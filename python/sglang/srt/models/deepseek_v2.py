@@ -660,6 +660,17 @@ class DeepseekV2MoE(nn.Module):
             prefix=add_prefix("experts", prefix),
         )
 
+        if self.alt_stream is not None and self.num_fused_shared_experts == 0:
+            # Layers that can take forward_normal_dual_stream read
+            # hidden_states on the alt stream (shared experts) concurrently
+            # with the routed experts on the main stream. An in-place routed
+            # runner (triton) overwrites that same tensor mid-read -- a data
+            # race captured into the decode CUDA graph, so every replay
+            # re-runs it; under SM pressure (PDMux overlap) the write can
+            # overtake the read and corrupt the shared-expert input. Force
+            # the routed output out of place for these layers.
+            self.experts.moe_runner_config.inplace = False
+
         if self.is_hash and not (is_nextn and is_deepseek_v4):
             self.topk = HashTopK(
                 topk=config.num_experts_per_tok + self.num_fused_shared_experts,
