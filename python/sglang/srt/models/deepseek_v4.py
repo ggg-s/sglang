@@ -110,6 +110,7 @@ from sglang.srt.model_executor.cuda_graph_config import (
     check_cuda_graph_backend,
 )
 from sglang.srt.model_executor.forward_batch_info import PPProxyTensors
+from sglang.srt.multiplex.pdmux_context import is_pdmux_standard_prefill
 from sglang.srt.model_executor.forward_context import (
     get_attn_backend,
     get_token_to_kv_pool,
@@ -2249,7 +2250,13 @@ class DeepseekV4Model(nn.Module):
                 )
             )
             or (_is_npu and envs.SGLANG_NPU_USE_MULTI_STREAM.get())
-        )
+        ) and not is_pdmux_standard_prefill()
+        # PDMux standard runs prefill and decode concurrently on two
+        # green-context streams. These helper streams are created on the plain
+        # context, so work forked onto them is not placed by the lane that
+        # forked it. Leaving them unset routes the attention KV / compressor /
+        # indexer split, the indexer's internal split and the MoE shared-expert
+        # branch onto the already-supported single-stream path.
         device_module = torch.get_device_module()
         num_alt_streams = 5 if _is_cuda else 2
         self.alt_streams = (

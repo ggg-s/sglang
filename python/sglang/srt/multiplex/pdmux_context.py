@@ -25,6 +25,37 @@ class PDMuxConfig:
     overlap_decode_full_sm: bool = False
 
 
+def is_pdmux_standard_prefill() -> bool:
+    """True when PD-Multiplexing submits prefills as one standard EXTEND.
+
+    Model and layer code reads this to pick the lane-safe variant of a path
+    that would otherwise place work on a stream the prefill green context does
+    not own (a model-internal helper stream) or share one communicator /
+    scratch buffer between the two lanes. It is deliberately a resolved-config
+    read rather than a constructor argument: the callers are leaf modules that
+    already read `get_disagg()` for the sibling `enable_pdmux` decisions.
+    """
+    from sglang.srt.runtime_context import get_disagg
+
+    disagg = get_disagg()
+    return disagg.enable_pdmux and disagg.pdmux_prefill_mode == "standard"
+
+
+def decode_lane_attn_backend(model_runner):
+    """The backend for decode-lane work that a caller plans before the forward.
+
+    TARGET_VERIFY is classified as an extend mode but runs on the decode lane.
+    On the standard lane it must plan into the per-stream decode backend the
+    eager runner will resolve for it, because the prefill instance may be
+    serving an in-flight prefill on the other stream and both write their
+    metadata in place. Every other configuration -- no PDMux, or layer_split --
+    keeps the runner's default, which is what those paths always used.
+    """
+    if is_pdmux_standard_prefill():
+        return model_runner.decode_attn_backend
+    return model_runner.attn_backend
+
+
 def load_pdmux_config(config_path: str) -> PDMuxConfig:
     """Load pdmux configuration from YAML file into a dataclass."""
     if not config_path:

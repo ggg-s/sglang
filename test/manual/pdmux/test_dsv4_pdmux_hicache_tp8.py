@@ -105,5 +105,21 @@ class TestDSV4PDMuxOverlappedMasksHiCache(DSV4PDMuxHiCacheMixin, CustomTestCase)
         )
 
 
+class TestDSV4PDMuxExclusivePartitionsHiCacheStandardPrefill(
+    TestDSV4PDMuxExclusivePartitionsHiCache
+):
+    """Exclusive layout, prefill submitted as one standard EXTEND."""
+
+    pdmux_prefill_mode = "standard"
+
+
+class TestDSV4PDMuxOverlappedMasksHiCacheStandardPrefill(
+    TestDSV4PDMuxOverlappedMasksHiCache
+):
+    """Overlapped layout, prefill submitted as one standard EXTEND."""
+
+    pdmux_prefill_mode = "standard"
+
+
 if __name__ == "__main__":
     unittest.main()

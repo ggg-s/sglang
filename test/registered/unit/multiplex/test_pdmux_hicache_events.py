@@ -23,7 +23,6 @@ from unittest.mock import Mock, patch
 
 from sglang.srt.multiplex.multiplexing_mixin import SchedulerMultiplexMixin
 from sglang.test.ci.ci_register import register_cpu_ci
-from sglang.test.test_utils import CustomTestCase
 
 register_cpu_ci(est_time=5, suite="base-a-test-cpu")
 
@@ -93,11 +92,12 @@ class _SplitBatch:
 class _FakeScheduler(SchedulerMultiplexMixin):
     """Drives the real `event_loop_pdmux` over stubbed collaborators."""
 
-    def __init__(self, *, max_iterations, query_results):
+    def __init__(self, *, max_iterations, query_results, pump_interval=1):
         self.max_iterations = max_iterations
         self.iteration = -1
         self.pumps = []
         self.split_forward_consumer_indices = []
+        self.HICACHE_PUMP_INTERVAL = pump_interval
 
         self.model_config = SimpleNamespace(num_hidden_layers=NUM_LAYERS)
         self.pdmux_config = SimpleNamespace(split_forward_token_budget=1000)
@@ -106,6 +106,8 @@ class _FakeScheduler(SchedulerMultiplexMixin):
             allreduce=lambda tensor, op: SimpleNamespace(wait=lambda: None)
         )
         self.tree_cache = Mock()
+        self.pdmux_standard = False
+        self.draft_worker = None
         self.chunked_req = None
         self.split_prefill_batch = None
         self.running_batch = _DecodeBatch()
@@ -144,7 +146,7 @@ class _FakeScheduler(SchedulerMultiplexMixin):
     def on_idle(self):
         pass
 
-    def adjust_stream_groups(self, running_batch):
+    def adjust_stream_groups(self, running_batch, has_prefill):
         return 0, self.stream_groups[0]
 
     def run_batch(self, batch):
@@ -157,6 +159,8 @@ class _FakeScheduler(SchedulerMultiplexMixin):
 
     def check_hicache_events_if_enabled(self):
         self.pumps.append(self.iteration)
+        # Host-only ack drain: no device work, so no dependency to publish.
+        return False
 
 
 @contextlib.contextmanager
@@ -176,9 +180,11 @@ def _stubbed_cuda():
         yield
 
 
-def _run_loop(*, max_iterations, query_results):
+def _run_loop(*, max_iterations, query_results, pump_interval=1):
     scheduler = _FakeScheduler(
-        max_iterations=max_iterations, query_results=query_results
+        max_iterations=max_iterations,
+        query_results=query_results,
+        pump_interval=pump_interval,
     )
     with _stubbed_cuda():
         try:
@@ -188,9 +194,9 @@ def _run_loop(*, max_iterations, query_results):
     return scheduler
 
 
-class TestPDMuxHiCacheEvents(CustomTestCase):
+class TestPDMuxHiCacheEvents(unittest.TestCase):
     def test_every_iteration_pumps_hicache_events_exactly_once(self):
-        """One pump per iteration across all three formation states.
+        """At interval 1, one pump per iteration across all formation states.
 
         With three layers and a busy decode batch the loop walks: iteration 0
         forms the batch (pump rides along with formation), iterations 1-2 have a
@@ -228,6 +234,20 @@ class TestPDMuxHiCacheEvents(CustomTestCase):
         scheduler = _run_loop(max_iterations=3, query_results=[])
 
         self.assertEqual(scheduler.pumps, [0, 1, 2])
+
+    def test_pump_decimation_skips_off_interval_iterations(self):
+        """With an interval of 2, only every second ELIGIBLE iteration pumps.
+
+        The tick advances on eligible iterations only (formation iterations
+        pump through the formation path instead), and it is a deterministic
+        function of the loop state, so every TP rank pumps on the same
+        iterations -- the pump's collectives stay aligned. Iteration 0 forms
+        (formation-path pump); the in-flight/wait iterations 1-3 tick 1, 2, 3,
+        pumping only on tick 2 (iteration 2).
+        """
+        scheduler = _run_loop(max_iterations=4, query_results=[False], pump_interval=2)
+
+        self.assertEqual(scheduler.pumps, [0, 2])
 
 
 if __name__ == "__main__":

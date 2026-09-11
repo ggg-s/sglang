@@ -427,6 +427,18 @@ class Scheduler(
         self.enable_overlap = not server_args.disable_overlap_schedule and not use_mlx()
         self.enable_overlap_mlx = not server_args.disable_overlap_schedule and use_mlx()
         self.enable_pdmux = server_args.enable_pdmux
+        # PDMux prefill lane mode. "standard" submits a prefill as one ordinary
+        # EXTEND through the standard worker; "layer_split" keeps the per-layer
+        # split path. Resolved once here -- server_args is frozen for the
+        # scheduler's lifetime and the loop reads this per iteration.
+        self.pdmux_standard = (
+            server_args.enable_pdmux and server_args.pdmux_prefill_mode == "standard"
+        )
+        # Identity marker for the standard prefill work item currently being
+        # submitted. Set only around the run_batch call that submits it, so a
+        # batch that later becomes the running (decode) batch is never mistaken
+        # for a prefill.
+        self._pdmux_prefill_batch: Optional[ScheduleBatch] = None
         self.skip_tokenizer_init = get_serving().skip_tokenizer_init
         self.stream_interval = server_args.stream_interval
         self.spec_algorithm = SpeculativeAlgorithm.from_string(
@@ -3172,15 +3184,19 @@ class Scheduler(
 
         return NextBatchPlan(batch_to_run=ret, running_batch=running_batch)
 
-    def check_hicache_events_if_enabled(self) -> None:
+    def check_hicache_events_if_enabled(self) -> bool:
         """Drain HiCache transfer acks, host locks, and prefetch progress.
 
         Batch formation is the normal caller, so every scheduling loop must
         either form a batch or call this itself. The gate is load-bearing:
         the base `tree_cache` leaves `check_hicache_events` unimplemented.
+        Returns whether the pump may have enqueued DEVICE work (KV frees,
+        mapping writes) that the caller must publish to other streams --
+        ack retirement alone is host-only bookkeeping and returns False.
         """
         if self.enable_hierarchical_cache or get_memory().enable_flexkv:
-            self.tree_cache.check_hicache_events()
+            return bool(self.tree_cache.check_hicache_events())
+        return False
 
     def _get_new_batch_prefill_raw(
         self,
@@ -3573,24 +3589,31 @@ class Scheduler(
         batch.prepare_for_decode()
         return batch
 
+    @staticmethod
+    def _snapshot_batch_attrs(batch: ScheduleBatch) -> List[Any]:
+        """Reference snapshot of every SB field, for tensor lifetime only.
+
+        Snapshot all fields: spec V2 rebinds seq_lens / spec_info mid-forward,
+        so the values the forward actually reads are only reachable from here
+        once the batch has been restored.
+        """
+        return [getattr(batch, f.name, None) for f in dataclasses.fields(batch)]
+
     def record_batch_in_overlap(self, batch: ScheduleBatch):
         # FIXME(lsyin): hacky way to keep a reference to avoid GPU tensors being freed by torch GC
         # NOTE: More Reliable: record all tensors into the forward stream
         # NOTE: - for all future tensors, we shall always read from future map
         #       - for all non-future tensors (produced only by schedule stream),
         #       we shall keep its reference not being release during all the forwarding pass
-        # Snapshot all fields: spec V2 rebinds seq_lens / spec_info mid-forward.
-        attr_snapshot = [
-            getattr(batch, f.name, None) for f in dataclasses.fields(batch)
-        ]
+        attr_snapshot = self._snapshot_batch_attrs(batch)
         self.batch_record_ct = (self.batch_record_ct + 1) % 2
         # List (not tuple) so that workers can register additional refs via
         # GenerationBatchResult.extra_keep_alive_refs after forward returns.
         self.batch_record_buf[self.batch_record_ct] = [batch, attr_snapshot]
 
     @contextmanager
-    def _forward_isolation(self, batch: ScheduleBatch, *, overlap: bool):
-        """Make SB transactional across one forward (overlap and non-overlap).
+    def _isolate_forward_fields(self, batch: ScheduleBatch):
+        """Make the SB's *fields* transactional across one forward.
 
         1. Snapshot SB fields so V2's mid-forward mutations (forward_mode /
            input_ids / seq_lens / spec_info / ...) can be undone. V1 / non-spec
@@ -3599,12 +3622,12 @@ class Scheduler(
         2. Substitute sampling_info with a forward-only copy (orchestrator=None,
            shares the pre-accumulated penalty buffer) so V2's multiple init_new
            calls don't double-accumulate penalties.
-        3. (overlap=True only) Pin (batch, snapshot) into batch_record_buf
-           for 2 iters so GPU tensors in the snapshot survive the caching
-           allocator past the forward stream. Must run AFTER the sampling_info
-           swap so the forward-only copy gets pinned. The non-overlap (sync) path
-           runs on a single stream and doesn't allocate batch_record_buf, so it
-           passes overlap=False.
+
+        Field isolation only: keeping the forward's GPU tensors alive is the
+        caller's job, because the two schemes differ. The overlap loop pins them
+        into a 2-iteration ring (see `_forward_isolation`); the PDMux prefill
+        lane holds them for the lifetime of one in-flight work item, which can
+        span many decode steps.
         """
         # 1. snapshot
         snapshot_v2_full = not batch.spec_algorithm.is_none()
@@ -3619,10 +3642,6 @@ class Scheduler(
         if sched_sampling_info is not None:
             batch.sampling_info = sched_sampling_info.copy_for_forward()
 
-        # 3. pin for 2-iter tensor lifetime (overlap path only)
-        if overlap:
-            self.record_batch_in_overlap(batch)
-
         try:
             yield
         finally:
@@ -3631,6 +3650,130 @@ class Scheduler(
                     setattr(batch, name, value)
             else:
                 batch.sampling_info = sched_sampling_info
+
+    @contextmanager
+    def _forward_isolation(self, batch: ScheduleBatch, *, overlap: bool):
+        """Field isolation plus the overlap loop's 2-iteration keep-alive.
+
+        (overlap=True only) Pin (batch, snapshot) into batch_record_buf for 2
+        iters so GPU tensors in the snapshot survive the caching allocator past
+        the forward stream. Must run AFTER the sampling_info swap so the
+        forward-only copy gets pinned. The non-overlap (sync) path runs on a
+        single stream and doesn't allocate batch_record_buf, so it passes
+        overlap=False.
+        """
+        with self._isolate_forward_fields(batch):
+            if overlap:
+                self.record_batch_in_overlap(batch)
+            yield
+
+    def _launch_result_copy(
+        self,
+        batch_result: GenerationBatchResult,
+        *,
+        return_logprob: bool,
+        return_hidden_states: bool,
+        forward_stream,
+        copy_stream,
+        copy_stream_ctx,
+    ) -> None:
+        """Start the result D2H that `batch_result.copy_done` gates.
+
+        The caller assigns `copy_done` first; `copy_to_cpu` records it after the
+        copies. The two return flags are explicit parameters rather than reads
+        off the batch so a caller that has already left field isolation still
+        copies what the user asked for.
+        """
+        if _is_hip:
+            # Cross-stream sync costs more than the tiny D2H it overlaps.
+            batch_result.copy_to_cpu(
+                return_logprob=return_logprob,
+                return_hidden_states=return_hidden_states,
+            )
+            return
+        # Result D2H on copy_stream overlaps the next forward instead of
+        # serializing on the forward stream; it's a leaf gated by copy_done, so
+        # nothing on the forward stream waits.
+        copy_stream.wait_stream(forward_stream)
+        with copy_stream_ctx:
+            batch_result.copy_to_cpu(
+                return_logprob=return_logprob,
+                return_hidden_states=return_hidden_states,
+            )
+
+    def _run_pdmux_standard_prefill(
+        self, batch: ScheduleBatch
+    ) -> GenerationBatchResult:
+        """Submit one PDMux prefill as a standard EXTEND, without blocking.
+
+        Same submission shape as the overlap branch -- field isolation, relay,
+        result D2H gated by copy_done -- but issued on the prefill lane's
+        streams, and with the keep-alive bundled onto the result instead of
+        pinned into the overlap ring: this work item is finalized only once
+        copy_done is ready on every rank, which can be many decode steps later.
+
+        Reads no device tensor and never synchronizes. run_batch's shared
+        pre/post processing (forward counters, profiler, extend_input_len /
+        extend_logprob_start_len per req) still runs around it.
+        """
+        # Read the copy options before entering isolation so the values handed
+        # to the copy describe the user's request, independent of any field the
+        # worker rebinds mid-forward.
+        return_logprob = batch.return_logprob
+        return_hidden_states = batch.return_hidden_states
+        prefill_stream = self.pdmux_prefill_stream
+
+        resolve_forward_inputs(batch, self.future_map)
+        with self._isolate_forward_fields(batch):
+            # Keep-alive snapshot: taken after the sampling_info swap and before
+            # the forward, so it pins exactly the objects this forward reads.
+            # It rides on extra_keep_alive_refs, which already means "refs the
+            # scheduler must keep alive for this forward"; the PDMux loop holds
+            # the bundle until finalize instead of for a fixed 2 iterations.
+            keep_alive = [batch, self._snapshot_batch_attrs(batch)]
+            batch_result = self.model_worker.forward_batch_generation(batch)
+            if batch_result.extra_keep_alive_refs:
+                keep_alive.extend(batch_result.extra_keep_alive_refs)
+            batch_result.extra_keep_alive_refs = keep_alive
+
+            if batch.spec_algorithm.is_none():
+                # Non-spec relays the sampled token through the FutureMap, as
+                # the synchronous branch does. Spec hands the next round a
+                # materialized next_draft_input instead and never enters the
+                # spec-extras relay protocol, which only the overlap loop
+                # resolves (resolve_forward_inputs gates it on enable_overlap).
+                self._relay_forward_payload(batch.req_pool_indices, batch_result)
+
+            batch_result.copy_done = self.device_module.Event()
+            self._launch_result_copy(
+                batch_result,
+                return_logprob=return_logprob,
+                return_hidden_states=return_hidden_states,
+                forward_stream=prefill_stream,
+                copy_stream=self.pdmux_prefill_copy_stream,
+                copy_stream_ctx=self.pdmux_prefill_copy_stream_ctx,
+            )
+
+        # Isolation restored the worker's in-forward SB edits; re-apply what
+        # must carry to the next iteration, without any host read.
+        batch.input_ids = None
+        if not batch.spec_algorithm.is_none():
+            batch.spec_info = batch_result.next_draft_input
+            if batch_result.new_seq_lens is not None:
+                # Spec V2's convention is that seq_lens is the length BEFORE
+                # this iteration's tokens, so a prefill hands back the batch's
+                # own tensor and there is nothing to recompute on the host.
+                # Assert instead of silently dropping a future rebind, which
+                # would need a host copy this lane must not block on.
+                assert batch_result.new_seq_lens is batch.seq_lens, (
+                    "PDMux standard prefill expects the worker to return the "
+                    "batch's own seq_lens; a rebind would require a blocking "
+                    "device-to-host copy on the prefill lane."
+                )
+        # Same position as in the other non-overlap branches: right after the
+        # forward returns, before the result is consumed.
+        self.update_cache_from_scheduler(batch, batch_result)
+        return batch_result
 
     @scheduler_nvtx_method("scheduler.run_batch")
     def run_batch(
@@ -3731,23 +3874,14 @@ class Scheduler(
                         batch_result.copy_done = self.device_module.Event()
                         if batch_result.delay_sample_func is None:
                             self._relay_forward_payload(future_indices, batch_result)
-                            if _is_hip:
-                                # Cross-stream sync costs more than the tiny D2H it
-                                # overlaps.
-                                batch_result.copy_to_cpu(
-                                    return_logprob=batch.return_logprob,
-                                    return_hidden_states=batch.return_hidden_states,
-                                )
-                            else:
-                                # Result D2H on copy_stream overlaps the next forward
-                                # instead of serializing on forward_stream; it's a leaf
-                                # gated by copy_done, so nothing on forward_stream waits.
-                                self.copy_stream.wait_stream(self.forward_stream)
-                                with self.copy_stream_ctx:
-                                    batch_result.copy_to_cpu(
-                                        return_logprob=batch.return_logprob,
-                                        return_hidden_states=batch.return_hidden_states,
-                                    )
+                            self._launch_result_copy(
+                                batch_result,
+                                return_logprob=batch.return_logprob,
+                                return_hidden_states=batch.return_hidden_states,
+                                forward_stream=self.forward_stream,
+                                copy_stream=self.copy_stream,
+                                copy_stream_ctx=self.copy_stream_ctx,
+                            )
                         else:
                             batch_result.future_indices = future_indices
 
@@ -3760,6 +3894,8 @@ class Scheduler(
                         batch.spec_info.dsa_topk_indices is not None
                     )
                     batch.spec_info.future_indices = future_indices
+            elif self.pdmux_standard and batch is self._pdmux_prefill_batch:
+                batch_result = self._run_pdmux_standard_prefill(batch)
             elif self.enable_pdmux and batch.forward_mode.is_split_prefill():
                 # Resolve only on the first segment: input_ids comes from the
                 # CPU staging there and is snapshotted into split_forward_batch.
@@ -4104,6 +4240,11 @@ class Scheduler(
             and (self.last_batch is None or self.last_batch.is_empty())
             and (not self.enable_overlap or len(self.result_queue) == 0)
             and self._pp_microbatches_drained()
+            # A PDMux prefill that is formed or in flight lives outside
+            # running_batch / last_batch until it is finalized. flush_cache
+            # gates on this predicate and would reset the tree cache and the
+            # request / KV pools underneath it.
+            and not self._extra_inflight_batches()
         )
 
         # Waiting queues: waiting + bootstrapping + preallocation + kv transfer (decode)
@@ -4573,6 +4714,10 @@ class Scheduler(
             inflight_batches = [self.running_batch, self.last_batch]
         else:
             inflight_batches = [*self.running_mbs, *self.mbs]
+        # A PDMux prefill batch is neither of those between formation and
+        # finalize; without this its requests would ignore an abort until they
+        # reach the decode batch.
+        inflight_batches += self._extra_inflight_batches()
 
         inflight_reqs = {r for b in inflight_batches if b is not None for r in b.reqs}
         for req in inflight_reqs:

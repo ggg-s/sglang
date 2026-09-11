@@ -216,6 +216,14 @@ class BaseRunner(ABC):
         self.dp_size = get_parallel().dp_size
         self.pp_size = model_runner.server_args.pp_size
         self.enable_pdmux = model_runner.server_args.enable_pdmux
+        # PDMux standard-prefill lane: decode-lane work classified as extend
+        # (TARGET_VERIFY) resolves the per-stream decode backend, and a caller
+        # that published its own ForwardContext keeps it. layer_split keeps the
+        # original routing.
+        self.pdmux_standard = (
+            self.enable_pdmux
+            and model_runner.server_args.pdmux_prefill_mode == "standard"
+        )
         self.return_hidden_states_mode = (
             CaptureHiddenMode.NULL
             if model_runner.is_draft_worker

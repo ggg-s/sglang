@@ -13,7 +13,6 @@ from sglang.srt.distributed.parallel_state import (
 )
 from sglang.srt.multiplex.multiplexing_mixin import SchedulerMultiplexMixin
 from sglang.test.ci.ci_register import register_cpu_ci
-from sglang.test.test_utils import CustomTestCase
 
 register_cpu_ci(est_time=5, suite="base-a-test-cpu")
 
@@ -81,7 +80,7 @@ def _make_chunked_req(*, extend_end, prefix_len):
     return _ChunkedReq(extend_end=extend_end, prefix_len=prefix_len)
 
 
-class TestPDMuxScheduler(CustomTestCase):
+class TestPDMuxScheduler(unittest.TestCase):
     def tearDown(self):
         set_pdmux_status(False)
 
@@ -291,6 +290,8 @@ class TestPDMuxScheduler(CustomTestCase):
         model_runner = SimpleNamespace(update_decode_attn_backend=lambda _idx: None)
         return SimpleNamespace(
             split_prefill_batch=object(),
+            pdmux_standard=False,
+            draft_worker=None,
             pdmux_config=SimpleNamespace(
                 manual_divisions=manual_divisions, decode_bs_divisor=36
             ),
@@ -315,7 +316,7 @@ class TestPDMuxScheduler(CustomTestCase):
 
         with self._stubbed_stream_idx():
             stream_idx, stream_group = SchedulerMultiplexMixin.adjust_stream_groups(
-                scheduler, running_batch
+                scheduler, running_batch, has_prefill=True
             )
 
         self.assertEqual(stream_idx, 1)
@@ -329,7 +330,7 @@ class TestPDMuxScheduler(CustomTestCase):
 
         with self._stubbed_stream_idx():
             stream_idx, _ = SchedulerMultiplexMixin.adjust_stream_groups(
-                scheduler, running_batch
+                scheduler, running_batch, has_prefill=True
             )
 
         self.assertEqual(stream_idx, 2)

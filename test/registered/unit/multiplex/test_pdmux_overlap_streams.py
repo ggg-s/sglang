@@ -15,10 +15,6 @@ import tempfile
 import types
 import unittest
 from pathlib import Path
-from unittest.mock import patch
-
-from sglang.test.ci.ci_register import register_cpu_ci
-from sglang.test.test_utils import CustomTestCase
 
 REPO_ROOT = Path(__file__).resolve().parents[4]
 PDMUX_CONTEXT_PATH = REPO_ROOT / "python/sglang/srt/multiplex/pdmux_context.py"
@@ -35,6 +31,9 @@ def _load_module(name: str, path: Path):
     return module
 
 
+register_cpu_ci = _load_module(
+    "_pdmux_overlap_ci_register", REPO_ROOT / "python/sglang/test/ci/ci_register.py"
+).register_cpu_ci
 register_cpu_ci(est_time=2, suite="base-a-test-cpu")
 
 
@@ -60,7 +59,7 @@ class _FakeSpatial:
         return TOTAL_SM
 
 
-def _make_stubs():
+def _install_stubs():
     spatial = _FakeSpatial()
     spatial_module = types.ModuleType("sgl_kernel.spatial")
     spatial_module.create_greenctx_stream_by_value = (
@@ -69,18 +68,15 @@ def _make_stubs():
     spatial_module.get_sm_available = spatial.get_sm_available
     sgl_kernel = types.ModuleType("sgl_kernel")
     sgl_kernel.spatial = spatial_module
-    return spatial, {
-        "sgl_kernel": sgl_kernel,
-        "sgl_kernel.spatial": spatial_module,
-    }
+    sys.modules["sgl_kernel"] = sgl_kernel
+    sys.modules["sgl_kernel.spatial"] = spatial_module
+    return spatial
 
 
-class PDMuxOverlapStreamTest(CustomTestCase):
+class PDMuxOverlapStreamTest(unittest.TestCase):
     @classmethod
     def setUpClass(cls):
-        cls.spatial, stubs = _make_stubs()
-        cls.modules_patcher = patch.dict(sys.modules, stubs)
-        cls.modules_patcher.start()
+        cls.spatial = _install_stubs()
         cls.pdmux = _load_module("_pdmux_context_overlap_test", PDMUX_CONTEXT_PATH)
         fake_torch = types.ModuleType("torch")
         fake_torch.cuda = types.SimpleNamespace(
@@ -89,20 +85,12 @@ class PDMuxOverlapStreamTest(CustomTestCase):
             get_device_capability=lambda device: (9, 0),
         )
         cls.pdmux.torch = fake_torch
-        cls.temp_dir = tempfile.TemporaryDirectory()
-
-    @classmethod
-    def tearDownClass(cls):
-        if hasattr(cls, "temp_dir"):
-            cls.temp_dir.cleanup()
-        if hasattr(cls, "modules_patcher"):
-            cls.modules_patcher.stop()
 
     def setUp(self):
         self.spatial.calls.clear()
 
     def _write_config(self, body: str) -> str:
-        path = Path(self.temp_dir.name) / "pdmux.yaml"
+        path = Path(tempfile.mkdtemp()) / "pdmux.yaml"
         path.write_text(body, encoding="utf-8")
         return str(path)
 

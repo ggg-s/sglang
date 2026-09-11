@@ -27,6 +27,8 @@ from __future__ import annotations
 import os
 import re
 import tempfile
+import threading
+import time
 import unittest
 from concurrent.futures import ThreadPoolExecutor
 
@@ -87,9 +89,26 @@ class PDMuxHiCacheMixin:
     model_path = DEFAULT_SMALL_MODEL_NAME_FOR_TEST
     max_total_tokens = MAX_TOTAL_TOKENS
     prompt_len = PROMPT_LEN
+    # How PDMux submits the prefill. The default keeps this test on the
+    # layer_split path it was written against; the *StandardPrefill subclasses
+    # run the same checks against the standard-EXTEND lane.
+    pdmux_prefill_mode = "layer_split"
     # Extra launch args and env, appended after the shared ones.
     extra_server_args: list = []
     server_env: dict = {}
+
+    @classmethod
+    def pdmux_mode_args(cls) -> list:
+        if cls.pdmux_prefill_mode == "layer_split":
+            return []
+        # The standard lane rejects a prefill CUDA graph: that graph carries no
+        # stream-group key, so its nodes keep the context they were captured in.
+        return [
+            "--pdmux-prefill-mode",
+            cls.pdmux_prefill_mode,
+            "--cuda-graph-backend-prefill",
+            "disabled",
+        ]
 
     @classmethod
     def pdmux_config_body(cls) -> str:
@@ -124,6 +143,10 @@ class PDMuxHiCacheMixin:
                 str(cls.max_total_tokens),
                 "--mem-fraction-static",
                 "0.7",
+                # Both checks read Prometheus counters, which the server only
+                # exports when metrics are on (default off).
+                "--enable-metrics",
+                *cls.pdmux_mode_args(),
                 *cls.extra_server_args,
             ],
             **popen_kwargs,
@@ -133,6 +156,15 @@ class PDMuxHiCacheMixin:
         # --max-total-tokens, and a hardcoded round count silently stops
         # evicting when it drifts.
         info = requests.get(cls.base_url + "/get_server_info", timeout=120).json()
+        # A server that resolved to the other lane would validate nothing about
+        # the mode this class is about, so check what actually took effect.
+        if info["pdmux_prefill_mode"] != cls.pdmux_prefill_mode:
+            raise AssertionError(
+                f"server launched with pdmux_prefill_mode="
+                f"{info['pdmux_prefill_mode']!r}, expected {cls.pdmux_prefill_mode!r}"
+            )
+        if not info["enable_metrics"]:
+            raise AssertionError("server launched without metrics; counters unreadable")
         cls.pool_tokens = info["max_total_num_tokens"]
         cls.eviction_rounds = min(
             MAX_EVICTION_ROUNDS, cls.pool_tokens // cls.prompt_len + 2
@@ -140,10 +172,8 @@ class PDMuxHiCacheMixin:
 
     @classmethod
     def tearDownClass(cls):
-        if hasattr(cls, "process") and cls.process:
-            kill_process_tree(cls.process.pid)
-        if hasattr(cls, "config_path") and os.path.exists(cls.config_path):
-            os.unlink(cls.config_path)
+        kill_process_tree(cls.process.pid)
+        os.unlink(cls.config_path)
 
     # --- helpers -----------------------------------------------------------
 
@@ -163,8 +193,14 @@ class PDMuxHiCacheMixin:
         return response.json()
 
     def _counter(self, name) -> float:
-        """Sum a Prometheus counter across its per-pool label sets."""
-        metrics = requests.get(self.base_url + "/metrics", timeout=60).text
+        """Sum a Prometheus counter across its per-pool label sets.
+
+        An unmounted or failing /metrics must surface as an error: parsed as
+        text it matches nothing and reads as zero, i.e. as "no progress".
+        """
+        response = requests.get(self.base_url + "/metrics", timeout=60)
+        response.raise_for_status()
+        metrics = response.text
         return sum(
             float(match.group(1))
             for match in re.finditer(
@@ -173,6 +209,24 @@ class PDMuxHiCacheMixin:
                 re.MULTILINE,
             )
         )
+
+    def _settled_counter(self, name, *, interval=1.0, attempts=30) -> float:
+        """A quiet baseline: the counter after two equal reads a second apart.
+
+        Acks from the previous case's traffic can retire after that case has
+        returned; a baseline taken while they land would make "advanced while
+        this case's requests ran" trivially true. Two equal reads show the
+        counter is not moving at that moment, not that every earlier ack has
+        retired -- a late one can still land after this returns.
+        """
+        value = self._counter(name)
+        for _ in range(attempts):
+            time.sleep(interval)
+            current = self._counter(name)
+            if current == value:
+                return value
+            value = current
+        raise AssertionError(f"{name} kept moving with no requests in flight")
 
     def _flush(self):
         requests.post(self.base_url + "/flush_cache", timeout=120).raise_for_status()
@@ -208,25 +262,60 @@ class PDMuxHiCacheMixin:
         self.assertGreater(after, before, "prompt was not served from the host cache")
         self.assertEqual(warm["output_ids"], cold["output_ids"])
 
-    def test_backups_keep_draining_under_overlapped_long_prefills(self):
-        """Transfer acks must keep retiring while split prefills are in flight.
+    def test_backups_advance_while_requests_are_running(self):
+        """Backup acks retire while this case's requests are still running.
 
-        HiCache write acks are drained by the scheduler loop, and PDMux spends
-        most of its iterations inside a split prefill. Long prefills running
-        concurrently with decode must not freeze the backup counter -- if they
-        did, host pages would stay pinned for the whole prefill and the pool
-        would eventually stall.
+        A smoke check, not a timing proof. Request completion includes the
+        decode tail, and PDMux can admit several of these prompts into one
+        prefill batch, so an advance before the last completion does not show
+        that acks retired while a prefill was in flight. That property is the
+        TP8 timing item in standard_prefill_runbook.md, which correlates the
+        counter with individual prefill work items. What this case does rule
+        out is a counter that only moves once the server is idle again, which
+        is what a scheduler that never pumps HiCache events between prefills
+        would show.
         """
         self._flush()
-        before = self._counter(BACKUP_TOKENS)
+        before = self._settled_counter(BACKUP_TOKENS)
 
         # Seeds well clear of the eviction phase's range, so these prompts are
         # genuinely cold rather than prefix hits from the other case.
         prompts = [self._prompt(seed) for seed in range(200, 206)]
-        with ThreadPoolExecutor(max_workers=len(prompts)) as pool:
-            results = list(
-                pool.map(lambda p: self._generate(p, max_new_tokens=32), prompts)
-            )
+
+        samples = []
+        sampler_errors = []
+        stop_sampling = threading.Event()
+
+        def sample_counter():
+            try:
+                while not stop_sampling.is_set():
+                    value = self._counter(BACKUP_TOKENS)
+                    # Stamp after the read: the value is known to hold at this
+                    # instant, so "before the last completion" is conservative.
+                    samples.append((time.monotonic(), value))
+                    stop_sampling.wait(0.2)
+            except Exception as exc:
+                # join() does not propagate this; re-raised on the test thread.
+                sampler_errors.append(exc)
+
+        sampler = threading.Thread(target=sample_counter, daemon=True)
+        sampler.start()
+        completion_times = []
+        try:
+            with ThreadPoolExecutor(max_workers=len(prompts)) as pool:
+
+                def run(prompt):
+                    result = self._generate(prompt, max_new_tokens=32)
+                    completion_times.append(time.monotonic())
+                    return result
+
+                results = list(pool.map(run, prompts))
+        finally:
+            stop_sampling.set()
+            sampler.join(timeout=60)
+        self.assertFalse(sampler.is_alive(), "counter sampler did not exit")
+        if sampler_errors:
+            raise sampler_errors[0]
 
         after = self._counter(BACKUP_TOKENS)
 
@@ -234,6 +323,15 @@ class PDMuxHiCacheMixin:
             self.assertEqual(result["meta_info"]["completion_tokens"], 32)
         self.assertGreater(
             after, before, "no device-to-host backup acks retired during the run"
+        )
+        first_progress = next((t for t, value in samples if value > before), None)
+        self.assertIsNotNone(
+            first_progress, "backup counter never advanced while requests ran"
+        )
+        self.assertLess(
+            first_progress,
+            max(completion_times),
+            "backups only retired after every request had finished",
         )
         requests.get(self.base_url + "/health", timeout=60).raise_for_status()
 
@@ -275,6 +373,20 @@ class TestPDMuxOverlappedMasksHiCache(PDMuxHiCacheMixin, CustomTestCase):
             "overlap_decode_full_sm: true\n"
             f"manual_divisions:\n{entries}"
         )
+
+
+class TestPDMuxExclusivePartitionsHiCacheStandardPrefill(
+    TestPDMuxExclusivePartitionsHiCache
+):
+    """Exclusive layout, prefill submitted as one standard EXTEND."""
+
+    pdmux_prefill_mode = "standard"
+
+
+class TestPDMuxOverlappedMasksHiCacheStandardPrefill(TestPDMuxOverlappedMasksHiCache):
+    """Overlapped layout, prefill submitted as one standard EXTEND."""
+
+    pdmux_prefill_mode = "standard"
 
 
 if __name__ == "__main__":

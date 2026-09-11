@@ -660,17 +660,6 @@ class DeepseekV2MoE(nn.Module):
             prefix=add_prefix("experts", prefix),
         )
 
-        if self.alt_stream is not None and self.num_fused_shared_experts == 0:
-            # Layers that can take forward_normal_dual_stream read
-            # hidden_states on the alt stream (shared experts) concurrently
-            # with the routed experts on the main stream. An in-place routed
-            # runner (triton) overwrites that same tensor mid-read -- a data
-            # race captured into the decode CUDA graph, so every replay
-            # re-runs it; under SM pressure (PDMux overlap) the write can
-            # overtake the read and corrupt the shared-expert input. Force
-            # the routed output out of place for these layers.
-            self.experts.moe_runner_config.inplace = False
-
         if self.is_hash and not (is_nextn and is_deepseek_v4):
             self.topk = HashTopK(
                 topk=config.num_experts_per_tok + self.num_fused_shared_experts,
@@ -960,6 +949,19 @@ class DeepseekV2MoE(nn.Module):
             if use_flashinfer_trtllm_bypass
             else self._maybe_quant_moe_input_once(hidden_states)
         )
+        # An in-place routed runner (triton) writes its output into
+        # hidden_states, which the shared experts read concurrently on the alt
+        # stream -- the fork below orders the alt stream only after work
+        # enqueued so far, not against the routed write issued later. Hand the
+        # alt stream its own copy instead of forcing the routed path out of
+        # place: the clone costs ~0.2ms/step at decode shapes, while an
+        # out-of-place routed MoE broke the per-layer PDL fusion chain for
+        # ~7ms/step (measured, DSV4 TP8 decode bs~40).
+        shared_expert_input = (
+            hidden_states.clone()
+            if self.experts.moe_runner_config.inplace
+            else hidden_states
+        )
         self.alt_stream.wait_stream(current_stream)
         has_shared_output = (
             hidden_states.shape[0] > 0 and self.num_fused_shared_experts == 0
@@ -1018,7 +1020,7 @@ class DeepseekV2MoE(nn.Module):
         # Shared expert on alt stream, issued AFTER the main (routed) branch. See note above.
         with torch.cuda.stream(self.alt_stream):
             shared_output = self._forward_shared_experts(
-                hidden_states,
+                shared_expert_input,
                 gemm_output_zero_allocator,
                 pre_quant_input=pre_quant_input,
             )

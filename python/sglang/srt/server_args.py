@@ -3122,6 +3122,19 @@ class ServerArgs:
         Optional[str], "The path of the PD-Multiplexing config file.", NS("disagg")
     ] = None
     sm_group_num: A[int, "Number of sm partition groups.", NS("disagg")] = 8
+    pdmux_prefill_mode: A[
+        str,
+        Arg(
+            help="How PD-Multiplexing submits a prefill. 'layer_split' walks the "
+            "model's forward_split_prefill one layer interval per scheduling "
+            "step. 'standard' submits the whole prefill as one ordinary EXTEND "
+            "through the standard worker, so speculative decoding, HiCache and "
+            "new models reuse the community prefill path; the loop then waits "
+            "on the result's copy_done instead of layer boundaries.",
+            choices=["layer_split", "standard"],
+        ),
+        NS("disagg"),
+    ] = "layer_split"
 
     # -------------------------------------------------------------------------
     # Model weight update and weight loading
@@ -8947,6 +8960,9 @@ class ServerArgs:
                     "stream too. Prefer write_through."
                 )
 
+            if self.pdmux_prefill_mode == "standard":
+                self._check_pdmux_standard_prefill()
+
             if self.pdmux_config_path:
                 from sglang.srt.multiplex.pdmux_context import load_pdmux_config
 
@@ -9076,6 +9092,65 @@ class ServerArgs:
         if self.kv_canary_sweep_interval > 0 and self.kv_canary == "none":
             raise ValueError(
                 "--kv-canary-sweep-interval requires --kv-canary in {log, raise}"
+            )
+
+    def _check_pdmux_standard_prefill(self):
+        """Admission for `--pdmux-prefill-mode standard`.
+
+        The standard lane submits a prefill as one ordinary EXTEND on the
+        prefill green-context stream while decode keeps running on its own.
+        Every rejection below names a resource whose placement that lane cannot
+        yet control -- a graph captured without a stream-group key, a runner
+        that reads the pdmux flag without initializing its stream groups, or a
+        parallelism whose idle/sync path still resolves the prefill attention
+        backend. None of them is a feature being dropped; each is a combination
+        this lane has not been built or exercised against.
+
+        Runs from check_server_args, i.e. after __post_init__ resolved
+        cuda_graph_config, so the prefill backend read here is final.
+        """
+        from sglang.srt.model_executor.cuda_graph_config import Backend
+
+        prefill_backend = self.cuda_graph_config.prefill.backend
+        assert prefill_backend == Backend.DISABLED, (
+            f"--pdmux-prefill-mode standard requires the prefill CUDA graph to be "
+            f"disabled, but the resolved prefill backend is '{prefill_backend}'. "
+            f"The prefill graph is captured once on a plain stream and its shape "
+            f"key carries no stream index, so its nodes keep the resource context "
+            f"they were captured with. Pass --cuda-graph-backend-prefill disabled."
+        )
+        assert not self.enable_multi_layer_eagle, (
+            "--pdmux-prefill-mode standard is not compatible with "
+            "--enable-multi-layer-eagle: MultiLayerEagleDraftExtendCudaGraphRunner "
+            "reads enable_pdmux but never runs the base __init__ that fills "
+            "stream_groups, so its capture path would dereference an unset field."
+        )
+        assert not self.enable_two_batch_overlap, (
+            "--pdmux-prefill-mode standard is not compatible with "
+            "--enable-two-batch-overlap: TBO wraps the attention backend per "
+            "micro-batch instead of per stream group, so the two schemes would "
+            "both claim ownership of the same backend instances."
+        )
+        assert not self.enable_unified_memory, (
+            "--pdmux-prefill-mode standard is not compatible with "
+            "--enable-unified-memory: the unified allocator gates page reuse on "
+            "a single forward_done event recorded on one forward stream, which "
+            "cannot describe two lanes running at once."
+        )
+        assert not self.enable_dp_attention, (
+            "--pdmux-prefill-mode standard is not compatible with "
+            "--enable-dp-attention: the idle-batch path still resolves the "
+            "prefill attention backend, which the decode lane must not touch."
+        )
+        for name, value in (
+            ("--ep-size", self.ep_size),
+            ("--attn-cp-size", self.attn_cp_size),
+            ("--dcp-size", self.dcp_size),
+        ):
+            assert value == 1, (
+                f"--pdmux-prefill-mode standard is not compatible with "
+                f"{name}={value}: expert and context parallelism add collectives "
+                f"and helper streams this lane has not been exercised against."
             )
 
     def check_lora_server_args(self):
