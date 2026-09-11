@@ -733,6 +733,29 @@ def _fused_moe_kernel_sequence(
 
     del intermediate_cache1
 
+    # Diagnose large prefill allocations before an OOM destroys the scheduler.
+    # Avoid querying memory while recording a CUDA graph.
+    intermediate_cache3_bytes = (
+        num_tokens * topk * w2.shape[1] * hidden_states.element_size()
+    )
+    if (
+        hidden_states.is_cuda
+        and intermediate_cache3_bytes >= 512 * 1024**2
+        and not torch.cuda.is_current_stream_capturing()
+    ):
+        free_bytes, total_bytes = torch.cuda.mem_get_info(hidden_states.device)
+        print(
+            f"[MOE_MEM] device={hidden_states.device} "
+            f"tokens={num_tokens} topk={topk} hidden={w2.shape[1]} "
+            f"dtype={hidden_states.dtype} "
+            f"need={intermediate_cache3_bytes / 1024**3:.3f}GiB "
+            f"free={free_bytes / 1024**3:.3f}GiB "
+            f"total={total_bytes / 1024**3:.3f}GiB "
+            f"allocated={torch.cuda.memory_allocated(hidden_states.device) / 1024**3:.3f}GiB "
+            f"reserved={torch.cuda.memory_reserved(hidden_states.device) / 1024**3:.3f}GiB",
+            flush=True,
+        )
+
     intermediate_cache3 = torch.empty(
         (num_tokens, topk, w2.shape[1]),
         device=hidden_states.device,
