@@ -16,9 +16,10 @@ from sglang.srt.managers.scheduler import GenerationBatchResult
 from sglang.srt.managers.tp_worker import TpModelWorker
 from sglang.srt.model_executor.forward_batch_info import (
     CaptureHiddenMode,
+    PPProxyTensors,
     compute_position,
 )
-from sglang.srt.runtime_context import get_exec, get_parallel, get_spec
+from sglang.srt.runtime_context import get_disagg, get_exec, get_parallel, get_spec
 from sglang.srt.server_args import ServerArgs
 from sglang.srt.speculative.base_spec_worker import BaseSpecWorker
 from sglang.srt.speculative.dflash_info_v2 import DFlashDraftInputV2
@@ -90,6 +91,20 @@ class DSparkWorkerV2(BaseSpecWorker):
         self.model_runner = target_worker.model_runner
         self.page_size = server_args.page_size
         self.device = target_worker.device
+
+        disagg = get_disagg()
+        if (
+            getattr(disagg, "enable_pdmux", False)
+            and getattr(disagg, "pdmux_prefill_mode", "layer_split") == "layer_split"
+            and not getattr(
+                self.model_runner.model, "supports_pdmux_dspark_prefill", False
+            )
+        ):
+            raise NotImplementedError(
+                "PDMux layer-split + DSPARK requires a target model that "
+                "preserves DSPARK auxiliary hidden states across split prefill. "
+                "DeepSeek-V4 is currently supported."
+            )
 
         self._draft_is_moe = draft_is_deepseek_v4(server_args=server_args)
         self._draft_dp_context_enabled = (
@@ -382,6 +397,11 @@ class DSparkWorkerV2(BaseSpecWorker):
     def clear_cache_pool(self):
         pass
 
+    def update_pdmux_decode_attn_backend(self, stream_idx: int) -> None:
+        """Switch target and draft runners to the active PDMux stream group."""
+        self.model_runner.update_decode_attn_backend(stream_idx)
+        self.draft_model_runner.update_decode_attn_backend(stream_idx)
+
     def set_dspark_forced_budget_frac(self, frac: Optional[float]) -> None:
         self._forced_budget_frac = frac
         self._verify_planner.set_forced_budget_frac(frac)
@@ -403,6 +423,7 @@ class DSparkWorkerV2(BaseSpecWorker):
         batch: ScheduleBatch,
         on_publish=None,
         grammar_barrier=None,
+        pp_proxy_tensors: Optional[PPProxyTensors] = None,
     ) -> GenerationBatchResult:
         if getattr(batch, "return_logprob", False):
             raise ValueError(
@@ -412,23 +433,58 @@ class DSparkWorkerV2(BaseSpecWorker):
         if batch.forward_mode.is_extend() or batch.is_extend_in_batch:
             self._verify_planner.note_non_decode_step()
             self._observers.note_prefill_step()
-            return self._forward_prefill(batch, on_publish)
+            return self._forward_prefill(
+                batch, on_publish, pp_proxy_tensors=pp_proxy_tensors
+            )
 
         return self._forward_decode(batch, on_publish, grammar_barrier)
 
     def _forward_prefill(
-        self, batch: ScheduleBatch, on_publish
+        self,
+        batch: ScheduleBatch,
+        on_publish,
+        pp_proxy_tensors: Optional[PPProxyTensors] = None,
     ) -> GenerationBatchResult:
         if batch.forward_mode.is_idle():
             if get_parallel().enable_dp_attention:
                 self.target_worker.forward_batch_generation(
-                    batch, capture_hidden_mode=CaptureHiddenMode.FULL
+                    batch,
+                    pp_proxy_tensors=pp_proxy_tensors,
+                    capture_hidden_mode=CaptureHiddenMode.FULL,
                 )
             return self._decode_idle_result(on_publish=on_publish)
 
         batch_output = self.target_worker.forward_batch_generation(
+            batch,
+            pp_proxy_tensors=pp_proxy_tensors,
+            capture_hidden_mode=CaptureHiddenMode.FULL,
+        )
+        return self._finalize_prefill(batch, batch_output, on_publish)
+
+    def forward_batch_split_prefill(
+        self, batch: ScheduleBatch
+    ) -> GenerationBatchResult:
+        """Run one target split and inject DSpark state after the final split."""
+        if batch.split_index == 0:
+            self._verify_planner.note_non_decode_step()
+            self._observers.note_prefill_step()
+
+        batch_output = self.target_worker.forward_batch_split_prefill(
             batch, capture_hidden_mode=CaptureHiddenMode.FULL
         )
+        if batch_output.logits_output is None:
+            return batch_output
+        if batch.forward_mode.is_idle():
+            return self._decode_idle_result(on_publish=None)
+        return self._finalize_prefill(batch, batch_output, on_publish=None)
+
+    def _finalize_prefill(
+        self,
+        batch: ScheduleBatch,
+        batch_output: GenerationBatchResult,
+        on_publish,
+    ) -> GenerationBatchResult:
+        """Inject captured target hidden states into the DSpark draft KV."""
         logits_output = batch_output.logits_output
         next_token_ids = batch_output.next_token_ids
         batch_output.new_seq_lens = batch.seq_lens
@@ -438,7 +494,7 @@ class DSparkWorkerV2(BaseSpecWorker):
         if logits_output.hidden_states is None:
             raise RuntimeError(
                 "DSpark requires target aux hidden capture for prefill, but got None. "
-                "Make sure the target model has DFlash layers-to-capture configured."
+                "Make sure the target model has DSpark layers-to-capture configured."
             )
         if batch.extend_lens is None or batch.prefix_lens is None:
             raise RuntimeError(

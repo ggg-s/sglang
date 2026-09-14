@@ -20,6 +20,7 @@ SCHEDULER_PATH = (
     Path(__file__).resolve().parents[4] / "python/sglang/srt/managers/scheduler.py"
 )
 TP_WORKER_PATH = SCHEDULER_PATH.parent / "tp_worker.py"
+DP_ATTN_PATH = SCHEDULER_PATH.parent / "scheduler_components" / "dp_attn.py"
 
 
 def _init_call_order(class_name, targets):
@@ -81,6 +82,36 @@ def _make_chunked_req(*, extend_end, prefix_len):
 
 
 class TestPDMuxScheduler(unittest.TestCase):
+    def test_dp_attn_adapter_uses_active_pdmux_tp_group(self):
+        tree = ast.parse(DP_ATTN_PATH.read_text(encoding="utf-8"))
+        cls = next(
+            node
+            for node in tree.body
+            if isinstance(node, ast.ClassDef) and node.name == "SchedulerDPAttnAdapter"
+        )
+        method = next(
+            node
+            for node in cls.body
+            if isinstance(node, ast.FunctionDef)
+            and node.name == "prepare_mlp_sync_batch"
+        )
+        prepare_call = next(
+            node
+            for node in ast.walk(method)
+            if isinstance(node, ast.Call)
+            and isinstance(node.func, ast.Name)
+            and node.func.id == "prepare_mlp_sync_batch_raw"
+        )
+        tp_group = next(
+            keyword.value
+            for keyword in prepare_call.keywords
+            if keyword.arg == "tp_group"
+        )
+
+        self.assertIsInstance(tp_group, ast.Call)
+        self.assertIsInstance(tp_group.func, ast.Name)
+        self.assertEqual(tp_group.func.id, "get_tp_group")
+
     def tearDown(self):
         set_pdmux_status(False)
 
@@ -335,6 +366,26 @@ class TestPDMuxScheduler(unittest.TestCase):
 
         self.assertEqual(stream_idx, 2)
 
+    def test_stream_switch_uses_speculative_worker_backend_hook(self):
+        scheduler = self._make_stream_group_scheduler(
+            manual_divisions=[[32, 0, 1]], group_num=3
+        )
+        scheduler.model_worker = SimpleNamespace(
+            update_pdmux_decode_attn_backend=Mock()
+        )
+        target_update = scheduler.tp_worker.model_runner.update_decode_attn_backend
+        running_batch = SimpleNamespace(is_empty=lambda: False, batch_size=lambda: 1)
+
+        with self._stubbed_stream_idx():
+            SchedulerMultiplexMixin.adjust_stream_groups(
+                scheduler, running_batch, has_prefill=True
+            )
+
+        scheduler.model_worker.update_pdmux_decode_attn_backend.assert_called_once_with(
+            1
+        )
+        target_update.assert_not_called()
+
     def test_split_prefill_forward_installs_hicache_consumer_first(self):
         """Every split-prefill segment must install the HiCache consumer index
         before running the model.
@@ -488,6 +539,43 @@ class TestPDMuxScheduler(unittest.TestCase):
         self.assertIs(scheduler.running_batch, running_batch)
         self.assertIsNone(scheduler.split_prefill_batch)
 
+    def test_finished_prefill_releases_persistent_forward_batch(self):
+        split_forward_batch = object()
+        split_batch = Mock()
+        split_batch.chunked_req = None
+        split_batch.split_forward_batch = split_forward_batch
+        split_batch.split_index = 61
+        split_batch.split_forward_count = 4
+        split_batch.split_prefill_finished = True
+        split_batch.batch_size.side_effect = [1, 1]
+        split_batch.is_empty.return_value = False
+        running_batch = Mock()
+        running_batch.is_empty.return_value = True
+        running_batch.batch_is_full = True
+        prefill_stream, decode_stream, merge_done = self._make_merge_streams([])
+        scheduler = SimpleNamespace(
+            running_batch=running_batch,
+            split_prefill_batch=split_batch,
+            chunked_req=None,
+            process_batch_result=Mock(),
+        )
+
+        returned = SchedulerMultiplexMixin._merge_finished_prefill_batch(
+            scheduler,
+            prefill_result=object(),
+            prefill_stream=prefill_stream,
+            decode_stream=decode_stream,
+            running_batch=running_batch,
+        )
+
+        self.assertIs(returned, split_batch)
+        self.assertIsNone(split_batch.split_forward_batch)
+        self.assertEqual(split_batch.split_index, 0)
+        self.assertEqual(split_batch.split_forward_count, 1)
+        self.assertFalse(split_batch.split_prefill_finished)
+        self.assertIsNone(scheduler.split_prefill_batch)
+        decode_stream.wait_event.assert_called_once_with(merge_done)
+
     def test_merge_excludes_and_stashes_unfinished_chunked_request(self):
         """A request that only finished a middle chunk must be stashed and
         kept out of the decode batch; merging it would start decoding with a
@@ -623,6 +711,9 @@ class TestPDMuxScheduler(unittest.TestCase):
                     batch_to_run=None, running_batch=running_batch
                 )
             ),
+            dp_attn_adapter=SimpleNamespace(
+                maybe_prepare_mlp_sync_batch=Mock(return_value=None)
+            ),
         )
 
         created, returned = SchedulerMultiplexMixin.update_split_prefill_batch(
@@ -630,8 +721,44 @@ class TestPDMuxScheduler(unittest.TestCase):
         )
 
         scheduler.process_pending_chunked_abort.assert_called_once_with()
+        scheduler.dp_attn_adapter.maybe_prepare_mlp_sync_batch.assert_called_once_with(
+            None
+        )
         self.assertFalse(created)
         self.assertIs(returned, running_batch)
+
+    def test_update_split_prefill_batch_accepts_peer_dp_idle_batch(self):
+        running_batch = _Batch(empty=True)
+        idle_mode = SimpleNamespace(is_idle=lambda: True)
+        idle_batch = _Batch(empty=True)
+        idle_batch.forward_mode = idle_mode
+        adapter = SimpleNamespace(
+            maybe_prepare_mlp_sync_batch=Mock(return_value=idle_batch)
+        )
+        scheduler = SimpleNamespace(
+            split_prefill_batch=None,
+            process_pending_chunked_abort=Mock(),
+            get_new_batch_prefill=Mock(
+                return_value=SimpleNamespace(
+                    batch_to_run=None, running_batch=running_batch
+                )
+            ),
+            dp_attn_adapter=adapter,
+        )
+
+        created, returned = SchedulerMultiplexMixin.update_split_prefill_batch(
+            scheduler, 1, running_batch
+        )
+
+        self.assertTrue(created)
+        self.assertIs(returned, running_batch)
+        self.assertIs(scheduler.split_prefill_batch, idle_batch)
+        self.assertIs(idle_batch.forward_mode, idle_mode)
+        self.assertEqual(idle_batch.split_index, 0)
+        self.assertFalse(idle_batch.split_prefill_finished)
+        self.assertEqual(idle_batch.split_forward_count, 1)
+        self.assertIsNone(idle_batch.split_forward_batch)
+        adapter.maybe_prepare_mlp_sync_batch.assert_called_once_with(None)
 
     def test_update_split_prefill_batch_defers_abort_while_chunk_in_flight(self):
         """Tearing down a chunked request while its split forward is running

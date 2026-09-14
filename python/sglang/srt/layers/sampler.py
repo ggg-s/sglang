@@ -8,7 +8,6 @@ from torch import nn
 
 from sglang.kernels.ops.sampling.murmur_hash import murmur_hash32
 from sglang.srt.distributed import get_tp_group
-from sglang.srt.multiplex.pdmux_context import is_pdmux_standard_prefill
 from sglang.srt.layers.dp_attention import (
     is_dp_attention_enabled,
 )
@@ -16,6 +15,7 @@ from sglang.srt.layers.logits_processor import LogitsProcessorOutput
 from sglang.srt.layers.logprob_processor import (
     OutputLogprobProcessor,
 )
+from sglang.srt.multiplex.pdmux_context import is_pdmux_standard_prefill
 from sglang.srt.runtime_context import get_exec, get_parallel, get_server_args
 from sglang.srt.sampling.sampling_batch_info import SamplingBatchInfo
 from sglang.srt.sampling.sampling_params import TOP_K_ALL
@@ -79,7 +79,7 @@ class Sampler(nn.Module):
         # active. A group cached here would make the prefill lane's sync share
         # the decode lane's communicator with a decode collective in flight, so
         # that mode resolves the group per call instead. DP attention keeps the
-        # cached attn_tp_group either way -- PDMux standard rejects DP.
+        # cached attn_tp_group to synchronize only within each attention group.
         self._resolve_tp_sync_group_per_call = (
             is_pdmux_standard_prefill() and not is_dp_attention_enabled()
         )

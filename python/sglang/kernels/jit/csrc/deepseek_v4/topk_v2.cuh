@@ -437,7 +437,10 @@ struct TopKKernel {
         .cluster_floor = (batch_size <= kSmallBatchLowFloor) ? kClusterFloorSmall : kClusterFloor,
     };
 
-    const bool use_cluster = enable_cluster && (max_seq_len > params.cluster_floor) && (batch_size <= kClusterMaxBatch);
+#ifndef USE_ROCM
+    const bool use_cluster =
+        enable_cluster && (max_seq_len > params.cluster_floor) && (batch_size <= kClusterMaxBatch);
+#endif
     constexpr bool kUsePDL = true;
     if (use_cluster) {
       if (batch_size <= kNumPersistentClusters) {

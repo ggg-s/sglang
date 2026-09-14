@@ -9102,8 +9102,7 @@ class ServerArgs:
         Every rejection below names a resource whose placement that lane cannot
         yet control -- a graph captured without a stream-group key, a runner
         that reads the pdmux flag without initializing its stream groups, or a
-        parallelism whose idle/sync path still resolves the prefill attention
-        backend. None of them is a feature being dropped; each is a combination
+        parallelism whose helper streams are not isolated by lane. None of them is a feature being dropped; each is a combination
         this lane has not been built or exercised against.
 
         Runs from check_server_args, i.e. after __post_init__ resolved
@@ -9136,11 +9135,6 @@ class ServerArgs:
             "--enable-unified-memory: the unified allocator gates page reuse on "
             "a single forward_done event recorded on one forward stream, which "
             "cannot describe two lanes running at once."
-        )
-        assert not self.enable_dp_attention, (
-            "--pdmux-prefill-mode standard is not compatible with "
-            "--enable-dp-attention: the idle-batch path still resolves the "
-            "prefill attention backend, which the decode lane must not touch."
         )
         for name, value in (
             ("--ep-size", self.ep_size),
