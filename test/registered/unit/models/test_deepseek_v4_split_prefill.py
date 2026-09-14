@@ -67,7 +67,7 @@ class TestDeepseekV4SplitPrefill(unittest.TestCase):
                 return_value=SimpleNamespace(attn_dp_size=1),
             ),
             patch(
-                "sglang.srt.models.deepseek_v4.dsa_use_prefill_cp",
+                "sglang.srt.models.deepseek_v4.is_cp_active",
                 return_value=False,
             ),
             patch(
@@ -118,14 +118,12 @@ class TestDeepseekV4SplitPrefill(unittest.TestCase):
         torch.testing.assert_close(split_result[0], one_shot_result[0])
         torch.testing.assert_close(split_result[1], one_shot_result[1])
 
-    def test_causal_lm_initializes_cp_once_and_processes_final_logits(self):
-        prepare_cp = Mock()
+    def test_causal_lm_processes_only_final_logits(self):
         model_forward = Mock(
             side_effect=[None, (torch.tensor([1.0]), torch.tensor([2.0]))]
         )
         logits_processor = Mock(return_value="logits")
         model = SimpleNamespace(
-            _prepare_dsa_prefill_cp=prepare_cp,
             model=SimpleNamespace(forward_split_prefill=model_forward),
             logits_processor=logits_processor,
             lm_head=object(),
@@ -153,7 +151,6 @@ class TestDeepseekV4SplitPrefill(unittest.TestCase):
             )
 
         self.assertEqual(result, "logits")
-        prepare_cp.assert_called_once_with(args[0], args[2])
         logits_processor.assert_called_once()
 
 
