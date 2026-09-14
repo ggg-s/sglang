@@ -12,6 +12,7 @@ import enum
 import importlib.util
 import sys
 import unittest
+from http import HTTPStatus
 from pathlib import Path
 from types import SimpleNamespace
 from unittest.mock import Mock, patch
@@ -47,6 +48,103 @@ def load_method(path, owner, name, **namespace):
 
 
 class TestPdmuxMainCompat(unittest.TestCase):
+    def test_standard_loop_broadcasts_timeout_aborts_through_ingest(self):
+        class InputProcessed(Exception):
+            pass
+
+        ingest = load_method(
+            "python/sglang/srt/managers/scheduler.py", "Scheduler", "ingest_requests"
+        )
+        loop = load_method(
+            "python/sglang/srt/multiplex/multiplexing_mixin.py",
+            "SchedulerMultiplexMixin",
+            "event_loop_pdmux_standard",
+            dist=SimpleNamespace(get_world_size=lambda **kwargs: 2),
+            get_current_stream_idx=lambda: 0,
+            torch=SimpleNamespace(
+                cuda=SimpleNamespace(
+                    empty_cache=lambda: None,
+                    stream=lambda stream: contextlib.nullcontext(),
+                )
+            ),
+            set_pdmux_status=Mock(),
+            logger=Mock(),
+        )
+        abort = SimpleNamespace(
+            rid="expired", abort_message="Request running timeout reached."
+        )
+        for ranks in [(0, 0, 0), (1, 0, 0), (0, 1, 0), (0, 0, 1)]:
+            with self.subTest(ranks=ranks):
+                scheduler = SimpleNamespace(
+                    ps=SimpleNamespace(
+                        pp_rank=ranks[0], attn_tp_rank=ranks[1], attn_cp_rank=ranks[2]
+                    ),
+                    tp_cpu_group=object(),
+                    stream_groups=[(object(), object())],
+                    _poll_timeout_aborts=Mock(return_value=[abort]),
+                    request_receiver=SimpleNamespace(
+                        recv_requests=Mock(return_value=[abort])
+                    ),
+                    metrics_reporter=Mock(),
+                    process_input_requests=Mock(side_effect=InputProcessed),
+                )
+                scheduler.ingest_requests = lambda: ingest(scheduler)
+                # Stop after dispatch: this drives the real loop's input path
+                # without submitting model work or requiring a CUDA device.
+                with self.assertRaises(InputProcessed):
+                    loop(scheduler)
+                expected_local = [abort] if ranks == (0, 0, 0) else []
+                scheduler.request_receiver.recv_requests.assert_called_once_with(
+                    local_reqs=expected_local
+                )
+                self.assertEqual(
+                    scheduler._poll_timeout_aborts.call_count, int(ranks == (0, 0, 0))
+                )
+                scheduler.process_input_requests.assert_called_once_with([abort])
+                scheduler.metrics_reporter.record_scheduler_active.assert_called_once()
+
+    def test_running_timeout_covers_pending_and_inflight_prefills(self):
+        poll = load_method(
+            "python/sglang/srt/managers/scheduler.py",
+            "Scheduler",
+            "_poll_timeout_aborts",
+            envs=SimpleNamespace(
+                SGLANG_REQ_WAITING_TIMEOUT=SimpleNamespace(get=lambda: 0),
+                SGLANG_REQ_RUNNING_TIMEOUT=SimpleNamespace(get=lambda: 10),
+            ),
+            time=SimpleNamespace(perf_counter=lambda: 100),
+            AbortReq=SimpleNamespace,
+            HTTPStatus=HTTPStatus,
+        )
+
+        def req(rid, entry=1, done=False):
+            return SimpleNamespace(
+                rid=rid,
+                finished=lambda: done,
+                time_stats=SimpleNamespace(forward_entry_time=entry),
+            )
+
+        pending, inflight = req("pending"), req("inflight")
+        scheduler = SimpleNamespace(
+            ps=SimpleNamespace(pp_size=1),
+            running_batch=SimpleNamespace(reqs=[req("decode")]),
+            last_batch=None,
+            _extra_inflight_batches=lambda: [
+                SimpleNamespace(reqs=[pending, req("unstamped", entry=0)]),
+                SimpleNamespace(
+                    reqs=[inflight, req("fresh", entry=99), req("done", done=True)]
+                ),
+                SimpleNamespace(reqs=[inflight]),
+            ],
+        )
+        aborts = poll(scheduler)
+        self.assertCountEqual(
+            [abort.rid for abort in aborts], ["decode", "pending", "inflight"]
+        )
+        self.assertTrue(
+            all(abort.finished_reason["status_code"] == 503 for abort in aborts)
+        )
+
     def test_split_mode_participates_in_cp(self):
         mode = enum.Enum("Mode", "EXTEND MIXED SPLIT_PREFILL DRAFT_EXTEND_V2 DECODE")
         active = load_method(

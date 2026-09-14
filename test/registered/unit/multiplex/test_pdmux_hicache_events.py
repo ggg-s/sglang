@@ -130,6 +130,9 @@ class _FakeScheduler(SchedulerMultiplexMixin):
     def process_input_requests(self, recv_reqs):
         pass
 
+    def ingest_requests(self):
+        self.process_input_requests(self.request_receiver.recv_requests())
+
     def process_pending_chunked_abort(self):
         pass
 

@@ -3311,6 +3311,9 @@ class Scheduler(
                 inflight_batches = [self.running_batch, self.last_batch]
             else:
                 inflight_batches = [*self.running_mbs, *self.mbs]
+            # Standard PDMux prefills live outside the decode batches until
+            # completion, but their running-timeout clock has already started.
+            inflight_batches += self._extra_inflight_batches()
             seen_rids = set()
             for batch in inflight_batches:
                 if batch is None:

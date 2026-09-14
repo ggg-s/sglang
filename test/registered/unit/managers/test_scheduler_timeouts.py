@@ -58,6 +58,7 @@ def _scheduler(waiting_queue, running_reqs=(), last_batch_reqs=()):
     s.ipc_channels = SimpleNamespace(send_to_tokenizer=MagicMock())
     s.beam_coordinator = MagicMock()
     s.ps = SimpleNamespace(pp_size=1)
+    s.pdmux_standard = False
     s.running_batch = _batch(list(running_reqs))
     s.last_batch = _batch(list(last_batch_reqs)) if last_batch_reqs else None
     return s
