@@ -120,7 +120,7 @@ class Sampler(nn.Module):
         # active. A group cached here would make the prefill lane's sync share
         # the decode lane's communicator with a decode collective in flight, so
         # that mode resolves the group per call instead. DP attention keeps the
-        # cached attn_tp_group either way -- PDMux standard rejects DP.
+        # cached attn_tp_group to synchronize only within each attention group.
         self._resolve_tp_sync_group_per_call = (
             is_pdmux_standard_prefill() and not is_dp_attention_enabled()
         )

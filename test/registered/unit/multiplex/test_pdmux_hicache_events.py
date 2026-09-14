@@ -76,7 +76,7 @@ class _SplitBatch:
         self.split_forward_count = 0
         self.split_prefill_finished = False
         self.chunked_req = None
-        self.forward_mode = None
+        self.forward_mode = SimpleNamespace(is_idle=lambda: False)
         self.hicache_consumer_index = CONSUMER_INDEX
 
     def is_empty(self):
@@ -118,6 +118,11 @@ class _FakeScheduler(SchedulerMultiplexMixin):
         self.sm_counts = [(1, 1)]
 
         self.request_receiver = SimpleNamespace(recv_requests=self._recv_requests)
+        self.dp_attn_adapter = SimpleNamespace(
+            maybe_prepare_mlp_sync_batch=lambda batch: (
+                batch if batch is not None and not batch.is_empty() else None
+            )
+        )
 
     # --- collaborators the loop drives -------------------------------------
 

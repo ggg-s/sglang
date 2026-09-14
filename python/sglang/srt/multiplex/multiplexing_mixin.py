@@ -121,6 +121,13 @@ class SchedulerMultiplexMixin:
         Reached only with no prefill in flight and after both streams have been
         drained, so no forward can be reading these fields.
         """
+        model_worker = getattr(self, "model_worker", None)
+        if model_worker is not None and hasattr(
+            model_worker, "update_pdmux_decode_attn_backend"
+        ):
+            model_worker.update_pdmux_decode_attn_backend(stream_idx)
+            return
+
         self.tp_worker.model_runner.update_decode_attn_backend(stream_idx)
         if not self.pdmux_standard or self.draft_worker is None:
             return
@@ -176,7 +183,7 @@ class SchedulerMultiplexMixin:
     def update_split_prefill_batch(
         self: Scheduler, sm_count: int, running_batch: ScheduleBatch
     ) -> tuple[bool, ScheduleBatch]:
-        if self.split_prefill_batch:
+        if self.split_prefill_batch is not None:
             return False, running_batch
 
         # No split forward is in flight here, which matches the normal loop's
@@ -188,10 +195,19 @@ class SchedulerMultiplexMixin:
         prefill_plan = self.get_new_batch_prefill(running_batch)
         batch = prefill_plan.batch_to_run
         running_batch = prefill_plan.running_batch
-        if batch and not batch.is_empty():
-            batch.forward_mode = (
-                ForwardMode.SPLIT_PREFILL
-            )  # Set forward mode for split prefill
+        # PDMux forms batches outside get_next_batch_to_run(), so prepare the
+        # DP/MLP metadata here. Passing None is intentional: peer DP ranks may
+        # have prefill work and require this rank to run an idle participant.
+        batch = self.dp_attn_adapter.maybe_prepare_mlp_sync_batch(batch)
+        if batch is not None:
+            # Preserve IDLE so speculative workers can skip final prefill-only
+            # post-processing while still participating in every split layer.
+            if not batch.forward_mode.is_idle():
+                batch.forward_mode = ForwardMode.SPLIT_PREFILL
+            batch.split_index = 0
+            batch.split_prefill_finished = False
+            batch.split_forward_count = 1
+            batch.split_forward_batch = None
             self.split_prefill_batch = batch
             return True, running_batch
         return False, running_batch
@@ -338,6 +354,18 @@ class SchedulerMultiplexMixin:
         """
         self.process_batch_result(batch, prefill_result)
 
+        if all_segments_run:
+            assert batch.split_prefill_finished
+            # The persistent ForwardBatch owns the token inputs, intermediate
+            # mHC hidden state and DSpark auxiliary captures across segments.
+            # Release it before this ScheduleBatch can become the long-lived
+            # decode batch; otherwise those prefill activations remain pinned
+            # for the lifetime of the running batch and eventually cause OOM.
+            batch.split_forward_batch = None
+            batch.split_index = 0
+            batch.split_forward_count = 1
+            batch.split_prefill_finished = False
+
         # Mirror get_next_batch_to_run's chunked bookkeeping: a request that
         # only finished a middle chunk must stay out of the decode batch, and
         # its chunk KV must be stashed so the next chunk extends the cached
@@ -354,8 +382,6 @@ class SchedulerMultiplexMixin:
                 # it is only legal once every split segment has run. A standard
                 # prefill has no segments -- its single forward has already
                 # completed by the time this runs.
-                if all_segments_run:
-                    assert batch.split_prefill_finished
                 self.stash_chunked_request(self.chunked_req)
         if batch.chunked_req is not None:
             chunked_req_to_exclude.add(batch.chunked_req)
@@ -494,16 +520,18 @@ class SchedulerMultiplexMixin:
             with torch.cuda.stream(decode_stream):
                 set_pdmux_status(False)
                 # process decode batch
-                if running_batch and not running_batch.is_empty():
-                    decode_result = self.run_batch(running_batch)
+                decode_batch = self.dp_attn_adapter.maybe_prepare_mlp_sync_batch(
+                    running_batch if not running_batch.is_empty() else None
+                )
+                if decode_batch is not None:
+                    decode_result = self.run_batch(decode_batch)
                     decode_done = True
                 else:
                     decode_done = False
             with torch.cuda.stream(prefill_stream):
                 set_pdmux_status(True)
                 if (
-                    self.split_prefill_batch
-                    and not self.split_prefill_batch.is_empty()
+                    self.split_prefill_batch is not None
                     and not wait_prefill_kernel_done
                 ):
                     prefill_done = True
@@ -532,7 +560,7 @@ class SchedulerMultiplexMixin:
                 set_pdmux_status(False)
                 decode_stream.synchronize()
                 if decode_done:
-                    self.process_batch_result(running_batch, decode_result)
+                    self.process_batch_result(decode_batch, decode_result)
 
             with torch.cuda.stream(prefill_stream):
                 set_pdmux_status(True)
@@ -761,7 +789,10 @@ class SchedulerMultiplexMixin:
                     running_batch = prefill_plan.running_batch
                     self.running_batch = running_batch
                     new_batch = prefill_plan.batch_to_run
-                    if new_batch is not None and not new_batch.is_empty():
+                    new_batch = self.dp_attn_adapter.maybe_prepare_mlp_sync_batch(
+                        new_batch
+                    )
+                    if new_batch is not None:
                         self._pdmux_prefill_pending = new_batch
                         adjust_stream_group = True
                     # E1: record even when formation produced no batch. It ran
@@ -805,8 +836,13 @@ class SchedulerMultiplexMixin:
             decode_result = None
             with torch.cuda.stream(decode_stream):
                 set_pdmux_status(False)
-                if running_batch is not None and not running_batch.is_empty():
-                    decode_result = self.run_batch(running_batch)
+                decode_batch = self.dp_attn_adapter.maybe_prepare_mlp_sync_batch(
+                    running_batch
+                    if running_batch is not None and not running_batch.is_empty()
+                    else None
+                )
+                if decode_batch is not None:
+                    decode_result = self.run_batch(decode_batch)
 
             with torch.cuda.stream(prefill_stream):
                 set_pdmux_status(True)
@@ -818,7 +854,7 @@ class SchedulerMultiplexMixin:
                 set_pdmux_status(False)
                 decode_stream.synchronize()
                 if decode_result is not None:
-                    self.process_batch_result(running_batch, decode_result)
+                    self.process_batch_result(decode_batch, decode_result)
                 # E3: covers this iteration's decode result handling, the
                 # retract/free inside update_running_batch, and the pump above.
                 decode_done = decode_stream.record_event()

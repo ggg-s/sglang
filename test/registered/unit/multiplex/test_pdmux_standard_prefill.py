@@ -200,6 +200,11 @@ class _FakeScheduler(SchedulerMultiplexMixin):
         self.pdmux_prefill_stream = None
         self.tp_cpu_group = SimpleNamespace(allreduce=self._allreduce)
         self.request_receiver = SimpleNamespace(recv_requests=self._recv_requests)
+        self.dp_attn_adapter = SimpleNamespace(
+            maybe_prepare_mlp_sync_batch=lambda batch: (
+                batch if batch is not None and not batch.is_empty() else None
+            )
+        )
 
     # --- collaborators the loop drives -------------------------------------
 
@@ -719,6 +724,9 @@ class TestPdmuxStandardPrefillAdmission(unittest.TestCase):
     def test_a_clean_profile_is_accepted(self):
         self._check()
 
+    def test_dp_attention_is_accepted(self):
+        self._check(enable_dp_attention=True)
+
     def test_every_incompatible_feature_is_rejected(self):
         """Completeness: each gate must actually fire.
 
@@ -734,7 +742,6 @@ class TestPdmuxStandardPrefillAdmission(unittest.TestCase):
             dict(enable_multi_layer_eagle=True),
             dict(enable_two_batch_overlap=True),
             dict(enable_unified_memory=True),
-            dict(enable_dp_attention=True),
             dict(ep_size=2),
             dict(attn_cp_size=2),
             dict(dcp_size=2),
