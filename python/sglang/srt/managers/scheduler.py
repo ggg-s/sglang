@@ -2953,8 +2953,10 @@ class Scheduler(
                 self._pending_chunked_abort_req = None
             return
 
-        prepare_abort(req, "Aborted")
-        req.time_stats.trace_ctx.abort(abort_info={"reason": "Aborted"})
+        reason = req.to_finish if isinstance(req.to_finish, FINISH_ABORT) else None
+        message = reason.message if reason is not None else "Aborted"
+        prepare_abort(req, message, reason.status_code if reason is not None else None)
+        req.time_stats.trace_ctx.abort(abort_info={"reason": message})
         req.to_finish = None
         if self.disaggregation_mode == DisaggregationMode.PREFILL:
             self.clear_pending_chunk_send(req)
@@ -2969,7 +2971,13 @@ class Scheduler(
 
         self.chunked_req = None
         self._pending_chunked_abort_req = None
-        self.ipc_channels.send_to_tokenizer.send_output(AbortReq(rid=req.rid), req)
+        self.ipc_channels.send_to_tokenizer.send_output(
+            AbortReq(
+                rid=req.rid,
+                finished_reason=reason.to_json() if reason is not None else None,
+            ),
+            req,
+        )
         logger.debug(f"Abort chunked prefill request. {req.rid=}")
 
     def _build_hisparse_decode_batch(self, reqs):

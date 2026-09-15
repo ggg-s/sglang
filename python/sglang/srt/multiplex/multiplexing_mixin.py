@@ -6,6 +6,7 @@ from __future__ import annotations
 
 import logging
 import time
+from http import HTTPStatus
 from typing import TYPE_CHECKING, Any, List, Optional
 
 import msgspec
@@ -14,6 +15,9 @@ import torch.distributed as dist
 from torch.cuda.streams import ExternalStream
 
 from sglang.srt.distributed.parallel_state import set_pdmux_status
+from sglang.srt.environ import envs
+from sglang.srt.managers.io_struct import AbortReq
+from sglang.srt.managers.schedule_batch import FINISH_ABORT
 from sglang.srt.model_executor.forward_batch_info import ForwardMode
 from sglang.srt.multiplex.pdmux_context import (
     get_current_stream_idx,
@@ -24,6 +28,7 @@ from sglang.srt.multiplex.pdmux_context import (
     set_current_stream_idx,
 )
 from sglang.srt.runtime_context import get_disagg
+from sglang.srt.utils import broadcast_pyobj
 
 if TYPE_CHECKING:
     from sglang.srt.layers.attention.base_attn_backend import AttentionBackend
@@ -110,6 +115,86 @@ class SchedulerMultiplexMixin:
         if self._pdmux_prefill_inflight is not None:
             batches.append(self._pdmux_prefill_inflight.batch)
         return batches
+
+    def _check_pdmux_timeouts(self: Scheduler) -> None:
+        """Agree on expired requests before either lane schedules more work.
+
+        PDMux bypasses get_next_batch_to_run and its timeout checks. Only the
+        attention-group leader checks the clock; peers apply the same exact
+        request IDs, including when DP groups own different requests. In-flight
+        requests are marked only: result processing and the chunked-abort safe
+        point retain ownership of their device allocations.
+        """
+        waiting_timeout = envs.SGLANG_REQ_WAITING_TIMEOUT.get()
+        running_timeout = envs.SGLANG_REQ_RUNNING_TIMEOUT.get()
+        if waiting_timeout <= 0 and running_timeout <= 0:
+            return
+
+        batches = [self.running_batch, self.last_batch, self.split_prefill_batch]
+        batches += self._extra_inflight_batches()
+        running_reqs = {
+            req.rid: req for batch in batches if batch is not None for req in batch.reqs
+        }
+        if self.chunked_req is not None:
+            running_reqs[self.chunked_req.rid] = self.chunked_req
+
+        expired = None
+        if self.ps.attn_tp_rank == 0 and self.ps.attn_cp_rank == 0:
+            now = time.perf_counter()
+            expired = []
+            if waiting_timeout > 0:
+                expired.extend(
+                    (req.rid, "waiting")
+                    for req in self.waiting_queue
+                    if 0 < req.time_stats.wait_queue_entry_time < now - waiting_timeout
+                )
+            if running_timeout > 0:
+                expired.extend(
+                    (req.rid, "running")
+                    for req in running_reqs.values()
+                    if not req.finished()
+                    and req.to_finish is None
+                    and 0 < req.time_stats.forward_entry_time < now - running_timeout
+                )
+
+        if self.ps.attn_tp_size > 1:
+            expired = broadcast_pyobj(
+                expired,
+                self.attn_tp_group.rank,
+                self.attn_tp_cpu_group,
+                src=self.attn_tp_group.ranks[0],
+            )
+        if self.ps.attn_cp_size > 1:
+            expired = broadcast_pyobj(
+                expired,
+                self.attn_cp_group.rank,
+                self.attn_cp_cpu_group,
+                src=self.attn_cp_group.ranks[0],
+            )
+
+        waiting_reqs = {req.rid: req for req in self.waiting_queue}
+        expired_waiting = set()
+        for rid, stage in expired:
+            reason = FINISH_ABORT(
+                f"Request {stage} timeout reached.", HTTPStatus.SERVICE_UNAVAILABLE
+            )
+            if stage == "waiting":
+                req = waiting_reqs[rid]
+                if self.enable_hicache_storage:
+                    self.tree_cache.release_aborted_request(rid)
+                self.ipc_channels.send_to_tokenizer.send_output(
+                    AbortReq(rid=rid, finished_reason=reason.to_json()), req
+                )
+                expired_waiting.add(rid)
+            else:
+                req = running_reqs[rid]
+                req.to_finish = reason
+                if req is self.chunked_req:
+                    self._pending_chunked_abort_req = req
+        if expired_waiting:
+            self.waiting_queue = [
+                req for req in self.waiting_queue if req.rid not in expired_waiting
+            ]
 
     def _update_decode_attn_backends(self: Scheduler, stream_idx: int) -> None:
         """Point the decode-side attention backends at this stream group.
@@ -441,6 +526,7 @@ class SchedulerMultiplexMixin:
                 set_pdmux_status(False)
                 recv_reqs = self.request_receiver.recv_requests()
                 self.process_input_requests(recv_reqs)
+                self._check_pdmux_timeouts()
                 running_batch = self.running_batch
 
             with torch.cuda.stream(prefill_stream):
@@ -770,6 +856,7 @@ class SchedulerMultiplexMixin:
                 set_pdmux_status(False)
                 recv_reqs = self.request_receiver.recv_requests()
                 self.process_input_requests(recv_reqs)
+                self._check_pdmux_timeouts()
                 running_batch = self.running_batch
                 # E0: prefetch's prefix matching concatenates on this stream.
                 input_done = decode_stream.record_event()

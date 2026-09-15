@@ -21,7 +21,8 @@ _spec = importlib.util.spec_from_file_location(
 )
 _ci = importlib.util.module_from_spec(_spec)
 _spec.loader.exec_module(_ci)
-_ci.register_cpu_ci(est_time=2, suite="base-a-test-cpu")
+register_cpu_ci = _ci.register_cpu_ci
+register_cpu_ci(est_time=2, suite="base-a-test-cpu")
 
 
 def load_methods(path, class_name, names, **globals_):
