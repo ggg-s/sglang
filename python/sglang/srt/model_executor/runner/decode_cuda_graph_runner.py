@@ -636,6 +636,77 @@ class DecodeCudaGraphRunner(BaseCudaGraphRunner):
             )
         return max(request_counts)
 
+    def can_replay_batch_locally(
+        self,
+        *,
+        replace_embeds,
+        spec_num_tokens_per_req,
+        batch_size,
+        num_input_tokens,
+        encoder_lens,
+        can_run_tbo,
+    ) -> bool:
+        """Batch-intrinsic checks shared by scheduling and actual replay."""
+        if replace_embeds is not None:
+            return False
+        if (
+            spec_num_tokens_per_req is not None
+            and spec_num_tokens_per_req > 0
+            and spec_num_tokens_per_req != self.captured_req_width
+        ):
+            return False
+        if self.is_encoder_decoder and not bool(torch.all(encoder_lens > 0)):
+            return False
+        if self.enable_two_batch_overlap and not can_run_tbo:
+            return False
+        if self.model_runner.spec_algorithm.is_ngram():
+            return batch_size * self.captured_req_width == num_input_tokens
+        return True
+
+    def can_run_pdmux_decode_batch(self, batch) -> bool:
+        # These variants depend on fields the ordinary DP token-count exchange
+        # does not negotiate. Uniform eager is safer than a per-rank fallback.
+        if (
+            not self.model_runner.spec_algorithm.is_none()
+            or self.model_runner.lora_manager is not None
+            or self.attention_graph_variants is not None
+            or self.is_encoder_decoder
+            or self.enable_two_batch_overlap
+        ):
+            return False
+        if batch is None or batch.forward_mode.is_idle():
+            return True
+        if not batch.forward_mode.is_decode():
+            return False
+        return self.can_replay_batch_locally(
+            replace_embeds=batch.replace_embeds,
+            spec_num_tokens_per_req=None,
+            batch_size=batch.batch_size(),
+            num_input_tokens=batch.input_ids.numel(),
+            encoder_lens=batch.encoder_lens,
+            can_run_tbo=False,
+        )
+
+    def pdmux_graph_capability(self, num_stream_groups: int):
+        """Compared once across ranks before any PDMux scheduling tick."""
+        return (
+            type(self.backend).__name__,
+            self.disable_padding,
+            self.captured_req_width,
+            self.max_bs,
+            tuple(self.capture_bs),
+            self.require_mlp_tp_gather,
+            tuple(
+                (
+                    group,
+                    size,
+                    self.backend.has_captured_key(self._make_graph_key(size, group)),
+                )
+                for group in range(num_stream_groups)
+                for size in self.capture_bs
+            ),
+        )
+
     def can_run_graph(self, forward_batch: ForwardBatch):
         # Disable for token embedding overrides (dynamic per-request)
         if forward_batch.replace_embeds is not None:
@@ -651,14 +722,16 @@ class DecodeCudaGraphRunner(BaseCudaGraphRunner):
         if self.ragged_verify_mode and forward_batch.forward_mode.is_target_verify():
             return False
 
-        # Uniform-width replay invariant: the batch's actual per-request width
-        # must match this runner's capture width; anything else falls back to
-        # eager. (Unset widths pass: not every path fills the field yet.)
         spec_info = forward_batch.spec_info
-        if (
-            spec_info is not None
-            and spec_info.num_tokens_per_req > 0
-            and spec_info.num_tokens_per_req != self.captured_req_width
+        if not self.can_replay_batch_locally(
+            replace_embeds=forward_batch.replace_embeds,
+            spec_num_tokens_per_req=(
+                spec_info.num_tokens_per_req if spec_info else None
+            ),
+            batch_size=forward_batch.batch_size,
+            num_input_tokens=forward_batch.input_ids.numel(),
+            encoder_lens=forward_batch.encoder_lens,
+            can_run_tbo=forward_batch.can_run_tbo,
         ):
             return False
 
@@ -689,34 +762,23 @@ class DecodeCudaGraphRunner(BaseCudaGraphRunner):
                 is_bs_supported and forward_batch.can_run_decode_cuda_graph
             )
 
-        # NOTE: cuda graph cannot handle mixed batch (encoder_len = 0)
-        # If mixed batch cannot be supported, then encoder_lens can be removed in cuda graph
-        # because the full_text_row_masked_out_mask tensor will always be ones
-        is_encoder_lens_supported = (
-            torch.all(forward_batch.encoder_lens > 0)
-            if self.is_encoder_decoder
-            else True
-        )
-
-        is_tbo_supported = (
-            forward_batch.can_run_tbo if self.enable_two_batch_overlap else True
-        )
-
-        is_ngram_supported = (
-            (
-                forward_batch.batch_size * self.captured_req_width
-                == forward_batch.input_ids.numel()
+        if is_bs_supported and self.enable_pdmux and self.dp_size > 1:
+            # The bucket/key query happens after the scheduler publishes the
+            # globally selected group. Startup checked that these keys match on
+            # every rank; unlike local batch eligibility this needs no new vote.
+            padded_bs = (
+                cuda_graph_bs
+                if self.disable_padding
+                else self._pad_to_bucket(cuda_graph_bs, self.capture_bs)
             )
-            if self.model_runner.spec_algorithm.is_ngram()
-            else True
-        )
-
-        return (
-            is_bs_supported
-            and is_encoder_lens_supported
-            and is_tbo_supported
-            and is_ngram_supported
-        )
+            key = self._make_graph_key(
+                padded_bs,
+                stream_idx=get_current_stream_idx(),
+                variant_label=self._resolve_lora_variant(forward_batch),
+                attention_variant=self._resolve_attention_variant(forward_batch),
+            )
+            is_bs_supported = self.backend.has_captured_key(key)
+        return is_bs_supported
 
     def _can_run_ragged_verify_graph(self, forward_batch: ForwardBatch, ragged_layout):
         if not self.attn_backend.supports_ragged_verify_graph:

@@ -61,6 +61,10 @@ def _init_call_order(class_name, targets):
     return positions
 
 
+class _Scheduler(SimpleNamespace, SchedulerMultiplexMixin):
+    """Keep production helper dispatch available on lightweight fixtures."""
+
+
 class _Batch:
     def __init__(self, empty):
         self._empty = empty
@@ -319,8 +323,8 @@ class TestPDMuxScheduler(unittest.TestCase):
             yield
 
     def _make_stream_group_scheduler(self, *, manual_divisions, group_num):
-        model_runner = SimpleNamespace(update_decode_attn_backend=lambda _idx: None)
-        return SimpleNamespace(
+        model_runner = SimpleNamespace(update_decode_attn_backend=Mock())
+        scheduler = _Scheduler(
             split_prefill_batch=object(),
             pdmux_standard=False,
             draft_worker=None,
@@ -331,6 +335,8 @@ class TestPDMuxScheduler(unittest.TestCase):
             tp_worker=SimpleNamespace(model_runner=model_runner),
             stream_groups=[(f"p{i}", f"d{i}") for i in range(group_num)],
         )
+
+        return scheduler
 
     def test_manual_division_below_every_threshold_uses_first_shared_group(self):
         """A decode batch under every configured threshold still needs a group.
@@ -504,14 +510,14 @@ class TestPDMuxScheduler(unittest.TestCase):
         split_batch.is_empty.return_value = False
         # The unconditional filter drops nothing here: same size before/after.
         split_batch.batch_size.side_effect = [2, 2]
-        running_batch = Mock()
+        running_batch = Mock(sampling_info=None, spec_info=None)
         running_batch.is_empty.return_value = False
         running_batch.batch_is_full = True
         running_batch.merge_batch.side_effect = lambda batch: operations.append(
             ("merge", batch)
         )
         prefill_stream, decode_stream, merge_done = self._make_merge_streams(operations)
-        scheduler = SimpleNamespace(
+        scheduler = _Scheduler(
             running_batch=running_batch,
             split_prefill_batch=split_batch,
             chunked_req=None,
@@ -550,11 +556,11 @@ class TestPDMuxScheduler(unittest.TestCase):
         split_batch.split_prefill_finished = True
         split_batch.batch_size.side_effect = [1, 1]
         split_batch.is_empty.return_value = False
-        running_batch = Mock()
+        running_batch = Mock(sampling_info=None, spec_info=None)
         running_batch.is_empty.return_value = True
         running_batch.batch_is_full = True
         prefill_stream, decode_stream, merge_done = self._make_merge_streams([])
-        scheduler = SimpleNamespace(
+        scheduler = _Scheduler(
             running_batch=running_batch,
             split_prefill_batch=split_batch,
             chunked_req=None,
@@ -591,14 +597,14 @@ class TestPDMuxScheduler(unittest.TestCase):
         split_batch.filter_batch.side_effect = lambda **kwargs: operations.append(
             ("filter", kwargs)
         )
-        running_batch = Mock()
+        running_batch = Mock(sampling_info=None, spec_info=None)
         running_batch.is_empty.return_value = False
         running_batch.batch_is_full = True
         running_batch.merge_batch.side_effect = lambda batch: operations.append(
             ("merge", batch)
         )
         prefill_stream, decode_stream, merge_done = self._make_merge_streams(operations)
-        scheduler = SimpleNamespace(
+        scheduler = _Scheduler(
             running_batch=running_batch,
             split_prefill_batch=split_batch,
             chunked_req=chunked_req,
@@ -639,10 +645,10 @@ class TestPDMuxScheduler(unittest.TestCase):
         split_batch.split_prefill_finished = True
         split_batch.batch_size.side_effect = [1, 0]
         split_batch.is_empty.return_value = True
-        running_batch = Mock()
+        running_batch = Mock(sampling_info=None, spec_info=None)
         running_batch.batch_is_full = True
         prefill_stream, decode_stream, merge_done = self._make_merge_streams(operations)
-        scheduler = SimpleNamespace(
+        scheduler = _Scheduler(
             running_batch=running_batch,
             split_prefill_batch=split_batch,
             chunked_req=chunked_req,
@@ -676,9 +682,9 @@ class TestPDMuxScheduler(unittest.TestCase):
         split_batch.chunked_req = chunked_req
         split_batch.batch_size.side_effect = [1, 0]
         split_batch.is_empty.return_value = True
-        running_batch = Mock()
+        running_batch = Mock(sampling_info=None, spec_info=None)
         prefill_stream, decode_stream, _ = self._make_merge_streams([])
-        scheduler = SimpleNamespace(
+        scheduler = _Scheduler(
             running_batch=running_batch,
             split_prefill_batch=split_batch,
             chunked_req=chunked_req,

@@ -68,6 +68,11 @@ class BaseCudaGraphBackend(ABC):
     @abstractmethod
     def can_run(self, forward_batch: ForwardBatch, shape_key: ShapeKey) -> bool: ...
 
+    def has_captured_key(self, shape_key: ShapeKey) -> bool:
+        # Backends without a shape-only query cannot participate in PDMux's
+        # ahead-of-forward graph negotiation. They safely use eager there.
+        return False
+
     @abstractmethod
     def replay_session(self) -> Iterator[None]: ...
 

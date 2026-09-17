@@ -1544,7 +1544,10 @@ class ModelRunner:
         """
         # For MLP sync
         if forward_batch.global_num_tokens_cpu is not None:
-            forward_batch.prepare_mlp_sync_batch(self)
+            if forward_batch.split_index > 0:
+                forward_batch.republish_dp_state()
+            else:
+                forward_batch.prepare_mlp_sync_batch(self)
         else:
             forward_batch.prepare_attn_tp_scatter_input(self)
 
@@ -1782,13 +1785,18 @@ class ModelRunner:
         else:
             ctx_mgr = forward_context(ForwardContext(attn_backend=self.attn_backend))
         with ctx_mgr:
+            is_split_prefill = (
+                split_forward_count is not None
+                or forward_batch.forward_mode.is_split_prefill()
+            )
             mode_check = (
                 forward_batch.forward_mode.is_cpu_graph
                 if self.device == "cpu"
                 else forward_batch.forward_mode.is_cuda_graph
             )
             can_run_graph = bool(
-                mode_check()
+                not is_split_prefill
+                and mode_check()
                 and self.decode_cuda_graph_runner
                 and self.decode_cuda_graph_runner.can_run_graph(forward_batch)
             )
@@ -1870,6 +1878,10 @@ class ModelRunner:
             if (
                 forward_batch.global_num_tokens_cpu is not None
                 and self.pp_group.is_last_rank
+                and (
+                    not is_split_prefill
+                    or forward_batch.split_index >= self.model_config.num_hidden_layers
+                )
             ):
                 forward_batch.post_forward_mlp_sync_batch(ret)
 
