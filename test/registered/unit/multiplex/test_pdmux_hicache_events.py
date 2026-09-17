@@ -101,7 +101,7 @@ class _FakeScheduler(SchedulerMultiplexMixin):
 
         self.model_config = SimpleNamespace(num_hidden_layers=NUM_LAYERS)
         self.pdmux_config = SimpleNamespace(split_forward_token_budget=1000)
-        self.ps = SimpleNamespace(tp_size=1)
+        self.ps = SimpleNamespace(tp_size=1, attn_dp_size=1)
         self.tp_cpu_group = SimpleNamespace(
             allreduce=lambda tensor, op: SimpleNamespace(wait=lambda: None)
         )

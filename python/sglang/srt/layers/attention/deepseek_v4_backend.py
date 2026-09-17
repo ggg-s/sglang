@@ -670,6 +670,7 @@ class DeepseekV4AttnBackend(
         core_attn_metadata: DSV4AttnMetadata,
         *,
         use_prefill_cuda_graph: bool = False,
+        is_prefill: bool = False,
     ):
         return PagedIndexerMetadata(
             page_size=self.page_size,
@@ -681,6 +682,7 @@ class DeepseekV4AttnBackend(
                 self.enable_deepseek_v4_fp4_indexer and _is_sm120
             ),
             use_prefill_cuda_graph=use_prefill_cuda_graph,
+            is_prefill=is_prefill,
         )
 
     def init_forward_metadata_decode(
@@ -780,6 +782,7 @@ class DeepseekV4AttnBackend(
             self.init_forward_metadata_indexer(
                 core_attn_metadata,
                 use_prefill_cuda_graph=use_prefill_cuda_graph,
+                is_prefill=True,
             )
             if need_compress
             else None
@@ -1384,7 +1387,11 @@ class DeepseekV4AttnBackend(
 
     def init_forward_metadata(self, forward_batch: ForwardBatch) -> None:
         logical_forward_mode = _get_logical_forward_mode(forward_batch)
-        if self.mtp_enabled and logical_forward_mode.is_idle():
+        if logical_forward_mode.is_idle():
+            # PDMux runs split layers on idle DP ranks for MLP collectives, but
+            # there is no local attention work. Do not launch zero-row planners
+            # or retain another batch's metadata across this idle iteration.
+            self.forward_metadata = None
             self.online_c128_mtp.clear()
             return
 
@@ -1413,7 +1420,10 @@ class DeepseekV4AttnBackend(
         if max_seq_len_override is not None:
             max_seq_len = max_seq_len_override
         elif seq_lens_cpu is not None:
-            max_seq_len = int(seq_lens_cpu.max().item())
+            # PDMux split-prefill also runs on idle DP ranks with no requests.
+            # Keep their metadata path for MLP sync, but never reduce an empty
+            # CPU length tensor. An empty batch has no KV sequence to size.
+            max_seq_len = int(seq_lens_cpu.max().item()) if seq_lens_cpu.numel() else 0
         else:
             max_seq_len = self.MAX_SEQ_LEN_FOR_CAPTURE
         verify_bs = _get_target_verify_bs(forward_batch)
@@ -1652,8 +1662,11 @@ class DeepseekV4AttnBackend(
         attn_sink: Optional[torch.Tensor] = None,
         **_,
     ) -> torch.Tensor:
-        if self.mtp_enabled and forward_batch.forward_mode.is_idle():
-            return q.new_empty(q.shape[0], q.shape[1], layer.v_head_dim)
+        if forward_batch.forward_mode.is_idle():
+            # MAX_LEN padding can leave nonzero query rows on an idle rank.
+            # Those rows still pass through projections and the DP MoE gather;
+            # keep them finite instead of exposing uninitialized allocator data.
+            return q.new_zeros(q.shape[0], q.shape[1], layer.v_head_dim)
 
         assert k is v, "DeepseekV4 shares k and v"
         swa_k = k
