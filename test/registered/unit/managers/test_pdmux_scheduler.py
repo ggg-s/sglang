@@ -124,6 +124,7 @@ class TestPDMuxScheduler(unittest.TestCase):
         token_budget=65536,
     ):
         return SimpleNamespace(
+            ps=SimpleNamespace(attn_dp_size=1),
             model_config=SimpleNamespace(num_hidden_layers=61),
             pdmux_config=SimpleNamespace(split_forward_token_budget=token_budget),
             running_batch=_Batch(decode_empty),

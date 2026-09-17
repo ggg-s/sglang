@@ -26,7 +26,8 @@ _ci_spec = importlib.util.spec_from_file_location(
 _ci = importlib.util.module_from_spec(_ci_spec)
 sys.modules[_ci_spec.name] = _ci
 _ci_spec.loader.exec_module(_ci)
-_ci.register_cpu_ci(est_time=1, suite="base-a-test-cpu")
+register_cpu_ci = _ci.register_cpu_ci
+register_cpu_ci(est_time=1, suite="base-a-test-cpu")
 
 
 def load_method(path, owner, name, **namespace):
