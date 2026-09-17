@@ -583,6 +583,9 @@ class ForwardBatch(ForwardBatchDeepSeekMHAMixin):
     dp_local_start_pos: Optional[torch.Tensor] = None  # cached info at runtime
     dp_local_num_tokens: Optional[torch.Tensor] = None  # cached info at runtime
     global_dp_buffer_len: Optional[int] = None
+    # Segment 0 owns padding; later PDMux segments only restore process state
+    # overwritten by intervening decode forwards.
+    _pdmux_dp_state: Optional[tuple] = None
 
     # For Qwen2-VL
     mrope_positions: torch.Tensor = None
@@ -1309,6 +1312,13 @@ class ForwardBatch(ForwardBatchDeepSeekMHAMixin):
             num_tokens = global_num_tokens[0]
 
         self.global_dp_buffer_len = buffer_len
+        self._pdmux_dp_state = (
+            buffer_len,
+            num_tokens,
+            dp_padding_mode.is_max_len(),
+            global_num_tokens,
+            self.global_num_tokens_gpu,
+        )
         set_dp_buffer_len(
             buffer_len,
             num_tokens,
@@ -1434,6 +1444,12 @@ class ForwardBatch(ForwardBatchDeepSeekMHAMixin):
                 child._pad_inputs_to_size(
                     model_runner, child.tbo_padded_len, child.batch_size
                 )
+
+    def republish_dp_state(self) -> None:
+        if self._pdmux_dp_state is None:
+            raise RuntimeError("PDMux continuation has no prepared DP state")
+        set_dp_buffer_len(*self._pdmux_dp_state)
+        set_is_extend_in_batch(self.is_extend_in_batch)
 
     def _pad_inputs_to_size(self, model_runner: ModelRunner, num_tokens, bs):
         # padding
@@ -1562,9 +1578,8 @@ class ForwardBatch(ForwardBatchDeepSeekMHAMixin):
             if self.seq_lens_cpu is not None:
                 self.seq_lens_cpu = self.seq_lens_cpu[:bs]
 
-        # Intermediate layerwise-prefill segments intentionally return no
-        # logits. The structural DP padding above still has to be undone before
-        # the persistent ForwardBatch is reused by the next segment.
+        # An idle forward can return no logits. PDMux invokes this only after
+        # the LAST segment: intermediate segments retain the padded geometry.
         if logits_output is None:
             return
 

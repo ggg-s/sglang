@@ -137,6 +137,9 @@ class FullCudaGraphBackend(BaseCudaGraphBackend):
     def can_run(self, forward_batch: ForwardBatch, shape_key: ShapeKey) -> bool:
         return shape_key in self._graphs
 
+    def has_captured_key(self, shape_key: ShapeKey) -> bool:
+        return shape_key in self._graphs
+
     @contextmanager
     def replay_session(self):
         yield

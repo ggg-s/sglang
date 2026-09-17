@@ -27,6 +27,7 @@ from sglang.srt.multiplex.pdmux_context import (
     load_pdmux_config,
     set_current_stream_idx,
 )
+from sglang.srt.multiplex.pdmux_tensor_lifetime import publish_carried_tensors
 from sglang.srt.runtime_context import get_disagg
 from sglang.srt.utils import broadcast_pyobj
 
@@ -232,8 +233,15 @@ class SchedulerMultiplexMixin:
         but not yet submitted -- which still needs a shared group, because it is
         about to run alongside decode.
         """
-        if not running_batch.is_empty() and has_prefill:
-            decode_bs = running_batch.batch_size()
+        stream_idx = self._select_pdmux_stream_idx(
+            has_prefill=has_prefill, decode_bs=running_batch.batch_size()
+        )
+        set_current_stream_idx(stream_idx)
+        self._update_decode_attn_backends(stream_idx)
+        return stream_idx, self.stream_groups[stream_idx]
+
+    def _select_pdmux_stream_idx(self, *, has_prefill: bool, decode_bs: int) -> int:
+        if decode_bs > 0 and has_prefill:
             manual_divisions = self.pdmux_config.manual_divisions
             if manual_divisions:
                 # A decode batch under every configured threshold still has to
@@ -254,16 +262,49 @@ class SchedulerMultiplexMixin:
                         // self.pdmux_config.decode_bs_divisor,
                     ),
                 )
-            set_current_stream_idx(stream_idx)
-        elif not running_batch.is_empty():
-            set_current_stream_idx(self.real_sm_group_num - 1)
+            return stream_idx
+        return self.real_sm_group_num - 1 if decode_bs > 0 else 0
+
+    def _get_pdmux_dp_stream_idx(self, decode_batch, stream_idx: int) -> int:
+        # A split's backend and streams stay fixed until every rank finalizes.
+        # Even a rank whose decode batch drains must keep participating there.
+        if (
+            self.split_prefill_batch is not None
+            and self.split_prefill_batch.split_index > 0
+        ):
+            return stream_idx
+        counts = decode_batch.global_num_tokens if decode_batch is not None else None
+        if decode_batch is None:
+            # The adapter returns None only when the synchronized batch is
+            # empty globally; no second emptiness vote is needed.
+            decode_bs = 0
+        elif counts is not None and len(counts) == self.ps.attn_dp_size:
+            decode_bs = max(counts)
         else:
-            set_current_stream_idx(0)
+            # Local-only metadata (e.g. an A2A backend) cannot select a global
+            # group. The TP/DP gathered path uses no additional collective.
+            count = torch.tensor(
+                [self.running_batch.batch_size()], dtype=torch.int32, device="cpu"
+            )
+            self.tp_cpu_group.allreduce(count, dist.ReduceOp.MAX).wait()
+            decode_bs = int(count.item())
+        return self._select_pdmux_stream_idx(
+            has_prefill=self.split_prefill_batch is not None, decode_bs=decode_bs
+        )
 
-        stream_idx = get_current_stream_idx()
-
-        self._update_decode_attn_backends(stream_idx)
-        return stream_idx, self.stream_groups[stream_idx]
+    def _check_pdmux_dp_graph_capability(self):
+        if self.ps.attn_dp_size <= 1:
+            return
+        runner = self.tp_worker.model_runner.decode_cuda_graph_runner
+        local = (
+            runner.pdmux_graph_capability(self.real_sm_group_num) if runner else None
+        )
+        capabilities = [None] * dist.get_world_size(self.tp_cpu_group)
+        dist.all_gather_object(capabilities, local, group=self.tp_cpu_group)
+        if any(value != capabilities[0] for value in capabilities):
+            raise RuntimeError(
+                "PDMux DP ranks have different decode graph capabilities"
+            )
 
     def update_split_prefill_batch(
         self: Scheduler, sm_count: int, running_batch: ScheduleBatch
@@ -307,7 +348,9 @@ class SchedulerMultiplexMixin:
         if self.ps.attn_dp_size > 1:
             prefill_tokens = self.split_prefill_batch.global_num_tokens
             decode_tokens = (
-                decode_batch.global_num_tokens if decode_batch is not None else None
+                decode_batch.global_num_tokens
+                if decode_batch is not None
+                else [0] * self.ps.attn_dp_size
             )
             if (
                 prefill_tokens is not None
@@ -443,7 +486,14 @@ class SchedulerMultiplexMixin:
         prefill_stream,
         decode_stream,
         running_batch: ScheduleBatch,
+        decode_done=None,
     ) -> ScheduleBatch:
+        # Result processing enqueues device writes AFTER decode.synchronize().
+        # Merge/allocator work on the prefill lane must follow those writes.
+        if decode_done is not None:
+            prefill_stream.wait_event(decode_done)
+        if running_batch is not None and not running_batch.is_empty():
+            publish_carried_tensors(running_batch, prefill_stream)
         running_batch = self._merge_completed_prefill_batch(
             batch=self.split_prefill_batch,
             prefill_result=prefill_result,
@@ -554,6 +604,8 @@ class SchedulerMultiplexMixin:
         prefill_done = False
         wait_prefill_kernel_done = False
         adjust_stream_group = False
+        carried_batch_pending = False
+        self._check_pdmux_dp_graph_capability()
         self._hicache_pump_tick = 0
         stream_idx = get_current_stream_idx()
         stream_group = self.stream_groups[stream_idx]
@@ -566,10 +618,13 @@ class SchedulerMultiplexMixin:
         while True:
             with torch.cuda.stream(decode_stream):
                 set_pdmux_status(False)
+                if carried_batch_pending and not self.running_batch.is_empty():
+                    publish_carried_tensors(self.running_batch, decode_stream)
                 recv_reqs = self.request_receiver.recv_requests()
                 self.process_input_requests(recv_reqs)
                 self._check_pdmux_timeouts()
                 running_batch = self.running_batch
+                input_done = decode_stream.record_event()
 
             with torch.cuda.stream(prefill_stream):
                 set_pdmux_status(True)
@@ -600,12 +655,18 @@ class SchedulerMultiplexMixin:
                         if self.check_hicache_events_if_enabled():
                             formation_done = prefill_stream.record_event()
                 if not wait_prefill_kernel_done:
+                    if not had_inflight_split:
+                        # Includes the previous iteration's decode result writes.
+                        prefill_stream.wait_event(input_done)
+                        if not running_batch.is_empty():
+                            publish_carried_tensors(running_batch, prefill_stream)
                     created, running_batch = self.update_split_prefill_batch(
                         sm_count, running_batch=running_batch
                     )
                     self.running_batch = running_batch
                     adjust_stream_group = created or adjust_stream_group
                     if not had_inflight_split:
+                        carried_batch_pending = True
                         # Batch formation enqueued radix-cache and allocator
                         # work (prefix-match concatenations, evictions, KV
                         # allocation) on the prefill stream, rebinding the
@@ -624,21 +685,48 @@ class SchedulerMultiplexMixin:
                 set_pdmux_status(False)
                 if formation_done is not None:
                     decode_stream.wait_event(formation_done)
+                if carried_batch_pending and not running_batch.is_empty():
+                    publish_carried_tensors(running_batch, decode_stream)
                 running_batch = self.update_running_batch(running_batch)
                 self.running_batch = running_batch
                 adjust_stream_group = adjust_stream_group or (
                     stream_idx > 0 and running_batch.is_empty()
                 )
-                if running_batch.is_empty() and self.split_prefill_batch is None:
+                if (
+                    self.ps.attn_dp_size == 1
+                    and running_batch.is_empty()
+                    and self.split_prefill_batch is None
+                ):
+                    self.on_idle()
+
+                # Exchange once, before choosing the group. These raw counts
+                # also drive the segment budget below; the batch is unchanged
+                # between this point and submission.
+                decode_batch = self.dp_attn_adapter.maybe_prepare_mlp_sync_batch(
+                    running_batch if not running_batch.is_empty() else None
+                )
+
+            if self.ps.attn_dp_size > 1:
+                next_stream_idx = self._get_pdmux_dp_stream_idx(
+                    decode_batch, stream_idx
+                )
+                adjust_stream_group = next_stream_idx != stream_idx
+                if decode_batch is None and self.split_prefill_batch is None:
                     self.on_idle()
 
             if adjust_stream_group:
                 prefill_stream.synchronize()
                 decode_stream.synchronize()
-                stream_idx, stream_group = self.adjust_stream_groups(
-                    running_batch=running_batch,
-                    has_prefill=self.split_prefill_batch is not None,
-                )
+                if self.ps.attn_dp_size > 1:
+                    stream_idx = next_stream_idx
+                    set_current_stream_idx(stream_idx)
+                    self._update_decode_attn_backends(stream_idx)
+                    stream_group = self.stream_groups[stream_idx]
+                else:
+                    stream_idx, stream_group = self.adjust_stream_groups(
+                        running_batch=running_batch,
+                        has_prefill=self.split_prefill_batch is not None,
+                    )
                 prefill_stream = stream_group[0]
                 decode_stream = stream_group[1]
                 adjust_stream_group = False
@@ -648,10 +736,11 @@ class SchedulerMultiplexMixin:
 
             with torch.cuda.stream(decode_stream):
                 set_pdmux_status(False)
-                # process decode batch
-                decode_batch = self.dp_attn_adapter.maybe_prepare_mlp_sync_batch(
-                    running_batch if not running_batch.is_empty() else None
-                )
+                # A group switch may replace the consumer stream after the
+                # first registration above. Register on the actual lane too.
+                if carried_batch_pending and not running_batch.is_empty():
+                    publish_carried_tensors(running_batch, decode_stream)
+                carried_batch_pending = False
                 if decode_batch is not None:
                     decode_result = self.run_batch(decode_batch)
                     decode_done = True
@@ -690,6 +779,7 @@ class SchedulerMultiplexMixin:
                 decode_stream.synchronize()
                 if decode_done:
                     self.process_batch_result(decode_batch, decode_result)
+                decode_result_done = decode_stream.record_event()
 
             with torch.cuda.stream(prefill_stream):
                 set_pdmux_status(True)
@@ -709,7 +799,9 @@ class SchedulerMultiplexMixin:
                             prefill_stream,
                             decode_stream,
                             running_batch,
+                            decode_result_done,
                         )
+                        carried_batch_pending = True
                         wait_prefill_kernel_done = False
                         adjust_stream_group = True
 

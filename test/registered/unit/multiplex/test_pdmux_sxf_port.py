@@ -101,6 +101,7 @@ class TestPdmuxSxfPort(unittest.TestCase):
                             "_merge_finished_prefill_batch",
                             "_merge_completed_prefill_batch",
                         ],
+                        publish_carried_tensors=Mock(),
                     ),
                 )
                 running = SimpleNamespace(

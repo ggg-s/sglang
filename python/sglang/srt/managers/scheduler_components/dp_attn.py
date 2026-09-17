@@ -26,7 +26,7 @@ from sglang.srt.model_executor.cuda_graph_config import (
 )
 from sglang.srt.model_executor.forward_batch_info import ForwardMode
 from sglang.srt.observability.metrics_collector import DPCooperationInfo
-from sglang.srt.runtime_context import get_parallel, get_schedule
+from sglang.srt.runtime_context import get_disagg, get_parallel, get_schedule
 from sglang.srt.server_args import ServerArgs
 from sglang.srt.speculative.spec_info import SpeculativeAlgorithm
 from sglang.srt.utils.common import require_mlp_tp_gather
@@ -267,6 +267,18 @@ def prepare_mlp_sync_batch_raw(
         or local_batch.forward_mode.is_decode_or_idle()
         or local_batch.forward_mode.is_prebuilt()
     ) and not disable_cuda_graph
+    if (
+        get_disagg().enable_pdmux
+        and get_disagg().pdmux_prefill_mode == "layer_split"
+        and dp_size > 1
+    ):
+        runner = model_runner.decode_cuda_graph_runner
+        # Include actual local eligibility in the existing global MIN vote.
+        can_run_decode_cuda_graph = bool(
+            can_run_decode_cuda_graph
+            and runner is not None
+            and runner.can_run_pdmux_decode_batch(local_batch)
+        )
     breakable_prefill = check_cuda_graph_backend(Phase.PREFILL, Backend.BREAKABLE)
     prefill_graph_runner = (
         model_runner.prefill_cuda_graph_runner if breakable_prefill else None

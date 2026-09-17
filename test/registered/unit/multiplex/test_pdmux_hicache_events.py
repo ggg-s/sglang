@@ -61,6 +61,8 @@ class _DecodeBatch:
     """A non-empty decode batch, so split prefill advances one layer at a time."""
 
     batch_is_full = False
+    sampling_info = None
+    spec_info = None
 
     def is_empty(self):
         return False

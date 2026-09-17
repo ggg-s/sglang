@@ -210,6 +210,7 @@ class TestPdmuxTimeouts(unittest.TestCase):
                     ),
                     process_input_requests=Mock(),
                     _check_pdmux_timeouts=check,
+                    _check_pdmux_dp_graph_capability=Mock(),
                 )
                 method = load_methods(
                     "multiplex/multiplexing_mixin.py",
