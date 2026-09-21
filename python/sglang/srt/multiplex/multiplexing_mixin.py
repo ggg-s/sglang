@@ -525,7 +525,7 @@ class SchedulerMultiplexMixin:
     @torch.inference_mode()
     def event_loop_pdmux_layer_split(self: Scheduler):
         """A scheduler loop for pd multiplexing."""
-        decode_done = False
+        pending_decode_result = None
         prefill_done = False
         wait_prefill_kernel_done = False
         adjust_stream_group = False
@@ -610,6 +610,22 @@ class SchedulerMultiplexMixin:
                     decode_stream.wait_event(formation_done)
                 if carried_batch_pending and not running_batch.is_empty():
                     publish_carried_tensors(running_batch, decode_stream)
+                if (
+                    pending_decode_result is not None
+                    and not running_batch.is_empty()
+                    and not running_batch.check_decode_mem()
+                ):
+                    # update_running_batch retracts requests when the next
+                    # allocation still does not fit after cache eviction.
+                    # Retraction resets their Mamba counters, so first commit
+                    # the one pending result that owns the old counter snapshot.
+                    self.process_batch_result(*pending_decode_result)
+                    pending_decode_result = None
+                # PDMux keeps one decode result in flight below, matching the
+                # standard overlap scheduler's one-step lookahead.  Mark the
+                # batch accordingly so Mamba snapshots the next boundary before
+                # the shared Req counters advance in the following iteration.
+                running_batch.enable_overlap = True
                 running_batch = self.update_running_batch(running_batch)
                 self.running_batch = running_batch
                 adjust_stream_group = adjust_stream_group or (
@@ -666,9 +682,9 @@ class SchedulerMultiplexMixin:
                 carried_batch_pending = False
                 if decode_batch is not None:
                     decode_result = self.run_batch(decode_batch)
-                    decode_done = True
+                    current_decode_result = (decode_batch.copy(), decode_result)
                 else:
-                    decode_done = False
+                    current_decode_result = None
             with torch.cuda.stream(prefill_stream):
                 set_pdmux_status(True)
                 if (
@@ -715,9 +731,27 @@ class SchedulerMultiplexMixin:
 
             with torch.cuda.stream(decode_stream):
                 set_pdmux_status(False)
-                decode_stream.synchronize()
-                if decode_done:
-                    self.process_batch_result(decode_batch, decode_result)
+                # Process N-1 after submitting N.  process_batch_result waits
+                # only for N-1's result copy, so its CPU work overlaps the
+                # current decode and split-prefill kernels instead of draining
+                # the decode stream every iteration.
+                if pending_decode_result is not None:
+                    self.process_batch_result(*pending_decode_result)
+
+                finishing_prefill = (
+                    prefill_done
+                    and self.split_prefill_batch is not None
+                    and self.split_prefill_batch.split_prefill_finished
+                )
+                if finishing_prefill and current_decode_result is not None:
+                    # Finalization can enqueue allocator and Mamba state work
+                    # that must observe this decode result.  Drain the current
+                    # item at this uncommon merge boundary and publish one event
+                    # covering both result processing and the forward.
+                    self.process_batch_result(*current_decode_result)
+                    pending_decode_result = None
+                else:
+                    pending_decode_result = current_decode_result
                 decode_result_done = decode_stream.record_event()
 
             with torch.cuda.stream(prefill_stream):

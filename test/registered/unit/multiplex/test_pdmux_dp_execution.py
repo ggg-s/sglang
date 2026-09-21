@@ -72,12 +72,23 @@ class Batch:
         self.encoder_lens = None
         self.global_num_tokens = None
         self.split_index = 0
+        self.enable_overlap = False
+        self.decode_mem_ok = True
 
     def batch_size(self):
         return self.rows
 
     def is_empty(self):
         return not self.rows
+
+    def check_decode_mem(self):
+        return self.decode_mem_ok
+
+    def copy(self):
+        copied = Batch(self.rows, self.forward_mode)
+        copied.enable_overlap = self.enable_overlap
+        copied.decode_mem_ok = self.decode_mem_ok
+        return copied
 
 
 def scheduler_class(extra=None):
@@ -441,7 +452,7 @@ class StopLoop(Exception):
 
 
 class TestActualLoop(unittest.TestCase):
-    def run_rank(self, rank):
+    def run_rank(self, rank, memory_pressure=False):
         trace, current = [], {"idx": 0, "lane": None}
 
         class Stream:
@@ -521,6 +532,8 @@ class TestActualLoop(unittest.TestCase):
             tick["n"] += 1
             if tick["n"] == 2:
                 raise StopLoop
+            if tick["n"] == 1 and memory_pressure:
+                s.running_batch.decode_mem_ok = False
             trace.append(("ingest", tick["n"]))
 
         s.ingest_requests = ingest
@@ -540,7 +553,11 @@ class TestActualLoop(unittest.TestCase):
             return batch
 
         s.dp_attn_adapter = NS(maybe_prepare_mlp_sync_batch=sync_batch)
-        s.update_running_batch = lambda b: b
+        def update_running_batch(batch):
+            trace.append(("update_running",))
+            return batch
+
+        s.update_running_batch = update_running_batch
 
         def run(batch):
             trace.append(
@@ -598,6 +615,13 @@ class TestActualLoop(unittest.TestCase):
             first_wait = next(x for x in trace if x[0] == "wait")
             self.assertEqual(first_wait[1], "p0")
             self.assertEqual(first_wait[2][0], "d0")
+
+    def test_memory_pressure_commits_pending_result_before_retraction_path(self):
+        trace = self.run_rank(1, memory_pressure=True)
+        second_ingest = trace.index(("ingest", 1))
+        process = trace.index(("process_decode",), second_ingest)
+        update = trace.index(("update_running",), second_ingest)
+        self.assertLess(process, update)
 
 
 if __name__ == "__main__":

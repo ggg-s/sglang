@@ -63,12 +63,22 @@ class _DecodeBatch:
     batch_is_full = False
     sampling_info = None
     spec_info = None
+    enable_overlap = False
 
     def is_empty(self):
         return False
 
+    def batch_size(self):
+        return 1
+
+    def check_decode_mem(self):
+        return True
+
     def merge_batch(self, other):
         pass
+
+    def copy(self):
+        return self
 
 
 class _SplitBatch:
