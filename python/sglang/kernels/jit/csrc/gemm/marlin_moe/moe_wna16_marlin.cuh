@@ -873,7 +873,8 @@ void moe_wna16_marlin_gemm(
     int64_t group_size,
     bool use_atomic_add,
     bool use_fp32_reduce,
-    bool is_zp_float) {
+    bool is_zp_float,
+    int64_t sm_count) {
   using namespace host;
 
   RuntimeCheck(is_ep == kIsEP, "is_ep does not match the compiled Marlin MoE specialization");
@@ -934,6 +935,13 @@ void moe_wna16_marlin_gemm(
   int dev = dl_device.device_id;
   cudaStream_t stream = LaunchKernel::resolve_device(dl_device);
   RuntimeDeviceCheck(cudaDeviceGetAttribute(&sms, cudaDevAttrMultiProcessorCount, dev));
+  // A green context owns only a subset of the device SMs. Size this persistent
+  // grid for the caller's execution partition rather than the full device.
+  if (sm_count != -1) {
+    RuntimeCheck(sm_count > 0 && sm_count <= sms, "invalid Marlin SM count: ", sm_count);
+    sms = static_cast<int>(sm_count);
+  }
+
 
   // Verify c (allocation done in Python)
   device.verify(c.device());

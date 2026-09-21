@@ -20,6 +20,10 @@ class PDMuxConfig:
     # Tokens x layers per segment. With DP/TP-MoE, tokens means the gathered
     # batch total; do not divide this budget by dp_size in the YAML config.
     split_forward_token_budget: int = 65536
+    # Optional latency guard for cache-hit tails and other very small prefills.
+    # A token-only budget can otherwise submit every remaining layer as one
+    # long GPU interval while decode is active. Zero preserves the old behavior.
+    split_forward_max_layers: int = 0
     decode_bs_divisor: int = 36
     # Overlap mode: prefill keeps its green-context SM cap while decode runs on
     # plain full-device streams, so the two SM sets deliberately overlap and the
@@ -89,10 +93,15 @@ def load_pdmux_config(config_path: str) -> PDMuxConfig:
             "exclusive partitions, which does not describe an overlapped one."
         )
 
+    split_forward_max_layers = raw.get("split_forward_max_layers", 0)
+    if split_forward_max_layers < 0:
+        raise ValueError("split_forward_max_layers must be >= 0")
+
     return PDMuxConfig(
         sm_group_num=raw["sm_group_num"],
         manual_divisions=manual_divisions,
         split_forward_token_budget=raw.get("split_forward_token_budget", 65536),
+        split_forward_max_layers=split_forward_max_layers,
         decode_bs_divisor=raw.get("decode_bs_divisor", 36),
         overlap_decode_full_sm=overlap_decode_full_sm,
     )

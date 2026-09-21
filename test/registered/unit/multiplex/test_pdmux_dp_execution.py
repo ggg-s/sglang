@@ -480,6 +480,9 @@ class TestActualLoop(unittest.TestCase):
             set_current_stream_idx=lambda i: current.update(idx=i),
             set_pdmux_status=lambda v: None,
             logger=Mock(),
+            time=NS(perf_counter=lambda: 0.0),
+            NVTX_SCHEDULER_ENABLED=False,
+            profile_range=lambda *a, **kw: contextlib.nullcontext(),
             publish_carried_tensors=lambda b, s: trace.append(("publish", s.lane)),
             ForwardMode=Mode,
         )

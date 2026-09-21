@@ -65,7 +65,9 @@ def scheduler(tokens, *, decode_empty=False, dp_size=2, group=None):
         ps=SimpleNamespace(attn_dp_size=dp_size),
         tp_cpu_group=group,
         model_config=SimpleNamespace(num_hidden_layers=61),
-        pdmux_config=SimpleNamespace(split_forward_token_budget=65536),
+        pdmux_config=SimpleNamespace(
+            split_forward_token_budget=65536, split_forward_max_layers=0
+        ),
         running_batch=SimpleNamespace(is_empty=lambda: decode_empty),
         split_prefill_batch=SimpleNamespace(
             split_index=0, extend_num_tokens=tokens, global_num_tokens=None
@@ -104,6 +106,22 @@ def _run_gloo_rank(rank, store_path, results, gathered_counts=False):
 
 
 class TestPDMuxDPLayerSplit(unittest.TestCase):
+    def test_max_layers_caps_tiny_prefill_only_while_decode_is_active(self):
+        current = scheduler(8, decode_empty=False, dp_size=1, group=Mock())
+        current.pdmux_config.split_forward_max_layers = 8
+        self.assertEqual(get_count(current), 8)
+
+        current.running_batch = SimpleNamespace(is_empty=lambda: True)
+        self.assertEqual(get_count(current), 61)
+
+    def test_max_layers_caps_rank_uniform_dp_segments(self):
+        current = scheduler(8, dp_size=2, group=Mock())
+        current.pdmux_config.split_forward_max_layers = 8
+        current.split_prefill_batch.global_num_tokens = [8, 0]
+        decode = SimpleNamespace(global_num_tokens=[1, 0])
+        self.assertEqual(get_count(current, decode), 8)
+        current.tp_cpu_group.allreduce.assert_not_called()
+
     def test_uneven_dp_ranks_finish_each_segment_together(self):
         for tokens, empty, expected in (
             ((2048, 0), (False, True), [32, 29]),

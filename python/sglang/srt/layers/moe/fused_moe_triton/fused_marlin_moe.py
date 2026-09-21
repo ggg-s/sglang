@@ -6,6 +6,8 @@ import triton
 import triton.language as tl
 
 from sglang.srt.layers import zero_copy_context
+from sglang.srt.distributed.parallel_state import is_pdmux_prefill_enabled
+from sglang.srt.multiplex.pdmux_context import get_current_stream_idx, get_sm_counts
 from sglang.srt.utils import is_cuda
 from sglang.srt.utils.custom_op import register_custom_op
 
@@ -302,6 +304,10 @@ def fused_marlin_moe(
         or torch.cuda.get_device_capability(hidden_states.device)[0] >= 9
     ) and (not is_mxfp4_marlin)
 
+    sm_count = -1
+    if is_pdmux_prefill_enabled():
+        sm_count = get_sm_counts()[get_current_stream_idx()][0]
+
     intermediate_cache1 = moe_wna16_marlin_gemm(
         hidden_states,
         intermediate_cache1,
@@ -329,6 +335,7 @@ def fused_marlin_moe(
         use_atomic_add=use_atomic_add,
         use_fp32_reduce=True,
         is_zp_float=False,
+        sm_count=sm_count,
     )
 
     if activation == "silu" and is_gated and gemm1_alpha is not None:
@@ -392,6 +399,7 @@ def fused_marlin_moe(
         use_atomic_add=use_atomic_add,
         use_fp32_reduce=True,
         is_zp_float=False,
+        sm_count=sm_count,
     ).view(-1, topk, K)
 
     output = zero_copy_context.get_moe_output(hidden_states)

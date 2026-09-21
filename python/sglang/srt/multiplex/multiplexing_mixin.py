@@ -25,6 +25,7 @@ from sglang.srt.multiplex.pdmux_context import (
 )
 from sglang.srt.multiplex.pdmux_tensor_lifetime import publish_carried_tensors
 from sglang.srt.runtime_context import get_disagg
+from sglang.srt.utils.nvtx_utils import NVTX_SCHEDULER_ENABLED, profile_range
 
 if TYPE_CHECKING:
     from sglang.srt.layers.attention.base_attn_backend import AttentionBackend
@@ -259,6 +260,12 @@ class SchedulerMultiplexMixin:
         remaining_layers = (
             self.model_config.num_hidden_layers - self.split_prefill_batch.split_index
         )
+        max_layers = getattr(self.pdmux_config, "split_forward_max_layers", 0)
+
+        def limit_active_decode(count: int) -> int:
+            if max_layers > 0:
+                count = min(count, max_layers)
+            return count
 
         if self.ps.attn_dp_size > 1:
             prefill_tokens = self.split_prefill_batch.global_num_tokens
@@ -280,13 +287,15 @@ class SchedulerMultiplexMixin:
                 total_prefill_tokens = sum(prefill_tokens)
                 if total_prefill_tokens == 0 or not any(decode_tokens):
                     return remaining_layers
-                return min(
-                    remaining_layers,
-                    max(
-                        1,
-                        self.pdmux_config.split_forward_token_budget
-                        // total_prefill_tokens,
-                    ),
+                return limit_active_decode(
+                    min(
+                        remaining_layers,
+                        max(
+                            1,
+                            self.pdmux_config.split_forward_token_budget
+                            // total_prefill_tokens,
+                        ),
+                    )
                 )
 
         # Splitting only benefits decode work that can run between prefill
@@ -306,6 +315,7 @@ class SchedulerMultiplexMixin:
                     // self.split_prefill_batch.extend_num_tokens,
                 ),
             )
+            forward_count = limit_active_decode(forward_count)
 
         if self.ps.attn_dp_size > 1:
             # DP ranks can have different prefill lengths or no local work.
@@ -676,7 +686,23 @@ class SchedulerMultiplexMixin:
                     )
 
                     self.split_prefill_batch.split_forward_count = forward_count
-                    prefill_result = self.run_batch(self.split_prefill_batch)
+                    split_submit_start = time.perf_counter()
+                    with profile_range(
+                        f"pdmux.split_prefill.tokens={self.split_prefill_batch.extend_num_tokens}"
+                        f".layers={forward_count}.start={self.split_prefill_batch.split_index}"
+                        f".decode_bs={running_batch.batch_size()}",
+                        nvtx_enabled=NVTX_SCHEDULER_ENABLED,
+                    ):
+                        prefill_result = self.run_batch(self.split_prefill_batch)
+                    logger.debug(
+                        "PDMux split submit: tokens=%d layers=%d start=%d "
+                        "decode_bs=%d submit_ms=%.3f",
+                        self.split_prefill_batch.extend_num_tokens,
+                        forward_count,
+                        self.split_prefill_batch.split_index,
+                        running_batch.batch_size(),
+                        (time.perf_counter() - split_submit_start) * 1000,
+                    )
                     if next_split_index == self.model_config.num_hidden_layers:
                         self.split_prefill_batch.split_prefill_finished = True
                         prefill_exe_done = prefill_stream.record_event()

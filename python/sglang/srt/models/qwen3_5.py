@@ -2364,6 +2364,64 @@ class Qwen3_5MoeForConditionalGeneration(Qwen3VLForConditionalGeneration):
 
         self.enable_shared_expert_fusion = self.num_fused_shared_experts > 0
 
+    @torch.no_grad()
+    def forward_split_prefill(
+        self,
+        input_ids: torch.Tensor,
+        positions: torch.Tensor,
+        forward_batch: ForwardBatch,
+        split_interval: Tuple[int, int],
+        input_embeds: Optional[torch.Tensor] = None,
+    ):
+        """Submit a bounded number of text-only decoder layers for PDMux."""
+        start, end = split_interval
+        model = self.model
+        if start == 0:
+            if not (self.pp_group.is_first_rank and self.pp_group.is_last_rank):
+                raise ValueError("Qwen3.5 split prefill requires pipeline size 1")
+            if forward_batch.mm_inputs and any(
+                item is not None and item.contains_mm_input()
+                for item in forward_batch.mm_inputs
+            ):
+                raise ValueError("Qwen3.5 split prefill currently supports text only")
+            if self.capture_aux_hidden_states or forward_batch.spec_info is not None:
+                raise ValueError("Qwen3.5 split prefill does not support speculation")
+            if model.flashinfer_mnnvl_cutedsl_fusion is not None:
+                raise ValueError("Qwen3.5 split prefill does not support deferred MoE")
+            forward_batch.hidden_states = (
+                model.embed_tokens(input_ids) if input_embeds is None else input_embeds
+            )
+            forward_batch.residual = None
+
+        if self.is_mrope_enabled:
+            positions = forward_batch.mrope_positions
+        for layer_idx in range(start, end):
+            with get_global_expert_distribution_recorder().with_current_layer(layer_idx):
+                forward_batch.hidden_states, forward_batch.residual = model.layers[
+                    layer_idx
+                ](
+                    positions=positions,
+                    hidden_states=forward_batch.hidden_states,
+                    residual=forward_batch.residual,
+                    forward_batch=forward_batch,
+                )
+
+        if end != model.end_layer:
+            return None
+        hidden_states = forward_batch.hidden_states
+        if hidden_states.shape[0] != 0:
+            norm = (
+                model.norm.forward_native
+                if envs.SGLANG_QWEN35_NATIVE_FINAL_NORM.get()
+                else model.norm
+            )
+            if forward_batch.residual is None:
+                hidden_states = norm(hidden_states)
+            else:
+                hidden_states, _ = norm(hidden_states, forward_batch.residual)
+        forward_batch.hidden_states = hidden_states
+        return self.logits_processor(input_ids, hidden_states, self.lm_head, forward_batch)
+
     def get_hidden_dim(self, module_name: str, layer_idx: int):
         return self.model.get_hidden_dim(module_name, layer_idx)
 

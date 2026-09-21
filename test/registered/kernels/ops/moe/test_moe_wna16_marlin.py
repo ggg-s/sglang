@@ -684,5 +684,42 @@ def test_fused_marlin_moe_nvfp4_non_gated_matches_dequant_reference():
     torch.testing.assert_close(output, output_ref, rtol=0.05, atol=0.25)
 
 
+@pytest.mark.parametrize("m", [1, 123, 1024])
+def test_moe_wna16_marlin_sm_count_override(m):
+    """A partition-sized persistent grid must preserve AWQ GEMM numerics."""
+    from functools import partial
+
+    torch.manual_seed(42)
+    e, n, k, topk, block = 8, 256, 512, 2, 16
+    dtype = torch.float16
+    quant_type = scalar_types.uint4
+    _, qw, scales, zeros, g_idx, perm = _setup_moe_weights(
+        e, n, k, quant_type, 128, False, dtype
+    )
+    a = torch.randn((m, k), device="cuda", dtype=dtype) / 10
+    weights, ids = torch.softmax(torch.randn(m, e, device="cuda"), -1).topk(topk)
+    sorted_ids, experts, num = moe_align_block_size(ids.int(), block, e)
+    sms = torch.cuda.get_device_properties("cuda").multi_processor_count
+    workspace = torch.zeros(sms * 4, device="cuda", dtype=torch.int32)
+
+    def run(hint):
+        return _run_single_gemm(
+            partial(moe_wna16_marlin_gemm, sm_count=hint),
+            a,
+            torch.empty((m * topk, n), device="cuda", dtype=dtype),
+            qw, scales, zeros, g_idx, perm, workspace,
+            sorted_ids, experts, num, weights, quant_type,
+            block, topk, m, n, k, False, True, True,
+        )
+
+    reference = run(-1)
+    actual = run(max(1, sms // 2))
+    torch.cuda.synchronize()
+    torch.testing.assert_close(actual, reference, atol=0.005, rtol=0.01)
+    for invalid in (0, -2, sms + 1):
+        with pytest.raises(Exception, match="invalid Marlin SM count"):
+            run(invalid)
+
+
 if __name__ == "__main__":
     sys.exit(pytest.main([__file__, "-v", "-s"]))

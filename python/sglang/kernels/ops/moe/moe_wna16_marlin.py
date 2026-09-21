@@ -67,6 +67,7 @@ def moe_wna16_marlin_gemm(
     use_atomic_add: bool = False,
     use_fp32_reduce: bool = False,
     is_zp_float: bool = False,
+    sm_count: int = -1,
 ) -> torch.Tensor:
     device = a.device
 
@@ -171,6 +172,7 @@ def moe_wna16_marlin_gemm(
         use_atomic_add,
         use_fp32_reduce,
         is_zp_float,
+        sm_count,
     )
 
     return c
