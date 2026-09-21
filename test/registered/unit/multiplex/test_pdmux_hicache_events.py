@@ -67,6 +67,9 @@ class _DecodeBatch:
     def is_empty(self):
         return False
 
+    def batch_size(self):
+        return 1
+
     def merge_batch(self, other):
         pass
 
