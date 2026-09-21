@@ -3697,12 +3697,7 @@ class Scheduler(
 
         return res
 
-    def get_new_batch_prefill(
-        self,
-        running_batch: ScheduleBatch,
-        *,
-        defer_hicache_load: bool = False,
-    ) -> NextBatchPlan:
+    def get_new_batch_prefill(self, running_batch: ScheduleBatch) -> NextBatchPlan:
         prefill_delayer_single_pass = None
         if self.prefill_delayer:
             # Get max usage across all pools for prefill delay decision
@@ -3716,7 +3711,6 @@ class Scheduler(
         ret, running_batch = self._get_new_batch_prefill_raw(
             prefill_delayer_single_pass=prefill_delayer_single_pass,
             running_batch=running_batch,
-            defer_hicache_load=defer_hicache_load,
         )
 
         if self.prefill_delayer:
@@ -3752,7 +3746,6 @@ class Scheduler(
         self,
         prefill_delayer_single_pass: Optional[PrefillDelayerSinglePassExecutor],
         running_batch: ScheduleBatch,
-        defer_hicache_load: bool = False,
     ) -> Tuple[Optional[ScheduleBatch], ScheduleBatch]:
         # Check if the grammar is ready in the grammar queue
         if self.grammar_manager.has_waiting_grammars():
@@ -4026,9 +4019,7 @@ class Scheduler(
             self.chunked_req is None or len(can_run_list) != 1
         )
 
-        if (
-            self.enable_hierarchical_cache or self.enable_unified_cache_external_linker
-        ) and not defer_hicache_load:
+        if self.enable_hierarchical_cache or self.enable_unified_cache_external_linker:
             # todo (zhiqiang): disable cuda graph execution if hicache loading triggered
             new_batch.hicache_consumer_index = (
                 self.tree_cache.ready_to_load_host_cache()

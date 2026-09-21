@@ -504,8 +504,6 @@ class TestActualLoop(unittest.TestCase):
         s.model_config = NS(num_hidden_layers=3)
         s.pdmux_config.split_forward_token_budget = 2048
         s.split_prefill_batch = None
-        s.enable_hierarchical_cache = False
-        s.enable_unified_cache_external_linker = False
         s.HICACHE_PUMP_INTERVAL = 16
         s.running_batch = Batch(1 if rank == 1 else 0)
         s.stream_groups = [
@@ -527,9 +525,7 @@ class TestActualLoop(unittest.TestCase):
 
         s.ingest_requests = ingest
         prefill = Batch(1, Mode.SPLIT_PREFILL) if rank == 0 else None
-        s.get_new_batch_prefill = lambda b, **_kw: NS(
-            batch_to_run=prefill, running_batch=b
-        )
+        s.get_new_batch_prefill = lambda b: NS(batch_to_run=prefill, running_batch=b)
 
         def sync_batch(batch):
             if current["lane"].startswith("p"):

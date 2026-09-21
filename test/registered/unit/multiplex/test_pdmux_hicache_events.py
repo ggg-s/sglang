@@ -67,9 +67,6 @@ class _DecodeBatch:
     def is_empty(self):
         return False
 
-    def batch_size(self):
-        return 1
-
     def merge_batch(self, other):
         pass
 
@@ -82,7 +79,7 @@ class _SplitBatch:
         self.split_prefill_finished = False
         self.chunked_req = None
         self.forward_mode = SimpleNamespace(is_idle=lambda: False)
-        self.hicache_consumer_index = -1
+        self.hicache_consumer_index = CONSUMER_INDEX
 
     def is_empty(self):
         return False
@@ -111,9 +108,6 @@ class _FakeScheduler(SchedulerMultiplexMixin):
             allreduce=lambda tensor, op: SimpleNamespace(wait=lambda: None)
         )
         self.tree_cache = Mock()
-        self.tree_cache.ready_to_load_host_cache.return_value = CONSUMER_INDEX
-        self.enable_hierarchical_cache = True
-        self.enable_unified_cache_external_linker = False
         self.pdmux_standard = False
         self.draft_worker = None
         self.chunked_req = None
@@ -149,8 +143,7 @@ class _FakeScheduler(SchedulerMultiplexMixin):
     def process_pending_chunked_abort(self):
         pass
 
-    def get_new_batch_prefill(self, running_batch, *, defer_hicache_load=False):
-        assert defer_hicache_load
+    def get_new_batch_prefill(self, running_batch):
         # Stands in for `_get_new_batch_prefill_raw`, whose first act is to pump
         # HiCache events. Formation admits one request, then finds none.
         self.check_hicache_events_if_enabled()
