@@ -512,10 +512,10 @@ class SchedulerMultiplexMixin:
     # bookkeeping (~10ms/iteration measured on a busy 8-rank host), while the
     # acks it retires are latency-insensitive background accounting -- the
     # transfers themselves are ordered by CUDA events, not by the pump. Long
-    # layer-split prefills can span hundreds of iterations, so 64 still gives
+    # layer-split prefills can span hundreds of iterations, so 32 still gives
     # regular lock retirement while halving this collective tax. The tick
     # advances under a rank-consistent condition, keeping every rank aligned.
-    HICACHE_PUMP_INTERVAL = 64
+    HICACHE_PUMP_INTERVAL = 32
 
     def event_loop_pdmux(self: Scheduler):
         """Enter the PD-multiplexing loop for the configured prefill mode."""
