@@ -234,7 +234,14 @@ class SchedulerMultiplexMixin:
         self.process_pending_chunked_abort()
 
         # add new request
-        prefill_plan = self.get_new_batch_prefill(running_batch)
+        # Keep the load queued until the decode launch below. Starting HiCache's
+        # layerwise H2D copy here lets its long gather kernels reach the device
+        # before the high-priority decode work has even been submitted. The
+        # normal scheduler cannot defer this operation, but PDMux has an explicit
+        # decode/prefill submission boundary where it can safely do so.
+        prefill_plan = self.get_new_batch_prefill(
+            running_batch, defer_hicache_load=True
+        )
         batch = prefill_plan.batch_to_run
         running_batch = prefill_plan.running_batch
         # PDMux forms batches outside get_next_batch_to_run(), so prepare the
@@ -676,6 +683,22 @@ class SchedulerMultiplexMixin:
                     and not wait_prefill_kernel_done
                 ):
                     prefill_done = True
+                    if (
+                        self.split_prefill_batch.split_index == 0
+                        and (
+                            self.enable_hierarchical_cache
+                            or self.enable_unified_cache_external_linker
+                        )
+                    ):
+                        # The decode kernels are now queued on their high-priority
+                        # stream. Release the layerwise cache load only here so
+                        # CUDA can prioritize decode between H2D gather kernels.
+                        # The controller's start event is recorded on this stream
+                        # after batch formation and allocation, preserving page
+                        # reuse ordering before the transfer stream writes them.
+                        self.split_prefill_batch.hicache_consumer_index = (
+                            self.tree_cache.ready_to_load_host_cache()
+                        )
                     forward_count = self._get_split_forward_count(decode_batch)
                     next_split_index = min(
                         self.split_prefill_batch.split_index + forward_count,
