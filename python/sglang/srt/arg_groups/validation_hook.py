@@ -540,10 +540,12 @@ def check_pdmux_standard_prefill(cfg):
     from sglang.srt.model_executor.cuda_graph_config import Backend
 
     prefill_backend = cfg.cuda_graph_config.prefill.backend
-    assert prefill_backend in (Backend.DISABLED, Backend.FULL), (
-        f"--pdmux-prefill-mode standard supports only the full prefill CUDA "
-        f"graph backend, but the resolved backend is '{prefill_backend}'. "
-        f"Pass --cuda-graph-backend-prefill full or disabled."
+    assert prefill_backend == Backend.DISABLED, (
+        f"--pdmux-prefill-mode standard requires the prefill CUDA graph to be "
+        f"disabled, but the resolved prefill backend is '{prefill_backend}'. "
+        f"The prefill graph is captured once on a plain stream and its shape "
+        f"key carries no stream index, so its nodes keep the resource context "
+        f"they were captured with. Pass --cuda-graph-backend-prefill disabled."
     )
     assert not cfg.enable_multi_layer_eagle, (
         "--pdmux-prefill-mode standard is not compatible with "
