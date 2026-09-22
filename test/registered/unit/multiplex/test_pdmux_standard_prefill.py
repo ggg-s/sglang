@@ -724,14 +724,12 @@ class TestPdmuxStandardPrefillAdmission(unittest.TestCase):
     def test_a_clean_profile_is_accepted(self):
         self._check()
 
-    def test_supported_prefill_cuda_graphs_are_accepted(self):
-        for backend in ("full", "breakable"):
-            with self.subTest(backend=backend):
-                self._check(
-                    cuda_graph_config=SimpleNamespace(
-                        prefill=SimpleNamespace(backend=backend)
-                    )
-                )
+    def test_full_prefill_cuda_graph_is_accepted(self):
+        self._check(
+            cuda_graph_config=SimpleNamespace(
+                prefill=SimpleNamespace(backend="full")
+            )
+        )
 
     def test_dp_attention_is_accepted(self):
         self._check(enable_dp_attention=True)
@@ -745,7 +743,7 @@ class TestPdmuxStandardPrefillAdmission(unittest.TestCase):
         rejections = [
             dict(
                 cuda_graph_config=SimpleNamespace(
-                    prefill=SimpleNamespace(backend="tc_piecewise")
+                    prefill=SimpleNamespace(backend="breakable")
                 )
             ),
             dict(enable_multi_layer_eagle=True),
