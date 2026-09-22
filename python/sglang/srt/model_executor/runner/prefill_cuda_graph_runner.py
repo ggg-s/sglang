@@ -439,6 +439,15 @@ class PrefillCudaGraphRunner(BaseCudaGraphRunner):
             max_req = prefill_config.full_prefill_max_req
             assert max_req is not None, "full_prefill_max_req must be resolved"
             self._capture_req_slots = max_req
+            # Decode graph capture initializes its own (per-stream) attention
+            # backend. Full prefill graph uses the ordinary prefill backend,
+            # whose hybrid Mamba replay metadata otherwise has no static
+            # request-slot buffers at capture time.
+            if self.mamba_track_enabled:
+                self.model_runner.attn_backend.init_cuda_graph_state(
+                    max_bs=self._capture_req_slots,
+                    max_num_tokens=self.max_num_tokens,
+                )
         # BCG/Full record LoRA kernels, so the metadata they read must live in
         # static buffers refreshed in place per batch; unsupported LoRA
         # configs were already routed to the eager runner.
