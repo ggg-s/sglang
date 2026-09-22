@@ -73,10 +73,6 @@ class SchedulerMultiplexMixin:
         # has been submitted and is waiting for its copy_done.
         self._pdmux_prefill_pending: Optional[ScheduleBatch] = None
         self._pdmux_prefill_inflight: Optional[PdmuxPrefillInflight] = None
-        # layer_split completion uses the same one-iteration asynchronous vote
-        # pipeline as standard mode. TP=1 bypasses the CPU collective entirely.
-        self._pdmux_split_done_work = None
-        self._pdmux_split_done_flags = None
         # The prefill lane's current stream, republished on every group switch
         # so the scheduler's submit path issues on the lane the loop selected.
         self.pdmux_prefill_stream = None
@@ -537,8 +533,6 @@ class SchedulerMultiplexMixin:
         carried_batch_pending = False
         self._check_pdmux_dp_graph_capability()
         self._hicache_pump_tick = 0
-        self._pdmux_split_done_work = None
-        self._pdmux_split_done_flags = None
         stream_idx = get_current_stream_idx()
         stream_group = self.stream_groups[stream_idx]
         prefill_stream = stream_group[0]
@@ -765,72 +759,25 @@ class SchedulerMultiplexMixin:
                 set_pdmux_status(True)
                 if prefill_done and self.split_prefill_batch.split_prefill_finished:
                     wait_prefill_kernel_done = True
-                    running_batch, completion_ready = (
-                        self._advance_split_prefill_completion(
-                            prefill_exe_done=prefill_exe_done,
-                            prefill_result=prefill_result,
-                            prefill_stream=prefill_stream,
-                            decode_stream=decode_stream,
-                            running_batch=running_batch,
-                            decode_result_done=decode_result_done,
-                        )
+                    prefill_exe_done_flag = prefill_exe_done.query()
+                    flags = (
+                        torch.ones(1, device="cpu", dtype=torch.int32)
+                        if prefill_exe_done_flag
+                        else torch.zeros(1, device="cpu", dtype=torch.int32)
                     )
-                    if completion_ready:
+
+                    self.tp_cpu_group.allreduce(flags, dist.ReduceOp.SUM).wait()
+                    if flags.item() == self.ps.tp_size:
+                        running_batch = self._merge_finished_prefill_batch(
+                            prefill_result,
+                            prefill_stream,
+                            decode_stream,
+                            running_batch,
+                            decode_result_done,
+                        )
                         carried_batch_pending = True
                         wait_prefill_kernel_done = False
                         adjust_stream_group = True
-
-    def _advance_split_prefill_completion(
-        self: Scheduler,
-        *,
-        prefill_exe_done,
-        prefill_result,
-        prefill_stream,
-        decode_stream,
-        running_batch,
-        decode_result_done,
-    ) -> tuple[ScheduleBatch, bool]:
-        """Poll split-prefill completion without stalling decode submission.
-
-        A single-rank worker needs no rank-consensus collective. With TP, the
-        vote issued in one scheduler iteration is consumed in the next, giving
-        Gloo a full decode iteration to finish instead of waiting immediately.
-        """
-        if self.ps.tp_size == 1:
-            if not prefill_exe_done.query():
-                return running_batch, False
-            running_batch = self._merge_finished_prefill_batch(
-                prefill_result,
-                prefill_stream,
-                decode_stream,
-                running_batch,
-                decode_result_done,
-            )
-            return running_batch, True
-
-        if self._pdmux_split_done_work is not None:
-            self._pdmux_split_done_work.wait()
-            ready_ranks = int(self._pdmux_split_done_flags.item())
-            self._pdmux_split_done_work = None
-            self._pdmux_split_done_flags = None
-            if ready_ranks == self.ps.tp_size:
-                running_batch = self._merge_finished_prefill_batch(
-                    prefill_result,
-                    prefill_stream,
-                    decode_stream,
-                    running_batch,
-                    decode_result_done,
-                )
-                return running_batch, True
-
-        flags = torch.zeros(1, device="cpu", dtype=torch.int32)
-        if prefill_exe_done.query():
-            flags[0] = 1
-        self._pdmux_split_done_flags = flags
-        self._pdmux_split_done_work = self.tp_cpu_group.allreduce(
-            flags, dist.ReduceOp.SUM
-        )
-        return running_batch, False
 
     # ------------------------------------------------------------------
     # Standard prefill lane
