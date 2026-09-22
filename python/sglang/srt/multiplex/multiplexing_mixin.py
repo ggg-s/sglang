@@ -740,9 +740,7 @@ class SchedulerMultiplexMixin:
                         running_batch.batch_size(),
                         next_split_index,
                     )
-                    # Some scheduler-focused unit tests construct only the
-                    # loop collaborators rather than running init_pdmux().
-                    executor = getattr(self, "_pdmux_split_submit_executor", None)
+                    executor = self._pdmux_split_submit_executor
                     if executor is None:
                         with profile_range(
                             f"pdmux.split_prefill.tokens={self.split_prefill_batch.extend_num_tokens}"
