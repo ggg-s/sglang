@@ -955,6 +955,10 @@ class SchedulerMultiplexMixin:
         self.pdmux_prefill_stream = prefill_stream
         adjust_stream_group = False
         decode_done = None
+        # Keep one decode result behind the GPU. This is the same pipeline
+        # shape used by layer_split: while decode N and the prefill lane run,
+        # process decode N-1 on the host instead of synchronizing decode N.
+        pending_decode_result = None
         torch.cuda.empty_cache()
 
         logger.debug("Starting event loop for pd multiplexing (standard prefill)...")
@@ -1028,7 +1032,7 @@ class SchedulerMultiplexMixin:
                     f"{self.sm_counts[stream_idx][1]}"
                 )
 
-            decode_result = None
+            current_decode_result = None
             with torch.cuda.stream(decode_stream):
                 set_pdmux_status(False)
                 decode_batch = self.dp_attn_adapter.maybe_prepare_mlp_sync_batch(
@@ -1038,6 +1042,7 @@ class SchedulerMultiplexMixin:
                 )
                 if decode_batch is not None:
                     decode_result = self.run_batch(decode_batch)
+                    current_decode_result = (decode_batch.copy(), decode_result)
 
             with torch.cuda.stream(prefill_stream):
                 set_pdmux_status(True)
@@ -1047,11 +1052,15 @@ class SchedulerMultiplexMixin:
 
             with torch.cuda.stream(decode_stream):
                 set_pdmux_status(False)
-                decode_stream.synchronize()
-                if decode_result is not None:
-                    self.process_batch_result(decode_batch, decode_result)
-                # E3: covers this iteration's decode result handling, the
-                # retract/free inside update_running_batch, and the pump above.
+                # Do not drain decode N here. Its result-copy event gates the
+                # next iteration's processing, while this CPU window handles
+                # decode N-1 concurrently with decode N and prefill kernels.
+                if pending_decode_result is not None:
+                    self.process_batch_result(*pending_decode_result)
+                pending_decode_result = current_decode_result
+                # E3 covers the GPU decode work plus any result processing for
+                # N-1. Prefill finalization waits on it before altering shared
+                # allocator/Mamba state.
                 decode_done = decode_stream.record_event()
 
             with torch.cuda.stream(prefill_stream):
