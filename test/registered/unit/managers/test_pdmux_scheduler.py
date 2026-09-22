@@ -468,6 +468,14 @@ class TestPDMuxScheduler(unittest.TestCase):
                 "sglang.srt.multiplex.multiplexing_mixin.get_sm_counts",
                 return_value=[(1, 0), (1, 1), (0, 1)],
             ),
+            patch(
+                "sglang.srt.multiplex.multiplexing_mixin.torch.cuda.Stream",
+                return_value=object(),
+            ),
+            patch(
+                "sglang.srt.multiplex.multiplexing_mixin.torch.cuda.stream",
+                return_value=object(),
+            ),
         ):
             SchedulerMultiplexMixin.init_pdmux(scheduler)
 
