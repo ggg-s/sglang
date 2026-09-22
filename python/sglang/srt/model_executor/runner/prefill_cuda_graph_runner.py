@@ -52,7 +52,7 @@ import tqdm
 from sglang.kernels.ops.kvcache.kv_indices import (
     create_chunked_prefix_cache_kv_indices,
 )
-from sglang.srt.distributed.parallel_state import graph_capture
+from sglang.srt.distributed.parallel_state import graph_capture, set_pdmux_status
 from sglang.srt.layers.attention.dsa.utils import is_dsa_enable_prefill_cp
 from sglang.srt.layers.cp.bcg import (
     PrefillCPBCGInput,
@@ -123,6 +123,11 @@ from sglang.srt.model_executor.runner_utils.buffers import (
 from sglang.srt.model_executor.runner_utils.capture_mode import model_capture_mode
 from sglang.srt.model_executor.runner_utils.pool import (
     get_or_create_global_graph_capture_stream,
+)
+from sglang.srt.multiplex.pdmux_context import (
+    get_current_stream_idx,
+    get_stream_groups,
+    set_current_stream_idx,
 )
 from sglang.srt.model_loader.utils import resolve_language_model
 from sglang.srt.runtime_context import (
@@ -918,7 +923,19 @@ class PrefillCudaGraphRunner(BaseCudaGraphRunner):
                     "prefix batch has no captured FullCG variant"
                 )
                 variant = _chunked_prefix_variant(captured_n)
-        return ShapeKey(size=num_tokens, variant_label=variant)
+        return self._make_shape_key(num_tokens, variant_label=variant)
+
+    def _make_shape_key(
+        self, size: int, *, variant_label: Optional[str] = None
+    ) -> ShapeKey:
+        """Key a standard-PDMux prefill graph by its green-context lane."""
+        stream_idx = (
+            get_current_stream_idx()
+            if getattr(self, "enable_pdmux", False)
+            and getattr(self, "pdmux_standard", False)
+            else None
+        )
+        return ShapeKey(size=size, stream_idx=stream_idx, variant_label=variant_label)
 
     def _create_chunked_prefix_buffers(self) -> _ChunkedPrefixCaptureBuffers:
         """Allocate the stable chunk-metadata tensors shared by all variants."""
@@ -1410,12 +1427,37 @@ class PrefillCudaGraphRunner(BaseCudaGraphRunner):
         dp_flags.capturing_prefill_graph = True
         try:
             with freeze_gc(get_exec().graph.enable_cudagraph_gc):
-                with graph_capture(
-                    stream=get_or_create_global_graph_capture_stream()
-                ) as graph_capture_context:
-                    self.stream = graph_capture_context.stream
-                    with self.backend.capture_session(self.stream):
-                        self._capture_one_stream()
+                if self.enable_pdmux and self.pdmux_standard:
+                    # Standard PDMux runs an overlapping pair only on an
+                    # interior stream group. Graph nodes and attention metadata
+                    # are capture-stream specific, so key and capture each
+                    # shared green-context lane separately. The normal
+                    # full-device lanes remain eager and need no duplicate
+                    # graph allocation.
+                    stream_groups = get_stream_groups()
+                    original_stream_idx = get_current_stream_idx()
+                    try:
+                        for stream_idx, (prefill_stream, _) in enumerate(stream_groups):
+                            if stream_idx == 0 or stream_idx == len(stream_groups) - 1:
+                                continue
+                            set_current_stream_idx(stream_idx)
+                            set_pdmux_status(True)
+                            with graph_capture(
+                                stream=prefill_stream
+                            ) as graph_capture_context:
+                                self.stream = graph_capture_context.stream
+                                with self.backend.capture_session(self.stream):
+                                    self._capture_one_stream()
+                    finally:
+                        set_pdmux_status(False)
+                        set_current_stream_idx(original_stream_idx)
+                else:
+                    with graph_capture(
+                        stream=get_or_create_global_graph_capture_stream()
+                    ) as graph_capture_context:
+                        self.stream = graph_capture_context.stream
+                        with self.backend.capture_session(self.stream):
+                            self._capture_one_stream()
         finally:
             dp_flags.capturing_prefill_graph = False
         if dp_flags.prefill_graph_has_dp_gather:
@@ -1474,8 +1516,8 @@ class PrefillCudaGraphRunner(BaseCudaGraphRunner):
                 "limits; the graph would read stale LoRA metadata at replay."
             )
             lora_manager.prepare_lora_batch(forward_batch)
-        shape_key = ShapeKey(
-            size=num_tokens,
+        shape_key = self._make_shape_key(
+            num_tokens,
             variant_label=(
                 _chunked_prefix_variant(prefix_num_chunks)
                 if prefix_num_chunks
@@ -1863,7 +1905,7 @@ class PrefillCudaGraphRunner(BaseCudaGraphRunner):
             raw_num_tokens=raw_num_tokens,
         ):
             return self.backend.replay(
-                ShapeKey(size=static_num_tokens),
+                self._make_shape_key(static_num_tokens),
                 static_forward_batch,
                 **kwargs,
             )
