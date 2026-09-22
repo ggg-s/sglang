@@ -1,4 +1,3 @@
-from functools import lru_cache
 from typing import Optional
 
 import torch
@@ -13,11 +12,6 @@ from sglang.srt.utils import is_cuda
 from sglang.srt.utils.custom_op import register_custom_op
 
 _is_cuda = is_cuda()
-
-
-@lru_cache(maxsize=None)
-def _cuda_capability_major(device_index: int) -> int:
-    return torch.cuda.get_device_capability(device_index)[0]
 
 if _is_cuda:
     from sgl_kernel import moe_sum_reduce
@@ -305,12 +299,9 @@ def fused_marlin_moe(
     intermediate_cache3 = intermediate_cache13[: M * topk_ids.shape[1] * K]
     intermediate_cache3 = intermediate_cache3.view(-1, K)
 
-    device_index = hidden_states.device.index
-    if device_index is None:
-        device_index = torch.cuda.current_device()
     use_atomic_add = (
         hidden_states.dtype == torch.half
-        or _cuda_capability_major(device_index) >= 9
+        or torch.cuda.get_device_capability(hidden_states.device)[0] >= 9
     ) and (not is_mxfp4_marlin)
 
     sm_count = -1

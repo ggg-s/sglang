@@ -149,8 +149,8 @@ def fused_experts_none_to_marlin(
             f"Unsupported Marlin MoE activation: {runner_config.activation}"
         )
 
-    # Keep workspaces independent across concurrent PDMux lanes. Reusing a
-    # lock buffer by CUDA stream reduced overlap throughput in real workloads.
+    # Use a per-call workspace so captured graphs cannot alias Marlin's
+    # inter-block reduction locks and deadlock during capture.
     workspace = marlin_make_workspace(hidden_states.device, max_blocks_per_sm=4)
 
     marlin_hidden_states = hidden_states

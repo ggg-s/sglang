@@ -6,7 +6,6 @@ from __future__ import annotations
 
 import logging
 from dataclasses import dataclass
-from functools import lru_cache
 from typing import TYPE_CHECKING, Optional
 
 import numpy
@@ -266,17 +265,12 @@ def check_moe_marlin_supports_layer(
     )
 
 
-@lru_cache(maxsize=None)
-def _marlin_sm_count(device: torch.device) -> int:
-    return torch.cuda.get_device_properties(device).multi_processor_count
-
-
 def marlin_make_workspace(
     device: torch.device, max_blocks_per_sm: int = 1
 ) -> torch.Tensor:
     # In the new marlin kernel, we use the num of threadblocks as workspace
     # size. The num of threadblocks is sms_count * max_blocks_per_sm.
-    sms = _marlin_sm_count(device)
+    sms = torch.cuda.get_device_properties(device).multi_processor_count
     return torch.zeros(
         sms * max_blocks_per_sm, dtype=torch.int, device=device, requires_grad=False
     )
