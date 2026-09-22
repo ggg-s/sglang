@@ -6,7 +6,6 @@ from __future__ import annotations
 
 import logging
 import time
-from concurrent.futures import Future, ThreadPoolExecutor
 from typing import TYPE_CHECKING, Any, List, Optional
 
 import msgspec
@@ -92,34 +91,9 @@ class SchedulerMultiplexMixin:
         self.stream_groups = get_stream_groups()
         self.sm_counts = get_sm_counts()
         self.real_sm_group_num = len(self.stream_groups)
-        # A single worker preserves split-prefill submission order. It is
-        # intentionally opt-in: models must first demonstrate that all lane
-        # state is isolated (TP group, stream index and ForwardContext).
-        self._pdmux_split_submit_executor = (
-            ThreadPoolExecutor(max_workers=1, thread_name_prefix="pdmux-prefill")
-            if self.pdmux_config.split_prefill_host_submit
-            else None
-        )
         logger.info(
             f"PD-Multiplexing enabled with {self.real_sm_group_num} stream groups, sm_counts (prefill_sm, decode_sm): {self.sm_counts}"
         )
-
-    def _submit_split_prefill_on_lane(
-        self: Scheduler,
-        batch: ScheduleBatch,
-        prefill_stream: ExternalStream,
-        stream_idx: int,
-    ) -> GenerationBatchResult:
-        """Issue one split interval from the prefill host lane.
-
-        CUDA streams overlap GPU execution, but an eager Qwen-MoE split also
-        spends substantial wall time issuing kernels. This lane worker permits
-        decode-result CPU work to proceed during that submission interval.
-        """
-        with torch.cuda.device(self.ps.gpu_id), torch.cuda.stream(prefill_stream):
-            set_current_stream_idx(stream_idx)
-            set_pdmux_status(True)
-            return self.run_batch(batch)
 
     def _extra_inflight_batches(self: Scheduler) -> List[ScheduleBatch]:
         """PDMux prefill batches that live outside running_batch / last_batch.
@@ -576,9 +550,6 @@ class SchedulerMultiplexMixin:
                 running_batch = self.running_batch
                 input_done = decode_stream.record_event()
 
-            split_submit_future: Optional[Future] = None
-            split_submit_start = None
-            split_submit_meta = None
             with torch.cuda.stream(prefill_stream):
                 set_pdmux_status(True)
                 sm_count = self.sm_counts[stream_idx][0]
@@ -733,35 +704,26 @@ class SchedulerMultiplexMixin:
 
                     self.split_prefill_batch.split_forward_count = forward_count
                     split_submit_start = time.perf_counter()
-                    split_submit_meta = (
+                    with profile_range(
+                        f"pdmux.split_prefill.tokens={self.split_prefill_batch.extend_num_tokens}"
+                        f".layers={forward_count}.start={self.split_prefill_batch.split_index}"
+                        f".decode_bs={running_batch.batch_size()}",
+                        nvtx_enabled=NVTX_SCHEDULER_ENABLED,
+                    ):
+                        prefill_result = self.run_batch(self.split_prefill_batch)
+                    logger.debug(
+                        "PDMux split submit: tokens=%d layers=%d start=%d "
+                        "decode_bs=%d submit_ms=%.3f",
                         self.split_prefill_batch.extend_num_tokens,
                         forward_count,
                         self.split_prefill_batch.split_index,
                         running_batch.batch_size(),
-                        next_split_index,
+                        (time.perf_counter() - split_submit_start) * 1000,
                     )
-                    executor = self._pdmux_split_submit_executor
-                    if executor is None:
-                        with profile_range(
-                            f"pdmux.split_prefill.tokens={self.split_prefill_batch.extend_num_tokens}"
-                            f".layers={forward_count}.start={self.split_prefill_batch.split_index}"
-                            f".decode_bs={running_batch.batch_size()}",
-                            nvtx_enabled=NVTX_SCHEDULER_ENABLED,
-                        ):
-                            prefill_result = self.run_batch(self.split_prefill_batch)
-                    else:
-                        split_submit_future = executor.submit(
-                            self._submit_split_prefill_on_lane,
-                            self.split_prefill_batch,
-                            prefill_stream,
-                            stream_idx,
-                        )
-                        prefill_result = None
-                    if split_submit_future is None:
-                        if next_split_index == self.model_config.num_hidden_layers:
-                            self.split_prefill_batch.split_prefill_finished = True
-                            prefill_exe_done = prefill_stream.record_event()
-                        self.split_prefill_batch.split_index = next_split_index
+                    if next_split_index == self.model_config.num_hidden_layers:
+                        self.split_prefill_batch.split_prefill_finished = True
+                        prefill_exe_done = prefill_stream.record_event()
+                    self.split_prefill_batch.split_index = next_split_index
 
                 elif wait_prefill_kernel_done:
                     prefill_done = True
@@ -776,38 +738,6 @@ class SchedulerMultiplexMixin:
                 # the decode stream every iteration.
                 if pending_decode_result is not None:
                     self.process_batch_result(*pending_decode_result)
-
-                if split_submit_future is not None:
-                    # While the lane worker issues eager kernels, this thread
-                    # handles the previous decode result above. Join before
-                    # exposing the mutated split batch to the next interval.
-                    prefill_result = split_submit_future.result()
-                    with torch.cuda.stream(prefill_stream):
-                        if next_split_index == self.model_config.num_hidden_layers:
-                            self.split_prefill_batch.split_prefill_finished = True
-                            prefill_exe_done = prefill_stream.record_event()
-                        self.split_prefill_batch.split_index = next_split_index
-                    tokens, layers, start, decode_bs, _ = split_submit_meta
-                    logger.debug(
-                        "PDMux split submit: tokens=%d layers=%d start=%d "
-                        "decode_bs=%d submit_ms=%.3f",
-                        tokens,
-                        layers,
-                        start,
-                        decode_bs,
-                        (time.perf_counter() - split_submit_start) * 1000,
-                    )
-                elif split_submit_meta is not None:
-                    tokens, layers, start, decode_bs, _ = split_submit_meta
-                    logger.debug(
-                        "PDMux split submit: tokens=%d layers=%d start=%d "
-                        "decode_bs=%d submit_ms=%.3f",
-                        tokens,
-                        layers,
-                        start,
-                        decode_bs,
-                        (time.perf_counter() - split_submit_start) * 1000,
-                    )
 
                 finishing_prefill = (
                     prefill_done

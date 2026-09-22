@@ -32,10 +32,6 @@ class PDMuxConfig:
     # plain full-device streams, so the two SM sets deliberately overlap and the
     # manual_divisions decode_sm column is ignored.
     overlap_decode_full_sm: bool = False
-    # Submit split-prefill kernels from the prefill lane's dedicated host
-    # thread. This overlaps their Python launch work with decode result handling.
-    # Disabled until a model has passed its lane-concurrency regression test.
-    split_prefill_host_submit: bool = False
 
 
 def is_pdmux_standard_prefill() -> bool:
@@ -111,7 +107,6 @@ def load_pdmux_config(config_path: str) -> PDMuxConfig:
         split_forward_max_layers=split_forward_max_layers,
         decode_bs_divisor=raw.get("decode_bs_divisor", 36),
         overlap_decode_full_sm=overlap_decode_full_sm,
-        split_prefill_host_submit=raw.get("split_prefill_host_submit", False),
     )
 
 
