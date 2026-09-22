@@ -23,34 +23,6 @@ if TYPE_CHECKING:
     )
 
 
-# Marlin uses this buffer for inter-block reduction locks. Eager execution can
-# safely reuse one buffer per CUDA stream because launches on a stream are
-# ordered. Keep separate buffers for PDMux lanes, which execute concurrently.
-_workspace_by_stream: dict[tuple[int, int], torch.Tensor] = {}
-
-
-def _get_marlin_moe_workspace(device: torch.device) -> torch.Tensor:
-    from sglang.srt.layers.quantization.marlin_utils import marlin_make_workspace
-
-    # Graphs need distinct storage: aliasing their lock buffers can deadlock
-    # when captured graphs are replayed concurrently.
-    if torch.cuda.is_current_stream_capturing():
-        return marlin_make_workspace(device, max_blocks_per_sm=4)
-
-    stream = torch.cuda.current_stream(device)
-    device_index = device.index
-    if device_index is None:
-        device_index = torch.cuda.current_device()
-    key = (device_index, stream.cuda_stream)
-    workspace = _workspace_by_stream.get(key)
-    if workspace is None:
-        workspace = marlin_make_workspace(device, max_blocks_per_sm=4)
-        _workspace_by_stream[key] = workspace
-    else:
-        workspace.zero_()
-    return workspace
-
-
 @triton.jit
 def _unpack_packed_topk_kernel(packed_ptr, ids_ptr, w_ptr, numel, BLOCK: tl.constexpr):
     pid = tl.program_id(0)
@@ -148,6 +120,7 @@ def fused_experts_none_to_marlin(
 ) -> StandardCombineInput:
     from sglang.srt.layers.moe.fused_moe_triton.fused_marlin_moe import fused_marlin_moe
     from sglang.srt.layers.moe.token_dispatcher.standard import StandardCombineInput
+    from sglang.srt.layers.quantization.marlin_utils import marlin_make_workspace
 
     hidden_states = dispatch_output.hidden_states
     topk_output = dispatch_output.topk_output
@@ -176,7 +149,9 @@ def fused_experts_none_to_marlin(
             f"Unsupported Marlin MoE activation: {runner_config.activation}"
         )
 
-    workspace = _get_marlin_moe_workspace(hidden_states.device)
+    # Keep workspaces independent across concurrent PDMux lanes. Reusing a
+    # lock buffer by CUDA stream reduced overlap throughput in real workloads.
+    workspace = marlin_make_workspace(hidden_states.device, max_blocks_per_sm=4)
 
     marlin_hidden_states = hidden_states
     # Avoid aliasing the MoE input buffer until Marlin output semantics are
