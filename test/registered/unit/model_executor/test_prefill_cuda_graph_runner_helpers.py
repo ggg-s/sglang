@@ -4,8 +4,11 @@ import unittest
 from contextlib import nullcontext
 from functools import partial
 from types import SimpleNamespace
+from unittest.mock import patch
 
 import torch
+
+import sglang.srt.model_executor.runner.prefill_cuda_graph_runner as runner_module
 
 from sglang.srt.model_executor.cuda_graph_buffer_registry import (
     build_prefill_registry,
@@ -52,6 +55,22 @@ def _make_pp_buffers_and_registry():
 
 
 class TestPrefillCudaGraphRunnerHelpers(CustomTestCase):
+    def test_standard_pdmux_keys_prefill_graphs_by_lane(self):
+        runner = PrefillCudaGraphRunner.__new__(PrefillCudaGraphRunner)
+        runner.enable_pdmux = True
+        runner.pdmux_standard = True
+
+        with patch.object(runner_module, "get_current_stream_idx", return_value=1):
+            shared = runner._make_shape_key(64)
+        with patch.object(runner_module, "get_current_stream_idx", return_value=2):
+            other = runner._make_shape_key(64)
+
+        self.assertEqual(shared.size, other.size)
+        self.assertEqual((shared.stream_idx, other.stream_idx), (1, 2))
+
+        runner.enable_pdmux = False
+        self.assertIsNone(runner._make_shape_key(64).stream_idx)
+
     def test_pp_proxy_stable_buffers_accept_full_and_hidden_only_contracts(self):
         buffers, registry = _make_pp_buffers_and_registry()
         full_proxy = PPProxyTensors(
