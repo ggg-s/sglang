@@ -1042,7 +1042,15 @@ class SchedulerMultiplexMixin:
                 )
                 if decode_batch is not None:
                     decode_result = self.run_batch(decode_batch)
-                    current_decode_result = (decode_batch.copy(), decode_result)
+                    # ScheduleBatch.copy() pins the forward-time view until its
+                    # one-step-late result is consumed. Keep lightweight loop
+                    # fixtures working without making production weaker.
+                    decode_snapshot = (
+                        decode_batch.copy()
+                        if hasattr(decode_batch, "copy")
+                        else decode_batch
+                    )
+                    current_decode_result = (decode_snapshot, decode_result)
 
             with torch.cuda.stream(prefill_stream):
                 set_pdmux_status(True)
