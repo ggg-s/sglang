@@ -1264,6 +1264,18 @@ class PrefillCudaGraphRunner(BaseCudaGraphRunner):
                 is None
             ):
                 return False
+        if getattr(self, "enable_pdmux", False) and getattr(
+            self, "pdmux_standard", False
+        ):
+            # Only interior green-context lanes are captured. A prefill that
+            # arrives while decode is idle runs on the normal lane and must
+            # remain eager instead of attempting a missing graph key.
+            graph_size = self._pad_to_bucket(
+                len(forward_batch.input_ids), self.capture_num_tokens
+            )
+            return self.backend.has_captured_key(
+                self._shape_key(graph_size, forward_batch)
+            )
         # Multi-req replay is supported by body-capture backends via the
         # layer_model.forward monkey-patch in replay(): the captured graph runs
         # the transformer stack, then the outer model.forward runs
