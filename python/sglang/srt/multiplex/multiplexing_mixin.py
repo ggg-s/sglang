@@ -1005,14 +1005,6 @@ class SchedulerMultiplexMixin:
                     decode_stream.wait_event(formation_done)
                 if inflight is not None:
                     self._pump_hicache_events_inflight()
-                # Consume the previous decode before selecting this tick's
-                # batch.  Enqueuing the current decode first puts N-1's D2H
-                # result-copy behind N on the same stream, so the host waits
-                # for N rather than overlapping with it.  At this point N-1
-                # has had the preceding prefill window to complete.
-                if pending_decode_result is not None:
-                    self.process_batch_result(*pending_decode_result)
-                    pending_decode_result = None
                 # Decode results are consumed one iteration later below. Mamba
                 # must snapshot its next-boundary metadata before this update
                 # advances the shared request counters, as layer_split does.
@@ -1072,13 +1064,15 @@ class SchedulerMultiplexMixin:
 
             with torch.cuda.stream(decode_stream):
                 set_pdmux_status(False)
-                # Keep decode N available for the next tick. Its result is
-                # consumed before scheduling N+1, ahead of that stream's
-                # launch, so the D2H dependency cannot be serialized behind
-                # a newer decode.
+                # Do not drain decode N here. Its result-copy event gates the
+                # next iteration's processing, while this CPU window handles
+                # decode N-1 concurrently with decode N and prefill kernels.
+                if pending_decode_result is not None:
+                    self.process_batch_result(*pending_decode_result)
                 pending_decode_result = current_decode_result
-                # E3 covers this iteration's decode work. Prefill finalization
-                # waits on it before altering shared allocator/Mamba state.
+                # E3 covers the GPU decode work plus any result processing for
+                # N-1. Prefill finalization waits on it before altering shared
+                # allocator/Mamba state.
                 decode_done = decode_stream.record_event()
 
             with torch.cuda.stream(prefill_stream):
