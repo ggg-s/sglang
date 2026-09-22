@@ -1005,6 +1005,10 @@ class SchedulerMultiplexMixin:
                     decode_stream.wait_event(formation_done)
                 if inflight is not None:
                     self._pump_hicache_events_inflight()
+                # Decode results are consumed one iteration later below. Mamba
+                # must snapshot its next-boundary metadata before this update
+                # advances the shared request counters, as layer_split does.
+                running_batch.enable_overlap = True
                 running_batch = self.update_running_batch(running_batch)
                 self.running_batch = running_batch
                 adjust_stream_group = adjust_stream_group or (
