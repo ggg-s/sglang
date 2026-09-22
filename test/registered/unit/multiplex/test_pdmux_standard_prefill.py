@@ -360,8 +360,8 @@ class TestPDMuxStandardPrefillLoop(unittest.TestCase):
         on the whole forward or swap the backend a running forward reads. The
         switch to the shared group happens before the submit; nothing switches
         again, and the prefill stream is never drained, until the work item is
-        finalized. Decode completion is one-step pipelined in that window, so
-        standard PDMux can continue submitting decode during the prefill.
+        finalized. The decode lane's own per-step `synchronize()` is expected
+        in that window -- it is the synchronous decode path, not a switch.
         """
         scheduler = _run_loop(max_iterations=6, copy_done_script=[False] * 3)
 
@@ -372,8 +372,8 @@ class TestPDMuxStandardPrefillLoop(unittest.TestCase):
 
         self.assertEqual([e for e in window if e[0] == "switch"], [])
         self.assertEqual([e for e in window if e[0] == "sync" and e[1].lane == "P"], [])
-        # The decode lane kept stepping without draining itself meanwhile.
-        self.assertFalse(any(e[0] == "sync" and e[1].lane == "D" for e in window))
+        # The decode lane kept stepping (and draining itself) meanwhile.
+        self.assertTrue(any(e[0] == "sync" and e[1].lane == "D" for e in window))
         self.assertEqual(scheduler.decode_backend_switches[:1], [1])
 
     def test_one_completion_vote_per_iteration_while_in_flight(self):
