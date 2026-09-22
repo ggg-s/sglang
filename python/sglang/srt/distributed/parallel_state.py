@@ -31,6 +31,7 @@ import pickle
 import weakref
 from collections import namedtuple
 from contextlib import contextmanager, nullcontext
+from contextvars import ContextVar
 from dataclasses import dataclass
 from datetime import timedelta
 from multiprocessing import shared_memory
@@ -2097,16 +2098,21 @@ _DCP: Optional[GroupCoordinator] = None
 # duplicate GroupCoordinator for prefill in PD-Multiplexing
 _PDMUX_PREFILL_TP_GROUP: Optional[GroupCoordinator] = None
 
-_ENABLE_PDMUX_P_TP: bool = False
+# A PDMux prefill and decode lane can submit CUDA work concurrently. The
+# selected TP communicator belongs to the submitting host thread, not to the
+# worker process. A ContextVar preserves the single-thread behavior while
+# keeping each lane's communicator selection independent.
+_ENABLE_PDMUX_P_TP: ContextVar[bool] = ContextVar(
+    "enable_pdmux_prefill_tp", default=False
+)
 
 
 def set_pdmux_status(enable_prefill_multiplexing: bool):
-    global _ENABLE_PDMUX_P_TP
-    _ENABLE_PDMUX_P_TP = enable_prefill_multiplexing
+    _ENABLE_PDMUX_P_TP.set(enable_prefill_multiplexing)
 
 
 def is_pdmux_prefill_enabled() -> bool:
-    return _ENABLE_PDMUX_P_TP
+    return _ENABLE_PDMUX_P_TP.get()
 
 
 def is_pdmux_enabled() -> bool:
@@ -2114,7 +2120,7 @@ def is_pdmux_enabled() -> bool:
 
 
 def get_tp_group() -> GroupCoordinator:
-    if _ENABLE_PDMUX_P_TP:
+    if _ENABLE_PDMUX_P_TP.get():
         assert _PDMUX_PREFILL_TP_GROUP is not None, (
             "tensor model parallel group for PD-Multiplexing Prefill is not initialized"
         )

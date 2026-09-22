@@ -1,3 +1,4 @@
+from contextvars import ContextVar
 from dataclasses import dataclass, field
 from typing import List
 
@@ -7,7 +8,9 @@ import yaml
 STREAM_GROUPS = []
 SM_COUNTS = []
 SM_GROUP_NUM = 8  # Default number of SM groups
-CURRENT_STREAM_IDX = 0
+# Model code reads this index to apply the lane's SM cap. It must be local to
+# the submitting host thread before the prefill and decode submitters overlap.
+CURRENT_STREAM_IDX: ContextVar[int] = ContextVar("pdmux_current_stream_idx", default=0)
 CURRENT_STREAM_GROUP = None
 
 
@@ -159,12 +162,7 @@ def divide_sm(total_sms, compute_capability, groups):
 def initialize_stream_groups(gpu_id: int, config: PDMuxConfig):
     from sgl_kernel import spatial
 
-    global \
-        STREAM_GROUPS, \
-        SM_COUNTS, \
-        SM_GROUP_NUM, \
-        CURRENT_STREAM_IDX, \
-        CURRENT_STREAM_GROUP
+    global STREAM_GROUPS, SM_COUNTS, SM_GROUP_NUM, CURRENT_STREAM_GROUP
     # for pd_multiplexing, Init stream_groups
     device = torch.cuda.current_device()
     total_sm_count = spatial.get_sm_available(gpu_id)
@@ -233,16 +231,16 @@ def initialize_stream_groups(gpu_id: int, config: PDMuxConfig):
         (torch.cuda.Stream(gpu_id), torch.cuda.Stream(gpu_id))
     )  # Normal stream for decode
 
-    CURRENT_STREAM_IDX = 0
-    CURRENT_STREAM_GROUP = STREAM_GROUPS[CURRENT_STREAM_IDX]
+    CURRENT_STREAM_IDX.set(0)
+    CURRENT_STREAM_GROUP = STREAM_GROUPS[0]
 
 
 def set_current_stream_idx(idx: int):
-    global CURRENT_STREAM_IDX, CURRENT_STREAM_GROUP
+    global CURRENT_STREAM_GROUP
     if idx < 0 or idx >= len(STREAM_GROUPS):
         raise ValueError(f"Invalid stream index: {idx}")
-    CURRENT_STREAM_IDX = idx
-    CURRENT_STREAM_GROUP = STREAM_GROUPS[CURRENT_STREAM_IDX]
+    CURRENT_STREAM_IDX.set(idx)
+    CURRENT_STREAM_GROUP = STREAM_GROUPS[idx]
 
 
 def get_stream_groups() -> list[tuple[torch.cuda.Stream, torch.cuda.Stream]]:
@@ -257,4 +255,4 @@ def get_sm_counts() -> list[tuple[int, int]]:
 
 def get_current_stream_idx() -> int:
     """Get the current stream index."""
-    return CURRENT_STREAM_IDX
+    return CURRENT_STREAM_IDX.get()
