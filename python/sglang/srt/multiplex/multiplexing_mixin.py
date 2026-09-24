@@ -853,19 +853,6 @@ class SchedulerMultiplexMixin:
                     else:
                         decode_result.copy_done.synchronize()
                         self.process_batch_result(decode_result_batch, decode_result)
-                if (
-                    pending_decode is not None
-                    and prefill_done
-                    and self.split_prefill_batch is not None
-                    and self.split_prefill_batch.split_prefill_finished
-                ):
-                    # The prefill merge can release or rebind state used by this
-                    # decode result. Finish it before publishing the merge fence.
-                    batch, result = pending_decode
-                    result.copy_done.synchronize()
-                    self.process_batch_result(batch, result)
-                    pending_decode = None
-                decode_result_done = decode_stream.record_event()
 
             with torch.cuda.stream(prefill_stream):
                 set_pdmux_status(True)
@@ -880,6 +867,19 @@ class SchedulerMultiplexMixin:
 
                     self.tp_cpu_group.allreduce(flags, dist.ReduceOp.SUM).wait()
                     if flags.item() == self.ps.tp_size:
+                        # Only the actual merge needs the current decode result.
+                        # A completed split forward can wait several iterations
+                        # for the rank-wide vote; keep the pipeline open until
+                        # this vote succeeds.
+                        with torch.cuda.stream(decode_stream):
+                            set_pdmux_status(False)
+                            if pending_decode is not None:
+                                batch, result = pending_decode
+                                result.copy_done.synchronize()
+                                self.process_batch_result(batch, result)
+                                pending_decode = None
+                            decode_result_done = decode_stream.record_event()
+                        set_pdmux_status(True)
                         running_batch = self._merge_finished_prefill_batch(
                             prefill_result,
                             prefill_stream,

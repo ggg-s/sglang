@@ -75,6 +75,8 @@ class Batch:
         self.sampling_info = None
         self.enable_overlap = False
         self.decode_mem_ok = True
+        self.return_logprob = False
+        self.return_hidden_states = False
 
     def batch_size(self):
         return self.rows
@@ -89,6 +91,8 @@ class Batch:
         copied = Batch(self.rows, self.forward_mode)
         copied.enable_overlap = self.enable_overlap
         copied.decode_mem_ok = self.decode_mem_ok
+        copied.return_logprob = self.return_logprob
+        copied.return_hidden_states = self.return_hidden_states
         return copied
 
 
@@ -450,7 +454,9 @@ class StopLoop(Exception):
 
 
 class TestActualLoop(unittest.TestCase):
-    def run_rank(self, rank, memory_pressure=False, finish_on_first=False):
+    def run_rank(
+        self, rank, memory_pressure=False, finish_on_first=False, vote_ready_after=1
+    ):
         trace, current = [], {"idx": 0, "lane": None}
 
         class Stream:
@@ -601,7 +607,8 @@ class TestActualLoop(unittest.TestCase):
         def reduce(flags, op):
             self.assertEqual(op, dist.ReduceOp.SUM)
             trace.append(("completion_vote",))
-            return NS(wait=lambda: flags.fill_(2))
+            ready = sum(x[0] == "completion_vote" for x in trace) >= vote_ready_after
+            return NS(wait=lambda: flags.fill_(2 if ready else 0))
 
         s.tp_cpu_group = NS(allreduce=reduce)
         with self.assertRaises(StopLoop):
@@ -639,6 +646,12 @@ class TestActualLoop(unittest.TestCase):
 
     def test_prefill_merge_processes_current_decode_first(self):
         trace = self.run_rank(1, finish_on_first=True)
+        self.assertLess(trace.index(("process_decode",)), trace.index(("merge",)))
+
+    def test_unready_prefill_vote_keeps_current_decode_pending(self):
+        trace = self.run_rank(1, finish_on_first=True, vote_ready_after=2)
+        first_vote = trace.index(("completion_vote",))
+        self.assertLess(first_vote, trace.index(("process_decode",)))
         self.assertLess(trace.index(("process_decode",)), trace.index(("merge",)))
 
 
