@@ -710,6 +710,27 @@ class SchedulerMultiplexMixin:
                     decode_stream.wait_event(formation_done)
                 if carried_batch_pending and not running_batch.is_empty():
                     publish_carried_tensors(running_batch, decode_stream)
+                if (
+                    pending_decode is not None
+                    and not running_batch.is_empty()
+                    and not running_batch.check_decode_mem()
+                ):
+                    # Retraction rewrites request state, including Mamba counters.
+                    # Commit the result that still refers to the old state first.
+                    batch, result = pending_decode
+                    result.copy_done.synchronize()
+                    self.process_batch_result(batch, result)
+                    pending_decode = None
+                # Mamba result processing may observe a request after the next
+                # decode has advanced its counter. Save both boundary masks.
+                running_batch.enable_overlap = (
+                    self.spec_algorithm.is_none()
+                    and not running_batch.has_grammar
+                    and not (
+                        running_batch.sampling_info is not None
+                        and running_batch.sampling_info.penalizer_orchestrator.is_required
+                    )
+                )
                 running_batch = self.update_running_batch(running_batch)
                 self.running_batch = running_batch
                 adjust_stream_group = adjust_stream_group or (
@@ -832,6 +853,18 @@ class SchedulerMultiplexMixin:
                     else:
                         decode_result.copy_done.synchronize()
                         self.process_batch_result(decode_result_batch, decode_result)
+                if (
+                    pending_decode is not None
+                    and prefill_done
+                    and self.split_prefill_batch is not None
+                    and self.split_prefill_batch.split_prefill_finished
+                ):
+                    # The prefill merge can release or rebind state used by this
+                    # decode result. Finish it before publishing the merge fence.
+                    batch, result = pending_decode
+                    result.copy_done.synchronize()
+                    self.process_batch_result(batch, result)
+                    pending_decode = None
                 decode_result_done = decode_stream.record_event()
 
             with torch.cuda.stream(prefill_stream):

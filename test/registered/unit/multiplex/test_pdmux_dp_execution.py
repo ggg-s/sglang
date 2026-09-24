@@ -71,12 +71,25 @@ class Batch:
         self.encoder_lens = None
         self.global_num_tokens = None
         self.split_index = 0
+        self.has_grammar = False
+        self.sampling_info = None
+        self.enable_overlap = False
+        self.decode_mem_ok = True
 
     def batch_size(self):
         return self.rows
 
     def is_empty(self):
         return not self.rows
+
+    def check_decode_mem(self):
+        return self.decode_mem_ok
+
+    def copy(self):
+        copied = Batch(self.rows, self.forward_mode)
+        copied.enable_overlap = self.enable_overlap
+        copied.decode_mem_ok = self.decode_mem_ok
+        return copied
 
 
 def scheduler_class(extra=None):
@@ -437,7 +450,7 @@ class StopLoop(Exception):
 
 
 class TestActualLoop(unittest.TestCase):
-    def run_rank(self, rank):
+    def run_rank(self, rank, memory_pressure=False, finish_on_first=False):
         trace, current = [], {"idx": 0, "lane": None}
 
         class Stream:
@@ -445,7 +458,11 @@ class TestActualLoop(unittest.TestCase):
                 self.lane = lane
 
             def record_event(self):
-                event = NS(query=lambda: True, name=(self.lane, len(trace)))
+                event = NS(
+                    query=lambda: True,
+                    synchronize=lambda: trace.append(("event_sync", self.lane)),
+                    name=(self.lane, len(trace)),
+                )
                 trace.append(("record", event.name))
                 return event
 
@@ -494,7 +511,7 @@ class TestActualLoop(unittest.TestCase):
         )
         s = scheduler_config(cls())
         s.ps = NS(attn_dp_size=2, tp_size=2)
-        s.model_config = NS(num_hidden_layers=3)
+        s.model_config = NS(num_hidden_layers=1 if finish_on_first else 3)
         s.pdmux_config.split_forward_token_budget = 2048
         s.split_prefill_batch = None
         s.HICACHE_PUMP_INTERVAL = 16
@@ -508,12 +525,21 @@ class TestActualLoop(unittest.TestCase):
         s.process_pending_chunked_abort = lambda: None
         s.check_hicache_events_if_enabled = lambda: False
         s.on_idle = Mock()
+        s.spec_algorithm = NS(is_none=lambda: True)
+        s.device_module = NS(
+            Event=lambda: NS(synchronize=lambda: trace.append(("copy_sync",)))
+        )
+        s.copy_stream = Stream("copy")
+        s.copy_stream_ctx = stream_context(s.copy_stream)
+        s._launch_result_copy = lambda result, **kw: trace.append(("copy",))
         tick = {"n": -1}
 
         def ingest():
             tick["n"] += 1
             if tick["n"] == 2:
                 raise StopLoop
+            if tick["n"] == 1 and memory_pressure:
+                s.running_batch.decode_mem_ok = False
             trace.append(("ingest", tick["n"]))
 
         s.request_receiver = NS(recv_requests=ingest)
@@ -535,7 +561,12 @@ class TestActualLoop(unittest.TestCase):
             return batch
 
         s.dp_attn_adapter = NS(maybe_prepare_mlp_sync_batch=sync_batch)
-        s.update_running_batch = lambda b: b
+
+        def update_running_batch(batch):
+            trace.append(("update_running", batch.enable_overlap))
+            return batch
+
+        s.update_running_batch = update_running_batch
 
         def run(batch):
             trace.append(
@@ -546,7 +577,12 @@ class TestActualLoop(unittest.TestCase):
                     getattr(batch, "split_forward_count", None),
                 )
             )
-            return object()
+            return NS(
+                has_sampled_token_ids=(
+                    batch is not s.split_prefill_batch and batch.forward_mode is Mode.DECODE
+                ),
+                copy_done=None,
+            )
 
         s.run_batch = run
 
@@ -593,6 +629,17 @@ class TestActualLoop(unittest.TestCase):
             first_wait = next(x for x in trace if x[0] == "wait")
             self.assertEqual(first_wait[1], "p0")
             self.assertEqual(first_wait[2][0], "d0")
+
+    def test_memory_pressure_processes_pending_decode_before_retraction(self):
+        trace = self.run_rank(1, memory_pressure=True)
+        second_ingest = trace.index(("ingest", 1))
+        process = trace.index(("process_decode",), second_ingest)
+        update = trace.index(("update_running", True), second_ingest)
+        self.assertLess(process, update)
+
+    def test_prefill_merge_processes_current_decode_first(self):
+        trace = self.run_rank(1, finish_on_first=True)
+        self.assertLess(trace.index(("process_decode",)), trace.index(("merge",)))
 
 
 if __name__ == "__main__":
