@@ -50,7 +50,11 @@ import tqdm
 from sglang.kernels.ops.kvcache.kv_indices import (
     create_chunked_prefix_cache_kv_indices,
 )
-from sglang.srt.distributed.parallel_state import graph_capture
+from sglang.srt.distributed.parallel_state import (
+    graph_capture,
+    is_pdmux_prefill_enabled,
+    set_pdmux_status,
+)
 from sglang.srt.layers.attention.dsa.utils import is_dsa_enable_prefill_cp
 from sglang.srt.layers.cp.bcg import (
     PrefillCPBCGInput,
@@ -112,6 +116,11 @@ from sglang.srt.model_executor.runner_backend_utils.tc_piecewise_cuda_graph impo
 from sglang.srt.model_executor.runner_utils import maybe_publish_prefill_war_read_done
 from sglang.srt.model_executor.runner_utils.buffers import (
     PrefillInputBuffers,
+)
+from sglang.srt.multiplex.pdmux_context import (
+    get_current_stream_idx,
+    get_stream_groups,
+    set_current_stream_idx,
 )
 from sglang.srt.model_loader.utils import resolve_language_model
 from sglang.srt.runtime_context import get_parallel, get_schedule
@@ -262,6 +271,12 @@ class PrefillCudaGraphRunner(BaseCudaGraphRunner):
         # --- prefill graph config -------------------------------------
         prefill_config = model_runner.server_args.cuda_graph_config.prefill
         self.prefill_backend_name = prefill_config.backend
+        self.pdmux_split = (
+            self.enable_pdmux
+            and not self.pdmux_standard
+            and not model_runner.is_draft_worker
+            and self.prefill_backend_name == Backend.BREAKABLE
+        )
         # bs in prefill carries the captured shape (token count for
         # tc_piecewise) — one shape knob per phase.
         capture_tokens = prefill_config.bs
@@ -809,7 +824,15 @@ class PrefillCudaGraphRunner(BaseCudaGraphRunner):
             captured_n = self._select_prefix_capture_chunks(forward_batch)
             assert captured_n is not None, "prefix batch has no captured FullCG variant"
             variant = _chunked_prefix_variant(captured_n)
-        return ShapeKey(size=num_tokens, variant_label=variant)
+        return ShapeKey(
+            size=num_tokens,
+            stream_idx=(
+                get_current_stream_idx()
+                if getattr(self, "pdmux_split", False)
+                else None
+            ),
+            variant_label=variant,
+        )
 
     def _create_chunked_prefix_buffers(self) -> _ChunkedPrefixCaptureBuffers:
         """Allocate the stable chunk-metadata tensors shared by all variants."""
@@ -1134,6 +1157,15 @@ class PrefillCudaGraphRunner(BaseCudaGraphRunner):
         # layer_model.forward monkey-patch in replay(): the captured graph runs
         # the transformer stack, then the outer model.forward runs
         # logits_processor eagerly on top with live request metadata.
+        if getattr(self, "pdmux_split", False):
+            # A graph captured on the prefill-only stream cannot replay on a
+            # green-context lane with a different SM partition.
+            graph_size = self._pad_to_bucket(
+                len(forward_batch.input_ids), self.capture_num_tokens
+            )
+            return self.backend.has_captured_key(
+                self._shape_key(graph_size, forward_batch)
+            )
         return True
 
     def _build_capture_spec_info(self, num_tokens: int):
@@ -1296,10 +1328,29 @@ class PrefillCudaGraphRunner(BaseCudaGraphRunner):
         # decode + prefill runners; see BaseRunner.warmup).
         self.warmup()
         with freeze_gc(self.model_runner.server_args.enable_cudagraph_gc):
-            with graph_capture() as graph_capture_context:
-                self.stream = graph_capture_context.stream
-                with self.backend.capture_session(self.stream):
-                    self._capture_one_stream()
+            if self.pdmux_split:
+                # A CUDA graph retains its capture stream's resource context.
+                # The unsplit fast path runs only on the prefill-only lane (0).
+                logger.info(
+                    "Capturing PDMux whole-prefill BCG on prefill-only lane 0"
+                )
+                original_stream_idx = get_current_stream_idx()
+                original_pdmux_status = is_pdmux_prefill_enabled()
+                try:
+                    set_current_stream_idx(0)
+                    set_pdmux_status(True)
+                    with graph_capture(stream=get_stream_groups()[0][0]) as ctx:
+                        self.stream = ctx.stream
+                        with self.backend.capture_session(self.stream):
+                            self._capture_one_stream()
+                finally:
+                    set_pdmux_status(original_pdmux_status)
+                    set_current_stream_idx(original_stream_idx)
+            else:
+                with graph_capture() as graph_capture_context:
+                    self.stream = graph_capture_context.stream
+                    with self.backend.capture_session(self.stream):
+                        self._capture_one_stream()
 
     def _capture_one_stream(self) -> None:
         avail_mem = get_available_gpu_memory(
@@ -1351,14 +1402,13 @@ class PrefillCudaGraphRunner(BaseCudaGraphRunner):
                 "limits; the graph would read stale LoRA metadata at replay."
             )
             lora_manager.prepare_lora_batch(forward_batch)
-        shape_key = ShapeKey(
-            size=num_tokens,
-            variant_label=(
-                _chunked_prefix_variant(prefix_num_chunks)
-                if prefix_num_chunks
-                else None
-            ),
-        )
+        shape_key = self._shape_key(num_tokens, forward_batch)
+        if prefix_num_chunks:
+            shape_key = ShapeKey(
+                size=num_tokens,
+                stream_idx=shape_key.stream_idx,
+                variant_label=_chunked_prefix_variant(prefix_num_chunks),
+            )
         if prefix_num_chunks:
             self._prepare_chunked_prefix_capture(
                 forward_batch, shape_key, prefix_num_chunks
@@ -1477,16 +1527,18 @@ class PrefillCudaGraphRunner(BaseCudaGraphRunner):
             else forward_batch.num_token_non_padded
         )
 
-        # Normalize MIXED→EXTEND so dynamo's guard (captured with EXTEND=1)
-        # doesn't fail on MIXED=3.
+        # Normalize MIXED / a whole-model SPLIT_PREFILL to the captured
+        # EXTEND mode. A partial split never reaches this runner.
         pcg_forward_mode = (
             ForwardMode.EXTEND
-            if forward_batch.forward_mode == ForwardMode.MIXED
+            if forward_batch.forward_mode
+            in (ForwardMode.MIXED, ForwardMode.SPLIT_PREFILL)
             else forward_batch.forward_mode
         )
         pcg_global_forward_mode = (
             ForwardMode.EXTEND
-            if forward_batch.global_forward_mode == ForwardMode.MIXED
+            if forward_batch.global_forward_mode
+            in (ForwardMode.MIXED, ForwardMode.SPLIT_PREFILL)
             else forward_batch.global_forward_mode
         )
 

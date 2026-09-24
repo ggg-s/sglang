@@ -13,6 +13,9 @@ from sglang.srt.model_executor.forward_batch_info import CaptureHiddenMode
 from sglang.srt.model_executor.model_runner_components.cuda_graph_setup import (
     capture_prefill_graph,
 )
+from sglang.srt.model_executor.model_runner import (
+    _can_replay_whole_split_prefill,
+)
 from sglang.srt.model_executor.runner.prefill_cuda_graph_runner import (
     PrefillCudaGraphRunner,
 )
@@ -61,6 +64,55 @@ class _FakeKVIndexKernel:
 
 
 class TestPrefillCudaGraphRunnerChunkedPrefix(CustomTestCase):
+    def test_split_prefill_requires_the_complete_first_interval(self):
+        graph = SimpleNamespace(pdmux_split=True, can_run_graph=lambda batch: True)
+        batch = SimpleNamespace(
+            forward_mode=SimpleNamespace(is_split_prefill=lambda: True),
+            split_index=0,
+        )
+        with patch(
+            "sglang.srt.model_executor.model_runner."
+            "_prefill_cuda_graph_allows_context_parallel",
+            return_value=True,
+        ):
+            self.assertTrue(_can_replay_whole_split_prefill(batch, 61, 61, graph))
+            self.assertFalse(_can_replay_whole_split_prefill(batch, 1, 61, graph))
+            batch.split_index = 1
+            self.assertFalse(_can_replay_whole_split_prefill(batch, 60, 61, graph))
+            batch.split_index = 0
+            self.assertFalse(_can_replay_whole_split_prefill(batch, 61, 61, None))
+
+    def test_pdmux_split_graph_replays_only_on_captured_prefill_lane(self):
+        runner = PrefillCudaGraphRunner.__new__(PrefillCudaGraphRunner)
+        runner.pdmux_split = True
+        runner._is_full_backend = False
+        runner.enable_lora = False
+        runner._capture_chunked_prefix = False
+        runner.prefill_backend_name = Backend.BREAKABLE
+        runner.has_mha_companion_layers = False
+        runner.capture_hidden_mode = CaptureHiddenMode.NULL
+        runner.capture_num_tokens = [4, 8]
+        runner.max_num_tokens = 8
+        runner.backend = SimpleNamespace(
+            has_captured_key=lambda key: key == ShapeKey(size=8, stream_idx=0)
+        )
+        batch = SimpleNamespace(
+            batch_size=1,
+            input_ids=[1] * 5,
+            input_embeds=None,
+            replace_embeds=None,
+            forward_mode=SimpleNamespace(is_target_verify=lambda: False),
+            capture_hidden_mode=CaptureHiddenMode.NULL,
+            global_num_tokens_cpu=None,
+            return_logprob=False,
+            extend_prefix_lens_cpu=[0],
+        )
+
+        with patch.object(runner_module, "get_current_stream_idx", return_value=0):
+            self.assertTrue(runner.can_run_graph(batch))
+        with patch.object(runner_module, "get_current_stream_idx", return_value=1):
+            self.assertFalse(runner.can_run_graph(batch))
+
     def test_low_free_memory_still_captures_prefill_graph(self):
         eager_runner = object()
         prefill_runner = object()
