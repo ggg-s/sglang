@@ -2156,7 +2156,9 @@ class Scheduler(
         self.batch_result_processor = SchedulerBatchResultProcessor(
             is_generation=self.is_generation,
             disaggregation_mode=self.disaggregation_mode,
-            enable_overlap=self.enable_overlap,
+            enable_overlap=self.enable_overlap or (
+                self.enable_pdmux and not self.pdmux_standard
+            ),
             enable_overlap_mlx=self.enable_overlap_mlx,
             server_args=self.server_args,
             model_config=self.model_config,

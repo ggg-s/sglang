@@ -488,8 +488,8 @@ class SchedulerMultiplexMixin:
         running_batch: ScheduleBatch,
         decode_done=None,
     ) -> ScheduleBatch:
-        # Result processing enqueues device writes AFTER decode.synchronize().
-        # Merge/allocator work on the prefill lane must follow those writes.
+        # Result processing can run while the next decode is in flight.
+        # Merge/allocator work on the prefill lane must follow both.
         if decode_done is not None:
             prefill_stream.wait_event(decode_done)
         if running_batch is not None and not running_batch.is_empty():
@@ -601,6 +601,7 @@ class SchedulerMultiplexMixin:
     def event_loop_pdmux_layer_split(self: Scheduler):
         """A scheduler loop for pd multiplexing."""
         decode_done = False
+        pending_decode = None
         prefill_done = False
         wait_prefill_kernel_done = False
         adjust_stream_group = False
@@ -616,6 +617,28 @@ class SchedulerMultiplexMixin:
         logger.debug("Starting event loop for pd multiplexing...")
 
         while True:
+            # Grammar and penalties consume the previous token on the CPU while
+            # preparing the next forward. They cannot use the one-step relay.
+            if pending_decode is not None and (
+                not self.spec_algorithm.is_none()
+                or (
+                    self.running_batch is not None
+                    and (
+                        self.running_batch.has_grammar
+                        or (
+                            self.running_batch.sampling_info is not None
+                            and self.running_batch.sampling_info.penalizer_orchestrator.is_required
+                        )
+                    )
+                )
+            ):
+                batch, result = pending_decode
+                result.copy_done.synchronize()
+                with torch.cuda.stream(decode_stream):
+                    set_pdmux_status(False)
+                    self.process_batch_result(batch, result)
+                pending_decode = None
+
             with torch.cuda.stream(decode_stream):
                 set_pdmux_status(False)
                 if carried_batch_pending and not self.running_batch.is_empty():
@@ -743,6 +766,28 @@ class SchedulerMultiplexMixin:
                 carried_batch_pending = False
                 if decode_batch is not None:
                     decode_result = self.run_batch(decode_batch)
+                    decode_result_batch = decode_batch.copy()
+                    overlap_decode = (
+                        self.spec_algorithm.is_none()
+                        and decode_result.has_sampled_token_ids
+                        and not decode_batch.has_grammar
+                        and not (
+                            decode_batch.sampling_info is not None
+                            and decode_batch.sampling_info.penalizer_orchestrator.is_required
+                        )
+                    )
+                    if overlap_decode:
+                        decode_result.copy_done = self.device_module.Event()
+                        self._launch_result_copy(
+                            decode_result,
+                            return_logprob=decode_batch.return_logprob,
+                            return_hidden_states=decode_batch.return_hidden_states,
+                            forward_stream=decode_stream,
+                            copy_stream=self.copy_stream,
+                            copy_stream_ctx=self.copy_stream_ctx,
+                        )
+                    elif decode_result.copy_done is None:
+                        decode_result.copy_done = decode_stream.record_event()
                     decode_done = True
                 else:
                     decode_done = False
@@ -776,9 +821,17 @@ class SchedulerMultiplexMixin:
 
             with torch.cuda.stream(decode_stream):
                 set_pdmux_status(False)
-                decode_stream.synchronize()
+                if pending_decode is not None:
+                    batch, result = pending_decode
+                    result.copy_done.synchronize()
+                    self.process_batch_result(batch, result)
+                pending_decode = None
                 if decode_done:
-                    self.process_batch_result(decode_batch, decode_result)
+                    if overlap_decode:
+                        pending_decode = (decode_result_batch, decode_result)
+                    else:
+                        decode_result.copy_done.synchronize()
+                        self.process_batch_result(decode_result_batch, decode_result)
                 decode_result_done = decode_stream.record_event()
 
             with torch.cuda.stream(prefill_stream):
