@@ -207,6 +207,18 @@ class AttentionBackend(ABC):
         """The mask the draft stage fills in place, if this backend has one."""
         return None
 
+    def on_after_cuda_graph_capture(self):
+        """Hook immediately after a CUDA graph capture finishes."""
+        pass
+
+    def get_verify_buffers_to_fill_after_draft(self):
+        """
+        Return buffers of verify attention kernels that needs to be filled after draft.
+
+        Typically, these are tree mask and position buffers.
+        """
+        return [None, None]
+
     def update_verify_buffers_to_fill_after_draft(
         self, spec_info: SpecInput, cuda_graph_bs: Optional[int]
     ):

@@ -3909,6 +3909,10 @@ class ServerArgs:
                     "communication backend (it removes the head-dim Q all-gather); "
                     f"got --dcp-comm-backend={self.dcp_comm_backend}."
                 )
+        if self.dcp_size > 1 and not (is_hip() or is_cuda()):
+            raise ValueError(
+                "Decode context parallel (--dcp-size > 1) requires HIP or CUDA."
+            )
 
     def _handle_load_balance_method(self):
         if self.disaggregation_mode not in ("null", "prefill", "decode"):
@@ -8892,6 +8896,30 @@ class ServerArgs:
                 "parallelism: allocatable slots per microbatch are bounded by "
                 "pp-max-micro-batch-size, so the threshold may never be reached"
             )
+
+        if self.dcp_size > 1:
+            assert (
+                self.tp_size % self.dcp_size == 0
+            ), f"tp_size ({self.tp_size}) must be divisible by dcp_size ({self.dcp_size})"
+            assert (
+                self.pp_size == 1
+            ), "Decode context parallelism is not compatible with pipeline parallelism"
+            # DCP + PD disaggregation: only the mooncake transfer backend
+            # has been adapted to the per-rank physical offset remap
+            # (token-level RDMA path). Other backends still address GPU
+            # buffers using the cluster-wide global loc and would silently
+            # corrupt the transferred KV cache. Backends without DCP
+            # support also bail out at runtime via
+            # ``CommonKVManager._check_dcp_compat``; this assertion is the
+            # earlier, friendlier failure.
+            if self.disaggregation_mode != "null":
+                assert self.disaggregation_transfer_backend == "mooncake", (
+                    "Decode context parallelism (--dcp-size > 1) with PD "
+                    "disaggregation only supports "
+                    "--disaggregation-transfer-backend=mooncake right now "
+                    f"(got {self.disaggregation_transfer_backend!r}). Use "
+                    "--dcp-size 1 or switch to mooncake."
+                )
 
         assert not (
             self.dp_size > 1 and self.nnodes != 1 and not self.enable_dp_attention

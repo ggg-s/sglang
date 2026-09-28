@@ -967,12 +967,34 @@ class ForwardBatch(ForwardBatchDeepSeekMHAMixin):
         if (
             model_runner.ps.attn_dcp_size > 1
             and ret.out_cache_loc is not None
-            and is_hip()
         ):
-            ret.dcp_kv_mask = (
-                ret.positions % model_runner.ps.attn_dcp_size
-                == model_runner.ps.attn_dcp_rank
-            )
+            dcp_positions = ret.positions
+            if (
+                dcp_positions is not None
+                and dcp_positions.numel() != ret.out_cache_loc.numel()
+                and ret.forward_mode.is_target_verify()
+            ):
+                bs = len(batch.seq_lens)
+                num_verify_tokens = ret.out_cache_loc.numel() // bs
+                if num_verify_tokens * bs == ret.out_cache_loc.numel():
+                    offsets = torch.arange(
+                        num_verify_tokens,
+                        dtype=batch.seq_lens.dtype,
+                        device=device,
+                    )
+                    dcp_positions = (
+                        batch.seq_lens[:, None] + offsets[None, :]
+                    ).reshape(-1)
+            if (
+                dcp_positions is not None
+                and dcp_positions.numel() == ret.out_cache_loc.numel()
+            ):
+                ret.dcp_kv_mask = (
+                    dcp_positions % model_runner.ps.attn_dcp_size
+                    == model_runner.ps.attn_dcp_rank
+                )
+            else:
+                ret.dcp_kv_mask = None
 
         return ret
 
@@ -1480,6 +1502,8 @@ class ForwardBatch(ForwardBatchDeepSeekMHAMixin):
         if self.encoder_lens is not None:
             self.encoder_lens = self._pad_tensor_to_size(self.encoder_lens, bs)
         self.positions = self._pad_tensor_to_size(self.positions, num_tokens)
+        if self.dcp_kv_mask is not None:
+            self.dcp_kv_mask = self._pad_tensor_to_size(self.dcp_kv_mask, num_tokens)
         if self.mamba_track_indices is not None:
             self.mamba_track_indices = self._pad_tensor_to_size(
                 self.mamba_track_indices, bs
@@ -1598,6 +1622,8 @@ class ForwardBatch(ForwardBatchDeepSeekMHAMixin):
                 logits_output.hidden_states = logits_output.hidden_states[:num_tokens]
             elif self.forward_mode.is_target_verify():  # verify
                 num_tokens = bs * self.spec_info.num_tokens_per_req
+                if self.dcp_kv_mask is not None:
+                    self.dcp_kv_mask = self.dcp_kv_mask[:num_tokens]
                 if logits_output.next_token_logits is not None:
                     logits_output.next_token_logits = logits_output.next_token_logits[
                         :num_tokens
