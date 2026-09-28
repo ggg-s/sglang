@@ -38,6 +38,7 @@ from sglang.srt.model_executor.runner_backend_utils.breakable_cuda_graph import 
     BreakableCUDAGraphCapture,
     eager_on_graph,
     enable_breakable_cuda_graph,
+    split_layer_capture_context,
 )
 from sglang.srt.model_executor.runner_utils.pool import (
     get_or_create_global_graph_memory_pool,
@@ -70,6 +71,9 @@ class BreakableCudaGraphBackend(DedupedCudaGraphMixin, BaseCudaGraphBackend):
         self._outputs: Dict[Any, Any] = {}
         self._capture_inputs: Dict[Any, Any] = {}
         self._pool = None
+        self._split_layer_capture = bool(
+            getattr(cuda_graph_runner, "pdmux_segmented", False)
+        )
         self._device_module = cuda_graph_runner.device_module
         self._tp_group = cuda_graph_runner.model_runner.tp_group
         self._capture_stream: Optional[torch.cuda.Stream] = None
@@ -90,19 +94,31 @@ class BreakableCudaGraphBackend(DedupedCudaGraphMixin, BaseCudaGraphBackend):
     @contextmanager
     def capture_session(self, stream: torch.cuda.Stream):
         if self._pool is None:
-            self._pool = get_or_create_global_graph_memory_pool(self._device_module)
+            # Split prefill yields to decode between graph segments. The shared
+            # prefill/decode pool is safe only for whole-forward replays: a
+            # decode graph could overwrite an in-flight layer's activations.
+            self._pool = (
+                self._device_module.graph_pool_handle()
+                if self._split_layer_capture
+                else get_or_create_global_graph_memory_pool(self._device_module)
+            )
         set_graph_pool_id(self._pool)
         self._capture_stream = stream
         self._shared_output_buffer = None
         self.begin_cuda_graph_capture()
         try:
-            with self.replay_session():
-                yield
+            with split_layer_capture_context(self._split_layer_capture):
+                with self.replay_session():
+                    yield
         finally:
             try:
                 self.end_cuda_graph_capture()
             finally:
                 self._capture_stream = None
+                if self._split_layer_capture:
+                    set_graph_pool_id(
+                        get_or_create_global_graph_memory_pool(self._device_module)
+                    )
 
     def capture_one(
         self,
@@ -120,6 +136,7 @@ class BreakableCudaGraphBackend(DedupedCudaGraphMixin, BaseCudaGraphBackend):
                 post_warmup_hook()
 
         graph = BreakableCUDAGraph(self.deduped_cuda_graph)
+        graph.capture_split_layers = self._split_layer_capture
         captured_fn = (
             eager_on_graph(True)(forward_fn) if self._debug_eager else forward_fn
         )
@@ -237,6 +254,12 @@ class BreakableCudaGraphBackend(DedupedCudaGraphMixin, BaseCudaGraphBackend):
     def has_captured_key(self, shape_key: ShapeKey) -> bool:
         return shape_key in self._graphs
 
+    def has_split_layers(self, shape_key: ShapeKey, num_layers: int) -> bool:
+        graph = self._graphs.get(shape_key)
+        return graph is not None and all(
+            i in graph.split_layer_segments for i in range(num_layers + 1)
+        )
+
     @contextmanager
     def replay_session(self):
         with enable_breakable_cuda_graph():
@@ -249,6 +272,26 @@ class BreakableCudaGraphBackend(DedupedCudaGraphMixin, BaseCudaGraphBackend):
         **kwargs,
     ) -> Any:
         self._graphs[shape_key].replay()
+        return self._outputs[shape_key]
+
+    def replay_split_layers(
+        self, shape_key: ShapeKey, start_layer: int, end_layer: int, num_layers: int
+    ) -> Any:
+        """Replay an interval of a captured DSV4 forward on one prefill lane."""
+        graph = self._graphs[shape_key]
+        markers = graph.split_layer_segments
+        if start_layer not in markers or end_layer not in markers:
+            raise RuntimeError(
+                f"BCG {shape_key} lacks split markers [{start_layer}, {end_layer}]"
+            )
+        start_segment = 0 if start_layer == 0 else markers[start_layer]
+        end_segment = markers[end_layer]
+        graph.replay_segments(start_segment, end_segment)
+        if end_layer != num_layers:
+            return None
+        # Complete the captured body tail (mHC post, head, norm and output
+        # copy) only after the final split interval.
+        graph.replay_segments(end_segment, len(graph._segments))
         return self._outputs[shape_key]
 
     def cleanup(self) -> None:

@@ -118,8 +118,10 @@ from sglang.srt.model_executor.runner import (
     compile_in_capture_mode,
     get_is_capture_mode,
 )
-from sglang.srt.model_executor.runner_backend_utils.breakable_cuda_graph.breakable_cuda_graph import (
+from sglang.srt.model_executor.runner_backend_utils.breakable_cuda_graph import (
     eager_on_graph,
+    is_split_layer_capture_enabled,
+    mark_split_layer_boundary,
 )
 from sglang.srt.model_executor.runner_backend_utils.breakable_cuda_graph.context import (
     is_in_breakable_cuda_graph,
@@ -2503,7 +2505,11 @@ class DeepseekV4Model(nn.Module):
         # DSpark aux capture needs the per-layer eager loop (TBO's overlapped
         # execution cannot expose per-layer completed hidden states), so skip
         # TBO when capturing -- a perf-only downgrade, not a correctness one.
-        if self._can_run_tbo(forward_batch) and not capture_dspark:
+        if (
+            self._can_run_tbo(forward_batch)
+            and not capture_dspark
+            and not is_split_layer_capture_enabled()
+        ):
             # Two-batch-overlap prefill (EP / mori). Cross-layer mHC fusion is
             # disabled here (each layer self-contained), so no trailing hc_post.
             hidden_states = self._forward_layers_tbo(
@@ -2515,6 +2521,12 @@ class DeepseekV4Model(nn.Module):
             use_fused = self.use_fused_mhc_post_pre
             prev_residual, prev_post, prev_comb = None, None, None
             last_layer = None
+            split_graph_markers = (
+                is_split_layer_capture_enabled()
+                and forward_batch.forward_mode.is_extend()
+            )
+            if split_graph_markers:
+                mark_split_layer_boundary(self.start_layer)
             for i in range(self.start_layer, self.end_layer):
                 layer = self.layers[i]
                 last_layer = layer
@@ -2542,6 +2554,8 @@ class DeepseekV4Model(nn.Module):
                     else:
                         completed = hidden_states
                     dspark_aux_hidden_states.append(completed.mean(dim=1))
+                if split_graph_markers:
+                    mark_split_layer_boundary(i + 1)
             if use_fused and last_layer is not None:
                 hidden_states = last_layer.hc_post(
                     hidden_states, prev_residual, prev_post, prev_comb
@@ -2713,6 +2727,7 @@ class DeepseekV4Model(nn.Module):
 
 class DeepseekV4ForCausalLM(nn.Module):
     supports_pdmux_dspark_prefill = True
+    supports_pdmux_split_bcg = True
 
     def __init__(
         self,

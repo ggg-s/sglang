@@ -11,9 +11,9 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 # ==============================================================================
-"""Process-wide CUDA graph memory pool shared across the prefill and
-decode graph backends. The two phases never replay concurrently, so
-sharing one pool reserves only the larger phase's capture footprint.
+"""Process-wide CUDA graph memory pool shared across ordinary prefill and
+decode graph backends. PDMux split prefill uses a separate pool because its
+graph segments can be interleaved with decode replay.
 """
 
 from __future__ import annotations

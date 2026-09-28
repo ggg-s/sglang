@@ -680,6 +680,7 @@ class TpModelWorker(BaseTpWorker):
                 capture_hidden_mode=capture_hidden_mode,
                 return_hidden_states_before_norm=False,
             )
+            forward_batch.pdmux_hicache_consumer_index = batch.hicache_consumer_index
             batch.split_forward_batch = forward_batch
 
         out = self.model_runner.forward(
