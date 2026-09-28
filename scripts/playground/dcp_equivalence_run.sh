@@ -1,7 +1,9 @@
 #!/usr/bin/env bash
-# DeepSeek-V4-Flash DCP equivalence regression on one 8x H100 node.
+# DeepSeek-V4-Flash + DSpark DCP equivalence regression on one 8x H100 node.
 #
-# Baseline and candidate each use all eight GPUs, so run them in sequence.
+# Baseline uses TP8/DP8/DCP1; candidate uses TP8/DP4/DCP2. Both use DSpark.
+# Set SPECULATIVE_ALGORITHM=none to test the target without draft decoding.
+# Each run uses all eight GPUs, so run them in sequence.
 #
 # Typical workflow:
 #   ACTION=serve-baseline bash scripts/playground/dcp_equivalence_run.sh
@@ -26,8 +28,10 @@ mkdir -p "${LOG_DIR}"
 
 ACTION="${ACTION:-serve-candidate}"
 MODEL_PATH="${MODEL_PATH:-deepseek-ai/DeepSeek-V4-Flash}"
+DRAFT_MODEL_PATH="${DRAFT_MODEL_PATH:-deepseek-ai/DeepSeek-V4-Flash-DSpark}"
 TP_SIZE="${TP_SIZE:-8}"
-DP_SIZE="${DP_SIZE:-4}"
+BASELINE_DP_SIZE="${BASELINE_DP_SIZE:-8}"
+CANDIDATE_DP_SIZE="${CANDIDATE_DP_SIZE:-4}"
 DCP_SIZE="${DCP_SIZE:-2}"
 NNODES="${NNODES:-1}"
 NODE_RANK="${NODE_RANK:-0}"
@@ -41,6 +45,7 @@ NUM_PROMPTS="${NUM_PROMPTS:-8}"
 MAX_TOKENS="${MAX_TOKENS:-256}"
 CONCURRENCY="${CONCURRENCY:-8}"
 EXTRA_ARGS="${EXTRA_ARGS:-}"
+SPECULATIVE_ALGORITHM="${SPECULATIVE_ALGORITHM:-DSPARK}"
 
 COMMON_ENV=(SGLANG_OPT_USE_ONLINE_COMPRESS=0)
 
@@ -48,14 +53,12 @@ COMMON_SERVER_ARGS=(
   --trust-remote-code
   --model-path "${MODEL_PATH}"
   --tp "${TP_SIZE}"
-  --dp-size "${DP_SIZE}"
   --enable-dp-attention
-  --cuda-graph-max-bs 128
-  --max-running-requests 256
+  --max-running-requests 16
   --enable-metrics
   --host "${HOST}"
   --port "${PORT}"
-  --mem-fraction-static 0.75
+  --mem-fraction-static 0.7
   --moe-runner-backend marlin
   --moe-a2a-backend none
   --dist-init-addr "${DIST_INIT_ADDR}"
@@ -70,9 +73,11 @@ COMMON_SERVER_ARGS=(
 run_server() {
   local dcp_size="$1"
   local label="$2"
+  local dp_size="$3"
   local logfile="${LOG_DIR}/${label}_node${NODE_RANK}_dcp${dcp_size}.log"
   local dcp_env=()
   local dcp_args=()
+  local spec_args=()
 
   if [[ "${dcp_size}" -gt 1 ]]; then
     dcp_env=(SGLANG_DSV4_ENABLE_DCP=1)
@@ -80,14 +85,23 @@ run_server() {
   else
     dcp_args=(--dcp-size 1)
   fi
+  if [[ "${SPECULATIVE_ALGORITHM}" == "DSPARK" ]]; then
+    spec_args=(
+      --speculative-algorithm DSPARK
+      --speculative-draft-model-path "${DRAFT_MODEL_PATH}"
+      --enable-dp-lm-head
+    )
+  fi
 
-  echo "[serve] label=${label} node_rank=${NODE_RANK} dcp_size=${dcp_size}"
+  echo "[serve] label=${label} node_rank=${NODE_RANK} dp_size=${dp_size} dcp_size=${dcp_size} spec=${SPECULATIVE_ALGORITHM}"
   echo "[serve] log=${logfile}"
   # shellcheck disable=SC2086
   env "${COMMON_ENV[@]}" "${dcp_env[@]}" \
     sglang serve \
     "${COMMON_SERVER_ARGS[@]}" \
+    --dp-size "${dp_size}" \
     "${dcp_args[@]}" \
+    "${spec_args[@]}" \
     ${EXTRA_ARGS} \
     2>&1 | tee "${logfile}"
 }
@@ -98,10 +112,10 @@ run_check() {
 
 case "${ACTION}" in
   serve-baseline)
-    run_server 1 baseline
+    run_server 1 baseline "${BASELINE_DP_SIZE}"
     ;;
   serve-candidate)
-    run_server "${DCP_SIZE}" "candidate"
+    run_server "${DCP_SIZE}" "candidate" "${CANDIDATE_DP_SIZE}"
     ;;
   capture-baseline)
     run_check \

@@ -17,6 +17,7 @@ from sglang.kernels.ops.speculative.dspark.dspark_draft_model import (
     CommitKvProj,
 )
 from sglang.srt.configs.deepseek_v4 import DeepSeekV4Config
+from sglang.srt.distributed.parallel_state import get_dcp_group_no_assert
 from sglang.srt.environ import envs
 from sglang.srt.layers.layernorm import RMSNorm
 from sglang.srt.layers.logits_processor import LogitsProcessorOutput
@@ -110,6 +111,12 @@ class DSparkAttention(MqaAttentionBase):
         assert (
             self.compress_ratio == 0
         ), "DSpark draft attention requires compress_ratio == 0."
+        # The draft MoE still spans the full TP group under DP attention, while
+        # its attention heads are sharded only within an attention-TP group.
+        # RowParallelLinear otherwise reduces wo_b across full TP and mixes
+        # different DP requests when attn_tp_size > 1.
+        if get_parallel().attn_dp_size > 1 and self.attn_tp_size > 1:
+            self.wo_b.use_dp_attention_reduce = True
         self.window_size = int(
             getattr(config, "sliding_window", None) or config.window_size
         )
@@ -163,6 +170,8 @@ class DSparkAttention(MqaAttentionBase):
             eps=self.eps,
             freqs_cis=self.freqs_cis,
             positions=positions,
+            dcp_kv_mask=forward_batch.dcp_kv_mask,
+            raw_loc=forward_batch.out_cache_loc,
         )
 
     def _compute_q(
@@ -242,9 +251,29 @@ class DSparkAttention(MqaAttentionBase):
             )
             q = self._compute_q(hidden_states, positions, q_out=q_out)
 
-        if q_padded is not None:
-            q = q_padded
-        attn_sink = self._local_attn_sink()
+        dcp_group = get_dcp_group_no_assert()
+        if dcp_group is not None and dcp_group.world_size > 1:
+            if dcp_group.world_size != self.attn_tp_size:
+                raise ValueError(
+                    "DSpark DCP requires the DCP group to match attention TP: "
+                    f"dcp={dcp_group.world_size}, attn_tp={self.attn_tp_size}."
+                )
+            # Every DCP rank evaluates the same heads against its local KV
+            # shard. The backend merges their LSEs and reduce-scatters heads.
+            q = dcp_group.all_gather(q.contiguous(), dim=1)
+            attn_sink = dcp_group.all_gather(
+                self._local_attn_sink()[: self.n_local_heads].contiguous(), dim=0
+            )
+            if dcp_group.rank_in_group != 0:
+                # The attention sink is a single virtual KV item. Count it
+                # once across DCP ranks during the online-softmax merge.
+                attn_sink = torch.full_like(
+                    attn_sink, torch.finfo(attn_sink.dtype).min
+                )
+        else:
+            if q_padded is not None:
+                q = q_padded
+            attn_sink = self._local_attn_sink()
 
         o = attn_backend.forward(
             q=q,

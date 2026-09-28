@@ -597,6 +597,25 @@ class TestDSV4BreakableCudaGraphMetadataContract(CustomTestCase):
         self.assertIs(calls[0][0][1], swa_loc)
         self.assertEqual(calls[0][1]["write_mask"].tolist(), [True, False])
 
+    def test_dspark_injected_swa_slot_zero_and_rejected_token(self):
+        from sglang.srt.mem_cache.deepseek_v4_memory_pool import (
+            DeepSeekV4TokenToKVPool,
+        )
+
+        mask = DeepSeekV4TokenToKVPool._dcp_swa_write_mask(
+            swa_loc=torch.tensor([0, -1, 6], dtype=torch.int32),
+            raw_loc=None,
+            dcp_kv_mask=torch.tensor([True, True, False]),
+        )
+        self.assertEqual(mask.tolist(), [True, False, False])
+
+        mask = DeepSeekV4TokenToKVPool._dcp_swa_write_mask(
+            swa_loc=torch.tensor([0, 0, 6], dtype=torch.int32),
+            raw_loc=torch.tensor([4, 0, 7], dtype=torch.int32),
+            dcp_kv_mask=None,
+        )
+        self.assertEqual(mask.tolist(), [True, False, True])
+
     def test_compressed_move_uses_logical_sequence_boundaries(self):
         from sglang.srt.mem_cache.deepseek_v4_memory_pool import (
             DeepSeekV4TokenToKVPool,

@@ -1545,6 +1545,21 @@ class DeepSeekV4TokenToKVPool(BaseSWAKVPool):
         # full-cache loc instead, because translated slot 0 can be valid.
         return (loc > 0).contiguous()
 
+    @staticmethod
+    def _dcp_swa_write_mask(
+        swa_loc: torch.Tensor,
+        raw_loc: Optional[torch.Tensor],
+        dcp_kv_mask: Optional[torch.Tensor],
+    ) -> torch.Tensor:
+        # SWA slot 0 is valid, whereas full-cache slot 0 is padding. Injected
+        # DSpark KV has no raw full-cache loc, but uses -1 for rejected tokens.
+        write_mask = swa_loc >= 0
+        if raw_loc is not None:
+            write_mask &= raw_loc > 0
+        if dcp_kv_mask is not None:
+            write_mask &= dcp_kv_mask
+        return write_mask.contiguous()
+
     def set_swa_key_buffer(
         self,
         layer_id: int,
@@ -1669,8 +1684,8 @@ class DeepSeekV4TokenToKVPool(BaseSWAKVPool):
     ) -> None:
         dcp_world_size, dcp_rank, dcp_enabled = self._dcp_write_context()
         if dcp_enabled or dcp_kv_mask is not None:
-            write_mask = self._dcp_loc_write_mask(
-                raw_loc if raw_loc is not None else swa_loc
+            write_mask = self._dcp_swa_write_mask(
+                swa_loc, raw_loc, dcp_kv_mask
             )
         else:
             write_mask = None
@@ -1703,8 +1718,8 @@ class DeepSeekV4TokenToKVPool(BaseSWAKVPool):
                 cache_k,
                 dcp_world_size=dcp_world_size,
                 dcp_rank=dcp_rank,
-                write_mask=self._dcp_loc_write_mask(
-                    raw_loc if raw_loc is not None else swa_loc
+                write_mask=self._dcp_swa_write_mask(
+                    swa_loc, raw_loc, dcp_kv_mask
                 ),
             )
         return self.swa_kv_pool.set_key_buffer_fused(
@@ -1735,8 +1750,8 @@ class DeepSeekV4TokenToKVPool(BaseSWAKVPool):
                 kv,
                 dcp_world_size=dcp_world_size,
                 dcp_rank=dcp_rank,
-                write_mask=self._dcp_loc_write_mask(
-                    raw_loc if raw_loc is not None else swa_loc
+                write_mask=self._dcp_swa_write_mask(
+                    swa_loc, raw_loc, dcp_kv_mask
                 ),
             )
         fused_k_norm_rope_flashmla(

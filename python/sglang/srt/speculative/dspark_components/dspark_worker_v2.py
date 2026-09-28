@@ -118,11 +118,13 @@ class DSparkWorkerV2(BaseSpecWorker):
             server_args.enable_dp_attention
             and self._draft_is_moe
             and ps.attn_tp_size > 1
+            and ps.attn_dcp_size != ps.attn_tp_size
         ):
             raise ValueError(
-                "DSpark + dp attention with a DeepSeek-V4 (MoE) draft requires "
-                "attn_tp == 1 (set --dp-size == --tp). attn_tp > 1 corrupts the "
-                "MoE-under-DP all-reduce."
+                "DSpark + DP attention with a DeepSeek-V4 MoE draft requires "
+                "attn_tp == 1, or DCP spanning the full attention-TP group. "
+                "The draft attention output reduction otherwise mixes DP "
+                "requests across the full TP group."
             )
 
         with self._draft_context():
