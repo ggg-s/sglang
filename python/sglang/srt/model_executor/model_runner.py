@@ -266,35 +266,9 @@ def _can_replay_whole_split_prefill(
         forward_batch.forward_mode.is_split_prefill()
         and forward_batch.split_index == 0
         and forward_count >= num_hidden_layers
-        and getattr(forward_batch, "pdmux_hicache_consumer_index", -1) < 0
         and prefill_graph is not None
         and getattr(prefill_graph, "pdmux_split", False)
         and prefill_graph.can_run_graph(forward_batch)
-        and _prefill_cuda_graph_allows_context_parallel(
-            prefill_graph, forward_batch
-        )
-    )
-
-
-def _can_replay_split_prefill_segment(
-    forward_batch: ForwardBatch,
-    prefill_graph,
-    num_hidden_layers: int,
-) -> bool:
-    if (
-        not forward_batch.forward_mode.is_split_prefill()
-        or prefill_graph is None
-        or not getattr(prefill_graph, "pdmux_segmented", False)
-    ):
-        return False
-    if forward_batch.split_index > 0:
-        return hasattr(forward_batch, "_pdmux_split_graph_state")
-    # A load-back may still be writing pages read by captured attention.
-    # Preserve the existing eager per-layer fence for that batch.
-    if getattr(forward_batch, "pdmux_hicache_consumer_index", -1) >= 0:
-        return False
-    return bool(
-        prefill_graph.can_run_split_segment(forward_batch, num_hidden_layers)
         and _prefill_cuda_graph_allows_context_parallel(
             prefill_graph, forward_batch
         )
@@ -1730,29 +1704,7 @@ class ModelRunner:
                     split_forward_count if split_forward_count is not None else 1
                 )
                 prefill_graph = self.prefill_cuda_graph_runner
-                if _can_replay_split_prefill_segment(
-                    forward_batch,
-                    prefill_graph,
-                    self.model_config.num_hidden_layers,
-                ):
-                    next_split_index = min(
-                        forward_batch.split_index + forward_count,
-                        self.model_config.num_hidden_layers,
-                    )
-                    kwargs = self._extend_forward_kwargs(
-                        forward_batch, pp_proxy_tensors
-                    )
-                    with device_timer_ctx(self.device_timer, "split_prefill"):
-                        ret = prefill_graph.execute_split_segment(
-                            forward_batch,
-                            forward_batch.split_index,
-                            next_split_index,
-                            self.model_config.num_hidden_layers,
-                            **kwargs,
-                        )
-                    forward_batch.split_index = next_split_index
-                    can_run_graph = True
-                elif _can_replay_whole_split_prefill(
+                if _can_replay_whole_split_prefill(
                     forward_batch,
                     forward_count,
                     self.model_config.num_hidden_layers,
@@ -1760,7 +1712,7 @@ class ModelRunner:
                 ):
                     # With no layer boundary to yield at, the ordinary BCG
                     # body is equivalent to one complete split prefill. Replay
-                    # on the graph captured for this prefill lane.
+                    # only on the prefill-only lane captured by this runner.
                     kwargs = self._extend_forward_kwargs(
                         forward_batch, pp_proxy_tensors
                     )

@@ -23,7 +23,6 @@ buffers to keep break-point tensors at stable addresses.
 """
 
 import threading
-from contextlib import contextmanager
 from contextvars import ContextVar
 from typing import Any, Callable, Optional
 
@@ -46,9 +45,6 @@ __all__ = [
     "BreakableCUDAGraph",
     "BreakableCUDAGraphCapture",
     "break_graph",
-    "mark_split_layer_boundary",
-    "split_layer_capture_context",
-    "is_split_layer_capture_enabled",
 ]
 
 
@@ -72,22 +68,6 @@ _current_stream_var: ContextVar[torch.Stream | None] = ContextVar(
 _forked_streams_var: ContextVar[set[torch.Stream] | None] = ContextVar(
     "forked_streams", default=None
 )
-_split_layer_capture_var: ContextVar[bool] = ContextVar(
-    "split_layer_capture", default=False
-)
-
-
-@contextmanager
-def split_layer_capture_context(enabled: bool):
-    token = _split_layer_capture_var.set(enabled)
-    try:
-        yield
-    finally:
-        _split_layer_capture_var.reset(token)
-
-
-def is_split_layer_capture_enabled() -> bool:
-    return _split_layer_capture_var.get()
 
 
 def get_current_stream(device: torch.device | None = None) -> torch.Stream:
@@ -297,26 +277,13 @@ class BreakableCUDAGraph:
         self._segments: list[Any] = []
         self._break_fns: list[Callable[[], Any]] = []
         self._deduped_cuda_graph = deduped_cuda_graph
-        self.split_layer_segments: dict[int, int] = {}
-        self.capture_split_layers = False
 
     def replay(self) -> None:
-        self.replay_segments(0, len(self._segments))
-
-    def replay_segments(self, start: int, end: int) -> None:
-        """Replay a captured interval, including its trailing break function.
-
-        A split-layer marker closes the segment before the next layer. Running
-        that marker's break function before yielding keeps the next replay at
-        exactly the same graph state as a continuous full replay.
-        """
-        if not 0 <= start <= end <= len(self._segments):
-            raise ValueError(f"Invalid BCG segment range [{start}, {end})")
         stream = get_device_module().current_stream()
         token = _current_stream_var.set(stream)
         try:
-            for i in range(start, end):
-                self._segments[i].replay()
+            for i, seg in enumerate(self._segments):
+                seg.replay()
                 if i < len(self._break_fns):
                     self._break_fns[i]()
         finally:
@@ -438,26 +405,3 @@ def break_graph() -> None:
     """Insert a graph break. The @eager_on_graph decorator does the actual
     segment split; this function body intentionally does nothing."""
     pass
-
-
-def mark_split_layer_boundary(layer_index: int) -> None:
-    """Record a replay boundary while capturing a split-prefill BCG.
-
-    Ordinary eager forwards and unrelated BCG captures pay no graph break.
-    The boundary points to the first segment of ``layer_index`` (or the tail
-    after the final layer), so a scheduler can replay any consecutive layers.
-    """
-    capture = _current_capture_var.get()
-    if capture is None or not capture.cuda_graph.capture_split_layers:
-        return
-    capture._end_current_segment()
-    # Keep ranks aligned after graph teardown before the following layer may
-    # start a collective, as eager_on_graph does for its own graph breaks.
-    if capture._barrier_fn is not None:
-        capture._barrier_fn()
-    graph = capture.cuda_graph
-    if layer_index in graph.split_layer_segments:
-        raise RuntimeError(f"Duplicate split-layer graph boundary {layer_index}")
-    graph.split_layer_segments[layer_index] = len(graph._segments)
-    graph._break_fns.append(lambda: None)
-    capture._begin_new_segment()

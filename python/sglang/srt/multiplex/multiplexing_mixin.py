@@ -758,15 +758,6 @@ class SchedulerMultiplexMixin:
                 if decode_batch is None and self.split_prefill_batch is None:
                     self.on_idle()
 
-            # A segmented prefill graph carries intermediate activations in
-            # the pool captured for its lane. Keep that lane until the batch
-            # finishes, including when the local decode batch drains.
-            if (
-                self.split_prefill_batch is not None
-                and self.split_prefill_batch.split_index > 0
-            ):
-                adjust_stream_group = False
-
             if adjust_stream_group:
                 prefill_stream.synchronize()
                 decode_stream.synchronize()

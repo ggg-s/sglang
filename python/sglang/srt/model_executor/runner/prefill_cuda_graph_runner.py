@@ -277,9 +277,6 @@ class PrefillCudaGraphRunner(BaseCudaGraphRunner):
             and not model_runner.is_draft_worker
             and self.prefill_backend_name == Backend.BREAKABLE
         )
-        self.pdmux_segmented = self.pdmux_split and getattr(
-            model_runner.model, "supports_pdmux_split_bcg", False
-        )
         # bs in prefill carries the captured shape (token count for
         # tc_piecewise) — one shape knob per phase.
         capture_tokens = prefill_config.bs
@@ -506,7 +503,7 @@ class PrefillCudaGraphRunner(BaseCudaGraphRunner):
             )
         else:
             self.use_captured_attn_metadata = False
-        self.attn_metadata_buffers: Optional[Dict[tuple, object]] = (
+        self.attn_metadata_buffers: Optional[Dict[int, object]] = (
             {} if self.use_captured_attn_metadata else None
         )
 
@@ -985,13 +982,7 @@ class PrefillCudaGraphRunner(BaseCudaGraphRunner):
             forward_batch
         )
         assert self.attn_metadata_buffers is not None
-        self.attn_metadata_buffers[self._attn_metadata_key(num_tokens)] = metadata
-
-    def _attn_metadata_key(self, num_tokens: int) -> tuple:
-        return (
-            get_current_stream_idx() if self.pdmux_segmented else None,
-            num_tokens,
-        )
+        self.attn_metadata_buffers[num_tokens] = metadata
 
     def _prepare_forward_metadata_for_replay(
         self,
@@ -1029,7 +1020,7 @@ class PrefillCudaGraphRunner(BaseCudaGraphRunner):
             attn_backend.init_forward_metadata(forward_batch)
             return
         assert self.attn_metadata_buffers is not None
-        metadata = self.attn_metadata_buffers[self._attn_metadata_key(num_tokens)]
+        metadata = self.attn_metadata_buffers[num_tokens]
         attn_backend.prepare_forward_metadata_for_breakable_cuda_graph_replay(
             metadata,
             forward_batch,
@@ -1337,32 +1328,12 @@ class PrefillCudaGraphRunner(BaseCudaGraphRunner):
         # decode + prefill runners; see BaseRunner.warmup).
         self.warmup()
         with freeze_gc(self.model_runner.server_args.enable_cudagraph_gc):
-            if self.pdmux_segmented:
+            if self.pdmux_split:
                 # A CUDA graph retains its capture stream's resource context.
-                # Capture each lane that can run prefill. The last lane is
-                # decode-only and never submits a split prefill.
-                original_stream_idx = get_current_stream_idx()
-                original_pdmux_status = is_pdmux_prefill_enabled()
-                try:
-                    for stream_idx, (prefill_stream, _) in enumerate(
-                        get_stream_groups()[:-1]
-                    ):
-                        logger.info(
-                            "Capturing PDMux split-prefill BCG on lane %d",
-                            stream_idx,
-                        )
-                        set_current_stream_idx(stream_idx)
-                        set_pdmux_status(True)
-                        with graph_capture(stream=prefill_stream) as ctx:
-                            self.stream = ctx.stream
-                            with self.backend.capture_session(self.stream):
-                                self._capture_one_stream()
-                finally:
-                    set_pdmux_status(original_pdmux_status)
-                    set_current_stream_idx(original_stream_idx)
-            elif self.pdmux_split:
-                # Models without layer markers retain the existing whole-body
-                # graph on the prefill-only lane.
+                # The unsplit fast path runs only on the prefill-only lane (0).
+                logger.info(
+                    "Capturing PDMux whole-prefill BCG on prefill-only lane 0"
+                )
                 original_stream_idx = get_current_stream_idx()
                 original_pdmux_status = is_pdmux_prefill_enabled()
                 try:
@@ -1710,7 +1681,6 @@ class PrefillCudaGraphRunner(BaseCudaGraphRunner):
         static_num_tokens: int,
         raw_num_tokens: int,
         shape_key: ShapeKey,
-        precomputed_body=None,
         **kwargs,
     ):
         # BCG / Full: replay the captured body, run the LM head +
@@ -1735,11 +1705,7 @@ class PrefillCudaGraphRunner(BaseCudaGraphRunner):
                     self.buffer_registry.get_slot("input_embeds").slice_for(
                         1, static_num_tokens
                     )[: ie.shape[0]].copy_(ie)
-            hs = (
-                precomputed_body
-                if precomputed_body is not None
-                else self.backend.replay(shape_key, static_forward_batch, **kwargs)
-            )
+            hs = self.backend.replay(shape_key, static_forward_batch, **kwargs)
             return _slice_output_rows(hs, raw_num_tokens) if full_path else hs
 
         original_layer_forward = self.layer_model.forward
@@ -1829,82 +1795,6 @@ class PrefillCudaGraphRunner(BaseCudaGraphRunner):
                 "The runtime hidden-state mode exceeds the fixed CUDA graph "
                 f"capture mode ({self.capture_hidden_mode.name})."
             )
-
-    def can_run_split_segment(
-        self, forward_batch: ForwardBatch, num_layers: int
-    ) -> bool:
-        if not self.pdmux_segmented or not self.can_run_graph(forward_batch):
-            return False
-        num_tokens = self._pad_to_bucket(
-            len(forward_batch.input_ids), self.capture_num_tokens
-        )
-        return self.backend.has_split_layers(
-            self._shape_key(num_tokens, forward_batch), num_layers
-        )
-
-    def execute_split_segment(
-        self,
-        forward_batch: ForwardBatch,
-        start_layer: int,
-        end_layer: int,
-        num_layers: int,
-        **kwargs,
-    ) -> Optional[LogitsProcessorOutput]:
-        """Replay consecutive captured layers, preserving graph state across yields."""
-        self._validate_capture_hidden_mode(forward_batch)
-        with self.backend.replay_session():
-            if start_layer == 0:
-                static_batch = self.load_batch(forward_batch, **kwargs)
-                static_num_tokens = len(static_batch.input_ids)
-                shape_key = self._shape_key(static_num_tokens, forward_batch)
-                if not self.backend.has_split_layers(shape_key, num_layers):
-                    raise RuntimeError(f"BCG {shape_key} lacks split-layer markers")
-                maybe_publish_prefill_war_read_done(
-                    self.model_runner, forward_batch, self.device_module
-                )
-                state = (shape_key, static_batch, self.raw_num_tokens, 0)
-            else:
-                state = getattr(forward_batch, "_pdmux_split_graph_state", None)
-                if state is None or state[3] != start_layer:
-                    raise RuntimeError(
-                        "PDMux split BCG resumed without its prior layer state"
-                    )
-                shape_key, static_batch, _, _ = state
-                if shape_key.stream_idx != get_current_stream_idx():
-                    raise RuntimeError("PDMux split BCG changed lanes mid-prefill")
-                static_num_tokens = len(static_batch.input_ids)
-
-            shape_key, static_batch, raw_num_tokens, _ = state
-            with self._prefill_forward_context(
-                static_batch,
-                num_tokens=static_num_tokens,
-                raw_num_tokens=raw_num_tokens,
-            ):
-                body_output = self.backend.replay_split_layers(
-                    shape_key, start_layer, end_layer, num_layers
-                )
-
-            if end_layer != num_layers:
-                forward_batch._pdmux_split_graph_state = (
-                    shape_key,
-                    static_batch,
-                    raw_num_tokens,
-                    end_layer,
-                )
-                return None
-
-            if hasattr(forward_batch, "_pdmux_split_graph_state"):
-                del forward_batch._pdmux_split_graph_state
-            output = self._execute_body_capture(
-                forward_batch,
-                static_batch,
-                static_num_tokens,
-                raw_num_tokens,
-                shape_key,
-                precomputed_body=body_output,
-                **kwargs,
-            )
-            return self._finalize_execute_output(output)
 
     def execute(
         self, forward_batch: ForwardBatch, **kwargs
