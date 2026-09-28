@@ -200,10 +200,10 @@ class SchedulerMultiplexMixin:
     def _update_decode_attn_backends(self: Scheduler, stream_idx: int) -> None:
         """Point the decode-side attention backends at this stream group.
 
-        The target runner has always been switched here. The standard lane also
-        switches the draft runners: a graph replay indexes the group directly,
-        but the eager TARGET_VERIFY fallback and DSpark's draft block resolve
-        `decode_attn_backend`, which would otherwise stay pinned to group 0.
+        The target runner has always been switched here. Both PDMux prefill
+        modes also switch draft runners: eager MTP draft steps, TARGET_VERIFY
+        fallback, and DSpark's draft block resolve `decode_attn_backend`, which
+        would otherwise stay pinned to group 0.
         Reached only with no prefill in flight and after both streams have been
         drained, so no forward can be reading these fields.
         """
@@ -215,7 +215,7 @@ class SchedulerMultiplexMixin:
             return
 
         self.tp_worker.model_runner.update_decode_attn_backend(stream_idx)
-        if not self.pdmux_standard or self.draft_worker is None:
+        if self.draft_worker is None:
             return
         for runner in self.draft_worker._draft_model_runners():
             if runner.decode_attn_backend_group:

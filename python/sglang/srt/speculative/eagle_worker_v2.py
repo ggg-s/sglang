@@ -39,18 +39,20 @@ from sglang.srt.model_executor.cuda_graph_config import (
     Phase,
     check_cuda_graph_backend,
 )
-from sglang.srt.model_executor.forward_batch_info import CaptureHiddenMode, ForwardBatch
+from sglang.srt.model_executor.forward_batch_info import (
+    CaptureHiddenMode,
+    ForwardBatch,
+    ForwardMode,
+)
 from sglang.srt.model_executor.forward_context import ForwardContext, forward_context
 from sglang.srt.model_executor.runner import (
     DecodeCudaGraphRunner,
     get_batch_sizes_to_capture,
 )
-from sglang.srt.multiplex.pdmux_context import (
-    decode_lane_attn_backend,
-    is_pdmux_standard_prefill,
-)
+from sglang.srt.multiplex.pdmux_context import decode_lane_attn_backend
 from sglang.srt.runtime_context import (
     get_context,
+    get_disagg,
     get_exec,
     get_model,
     get_parallel,
@@ -343,14 +345,14 @@ class EagleDraftWorker(EagleDraftWorkerBase):
         if self.draft_extend_attn_backend is not None:
             self.draft_runner.attn_backend = self.draft_extend_attn_backend
 
-        # PDMux standard: the prefill lane runs its own draft extend (a plain
-        # EXTEND on the draft runner) while the decode lane may be running
+        # PDMux prefill runs its own draft extend (a plain EXTEND on the draft
+        # runner) while the decode lane may be running
         # DRAFT_EXTEND_V2 on the other stream. Both resolve
         # `draft_runner.attn_backend` and write its metadata and scratch buffers
         # in place, so give the prefill lane a second instance from the same
         # factory, bound only for the duration of that call.
         needs_prefill_lane_backend = (
-            is_pdmux_standard_prefill() and self.draft_extend_attn_backend is not None
+            get_disagg().enable_pdmux and self.draft_extend_attn_backend is not None
         )
         self.prefill_lane_draft_extend_attn_backend = (
             draft_backend_factory.create_draft_extend_backend()
@@ -385,7 +387,7 @@ class EagleDraftWorker(EagleDraftWorkerBase):
         if _is_cpu or check_cuda_graph_backend(Phase.DECODE, Backend.DISABLED):
             return
 
-        if is_pdmux_standard_prefill():
+        if get_disagg().enable_pdmux:
             # These two runners hard-disable the pdmux capture path, so they
             # would capture a single graph set on a plain stream and replay it
             # on whichever green-context stream is current -- the graph's nodes
@@ -393,7 +395,7 @@ class EagleDraftWorker(EagleDraftWorkerBase):
             # steps and the draft extend eagerly instead; the target's decode
             # and verify graphs are captured per stream group and stay on.
             logger.info(
-                "PD-Multiplexing standard prefill: skipping draft CUDA graph "
+                "PD-Multiplexing prefill: skipping draft CUDA graph "
                 "capture (draft decode and draft extend run eagerly)."
             )
             return
@@ -856,6 +858,10 @@ class EagleDraftWorker(EagleDraftWorkerBase):
         )
         with canary_ctx:
             logits_output = self.draft_runner.forward(forward_batch).logits_output
+        if batch.forward_mode.is_idle():
+            # DP attention may place real prefill work on peer ranks. This
+            # empty forward still joins the draft MoE collectives on this rank.
+            return None
         maybe_detect_nan(logits_output.next_token_logits, "draft_extend_for_prefill")
         maybe_detect_inf(logits_output.next_token_logits, "draft_extend_for_prefill")
 
@@ -1146,6 +1152,54 @@ class EAGLEWorkerV2(BaseSpecWorker):
                         else get_exec().graph.cuda_graph_bs_decode
                     ),
                 )
+
+    def forward_batch_split_prefill(
+        self, batch: ScheduleBatch
+    ) -> GenerationBatchResult:
+        """Finish MTP draft state after the target's last split segment."""
+        batch_output = self.target_worker.forward_batch_split_prefill(
+            batch, capture_hidden_mode=CaptureHiddenMode.FULL
+        )
+        is_idle = batch.forward_mode.is_idle()
+        if is_idle:
+            is_final_segment = (
+                batch.split_index + batch.split_forward_count
+                >= self.target_worker.model_config.num_hidden_layers
+            )
+            if not is_final_segment:
+                return batch_output
+        elif batch_output.logits_output is None:
+            return batch_output
+
+        if not is_idle:
+            batch_output.new_seq_lens = batch.seq_lens
+        # The target keeps SPLIT_PREFILL while processing its segments. The
+        # draft now runs one ordinary extend; leaving that mode on the draft
+        # ForwardBatch would make its attention treat this as another segment.
+        original_mode = batch.forward_mode
+        if not is_idle:
+            batch.forward_mode = ForwardMode.EXTEND
+        try:
+            with (
+                self.draft_worker.draft_tp_context(
+                    self.draft_worker.draft_runner.tp_group
+                ),
+                speculative_moe_backend_context(),
+                speculative_moe_a2a_backend_context(),
+                spec_stage_span("draft_extend"),
+                self.draft_worker.prefill_lane_draft_extend_backend(),
+            ):
+                draft_input = self.draft_worker._draft_extend_for_prefill(
+                    batch,
+                    None if is_idle else batch_output.logits_output.hidden_states,
+                    None if is_idle else batch_output.next_token_ids,
+                    None if is_idle else batch_output.logits_output.mm_input_embeds,
+                )
+                if not is_idle:
+                    batch_output.next_draft_input = draft_input
+        finally:
+            batch.forward_mode = original_mode
+        return batch_output
 
     def forward_batch_generation(
         self, batch: ScheduleBatch, on_publish=None, grammar_barrier=None

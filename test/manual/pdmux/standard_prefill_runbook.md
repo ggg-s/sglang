@@ -151,8 +151,8 @@ Every baseline runs the same checkpoint as the cell it is compared with.
   real acceptance. `test/manual/dsv4/test_dsv4_flash_mtp_tp8.py` sets
   `SGLANG_SIMULATE_ACC_LEN=3` for a latency case; do not carry that variable
   into either the baseline or the PDMux cell, or the accept lengths compare
-  a simulation. Do not use layer_split as the MTP baseline: its split path
-  bypasses the draft extend.
+  a simulation. Layer-split MTP now performs draft extend after its final
+  target segment; keep the ordinary scheduler as the independent baseline.
 - DSpark: the standard scheduler with `DSPARK` and the confirmed draft
   checkpoint.
 

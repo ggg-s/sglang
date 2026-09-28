@@ -1,8 +1,10 @@
 #!/usr/bin/env bash
-# DeepSeek-V4-Flash + DSpark DCP equivalence regression on one 8x H100 node.
+# DeepSeek-V4-Flash speculative DCP equivalence regression on one 8x H100 node.
 #
-# Baseline uses TP8/DP8/DCP1; candidate uses TP8/DP4/DCP2. Both use DSpark.
+# Baseline uses TP8/DP8/DCP1; candidate uses TP8/DP4/DCP2.
 # Set SPECULATIVE_ALGORITHM=none to test the target without draft decoding.
+# Set SPECULATIVE_ALGORITHM=EAGLE ENABLE_PDMUX=1 to exercise bundled MTP
+# on the PDMux layer-split lane.
 # Each run uses all eight GPUs, so run them in sequence.
 #
 # Typical workflow:
@@ -13,6 +15,11 @@
 #   ACTION=serve-candidate bash scripts/playground/dcp_equivalence_run.sh
 #   # In another shell while candidate is healthy:
 #   ACTION=compare-candidate bash scripts/playground/dcp_equivalence_run.sh
+#   # Bundled MTP with PDMux layer-split (same four ACTIONs):
+#   SPECULATIVE_ALGORITHM=EAGLE ENABLE_PDMUX=1 ACTION=serve-candidate \
+#     bash scripts/playground/dcp_equivalence_run.sh
+#   # HiCache may be added with EXTRA_ARGS only when DCP_SIZE=1; DSV4
+#   # currently rejects the combined HiCache + DCP>1 configuration.
 #
 # ACTION values:
 #   serve-baseline      launch the dcp_size=1 server for this node
@@ -46,6 +53,7 @@ MAX_TOKENS="${MAX_TOKENS:-256}"
 CONCURRENCY="${CONCURRENCY:-8}"
 EXTRA_ARGS="${EXTRA_ARGS:-}"
 SPECULATIVE_ALGORITHM="${SPECULATIVE_ALGORITHM:-DSPARK}"
+ENABLE_PDMUX="${ENABLE_PDMUX:-0}"
 
 COMMON_ENV=(SGLANG_OPT_USE_ONLINE_COMPRESS=0)
 
@@ -78,6 +86,7 @@ run_server() {
   local dcp_env=()
   local dcp_args=()
   local spec_args=()
+  local pdmux_args=()
 
   if [[ "${dcp_size}" -gt 1 ]]; then
     dcp_env=(SGLANG_DSV4_ENABLE_DCP=1)
@@ -91,6 +100,19 @@ run_server() {
       --speculative-draft-model-path "${DRAFT_MODEL_PATH}"
       --enable-dp-lm-head
     )
+  elif [[ "${SPECULATIVE_ALGORITHM}" == "EAGLE" ]]; then
+    spec_args=(
+      --speculative-algorithm EAGLE
+      --speculative-num-steps 3
+      --speculative-eagle-topk 1
+      --speculative-num-draft-tokens 4
+    )
+  elif [[ "${SPECULATIVE_ALGORITHM}" != "none" ]]; then
+    echo "Unknown SPECULATIVE_ALGORITHM=${SPECULATIVE_ALGORITHM}" >&2
+    exit 2
+  fi
+  if [[ "${ENABLE_PDMUX}" == "1" ]]; then
+    pdmux_args=(--enable-pdmux --pdmux-prefill-mode layer_split --disable-overlap-schedule)
   fi
 
   echo "[serve] label=${label} node_rank=${NODE_RANK} dp_size=${dp_size} dcp_size=${dcp_size} spec=${SPECULATIVE_ALGORITHM}"
@@ -102,6 +124,7 @@ run_server() {
     --dp-size "${dp_size}" \
     "${dcp_args[@]}" \
     "${spec_args[@]}" \
+    "${pdmux_args[@]}" \
     ${EXTRA_ARGS} \
     2>&1 | tee "${logfile}"
 }
