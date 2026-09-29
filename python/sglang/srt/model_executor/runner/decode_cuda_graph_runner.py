@@ -616,7 +616,7 @@ class DecodeCudaGraphRunner(BaseCudaGraphRunner):
         # does not negotiate. Uniform eager is safer than a per-rank fallback.
         if (
             not self.model_runner.spec_algorithm.is_none()
-            or self.model_runner.lora_manager is not None
+            or self.model_runner.server_args.enable_lora
             or self.is_encoder_decoder
             or self.enable_two_batch_overlap
         ):
@@ -625,11 +625,16 @@ class DecodeCudaGraphRunner(BaseCudaGraphRunner):
             return True
         if not batch.forward_mode.is_decode():
             return False
+        num_input_tokens = (
+            batch.input_ids.numel()
+            if batch.input_ids is not None
+            else batch.batch_size()
+        )
         return self.can_replay_batch_locally(
             replace_embeds=batch.replace_embeds,
             spec_num_tokens_per_req=None,
             batch_size=batch.batch_size(),
-            num_input_tokens=batch.input_ids.numel(),
+            num_input_tokens=num_input_tokens,
             encoder_lens=batch.encoder_lens,
             can_run_tbo=False,
         )

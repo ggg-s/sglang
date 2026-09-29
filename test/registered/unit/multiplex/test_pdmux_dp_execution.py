@@ -173,7 +173,7 @@ def graph_runner():
     runner = cls()
     runner.model_runner = NS(
         spec_algorithm=NS(is_none=lambda: True, is_ngram=lambda: False),
-        lora_manager=None,
+        server_args=NS(enable_lora=False),
     )
     runner.attention_graph_variants = None
     runner.is_encoder_decoder = False
@@ -209,6 +209,9 @@ class TestGraphAgreement(unittest.TestCase):
         runner = graph_runner()
         batch = Batch()
         self.assertTrue(runner.can_run_pdmux_decode_batch(batch))
+        batch.input_ids = None
+        self.assertTrue(runner.can_run_pdmux_decode_batch(batch))
+        batch.input_ids = torch.arange(batch.rows)
         batch.replace_embeds = torch.ones(1)
         self.assertFalse(runner.can_run_pdmux_decode_batch(batch))
         self.assertFalse(runner.can_run_graph(batch))
@@ -242,7 +245,7 @@ class TestGraphAgreement(unittest.TestCase):
         before = runner.pdmux_graph_capability(3)
         runner.backend.has_captured_key = lambda key: key != (4, 1)
         self.assertNotEqual(before, runner.pdmux_graph_capability(3))
-        runner.model_runner.lora_manager = object()
+        runner.model_runner.server_args.enable_lora = True
         self.assertFalse(runner.can_run_pdmux_decode_batch(Batch()))
         self.assertFalse(runner.can_run_pdmux_decode_batch(None))
 

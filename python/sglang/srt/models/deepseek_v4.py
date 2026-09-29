@@ -1336,7 +1336,7 @@ class MQALayer(MqaAttentionBase):
             # TP slice initialized, so gather local heads from the DCP group.
             q_for_attn = dcp_group.all_gather(attn_q_base.contiguous(), dim=1)
             attn_sink_for_attn = dcp_group.all_gather(
-                self._attn_sink_local[: self.n_local_heads].contiguous(), dim=0
+                attn_sink[: self.n_local_heads].contiguous(), dim=0
             )
             if dcp_group.rank_in_group != 0:
                 # The sink is a global virtual KV item. Folding it into every
@@ -1347,7 +1347,7 @@ class MQALayer(MqaAttentionBase):
                 )
         else:
             q_for_attn = q_padded if q_padded is not None else attn_q_base
-            attn_sink_for_attn = self._attn_sink_local
+            attn_sink_for_attn = attn_sink
 
         # The cache write is always fused / already done by _forward_prepare* --
         # tell the backend to skip its own store_cache. When `kv is None`
