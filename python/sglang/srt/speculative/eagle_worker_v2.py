@@ -387,18 +387,22 @@ class EagleDraftWorker(EagleDraftWorkerBase):
         if _is_cpu or check_cuda_graph_backend(Phase.DECODE, Backend.DISABLED):
             return
 
-        if get_disagg().enable_pdmux:
-            # These two runners hard-disable the pdmux capture path, so they
-            # would capture a single graph set on a plain stream and replay it
-            # on whichever green-context stream is current -- the graph's nodes
-            # keep the resource context they were captured with. Run the draft
-            # steps and the draft extend eagerly instead; the target's decode
-            # and verify graphs are captured per stream group and stay on.
-            logger.info(
-                "PD-Multiplexing prefill: skipping draft CUDA graph "
-                "capture (draft decode and draft extend run eagerly)."
+        if get_disagg().enable_pdmux and not _is_cuda:
+            logger.warning(
+                "PDMux draft CUDA graphs currently require CUDA; using eager"
             )
             return
+
+        def make_runner(runner_cls, *, draft_extend=False):
+            if get_disagg().enable_pdmux:
+                from sglang.srt.speculative.pdmux_draft_cuda_graph_runner import (
+                    PDMuxDraftCudaGraphRunner,
+                )
+
+                return PDMuxDraftCudaGraphRunner(
+                    self, runner_cls, draft_extend=draft_extend
+                )
+            return runner_cls(self)
 
         if get_model().model_impl == "mindspore":
             return
@@ -421,9 +425,9 @@ class EagleDraftWorker(EagleDraftWorkerBase):
                 f"num_tokens_per_req={self.topk}, bs={capture_bs}, "
                 f"avail mem={before_mem:.2f} GB",
             )
-            self.cuda_graph_runner = Device2DraftCudaGraphRunner[
-                self.target_worker.device
-            ](self)
+            self.cuda_graph_runner = make_runner(
+                Device2DraftCudaGraphRunner[self.target_worker.device]
+            )
             after_mem = get_available_gpu_memory(self.device, self.gpu_id)
             capture_time = time.perf_counter() - tic
             self._specialized_graph_memory_usage["draft_decode"] = (
@@ -514,9 +518,10 @@ class EagleDraftWorker(EagleDraftWorkerBase):
                 f"num_tokens_per_req={self.speculative_num_draft_tokens}, "
                 f"bs={capture_bs}, avail mem={before_mem:.2f} GB",
             )
-            self.cuda_graph_runner_for_draft_extend = Device2ExtendCudaGraphRunner[
-                self.target_worker.device
-            ](self)
+            self.cuda_graph_runner_for_draft_extend = make_runner(
+                Device2ExtendCudaGraphRunner[self.target_worker.device],
+                draft_extend=True,
+            )
             # draft_extend is the step's last shared-buffer-reading phase; its
             # read-done event is what the scheduler's WAR barrier waits on.
             after_mem = get_available_gpu_memory(self.device, self.gpu_id)

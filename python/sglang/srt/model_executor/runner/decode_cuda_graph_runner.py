@@ -1038,7 +1038,12 @@ class DecodeCudaGraphRunner(BaseCudaGraphRunner):
         # can reuse the memory pool allocated for the large shapes.
         with freeze_gc(self.model_runner.server_args.enable_cudagraph_gc):
             if not self.enable_pdmux:
-                with graph_capture() as graph_capture_context, profile_context as prof:
+                with (
+                    graph_capture(
+                        stream=getattr(self, "capture_stream", None)
+                    ) as graph_capture_context,
+                    profile_context as prof,
+                ):
                     self.stream = graph_capture_context.stream
                     with self.backend.capture_session(self.stream):
                         self._capture_one_stream()

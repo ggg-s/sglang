@@ -85,6 +85,7 @@ class EAGLEDraftExtendCudaGraphRunner(DecodeCudaGraphRunner):
         *,
         draft_extend_attn_backend=None,
         speculative_num_steps: Optional[int] = None,
+        capture_stream=None,
     ):
         # Parse args
         self.eagle_worker = eagle_worker
@@ -119,6 +120,7 @@ class EAGLEDraftExtendCudaGraphRunner(DecodeCudaGraphRunner):
         # Disable parent paths that don't apply.
         self.compile_bs = []
         self.enable_pdmux = False
+        self.capture_stream = capture_stream
         self.record_nolora_graph = False
         self.is_dllm = False
 
@@ -268,7 +270,9 @@ class EAGLEDraftExtendCudaGraphRunner(DecodeCudaGraphRunner):
             dsa_seed_topk_capture=dsa_seed_topk_capture,
             dcp_kv_mask=dcp_kv_mask,
         )
-        self.buffers.share_buffers()
+        # PDMux prefill may be using the process-wide input buffer pool.
+        if capture_stream is None:
+            self.buffers.share_buffers()
 
         self.backend = resolve_decode_backend(self)
 
