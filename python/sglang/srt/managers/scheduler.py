@@ -3916,7 +3916,15 @@ class Scheduler(
                             batch.seq_lens_sum = int(batch.seq_lens_cpu.sum())
                 elif batch_result.has_sampled_token_ids:
                     self._relay_forward_payload(batch.req_pool_indices, batch_result)
-                batch.input_ids = None
+                # MTP rebuilds its draft-extend ForwardBatch from this batch
+                # after the target's final segment. Keep the original unpadded
+                # inputs until then, including the empty tensor on idle ranks.
+                # The target's persistent ForwardBatch may hold padded inputs.
+                if (
+                    batch.split_index + batch.split_forward_count
+                    >= self.model_config.num_hidden_layers
+                ):
+                    batch.input_ids = None
             elif not batch.spec_algorithm.is_none():
                 # Non-overlap: drive the V2 worker synchronously (no
                 # future_map relay / on_publish).
