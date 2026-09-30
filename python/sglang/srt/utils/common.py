@@ -2365,9 +2365,11 @@ def delete_directory(dirpath):
         logger.warning("Failed to delete directory %s: %s", dirpath, e.strerror)
 
 
-# Temporary directory for prometheus multiprocess mode
-# Cleaned up automatically when this object is garbage collected
-prometheus_multiproc_dir: tempfile.TemporaryDirectory
+# Keep every directory created in this process alive until it exits. A caller
+# may clear the env var before starting another Engine while the first one's
+# workers still use its directory.
+_prometheus_multiproc_dirs: list[tempfile.TemporaryDirectory] = []
+_prometheus_multiproc_dir_lock = threading.Lock()
 
 
 def set_prometheus_multiproc_dir():
@@ -2375,17 +2377,23 @@ def set_prometheus_multiproc_dir():
     # sglang uses prometheus multiprocess mode
     # we need to set this before importing prometheus_client
     # https://prometheus.github.io/client_python/multiprocess/
-    global prometheus_multiproc_dir
+    with _prometheus_multiproc_dir_lock:
+        if "PROMETHEUS_MULTIPROC_DIR" in os.environ:
+            # The directory is either caller-owned or was created by a previous
+            # call. Replacing its TemporaryDirectory owner can delete the path
+            # while scheduler processes are still writing metrics to it.
+            if not os.path.isdir(os.environ["PROMETHEUS_MULTIPROC_DIR"]):
+                raise FileNotFoundError(
+                    f"PROMETHEUS_MULTIPROC_DIR does not exist: "
+                    f"{os.environ['PROMETHEUS_MULTIPROC_DIR']}"
+                )
+            logger.debug("PROMETHEUS_MULTIPROC_DIR already set.")
+            return
 
-    if "PROMETHEUS_MULTIPROC_DIR" in os.environ:
-        logger.debug("User set PROMETHEUS_MULTIPROC_DIR detected.")
-        prometheus_multiproc_dir = tempfile.TemporaryDirectory(
-            dir=os.environ["PROMETHEUS_MULTIPROC_DIR"]
-        )
-    else:
-        prometheus_multiproc_dir = tempfile.TemporaryDirectory()
-        os.environ["PROMETHEUS_MULTIPROC_DIR"] = prometheus_multiproc_dir.name
-    logger.debug(f"PROMETHEUS_MULTIPROC_DIR: {os.environ['PROMETHEUS_MULTIPROC_DIR']}")
+        directory = tempfile.TemporaryDirectory()
+        _prometheus_multiproc_dirs.append(directory)
+        os.environ["PROMETHEUS_MULTIPROC_DIR"] = directory.name
+        logger.debug("PROMETHEUS_MULTIPROC_DIR: %s", directory.name)
 
 
 def add_prometheus_middleware(app):
