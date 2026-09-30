@@ -1322,7 +1322,7 @@ class EAGLEWorkerV2(BaseSpecWorker):
 
         # Verify runs on the decode lane; `verify_mask.buffer` is filled in
         # place, so take the backend the eager runner will resolve for it (the
-        # per-stream decode backend on the PDMux standard lane, the runner
+        # per-stream decode backend in either PDMux mode, the runner
         # default everywhere else).
         attn_backend = decode_lane_attn_backend(self._target_worker.model_runner)
         verify_mask = attn_backend.verify_mask

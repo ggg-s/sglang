@@ -47,13 +47,14 @@ def decode_lane_attn_backend(model_runner):
     """The backend for decode-lane work that a caller plans before the forward.
 
     TARGET_VERIFY is classified as an extend mode but runs on the decode lane.
-    On the standard lane it must plan into the per-stream decode backend the
+    In either PDMux mode it must plan into the per-stream decode backend the
     eager runner will resolve for it, because the prefill instance may be
     serving an in-flight prefill on the other stream and both write their
-    metadata in place. Every other configuration -- no PDMux, or layer_split --
-    keeps the runner's default, which is what those paths always used.
+    metadata in place, including between split-prefill segments.
     """
-    if is_pdmux_standard_prefill():
+    from sglang.srt.runtime_context import get_disagg
+
+    if get_disagg().enable_pdmux:
         return model_runner.decode_attn_backend
     return model_runner.attn_backend
 

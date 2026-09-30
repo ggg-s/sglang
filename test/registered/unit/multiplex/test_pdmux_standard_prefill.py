@@ -655,15 +655,15 @@ class TestEagerRunnerBackendResolution(unittest.TestCase):
                             self.assertIs(runner._execute_decode(batch), metadata)
                             self.assertIs(get_forward_context().attn_backend, per_step)
 
-    def test_target_verify_uses_the_decode_backend_only_on_the_standard_lane(self):
+    def test_target_verify_uses_the_decode_backend_in_both_pdmux_modes(self):
         """TARGET_VERIFY is extend-classified but decode-lane work.
 
-        Standard routes it to the per-stream decode backend; layer_split and
-        non-PDMux keep the runner default they always used.
+        Both PDMux modes isolate it from pending prefills. Non-PDMux keeps the
+        runner default.
         """
         cases = [
             (True, True, self.group),
-            (True, False, self.default),
+            (True, False, self.group),
             (False, False, self.default),
         ]
         for enable_pdmux, pdmux_standard, expected in cases:
@@ -727,7 +727,7 @@ class TestPdmuxStandardPrefillMode(unittest.TestCase):
         with self._disagg(enable_pdmux=True, mode="standard"):
             self.assertIs(decode_lane_attn_backend(model_runner), group)
         with self._disagg(enable_pdmux=True, mode="layer_split"):
-            self.assertIs(decode_lane_attn_backend(model_runner), default)
+            self.assertIs(decode_lane_attn_backend(model_runner), group)
         with self._disagg(enable_pdmux=False, mode="layer_split"):
             self.assertIs(decode_lane_attn_backend(model_runner), default)
 
