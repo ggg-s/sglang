@@ -1593,9 +1593,13 @@ class ForwardBatch(ForwardBatchDeepSeekMHAMixin):
 
         # MLP-sync padding appended dummy rows after the real ones; slice the
         # per-request tensors back so post-forward consumers (seeded sampling,
-        # ngram token-table updates) never see the padding. The draft-decode
-        # branch below does the same for speculative batches.
-        if self.spec_info is None and self._original_num_tokens is not None:
+        # ngram token-table updates) never see the padding. Speculative IDLE
+        # also needs this: its logits are trimmed to zero rows below, so leaving
+        # padded positions would break the next draft topk1 postprocess. Active
+        # speculative decode uses its draft token count in the branch below.
+        if (
+            self.spec_info is None or self.forward_mode.is_idle()
+        ) and self._original_num_tokens is not None:
             self.positions = self.positions[: self._original_num_tokens]
             self.seq_lens = self.seq_lens[:bs]
             self.req_pool_indices = self.req_pool_indices[:bs]

@@ -219,6 +219,65 @@ class TestPdmuxSxfPort(unittest.TestCase):
         self.assertEqual(batch.seq_lens_cpu, [1, 2])
         self.assertEqual(batch.forward_mode, "split")
 
+    def test_speculative_idle_unpads_inputs_with_and_without_logits(self):
+        method = load_methods(
+            "model_executor/forward_batch_info.py",
+            "ForwardBatch",
+            ["post_forward_mlp_sync_batch"],
+        )["post_forward_mlp_sync_batch"]
+        idle_mode = SimpleNamespace(
+            is_idle=lambda: True,
+            is_decode=lambda: False,
+            is_target_verify=lambda: False,
+            is_draft_extend_v2=lambda: False,
+            is_extend=lambda: False,
+        )
+        for has_logits in (False, True):
+            for has_cpu_lengths in (False, True):
+                with self.subTest(logits=has_logits, cpu_lengths=has_cpu_lengths):
+                    batch = SimpleNamespace(
+                        forward_mode=idle_mode,
+                        batch_size=0,
+                        spec_info=SimpleNamespace(hidden_states=[]),
+                        positions=[],
+                    )
+                    # Each draft step pads again to join peer ranks' forward.
+                    # A leftover row would become the next step's "real" size.
+                    for padded_width in (1, 8, 2):
+                        batch._original_num_tokens = len(batch.positions)
+                        batch._original_batch_size = 0
+                        batch._original_forward_mode = idle_mode
+                        batch.batch_size = padded_width
+                        batch.positions = [0] * padded_width
+                        batch.seq_lens = [1] * padded_width
+                        batch.req_pool_indices = [0] * padded_width
+                        batch.seq_lens_cpu = (
+                            [1] * padded_width if has_cpu_lengths else None
+                        )
+                        logits = (
+                            SimpleNamespace(
+                                next_token_logits=[[0.0] * 16] * padded_width,
+                                hidden_states=[[0.0] * 4] * padded_width,
+                            )
+                            if has_logits
+                            else None
+                        )
+                        method(batch, logits)
+                        self.assertEqual(batch.batch_size, 0)
+                        self.assertIs(batch.forward_mode, idle_mode)
+                        self.assertEqual(batch.positions, [])
+                        self.assertEqual(batch.seq_lens, [])
+                        self.assertEqual(batch.req_pool_indices, [])
+                        self.assertEqual(
+                            batch.seq_lens_cpu, [] if has_cpu_lengths else None
+                        )
+                        if has_logits:
+                            self.assertEqual(logits.next_token_logits, [])
+                            self.assertEqual(logits.hidden_states, [])
+                            self.assertEqual(
+                                len(batch.positions), len(logits.next_token_logits)
+                            )
+
     def test_dspark_finalizes_only_the_last_nonidle_split(self):
         capture_mode = SimpleNamespace(FULL=object())
         method = load_methods(
