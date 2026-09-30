@@ -232,7 +232,7 @@ class EagerRunner(BaseRunner):
         runs under. PDmux selects a per-stream backend and publishes it via an
         active ForwardContext; non-pdmux uses attn_backend + the ambient ctx.
 
-        The standard lane makes one exception: a backend the caller already
+        Both prefill modes make one exception: a backend the caller already
         published wins. Overriding it would hand the model a per-stream backend
         that never planned this forward's metadata (the init is skipped because
         the caller marked it ready), and would drop the per-step
@@ -241,10 +241,9 @@ class EagerRunner(BaseRunner):
         model_runner = self.model_runner
         if not self.enable_pdmux:
             return model_runner.attn_backend, contextlib.nullcontext()
-        if self.pdmux_standard:
-            chosen = self._caller_published_attn_backend()
-            if chosen is not None:
-                return chosen, contextlib.nullcontext()
+        chosen = self._caller_published_attn_backend()
+        if chosen is not None:
+            return chosen, contextlib.nullcontext()
         return model_runner.decode_attn_backend, forward_context(
             ForwardContext(attn_backend=model_runner.decode_attn_backend)
         )

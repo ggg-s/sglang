@@ -555,7 +555,7 @@ class TestEagerRunnerBackendResolution(unittest.TestCase):
 
     The multi-step EAGLE draft binds `draft_attn_backend.attn_backends[i]` per
     step and marks the forward's metadata ready against it. With draft graphs
-    off (which the standard lane forces), every step is eager, and the runner's
+    off (which both PDMux modes force), every step is eager, and the runner's
     pdmux override replaced that per-step backend with the per-stream decode
     backend: metadata init was skipped because it was marked ready, so the
     model read a backend that had never planned this forward.
@@ -601,14 +601,59 @@ class TestEagerRunnerBackendResolution(unittest.TestCase):
         self.assertIs(backend, self.group)
         self.assertIs(active, self.group)
 
-    def test_layer_split_keeps_its_original_override(self):
-        """layer_split behaviour is unchanged, caller context or not."""
+    def test_layer_split_keeps_a_caller_published_backend(self):
+        """MTP's preplanned per-step backend must survive layer_split routing."""
         backend, active = self._resolve_decode_under(
             self.per_step, pdmux_standard=False
         )
 
-        self.assertIs(backend, self.group)
-        self.assertIs(active, self.group)
+        self.assertIs(backend, self.per_step)
+        self.assertIs(active, self.per_step)
+
+    def test_layer_split_routes_default_backend_to_current_stream_group(self):
+        for group in (object(), object(), object()):
+            with self.subTest(group=group):
+                self.model_runner.decode_attn_backend = group
+                backend, active = self._resolve_decode_under(
+                    self.default, pdmux_standard=False
+                )
+                self.assertIs(backend, group)
+                self.assertIs(active, group)
+
+    def test_preplanned_draft_decode_preserves_metadata_across_stream_groups(self):
+        """Reproduce ready=True with an unplanned per-stream decode backend."""
+        for standard in (False, True):
+            runner = _RunnerStub(
+                enable_pdmux=True,
+                pdmux_standard=standard,
+                model_runner=self.model_runner,
+            )
+            batch = SimpleNamespace(needs_forward_metadata_init=lambda: False)
+            self.model_runner.device_timer = None
+            self.model_runner._pp_kwargs = lambda _: {}
+            batch.input_ids = batch.positions = None
+            for group in (object(), object(), object()):
+                self.model_runner.decode_attn_backend = SimpleNamespace(
+                    forward_metadata=None, group=group
+                )
+                for step in range(2):
+                    with self.subTest(standard=standard, group=group, step=step):
+                        metadata = object()
+                        per_step = SimpleNamespace(
+                            forward_metadata=metadata, speculative_step_id=step
+                        )
+
+                        def model_forward(*args):
+                            active = get_forward_context().attn_backend
+                            self.assertIs(active, per_step)
+                            self.assertIs(active.forward_metadata, metadata)
+                            self.assertEqual(active.speculative_step_id, step)
+                            return metadata
+
+                        self.model_runner.model = SimpleNamespace(forward=model_forward)
+                        with forward_context(ForwardContext(attn_backend=per_step)):
+                            self.assertIs(runner._execute_decode(batch), metadata)
+                            self.assertIs(get_forward_context().attn_backend, per_step)
 
     def test_target_verify_uses_the_decode_backend_only_on_the_standard_lane(self):
         """TARGET_VERIFY is extend-classified but decode-lane work.
