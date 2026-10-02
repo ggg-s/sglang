@@ -23,6 +23,8 @@ from unittest.mock import Mock
 import torch
 import torch.distributed as dist
 
+from sglang.test.test_utils import CustomTestCase
+
 ROOT = Path(__file__).resolve().parents[4]
 SRT = ROOT / "python/sglang/srt"
 register_cpu_ci = runpy.run_path(str(ROOT / "python/sglang/test/ci/ci_register.py"))[
@@ -158,7 +160,11 @@ class TestStreamAgreement(unittest.TestCase):
 
 
 def graph_runner():
-    namespace = dict(torch=torch, get_current_stream_idx=lambda: 1)
+    namespace = dict(
+        torch=torch,
+        get_current_stream_idx=lambda: 1,
+        get_spec=lambda: NS(speculative_num_draft_tokens=4),
+    )
     names = [
         "can_replay_batch_locally",
         "can_run_pdmux_decode_batch",
@@ -172,8 +178,13 @@ def graph_runner():
     )
     runner = cls()
     runner.model_runner = NS(
-        spec_algorithm=NS(is_none=lambda: True, is_ngram=lambda: False),
-        server_args=NS(enable_lora=False),
+        spec_algorithm=NS(
+            is_none=lambda: True,
+            is_ngram=lambda: False,
+            is_eagle=lambda: False,
+            is_frozen_kv_mtp=lambda: False,
+        ),
+        server_args=NS(enable_lora=False, speculative_adaptive=False),
     )
     runner.attention_graph_variants = None
     runner.is_encoder_decoder = False
@@ -204,7 +215,62 @@ def graph_runner():
     return runner
 
 
-class TestGraphAgreement(unittest.TestCase):
+class TestGraphAgreement(CustomTestCase):
+    def test_fixed_eagle_vote_allows_target_and_both_draft_phases(self):
+        runner = graph_runner()
+        runner.model_runner.spec_algorithm.is_none = lambda: False
+        runner.model_runner.spec_algorithm.is_eagle = lambda: True
+        runner.captured_req_width = 4
+        batches = [Batch(1), Batch(3)] + [Batch(0, Mode.IDLE) for _ in range(6)]
+        # Scheduler input has draft width 1; target verify will have width 4.
+        for batch in batches:
+            batch.spec_info = NS(num_tokens_per_req=1)
+        for veto in (False, True):
+            with self.subTest(veto=veto):
+                batches[0].replace_embeds = object() if veto else None
+                vote = all(runner.can_run_pdmux_decode_batch(b) for b in batches)
+                self.assertEqual(vote, not veto)
+                for batch in batches:
+                    forward = NS(
+                        replace_embeds=batch.replace_embeds,
+                        spec_info=NS(num_tokens_per_req=4),
+                        batch_size=batch.rows,
+                        input_ids=torch.zeros(batch.rows * 4),
+                        encoder_lens=None,
+                        can_run_tbo=False,
+                        can_run_dp_cuda_graph=vote,
+                        original_global_num_tokens_cpu=[b.rows for b in batches],
+                    )
+                    self.assertEqual(runner.can_run_graph(forward), not veto)
+                    for filename, width in (
+                        ("eagle_draft_cuda_graph_runner.py", 1),
+                        ("eagle_draft_extend_cuda_graph_runner.py", 4),
+                    ):
+                        can_run = methods(
+                            "speculative/" + filename, ["can_run_graph"], {}
+                        )["can_run_graph"]
+                        draft = NS(**vars(runner))
+                        draft.captured_req_width = width
+                        forward.spec_info.num_tokens_per_req = width
+                        self.assertEqual(can_run(draft, forward), not veto)
+
+    def test_eagle_unnegotiated_variants_and_width_mismatch_veto_idle_too(self):
+        for variant in ("adaptive", "ragged", "width", "other", "frozen"):
+            with self.subTest(variant=variant):
+                runner = graph_runner()
+                runner.model_runner.spec_algorithm.is_none = lambda: False
+                runner.model_runner.spec_algorithm.is_eagle = lambda: variant != "other"
+                runner.model_runner.spec_algorithm.is_frozen_kv_mtp = (
+                    lambda: variant == "frozen"
+                )
+                runner.model_runner.server_args.speculative_adaptive = (
+                    variant == "adaptive"
+                )
+                runner.ragged_verify_mode = variant == "ragged"
+                runner.captured_req_width = 3 if variant == "width" else 4
+                for batch in (Batch(), Batch(0, Mode.IDLE), None):
+                    self.assertFalse(runner.can_run_pdmux_decode_batch(batch))
+
     def test_embedding_override_veto_is_shared_with_actual_replay(self):
         runner = graph_runner()
         batch = Batch()
