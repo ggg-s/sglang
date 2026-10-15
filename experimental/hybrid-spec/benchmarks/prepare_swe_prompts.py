@@ -25,7 +25,7 @@ def main():
     parser.add_argument("--revision", required=True)
     parser.add_argument("--output", required=True, type=Path)
     parser.add_argument("--num-prompts", type=int, default=16)
-    parser.add_argument("--max-prompt-tokens", type=int, default=6144)
+    parser.add_argument("--max-prompt-tokens", type=int, default=7168)
     args = parser.parse_args()
     import pyarrow.parquet as pq
     from transformers import AutoTokenizer
@@ -60,10 +60,7 @@ def main():
             ]
             # Find the longest whole-turn prefix that fits, without truncating
             # serialized tool calls or dropping system/tool instructions.
-            low, high, chosen = 0, len(turns) - 1, None
-            while low <= high:
-                middle = (low + high) // 2
-                index = turns[middle]
+            def render(index):
                 prompt = tokenizer.apply_chat_template(
                     messages[:index],
                     tools=tools,
@@ -72,6 +69,20 @@ def main():
                     enable_thinking=False,
                 )
                 length = len(tokenizer.encode(prompt, add_special_tokens=False))
+                return index, prompt, length
+
+            # Tool schemas alone can exceed the budget. Reject those rows
+            # before tokenizing many long prefixes from the same trajectory.
+            chosen = render(turns[0]) if turns else None
+            if chosen is None or chosen[2] > args.max_prompt_tokens:
+                skipped += 1
+                if skipped % 100 == 0:
+                    print(f"Skipped {skipped}; prepared {len(prompts)}", flush=True)
+                continue
+            low, high = 1, len(turns) - 1
+            while low <= high:
+                middle = (low + high) // 2
+                index, prompt, length = render(turns[middle])
                 if length <= args.max_prompt_tokens:
                     chosen = (index, prompt, length)
                     low = middle + 1
@@ -82,6 +93,7 @@ def main():
                 continue
             index, prompt, length = chosen
             prompts.append(prompt)
+            print(f"Prepared prefix {len(prompts)}: {length} tokens", flush=True)
             provenance.append(
                 dict(
                     trajectory_id=row["trajectory_id"],
