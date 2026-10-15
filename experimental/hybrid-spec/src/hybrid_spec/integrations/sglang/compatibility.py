@@ -22,13 +22,17 @@ def validate_config(config, cfg):
         "enable_mixed_chunk": False,
         "enable_multi_layer_eagle": False,
         "speculative_adaptive": False,
-        "enable_lora": False,
         "disaggregation_mode": "null",
         "decoupled_spec_role": "null",
     }
     for name, expected in required.items():
         if getattr(cfg, name, None) != expected:
             errors.append(f"{name}={expected!r} required")
+    # An unspecified LoRA option remains None when no adapters are loaded.
+    if getattr(cfg, "enable_lora", None) not in (None, False) or getattr(
+        cfg, "lora_paths", None
+    ):
+        errors.append("LoRA must be disabled")
     tp_size = getattr(cfg, "tp_size", None)
     if type(tp_size) is not int or tp_size < 1:
         errors.append("tp_size must be a positive integer")

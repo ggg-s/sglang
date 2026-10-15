@@ -101,7 +101,8 @@ def main():
     benchmark = Path(__file__).with_name("compare_servers.py")
     prompts = args.prompts or Path(__file__).with_name("prompts.json")
     url = f"http://127.0.0.1:{args.port}"
-    summary = {}
+    summary_path = out / "summary.json"
+    summary = json.loads(summary_path.read_text()) if summary_path.exists() else {}
     for mode in args.modes:
         if mode not in {
             "native-eager",
@@ -189,6 +190,7 @@ def main():
                     check_text_only_boundary(url)
                 for concurrency in (1, 4):
                     result_path = out / f"{mode}-c{concurrency}.json"
+                    result_path.unlink(missing_ok=True)
                     run = [
                         sys.executable,
                         str(benchmark),

@@ -217,6 +217,8 @@ def test_configuration_fails_closed():
     )
     config = HybridConfig(2, 2, 2, 32)
     validate_config(config, cfg)
+    # ServerArgs resolves an unspecified, disabled LoRA option to None.
+    validate_config(config, SimpleNamespace(**(vars(cfg) | {"enable_lora": None})))
     for tp_size in (2, 4, 8):
         validate_config(config, SimpleNamespace(**(vars(cfg) | {"tp_size": tp_size})))
     for field, value in (
@@ -232,6 +234,8 @@ def test_configuration_fails_closed():
         ("dcp_size", 2),
         ("moe_dp_size", 2),
         ("enable_torch_compile", True),
+        ("enable_lora", True),
+        ("lora_paths", ["adapter"]),
         ("speculative_eagle_topk", 2),
         ("speculative_num_steps", 0),
         ("disable_overlap_schedule", False),
