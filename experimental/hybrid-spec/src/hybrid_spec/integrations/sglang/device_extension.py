@@ -73,6 +73,7 @@ class DeviceDraftExtension:
         self.generation = 0
         self.lock = threading.RLock()
         self.pending_view = None
+        self.last_binding = None
 
     def create_graph_buffers(self, max_bs):
         return DeviceGraphBuffers(self.backend, max_bs)
@@ -164,7 +165,10 @@ class DeviceDraftExtension:
                 else:
                     slots.append(state[1])
                     generations.append(state[2])
-        view = self._view(slots, generations)
+        binding_key = (tuple(slots), tuple(generations))
+        if self.last_binding is None or self.last_binding[0] != binding_key:
+            self.last_binding = (binding_key, self._view(slots, generations))
+        view = self.last_binding[1]
         self.pending_view = view
         draft_input.draft_override = view
         try:

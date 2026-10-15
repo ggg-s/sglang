@@ -1,5 +1,23 @@
 # 验证记录
 
+## 对齐本地 sa_spec 的设备历史路径（2026-10-15）
+
+参考仓库：`../sa_spec`，HEAD `1cc7e8c86b1914a9c05eb60fb11ebe52daf47969`；集成参考为 TRT-LLM PR #10951 的 head `304ec62dd635cc7ad865c2ae35b4ae02910396d0`。该实现同样保留 MTP forward，再按匹配长度选择 SA token。不能把“未跳过 neural forward”单独当成我们与参考实现性能差异的原因。参考脚本要求完整代码续写、输出预算 2048、K=8、默认匹配阈值 4，图中接受长度 3.28→4.41；我们的前轮 K=3/阈值 2 与输入、停止方式并未对齐。
+
+代码提交 `3817502934` 新增 opt-in `history_mode="device"`，旧 CPU 路径仍为默认：
+
+- prefill 初始化一次完整 prompt SA，直接使用 GPU bonus；每轮 verify 从 GPU `predict/accept_index/accept_lens` 暂存接受增量，不再重组、比较或上传完整 CPU 输出历史。
+- draft 的 `prepare(seq_lens)` 在 Graph 内消费增量、查询 SA、生成选择 mask；eager 使用同一算子。重放没有新反馈时不会重复追加。版本必须与设备 `seq_lens+1` 一致。
+- GPU owner generation、CPU 请求对象代际与 padding 槽位隔离旧反馈和槽位复用。GPU 接受前缀仍可能包含 CPU 停止截断前的尾部，交付长度以原生停止处理为准。
+- 新路径允许 TP=1 overlap 实验，其他并行方式仍拒绝；默认 CPU 模式继续拒绝 overlap。
+- `partial_drafts="zero"` 用来复现参考集成的不足 K 尾部补零；默认 `fallback` 保留整条回退，两者均经过原生 target verify。参考配置在 `configs/device-sa-spec.json`（K=8、阈值 4）。
+
+验证：Windows 核心/真实 draft 函数体测试 98 passed，包括禁止读取 CPU decode 历史、GPU 反馈张量身份以及 Graph 选择 mask 对统计的桥接测试；native/Gloo 测试在沙箱内遇到 Zig 路径错误及多进程超时，移至沙箱外补跑后 **4 passed，1 skipped**（NCCL）。Ruff 检查与格式检查通过。Linux 完整包级回归 **102 passed，6 skipped**；新增 CUDA Graph、部分续写、全局接受索引、重放幂等、旧 generation、padding 测试因无 GPU 未执行。CUDA 13 编译器针对 `sm_120` 成功编译和加载新扩展，`CUDA_BUILD_EXIT=0`。日志在服务器 `/root/rivermind-data/validation/device-sa/check.log`。
+
+**验收限制**：本轮服务器容器中 `/dev/nvidia*` 不存在，`torch.cuda.is_available()=False`、设备数 0。尚未执行新模式真实 GPU kernel、模型 token 等价、overlap 生命周期压力测试或性能复测。旧模式此前的实机通过项不能移作新模式的证据；此前并发严格 token 等价失败仍未解决。
+
+该实现仍保留请求槽位/代际映射的 staging 和 verify 反馈 kernel，且 prompt SA 初始构建在 GPU 上，尚未实现参考项目 host 构建与 prefill 的重叠。因此目前只是朝参考执行路径对齐，不能宣称逐项一致或零开销。后续需在相同输入、K、阈值、停止策略下比较原生 MTP、阈值大于历史容量的 SA、正常 SA；再分别比较 overlap 开关与两种部分续写策略。
+
 ## RTX 6000D / Qwen3.6 实机验证（2026-10-15）
 
 最终 SWE 复测与回归测试代码：`1121bd1d0e`，分支 `codex/hybrid-suffix-speculation`。
