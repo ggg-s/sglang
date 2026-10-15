@@ -58,6 +58,7 @@ def main():
             turns = [
                 i for i, m in enumerate(messages) if i and m["role"] == "assistant"
             ]
+
             # Find the longest whole-turn prefix that fits, without truncating
             # serialized tool calls or dropping system/tool instructions.
             def render(index):
