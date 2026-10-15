@@ -54,6 +54,10 @@ def _can_pack_hicache_mtp(
 
 
 class EagleDraftWorkerBase(ABC):
+    # Optional request-level draft selector, installed before graph capture.
+    # The extension owns retrieval state; it never owns or reallocates model KV.
+    draft_extension = None
+
     # topk=1 chain constants for draft_forward's fast path; None when topk > 1.
     _topk1_parents_prealloc: Optional[torch.Tensor] = None
     _topk1_score_indices_prealloc: Optional[torch.Tensor] = None

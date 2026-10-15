@@ -16,7 +16,7 @@ import torch
 from sglang.srt.model_executor.forward_batch_info import ForwardMode
 from sglang.srt.runtime_context import get_context
 from sglang.srt.speculative.adaptive_runtime_state import SpecRuntimeState
-from sglang.srt.speculative.eagle_info import EagleVerifyInput
+from sglang.srt.speculative.eagle_info import EagleDraftInput, EagleVerifyInput
 from sglang.srt.speculative.eagle_utils import organize_draft_results
 from sglang.srt.speculative.eagle_worker_v2 import EagleDraftWorker, EAGLEWorkerV2
 from sglang.test.ci.ci_register import register_amd_ci, register_cpu_ci
@@ -135,6 +135,64 @@ class TestEagleWorkerV2Topk1FastPath(CustomTestCase):
         worker = _make_worker(num_steps=3, num_draft_tokens=3)
         with self.assertRaises(AssertionError):
             worker._rebuild_topk1_chain_buffers()
+
+    def test_override_drives_next_forward_and_final_chain(self):
+        """A final-chain-only replacement leaves draft KV on the wrong prefix;
+        an input-only replacement leaves stale tokens in the fast matrix.
+        Both must observe the same per-step extension selection.
+        """
+        tokens = torch.tensor([[11, 12, 13], [31, 32, 33]], device=DEVICE)
+        mask = torch.tensor([[True], [False]], device=DEVICE)
+
+        class Override:
+            def select_step(self, neural_tokens, step):
+                return torch.where(mask, tokens[:, step : step + 1], neural_tokens)
+
+        worker = _make_worker(num_steps=3, num_draft_tokens=4)
+        worker._rebuild_topk1_chain_buffers()
+        worker.hot_token_id = None
+        worker.index_share_for_mtp_iteration = False
+        worker.seed_dsa_topk_from_draft_extend = False
+        worker.draft_attn_backend = SimpleNamespace(attn_backends=[None, None])
+        forward_inputs = []
+
+        def forward(batch):
+            forward_inputs.append(batch.input_ids.clone())
+            logits = torch.zeros((2, 64), device=DEVICE)
+            logits.scatter_(1, (batch.input_ids + 1).view(-1, 1), 1)
+            return SimpleNamespace(
+                logits_output=SimpleNamespace(
+                    next_token_logits=logits, hidden_states=None
+                )
+            )
+
+        worker.draft_runner = SimpleNamespace(
+            canary_manager=None,
+            forward=forward,
+            model_config=SimpleNamespace(
+                hf_config=SimpleNamespace(architectures=["TestModel"]),
+                model_is_mrope=False,
+            ),
+        )
+        batch = SimpleNamespace(
+            batch_size=2,
+            forward_mode=ForwardMode.DECODE,
+            out_cache_loc=torch.arange(6, device=DEVICE),
+            positions=torch.zeros(2, dtype=torch.int64, device=DEVICE),
+            sampling_info=SimpleNamespace(is_all_greedy=True),
+            spec_info=EagleDraftInput(
+                topk_p=torch.ones((2, 1), device=DEVICE),
+                topk_index=torch.tensor([[1], [2]], device=DEVICE),
+                draft_override=Override(),
+            ),
+        )
+        with patch(
+            "sglang.srt.speculative.eagle_worker_v2.forward_context",
+            side_effect=lambda *_args, **_kwargs: contextlib.nullcontext(),
+        ):
+            _, _, drafts, _ = worker.draft_forward(batch)
+        self.assertEqual(drafts.tolist(), [[11, 12, 13], [2, 3, 4]])
+        self.assertEqual([x.tolist() for x in forward_inputs], [[11, 2], [12, 3]])
 
     def test_idle_verify_input_keeps_required_layout_tensors(self):
         verify_input = EagleVerifyInput.create_idle_input(

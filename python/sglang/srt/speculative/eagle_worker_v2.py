@@ -158,6 +158,8 @@ def _qsa_index_share_requested(hf_config) -> bool:
 
 
 class EagleDraftWorker(EagleDraftWorkerBase):
+    DRAFT_EXTENSION_API_VERSION = 1
+
     def __init__(
         self,
         server_args: ServerArgs,
@@ -642,7 +644,12 @@ class EagleDraftWorker(EagleDraftWorkerBase):
             else contextlib.nullcontext()
         )
 
-        with canary_outside_ctx:
+        override_ctx = (
+            self.draft_extension.bind(batch, draft_input)
+            if self.draft_extension is not None
+            else contextlib.nullcontext()
+        )
+        with override_ctx, canary_outside_ctx:
             # Run draft
             if can_run_decode_cuda_graph:
                 parent_list, top_scores_index, draft_tokens, draft_probs = (
@@ -710,6 +717,10 @@ class EagleDraftWorker(EagleDraftWorkerBase):
 
         if self.hot_token_id is not None:
             topk_index = self.hot_token_id[topk_index]
+
+        override = spec_info.draft_override
+        if override is not None:
+            topk_index = override.select_step(topk_index, 0)
 
         out_cache_loc = per_step_draft_out_cache_loc(
             out_cache_loc,
@@ -846,6 +857,12 @@ class EagleDraftWorker(EagleDraftWorkerBase):
                 )
                 if self.hot_token_id is not None:
                     topk_index = self.hot_token_id[topk_index]
+                if override is not None:
+                    topk_index = override.select_step(topk_index, i + 1)
+                    if draft_tokens_topk1 is not None:
+                        # postprocess already wrote the neural token. Both the
+                        # verify chain and next forward must use the selection.
+                        draft_tokens_topk1[:, i + 1 : i + 2].copy_(topk_index)
                 hidden_states = logits_output.hidden_states
 
         draft_probs = (

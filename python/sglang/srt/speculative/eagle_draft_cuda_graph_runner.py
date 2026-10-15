@@ -99,6 +99,8 @@ class EAGLEDraftCudaGraphRunner(DecodeCudaGraphRunner):
     the parent's capture() / backend contract is satisfied.
     """
 
+    DRAFT_EXTENSION_API_VERSION = 1
+
     def __init__(
         self,
         eagle_worker: EagleDraftWorker,
@@ -278,6 +280,13 @@ class EAGLEDraftCudaGraphRunner(DecodeCudaGraphRunner):
         )
         self.buffers.share_buffers()
 
+        extension = eagle_worker.draft_extension
+        self.draft_extension_buffers = (
+            extension.create_graph_buffers(self.max_bs)
+            if extension is not None
+            else None
+        )
+
         self.backend = resolve_decode_backend(self)
 
         # Capture
@@ -441,6 +450,10 @@ class EAGLEDraftCudaGraphRunner(DecodeCudaGraphRunner):
             hidden_states=hidden_states,
             capture_hidden_mode=capture_mode,
         )
+        if self.draft_extension_buffers is not None:
+            spec_info.draft_override = self.draft_extension_buffers.bind_capture_view(
+                num_seqs
+            )
         if self.buffers.dsa_seed_topk is not None:
             spec_info.dsa_topk_indices = self.buffers.dsa_seed_topk[:num_seqs]
 
@@ -570,6 +583,11 @@ class EAGLEDraftCudaGraphRunner(DecodeCudaGraphRunner):
             bs = self._pad_to_bucket(int(max_batch_size), self.capture_bs)
         else:
             bs = self._pad_to_bucket(raw_bs, self.capture_bs)
+
+        if self.draft_extension_buffers is not None:
+            self.draft_extension_buffers.stage(
+                forward_batch.spec_info.draft_override, raw_bs, bs
+            )
 
         if bs != raw_bs:
             buffers.seq_lens.fill_(self.seq_len_fill_value)

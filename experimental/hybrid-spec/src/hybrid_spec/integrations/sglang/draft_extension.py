@@ -1,0 +1,83 @@
+from __future__ import annotations
+
+import weakref
+from contextlib import contextmanager
+
+import torch
+from hybrid_spec.core.runtime import HybridRuntime
+from hybrid_spec.integrations.sglang.graph_buffers import GraphBuffers
+from hybrid_spec.observability.metrics import Metrics
+
+
+class DraftExtension:
+    def __init__(self, config, backend, vocab_size, tp_sync=None):
+        self.config = config
+        self.runtime = HybridRuntime(config, backend, vocab_size)
+        self.device = backend.device
+        self.identities = {}
+        self.metrics = Metrics()
+        self.pending_selection = None
+        self.tp_sync = tp_sync
+
+    def create_graph_buffers(self, max_bs):
+        return GraphBuffers(max_bs, self.config.num_drafts, self.device)
+
+    @contextmanager
+    def bind(self, batch, draft_input):
+        if batch.is_extend_in_batch or batch.has_grammar:
+            raise ValueError("hybrid-spec does not support mixed prefill or grammar")
+        if not batch.sampling_info.is_all_greedy:
+            raise ValueError("hybrid-spec supports greedy requests only")
+        for rid, ref in list(self.identities.items()):
+            req = ref()
+            if req is None or req.finished():
+                self.close_request(rid)
+        requests = []
+        for req in batch.reqs:
+            ref = self.identities.get(req.rid)
+            if ref is None or ref() is not req:
+                self.runtime.close_request(req.rid)
+                self.identities[req.rid] = weakref.ref(req)
+            if req.multimodal_inputs is not None:
+                raise ValueError("hybrid-spec does not index multimodal inputs")
+            history = req.origin_input_ids + req.output_ids
+            if not req.output_ids:
+                raise ValueError("hybrid-spec requires the committed prefill anchor")
+            requests.append(
+                (
+                    req.rid,
+                    history,
+                    req.sampling_params.max_new_tokens - len(req.output_ids),
+                )
+            )
+        view = self.runtime.prepare(requests)
+        # The native seq_lens excludes the current anchor. A mismatch must
+        # fall back, never apply candidates to another history version.
+        expected = torch.tensor(
+            [len(history) for _, history, _ in requests],
+            dtype=torch.int64,
+            device=self.device,
+        )
+        view.use_retrieval &= batch.seq_lens + 1 == expected
+        if self.tp_sync is not None:
+            view = self.tp_sync.synchronize(view)
+        self.pending_selection = view.use_retrieval
+        draft_input.draft_override = view
+        try:
+            yield view
+        finally:
+            draft_input.draft_override = None
+
+    def close_request(self, rid):
+        self.runtime.close_request(rid)
+        self.identities.pop(rid, None)
+
+    def reset(self):
+        self.runtime.reset()
+        self.identities.clear()
+        self.pending_selection = None
+
+    def on_verify_result(self, result):
+        if self.pending_selection is not None:
+            self.metrics.record(self.pending_selection, result.accept_lens)
+            self.pending_selection = None

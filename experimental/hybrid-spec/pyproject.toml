@@ -1,0 +1,27 @@
+[build-system]
+requires = ["setuptools>=68"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "hybrid-spec"
+version = "0.1.0"
+description = "Experimental request-level suffix-automaton draft selection for SGLang"
+readme = "README.md"
+requires-python = ">=3.10"
+dependencies = ["torch>=2.5"]
+
+[project.optional-dependencies]
+test = ["pytest>=8"]
+
+[project.entry-points."sglang.srt.plugins"]
+hybrid_spec = "hybrid_spec.plugin:register"
+
+[tool.setuptools.packages.find]
+where = ["src"]
+
+[tool.setuptools.package-data]
+hybrid_spec = ["backends/gpu_sa/*.cu", "backends/gpu_sa/*.h"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+pythonpath = ["src"]

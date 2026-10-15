@@ -189,6 +189,10 @@ class EagleDraftInput(SpecInput):
     # DP attention synchronizes the bit across ranks before the worker runs.
     cuda_graph_compatible: bool = True
 
+    # Transient request-level selection view. Bound only for an actual draft
+    # call; graph capture binds its own static view. Never carried in FutureMap.
+    draft_override: Optional[object] = None
+
     def __post_init__(self):
         super().__init__(SpecInputType.EAGLE_DRAFT)
 
