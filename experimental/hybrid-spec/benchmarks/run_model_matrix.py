@@ -113,6 +113,7 @@ def main():
             "native-graph",
             "hybrid-graph",
             "target-eager",
+            "target-graph",
             "native-k1-graph",
             "hybrid-k1-graph",
         }:
@@ -242,7 +243,11 @@ def main():
                             "SA usage was not observed; cannot validate hybrid"
                         )
                     (out / "summary.json").write_text(json.dumps(summary, indent=2))
-                if args.eval_examples and mode in ("native-graph", "hybrid-graph"):
+                if args.eval_examples and mode in (
+                    "native-graph",
+                    "hybrid-graph",
+                    "target-graph",
+                ):
                     from types import SimpleNamespace
                     from sglang.test.sgl_eval_utils import run_sgl_eval
 
