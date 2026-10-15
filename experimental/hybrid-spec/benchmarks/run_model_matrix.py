@@ -75,6 +75,9 @@ def main():
     parser.add_argument("--model-path", required=True)
     parser.add_argument("--output-dir", required=True, type=Path)
     parser.add_argument("--prompts", type=Path)
+    parser.add_argument(
+        "--performance-only", action="store_true", help="Do not compare output tokens"
+    )
     parser.add_argument("--port", type=int, default=30000)
     parser.add_argument("--startup-timeout", type=int, default=1800)
     parser.add_argument("--max-tokens", type=int, default=128)
@@ -209,7 +212,11 @@ def main():
                     if mode.startswith("target"):
                         reference_mode = "native-eager"
                     reference = out / f"{reference_mode}-c{concurrency}.json"
-                    if reference_mode != mode and reference.exists():
+                    if (
+                        not args.performance_only
+                        and reference_mode != mode
+                        and reference.exists()
+                    ):
                         run += ["--reference", str(reference)]
                     result = subprocess.run(run, check=False)
                     if not result_path.exists():

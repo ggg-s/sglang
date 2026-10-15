@@ -85,7 +85,15 @@ def main():
     )
     for label, url in endpoints:
         # Warm-up is intentionally excluded from the measured run.
-        generate(url, prompts[0], args.max_tokens)
+        # Warm the measured concurrency, including batch-size-specific kernels.
+        # A single request leaves the concurrent run's first batch cold.
+        with concurrent.futures.ThreadPoolExecutor(args.concurrency) as pool:
+            list(
+                pool.map(
+                    lambda p: generate(url, p, args.max_tokens),
+                    prompts[: args.concurrency],
+                )
+            )
         with urllib.request.urlopen(
             url.rstrip("/") + "/get_server_info", timeout=30
         ) as response:
@@ -100,6 +108,7 @@ def main():
             after = json.load(response)
         report[label] = {
             "url": url,
+            "warmup_requests": min(len(prompts), args.concurrency),
             "wall_s": wall,
             "mean_latency_s": statistics.mean(r["latency_s"] for r in rows),
             "output_tokens_per_s": sum(len(r["tokens"]) for r in rows) / wall,

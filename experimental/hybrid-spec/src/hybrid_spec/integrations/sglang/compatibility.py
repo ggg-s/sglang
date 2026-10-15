@@ -57,8 +57,7 @@ def validate_model(worker):
             ["Qwen3_5ForCausalLM"],
             ["Qwen3_5MoeForCausalLM"],
         )
-        and getattr(draft.hf_config, "architectures", [])
-        == ["Qwen3_5ForCausalLMMTP"]
+        and getattr(draft.hf_config, "architectures", []) == ["Qwen3_5ForCausalLMMTP"]
         and getattr(target.hf_config, "language_only", False)
         and getattr(draft.hf_config, "language_only", False)
     )
