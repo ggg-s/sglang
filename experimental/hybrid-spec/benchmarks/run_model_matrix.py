@@ -46,6 +46,30 @@ def find_metrics(value):
     return None
 
 
+def check_text_only_boundary(url):
+    for payload in (
+        {"text": "test", "image_data": "unsupported-test-image"},
+        {"input_embeds": [[0.5]]},
+    ):
+        payload["sampling_params"] = {"temperature": 0, "max_new_tokens": 1}
+        request = urllib.request.Request(
+            url + "/generate",
+            data=json.dumps(payload).encode(),
+            headers={"Content-Type": "application/json"},
+        )
+        try:
+            urllib.request.urlopen(request, timeout=30)
+        except urllib.error.HTTPError as error:
+            body = error.read().decode()
+            if (
+                error.code != 400
+                or "hybrid-spec requires text or token IDs" not in body
+            ):
+                raise RuntimeError(f"Unexpected request rejection: {body}") from error
+        else:
+            raise RuntimeError("Unsupported input was accepted")
+
+
 def main():
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--model-path", required=True)
@@ -161,6 +185,8 @@ def main():
                 wait_ready(url, process, args.startup_timeout)
                 print(f"READY {mode}", flush=True)
                 summary[mode] = {}
+                if hybrid:
+                    check_text_only_boundary(url)
                 for concurrency in (1, 4):
                     result_path = out / f"{mode}-c{concurrency}.json"
                     run = [
