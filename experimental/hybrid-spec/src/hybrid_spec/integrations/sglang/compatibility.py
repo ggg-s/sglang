@@ -43,14 +43,43 @@ def validate_config(config, cfg):
 
 
 def validate_model(worker):
-    from sglang.srt.configs.hybrid_arch import mambaish_config
+    target = worker.target_worker.model_runner.model_config
+    draft = worker.draft_runner.model_config
+    qwen_mtp = (
+        getattr(target.hf_config, "architectures", [])
+        in (
+            ["Qwen3_5ForConditionalGeneration"],
+            ["Qwen3_5MoeForConditionalGeneration"],
+            ["Qwen3_5ForCausalLM"],
+            ["Qwen3_5MoeForCausalLM"],
+        )
+        and getattr(draft.hf_config, "architectures", [])
+        == ["Qwen3_5ForCausalLMMTP"]
+        and getattr(target.hf_config, "language_only", False)
+        and getattr(draft.hf_config, "language_only", False)
+    )
 
-    for runner in (worker.target_worker.model_runner, worker.draft_runner):
-        model_config = runner.model_config
-        if (
-            model_config.is_multimodal
-            or model_config.model_is_mrope
-            or getattr(model_config, "is_hybrid_swa", False)
-            or mambaish_config(model_config) is not None
-        ):
-            raise ValueError("hybrid-spec requires a text-only full-attention model")
+    for model_config in (target, draft):
+        if getattr(model_config, "is_hybrid_swa", False):
+            raise ValueError(
+                "hybrid-spec does not support hybrid sliding-window attention"
+            )
+        if qwen_mtp:
+            # Qwen3.6 uses the Qwen3.5 architecture. Its MTP layer is full
+            # attention; the target's GDN verify writes intermediate states and
+            # commit_mamba_states_after_verify commits only the accepted prefix.
+            # Token replacement must stay before each draft forward and native
+            # verify/commit. Keep native mRoPE positions for text-only requests;
+            # DraftExtension.bind still rejects actual multimodal input.
+            continue
+        if model_config.is_multimodal or model_config.model_is_mrope:
+            raise ValueError(
+                "hybrid-spec requires full attention or Qwen3.5/3.6 MTP "
+                "with --language-only"
+            )
+        from sglang.srt.configs.hybrid_arch import mambaish_config
+
+        if mambaish_config(model_config) is not None:
+            raise ValueError(
+                "hybrid-spec supports linear attention only with Qwen3.5/3.6 MTP"
+            )

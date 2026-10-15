@@ -50,6 +50,12 @@ def register():
         _validate_sampling,
         HookType.BEFORE,
     )
+    HookRegistry.register(
+        "sglang.srt.managers.scheduler_components.internal_state."
+        "SchedulerInternalStateController.get_internal_state",
+        _diagnostics,
+        HookType.AFTER,
+    )
 
 
 def _config():
@@ -131,3 +137,12 @@ def _reset(result, worker, *args, **kwargs):
 def _verify(result, worker, *args, **kwargs):
     if worker.draft_worker.draft_extension is not None:
         worker.draft_worker.draft_extension.on_verify_result(result)
+
+
+def _diagnostics(result, controller, *args, **kwargs):
+    worker = controller.scheduler.draft_worker
+    draft = getattr(worker, "draft_worker", None)
+    extension = getattr(draft, "draft_extension", None)
+    if extension is not None:
+        # Explicit diagnostic readback only; never synchronize each decode step.
+        result.internal_state["hybrid_spec"] = extension.metrics.snapshot()

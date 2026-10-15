@@ -13,11 +13,11 @@ from hybrid_spec.core.contracts import (
 )
 from hybrid_spec.core.request_state import RequestState
 from hybrid_spec.core.runtime import HybridRuntime
-from hybrid_spec.integrations.sglang.compatibility import validate_config
+from hybrid_spec.integrations.sglang.compatibility import validate_config, validate_model
 from hybrid_spec.integrations.sglang.draft_extension import DraftExtension
 from hybrid_spec.integrations.sglang.graph_buffers import GraphBuffers
 from hybrid_spec.observability.metrics import Metrics
-from hybrid_spec.plugin import _validate_sampling
+from hybrid_spec.plugin import _diagnostics, _validate_sampling
 from hybrid_spec.selection.policy import select_requests
 
 
@@ -255,6 +255,75 @@ def test_feedback_attributes_bonus_separately_from_correct_drafts():
         retrieval_accept_tokens=5,
         neural_accept_tokens=5,
     )
+
+
+@pytest.mark.parametrize("moe", [False, True])
+def test_qwen_linear_attention_requires_text_only_mtp_pair(moe):
+    target = SimpleNamespace(
+        hf_config=SimpleNamespace(
+            architectures=[
+                "Qwen3_5MoeForConditionalGeneration"
+                if moe
+                else "Qwen3_5ForConditionalGeneration"
+            ],
+            language_only=True,
+        ),
+        is_multimodal=True,
+        model_is_mrope=True,
+        is_hybrid_swa=False,
+    )
+    draft = SimpleNamespace(
+        **(
+            vars(target)
+            | {
+                "hf_config": SimpleNamespace(
+                    architectures=["Qwen3_5ForCausalLMMTP"], language_only=True
+                )
+            }
+        )
+    )
+    worker = SimpleNamespace(
+        target_worker=SimpleNamespace(model_runner=SimpleNamespace(model_config=target)),
+        draft_runner=SimpleNamespace(model_config=draft),
+    )
+    validate_model(worker)
+    # Do not turn this exception into permission for arbitrary hybrid targets,
+    # external draft models, multimodal serving, or sliding-window pools.
+    for obj, field, value in (
+        (target.hf_config, "architectures", ["Qwen3NextForCausalLM"]),
+        (draft.hf_config, "architectures", ["Qwen3ForCausalLM"]),
+        (target.hf_config, "language_only", False),
+        (draft.hf_config, "language_only", False),
+        (target, "is_hybrid_swa", True),
+        (draft, "is_hybrid_swa", True),
+    ):
+        original = getattr(obj, field)
+        setattr(obj, field, value)
+        with pytest.raises(ValueError):
+            validate_model(worker)
+        setattr(obj, field, original)
+
+
+def test_diagnostic_readback_preserves_native_state_and_counts():
+    metrics = Metrics()
+    metrics.record(torch.tensor([True, False]), torch.tensor([2, 1]))
+    controller = SimpleNamespace(
+        scheduler=SimpleNamespace(
+            draft_worker=SimpleNamespace(
+                draft_worker=SimpleNamespace(
+                    draft_extension=SimpleNamespace(metrics=metrics)
+                )
+            )
+        )
+    )
+    result = SimpleNamespace(internal_state={"avg_spec_accept_length": 1.5})
+    _diagnostics(result, controller)
+    assert result.internal_state["avg_spec_accept_length"] == 1.5
+    assert result.internal_state["hybrid_spec"]["retrieval_correct_drafts"] == 1
+    assert result.internal_state["hybrid_spec"]["neural_accept_tokens"] == 1
+    # Repeated reads must not consume counters or change subsequent results.
+    _diagnostics(result, controller)
+    assert result.internal_state["hybrid_spec"]["retrieval_accept_tokens"] == 2
 
 
 def test_unsupported_requests_rejected_before_scheduling():

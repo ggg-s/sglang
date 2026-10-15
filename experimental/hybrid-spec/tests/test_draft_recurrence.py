@@ -37,7 +37,8 @@ def load_functions(relative, names, namespace, class_name=None):
 @pytest.mark.parametrize("k", [1, 2, 4])
 @pytest.mark.parametrize("matrix,hot", [(False, False), (True, False), (False, True)])
 @pytest.mark.parametrize("mask", [None, [False, False], [True, True], [True, False]])
-def test_selected_prefix_drives_model_and_verify_chain(k, matrix, hot, mask):
+@pytest.mark.parametrize("mrope", [False, True])
+def test_selected_prefix_drives_model_and_verify_chain(k, matrix, hot, mask, mrope):
     def postprocess(logits, positions, drafts, step):
         index = logits.argmax(dim=-1, keepdim=True)
         positions.add_(1)
@@ -90,9 +91,14 @@ def test_selected_prefix_drives_model_and_verify_chain(k, matrix, hot, mask):
         "EagleDraftWorker",
     )
     inputs = []
+    positions = []
+    mrope_positions = []
 
     def model_forward(batch):
         inputs.append(batch.input_ids.clone())
+        positions.append(batch.positions.clone())
+        if mrope:
+            mrope_positions.append(batch.mrope_positions.clone())
         logits = torch.zeros((2, 8))
         logits.scatter_(1, ((batch.input_ids + 1) % 8).view(-1, 1), 1)
         return SimpleNamespace(
@@ -106,7 +112,8 @@ def test_selected_prefix_drives_model_and_verify_chain(k, matrix, hot, mask):
         batch_size=2,
         forward_mode=SimpleNamespace(is_idle=lambda: False),
         out_cache_loc=torch.arange(2 * k),
-        positions=torch.zeros(2, dtype=torch.int64),
+        positions=torch.tensor([7, 19]),
+        mrope_positions=torch.tensor([[7, 19]]).expand(3, -1).clone(),
         spec_info=SimpleNamespace(
             topk_p=torch.ones((2, 1)),
             topk_index=torch.tensor([[1], [2]]),
@@ -128,7 +135,7 @@ def test_selected_prefix_drives_model_and_verify_chain(k, matrix, hot, mask):
         draft_runner=SimpleNamespace(
             model_config=SimpleNamespace(
                 hf_config=SimpleNamespace(architectures=["TestModel"]),
-                model_is_mrope=False,
+                model_is_mrope=mrope,
             ),
             canary_manager=None,
             forward=model_forward,
@@ -147,3 +154,6 @@ def test_selected_prefix_drives_model_and_verify_chain(k, matrix, hot, mask):
     assert len(inputs) == k - 1
     for step, tokens in enumerate(inputs):
         assert torch.equal(tokens, expected[:, step])
+        assert torch.equal(positions[step], torch.tensor([7, 19]) + step)
+        if mrope:
+            assert torch.equal(mrope_positions[step], positions[step].expand(3, -1))
