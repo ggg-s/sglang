@@ -158,7 +158,7 @@ def _qsa_index_share_requested(hf_config) -> bool:
 
 
 class EagleDraftWorker(EagleDraftWorkerBase):
-    DRAFT_EXTENSION_API_VERSION = 1
+    DRAFT_EXTENSION_API_VERSION = 2
 
     def __init__(
         self,
@@ -720,6 +720,8 @@ class EagleDraftWorker(EagleDraftWorkerBase):
 
         override = spec_info.draft_override
         if override is not None:
+            if hasattr(override, "prepare"):
+                override.prepare(forward_batch.seq_lens)
             topk_index = override.select_step(topk_index, 0)
 
         out_cache_loc = per_step_draft_out_cache_loc(

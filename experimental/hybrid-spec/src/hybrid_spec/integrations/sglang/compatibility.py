@@ -18,7 +18,6 @@ def validate_config(config, cfg):
         "speculative_eagle_topk": 1,
         "speculative_num_steps": config.num_drafts,
         "speculative_num_draft_tokens": config.num_drafts + 1,
-        "disable_overlap_schedule": True,
         "enable_mixed_chunk": False,
         "enable_multi_layer_eagle": False,
         "speculative_adaptive": False,
@@ -28,6 +27,10 @@ def validate_config(config, cfg):
     for name, expected in required.items():
         if getattr(cfg, name, None) != expected:
             errors.append(f"{name}={expected!r} required")
+    if config.history_mode == "cpu" and not cfg.disable_overlap_schedule:
+        errors.append("CPU history requires disable_overlap_schedule=True")
+    if config.history_mode == "device" and cfg.tp_size != 1:
+        errors.append("device history currently requires tp_size=1")
     # An unspecified LoRA option remains None when no adapters are loaded.
     if getattr(cfg, "enable_lora", None) not in (None, False) or getattr(
         cfg, "lora_paths", None

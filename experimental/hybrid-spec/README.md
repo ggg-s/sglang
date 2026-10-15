@@ -4,6 +4,14 @@
 
 这是实验实现。CPU 语义测试与 CUDA/真实模型验收是不同层次；当前验证记录见 [VALIDATION.md](VALIDATION.md)。未测模型不得视为已支持。
 
+新增 opt-in `history_mode="device"` 路径，用于对齐 Baseten `sa_spec` 的 GPU 增量更新与调度方式。请求 prefill 后初始化一次 prompt 索引；verify 直接在设备上暂存 `predict/accept_index/accept_lens`，下一轮 draft 在 CUDA Graph 内消费增量、查询并选择来源。不再每轮读取或重建 CPU 输出历史。eager 使用相同设备算子，CPU 只管理请求槽位和代际映射。
+
+该路径允许 TP=1 的 overlap 配置，但 **尚未完成 GPU/真实模型验收**。当前服务器不再暴露 GPU，不能把实现完成当作运行验证。旧模式默认 `history_mode="cpu"`，保留关闭 overlap 的限制及现有验证证据；新路径不继承其通过结论。device 路径保留每批槽位/代际映射的 H2D 和 verify 反馈 kernel，并未证明零开销；prompt 初始 SA 仍在 GPU 上构建，未实现参考项目的 host 构建与 prefill 重叠。
+
+`configs/device-sa-spec.json` 给出 K=8、阈值 4、`partial_drafts="zero"` 的参考策略配置。启动时相应设置 `--speculative-num-steps 8 --speculative-num-draft-tokens 9`；测试 overlap 时移除 `--disable-overlap-schedule`。`zero` 复现参考集成对不足 K 个续写的尾部补零；这些仍是草稿，必须经过原生 target verify，不代表输出补零。默认 `partial_drafts="fallback"` 继续整条回退，可用于单独比较该策略差异。阈值设为大于历史容量的数值可测量“维护 SA、全部选择 MTP”的成本。
+
+device 模式以 generation 和 GPU 历史版本检查隔离旧反馈、槽位复用、重排和 Graph padding；prefill/retract 时重建索引。GPU 接受前缀可能包含 CPU EOS/停止截断前的尾部，不能将索引长度当作交付长度；原生停止处理保持不变。新路径只开放单卡实验，不开放 TP 多卡、chunk prefill、grammar 等其余未支持组合。
+
 ## 实现与边界
 
 | 项目 | 当前实现 |
@@ -88,6 +96,8 @@ curl http://127.0.0.1:30000/generate \
 | `max_requests` | 可同时持有 SA 的请求数；无槽位时 neural fallback |
 | `max_history_tokens` | 单请求 prompt + 已提交输出容量；超出时 neural fallback |
 | `backend` | 服务只能使用 `gpu_sa`；`reference` 用于测试 |
+| `history_mode` | `cpu`（默认，旧同步路径）或 `device`（GPU 反馈与 Graph 内增量处理，实验 TP=1） |
+| `partial_drafts` | `fallback`（默认，不足 K 则整条回退）或 `zero`（参考实现的尾部补零草稿） |
 
 状态内存估计：`4 * max_requests * [H + 4*(2H+1) + 3*(3H+1) + 5]` 字节。示例约 36 MiB，另有查询与 Graph buffer。状态在 draft worker 构造时分配，早于 target KV 预算/分配；不修改原生 KV 规划。
 

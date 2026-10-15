@@ -46,6 +46,11 @@ def register():
         HookType.AFTER,
     )
     HookRegistry.register(
+        "sglang.srt.speculative.eagle_worker_v2.EAGLEWorkerV2._forward_prefill_batch",
+        _prefill,
+        HookType.AFTER,
+    )
+    HookRegistry.register(
         "sglang.srt.sampling.sampling_params.SamplingParams.verify",
         _validate_sampling,
         HookType.BEFORE,
@@ -111,11 +116,11 @@ def _attach(result, worker, *args, **kwargs):
 
     _validate(worker.server_args)
     if (
-        getattr(worker, "DRAFT_EXTENSION_API_VERSION", None) != 1
-        or getattr(EAGLEDraftCudaGraphRunner, "DRAFT_EXTENSION_API_VERSION", None) != 1
+        getattr(worker, "DRAFT_EXTENSION_API_VERSION", None) != 2
+        or getattr(EAGLEDraftCudaGraphRunner, "DRAFT_EXTENSION_API_VERSION", None) != 2
     ):
         raise RuntimeError(
-            "hybrid-spec requires the SGLang draft extension API v1 patch"
+            "hybrid-spec requires the SGLang draft extension API v2 patch"
         )
     validate_model(worker)
     config = _config()
@@ -128,7 +133,14 @@ def _attach(result, worker, *args, **kwargs):
         if tp_group.world_size > 1
         else None
     )
-    worker.draft_extension = DraftExtension(
+    extension_type = DraftExtension
+    if config.history_mode == "device":
+        from hybrid_spec.integrations.sglang.device_extension import (
+            DeviceDraftExtension,
+        )
+
+        extension_type = DeviceDraftExtension
+    worker.draft_extension = extension_type(
         config,
         backend,
         worker.target_worker.model_runner.model_config.vocab_size,
@@ -149,8 +161,18 @@ def _reset(result, worker, *args, **kwargs):
 
 
 def _verify(result, worker, *args, **kwargs):
-    if worker.draft_worker.draft_extension is not None:
-        worker.draft_worker.draft_extension.on_verify_result(result)
+    extension = worker.draft_worker.draft_extension
+    if extension is not None:
+        if on_device_verify := getattr(extension, "on_device_verify", None):
+            on_device_verify(result, args[0] if args else kwargs["batch"])
+        else:
+            extension.on_verify_result(result)
+
+
+def _prefill(result, worker, batch, *args, **kwargs):
+    extension = getattr(worker.draft_worker, "draft_extension", None)
+    if extension is not None and hasattr(extension, "on_prefill"):
+        extension.on_prefill(batch, result)
 
 
 def _diagnostics(result, controller, *args, **kwargs):

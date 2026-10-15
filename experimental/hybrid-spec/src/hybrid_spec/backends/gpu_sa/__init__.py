@@ -12,7 +12,11 @@ class GPUSuffixAutomaton:
     @staticmethod
     def estimate_memory(config):
         h, n = config.max_history_tokens, config.max_requests
-        return n * (h + (2 * h + 1) * 4 + (3 * h + 1) * 3 + 5) * 4
+        return n * (
+            (h + (2 * h + 1) * 4 + (3 * h + 1) * 3 + 5) * 4
+            + 40
+            + 4 * (config.num_drafts + 1)
+        )
 
     def __init__(self, config, device):
         from torch.utils.cpp_extension import load
@@ -37,6 +41,12 @@ class GPUSuffixAutomaton:
             (n, 3 * h + 1, 3), dtype=torch.int32, device=self.device
         )
         self.meta = torch.zeros((n, 5), dtype=torch.int32, device=self.device)
+        self.owners = torch.zeros(n, dtype=torch.int64, device=self.device)
+        self.limits = torch.zeros(n, dtype=torch.int64, device=self.device)
+        self.pending = torch.empty(
+            (n, config.num_drafts + 1), dtype=torch.int32, device=self.device
+        )
+        self.pending_meta = torch.zeros((n, 3), dtype=torch.int64, device=self.device)
         self.ready = torch.cuda.Event()
         self.ready.record(torch.cuda.current_stream(self.device))
         self.stream = None
@@ -74,3 +84,49 @@ class GPUSuffixAutomaton:
             self.history, self.states, self.edges, self.meta, slots, num_drafts
         )
         return RetrievalCandidates(*outputs)
+
+    def initialize_device_slot(self, slot, generation, limit):
+        self.reset_slot(slot)
+        self.owners[slot].fill_(generation)
+        self.limits[slot].fill_(limit)
+        self.pending_meta[slot].zero_()
+
+    def stage_feedback(
+        self, slots, generations, predict, indices, lengths, seq_lens, has_anchor, vocab
+    ):
+        self._check_stream()
+        self.module.stage_feedback(
+            self.meta,
+            self.owners,
+            self.pending,
+            self.pending_meta,
+            slots,
+            generations,
+            predict,
+            indices,
+            lengths,
+            seq_lens,
+            has_anchor,
+            vocab,
+        )
+
+    def consume_and_query(self, slots, generations, seq_lens, tokens, mask):
+        # Called on the native capture stream during capture and on its forward
+        # stream during replay. No host readback, allocation or stream binding.
+        self.module.consume_and_query(
+            self.history,
+            self.states,
+            self.edges,
+            self.meta,
+            self.owners,
+            self.limits,
+            self.pending,
+            self.pending_meta,
+            slots,
+            generations,
+            seq_lens,
+            tokens,
+            mask,
+            self.config.min_match_len,
+            self.config.partial_drafts == "zero",
+        )

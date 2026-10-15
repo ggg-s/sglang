@@ -80,5 +80,6 @@ class HybridRuntime:
             torch.tensor(remaining, device=self.backend.device, dtype=torch.int64),
             self.config.min_match_len,
             self.vocab_size,
+            self.config.partial_drafts,
         )
         return view

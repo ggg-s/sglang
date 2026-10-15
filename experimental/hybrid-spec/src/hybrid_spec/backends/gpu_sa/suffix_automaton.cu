@@ -154,8 +154,155 @@ std::vector<torch::Tensor> query(torch::Tensor history, torch::Tensor states,
   return {tokens, valid, matches, versions, healthy};
 }
 
+// Verify produces int32 predictions, path indices and accept lengths. Only
+// these device buffers are consumed; no CPU output history is inspected.
+__global__ void feedback_kernel(
+    int *meta, const int64_t *owners, int *pending, int64_t *pending_meta,
+    const int64_t *slots, const int64_t *generations, const int *predict,
+    const int *indices, const int *lengths, const int64_t *seq_lens, int n,
+    int width, int index_width, int predict_size, bool has_anchor, int vocab) {
+  int row = blockIdx.x;
+  int64_t slot = slots[row], generation = generations[row];
+  if (slot < 0 || slot >= n || owners[slot] != generation)
+    return;
+  int count = lengths[row];
+  int64_t *pm = pending_meta + slot * 3;
+  // Unconsumed feedback indicates a missing draft or duplicate delivery.
+  bool valid = count > 0 && count <= width && count <= index_width && pm[2] == 0;
+  for (int j = 0; valid && j < count; ++j) {
+    int index = indices[row * index_width + j];
+    valid = index >= 0 && index < predict_size;
+    if (valid) {
+      int token = predict[index];
+      valid = token >= 0 && token < vocab;
+      pending[slot * width + j] = token;
+    }
+  }
+  pm[0] = generation;
+  pm[1] = seq_lens[row] + static_cast<int>(has_anchor);
+  pm[2] = valid ? count : -1;
+}
+
+__global__ void consume_query_kernel(
+    int *history, int *states, int *edges, int *meta, const int64_t *owners,
+    const int64_t *limits, const int *pending, int64_t *pending_meta,
+    const int64_t *slots, const int64_t *generations, const int64_t *seq_lens,
+    int64_t *tokens, bool *mask, int n, int h, int k, int min_match,
+    bool zero_partial) {
+  int row = blockIdx.x;
+  mask[row] = false;
+  for (int j = 0; j < k; ++j)
+    tokens[row * k + j] = 0;
+  int64_t slot = slots[row], generation = generations[row];
+  if (slot < 0 || slot >= n || owners[slot] != generation)
+    return;
+  Automaton a{history + slot * h, states + slot * (2 * h + 1) * 4,
+              edges + slot * (3 * h + 1) * 3, meta + slot * 5, h};
+  int64_t *pm = pending_meta + slot * 3;
+  if (pm[2] != 0) {
+    int count = static_cast<int>(pm[2]);
+    pm[2] = 0; // Graph replay is idempotent without new verify feedback.
+    if (pm[0] != generation || pm[1] != a.meta[0] || count < 0 || count > k + 1)
+      a.meta[4] = 0;
+    else
+      for (int j = 0; j < count && a.meta[4]; ++j)
+        a.append(pending[slot * (k + 1) + j]);
+  }
+  // seq_lens excludes the current bonus anchor; the SA includes it.
+  if (!a.meta[4] || a.meta[0] != seq_lens[row] + 1 ||
+      static_cast<int64_t>(a.meta[0]) + k + 1 > limits[slot])
+    return;
+  int suffix = a.s(a.meta[3], 1);
+  if (suffix <= 0 || a.s(suffix, 0) < min_match)
+    return;
+  int start = a.s(suffix, 2) + 1;
+  int count = min(k, a.meta[0] - start);
+  if (count < k && !zero_partial)
+    return;
+  for (int j = 0; j < count; ++j)
+    tokens[row * k + j] = a.history[start + j];
+  mask[row] = true;
+}
+
+void check_device_metadata(torch::Tensor meta, torch::Tensor owners,
+                           torch::Tensor pending, torch::Tensor pending_meta,
+                           torch::Tensor slots, torch::Tensor generations,
+                           torch::Tensor seq_lens) {
+  auto device = meta.device();
+  check_tensor(meta, torch::kInt32, device);
+  check_tensor(pending, torch::kInt32, device);
+  for (const auto &t : {owners, pending_meta, slots, generations, seq_lens})
+    check_tensor(t, torch::kInt64, device);
+  TORCH_CHECK(meta.dim() == 2 && meta.size(1) == 5 && owners.dim() == 1 &&
+                  owners.size(0) == meta.size(0) && pending.dim() == 2 &&
+                  pending.size(0) == meta.size(0) && pending_meta.dim() == 2 &&
+                  pending_meta.size(0) == meta.size(0) && pending_meta.size(1) == 3 &&
+                  slots.dim() == 1 && generations.sizes() == slots.sizes() &&
+                  seq_lens.sizes() == slots.sizes(),
+              "invalid device feedback metadata");
+}
+
+void stage_feedback(torch::Tensor meta, torch::Tensor owners,
+                    torch::Tensor pending, torch::Tensor pending_meta,
+                    torch::Tensor slots, torch::Tensor generations,
+                    torch::Tensor predict, torch::Tensor indices,
+                    torch::Tensor lengths, torch::Tensor seq_lens,
+                    bool has_anchor, int64_t vocab) {
+  check_device_metadata(meta, owners, pending, pending_meta, slots, generations,
+                        seq_lens);
+  for (const auto &t : {predict, indices, lengths})
+    check_tensor(t, torch::kInt32, meta.device());
+  TORCH_CHECK(predict.dim() == 1 && indices.dim() == 2 &&
+                  indices.size(0) == slots.size(0) && lengths.sizes() == slots.sizes() &&
+                  vocab > 0 && vocab <= INT_MAX && predict.numel() < INT_MAX,
+              "invalid verify feedback");
+  c10::cuda::CUDAGuard guard(meta.device());
+  if (slots.numel()) {
+    feedback_kernel<<<slots.numel(), 1, 0, at::cuda::getCurrentCUDAStream()>>>(
+        meta.data_ptr<int>(), owners.data_ptr<int64_t>(), pending.data_ptr<int>(),
+        pending_meta.data_ptr<int64_t>(), slots.data_ptr<int64_t>(),
+        generations.data_ptr<int64_t>(), predict.data_ptr<int>(),
+        indices.data_ptr<int>(), lengths.data_ptr<int>(), seq_lens.data_ptr<int64_t>(),
+        meta.size(0), pending.size(1), indices.size(1), predict.numel(), has_anchor,
+        vocab);
+    C10_CUDA_KERNEL_LAUNCH_CHECK();
+  }
+}
+
+void consume_and_query(
+    torch::Tensor history, torch::Tensor states, torch::Tensor edges,
+    torch::Tensor meta, torch::Tensor owners, torch::Tensor limits,
+    torch::Tensor pending, torch::Tensor pending_meta, torch::Tensor slots,
+    torch::Tensor generations, torch::Tensor seq_lens, torch::Tensor tokens,
+    torch::Tensor mask, int64_t min_match, bool zero_partial) {
+  check_storage(history, states, edges, meta);
+  check_device_metadata(meta, owners, pending, pending_meta, slots, generations,
+                        seq_lens);
+  check_tensor(limits, torch::kInt64, meta.device());
+  check_tensor(tokens, torch::kInt64, meta.device());
+  check_tensor(mask, torch::kBool, meta.device());
+  TORCH_CHECK(limits.sizes() == owners.sizes() && tokens.dim() == 2 &&
+                  tokens.size(0) == slots.size(0) && tokens.size(1) > 0 &&
+                  tokens.size(1) + 1 == pending.size(1) &&
+                  mask.sizes() == slots.sizes() && min_match > 0 && min_match <= INT_MAX,
+              "invalid device query outputs");
+  c10::cuda::CUDAGuard guard(meta.device());
+  if (slots.numel()) {
+    consume_query_kernel<<<slots.numel(), 1, 0, at::cuda::getCurrentCUDAStream()>>>(
+        history.data_ptr<int>(), states.data_ptr<int>(), edges.data_ptr<int>(),
+        meta.data_ptr<int>(), owners.data_ptr<int64_t>(), limits.data_ptr<int64_t>(),
+        pending.data_ptr<int>(), pending_meta.data_ptr<int64_t>(),
+        slots.data_ptr<int64_t>(), generations.data_ptr<int64_t>(),
+        seq_lens.data_ptr<int64_t>(), tokens.data_ptr<int64_t>(), mask.data_ptr<bool>(),
+        history.size(0), history.size(1), tokens.size(1), min_match, zero_partial);
+    C10_CUDA_KERNEL_LAUNCH_CHECK();
+  }
+}
+
 PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
   m.def("reset", &reset);
   m.def("append", &append);
   m.def("query", &query);
+  m.def("stage_feedback", &stage_feedback);
+  m.def("consume_and_query", &consume_and_query);
 }

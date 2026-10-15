@@ -12,6 +12,8 @@ class HybridConfig:
     max_requests: int
     max_history_tokens: int
     backend: str = "gpu_sa"
+    history_mode: str = "cpu"
+    partial_drafts: str = "fallback"
 
     def __post_init__(self):
         for name in (
@@ -27,6 +29,10 @@ class HybridConfig:
             raise ValueError("num_drafts must be smaller than max_history_tokens")
         if self.backend not in ("gpu_sa", "reference"):
             raise ValueError("backend must be gpu_sa or reference")
+        if self.history_mode not in ("cpu", "device"):
+            raise ValueError("history_mode must be cpu or device")
+        if self.partial_drafts not in ("fallback", "zero"):
+            raise ValueError("partial_drafts must be fallback or zero")
 
     @classmethod
     def from_file(cls, path: str):

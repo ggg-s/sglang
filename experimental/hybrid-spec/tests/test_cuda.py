@@ -14,6 +14,10 @@ from hybrid_spec.core.contracts import (
     RequestSnapshot,
 )
 from hybrid_spec.integrations.sglang.graph_buffers import GraphBuffers
+from hybrid_spec.integrations.sglang.device_extension import (
+    DeviceGraphBuffers,
+    DeviceOverride,
+)
 
 pytestmark = pytest.mark.skipif(
     not torch.cuda.is_available(), reason="requires NVIDIA CUDA"
@@ -86,3 +90,96 @@ def test_cuda_graph_replay_reads_live_mask_and_padding(k):
     buffers.stage(DraftOverrideView(values[:1], mask_tensor[:1]), 1, 4)
     graph.replay()
     assert torch.equal(output[1:], neural[1:].expand(-1, k))
+
+
+@pytest.mark.parametrize("partial", ["fallback", "zero"])
+def test_device_feedback_graph_reorder_generation_and_replay(partial):
+    config = HybridConfig(3, 2, 2, 64, history_mode="device", partial_drafts=partial)
+    backend = GPUSuffixAutomaton(config, "cuda")
+    # Slot 0 has only two continuation tokens. Slot 1 has a complete chain.
+    histories = [[1, 2, 1], [4, 5, 6, 7, 4]]
+    for slot, history in enumerate(histories):
+        backend.initialize_device_slot(slot, slot + 10, 64)
+        backend.append(
+            slot, HistoryDelta(RequestKey(str(slot), slot + 10), 0, tuple(history))
+        )
+    buffers = DeviceGraphBuffers(backend, 4)
+    capture_view = buffers.bind_capture_view(4)
+    seq_lens = torch.ones(4, dtype=torch.int64, device="cuda")
+    # Capturing/warming empty slots must not mutate live automata.
+    stream = torch.cuda.Stream()
+    stream.wait_stream(torch.cuda.current_stream())
+    with torch.cuda.stream(stream):
+        capture_view.prepare(seq_lens)
+    torch.cuda.current_stream().wait_stream(stream)
+    graph = torch.cuda.CUDAGraph()
+    with torch.cuda.graph(graph):
+        capture_view.prepare(seq_lens)
+
+    def stage(slots, generations, lengths):
+        view = DeviceOverride(
+            backend,
+            torch.tensor(slots, device="cuda"),
+            torch.tensor(generations, device="cuda"),
+        )
+        buffers.stage(view, len(slots), 4)
+        seq_lens[: len(slots)].copy_(torch.tensor(lengths, device="cuda"))
+        return view
+
+    # Prefill bonus is appended exactly once inside the replay, not on the host.
+    slots = torch.tensor([0, 1], device="cuda")
+    generations = torch.tensor([10, 11], device="cuda")
+    backend.stage_feedback(
+        slots,
+        generations,
+        torch.tensor([2, 5], dtype=torch.int32, device="cuda"),
+        torch.tensor([[0], [1]], dtype=torch.int32, device="cuda"),
+        torch.ones(2, dtype=torch.int32, device="cuda"),
+        torch.tensor([3, 5], device="cuda"),
+        False,
+        100,
+    )
+    view = stage([1, 0], [11, 10], [5, 3])
+    graph.replay()
+    assert view.use_retrieval.tolist() == [True, partial == "zero"]
+    assert capture_view.tokens[0].tolist() == [6, 7, 4]
+    if partial == "zero":
+        assert capture_view.tokens[1].tolist() == [1, 2, 0]
+    assert not capture_view.use_retrieval[2:].any()
+    versions = backend.meta[:, 0].clone()
+    graph.replay()
+    assert torch.equal(backend.meta[:, 0], versions)
+
+    # Verify indices are global and may be non-contiguous; -1 padding is unread.
+    backend.stage_feedback(
+        slots[:1],
+        generations[:1],
+        torch.tensor([8, 9, 3, 4], dtype=torch.int32, device="cuda"),
+        torch.tensor([[2, 0, -1, -1]], dtype=torch.int32, device="cuda"),
+        torch.tensor([2], dtype=torch.int32, device="cuda"),
+        torch.tensor([3], device="cuda"),
+        True,
+        100,
+    )
+    stage([0], [10], [5])
+    graph.replay()
+    assert backend.history[0, :6].tolist() == [1, 2, 1, 2, 3, 8]
+
+    # Old in-flight feedback/query must never touch a reassigned slot.
+    backend.initialize_device_slot(0, 20, 64)
+    backend.append(0, HistoryDelta(RequestKey("replacement", 20), 0, (9, 8, 9)))
+    backend.stage_feedback(
+        slots[:1],
+        generations[:1],
+        torch.tensor([7], dtype=torch.int32, device="cuda"),
+        torch.tensor([[0]], dtype=torch.int32, device="cuda"),
+        torch.ones(1, dtype=torch.int32, device="cuda"),
+        torch.tensor([3], device="cuda"),
+        True,
+        100,
+    )
+    stage([0], [10], [3])
+    graph.replay()
+    assert not capture_view.use_retrieval.any()
+    assert backend.meta[0, 0].item() == 3
+    assert backend.meta[0, 4].item() == 1

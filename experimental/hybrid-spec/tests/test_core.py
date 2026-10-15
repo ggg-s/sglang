@@ -18,6 +18,7 @@ from hybrid_spec.integrations.sglang.compatibility import (
     validate_model,
 )
 from hybrid_spec.integrations.sglang.draft_extension import DraftExtension
+from hybrid_spec.integrations.sglang.device_extension import DeviceDraftExtension
 from hybrid_spec.integrations.sglang.graph_buffers import GraphBuffers
 from hybrid_spec.observability.metrics import Metrics
 from hybrid_spec.plugin import _diagnostics, _validate_inputs, _validate_sampling
@@ -217,6 +218,11 @@ def test_configuration_fails_closed():
     )
     config = HybridConfig(2, 2, 2, 32)
     validate_config(config, cfg)
+    device_config = HybridConfig(2, 2, 2, 32, history_mode="device")
+    overlap_cfg = SimpleNamespace(**(vars(cfg) | {"disable_overlap_schedule": False}))
+    validate_config(device_config, overlap_cfg)
+    with pytest.raises(ValueError, match="tp_size=1"):
+        validate_config(device_config, SimpleNamespace(**(vars(cfg) | {"tp_size": 2})))
     # ServerArgs resolves an unspecified, disabled LoRA option to None.
     validate_config(config, SimpleNamespace(**(vars(cfg) | {"enable_lora": None})))
     for tp_size in (2, 4, 8):
@@ -262,6 +268,85 @@ def test_feedback_attributes_bonus_separately_from_correct_drafts():
         retrieval_accept_tokens=5,
         neural_accept_tokens=5,
     )
+
+
+def test_device_bridge_keeps_feedback_on_device_and_ignores_cpu_decode_history():
+    """CPU output lags under overlap; feedback must use verify tensors instead."""
+    config = HybridConfig(2, 2, 2, 32, history_mode="device")
+
+    class Backend:
+        device = torch.device("cpu")
+
+        def __init__(self):
+            self.config = config
+            self.feedback = []
+
+        def initialize_device_slot(self, *args):
+            self.initialization = args
+
+        def append(self, slot, delta):
+            self.prompt = delta.accept_tokens
+
+        def stage_feedback(self, *args):
+            self.feedback.append(args)
+
+        def consume_and_query(self, slots, generations, seq_lens, tokens, mask):
+            tokens.fill_(7)
+            mask.copy_(slots >= 0)
+
+    backend = Backend()
+    extension = DeviceDraftExtension(config, backend, 100)
+    req = Request()
+    req.get_fill_ids = lambda: req.origin_input_ids
+    batch = SimpleNamespace(
+        reqs=[req],
+        seq_lens_cpu=torch.tensor([5]),
+        seq_lens=torch.tensor([5]),
+        forward_mode=SimpleNamespace(is_idle=lambda: False),
+        is_extend_in_batch=False,
+        has_grammar=False,
+        sampling_info=SimpleNamespace(is_all_greedy=True),
+    )
+    extension.on_prefill(batch, SimpleNamespace(next_token_ids=torch.tensor([2])))
+    assert backend.prompt == (1, 2, 3, 4, 1)
+    assert backend.initialization == (0, 1, 35)
+    assert backend.feedback[-1][-2] is False
+
+    class UnavailableHistory:
+        def __len__(self):
+            raise AssertionError("decode read stale CPU history")
+
+        def __add__(self, other):
+            raise AssertionError("decode reconstructed CPU history")
+
+    req.origin_input_ids = req.output_ids = UnavailableHistory()
+    req.get_fill_ids = lambda: pytest.fail("decode read CPU fill IDs")
+    draft = SimpleNamespace(draft_override=None)
+    buffers = extension.create_graph_buffers(4)
+    captured = buffers.bind_capture_view(4)
+    result = SimpleNamespace(
+        next_token_ids=torch.tensor([3, 4, 9], dtype=torch.int32),
+        accept_index=torch.tensor([[0, 1, -1]], dtype=torch.int32),
+        accept_lens=torch.tensor([2], dtype=torch.int32),
+    )
+    with extension.bind(batch, draft) as view:
+        buffers.stage(view, 1, 4)
+        captured.prepare(torch.tensor([5, 1, 1, 1]))
+        # The replay-written mask, including cleared padding, drives metrics.
+        assert view.use_retrieval.tolist() == [True]
+        assert captured.use_retrieval.tolist() == [True, False, False, False]
+    extension.on_device_verify(result, batch)
+    feedback = backend.feedback[-1]
+    assert feedback[2] is result.next_token_ids
+    assert feedback[3] is result.accept_index
+    assert feedback[4] is result.accept_lens
+    assert feedback[5] is batch.seq_lens
+    assert feedback[-2] is True
+    assert extension.metrics.snapshot()["retrieval_accept_tokens"] == 2
+    assert draft.draft_override is None
+    extension.close_request(req.rid)
+    with extension.bind(batch, draft) as view:
+        assert view.slots.tolist() == [-1]
 
 
 @pytest.mark.parametrize("moe", [False, True])

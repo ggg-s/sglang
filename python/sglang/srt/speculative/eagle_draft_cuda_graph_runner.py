@@ -99,7 +99,7 @@ class EAGLEDraftCudaGraphRunner(DecodeCudaGraphRunner):
     the parent's capture() / backend contract is satisfied.
     """
 
-    DRAFT_EXTENSION_API_VERSION = 1
+    DRAFT_EXTENSION_API_VERSION = 2
 
     def __init__(
         self,
