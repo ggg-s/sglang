@@ -40,6 +40,21 @@ def main():
         for row in batch.to_pylist():
             messages = without_nulls(row["trajectory"])
             tools = without_nulls(row["tools"])
+            # OpenAI trajectories store arguments as JSON strings; Qwen's chat
+            # template renders named arguments from a mapping.
+            try:
+                for message in messages:
+                    for call in message.get("tool_calls", []):
+                        function = call["function"]
+                        arguments = function.get("arguments", {})
+                        if isinstance(arguments, str):
+                            arguments = json.loads(arguments)
+                        if not isinstance(arguments, dict):
+                            raise ValueError("Tool arguments must be a JSON object")
+                        function["arguments"] = arguments
+            except (ValueError, json.JSONDecodeError):
+                skipped += 1
+                continue
             turns = [
                 i for i, m in enumerate(messages) if i and m["role"] == "assistant"
             ]
