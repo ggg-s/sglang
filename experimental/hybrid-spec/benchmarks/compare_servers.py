@@ -52,6 +52,8 @@ def main():
     parser.add_argument("--output", type=Path, required=True)
     parser.add_argument("--concurrency", type=int, default=1)
     parser.add_argument("--max-tokens", type=int, default=128)
+    parser.add_argument("--warmup-all", action="store_true")
+    parser.add_argument("--flush-cache-before-run", action="store_true")
     args = parser.parse_args()
     prompts = json.loads(args.prompts.read_text(encoding="utf-8"))
     if not prompts or not all(isinstance(p, str) for p in prompts):
@@ -91,9 +93,15 @@ def main():
             list(
                 pool.map(
                     lambda p: generate(url, p, args.max_tokens),
-                    prompts[: args.concurrency],
+                    prompts if args.warmup_all else prompts[: args.concurrency],
                 )
             )
+        if args.flush_cache_before_run:
+            with urllib.request.urlopen(
+                url.rstrip("/") + "/flush_cache?timeout=30", timeout=35
+            ) as response:
+                if response.status != 200:
+                    raise RuntimeError("Cache flush failed before measurement")
         with urllib.request.urlopen(
             url.rstrip("/") + "/get_server_info", timeout=30
         ) as response:
@@ -108,7 +116,10 @@ def main():
             after = json.load(response)
         report[label] = {
             "url": url,
-            "warmup_requests": min(len(prompts), args.concurrency),
+            "warmup_requests": (
+                len(prompts) if args.warmup_all else min(len(prompts), args.concurrency)
+            ),
+            "cache_flushed_before_run": args.flush_cache_before_run,
             "wall_s": wall,
             "mean_latency_s": statistics.mean(r["latency_s"] for r in rows),
             "output_tokens_per_s": sum(len(r["tokens"]) for r in rows) / wall,

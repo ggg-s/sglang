@@ -210,6 +210,8 @@ def main():
                         str(args.max_tokens),
                     ]
                     reference_mode = mode.replace("hybrid", "native")
+                    if args.performance_only:
+                        run += ["--warmup-all", "--flush-cache-before-run"]
                     if mode.startswith("target"):
                         reference_mode = "native-eager"
                     reference = out / f"{reference_mode}-c{concurrency}.json"
