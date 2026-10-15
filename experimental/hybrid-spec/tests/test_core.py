@@ -13,11 +13,14 @@ from hybrid_spec.core.contracts import (
 )
 from hybrid_spec.core.request_state import RequestState
 from hybrid_spec.core.runtime import HybridRuntime
-from hybrid_spec.integrations.sglang.compatibility import validate_config, validate_model
+from hybrid_spec.integrations.sglang.compatibility import (
+    validate_config,
+    validate_model,
+)
 from hybrid_spec.integrations.sglang.draft_extension import DraftExtension
 from hybrid_spec.integrations.sglang.graph_buffers import GraphBuffers
 from hybrid_spec.observability.metrics import Metrics
-from hybrid_spec.plugin import _diagnostics, _validate_sampling
+from hybrid_spec.plugin import _diagnostics, _validate_inputs, _validate_sampling
 from hybrid_spec.selection.policy import select_requests
 
 
@@ -283,7 +286,9 @@ def test_qwen_linear_attention_requires_text_only_mtp_pair(moe):
         )
     )
     worker = SimpleNamespace(
-        target_worker=SimpleNamespace(model_runner=SimpleNamespace(model_config=target)),
+        target_worker=SimpleNamespace(
+            model_runner=SimpleNamespace(model_config=target)
+        ),
         draft_runner=SimpleNamespace(model_config=draft),
     )
     validate_model(worker)
@@ -345,6 +350,17 @@ def test_unsupported_requests_rejected_before_scheduling():
     ):
         with pytest.raises(ValueError):
             _validate_sampling(SimpleNamespace(**(params | {field: value})), 100)
+
+
+def test_media_and_embeddings_rejected_before_gpu_scheduling():
+    _validate_inputs(
+        SimpleNamespace(contains_mm_input=lambda: False, input_embeds=None)
+    )
+    for media, embeds in ((True, None), (False, [[0.5]])):
+        with pytest.raises(ValueError, match="text or token IDs"):
+            _validate_inputs(
+                SimpleNamespace(contains_mm_input=lambda: media, input_embeds=embeds)
+            )
 
 
 @pytest.mark.parametrize(

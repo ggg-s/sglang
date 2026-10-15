@@ -56,6 +56,11 @@ def register():
         _diagnostics,
         HookType.AFTER,
     )
+    HookRegistry.register(
+        "sglang.srt.managers.io_struct.GenerateReqInput.normalize_batch_and_arguments",
+        _validate_inputs,
+        HookType.BEFORE,
+    )
 
 
 def _config():
@@ -82,6 +87,15 @@ def _validate_sampling(params, vocab_size):
         raise ValueError("hybrid-spec does not support grammar constraints")
     if params.beam_width is not None or params.watermark is not None:
         raise ValueError("hybrid-spec does not support beam search or watermarking")
+
+
+def _validate_inputs(request):
+    # Qwen's text-only MTP still advertises multimodal capabilities. Reject
+    # unsupported requests in the tokenizer process, before GPU scheduling.
+    if request.contains_mm_input() or request.input_embeds is not None:
+        raise ValueError(
+            "hybrid-spec requires text or token IDs without multimodal inputs"
+        )
 
 
 def _attach(result, worker, *args, **kwargs):

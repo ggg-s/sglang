@@ -127,6 +127,8 @@ def main():
             "0.8",
             "--random-seed",
             "42",
+            "--watchdog-timeout",
+            "1800",
             "--cuda-graph-backend-decode",
             "full" if graph else "disabled",
             "--cuda-graph-backend-prefill",
