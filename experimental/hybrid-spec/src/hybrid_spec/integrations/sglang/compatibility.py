@@ -38,8 +38,8 @@ def validate_config(config, cfg):
     tp_size = getattr(cfg, "tp_size", None)
     if type(tp_size) is not int or tp_size < 1:
         errors.append("tp_size must be a positive integer")
-    if cfg.chunked_prefill_size not in (None, -1):
-        errors.append("chunked_prefill_size=-1 required")
+    if config.history_mode == "cpu" and cfg.chunked_prefill_size not in (None, -1):
+        errors.append("CPU history requires chunked_prefill_size=-1")
     if cfg.speculative_algorithm not in ("EAGLE", "EAGLE3", "STANDALONE"):
         errors.append("only ordinary EAGLE/MTP, EAGLE3 and STANDALONE are wired")
     if config.backend != "gpu_sa":

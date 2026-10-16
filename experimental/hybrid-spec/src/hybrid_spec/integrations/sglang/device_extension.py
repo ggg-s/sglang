@@ -140,7 +140,7 @@ class DeviceDraftExtension:
                     self.close_request(state.rid)
 
     def begin_prefill(self, batch):
-        """Snapshot/submit before target prefill, without waiting for the build."""
+        """Build full histories on final prefill chunks, without waiting."""
         if batch.forward_mode.is_idle():
             return ()
         ticket = []
@@ -148,6 +148,14 @@ class DeviceDraftExtension:
             with self.lock:
                 for row, req in enumerate(batch.reqs):
                     self.close_request(req.rid)
+                    # A middle chunk's sampled token is discarded by SGLang.
+                    # It must not seed SA feedback or reserve a slot. Use this
+                    # batch's marker, not req.inflight_middle_chunks, which
+                    # overlap result processing can change independently.
+                    # Closing first also invalidates pre-retraction history.
+                    if req is getattr(batch, "chunked_req", None):
+                        ticket.append(None)
+                        continue
                     length = int(batch.seq_lens_cpu[row])
                     if not self.free_slots or length >= self.config.max_history_tokens:
                         ticket.append(None)
@@ -203,6 +211,8 @@ class DeviceDraftExtension:
                 state.device_initialized = True
                 slots.append(state.slot)
                 generations.append(state.generation)
+        if not any(slot >= 0 for slot in slots):
+            return
         view = self._view(slots, generations)
         bs = len(slots)
         # Prefill sampled one GPU bonus token. It is appended by the first

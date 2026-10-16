@@ -23,6 +23,13 @@ Version 2 requires the plugin's
 prefill and verify hooks for feedback; old CPU-history views need no `prepare`.
 The prefill AROUND hook submits a GIL-free host build before target prefill,
 stages the GPU bonus after success and cancels matching leases on exceptions.
+With chunked prefill, device history does this only for final-chunk rows. The
+batch-local `chunked_req` marks the intermediate row; its transient sampled
+token is discarded and it reserves no SA slot. Other final rows in that same
+batch remain eligible. The final chunk snapshots the full request history,
+including cached/earlier chunks, before launch. Re-prefill invalidates old
+leases even on intermediate chunks. CPU history still requires non-overlap
+scheduling and disabled chunked prefill; mixed prefill/decode remains rejected.
 At the first draft consumer it imports used pinned CPU prefixes on the forward
 stream, preserving GPU bonus feedback. Copy sources are retained until a CUDA
 event completes; background construction never touches CUDA or request objects.

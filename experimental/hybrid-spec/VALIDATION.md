@@ -1,5 +1,20 @@
 # 验证记录
 
+## Device overlap + chunked prefill 接入（2026-10-16）
+
+修改前 HEAD：`b39fab6873`。device 历史原已允许 overlap；本轮放开其 chunked prefill 校验并补齐分块生命周期。CPU 历史仍要求 `--disable-overlap-schedule --chunked-prefill-size -1`，mixed prefill/decode 继续拒绝。
+
+`Scheduler` 在构造本轮 `ScheduleBatch` 时保存 `chunked_req`，标识尚未完成 prefill 的请求。扩展以该批标记判断中间块，而不读取 overlap 结果处理会修改的 `req.inflight_middle_chunks`：
+
+- 中间块不构建 SA、不占槽、不消费临时采样 token；若该请求因 retract 重新 prefill，先关闭旧代际，避免旧 build/feedback 污染后续请求。
+- 同批的其他 final-chunk 请求正常构建。不能用批级 `contains_last_prefill_chunk` 跳过整批，也不能删除中间行后错用原始采样下标；无效行保持 slot=-1。
+- 最后一块开始前按该行完整 `seq_lens_cpu` 快照历史，包含 radix 命中的前缀和之前各块；仅一次后台构建，与最后一块 target/draft prefill 重叠。首次 draft 才导入完整状态并消费真实 bonus，若 host build 尚未完成仍会等待。
+- 全部行均无可用 SA 槽位时，prefill 返回钩子不读取 `next_token_ids`，兼容中间块跳过采样的情况。
+
+本地回归：修改前，新增分块场景暴露中间块占槽、临时反馈和重算旧状态未被丢弃的问题；修改后 `test_core.py` **37 passed**，`test_draft_recurrence.py` **72 passed**，`test_cuda.py` **6 skipped**（本机无 CUDA）。这覆盖分块/非分块后台构建、最后块与中间块共批、完整历史快照、槽位复用及旧回调隔离。Ruff 修改文件检查与 `git diff --check` 通过。
+
+尚未在 GPU 上验证模型输出、NCCL/Graph 或吞吐。部署时使用 `history_mode="device"`，移除 `--disable-overlap-schedule`，将 `--chunked-prefill-size -1` 改为 `--chunked-prefill-size 2048`（或省略以使用模型默认值），保持 `--enable-mixed-chunk` 不启用。固定模型/头、TP、K、JSON、请求和采样参数，native 与 hybrid 分别比较：两项关闭、仅 overlap、overlap + chunked prefill。输入应跨至少两个 chunk，同时覆盖短长请求共批、prefix cache 命中、abort/retract；检查 token 对照、SA 使用率和接受长度后再测 TTFT/TPOT。短于 chunk size 的请求不能用于证明分块路径正确或有收益。
+
 ## 性能报告独立复核与共识路径改进（2026-10-16）
 
 输入为根目录 `hybrid-spec性能瓶颈分析一.md`，报告基线 `1b0f580307`；本轮修改前 HEAD 为 `4030650794`。本地只有分析 Markdown，没有报告引用的原始 CPU/GPU trace，以下区分源码事实、实验观察和待证假设。

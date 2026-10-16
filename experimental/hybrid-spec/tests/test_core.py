@@ -237,7 +237,7 @@ def test_configuration_fails_closed():
     validate_config(device_config, overlap_cfg)
     for algorithm in ("EAGLE", "EAGLE3", "STANDALONE"):
         for tp_size in (1, 2, 4, 8):
-            for overlap in (False, True):
+            for overlap, chunk_size in itertools.product((False, True), (-1, 2048)):
                 validate_config(
                     device_config,
                     SimpleNamespace(
@@ -247,6 +247,7 @@ def test_configuration_fails_closed():
                                 "tp_size": tp_size,
                                 "speculative_algorithm": algorithm,
                                 "disable_overlap_schedule": not overlap,
+                                "chunked_prefill_size": chunk_size,
                             }
                         )
                     ),
@@ -276,12 +277,18 @@ def test_configuration_fails_closed():
         ("speculative_adaptive", True),
         ("enable_multi_layer_eagle", True),
         ("chunked_prefill_size", 2048),
+        ("enable_mixed_chunk", True),
         ("speculative_algorithm", "FROZEN_KV_MTP"),
     ):
         changed = SimpleNamespace(**vars(cfg))
         setattr(changed, field, value)
         with pytest.raises(ValueError):
             validate_config(config, changed)
+    with pytest.raises(ValueError, match="enable_mixed_chunk"):
+        validate_config(
+            device_config,
+            SimpleNamespace(**(vars(overlap_cfg) | {"enable_mixed_chunk": True})),
+        )
 
 
 def test_real_lora_cli_default_none_is_disabled_for_all_spec_algorithms():
@@ -521,10 +528,38 @@ def host_prefill_case():
         extension.shutdown()
 
 
-def test_host_build_overlaps_prefill_and_imports_only_at_first_draft(host_prefill_case):
+@pytest.mark.parametrize("chunked", [False, True])
+def test_host_build_overlaps_prefill_and_imports_only_at_first_draft(
+    host_prefill_case, chunked
+):
     """A blocked builder must not block prefill launch or its completion hook."""
     extension, backend, batch, worker, result = host_prefill_case
     backend.release.clear()
+    if chunked:
+        # The batch marker is immutable for this forward, unlike the request's
+        # middle-chunk counter, which overlap result processing can change.
+        req = batch.reqs[0]
+        req.inflight_middle_chunks = 0
+        middle = SimpleNamespace(
+            **(
+                vars(batch)
+                | {
+                    "chunked_req": req,
+                    "seq_lens_cpu": torch.tensor([2]),
+                    "seq_lens": torch.tensor([2]),
+                }
+            )
+        )
+        # SGLang can skip sampling entirely for an all-middle prefill batch.
+        _prefill(
+            lambda worker, batch: SimpleNamespace(next_token_ids=None), worker, middle
+        )
+        assert not extension.states and extension.free_slots == [0]
+        assert not backend.started.is_set()
+        assert backend.feedback == []
+        # The final batch has no middle row even if prior results are pending.
+        req.inflight_middle_chunks = 1
+        batch.chunked_req = None
 
     def prefill(worker, batch):
         assert backend.started.wait(5)
@@ -543,6 +578,43 @@ def test_host_build_overlaps_prefill_and_imports_only_at_first_draft(host_prefil
     assert backend.imports == [(0, (1, 2, 3, 4, 1))]
 
 
+def test_chunked_prefill_keeps_final_rows_and_discards_middle_bonus(host_prefill_case):
+    """A middle chunk must neither occupy a slot nor steal a final row's bonus."""
+    extension, backend, batch, worker, result = host_prefill_case
+    middle_req = batch.reqs[0]
+    final_req = Request("b")
+    final_req.origin_input_ids = [6, 7, 8, 6, 7]
+    final_req.get_fill_ids = lambda: final_req.origin_input_ids
+    batch.reqs = [middle_req, final_req]
+    batch.chunked_req = middle_req
+    batch.contains_last_prefill_chunk = True
+    batch.seq_lens_cpu = torch.tensor([2, 5])
+    batch.seq_lens = torch.tensor([2, 5])
+    result.next_token_ids = torch.tensor([99, 8])
+    _prefill(lambda worker, batch: result, worker, batch)
+    with extension.bind(batch, SimpleNamespace(draft_override=None)) as view:
+        assert view.slots.tolist() == [-1, 0]
+    assert backend.imports == [(0, (6, 7, 8, 6, 7))]
+    feedback = backend.feedback[-1]
+    assert feedback[0].tolist() == [-1, 0]
+    assert feedback[2].tolist() == [99, 8]
+    assert feedback[3].tolist() == [[0], [1]]
+
+    # After the other request finishes, the final chunk indexes the full
+    # prefix (including tokens processed/cached in earlier chunks).
+    extension.close_request("b")
+    batch.reqs = [middle_req]
+    batch.chunked_req = None
+    batch.seq_lens_cpu = torch.tensor([5])
+    batch.seq_lens = torch.tensor([5])
+    result.next_token_ids = torch.tensor([2])
+    _prefill(lambda worker, batch: result, worker, batch)
+    with extension.bind(batch, SimpleNamespace(draft_override=None)) as view:
+        assert view.slots.tolist() == [0]
+    assert backend.imports[-1] == (0, (1, 2, 3, 4, 1))
+    assert backend.feedback[-1][2].tolist() == [2]
+
+
 def test_prefill_exception_cancels_reserved_host_build(host_prefill_case):
     extension, backend, batch, worker, _ = host_prefill_case
     backend.release.clear()
@@ -557,7 +629,7 @@ def test_prefill_exception_cancels_reserved_host_build(host_prefill_case):
     assert backend.imports == []
 
 
-@pytest.mark.parametrize("finish", ["close", "reset"])
+@pytest.mark.parametrize("finish", ["close", "reset", "chunk"])
 def test_late_host_build_cannot_overwrite_reused_slot(host_prefill_case, finish):
     extension, backend, batch, worker, result = host_prefill_case
     backend.release.clear()
@@ -567,6 +639,14 @@ def test_late_host_build_cannot_overwrite_reused_slot(host_prefill_case, finish)
     extension.on_prefill(batch, result, old_ticket)
     if finish == "close":
         extension.close_request(old_req.rid)
+    elif finish == "chunk":
+        # Retraction re-prefills a live request. A new middle chunk must
+        # invalidate its old build even before the final chunk is scheduled.
+        middle = SimpleNamespace(**(vars(batch) | {"chunked_req": old_req}))
+        ticket = extension.begin_prefill(middle)
+        extension.on_prefill(middle, result, ticket)
+        assert ticket == (None,)
+        assert not extension.states and extension.free_slots == [0]
     else:
         extension.reset()
     replacement = Request("a")
