@@ -1,5 +1,8 @@
 # 验证记录
 
+当前机制、优化阶段与跨实验结论的汇总入口见 [优化总览](OPTIMIZATIONS.md)。
+下文按阶段保留当时的协议、结果和验收限制。
+
 ## 并发 4：混合批逐请求裁剪尾段（2026-10-16）
 
 已实现最多 4 请求的紧凑 MTP 尾段 Graph：整批先检查两个 neural token，
@@ -24,7 +27,8 @@ MTP，不一致则续跑尾段；默认仍为 full。A100、TP=1、K=8、相同 
 长输出有重复性差异，不能据此声称严格等价或所有负载稳定加速。
 最终 CPU/native/Gloo 147 passed、1 skipped，CUDA 13 passed。完整协议、
 trace 和限制见[分析记录](validation/acceptance-regression.md)。CUDA SA 仍为
-v3；此功能还需要更新 SGLang worker/runner 的 split Graph API v1。
+v3；该轮原型使用 split Graph API v1，当前分支统一要求更新 SGLang
+worker/runner 至 split Graph API v2。
 
 ## Qwen3.5 MTP 接受长度分析与 A100 对照（2026-10-16）
 

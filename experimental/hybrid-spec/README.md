@@ -1,14 +1,14 @@
-# SGLang 混合投机扩展首版
+# SGLang 混合投机扩展（实验）
 
-本目录实现 [DESIGN.md](DESIGN.md) 的固定长度、请求级来源选择：所有请求照常运行 neural draft，由设备端 mask 在每个位置选择 SA 或 neural token。选定 token 同时进入下一步模型输入和最终验证链。不会减少 neural forward 次数。
+本目录实现 [DESIGN.md](DESIGN.md) 的固定长度、请求级来源选择。默认 `draft_graph_mode="full"` 照常运行完整 neural draft，由设备端 mask 在每个位置选择 SA 或 neural token；选定 token 同时进入下一步模型输入和最终验证链。显式开启 `split` 后，可在前两个候选一致时跳过对应请求的 MTP 尾段，当前实验范围为并发 1～4。
 
-这是实验实现。CPU 语义测试与 CUDA/真实模型验收是不同层次；当前验证记录见 [VALIDATION.md](VALIDATION.md)。未测模型不得视为已支持。
+当前优化、执行流程、配置区别、A100 性能结论和未实现项见 [OPTIMIZATIONS.md](OPTIMIZATIONS.md)。SA 历史按请求隔离，当前不支持跨请求共享。CPU 语义测试与 CUDA/真实模型验收是不同层次；详细验证记录见 [VALIDATION.md](VALIDATION.md)。未测模型不得视为已支持。
 
 新增 opt-in `history_mode="device"` 路径，用于对齐 Baseten `sa_spec` 的 GPU 增量更新与调度方式。prefill 前快照 prompt 并准备 pinned CPU 缓冲，由后台线程使用与 CUDA 相同的 C++ 状态机构建初始 SA；本机 native 调用释放 GIL，与 target prefill/draft-extend 并行。prefill 返回时只暂存 GPU bonus，首次 draft 才消费构建结果，并在 forward stream 上异步拷贝已使用的状态前缀。不再在 GPU 上逐 token 构建 prompt SA，也不在每轮 decode 读取或重建 CPU 输出历史。
 
 verify 直接在设备上暂存 `predict/accept_index/accept_lens`，下一轮 draft 在 CUDA Graph 内消费增量、查询并选择来源。eager 使用相同设备算子。若 CPU 构建未完成，首次 draft 会等待该 future；不调用额外的 GPU 全局同步。异步 H2D 的 pinned 源缓冲保留到拷贝事件完成；异常、abort/flush、retract 和槽位复用会取消或丢弃旧任务结果，旧任务不能向新代际写入状态。
 
-该路径允许单机 TP≥1 的 overlap 配置。多 TP 在每次设备查询后达成候选与资格共识，eager 和 Graph 使用 SGLang 的 PyNccl 通信器，任一 rank 不合格或候选不同则统一回退 neural；TP=1 不增加通信。**尚未完成 GPU/真实模型验收**。本地 CPU/native 测试不能替代 GPU 时间线、H2D 或真实模型验证。旧模式默认 `history_mode="cpu"`，保留关闭 overlap 的限制及现有验证证据；新路径不继承其通过结论。device 路径保留每批槽位/代际映射的 H2D、verify 反馈 kernel 和一次 host 构建/导入，并未证明零开销或性能收益。
+该路径允许单机 TP≥1 的 overlap 配置。多 TP 在每次设备查询后达成候选与资格共识，eager 和 Graph 使用 SGLang 的 PyNccl 通信器，任一 rank 不合格或候选不同则统一回退 neural；TP=1 不增加通信。device 路径已有 Qwen3.5 MTP 的 A100 TP=1 实测，结果见上述优化总览；多 GPU 模型及真实 NCCL Graph 时间线仍待验收。旧模式默认 `history_mode="cpu"`，保留关闭 overlap 的限制。device 路径保留映射变化时的 H2D、verify 反馈 kernel 和 host 构建/导入，不能声称零开销或所有配置稳定加速。
 
 `configs/device-sa-spec.json` 给出 K=8、阈值 4、`partial_drafts="zero"` 的参考策略配置。启动时相应设置 `--speculative-num-steps 8 --speculative-num-draft-tokens 9`；测试 overlap 时移除 `--disable-overlap-schedule`。`zero` 复现参考集成对不足 K 个续写的尾部补零；这些仍是草稿，必须经过原生 target verify，不代表输出补零。默认 `partial_drafts="fallback"` 继续整条回退，可用于单独比较该策略差异。阈值设为大于历史容量的数值可测量“维护 SA、全部选择 MTP”的成本。
 
@@ -40,13 +40,13 @@ device 模式以 generation 和 GPU 历史版本检查隔离旧反馈、槽位�
 
 最长重复后缀通过 suffix link 查询，续写采用该后缀的最早出现位置。候选不含 anchor。匹配长度与可用续写长度分别记录；默认续写不足、版本不符、无槽位、历史超容量、token 非法或预算不足时整条链回退 neural。`partial_drafts="zero"` 单独复现尾部补零；不会选择较短匹配来填满候选。
 
-GPU SA 使用每请求一个线程维护状态，尚未对大词表和长历史优化。默认模式的 CPU 前缀检查随历史长度增长；device 模式只在 prefill/retract 快照一次历史，后台线程不触碰请求对象或 CUDA。净收益仍需完整推理循环实测。
+GPU SA 使用每请求一个线程维护状态，当前 v3 已引入高分叉哈希、双转移内联、增量分桶和低多样性快路径，历史状态预算约 68 字节/token。CPU 微基准的长历史改善不能直接推算 GPU 查询或模型 TPOT。默认 CPU 历史模式的前缀检查随历史长度增长；device 模式只在 prefill/retract 快照一次历史，后台线程不触碰请求对象或 CUDA。
 
 针对根目录性能分析的后续改动与独立归因边界，见 [VALIDATION.md](VALIDATION.md) 顶部。当前两种历史模式都把 TP 共识放在 draft 的 `prepare()` 中，Graph 可捕获一次精确 MIN 归约；eager 在同一位置执行。不能根据某个 rank 的本地命中 mask 跳过通信。
 
-device 模式将六项来源统计融合到已有 GPU verify 反馈 kernel，避免每轮单独执行六次 PyTorch 归约及相关逐元素算子；诊断字段和 bonus 口径保持不变。Graph 槽位/代际映射在请求顺序、代际及捕获形状均不变时复用，避免重复清零和拷贝；SA 查询和 TP 共识仍每轮执行。CPU 历史保留原统计实现。该优化尚未在本机完成 CUDA 编译和 GPU 性能验证。
+device 模式将六项来源统计融合到已有 GPU verify 反馈 kernel，避免每轮单独执行六次 PyTorch 归约及相关逐元素算子；诊断字段和 bonus 口径保持不变。Graph 槽位/代际映射在请求顺序、代际及捕获形状均不变时复用，避免重复清零和拷贝；SA 查询和 TP 共识仍每轮执行。CPU 历史保留原统计实现。当前 A100 回归和服务运行已覆盖设备反馈路径，组件改动的独立性能归因仍应按固定配置对照。
 
-`configs/device-k3.json` 提供与性能报告相同 K=3、阈值 4、整链 fallback 的设备历史配置，容量为 4×8192，约 2.25 MiB/卡，覆盖报告中并发 4、4096 输入 + 256 输出的负载。它同时改变历史模式和容量，仅作为运行配置，不是单变量归因证据；对照时应分别固定容量、固定历史模式。保留旧 `example.json` 以复现 CPU 路径。
+`configs/device-k3.json` 提供与性能报告相同 K=3、阈值 4、整链 fallback 的设备历史配置，容量为 4×8192，当前 v3 设备状态预算约 2.13 MiB/卡（不含 Graph pool 等额外开销），覆盖报告中并发 4、4096 输入 + 256 输出的负载。它同时改变历史模式和容量，仅作为运行配置，不是单变量归因证据；对照时应分别固定容量、固定历史模式。保留旧 `example.json` 以复现 CPU 路径。
 
 ## 安装
 
