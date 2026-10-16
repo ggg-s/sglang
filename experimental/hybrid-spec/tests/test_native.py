@@ -100,7 +100,7 @@ def test_host_native_layout_matches_reference_and_validates_tokens(host_builder)
             host = host_builder.build(host_builder.prepare(tokens), 100)
             oracle = SuffixAutomaton()
             oracle.append(tokens)
-            length, num_states, num_edges, last, healthy = host.meta.tolist()
+            length, num_states, num_edges, last, healthy, _, _ = host.meta.tolist()
             assert length == len(tokens) and last == oracle.last and healthy == 1
             assert host.history[:length].tolist() == list(tokens)
             assert num_states == len(oracle.links)
@@ -115,7 +115,7 @@ def test_host_native_layout_matches_reference_and_validates_tokens(host_builder)
                 edges = {}
                 while head != -1:
                     assert 0 <= head < num_edges
-                    token, target, head = host.edges[head].tolist()
+                    token, target, head = host.edges[head, :3].tolist()
                     assert token not in edges and 0 <= target < num_states
                     edges[token] = target
                 assert edges == oracle.edges[i]
@@ -151,8 +151,8 @@ def test_host_import_copies_used_prefixes_and_keeps_sources_until_event(
     backend._check_stream = lambda: None
     backend.history = torch.full((1, 32), -99, dtype=torch.int32)
     backend.states = torch.full((1, 65, 4), -99, dtype=torch.int32)
-    backend.edges = torch.full((1, 97, 3), -99, dtype=torch.int32)
-    backend.meta = torch.zeros((1, 5), dtype=torch.int32)
+    backend.edges = torch.full((1, 97, 6), -99, dtype=torch.int32)
+    backend.meta = torch.zeros((1, 7), dtype=torch.int32)
     backend.pending_meta = torch.tensor([[9, 5, 1]])
     backend.host_transfers = []
 
@@ -168,7 +168,7 @@ def test_host_import_copies_used_prefixes_and_keeps_sources_until_event(
     monkeypatch.setattr(torch.cuda, "Event", Event)
     monkeypatch.setattr(torch.cuda, "current_stream", lambda device: None)
     host = host_builder.build(host_builder.prepare((4, 5, 6, 7, 4)), 100)
-    _, num_states, num_edges, _, _ = host.meta.tolist()
+    _, num_states, num_edges, _, _, _, _ = host.meta.tolist()
     source = weakref.ref(host)
     backend.import_host(0, host)
     assert backend.history[0, :5].tolist() == [4, 5, 6, 7, 4]

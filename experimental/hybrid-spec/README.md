@@ -138,7 +138,9 @@ LoRA 关闭时，无需也无法通过 `--enable-lora` 显式传入 False；本�
 | `history_mode` | `cpu`（默认，旧同步路径）或 `device`（GPU 反馈与 Graph 内增量处理，支持单机多 TP 实验） |
 | `partial_drafts` | `fallback`（默认，不足 K 则整条回退）或 `zero`（参考实现的尾部补零草稿） |
 
-状态内存估计：`4 * max_requests * [H + 4*(2H+1) + 3*(3H+1) + 5]` 字节，加上每请求 `40 + 4*(K+1)` 字节的设备反馈元数据。示例约 36 MiB，另有查询与 Graph buffer。状态在 draft worker 构造时分配，早于 target KV 预算/分配；不修改原生 KV 规划。
+状态内存估计：`4 * max_requests * [H + 4*(2H+1) + 6*(3H+1) + 7]` 字节，加上每请求 `40 + 4*(K+1)` 字节的设备反馈元数据。`configs/example.json` 约 54 MiB，另有查询与 Graph buffer。状态在 draft worker 构造时分配，早于 target KV 预算/分配；不修改原生 KV 规划。
+
+转移边使用自适应查找：最多 4 条出边保持短链快路径，第 5 条起建立精确 `(state, token)` 哈希索引。参考 sa-spec 的小出度直达/多出度哈希思路，但采用逐桶分裂避免 decode 时整表扩容；碰撞比较完整键，保留邻接链用于 clone 枚举。哈希位置与槽位最大容量无关，CPU 建好的有效前缀可以直接导入 GPU 并继续扩展。重置只清元数据，不扫描整块容量。该布局约 108 字节/历史 token（原约 72）；例如 32 × 262144 的状态池每 rank 约 864 MiB，另加反馈和 Graph buffer。更新后须重启服务，扩展名已升为 `hybrid_spec_gpu_sa_v2`。
 
 多 TP 的 SA 状态按 rank 复制，上述容量是每张卡的占用，不随 TP 分片缩小。每轮将 `[tokens, ~tokens, eligibility]` 打包做一次 MIN all-reduce；按位取反逆转 int64 的有符号顺序，因此归约后 `min(tokens) == ~min(~tokens)` 逐位置成立当且仅当所有 rank 的候选完全相同。资格也必须全部为真。任一 rank 不满足条件或候选不同，所有 rank 对该行统一回退 neural；不需要广播或指定源 rank。归约输入为 `8*B*(2K+1)` 字节（不代表实际链路流量），Graph 中 B 包括 padding。沿用 SGLang 的 TP batch 顺序/形状一致性约定，不能用于不同 rank 独立调度请求。
 
@@ -163,6 +165,21 @@ python -m pytest experimental/hybrid-spec/tests/test_cuda.py -q
 # 两张 NVIDIA GPU + NCCL + nvcc：实际 SA、TP 共识和 Graph replay
 python -m pytest experimental/hybrid-spec/tests/test_tp.py -k nccl -q
 ```
+
+长历史哈希 A/B 使用同一基准分别编译 `44637fe669` 和当前源码，输出原始样本、中位数和语义状态校验：
+
+```bash
+# CPU 原生状态机；需要 C++ 编译器或 ziglang
+python experimental/hybrid-spec/benchmarks/benchmark_sa_history.py \
+  --output /tmp/sa-history-cpu.json
+
+# NVIDIA CUDA + nvcc；同进程比较真实 Graph 内消费反馈/查询 kernel
+python experimental/hybrid-spec/benchmarks/benchmark_sa_history_cuda.py \
+  --lengths 8192 65536 262144 --batch-sizes 1 4 32 \
+  --output /tmp/sa-history-cuda.json
+```
+
+默认覆盖单 token 重复、2/64/8192 种 token 的伪随机历史。CUDA 每轮追加 9 token，计时前恢复相同历史；这是缓存较热的组件实验，排除导入、反馈生成、TP 通信和模型 forward，不能当成 TPOT。基线 commit 必须存在于本地 Git 历史；服务吞吐仍需固定模型与工作负载另测。
 
 `test_draft_recurrence.py` 从当前 checkout 加载真实 `draft_forward` 方法和选链函数体，只对模型与设备 kernel 边界使用 CPU 替身；它证明覆盖顺序与递推语义，不证明真实模型、attention/KV 或 CUDA kernel 的正确性。
 

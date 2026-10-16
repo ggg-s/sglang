@@ -272,7 +272,74 @@ def test_feedback_fused_metrics_includes_neural_rows_without_slots():
     reference.record(mask, lengths)
     assert torch.equal(backend.pending_meta[0], pending[0])
     assert metrics.snapshot() == reference.snapshot()
+
     backend.stage_feedback(
         slots, generations, predict, indices, lengths, seq_lens, False, 100
     )
     assert metrics.snapshot() == reference.snapshot()
+
+
+def test_long_history_hash_import_and_captured_splits():
+    """Imported hash buckets must grow correctly inside the production graph."""
+    config = HybridConfig(8, 4, 1, 32768, history_mode="device", partial_drafts="zero")
+    backend = GPUSuffixAutomaton(config, "cuda")
+    prompt = list(range(4096)) * 2 + [0, 1, 2, 3]
+    backend.initialize_device_slot(0, 1, config.max_history_tokens)
+    backend.import_host(0, backend.build_host(backend.prepare_host(prompt), 100000))
+    slots = torch.tensor([0], device="cuda")
+    generations = torch.tensor([1], device="cuda")
+    seq_lens = torch.tensor([len(prompt)], device="cuda")
+    predict = torch.zeros(9, dtype=torch.int32, device="cuda")
+    indices = torch.arange(9, dtype=torch.int32, device="cuda").view(1, 9)
+    lengths = torch.tensor([9], dtype=torch.int32, device="cuda")
+    view = DeviceOverride(backend, slots, generations)
+    # Capture with no pending update, then stage real feedback on each replay.
+    stream = torch.cuda.Stream()
+    stream.wait_stream(torch.cuda.current_stream())
+    with torch.cuda.stream(stream):
+        view.prepare(seq_lens)
+    torch.cuda.current_stream().wait_stream(stream)
+    graph = torch.cuda.CUDAGraph()
+    with torch.cuda.graph(graph):
+        view.prepare(seq_lens)
+    oracle = SuffixAutomaton()
+    oracle.append(prompt)
+    history = list(prompt)
+    for step in range(32):
+        delta = [5000 + step * 9 + j for j in range(9)]
+        # Mix new high-fanout transitions with a long repeated suffix.
+        if step % 4 == 3:
+            delta = list(range(9))
+        predict.copy_(torch.tensor(delta, dtype=torch.int32, device="cuda"))
+        seq_lens.fill_(len(history))
+        backend.stage_feedback(
+            slots, generations, predict, indices, lengths, seq_lens, False, 100000
+        )
+        history.extend(delta)
+        oracle.append(delta)
+        seq_lens.fill_(len(history) - 1)
+        graph.replay()
+        tokens, match = oracle.query(8)
+        eligible = match >= 4
+        assert view.use_retrieval.item() == eligible
+        assert view.tokens.tolist() == [
+            tokens + [0] * (8 - len(tokens)) if eligible else [0] * 8
+        ]
+        assert backend.meta[0, 0].item() == len(history)
+        assert backend.meta[0, 4].item() == 1
+    # Compare every semantic state and edge with an independent CPU automaton.
+    num_states = backend.meta[0, 1].item()
+    assert num_states == len(oracle.links)
+    states = backend.states[0, :num_states].cpu().tolist()
+    edges = backend.edges[0, : backend.meta[0, 2].item(), :3].cpu().tolist()
+    for p, (depth, link, pos, head) in enumerate(states):
+        assert (depth, link, pos) == (
+            oracle.lengths[p],
+            oracle.links[p],
+            oracle.first_pos[p],
+        )
+        transitions = {}
+        while head != -1:
+            token, target, head = edges[head]
+            transitions[token] = target
+        assert transitions == oracle.edges[p]

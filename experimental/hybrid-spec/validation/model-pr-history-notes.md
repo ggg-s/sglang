@@ -60,3 +60,17 @@ Reference hash-based transition lookup versus our linked adjacency scan is a
 separate long-history performance risk; changing layout needs its own CPU/GPU
 differential validation and length/vocabulary sweep. Source comparison alone
 does not establish its contribution to the supplied EAGLE3 slowdown.
+
+## Hash transition follow-up (2026-10-16)
+
+Baseline: `44637fe669`. Read the same pinned sa_spec `flat_graph.hpp` and
+`flat_hash_map.hpp`: inline single edge, then per-node open addressing, growth
+by five with a full copy and no allocator reclamation. This implementation uses
+an independently written exact `(state, token)` chained hash index with linear
+bucket splitting. Up to four outgoing edges stay on a short-list path to avoid
+hashing low-diversity histories; larger lists are indexed. The adjacency list
+is retained for clone enumeration. Used prefixes remain relocatable between
+compact host construction and larger GPU slots, with no device allocation or
+full-table rebuild during graph replay. These storage choices are specific to
+our bounded runtime and are not claims about sa_spec benchmark equivalence.
+See VALIDATION.md for native measurements and the separate CUDA validation gap.

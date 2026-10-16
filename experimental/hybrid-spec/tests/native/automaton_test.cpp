@@ -9,12 +9,32 @@
 #error "Native differential tests require active assertions"
 #endif
 
+static void check_index(Automaton &sa) {
+  std::vector<bool> seen(sa.meta[2], false);
+  for (int b = 0; b < sa.meta[6]; ++b) {
+    for (int edge = sa.e(b, 5); edge != -1; edge = sa.e(edge, 4)) {
+      assert(edge >= 0 && edge < sa.meta[2] && !seen[edge]);
+      seen[edge] = true;
+      assert(sa.bucket(Automaton::hash(sa.e(edge, 3), sa.e(edge, 0))) == b);
+    }
+  }
+  assert(std::count(seen.begin(), seen.end(), true) == sa.meta[6]);
+  for (int p = 0; p < sa.meta[1]; ++p) {
+    for (int edge = sa.s(p, 3); edge != -1; edge = sa.e(edge, 2)) {
+      assert(sa.e(edge, 3) == p);
+      assert(seen[edge] == (sa.e(sa.s(p, 3), 4) != -2));
+      assert(sa.find(p, sa.e(edge, 0)) == edge);
+    }
+    assert(sa.find(p, -1) == -1);
+  }
+}
+
 static void check(const std::vector<int> &input) {
   int capacity = static_cast<int>(input.size());
   std::vector<int> history(capacity, -99);
   std::vector<int> states((2 * capacity + 1) * 4, -99);
-  std::vector<int> edges((3 * capacity + 1) * 3, -99);
-  int meta[5] = {0, 1, 0, 0, 1};
+  std::vector<int> edges((3 * capacity + 1) * Automaton::EDGE_FIELDS, -99);
+  int meta[Automaton::META_FIELDS] = {0, 1, 0, 0, 1, 1, 0};
   states[0] = 0;
   states[1] = -1;
   states[2] = -1;
@@ -44,6 +64,7 @@ static void check(const std::vector<int> &input) {
     if (length)
       assert(states[4 * suffix + 2] == best_end);
     assert(meta[1] <= 2 * capacity + 1 && meta[2] <= 3 * capacity + 1);
+    check_index(sa);
   }
   // Build a prompt in compact host storage, copy only used POD prefixes to a
   // larger decode slot and continue appending with the device's state machine.
@@ -51,31 +72,38 @@ static void check(const std::vector<int> &input) {
   std::vector<int64_t> input64(input.begin(), input.end());
   std::vector<int> host_history(prefix);
   std::vector<int> host_states((2 * prefix + 1) * 4);
-  std::vector<int> host_edges((3 * prefix + 1) * 3);
-  int host_meta[5];
-  int status = hybrid_sa_build_host(input64.data(), prefix, 1000,
-                                    host_history.data(), host_states.data(),
-                                    host_edges.data(), host_meta, prefix);
+  std::vector<int> host_edges((3 * prefix + 1) * Automaton::EDGE_FIELDS);
+  int host_meta[Automaton::META_FIELDS];
+  int status = hybrid_sa_build_host(input64.data(), prefix, 2147483647,
+                                   host_history.data(), host_states.data(),
+                                   host_edges.data(), host_meta, prefix);
   assert(status == 0);
   std::vector<int> resumed_history(capacity), resumed_states(states.size()),
       resumed_edges(edges.size());
   std::copy_n(host_history.begin(), prefix, resumed_history.begin());
   std::copy_n(host_states.begin(), host_meta[1] * 4, resumed_states.begin());
-  std::copy_n(host_edges.begin(), host_meta[2] * 3, resumed_edges.begin());
+  std::copy_n(host_edges.begin(), host_meta[2] * Automaton::EDGE_FIELDS,
+              resumed_edges.begin());
   Automaton resumed{resumed_history.data(), resumed_states.data(),
                     resumed_edges.data(), host_meta, capacity};
   for (int i = prefix; i < capacity; ++i)
     resumed.append(input[i]);
-  assert(std::equal(meta, meta + 5, host_meta));
+  assert(std::equal(meta, meta + Automaton::META_FIELDS, host_meta));
   assert(std::equal(states.begin(), states.begin() + meta[1] * 4,
                     resumed_states.begin()));
-  assert(std::equal(edges.begin(), edges.begin() + meta[2] * 3,
+  assert(std::equal(edges.begin(), edges.begin() + meta[2] * Automaton::EDGE_FIELDS,
                     resumed_edges.begin()));
   assert(resumed_history == input);
+  check_index(resumed);
   // Capacity exhaustion is a status, never a write beyond the reserved arrays.
   sa.append(123);
   assert(meta[4] == 0 && meta[0] == capacity);
   assert(history == input);
+  // Reuse dirty storage without clearing old buckets or old edges.
+  assert(hybrid_sa_build_host(input64.data(), prefix, 2147483647,
+                             history.data(), states.data(), edges.data(), meta,
+                             capacity) == 0);
+  check_index(sa);
 }
 
 int main() {
@@ -97,5 +125,13 @@ int main() {
     check(tokens);
   }
   check(std::vector<int>(512, 42));
+  // Force long collision chains, including absent-key probes, across splits.
+  std::vector<int> collisions;
+  for (int token = 0; collisions.size() < 48; ++token)
+    if ((Automaton::hash(0, token) & 255) == 0)
+      collisions.push_back(token);
+  auto repeat = collisions;
+  collisions.insert(collisions.end(), repeat.begin(), repeat.end());
+  check(collisions);
   return 0;
 }

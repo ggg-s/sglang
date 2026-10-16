@@ -8,12 +8,14 @@
 #include "automaton.h"
 
 __global__ void reset_kernel(int *states, int *meta, int slot, int h) {
-  int *m = meta + slot * 5;
+  int *m = meta + slot * Automaton::META_FIELDS;
   m[0] = 0;
   m[1] = 1;
   m[2] = 0;
   m[3] = 0;
   m[4] = 1;
+  m[5] = 1;
+  m[6] = 0;
   int *root = states + static_cast<int64_t>(slot) * (2 * h + 1) * 4;
   root[0] = 0;
   root[1] = -1;
@@ -26,8 +28,9 @@ __global__ void append_kernel(int *history, int *states, int *edges, int *meta,
                               int version, int h) {
   Automaton a{history + static_cast<int64_t>(slot) * h,
               states + static_cast<int64_t>(slot) * (2 * h + 1) * 4,
-              edges + static_cast<int64_t>(slot) * (3 * h + 1) * 3,
-              meta + slot * 5, h};
+              edges + static_cast<int64_t>(slot) * (3 * h + 1) *
+                          Automaton::EDGE_FIELDS,
+              meta + slot * Automaton::META_FIELDS, h};
   if (a.meta[0] != version) {
     a.meta[4] = 0;
     return;
@@ -56,7 +59,7 @@ __global__ void query_kernel(const int *history, const int *states,
   int64_t slot = slots[row];
   if (slot < 0 || slot >= n)
     return; // No padding row may touch an automaton.
-  const int *m = meta + slot * 5;
+  const int *m = meta + slot * Automaton::META_FIELDS;
   versions[row] = m[0];
   healthy[row] = m[4] != 0;
   if (!m[4] || m[0] == 0)
@@ -85,14 +88,16 @@ void check_storage(torch::Tensor history, torch::Tensor states,
   for (const auto &t : {history, states, edges, meta})
     check_tensor(t, torch::kInt32, history.device());
   TORCH_CHECK(history.dim() == 2 && history.size(0) > 0 &&
-                  history.size(1) > 0 && history.size(1) < INT_MAX / 12,
+                  history.size(1) > 0 && history.size(1) < INT_MAX / 24,
               "invalid history capacity");
   auto n = history.size(0), h = history.size(1);
-  TORCH_CHECK(n < INT_MAX / 5 && states.dim() == 3 && states.size(0) == n &&
+  TORCH_CHECK(n < INT_MAX / Automaton::META_FIELDS && states.dim() == 3 &&
+                  states.size(0) == n &&
                   states.size(1) == 2 * h + 1 && states.size(2) == 4 &&
                   edges.dim() == 3 && edges.size(0) == n &&
-                  edges.size(1) == 3 * h + 1 && edges.size(2) == 3 &&
-                  meta.dim() == 2 && meta.size(0) == n && meta.size(1) == 5,
+                  edges.size(1) == 3 * h + 1 &&
+                  edges.size(2) == Automaton::EDGE_FIELDS && meta.dim() == 2 &&
+                  meta.size(0) == n && meta.size(1) == Automaton::META_FIELDS,
               "invalid automaton storage shape");
 }
 
@@ -102,7 +107,9 @@ void reset(torch::Tensor states, torch::Tensor meta, int64_t slot) {
   TORCH_CHECK(states.dim() == 3 && states.size(2) == 4 && states.size(1) >= 3 &&
                   states.size(1) < INT_MAX / 4 && states.size(1) % 2 == 1 &&
                   meta.dim() == 2 && meta.size(0) == states.size(0) &&
-                  meta.size(1) == 5 && slot >= 0 && slot < states.size(0),
+                  meta.size(1) == Automaton::META_FIELDS &&
+                  meta.size(0) < INT_MAX / Automaton::META_FIELDS && slot >= 0 &&
+                  slot < states.size(0),
               "invalid reset slot/storage");
   c10::cuda::CUDAGuard guard(states.device());
   int h = (states.size(1) - 1) / 2;
@@ -210,7 +217,8 @@ __global__ void consume_query_kernel(
   if (slot < 0 || slot >= n || owners[slot] != generation)
     return;
   Automaton a{history + slot * h, states + slot * (2 * h + 1) * 4,
-              edges + slot * (3 * h + 1) * 3, meta + slot * 5, h};
+              edges + slot * (3 * h + 1) * Automaton::EDGE_FIELDS,
+              meta + slot * Automaton::META_FIELDS, h};
   int64_t *pm = pending_meta + slot * 3;
   if (pm[2] != 0) {
     int count = static_cast<int>(pm[2]);
@@ -246,7 +254,9 @@ void check_device_metadata(torch::Tensor meta, torch::Tensor owners,
   check_tensor(pending, torch::kInt32, device);
   for (const auto &t : {owners, pending_meta, slots, generations, seq_lens})
     check_tensor(t, torch::kInt64, device);
-  TORCH_CHECK(meta.dim() == 2 && meta.size(1) == 5 && owners.dim() == 1 &&
+  TORCH_CHECK(meta.dim() == 2 && meta.size(1) == Automaton::META_FIELDS &&
+                  meta.size(0) < INT_MAX / Automaton::META_FIELDS &&
+                  owners.dim() == 1 &&
                   owners.size(0) == meta.size(0) && pending.dim() == 2 &&
                   pending.size(0) == meta.size(0) && pending_meta.dim() == 2 &&
                   pending_meta.size(0) == meta.size(0) && pending_meta.size(1) == 3 &&

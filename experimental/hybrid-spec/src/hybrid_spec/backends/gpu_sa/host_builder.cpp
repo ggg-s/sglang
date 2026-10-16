@@ -9,7 +9,7 @@ extern "C" HYBRID_EXPORT int hybrid_sa_build_host(
     const int64_t *tokens, int count, int vocab, int *history, int *states,
     int *edges, int *meta, int capacity) {
   if (!history || !states || !edges || !meta || (count && !tokens) ||
-      capacity < 1 || capacity >= INT_MAX / 12 || count < 0 || count > capacity ||
+      capacity < 1 || capacity >= INT_MAX / 24 || count < 0 || count > capacity ||
       vocab < 1)
     return 1;
   meta[0] = 0;
@@ -17,6 +17,8 @@ extern "C" HYBRID_EXPORT int hybrid_sa_build_host(
   meta[2] = 0;
   meta[3] = 0;
   meta[4] = 1;
+  meta[5] = 1;
+  meta[6] = 0;
   states[0] = 0;
   states[1] = -1;
   states[2] = -1;
