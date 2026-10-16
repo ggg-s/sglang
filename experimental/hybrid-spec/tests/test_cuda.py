@@ -13,11 +13,11 @@ from hybrid_spec.core.contracts import (
     RequestKey,
     RequestSnapshot,
 )
-from hybrid_spec.integrations.sglang.graph_buffers import GraphBuffers
 from hybrid_spec.integrations.sglang.device_extension import (
     DeviceGraphBuffers,
     DeviceOverride,
 )
+from hybrid_spec.integrations.sglang.graph_buffers import GraphBuffers
 
 pytestmark = pytest.mark.skipif(
     not torch.cuda.is_available(), reason="requires NVIDIA CUDA"
@@ -183,3 +183,33 @@ def test_device_feedback_graph_reorder_generation_and_replay(partial):
     assert not capture_view.use_retrieval.any()
     assert backend.meta[0, 0].item() == 3
     assert backend.meta[0, 4].item() == 1
+
+
+def test_host_prefill_import_preserves_gpu_bonus_feedback():
+    config = HybridConfig(3, 2, 1, 64, history_mode="device")
+    backend = GPUSuffixAutomaton(config, "cuda")
+    prompt = (4, 5, 6, 7, 4)
+    host = backend.build_host(backend.prepare_host(prompt), 100)
+    assert all(
+        t.is_pinned() for t in (host.history, host.states, host.edges, host.meta)
+    )
+    backend.initialize_device_slot(0, 9, 64)
+    slots = torch.tensor([0], device="cuda")
+    generations = torch.tensor([9], device="cuda")
+    seq_lens = torch.tensor([len(prompt)], device="cuda")
+    backend.stage_feedback(
+        slots,
+        generations,
+        torch.tensor([5], dtype=torch.int32, device="cuda"),
+        torch.tensor([[0]], dtype=torch.int32, device="cuda"),
+        torch.ones(1, dtype=torch.int32, device="cuda"),
+        seq_lens,
+        False,
+        100,
+    )
+    backend.import_host(0, host)
+    view = DeviceOverride(backend, slots, generations)
+    view.prepare(seq_lens)
+    assert view.use_retrieval.tolist() == [True]
+    assert view.tokens.tolist() == [[6, 7, 4]]
+    assert backend.history[0, :6].tolist() == [4, 5, 6, 7, 4, 5]

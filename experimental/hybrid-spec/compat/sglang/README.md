@@ -19,6 +19,11 @@ counter. A device-history view additionally exposes `prepare(seq_lens)`, called
 inside `draft_forward` before token selection, so pending GPU feedback, SA updates
 and lookup are included in the draft graph. Version 2 requires the plugin's
 prefill and verify hooks for feedback; old CPU-history views need no `prepare`.
+The prefill AROUND hook submits a GIL-free host build before target prefill,
+stages the GPU bonus after success and cancels matching leases on exceptions.
+At the first draft consumer it imports used pinned CPU prefixes on the forward
+stream, preserving GPU bonus feedback. Copy sources are retained until a CUDA
+event completes; background construction never touches CUDA or request objects.
 Registration installs resources after both ordinary and Standalone draft
 constructors, before memory-pool planning and graph capture.
 

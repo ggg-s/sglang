@@ -5,6 +5,8 @@ from __future__ import annotations
 from pathlib import Path
 
 import torch
+
+from hybrid_spec.backends.host_sa import NativeHostBuilder
 from hybrid_spec.core.contracts import RetrievalCandidates
 
 
@@ -29,9 +31,15 @@ class GPUSuffixAutomaton:
             self.device = torch.device("cuda", torch.cuda.current_device())
         self.module = load(
             name="hybrid_spec_gpu_sa_v1",
-            sources=[str(Path(__file__).with_name("suffix_automaton.cu"))],
+            sources=[
+                str(Path(__file__).with_name("suffix_automaton.cu")),
+                str(Path(__file__).with_name("host_builder.cpp")),
+            ],
+            extra_cflags=["-O3"],
             extra_cuda_cflags=["-O3"],
         )
+        self.host_builder = NativeHostBuilder(self.module.__file__)
+        self.host_transfers = []
         n, h = config.max_requests, config.max_history_tokens
         self.history = torch.empty((n, h), dtype=torch.int32, device=self.device)
         self.states = torch.empty(
@@ -90,6 +98,41 @@ class GPUSuffixAutomaton:
         self.owners[slot].fill_(generation)
         self.limits[slot].fill_(limit)
         self.pending_meta[slot].zero_()
+
+    def prepare_host(self, history):
+        return self.host_builder.prepare(history)
+
+    def build_host(self, host, vocab_size):
+        return self.host_builder.build(host, vocab_size)
+
+    def import_host(self, slot, host):
+        self._check_stream()
+        length, num_states, num_edges, _, healthy = host.meta.tolist()
+        h = self.config.max_history_tokens
+        if not (
+            0 <= slot < self.config.max_requests
+            and 0 <= length < h
+            and 1 <= num_states <= min(host.states.shape[0], 2 * h + 1)
+            and 0 <= num_edges <= min(host.edges.shape[0], 3 * h + 1)
+            and healthy == 1
+        ):
+            raise ValueError("invalid completed host automaton")
+        # Only used prefixes are copied; metadata/bonus feedback and ownership
+        # live in separate buffers. All copies precede draft replay in stream.
+        self.history[slot, :length].copy_(host.history[:length], non_blocking=True)
+        self.states[slot, :num_states].copy_(
+            host.states[:num_states], non_blocking=True
+        )
+        self.edges[slot, :num_edges].copy_(host.edges[:num_edges], non_blocking=True)
+        self.meta[slot].copy_(host.meta, non_blocking=True)
+        # Explicitly retain pinned sources until their asynchronous H2D reads
+        # finish, even if abort/flush closes the request immediately afterwards.
+        self.host_transfers = [
+            transfer for transfer in self.host_transfers if not transfer[0].query()
+        ]
+        done = torch.cuda.Event()
+        done.record(torch.cuda.current_stream(self.device))
+        self.host_transfers.append((done, host))
 
     def stage_feedback(
         self, slots, generations, predict, indices, lengths, seq_lens, has_anchor, vocab

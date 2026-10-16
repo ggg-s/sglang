@@ -31,7 +31,8 @@ def validate_config(config, cfg):
         errors.append("CPU history requires disable_overlap_schedule=True")
     if config.history_mode == "device" and cfg.tp_size != 1:
         errors.append("device history currently requires tp_size=1")
-    # An unspecified LoRA option remains None when no adapters are loaded.
+    # CLI store_true has no False spelling: no flag/no adapters leaves None,
+    # which SGLang treats as disabled. Never require literal enable_lora=False.
     if getattr(cfg, "enable_lora", None) not in (None, False) or getattr(
         cfg, "lora_paths", None
     ):

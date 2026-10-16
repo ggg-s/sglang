@@ -1,5 +1,10 @@
+import importlib
 import itertools
-from types import SimpleNamespace
+import sys
+import threading
+from pathlib import Path
+from types import ModuleType, SimpleNamespace
+from unittest.mock import patch
 
 import pytest
 import torch
@@ -17,11 +22,16 @@ from hybrid_spec.integrations.sglang.compatibility import (
     validate_config,
     validate_model,
 )
-from hybrid_spec.integrations.sglang.draft_extension import DraftExtension
 from hybrid_spec.integrations.sglang.device_extension import DeviceDraftExtension
+from hybrid_spec.integrations.sglang.draft_extension import DraftExtension
 from hybrid_spec.integrations.sglang.graph_buffers import GraphBuffers
 from hybrid_spec.observability.metrics import Metrics
-from hybrid_spec.plugin import _diagnostics, _validate_inputs, _validate_sampling
+from hybrid_spec.plugin import (
+    _diagnostics,
+    _prefill,
+    _validate_inputs,
+    _validate_sampling,
+)
 from hybrid_spec.selection.policy import select_requests
 
 
@@ -190,8 +200,8 @@ def test_bridge_anchor_reconcile_cleanup_and_failure_clear():
         assert not extension.runtime.states
 
 
-def test_configuration_fails_closed():
-    cfg = SimpleNamespace(
+def valid_config():
+    return SimpleNamespace(
         device="cuda",
         tp_size=1,
         dp_size=1,
@@ -216,6 +226,10 @@ def test_configuration_fails_closed():
         chunked_prefill_size=-1,
         speculative_algorithm="STANDALONE",
     )
+
+
+def test_configuration_fails_closed():
+    cfg = valid_config()
     config = HybridConfig(2, 2, 2, 32)
     validate_config(config, cfg)
     device_config = HybridConfig(2, 2, 2, 32, history_mode="device")
@@ -256,6 +270,63 @@ def test_configuration_fails_closed():
             validate_config(config, changed)
 
 
+def test_real_lora_cli_default_none_is_disabled_for_all_spec_algorithms():
+    """Load actual field/CLI code, without model imports or hand-written defaults."""
+    root = Path(__file__).resolve().parents[3] / "python"
+    # Only unused adapter metadata and GPU-dependent constants are boundaries.
+    # Field defaults, msgspec records, argparse generation and path action are real.
+    modules = {}
+    for name in (
+        "sglang",
+        "sglang.srt",
+        "sglang.srt.arg_groups",
+        "sglang.srt.arg_groups.fields",
+        "sglang.srt.lora",
+        "sglang.srt.utils",
+    ):
+        module = ModuleType(name)
+        module.__path__ = [str(root.joinpath(*name.split(".")))]
+        modules[name] = module
+    registry = ModuleType("sglang.srt.lora.lora_registry")
+    registry.LoRARef = object
+    modules[registry.__name__] = registry
+    common = ModuleType("sglang.srt.utils.common")
+    common.LORA_TARGET_ALL_MODULES = "all"
+    common.SUPPORTED_LORA_TARGET_MODULES = []
+    modules[common.__name__] = common
+    # Restore newly imported child modules too, not just the injected parents.
+    with patch.dict(sys.modules, modules):
+        utils = importlib.import_module("sglang.srt.arg_groups.arg_utils")
+        fields = importlib.import_module("sglang.srt.arg_groups.fields.lora")
+        import argparse
+
+        parser = argparse.ArgumentParser()
+        utils.add_cli_args_from_dataclass(parser, fields.Lora)
+        assert fields.Lora().enable_lora is None
+        config = HybridConfig(3, 4, 4, 8192)
+        for argv, disabled in (
+            ([], True),
+            (["--lora-paths"], True),
+            (["--enable-lora"], False),
+            (["--lora-paths", "/models/adapter"], False),
+        ):
+            parsed = parser.parse_args(argv)
+            for algorithm in ("STANDALONE", "EAGLE", "EAGLE3"):
+                for tp_size in (1, 2, 4, 8):
+                    cfg = valid_config()
+                    cfg.speculative_algorithm, cfg.tp_size = algorithm, tp_size
+                    cfg.speculative_num_steps, cfg.speculative_num_draft_tokens = 3, 4
+                    cfg.enable_lora, cfg.lora_paths = (
+                        parsed.enable_lora,
+                        parsed.lora_paths,
+                    )
+                    if disabled:
+                        validate_config(config, cfg)
+                    else:
+                        with pytest.raises(ValueError, match="LoRA must be disabled"):
+                            validate_config(config, cfg)
+
+
 def test_feedback_attributes_bonus_separately_from_correct_drafts():
     metrics = Metrics()
     metrics.record(torch.tensor([True, False, True]), torch.tensor([3, 1, 2]))
@@ -285,7 +356,16 @@ def test_device_bridge_keeps_feedback_on_device_and_ignores_cpu_decode_history()
             self.initialization = args
 
         def append(self, slot, delta):
-            self.prompt = delta.accept_tokens
+            pytest.fail("prefill must not build the prompt SA on GPU")
+
+        def prepare_host(self, history):
+            return history
+
+        def build_host(self, host, vocab_size):
+            return host
+
+        def import_host(self, slot, host):
+            self.prompt = host
 
         def stage_feedback(self, *args):
             self.feedback.append(args)
@@ -307,8 +387,11 @@ def test_device_bridge_keeps_feedback_on_device_and_ignores_cpu_decode_history()
         has_grammar=False,
         sampling_info=SimpleNamespace(is_all_greedy=True),
     )
-    extension.on_prefill(batch, SimpleNamespace(next_token_ids=torch.tensor([2])))
-    assert backend.prompt == (1, 2, 3, 4, 1)
+    ticket = extension.begin_prefill(batch)
+    extension.on_prefill(
+        batch, SimpleNamespace(next_token_ids=torch.tensor([2])), ticket
+    )
+    assert not hasattr(backend, "prompt")
     assert backend.initialization == (0, 1, 35)
     assert backend.feedback[-1][-2] is False
 
@@ -330,6 +413,7 @@ def test_device_bridge_keeps_feedback_on_device_and_ignores_cpu_decode_history()
         accept_lens=torch.tensor([2], dtype=torch.int32),
     )
     with extension.bind(batch, draft) as view:
+        assert backend.prompt == (1, 2, 3, 4, 1)
         buffers.stage(view, 1, 4)
         captured.prepare(torch.tensor([5, 1, 1, 1]))
         # The replay-written mask, including cleared padding, drives metrics.
@@ -347,6 +431,142 @@ def test_device_bridge_keeps_feedback_on_device_and_ignores_cpu_decode_history()
     extension.close_request(req.rid)
     with extension.bind(batch, draft) as view:
         assert view.slots.tolist() == [-1]
+    extension.shutdown()
+
+
+@pytest.fixture
+def host_prefill_case():
+    config = HybridConfig(2, 2, 1, 32, history_mode="device")
+
+    class Backend:
+        device = torch.device("cpu")
+
+        def __init__(self):
+            self.config = config
+            self.started, self.release = threading.Event(), threading.Event()
+            self.release.set()
+            self.owner_thread = threading.get_ident()
+            self.imports, self.feedback = [], []
+            self.fail_build = False
+
+        def prepare_host(self, history):
+            return history
+
+        def build_host(self, host, vocab_size):
+            assert threading.get_ident() != self.owner_thread
+            self.started.set()
+            assert self.release.wait(5), "test failed to release native build boundary"
+            if self.fail_build:
+                raise ValueError("invalid host history")
+            return host
+
+        def initialize_device_slot(self, slot, generation, limit):
+            assert threading.get_ident() == self.owner_thread
+            self.generation = generation
+
+        def import_host(self, slot, host):
+            assert threading.get_ident() == self.owner_thread
+            self.imports.append((slot, host))
+
+        def stage_feedback(self, *args):
+            assert threading.get_ident() == self.owner_thread
+            self.feedback.append(args)
+
+    backend = Backend()
+    extension = DeviceDraftExtension(config, backend, 100)
+    req = Request()
+    req.get_fill_ids = lambda: req.origin_input_ids
+    batch = SimpleNamespace(
+        reqs=[req],
+        seq_lens_cpu=torch.tensor([5]),
+        seq_lens=torch.tensor([5]),
+        forward_mode=SimpleNamespace(is_idle=lambda: False),
+        is_extend_in_batch=False,
+        has_grammar=False,
+        sampling_info=SimpleNamespace(is_all_greedy=True),
+    )
+    worker = SimpleNamespace(draft_worker=SimpleNamespace(draft_extension=extension))
+    result = SimpleNamespace(next_token_ids=torch.tensor([2]))
+    try:
+        yield extension, backend, batch, worker, result
+    finally:
+        backend.release.set()
+        extension.shutdown()
+
+
+def test_host_build_overlaps_prefill_and_imports_only_at_first_draft(host_prefill_case):
+    """A blocked builder must not block prefill launch or its completion hook."""
+    extension, backend, batch, worker, result = host_prefill_case
+    backend.release.clear()
+
+    def prefill(worker, batch):
+        assert backend.started.wait(5)
+        assert not extension.states["a"].build.done()
+        batch.reqs[0].origin_input_ids[:] = [8] * 5
+        return result
+
+    assert _prefill(prefill, worker, batch) is result
+    assert not extension.states["a"].build.done()
+    assert backend.imports == []
+    backend.release.set()
+    draft = SimpleNamespace(draft_override=None)
+    for _ in range(2):
+        with extension.bind(batch, draft) as view:
+            assert view.slots.tolist() == [0]
+    assert backend.imports == [(0, (1, 2, 3, 4, 1))]
+
+
+def test_prefill_exception_cancels_reserved_host_build(host_prefill_case):
+    extension, backend, batch, worker, _ = host_prefill_case
+    backend.release.clear()
+
+    def prefill(worker, batch):
+        assert backend.started.wait(5)
+        raise RuntimeError("prefill failed")
+
+    with pytest.raises(RuntimeError, match="prefill failed"):
+        _prefill(prefill, worker, batch)
+    assert extension.states == {} and extension.free_slots == [0]
+    assert backend.imports == []
+
+
+@pytest.mark.parametrize("finish", ["close", "reset"])
+def test_late_host_build_cannot_overwrite_reused_slot(host_prefill_case, finish):
+    extension, backend, batch, worker, result = host_prefill_case
+    backend.release.clear()
+    old_req = batch.reqs[0]
+    old_ticket = extension.begin_prefill(batch)
+    assert backend.started.wait(5)
+    extension.on_prefill(batch, result, old_ticket)
+    if finish == "close":
+        extension.close_request(old_req.rid)
+    else:
+        extension.reset()
+    replacement = Request("a")
+    replacement.origin_input_ids = [7, 8, 7, 8, 7]
+    replacement.get_fill_ids = lambda: replacement.origin_input_ids
+    new_batch = SimpleNamespace(**(vars(batch) | {"reqs": [replacement]}))
+    _prefill(lambda worker, batch: result, worker, new_batch)
+    assert backend.generation == 2
+    extension.on_prefill(batch, result, old_ticket)
+    extension.cancel_prefill(old_ticket)
+    assert backend.generation == 2
+    with extension.bind(batch, SimpleNamespace(draft_override=None)) as view:
+        assert view.slots.tolist() == [-1]
+    backend.release.set()
+    with extension.bind(new_batch, SimpleNamespace(draft_override=None)) as view:
+        assert view.generations.tolist() == [2]
+    assert backend.imports == [(0, (7, 8, 7, 8, 7))]
+
+
+def test_failed_host_build_releases_slot_before_propagating(host_prefill_case):
+    extension, backend, batch, worker, result = host_prefill_case
+    backend.fail_build = True
+    _prefill(lambda worker, batch: result, worker, batch)
+    with pytest.raises(ValueError, match="invalid host history"):
+        with extension.bind(batch, SimpleNamespace(draft_override=None)):
+            pytest.fail("failed host build must not reach draft execution")
+    assert extension.states == {} and extension.free_slots == [0]
 
 
 @pytest.mark.parametrize("moe", [False, True])

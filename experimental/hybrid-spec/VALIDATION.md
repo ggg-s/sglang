@@ -1,5 +1,30 @@
 # 验证记录
 
+## CPU 初始 SA 构建与 prefill 重叠（2026-10-16）
+
+本轮继续完善 opt-in `history_mode="device"`；默认 CPU 历史模式与原生模型验证/停止处理不变。
+
+- prefill 的 AROUND hook 在 target prefill 前快照完整 prompt、分配 pinned CPU 存储并提交单个后台构建线程；纯 CPU `host_builder.cpp` 使用与 CUDA 相同的 `Automaton`，通过 `ctypes.CDLL` 释放 GIL。后台任务不读取请求对象，也不调用 CUDA。
+- prefill 成功后只初始化设备代际/预算并暂存 GPU bonus，不等待 CPU 构建。首次 draft 在需要状态时等待 future，异步拷贝 history/states/edges 的已使用前缀及 meta，然后继续原有 GPU 增量更新。数据都是相对索引，无指针重定位、无额外 GPU 全局同步；CPU 构建慢于 prefill 时仍会等待，不能声称该开销总被隐藏。
+- pinned 源缓冲由 CUDA 事件持有，事件完成前不释放；prefill 异常会清理对应 lease，abort/flush/retract、RID/槽位复用会取消或丢弃旧结果。旧 ticket 和旧完成任务不能覆盖新 generation。稳定批次继续复用设备槽位映射。
+- 同步补强 LoRA 启动回归。当前代码已包含 `3646c5bc3a` 的修复：无适配器时 `None` 和 `False` 都表示关闭。新测试读取本仓库真实 LoRA 字段及 CLI 生成器，覆盖三种算法、TP=1/2/4/8、默认 None、空适配器列表，以及拒绝显式开启/适配器路径。测试隔离了无关 GPU 常量与适配器元数据，没有声称启动真实模型服务。
+
+本地验证（Windows / Python 3.11.15 / CPU PyTorch）：**111 passed，7 skipped，103.26 秒**。跳过的 6 项 CUDA 和 1 项 NCCL 测试不计入通过；新增真实 GPU host 导入/bonus 保留用例已写入，尚未运行。通过项包含：
+
+- 实际 C++ 状态机的穷举/长序列 oracle，以及紧凑 host 状态复制到更大 decode 容量后继续追加的逐状态/逐边一致性。
+- 实际 C ABI/DLL 的完整状态、clone、suffix link、转移表与 Python 独立表示对照，以及非法词表 token 检查。
+- 无 sleep 的原生 GIL gate、构建未完成时 prefill 仍可执行、只导入一次、异常释放、flush/结束后迟到结果隔离。
+- CPU 拷贝替身验证只复制已使用前缀、保留 GPU bonus 元数据及事件完成前持有源缓冲；它不证明真实 CUDA DMA 的正确性。
+- 真实 LoRA 字段/CLI 与插件校验器，以及既有 draft 递推、CPU/Gloo TP 回归。
+
+两个反向对照均按预期失败：从 Git 读取 `3646c5bc3a` 的父版本校验器，新的 CLI 测试复现 `enable_lora=False required`；将 native 调用加载器换为持有 GIL 的 `PyDLL`，原生 gate 测试拒绝通过。源码没有为这些对照回退，脚本与日志只保存在忽略目录 `.tmp/hybrid-spec`。
+
+另修复原生测试自身的问题：本机 Zig 0.16 在 `-O2` 下默认定义 `NDEBUG`，会禁用旧 C++ `assert`。现在显式 `-UNDEBUG`，源码另有编译期保护，构建调用也移出 assert 表达式。此前 Windows/Zig 原生测试的“通过”不能视为有效断言证据；本轮已在断言启用后重跑通过。Linux 编译器是否定义 NDEBUG 取决于其参数，不能将该本机发现外推到所有旧测试环境。
+
+修改文件通过 Ruff 未定义名称/导入检查及格式检查；wheel 构建成功，并检查打包包含 host C++、共享头文件、CUDA 源码与 Python host builder。完整回归、反向对照及打包日志分别位于本地 `.tmp/hybrid-spec/host-full.log`、`host-negative-controls.log`、`host-wheel.log`。
+
+**未验收项**：本地无 CUDA 工具链/GPU；本轮未验证新的 CPU+CUDA 扩展组合编译/链接、真实 pinned H2D、Graph replay、prefill 时间线、模型逐 token 等价或吞吐。上轮单 CUDA 源扩展的编译成功不能替代本轮组合扩展的编译。先前并发严格 token 等价失败仍未解决。本轮完成的是可在本地实现和验证的构建/调度/生命周期部分，未报告新的性能收益。
+
 ## 对齐本地 sa_spec 的设备历史路径（2026-10-15）
 
 参考仓库：`../sa_spec`，HEAD `1cc7e8c86b1914a9c05eb60fb11ebe52daf47969`；集成参考为 TRT-LLM PR #10951 的 head `304ec62dd635cc7ad865c2ae35b4ae02910396d0`。该实现同样保留 MTP forward，再按匹配长度选择 SA token。不能把“未跳过 neural forward”单独当成我们与参考实现性能差异的原因。参考脚本要求完整代码续写、输出预算 2048、K=8、默认匹配阈值 4，图中接受长度 3.28→4.41；我们的前轮 K=3/阈值 2 与输入、停止方式并未对齐。

@@ -1,7 +1,13 @@
 #include "automaton.h"
+#include "host_builder.h"
+#include <algorithm>
 #include <cassert>
 #include <cstdint>
 #include <vector>
+
+#ifdef NDEBUG
+#error "Native differential tests require active assertions"
+#endif
 
 static void check(const std::vector<int> &input) {
   int capacity = static_cast<int>(input.size());
@@ -39,6 +45,33 @@ static void check(const std::vector<int> &input) {
       assert(states[4 * suffix + 2] == best_end);
     assert(meta[1] <= 2 * capacity + 1 && meta[2] <= 3 * capacity + 1);
   }
+  // Build a prompt in compact host storage, copy only used POD prefixes to a
+  // larger decode slot and continue appending with the device's state machine.
+  int prefix = (capacity + 1) / 2;
+  std::vector<int64_t> input64(input.begin(), input.end());
+  std::vector<int> host_history(prefix);
+  std::vector<int> host_states((2 * prefix + 1) * 4);
+  std::vector<int> host_edges((3 * prefix + 1) * 3);
+  int host_meta[5];
+  int status = hybrid_sa_build_host(input64.data(), prefix, 1000,
+                                    host_history.data(), host_states.data(),
+                                    host_edges.data(), host_meta, prefix);
+  assert(status == 0);
+  std::vector<int> resumed_history(capacity), resumed_states(states.size()),
+      resumed_edges(edges.size());
+  std::copy_n(host_history.begin(), prefix, resumed_history.begin());
+  std::copy_n(host_states.begin(), host_meta[1] * 4, resumed_states.begin());
+  std::copy_n(host_edges.begin(), host_meta[2] * 3, resumed_edges.begin());
+  Automaton resumed{resumed_history.data(), resumed_states.data(),
+                    resumed_edges.data(), host_meta, capacity};
+  for (int i = prefix; i < capacity; ++i)
+    resumed.append(input[i]);
+  assert(std::equal(meta, meta + 5, host_meta));
+  assert(std::equal(states.begin(), states.begin() + meta[1] * 4,
+                    resumed_states.begin()));
+  assert(std::equal(edges.begin(), edges.begin() + meta[2] * 3,
+                    resumed_edges.begin()));
+  assert(resumed_history == input);
   // Capacity exhaustion is a status, never a write beyond the reserved arrays.
   sa.append(123);
   assert(meta[4] == 0 && meta[0] == capacity);

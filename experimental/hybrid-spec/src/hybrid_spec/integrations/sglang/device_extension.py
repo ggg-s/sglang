@@ -5,10 +5,13 @@ from __future__ import annotations
 import heapq
 import threading
 import weakref
+from concurrent.futures import Future, ThreadPoolExecutor
 from contextlib import contextmanager
+from dataclasses import dataclass
 
 import torch
-from hybrid_spec.core.contracts import DraftOverrideView, HistoryDelta, RequestKey
+
+from hybrid_spec.core.contracts import DraftOverrideView
 from hybrid_spec.observability.metrics import Metrics
 
 
@@ -60,6 +63,17 @@ class DeviceGraphBuffers:
         view.use_retrieval = self.view.use_retrieval[:raw_bs]
 
 
+@dataclass
+class PrefillLease:
+    rid: str
+    request: weakref.ReferenceType
+    slot: int
+    generation: int
+    limit: int
+    build: Future | None
+    device_initialized: bool = False
+
+
 class DeviceDraftExtension:
     def __init__(self, config, backend, vocab_size, tp_sync=None):
         if tp_sync is not None:
@@ -74,6 +88,9 @@ class DeviceDraftExtension:
         self.lock = threading.RLock()
         self.pending_view = None
         self.last_binding = None
+        self.builder_pool = ThreadPoolExecutor(
+            max_workers=1, thread_name_prefix="hybrid-sa-prefill"
+        )
 
     def create_graph_buffers(self, max_bs):
         return DeviceGraphBuffers(self.backend, max_bs)
@@ -84,47 +101,93 @@ class DeviceDraftExtension:
         with self.lock:
             state = self.states.pop(rid, None)
             if state is not None:
-                heapq.heappush(self.free_slots, state[1])
+                if state.build is not None:
+                    state.build.cancel()
+                heapq.heappush(self.free_slots, state.slot)
 
     def reset(self):
         with self.lock:
+            for state in self.states.values():
+                if state.build is not None:
+                    state.build.cancel()
             self.states.clear()
             self.free_slots = list(range(self.config.max_requests))
             # Retain the generation counter across flush, fencing old feedback.
 
-    def on_prefill(self, batch, result):
+    def shutdown(self):
+        self.reset()
+        self.builder_pool.shutdown(wait=True, cancel_futures=True)
+
+    def cancel_prefill(self, ticket):
+        with self.lock:
+            for state in ticket:
+                if state is not None and self.states.get(state.rid) is state:
+                    self.close_request(state.rid)
+
+    def begin_prefill(self, batch):
+        """Snapshot/submit before target prefill, without waiting for the build."""
+        if batch.forward_mode.is_idle():
+            return ()
+        ticket = []
+        try:
+            with self.lock:
+                for row, req in enumerate(batch.reqs):
+                    self.close_request(req.rid)
+                    length = int(batch.seq_lens_cpu[row])
+                    if not self.free_slots or length >= self.config.max_history_tokens:
+                        ticket.append(None)
+                        continue
+                    history = tuple(req.get_fill_ids()[:length])
+                    if len(history) != length:
+                        ticket.append(None)
+                        continue
+                    request_ref = weakref.ref(req)
+                    limit = (
+                        len(req.origin_input_ids) + req.sampling_params.max_new_tokens
+                    )
+                    host = self.backend.prepare_host(history)
+                    future = self.builder_pool.submit(
+                        self.backend.build_host, host, self.vocab_size
+                    )
+                    slot = heapq.heappop(self.free_slots)
+                    self.generation += 1
+                    state = PrefillLease(
+                        req.rid,
+                        request_ref,
+                        slot,
+                        self.generation,
+                        limit,
+                        future,
+                    )
+                    self.states[req.rid] = state
+                    ticket.append(state)
+        except BaseException:
+            self.cancel_prefill(ticket)
+            raise
+        return tuple(ticket)
+
+    def on_prefill(self, batch, result, ticket):
         if batch.forward_mode.is_idle():
             return
         slots, generations = [], []
         with self.lock:
-            for row, req in enumerate(batch.reqs):
-                self.close_request(req.rid)
-                length = int(batch.seq_lens_cpu[row])
-                history = tuple(req.get_fill_ids()[:length])
+            for req, state in zip(batch.reqs, ticket, strict=True):
                 if (
-                    not self.free_slots
-                    or len(history) != length
-                    or length >= self.config.max_history_tokens
+                    state is None
+                    or self.states.get(req.rid) is not state
+                    or state.request() is not req
                 ):
                     slots.append(-1)
                     generations.append(-1)
                     continue
-                if any(not 0 <= token < self.vocab_size for token in history):
-                    raise ValueError("history must use the target vocabulary")
-                slot = heapq.heappop(self.free_slots)
-                self.generation += 1
-                generation = self.generation
+                # Do not join the CPU build here. GPU prefill/draft-extend is
+                # still running; import only at the first draft consumer.
                 self.backend.initialize_device_slot(
-                    slot,
-                    generation,
-                    len(req.origin_input_ids) + req.sampling_params.max_new_tokens,
+                    state.slot, state.generation, state.limit
                 )
-                self.backend.append(
-                    slot, HistoryDelta(RequestKey(req.rid, generation), 0, history)
-                )
-                self.states[req.rid] = (weakref.ref(req), slot, generation)
-                slots.append(slot)
-                generations.append(generation)
+                state.device_initialized = True
+                slots.append(state.slot)
+                generations.append(state.generation)
         view = self._view(slots, generations)
         bs = len(slots)
         # Prefill sampled one GPU bonus token. It is appended by the first
@@ -139,6 +202,28 @@ class DeviceDraftExtension:
             False,
             self.vocab_size,
         )
+
+    def _install_prefill(self, state):
+        future = state.build
+        if future is None:
+            return
+        try:
+            host = future.result()
+        except Exception:
+            with self.lock:
+                if self.states.get(state.rid) is not state:
+                    return  # Cancelled/superseded work cannot fail another request.
+                self.close_request(state.rid)
+            raise
+        with self.lock:
+            # Finish/flush/retract can run while result() releases the GIL.
+            if self.states.get(state.rid) is state:
+                try:
+                    self.backend.import_host(state.slot, host)
+                except BaseException:
+                    self.close_request(state.rid)
+                    raise
+                state.build = None
 
     def _view(self, slots, generations):
         return DeviceOverride(
@@ -155,16 +240,29 @@ class DeviceDraftExtension:
             raise ValueError("hybrid-spec supports greedy requests only")
         slots, generations = [], []
         with self.lock:
+            states = [self.states.get(req.rid) for req in batch.reqs]
+        for req, state in zip(batch.reqs, states, strict=True):
+            if (
+                state is not None
+                and state.request() is req
+                and state.device_initialized
+            ):
+                self._install_prefill(state)
+        with self.lock:
             for req in batch.reqs:
                 if req.multimodal_inputs is not None:
                     raise ValueError("hybrid-spec does not index multimodal inputs")
                 state = self.states.get(req.rid)
-                if state is None or state[0]() is not req:
+                if (
+                    state is None
+                    or state.request() is not req
+                    or not state.device_initialized
+                ):
                     slots.append(-1)
                     generations.append(-1)
                 else:
-                    slots.append(state[1])
-                    generations.append(state[2])
+                    slots.append(state.slot)
+                    generations.append(state.generation)
         binding_key = (tuple(slots), tuple(generations))
         if self.last_binding is None or self.last_binding[0] != binding_key:
             self.last_binding = (binding_key, self._view(slots, generations))

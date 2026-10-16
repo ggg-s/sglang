@@ -48,7 +48,7 @@ def register():
     HookRegistry.register(
         "sglang.srt.speculative.eagle_worker_v2.EAGLEWorkerV2._forward_prefill_batch",
         _prefill,
-        HookType.AFTER,
+        HookType.AROUND,
     )
     HookRegistry.register(
         "sglang.srt.sampling.sampling_params.SamplingParams.verify",
@@ -73,9 +73,9 @@ def _config():
 
 
 def _validate(server_args):
-    from hybrid_spec.integrations.sglang.compatibility import validate_config
-
     from sglang.srt.arg_groups.overrides import resolved_view
+
+    from hybrid_spec.integrations.sglang.compatibility import validate_config
 
     validate_config(_config(), resolved_view(server_args))
 
@@ -104,15 +104,15 @@ def _validate_inputs(request):
 
 
 def _attach(result, worker, *args, **kwargs):
-    from hybrid_spec.backends.gpu_sa import GPUSuffixAutomaton
-    from hybrid_spec.integrations.sglang.compatibility import validate_model
-    from hybrid_spec.integrations.sglang.draft_extension import DraftExtension
-    from hybrid_spec.integrations.sglang.tp_sync import TPSynchronizer
-
     from sglang.srt.distributed.parallel_state import get_tp_group
     from sglang.srt.speculative.eagle_draft_cuda_graph_runner import (
         EAGLEDraftCudaGraphRunner,
     )
+
+    from hybrid_spec.backends.gpu_sa import GPUSuffixAutomaton
+    from hybrid_spec.integrations.sglang.compatibility import validate_model
+    from hybrid_spec.integrations.sglang.draft_extension import DraftExtension
+    from hybrid_spec.integrations.sglang.tp_sync import TPSynchronizer
 
     _validate(worker.server_args)
     if (
@@ -169,10 +169,18 @@ def _verify(result, worker, *args, **kwargs):
             extension.on_verify_result(result)
 
 
-def _prefill(result, worker, batch, *args, **kwargs):
+def _prefill(original, worker, batch, *args, **kwargs):
     extension = getattr(worker.draft_worker, "draft_extension", None)
-    if extension is not None and hasattr(extension, "on_prefill"):
-        extension.on_prefill(batch, result)
+    if extension is None or not hasattr(extension, "begin_prefill"):
+        return original(worker, batch, *args, **kwargs)
+    ticket = extension.begin_prefill(batch)
+    try:
+        result = original(worker, batch, *args, **kwargs)
+        extension.on_prefill(batch, result, ticket)
+        return result
+    except BaseException:
+        extension.cancel_prefill(ticket)
+        raise
 
 
 def _diagnostics(result, controller, *args, **kwargs):

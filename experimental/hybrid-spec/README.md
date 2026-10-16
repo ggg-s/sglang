@@ -4,9 +4,11 @@
 
 这是实验实现。CPU 语义测试与 CUDA/真实模型验收是不同层次；当前验证记录见 [VALIDATION.md](VALIDATION.md)。未测模型不得视为已支持。
 
-新增 opt-in `history_mode="device"` 路径，用于对齐 Baseten `sa_spec` 的 GPU 增量更新与调度方式。请求 prefill 后初始化一次 prompt 索引；verify 直接在设备上暂存 `predict/accept_index/accept_lens`，下一轮 draft 在 CUDA Graph 内消费增量、查询并选择来源。不再每轮读取或重建 CPU 输出历史。eager 使用相同设备算子，CPU 只管理请求槽位和代际映射。
+新增 opt-in `history_mode="device"` 路径，用于对齐 Baseten `sa_spec` 的 GPU 增量更新与调度方式。prefill 前快照 prompt 并准备 pinned CPU 缓冲，由后台线程使用与 CUDA 相同的 C++ 状态机构建初始 SA；本机 native 调用释放 GIL，与 target prefill/draft-extend 并行。prefill 返回时只暂存 GPU bonus，首次 draft 才消费构建结果，并在 forward stream 上异步拷贝已使用的状态前缀。不再在 GPU 上逐 token 构建 prompt SA，也不在每轮 decode 读取或重建 CPU 输出历史。
 
-该路径允许 TP=1 的 overlap 配置，但 **尚未完成 GPU/真实模型验收**。当前服务器不再暴露 GPU，不能把实现完成当作运行验证。旧模式默认 `history_mode="cpu"`，保留关闭 overlap 的限制及现有验证证据；新路径不继承其通过结论。device 路径保留每批槽位/代际映射的 H2D 和 verify 反馈 kernel，并未证明零开销；prompt 初始 SA 仍在 GPU 上构建，未实现参考项目的 host 构建与 prefill 重叠。
+verify 直接在设备上暂存 `predict/accept_index/accept_lens`，下一轮 draft 在 CUDA Graph 内消费增量、查询并选择来源。eager 使用相同设备算子。若 CPU 构建未完成，首次 draft 会等待该 future；不调用额外的 GPU 全局同步。异步 H2D 的 pinned 源缓冲保留到拷贝事件完成；异常、abort/flush、retract 和槽位复用会取消或丢弃旧任务结果，旧任务不能向新代际写入状态。
+
+该路径允许 TP=1 的 overlap 配置，但 **尚未完成 GPU/真实模型验收**。本地 CPU/native 测试不能替代 GPU 时间线、H2D 或真实模型验证。旧模式默认 `history_mode="cpu"`，保留关闭 overlap 的限制及现有验证证据；新路径不继承其通过结论。device 路径保留每批槽位/代际映射的 H2D、verify 反馈 kernel 和一次 host 构建/导入，并未证明零开销或性能收益。
 
 `configs/device-sa-spec.json` 给出 K=8、阈值 4、`partial_drafts="zero"` 的参考策略配置。启动时相应设置 `--speculative-num-steps 8 --speculative-num-draft-tokens 9`；测试 overlap 时移除 `--disable-overlap-schedule`。`zero` 复现参考集成对不足 K 个续写的尾部补零；这些仍是草稿，必须经过原生 target verify，不代表输出补零。默认 `partial_drafts="fallback"` 继续整条回退，可用于单独比较该策略差异。阈值设为大于历史容量的数值可测量“维护 SA、全部选择 MTP”的成本。
 
@@ -16,21 +18,21 @@ device 模式以 generation 和 GPU 历史版本检查隔离旧反馈、槽位�
 
 | 项目 | 当前实现 |
 | --- | --- |
-| 检索 | 实例私有 GPU 后缀自动机；CPU SA 仅用于对照测试 |
+| 检索 | 实例私有 GPU SA；device 模式由 CPU C++ 构建初始状态；Python CPU SA 仅作对照 |
 | 神经后端接入 | 普通 EAGLE/MTP、EAGLE3、Standalone 的 V2 共用 draft 路径；均需逐模型 GPU 验收 |
 | 参数 | NVIDIA CUDA、单机 TP≥1、纯文本、greedy、topk=1、K≥1、验证宽度 K+1 |
-| TP | 各 rank 独立维护 SA；起草前广播候选并对选择 mask 达成一致 |
+| TP | CPU 历史模式各 rank 独立维护 SA 并达成选择共识；device 模式仅 TP=1 实验 |
 | 执行 | eager 与 CUDA Graph 接口；K=1 走原生无循环内 forward 路径 |
-| 历史 | 关闭调度 overlap；从已提交的 `origin_input_ids + output_ids` 生成确认增量 |
+| 历史 | CPU 模式关闭 overlap、从 CPU 已提交历史取增量；device 模式使用 GPU verify 反馈 |
 | 生命周期 | 历史重复不追加；历史变化重建；请求对象代际、结束释放、弱引用清理、flush reset |
 | 混合线性注意力 | 实验接入 Qwen3.5/3.6 target + 原生 Qwen3.5 MTP，要求 `--language-only`；保留 GDN verify/commit 和 mRoPE |
-| 暂不开放 | overlap、DP/PP/EP/CP、多机、torch.compile、chunk prefill、混合 prefill/decode、随机采样、grammar、LoRA、其他混合线性注意力模型、多模态请求、多层 EAGLE、FROZEN_KV_MTP、动态预算、Arctic |
+| 暂不开放 | CPU 模式 overlap、device 模式多 TP、DP/PP/EP/CP、多机、torch.compile、chunk prefill、混合 prefill/decode、随机采样、grammar、LoRA、其他混合线性注意力模型、多模态请求、多层 EAGLE、FROZEN_KV_MTP、动态预算、Arctic |
 
-此版本比设计稿收窄了历史接入：使用同步调度器已经提交到 CPU 的输出，不增加 D2H 读取，也不直接索引 verify 的预测缓冲。只有确认的增量上传 GPU；当前 anchor 已包含在历史中。EOS/停止后尾部不会进入下一轮索引。GPU verify 的接受统计可能包含最终 CPU 停止截断前的尾部，不能当作最终交付 token 统计。
+默认 CPU 历史模式使用同步调度器已提交到 CPU 的输出，只上传确认增量，当前 anchor 已包含在历史中。device 模式使用 GPU verify 的接受前缀，可能包含最终 CPU EOS/停止截断前的尾部；不能将其计数或索引长度当作最终交付 token 统计。两者均不增加逐步 D2H 读取。
 
-最长重复后缀通过 suffix link 查询，续写采用该后缀的最早出现位置。候选不含 anchor。匹配长度与可用续写长度分别记录；任意位置不足、版本不符、无槽位、历史超容量、token 非法或预算不足，整条链回退 neural。不会选择较短匹配来填满候选。
+最长重复后缀通过 suffix link 查询，续写采用该后缀的最早出现位置。候选不含 anchor。匹配长度与可用续写长度分别记录；默认续写不足、版本不符、无槽位、历史超容量、token 非法或预算不足时整条链回退 neural。`partial_drafts="zero"` 单独复现尾部补零；不会选择较短匹配来填满候选。
 
-GPU SA 使用每请求一个线程维护状态，首版优先实现正确的实例资源与契约，尚未对大词表和长历史优化。历史同步在 CPU 上检查前缀，复杂度与历史长度有关；需要用完整推理循环实测净收益。
+GPU SA 使用每请求一个线程维护状态，尚未对大词表和长历史优化。默认模式的 CPU 前缀检查随历史长度增长；device 模式只在 prefill/retract 快照一次历史，后台线程不触碰请求对象或 CUDA。净收益仍需完整推理循环实测。
 
 ## 安装
 
@@ -43,6 +45,8 @@ python -m pip install -e './experimental/hybrid-spec[test]'
 ```
 
 CUDA 扩展在第一次 worker 构造时通过 PyTorch 编译并缓存。插件注册不初始化 CUDA。包中包含 `.cu` 源码，不依赖本地 sa_spec checkout 或 TensorRT-LLM。
+
+扩展同时链接纯 CPU `host_builder.cpp`，通过释放 GIL 的 `ctypes.CDLL` 调用；CPU 与 GPU 状态仅含相对整数索引，无需指针重定位。device 模式还需要 pinned CPU 状态内存，随同时在途 prompt 长度增长；构建输入及状态上界约为每请求 `80*L+48` 字节（L>0，不含对象开销）。本地原生测试无需 CUDA，可用 C++ 编译器或 Zig 编译同一份 host builder。
 
 SGLang 基线与补丁接口见 [compat/sglang/README.md](compat/sglang/README.md)。仅安装包不能适配未打补丁的其他 SGLang 版本。
 
@@ -84,6 +88,8 @@ curl http://127.0.0.1:30000/generate \
 ```
 
 首版在请求参数校验阶段拒绝非 greedy、grammar、beam search 和 watermark 请求，worker 入口还会复核 greedy/grammar 条件。不将检索分数伪装成采样分布。
+
+LoRA 关闭时，无需也无法通过 `--enable-lora` 显式传入 False；本版本未传该参数的默认值是 `None`。插件接受 `enable_lora` 为 `None` 或 `False` 且无适配器路径，拒绝启用 LoRA 或配置适配器。若仍看到 `enable_lora=False required`，应更新到包含该修复的分支，而非寻找不存在的关闭参数。
 
 ## 配置
 
