@@ -14,6 +14,7 @@ class HybridConfig:
     backend: str = "gpu_sa"
     history_mode: str = "cpu"
     partial_drafts: str = "fallback"
+    num_neural_gate_tokens: int = 0
 
     def __post_init__(self):
         for name in (
@@ -33,6 +34,11 @@ class HybridConfig:
             raise ValueError("history_mode must be cpu or device")
         if self.partial_drafts not in ("fallback", "zero"):
             raise ValueError("partial_drafts must be fallback or zero")
+        if (
+            type(self.num_neural_gate_tokens) is not int
+            or not 0 <= self.num_neural_gate_tokens <= self.num_drafts
+        ):
+            raise ValueError("num_neural_gate_tokens must be between 0 and num_drafts")
 
     @classmethod
     def from_file(cls, path: str):

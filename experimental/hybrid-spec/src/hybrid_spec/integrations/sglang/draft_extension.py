@@ -30,7 +30,13 @@ class DraftExtension:
         self.tp_sync = tp_sync
 
     def create_graph_buffers(self, max_bs):
-        return GraphBuffers(max_bs, self.config.num_drafts, self.device, self.tp_sync)
+        return GraphBuffers(
+            max_bs,
+            self.config.num_drafts,
+            self.device,
+            self.tp_sync,
+            self.config.num_neural_gate_tokens,
+        )
 
     @contextmanager
     def bind(self, batch, draft_input):
@@ -70,7 +76,12 @@ class DraftExtension:
         )
         view.use_retrieval &= batch.seq_lens + 1 == expected
         if self.tp_sync is not None:
-            view = TPOverride(view.tokens, view.use_retrieval, self.tp_sync)
+            view = TPOverride(
+                view.tokens,
+                view.use_retrieval,
+                self.tp_sync,
+                self.config.num_neural_gate_tokens,
+            )
         self.pending_view = view
         draft_input.draft_override = view
         try:

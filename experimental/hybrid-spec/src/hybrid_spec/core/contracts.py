@@ -44,6 +44,7 @@ class RetrievalCandidates:
 class DraftOverrideView:
     tokens: torch.Tensor
     use_retrieval: torch.Tensor
+    num_neural_gate_tokens: int = 0
 
     def select_step(self, neural_tokens: torch.Tensor, step: int):
         # topk=1 has exactly one token per row. Preserve [B] or [B,1], never
@@ -53,6 +54,13 @@ class DraftOverrideView:
             (self.tokens.shape[0], 1),
         ):
             raise ValueError("hybrid selection requires one neural token per row")
+        if step < self.num_neural_gate_tokens:
+            # Before switching to retrieval, require agreement with the native
+            # draft prefix. A mismatch keeps the entire remaining chain neural.
+            # Keep this storage: graph staging and verify metrics alias it.
+            self.use_retrieval.logical_and_(
+                self.tokens[:, step] == neural_tokens.reshape(-1)
+            )
         return torch.where(
             self.use_retrieval.reshape(neural_tokens.shape),
             self.tokens[:, step].reshape(neural_tokens.shape),

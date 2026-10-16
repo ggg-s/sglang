@@ -31,6 +31,7 @@ class DeviceOverride(DraftOverrideView):
                 device=backend.device,
             ),
             torch.zeros(len(slots), dtype=torch.bool, device=backend.device),
+            backend.config.num_neural_gate_tokens,
         )
 
     def prepare(self, seq_lens):
@@ -60,6 +61,7 @@ class DeviceGraphBuffers:
         view.backend = self.view.backend
         view.tp_sync = self.view.tp_sync
         view.mapping_key = None
+        view.num_neural_gate_tokens = self.view.num_neural_gate_tokens
         for name in ("slots", "generations", "tokens", "use_retrieval"):
             setattr(view, name, getattr(self.view, name)[:batch_size])
         return view

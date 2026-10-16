@@ -11,8 +11,8 @@ from hybrid_spec.core.contracts import DraftOverrideView
 class TPOverride(DraftOverrideView):
     """Consensus at the draft consumer, including captured CPU-history views."""
 
-    def __init__(self, tokens, use_retrieval, tp_sync):
-        super().__init__(tokens, use_retrieval)
+    def __init__(self, tokens, use_retrieval, tp_sync, num_neural_gate_tokens=0):
+        super().__init__(tokens, use_retrieval, num_neural_gate_tokens)
         self.tp_sync = tp_sync
 
     def prepare(self, seq_lens):

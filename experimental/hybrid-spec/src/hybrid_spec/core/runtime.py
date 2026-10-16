@@ -3,6 +3,7 @@ from __future__ import annotations
 import heapq
 
 import torch
+
 from hybrid_spec.core.contracts import HistoryDelta, RequestKey, RequestSnapshot
 from hybrid_spec.core.request_state import RequestState
 from hybrid_spec.selection.policy import select_requests
@@ -82,4 +83,5 @@ class HybridRuntime:
             self.vocab_size,
             self.config.partial_drafts,
         )
+        view.num_neural_gate_tokens = self.config.num_neural_gate_tokens
         return view

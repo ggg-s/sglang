@@ -1,5 +1,13 @@
 # 验证记录
 
+## Qwen3.5 MTP 接受长度分析与 A100 对照（2026-10-16）
+
+新增可选 neural 前缀检查；默认关闭，CUDA 扩展布局保持 v3。A100 的原生与
+两组 SA 策略、官方 edits benchmark、全量 GSM8K CoT 及重复性限制见
+[接受长度分析](validation/acceptance-regression.md)。CPU/native/Gloo 141 passed、
+1 skipped，CUDA 11 passed；以下早期记录的“未验证”仅描述当时状态。
+尚未实现独立 SA CUDA stream 或 MTP 提前退出，多 GPU 新策略验收仍待完成。
+
 ## 双转移内联：压缩状态并修复低多样性追加退化（2026-10-16）
 
 基线为上一版哈希 `88f8d971eb`，另以原始链表 `44637fe669` 作独立对照。重新检查 sa_spec `flat_graph.hpp` 的单边内联和 clone 直接复制方式，进一步将本实现的第一、第二条转移保留在状态中：

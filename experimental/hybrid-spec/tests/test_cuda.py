@@ -93,6 +93,31 @@ def test_cuda_graph_replay_reads_live_mask_and_padding(k):
     assert torch.equal(output[1:], neural[1:].expand(-1, k))
 
 
+def test_cuda_graph_neural_gate_replay_resets_final_selection_mask():
+    """Graph replay must not reuse an earlier batch's rejected retrieval mask."""
+    buffers = GraphBuffers(3, 3, "cuda", num_neural_gate_tokens=2)
+    view = buffers.bind_capture_view(3)
+    neural = [
+        torch.full((3, 1), t, device="cuda", dtype=torch.int64) for t in (10, 20, 30)
+    ]
+    graph = torch.cuda.CUDAGraph()
+    with torch.cuda.graph(graph):
+        output = torch.cat(
+            [view.select_step(t, i) for i, t in enumerate(neural)], dim=1
+        )
+    candidates = torch.tensor([[10, 20, 99], [11, 20, 98], [10, 21, 97]], device="cuda")
+    eligibility = torch.ones(3, dtype=torch.bool, device="cuda")
+    buffers.stage(DraftOverrideView(candidates, eligibility), 3, 3)
+    graph.replay()
+    assert output.tolist() == [[10, 20, 99], [10, 20, 30], [10, 20, 30]]
+    assert view.use_retrieval.tolist() == [True, False, False]
+    candidates[:, :2] = torch.tensor([10, 20], device="cuda")
+    buffers.stage(DraftOverrideView(candidates, eligibility), 3, 3)
+    graph.replay()
+    assert torch.equal(output, candidates)
+    assert view.use_retrieval.tolist() == [True, True, True]
+
+
 @pytest.mark.parametrize("partial", ["fallback", "zero"])
 def test_device_feedback_graph_reorder_generation_and_replay(partial):
     config = HybridConfig(3, 2, 2, 64, history_mode="device", partial_drafts=partial)

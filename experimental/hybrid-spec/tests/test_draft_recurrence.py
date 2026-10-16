@@ -36,9 +36,20 @@ def load_functions(relative, names, namespace, class_name=None):
 
 @pytest.mark.parametrize("k", [1, 2, 4])
 @pytest.mark.parametrize("matrix,hot", [(False, False), (True, False), (False, True)])
-@pytest.mark.parametrize("mask", [None, [False, False], [True, True], [True, False]])
+@pytest.mark.parametrize(
+    "mask,gate",
+    [
+        (None, 0),
+        ([False, False], 0),
+        ([True, True], 0),
+        ([True, False], 0),
+        ([True, True], 2),
+    ],
+)
 @pytest.mark.parametrize("mrope", [False, True])
-def test_selected_prefix_drives_model_and_verify_chain(k, matrix, hot, mask, mrope):
+def test_selected_prefix_drives_model_and_verify_chain(
+    k, matrix, hot, mask, mrope, gate
+):
     def postprocess(logits, positions, drafts, step):
         index = logits.argmax(dim=-1, keepdim=True)
         positions.add_(1)
@@ -107,7 +118,15 @@ def test_selected_prefix_drives_model_and_verify_chain(k, matrix, hot, mask, mro
 
     hot_tokens = torch.arange(8) + 10 if hot else None
     retrieval = torch.arange(40, 40 + 2 * k).reshape(2, k)
-    view = None if mask is None else DraftOverrideView(retrieval, torch.tensor(mask))
+    if gate:
+        # Exercise agreement and later disagreement as well as immediate
+        # disagreement, including the hot-token remapping recurrence.
+        retrieval[0, : min(gate, k)] = torch.arange(1, 1 + min(gate, k)) + (
+            10 if hot else 0
+        )
+    view = (
+        None if mask is None else DraftOverrideView(retrieval, torch.tensor(mask), gate)
+    )
     batch = SimpleNamespace(
         batch_size=2,
         forward_mode=SimpleNamespace(is_idle=lambda: False),
@@ -145,8 +164,11 @@ def test_selected_prefix_drives_model_and_verify_chain(k, matrix, hot, mask, mro
     expected = torch.empty((2, k), dtype=torch.int64)
     for row in range(2):
         token = row + 1 + (10 if hot else 0)
+        eligible = mask is not None and mask[row]
         for step in range(k):
-            if mask is not None and mask[row]:
+            if step < gate and token != retrieval[row, step].item():
+                eligible = False
+            if eligible:
                 token = retrieval[row, step].item()
             expected[row, step] = token
             token = (token + 1) % 8 + (10 if hot else 0)

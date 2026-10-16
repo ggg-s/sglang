@@ -851,3 +851,50 @@ def test_invalid_plugin_configuration(field, value):
     values[field] = value
     with pytest.raises(ValueError):
         HybridConfig(**values)
+
+
+@pytest.mark.parametrize("value", [-1, 3, True, 1.5])
+def test_invalid_neural_gate_width(value):
+    with pytest.raises(ValueError, match="num_neural_gate_tokens"):
+        HybridConfig(2, 2, 2, 32, num_neural_gate_tokens=value)
+
+
+def test_neural_gate_falls_back_before_divergence_and_resets_next_batch():
+    """A four-token suffix alone can replace a correct MTP prefix with a wrong one.
+
+    Gating must preserve the neural recurrence after either early disagreement,
+    keep the metrics mask alias, and allow retrieval again on the next batch.
+    """
+    buffers = GraphBuffers(3, 3, "cpu", num_neural_gate_tokens=2)
+    view = buffers.bind_capture_view(3)
+    mask = view.use_retrieval
+    candidates = torch.tensor([[10, 20, 99], [11, 20, 98], [10, 21, 97]])
+    buffers.stage(DraftOverrideView(candidates, torch.ones(3, dtype=torch.bool)), 3, 3)
+    outputs = [
+        view.select_step(torch.full((3, 1), t), i) for i, t in enumerate((10, 20, 30))
+    ]
+    assert torch.cat(outputs, dim=1).tolist() == [
+        [10, 20, 99],
+        [10, 20, 30],
+        [10, 20, 30],
+    ]
+    assert view.use_retrieval is mask and mask.tolist() == [True, False, False]
+    candidates[:, :2] = torch.tensor([10, 20])
+    buffers.stage(DraftOverrideView(candidates, torch.ones(3, dtype=torch.bool)), 3, 3)
+    outputs = [
+        view.select_step(torch.full((3, 1), t), i) for i, t in enumerate((10, 20, 30))
+    ]
+    assert torch.equal(torch.cat(outputs, dim=1), candidates)
+    assert mask.tolist() == [True, True, True]
+
+
+def test_neural_gate_propagates_through_history_and_capture_views():
+    config = HybridConfig(3, 2, 1, 32, "reference", num_neural_gate_tokens=2)
+    runtime = HybridRuntime(config, ReferenceBackend(config), 100)
+    assert runtime.prepare([("a", [1, 2, 3, 4, 1, 2], 20)]).num_neural_gate_tokens == 2
+    backend = SimpleNamespace(config=config, device=torch.device("cpu"))
+    from hybrid_spec.integrations.sglang.device_extension import DeviceGraphBuffers
+
+    assert (
+        DeviceGraphBuffers(backend, 3).bind_capture_view(3).num_neural_gate_tokens == 2
+    )

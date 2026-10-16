@@ -5,8 +5,11 @@ from hybrid_spec.integrations.sglang.tp_sync import TPOverride
 
 
 class GraphBuffers:
-    def __init__(self, max_bs, num_drafts, device, tp_sync=None):
+    def __init__(
+        self, max_bs, num_drafts, device, tp_sync=None, num_neural_gate_tokens=0
+    ):
         self.tp_sync = tp_sync
+        self.num_neural_gate_tokens = num_neural_gate_tokens
         self.tokens = torch.zeros(
             (max_bs, num_drafts), device=device, dtype=torch.int64
         )
@@ -18,9 +21,12 @@ class GraphBuffers:
                 self.tokens[:batch_size],
                 self.use_retrieval[:batch_size],
                 self.tp_sync,
+                self.num_neural_gate_tokens,
             )
         return DraftOverrideView(
-            self.tokens[:batch_size], self.use_retrieval[:batch_size]
+            self.tokens[:batch_size],
+            self.use_retrieval[:batch_size],
+            self.num_neural_gate_tokens,
         )
 
     def stage(self, view, raw_bs, padded_bs):
