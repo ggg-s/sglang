@@ -1,5 +1,56 @@
 # 验证记录
 
+## 性能报告独立复核与共识路径改进（2026-10-16）
+
+输入为根目录 `hybrid-spec性能瓶颈分析一.md`，报告基线 `1b0f580307`；本轮修改前 HEAD 为 `4030650794`。本地只有分析 Markdown，没有报告引用的原始 CPU/GPU trace，以下区分源码事实、实验观察和待证假设。
+
+### 独立判断
+
+1. **可以确认 CPU 历史路径存在额外开销，但不能确认它解释全部退化。** 当前 CPU `DraftExtension.bind()` 原先每批调用共识，且完整历史拼接、词表检查、前缀比较、不可变 tuple 追加均随历史增长。报告中的“合成负载通信次数相同”与“无条件通信导致合成负载下降”不能仅凭汇总表相互推出；GPU kernel 累计时间也不是 CPU 临界路径时间。
+2. **eager 通信不等于全设备/主机同步，更不必然破坏已有 Graph。** 原生 draft、verify、draft_extend 原本就是分别 replay；图外算子可以在同一 stream 上排队。是否产生长 host gap、跨 rank 到达偏差、通信等待，需要 CPU launch、GPU 时间线和所有 TP rank 的相关性证据。`record_param_comms` 和 u32 kernel 名称本身不足以证明“打断整段 Graph 导致 TPOT 翻倍”。
+3. **不采用按本地 `use_retrieval` 跳过共识。** 一张卡无槽位/版本不符、另一张卡命中时，参与集合通信的 rank 数或顺序会不一致。对 GPU mask 做 `.any().item()` 还会增加 D2H 等待。保留所有 rank 的同序共识和统一 fallback。
+4. **不直接把 SA 分配挪到 KV 规划之后。** 当前 `Scheduler.init_model_worker()` 先构造 draft，再规划 KV；`KVCacheConfigurator._profile_available_bytes()` 从当前空闲显存减 runtime slack，已经驻留的 SA 因而计入预算。若以后延迟分配，需要在 KV 规划时显式预留相同空间。Graph 固定地址也不能证明不同进程/配置之间不受布局影响。
+5. **缩小配置的实验有混杂因素。** 32×16384 改成 1×256 同时改变分配量、可索引长度和被跟踪请求数；并发 4 时只跟踪 1 个请求，不能把恢复都归因于内存布局。0.73/0.79 约为原生吞吐的 92%，而恢复损失比例是 `(0.73-0.52)/(0.79-0.52)` 约 78%，两者口径不同。
+6. **当前分支已有可复用的增量设备模式。** `DeviceOverride.prepare()` 已把反馈消费、SA 查询与 TP 共识放进 draft Graph；不需要重新设计一套 SA 状态机。它消除每轮完整 CPU 历史检查，但仍有 SA 更新、查询、反馈与通信开销，也不减少 neural forward。接受长度降低时，消除这些开销仍不保证获得加速。
+
+### 本轮代码
+
+- 两阶段“广播候选 + MIN 一致性”改为一次精确 MIN 归约 `[tokens, ~tokens, eligibility]`。按位取反逆转有符号 int64 顺序，逐位置比较最小值与最大值即可确认所有 rank 候选一致；不使用可能碰撞的哈希，也没有负号在 INT64_MIN 上的溢出。不再需要 source/root rank。小消息的集合通信次数由每批 2 次降为 1 次，归约输入从两种张量改为 `8*B*(2K+1)` 字节；这不是实测性能提升声明。
+- CPU 历史模式 `bind()` 只准备本地候选；新增 `TPOverride.prepare()`，通过已有原生 draft 消费入口执行共识。GraphBuffers 绑定同样的视图，因此 Graph 可捕获通信，eager 使用相同语义。两种模式都复用现有 PyNccl；缺少可用通信器时 CUDA TP 启动报错。
+- CPU 路径待统计视图引用 Graph 的最终选择 mask，避免把共识前的本地命中当成实际 SA 使用；padding 清理保留有效行，并支持对同一别名视图重复 staging。
+- 新增 `configs/device-k3.json`：K=3、阈值 4、整链 fallback，容量 4×8192（约 2.25 MiB/卡），覆盖报告的并发/长度。旧 example 保留，避免无法复现旧路径。这个配置同时改变两项因素，不能用于单变量归因。
+- 未改变模型层、原生 target verify、接受采样、KV 池或停止逻辑。K=1 沿用原生没有 draft Graph 的 eager 入口，不声称被捕获；TP=1 不创建同步器。
+
+### 部署环境的必要对照
+
+保持同一模型、GPU、TP、K=3、阈值 4、fallback、输入、停止方式、缓存流程和 overlap 配置，分别执行：
+
+| 对照 | 唯一变化 | 要回答的问题 |
+| --- | --- | --- |
+| 修改前/后 CPU 历史，均 32×16384 | 本轮共识实现 | 一次归约及 Graph 捕获减少多少开销 |
+| 修改后 CPU/device，均 32×16384 | 历史模式 | 完整 CPU 历史维护占多少临界路径 |
+| device，32/4 请求槽，均 H=16384 | 预分配槽位数，实际并发均 4 | 空闲容量是否影响性能，避免只跟踪一个请求 |
+| device，4×16384/4×8192 | 每槽容量，全部实际历史 <8192 | 分配足迹是否独立影响吞吐 |
+| 上述关键配置，Graph 开/关 | Graph | 通信捕获的净收益；不能只比较 kernel 累计占比 |
+
+分别测合成未命中与重复代码命中场景；预热覆盖真实并发，每组多于 4 个请求并重复独立运行、交替顺序。无 profiler 的端到端 TTFT/TPOT/输出吞吐用于性能结论；单独抓所有 TP rank 的 CPU/GPU 时间线定位 gap、通信等待、SA 更新/查询。记录实际请求数、输出 token 数、SA 选中率和接受长度。若新旧序列/长度不同，应同时报告，不能只报吞吐比。
+
+本地验证（Windows / Python 3.11.15 / PyTorch 2.14.1+cpu，按文件单独运行）：
+
+| 检查 | 结果 |
+| --- | --- |
+| `test_core.py` | 34 passed |
+| `test_draft_recurrence.py` | 72 passed，执行当前原生 draft 函数体；K=1/2/4、eager 选择语义、矩阵/列表、hot-token 与 mRoPE |
+| `test_tp.py` | 3 passed，1 skipped；真实 Gloo TP=1/2/4 和 `[1,3]` 子组；无 GPU/NCCL，相关用例跳过 |
+| `test_native.py` | 4 passed，实际 C++ 状态机与 host builder |
+| `test_cuda.py` | 6 skipped，无 CUDA |
+
+合计 **113 passed，7 skipped**。新增/扩展覆盖精确共识（int64 极值、同和但不同候选、混合 mask、单 rank 回退）、CPU 历史 eager/Graph 缓冲桥接、捕获前全 false 到运行时命中、请求重排、padding、固定存储、同视图重复 staging 和共识后统计。CPU 缓冲测试不等于实际 Graph replay；双 GPU NCCL 分支包含真正的 Graph 捕获，但本机未执行。
+
+Gloo 在沙箱内的临时目录创建/进程通信失败；改用工作区临时目录并在沙箱外运行后通过。native 编译也在沙箱外完成。没有 CUDA/NCCL 实机性能结果，不宣称恢复报告中的 34%/51% 损失。
+
+修改的 Python 文件通过 Ruff 导入顺序及 F401/F811/F821/F823/UP037 检查；27 个 Python 文件格式检查和 `git diff --check` 通过。新增 JSON 经 `HybridConfig` 实际解析，设备状态估计为 2,359,712 字节/卡。
+
 ## Device 历史模式多 TP（2026-10-16）
 
 此前 `history_mode="device"` 的 TP=1 限制来自缺失 Graph 内的 TP 共识，而非 SA 算法只能使用单卡。本轮允许单机 TP≥1，覆盖普通 EAGLE/MTP、EAGLE3、STANDALONE 的共用插件路径，仍保留其他配置限制。

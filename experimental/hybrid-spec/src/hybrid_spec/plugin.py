@@ -126,12 +126,12 @@ def _attach(result, worker, *args, **kwargs):
     config = _config()
     tp_group = get_tp_group()
     communicator = None
-    if config.history_mode == "device" and tp_group.world_size > 1:
+    if tp_group.world_size > 1:
         communicator = tp_group.pynccl_comm
         if communicator is None or not communicator.available:
-            raise ValueError("device history TP requires SGLang's PyNccl communicator")
+            raise ValueError("hybrid-spec TP requires SGLang's PyNccl communicator")
     tp_sync = (
-        TPSynchronizer(tp_group.device_group, tp_group.ranks[0], communicator)
+        TPSynchronizer(tp_group.device_group, communicator)
         if tp_group.world_size > 1
         else None
     )

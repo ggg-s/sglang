@@ -448,11 +448,12 @@ def test_device_bridge_keeps_feedback_on_device_and_ignores_cpu_decode_history()
     extension.shutdown()
 
 
-def test_device_tp_rejects_process_group_only_communication():
-    """A CUDA device view must not capture the old CPU-history communicator."""
-    config = HybridConfig(2, 2, 1, 32, history_mode="device")
+@pytest.mark.parametrize("extension_type", [DraftExtension, DeviceDraftExtension])
+def test_tp_rejects_process_group_only_communication(extension_type):
+    """Both history modes require a communicator usable by the draft graph."""
+    config = HybridConfig(2, 2, 1, 32)
     with pytest.raises(ValueError, match="graph-capable PyNccl"):
-        DeviceDraftExtension(
+        extension_type(
             config,
             SimpleNamespace(device=torch.device("cuda")),
             100,

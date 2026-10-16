@@ -15,9 +15,11 @@ The extension interface is duck typed: `bind(batch, draft_input)` is a context
 manager; `create_graph_buffers(max_bs)` returns an object with
 `bind_capture_view(batch_size)` and `stage(view, raw_bs, padded_bs)`; a view exposes
 `select_step(neural_tokens, step)`. Step is a capture-time loop index, not a replay
-counter. A device-history view additionally exposes `prepare(seq_lens)`, called
-inside `draft_forward` before token selection, so pending GPU feedback, SA updates
-and lookup are included in the draft graph. Version 2 requires the plugin's
+counter. A device-history or TP CPU-history view additionally exposes
+`prepare(seq_lens)`, called inside `draft_forward` before token selection.
+Device history includes pending GPU feedback, SA updates and lookup in the
+draft graph; CPU history stages local candidates and captures TP consensus.
+Version 2 requires the plugin's
 prefill and verify hooks for feedback; old CPU-history views need no `prepare`.
 The prefill AROUND hook submits a GIL-free host build before target prefill,
 stages the GPU bonus after success and cancels matching leases on exceptions.
@@ -32,17 +34,18 @@ There is no promise of compatibility with later commits. Run the CPU and CUDA
 tests and real-model comparisons whenever rebasing. The native sampling, verify,
 draft_extend, tree building and KV allocation algorithms are unchanged.
 
-Single-node TP uses the existing `get_tp_group().device_group`, with the first
-global rank in `get_tp_group().ranks` as the broadcast source. Each rank owns an
-SA replica. Before draft execution, the plugin broadcasts candidates and reduces
-eligibility/candidate agreement with MIN. A disagreement falls back on all ranks.
-This relies on the native TP scheduler providing the same ordered batch and K.
-CPU-history collectives run outside CUDA Graph capture/replay. Device history
-runs consensus inside `prepare(seq_lens)`, AFTER local SA lookup and BEFORE
-token selection. Eager and captured paths use the TP group's existing PyNccl
-communicator on the current stream, with explicit enable/restore and conversion
-from global source rank to group-relative root. Device TP fails if PyNccl is
-unavailable. Graph outputs are copied back into the existing tokens/mask storage,
-so verify metrics see the final unanimous mask. TP=1 creates no synchronizer.
+Single-node TP uses the existing `get_tp_group().device_group`. Each rank owns
+an SA replica. One MIN all-reduce over `[tokens, ~tokens, eligibility]` computes
+exact candidate agreement and unanimous eligibility, without a broadcast root.
+Bitwise NOT reverses signed-int64 ordering, including the extrema. A disagreement
+falls back on all ranks. This relies on the native TP scheduler providing the
+same ordered batch and K; local eligibility never controls collective participation.
+Both history modes run consensus inside `prepare(seq_lens)`, AFTER local SA
+lookup and BEFORE token selection. Eager and captured paths use the TP group's
+existing PyNccl communicator on the current stream, with explicit enable/restore.
+Both modes fail on CUDA TP if PyNccl is unavailable. Graph outputs are copied
+back into the existing tokens/mask storage; CPU-history staging aliases the
+pending view's mask to this storage so verify metrics see the final consensus.
+K=1 retains the native eager draft path; TP=1 creates no synchronizer.
 CPU Gloo bridge tests do not establish GPU/NCCL or model correctness.
 DP/PP/EP/CP and multi-node remain rejected.

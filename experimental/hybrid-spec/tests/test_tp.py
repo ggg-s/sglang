@@ -38,7 +38,7 @@ class Request:
 
 
 class GlooCommunicator:
-    """Exercise PyNccl's local-root/in-place contract with real CPU collectives.
+    """Exercise PyNccl's enable/restore/in-place contract with CPU collectives.
 
     This boundary replacement tests adapter semantics, not NCCL or capture.
     """
@@ -47,7 +47,6 @@ class GlooCommunicator:
 
     def __init__(self, group):
         self.group = group
-        self.ranks = dist.get_process_group_ranks(group)
         self.disabled = True
 
     @contextmanager
@@ -58,10 +57,6 @@ class GlooCommunicator:
             yield
         finally:
             self.disabled = previous
-
-    def broadcast(self, tensor, src):
-        assert not self.disabled
-        dist.broadcast(tensor, src=self.ranks[src], group=self.group)
 
     def all_reduce(self, tensor, op):
         assert not self.disabled
@@ -227,8 +222,9 @@ def _check_device_bridge(sync, ranks, device):
 def _check_device_sync(group, ranks, device):
     if device.type == "cpu":
         for communicator in (None, GlooCommunicator(group)):
-            sync = TPSynchronizer(group, ranks[0], communicator)
+            sync = TPSynchronizer(group, communicator)
             _check_device_bridge(sync, ranks, device)
+            _check_cpu_history_bridge(sync, ranks, device)
             if communicator is not None:
                 assert communicator.disabled  # eager must restore caller state
     else:
@@ -239,8 +235,9 @@ def _check_device_sync(group, ranks, device):
 
         cpu_group = dist.new_group(ranks=ranks, backend="gloo")
         communicator = PyNcclCommunicator(cpu_group, device)
-        sync = TPSynchronizer(group, ranks[0], communicator)
+        sync = TPSynchronizer(group, communicator)
         _check_device_bridge(sync, ranks, device)
+        _check_cpu_history_bridge(sync, ranks, device)
         _check_device_kernel_consensus(sync, ranks, device)
         assert communicator.disabled
         dist.destroy_process_group(cpu_group)
@@ -319,7 +316,18 @@ def _check_device_kernel_consensus(sync, ranks, device):
 
 def _check_consensus(group, ranks, device):
     rank = dist.get_rank()
-    sync = TPSynchronizer(group, ranks[0])
+    sync = TPSynchronizer(group)
+    # Exact agreement must distinguish extrema and permutations with identical
+    # sums; a sum/hash or negation with signed overflow is not sufficient.
+    extrema = torch.tensor([[-(2**63), 2**63 - 1], [3, 5], [7, 9]], device=device)
+    if len(ranks) > 1 and rank == ranks[-1]:
+        extrema[1] = extrema[1].flip(0)
+        extrema[2, 1] -= 1
+    exact = sync.synchronize(
+        DraftOverrideView(extrema, torch.ones(3, dtype=torch.bool, device=device))
+    )
+    assert exact.use_retrieval.tolist() == [True, len(ranks) == 1, len(ranks) == 1]
+    assert exact.tokens[0].tolist() == [-(2**63), 2**63 - 1]
     for k in (1, 3):
         buffers = GraphBuffers(8, k, device)
         captured = buffers.bind_capture_view(8)
@@ -387,8 +395,14 @@ def _check_consensus(group, ranks, device):
                 graph.replay()
             assert torch.equal(output[1:], neural[1:].expand(-1, k))
 
-    # Exercise the actual bind path, including seq_lens validation BEFORE
-    # consensus, request reordering, lifecycle and metrics AFTER consensus.
+
+def _check_cpu_history_bridge(sync, ranks, device):
+    """Local bind is communication-free; consensus runs at the draft consumer.
+
+    Capture starts with all-false masks. Replays must synchronize newly staged
+    local masks, preserve unanimous fallback and report post-consensus metrics.
+    """
+    rank = dist.get_rank()
     config = HybridConfig(
         2, 2, 2, 32, "reference" if device.type == "cpu" else "gpu_sa"
     )
@@ -401,24 +415,67 @@ def _check_consensus(group, ranks, device):
     extension = DraftExtension(config, backend, 100, tp_sync=sync)
     requests = [Request("a"), Request("b")]
     draft_input = SimpleNamespace(draft_override=None)
-    for order in (requests, requests[::-1]):
-        batch = SimpleNamespace(
-            reqs=order,
-            is_extend_in_batch=False,
-            has_grammar=False,
-            sampling_info=SimpleNamespace(is_all_greedy=True),
-            seq_lens=torch.tensor([6 if rank == ranks[-1] else 5, 5], device=device),
-        )
-        with extension.bind(batch, draft_input) as view:
-            assert view.use_retrieval.tolist() == [False, True]
-            assert view.select_step(
-                torch.tensor([90, 91], device=device), 0
-            ).tolist() == [90, 3]
-        assert draft_input.draft_override is None
-        extension.on_verify_result(
-            SimpleNamespace(accept_lens=torch.tensor([1, 3], device=device))
-        )
-    assert extension.metrics.snapshot()["retrieval_requests"] == 2
+    buffers = extension.create_graph_buffers(4)
+    captured = buffers.bind_capture_view(4)
+    neural = torch.tensor([90, 91, 92, 93], device=device)
+    seq_lens = torch.ones(4, dtype=torch.int64, device=device)
+
+    def select():
+        captured.prepare(seq_lens)
+        return captured.select_step(neural, 0)
+
+    graph = None
+    if device.type == "cuda":
+        stream = torch.cuda.Stream()
+        stream.wait_stream(torch.cuda.current_stream())
+        with torch.cuda.stream(stream):
+            for _ in range(3):
+                output = select()
+        torch.cuda.current_stream().wait_stream(stream)
+        graph = torch.cuda.CUDAGraph()
+        with torch.cuda.graph(graph):
+            output = select()
+
+    token_address = captured.tokens.data_ptr()
+    mask_address = captured.use_retrieval.data_ptr()
+    for staged in (False, True):
+        for order in (requests, requests[::-1]):
+            batch = SimpleNamespace(
+                reqs=order,
+                is_extend_in_batch=False,
+                has_grammar=False,
+                sampling_info=SimpleNamespace(is_all_greedy=True),
+                seq_lens=torch.tensor(
+                    [6 if rank == ranks[-1] else 5, 5], device=device
+                ),
+            )
+            with extension.bind(batch, draft_input) as view:
+                # A different local mask survives bind until eager prepare or
+                # replay; no host-side consensus/readback chooses this branch.
+                assert view.use_retrieval.tolist() == [rank != ranks[-1], True]
+                if staged:
+                    buffers.stage(view, 2, 4)
+                    if graph is None:
+                        output = select()
+                    else:
+                        graph.replay()
+                    assert output.tolist() == [90, 3, 92, 93]
+                    assert not captured.use_retrieval[2:].any()
+                    # Restaging an aliased view must not erase valid rows.
+                    buffers.stage(view, 2, 4)
+                    assert view.use_retrieval.tolist() == [False, True]
+                    assert captured.tokens.data_ptr() == token_address
+                    assert captured.use_retrieval.data_ptr() == mask_address
+                else:
+                    view.prepare(batch.seq_lens)
+                    assert view.select_step(neural[:2], 0).tolist() == [90, 3]
+                assert view.use_retrieval.tolist() == [False, True]
+            assert draft_input.draft_override is None
+            extension.on_verify_result(
+                SimpleNamespace(accept_lens=torch.tensor([1, 3], device=device))
+            )
+    assert extension.metrics.snapshot()["retrieval_requests"] == 4
+    assert extension.metrics.snapshot()["neural_requests"] == 4
     extension.close_request("a")
     extension.reset()
     assert not extension.runtime.states
@@ -440,7 +497,7 @@ def _worker(rank, world_size, init_method, backend):
         _check_consensus(dist.group.WORLD, list(range(world_size)), device)
         _check_device_sync(dist.group.WORLD, list(range(world_size)), device)
         if world_size == 4:
-            # Source is global rank 1, not global rank 0 or subgroup rank 1.
+            # A subgroup excluding global rank zero must remain independent.
             ranks = [1, 3]
             group = dist.new_group(ranks=ranks, timeout=timedelta(seconds=60))
             if rank in ranks:

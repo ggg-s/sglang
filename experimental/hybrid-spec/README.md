@@ -34,6 +34,10 @@ device 模式以 generation 和 GPU 历史版本检查隔离旧反馈、槽位�
 
 GPU SA 使用每请求一个线程维护状态，尚未对大词表和长历史优化。默认模式的 CPU 前缀检查随历史长度增长；device 模式只在 prefill/retract 快照一次历史，后台线程不触碰请求对象或 CUDA。净收益仍需完整推理循环实测。
 
+针对根目录性能分析的后续改动与独立归因边界，见 [VALIDATION.md](VALIDATION.md) 顶部。当前两种历史模式都把 TP 共识放在 draft 的 `prepare()` 中，Graph 可捕获一次精确 MIN 归约；eager 在同一位置执行。不能根据某个 rank 的本地命中 mask 跳过通信。
+
+`configs/device-k3.json` 提供与性能报告相同 K=3、阈值 4、整链 fallback 的设备历史配置，容量为 4×8192，约 2.25 MiB/卡，覆盖报告中并发 4、4096 输入 + 256 输出的负载。它同时改变历史模式和容量，仅作为运行配置，不是单变量归因证据；对照时应分别固定容量、固定历史模式。保留旧 `example.json` 以复现 CPU 路径。
+
 ## 安装
 
 服务运行要求 Linux、与 PyTorch 匹配的 NVIDIA CUDA Toolkit（含 nvcc）、C++ 编译器和 ninja；在已可运行此 SGLang checkout 的环境操作：
@@ -49,6 +53,21 @@ CUDA 扩展在第一次 worker 构造时通过 PyTorch 编译并缓存。插件�
 扩展同时链接纯 CPU `host_builder.cpp`，通过释放 GIL 的 `ctypes.CDLL` 调用；CPU 与 GPU 状态仅含相对整数索引，无需指针重定位。device 模式还需要 pinned CPU 状态内存，随同时在途 prompt 长度增长；构建输入及状态上界约为每请求 `80*L+48` 字节（L>0，不含对象开销）。本地原生测试无需 CUDA，可用 C++ 编译器或 Zig 编译同一份 host builder。
 
 SGLang 基线与补丁接口见 [compat/sglang/README.md](compat/sglang/README.md)。仅安装包不能适配未打补丁的其他 SGLang 版本。
+
+### 更新时遇到 compatibility.py 本地修改
+
+`git pull` 提示本地修改将被覆盖，说明更新尚未执行。先把该文件的改动保存到 stash，再做 fast-forward 更新：
+
+```bash
+git diff HEAD -- experimental/hybrid-spec/src/hybrid_spec/integrations/sglang/compatibility.py
+git stash push -m "hybrid-spec compatibility before update" -- \
+  experimental/hybrid-spec/src/hybrid_spec/integrations/sglang/compatibility.py
+git pull --ff-only
+```
+
+保留 stash，查看 `git stash show -p` 后再判断是否需要合并回来。新版本已经处理 LoRA 默认值为 None、device 历史的 overlap 和 Qwen3.5/3.6 text-only MTP；旧的临时放宽校验可能已被覆盖。不要直接 `stash pop` 把旧文件逻辑重新覆盖回来，也无需 `reset --hard`。如果还有其他文件冲突，Git 会继续停止更新，按实际差异处理。
+
+成功更新后，若先前不是 editable 安装，重新运行上面的插件安装命令，并重启服务以加载新代码。部署 sa_spec 风格的设备增量路径时，将 `HYBRID_SPEC_CONFIG` 指向 `configs/device-k3.json`（原生 K=3）或 `configs/device-sa-spec.json`（原生 K=8）；`example.json` 继续用于旧 CPU 历史基线。
 
 ## 启动
 
@@ -107,9 +126,9 @@ LoRA 关闭时，无需也无法通过 `--enable-lora` 显式传入 False；本�
 
 状态内存估计：`4 * max_requests * [H + 4*(2H+1) + 3*(3H+1) + 5]` 字节，加上每请求 `40 + 4*(K+1)` 字节的设备反馈元数据。示例约 36 MiB，另有查询与 Graph buffer。状态在 draft worker 构造时分配，早于 target KV 预算/分配；不修改原生 KV 规划。
 
-多 TP 的 SA 状态按 rank 复制，上述容量是每张卡的占用，不随 TP 分片缩小。每轮在当前 forward stream 上先广播 TP 组首 rank 的候选与 mask，再对本地资格及候选一致性做 MIN all-reduce；任一 rank 不满足条件或候选不同，所有 rank 对该行统一回退 neural。CPU 历史模式在 draft 前通过进程组通信；device 模式在 `prepare()` 内完成本地查询后，通过 PyNccl 通信，Graph 将查询、通信和后续选择一起捕获，eager 也使用同一通信器。PyNccl 不可用时 device 多 TP 明确报错。全局 source rank 会转换成 PyNccl 所需的组内 rank。每轮两次设备通信，广播张量为 `8*B*(K+1)` 字节，归约张量为 `4*B` 字节（不代表实际链路流量）；device Graph 中 B 包括 padding。没有逐 token 通信，也不增加 D2H 读回；TP=1 跳过通信。沿用 SGLang 的 TP batch 顺序/形状一致性约定，不能用于不同 rank 独立调度请求。
+多 TP 的 SA 状态按 rank 复制，上述容量是每张卡的占用，不随 TP 分片缩小。每轮将 `[tokens, ~tokens, eligibility]` 打包做一次 MIN all-reduce；按位取反逆转 int64 的有符号顺序，因此归约后 `min(tokens) == ~min(~tokens)` 逐位置成立当且仅当所有 rank 的候选完全相同。资格也必须全部为真。任一 rank 不满足条件或候选不同，所有 rank 对该行统一回退 neural；不需要广播或指定源 rank。归约输入为 `8*B*(2K+1)` 字节（不代表实际链路流量），Graph 中 B 包括 padding。沿用 SGLang 的 TP batch 顺序/形状一致性约定，不能用于不同 rank 独立调度请求。
 
-通信在 `bind()` 中完成，早于 eager 起草或 Graph staging/replay；不会捕获到 draft Graph 中。统计也是每 rank 的相同副本，汇总时只读取 TP 组首 rank，避免重复计数。
+两种历史模式均在 `prepare()` 中、token 选择前通过现有 PyNccl 执行共识；CPU 历史模式在 `bind()` 中只准备本地候选，Graph staging 后由捕获视图完成共识；device 模式先在 Graph 内消费反馈/查询，再做共识。eager 使用相同入口和通信器；多 TP 缺少 PyNccl 时明确报错。没有按本地 mask 分支、逐 token 通信或新增 D2H 读回；TP=1 不创建同步器。统计读取最终共识 mask；每 rank 为相同副本，汇总时只读取 TP 组首 rank，避免重复计数。K=1 沿用原生无 draft Graph 的 eager 入口，不声称通信被捕获。
 
 状态操作绑定首次实际起草使用的 forward stream，并等待初始化事件；禁止后续跨 stream 使用。同一 worker 的 Graph replay 串行，padding mask 每轮清零。该版本没有 side stream overlap 或并发 replay lease。
 

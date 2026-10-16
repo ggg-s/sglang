@@ -4,23 +4,33 @@ import weakref
 from contextlib import contextmanager
 
 import torch
+
 from hybrid_spec.core.runtime import HybridRuntime
 from hybrid_spec.integrations.sglang.graph_buffers import GraphBuffers
+from hybrid_spec.integrations.sglang.tp_sync import TPOverride
 from hybrid_spec.observability.metrics import Metrics
 
 
 class DraftExtension:
     def __init__(self, config, backend, vocab_size, tp_sync=None):
+        if (
+            tp_sync is not None
+            and backend.device.type == "cuda"
+            and tp_sync.communicator is None
+        ):
+            raise ValueError(
+                "CPU history TP requires a graph-capable PyNccl communicator"
+            )
         self.config = config
         self.runtime = HybridRuntime(config, backend, vocab_size)
         self.device = backend.device
         self.identities = {}
         self.metrics = Metrics()
-        self.pending_selection = None
+        self.pending_view = None
         self.tp_sync = tp_sync
 
     def create_graph_buffers(self, max_bs):
-        return GraphBuffers(max_bs, self.config.num_drafts, self.device)
+        return GraphBuffers(max_bs, self.config.num_drafts, self.device, self.tp_sync)
 
     @contextmanager
     def bind(self, batch, draft_input):
@@ -60,8 +70,8 @@ class DraftExtension:
         )
         view.use_retrieval &= batch.seq_lens + 1 == expected
         if self.tp_sync is not None:
-            view = self.tp_sync.synchronize(view)
-        self.pending_selection = view.use_retrieval
+            view = TPOverride(view.tokens, view.use_retrieval, self.tp_sync)
+        self.pending_view = view
         draft_input.draft_override = view
         try:
             yield view
@@ -75,9 +85,9 @@ class DraftExtension:
     def reset(self):
         self.runtime.reset()
         self.identities.clear()
-        self.pending_selection = None
+        self.pending_view = None
 
     def on_verify_result(self, result):
-        if self.pending_selection is not None:
-            self.metrics.record(self.pending_selection, result.accept_lens)
-            self.pending_selection = None
+        if self.pending_view is not None:
+            self.metrics.record(self.pending_view.use_retrieval, result.accept_lens)
+            self.pending_view = None
