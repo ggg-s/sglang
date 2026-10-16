@@ -95,30 +95,38 @@ def host_builder(tmp_path_factory):
 
 def test_host_native_layout_matches_reference_and_validates_tokens(host_builder):
     """Transferred states must preserve suffix links, clone positions and edges."""
-    for width in range(1, 9):
-        for tokens in itertools.product(range(2), repeat=width):
-            host = host_builder.build(host_builder.prepare(tokens), 100)
-            oracle = SuffixAutomaton()
-            oracle.append(tokens)
-            length, num_states, num_edges, last, healthy, _, _ = host.meta.tolist()
-            assert length == len(tokens) and last == oracle.last and healthy == 1
-            assert host.history[:length].tolist() == list(tokens)
-            assert num_states == len(oracle.links)
-            for i, (depth, link, pos, head) in enumerate(
-                host.states[:num_states].tolist()
-            ):
-                assert (depth, link, pos) == (
-                    oracle.lengths[i],
-                    oracle.links[i],
-                    oracle.first_pos[i],
-                )
-                edges = {}
-                while head != -1:
-                    assert 0 <= head < num_edges
-                    token, target, head = host.edges[head, :3].tolist()
-                    assert token not in edges and 0 <= target < num_states
-                    edges[token] = target
-                assert edges == oracle.edges[i]
+    histories = itertools.chain.from_iterable(
+        itertools.product(range(alphabet), repeat=width)
+        for alphabet, maximum in ((2, 8), (3, 5), (5, 4))
+        for width in range(1, maximum + 1)
+    )
+    for tokens in histories:
+        host = host_builder.build(host_builder.prepare(tokens), 100)
+        oracle = SuffixAutomaton()
+        oracle.append(tokens)
+        length, num_states, num_edges, last, healthy, _, _ = host.meta.tolist()
+        assert length == len(tokens) and last == oracle.last and healthy == 1
+        assert host.history[:length].tolist() == list(tokens)
+        assert num_states == len(oracle.links)
+        for i, (depth, link, pos, inline, head) in enumerate(
+            host.states[:num_states].tolist()
+        ):
+            assert (depth, link, pos) == (
+                oracle.lengths[i],
+                oracle.links[i],
+                oracle.first_pos[i],
+            )
+            edges = {} if inline == -1 else {host.history[pos + 1].item(): inline}
+            if head < -1:
+                target = ~head
+                edges[host.history[host.states[target, 2]].item()] = target
+                head = -1
+            while head != -1:
+                assert 0 <= head < num_edges
+                token, target, head = host.edges[head, :3].tolist()
+                assert token not in edges and 0 <= target < num_states
+                edges[token] = target
+            assert edges == oracle.edges[i]
     for tokens in ((-1,), (100,), (2**32 + 3,)):
         with pytest.raises(ValueError, match="target-vocabulary"):
             host_builder.build(host_builder.prepare(tokens), 100)
@@ -150,8 +158,8 @@ def test_host_import_copies_used_prefixes_and_keeps_sources_until_event(
     backend.device = torch.device("cpu")
     backend._check_stream = lambda: None
     backend.history = torch.full((1, 32), -99, dtype=torch.int32)
-    backend.states = torch.full((1, 65, 4), -99, dtype=torch.int32)
-    backend.edges = torch.full((1, 97, 6), -99, dtype=torch.int32)
+    backend.states = torch.full((1, 65, 5), -99, dtype=torch.int32)
+    backend.edges = torch.full((1, 33, 6), -99, dtype=torch.int32)
     backend.meta = torch.zeros((1, 7), dtype=torch.int32)
     backend.pending_meta = torch.tensor([[9, 5, 1]])
     backend.host_transfers = []

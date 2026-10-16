@@ -6,6 +6,7 @@ by benchmark_sa_history_cuda.py; native CPU timings do not predict GPU TPOT.
 """
 
 import argparse
+import ctypes
 import importlib.util
 import json
 import os
@@ -20,13 +21,33 @@ from pathlib import Path
 
 def main():
     parser = argparse.ArgumentParser(description=__doc__)
-    parser.add_argument("--baseline-ref", default="44637fe669")
+    parser.add_argument("--baseline-ref", default="88f8d971eb")
     parser.add_argument("--lengths", nargs="+", type=int, default=[8192, 65536, 262144])
     parser.add_argument("--vocabs", nargs="+", type=int, default=[1, 2, 64, 8192])
     parser.add_argument("--tail", type=int, default=1024)
     parser.add_argument("--repeats", type=int, default=3)
+    parser.add_argument(
+        "--compiler-cache", type=Path, help="optional reusable Zig cache directory"
+    )
+    parser.add_argument(
+        "--cpu",
+        type=int,
+        help="pin benchmark and compiler processes to one logical CPU",
+    )
     parser.add_argument("--output", type=Path, required=True)
     args = parser.parse_args()
+    if args.cpu is not None:
+        if args.cpu < 0:
+            parser.error("cpu must be nonnegative")
+        if os.name == "nt":
+            set_affinity = ctypes.windll.kernel32.SetProcessAffinityMask
+            set_affinity.argtypes = [ctypes.c_void_p, ctypes.c_size_t]
+            if args.cpu >= ctypes.sizeof(ctypes.c_size_t) * 8:
+                parser.error("cpu exceeds the Windows affinity mask width")
+            if not set_affinity(ctypes.c_void_p(-1), 1 << args.cpu):
+                raise ctypes.WinError()
+        else:
+            os.sched_setaffinity(0, {args.cpu})
     if min(*args.lengths, *args.vocabs, args.tail, args.repeats) < 1:
         parser.error("lengths, vocabs, tail and repeats must be positive")
     package = Path(__file__).resolve().parents[1]
@@ -45,6 +66,7 @@ def main():
         "baseline_ref": args.baseline_ref,
         "tail": args.tail,
         "repeats": args.repeats,
+        "logical_cpu": args.cpu,
         "scope": "native CPU build / append, allocation excluded; not GPU or TPOT",
         "results": [],
     }
@@ -63,8 +85,9 @@ def main():
         (baseline / "automaton.h").write_bytes(header)
         executables = {}
         env = os.environ.copy()
-        env["ZIG_GLOBAL_CACHE_DIR"] = str(work / "zig-global")
-        env["ZIG_LOCAL_CACHE_DIR"] = str(work / "zig-local")
+        cache = args.compiler_cache.resolve() if args.compiler_cache else work
+        env["ZIG_GLOBAL_CACHE_DIR"] = str(cache / "zig-global")
+        env["ZIG_LOCAL_CACHE_DIR"] = str(cache / "zig-local")
         for name, include in (("before", baseline), ("after", source)):
             executable = work / (name + (".exe" if os.name == "nt" else ""))
             flags = (
@@ -72,6 +95,8 @@ def main():
                 if b"EDGE_FIELDS" in (include / "automaton.h").read_bytes()
                 else ["-DHYBRID_SA_LEGACY_LAYOUT"]
             )
+            if b"STATE_FIELDS" in (include / "automaton.h").read_bytes():
+                flags.append("-DHYBRID_SA_COMPACT_LAYOUT")
             subprocess.run(
                 command
                 + ["-std=c++17", "-O3"]

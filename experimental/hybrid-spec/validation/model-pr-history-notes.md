@@ -74,3 +74,22 @@ compact host construction and larger GPU slots, with no device allocation or
 full-table rebuild during graph replay. These storage choices are specific to
 our bounded runtime and are not claims about sa_spec benchmark equivalence.
 See VALIDATION.md for native measurements and the separate CUDA validation gap.
+
+## Compact inline transitions (2026-10-16)
+
+Baseline: `88f8d971eb`; original-list control: `44637fe669`. Re-read sa_spec
+`flat_graph.hpp`: its inline edge avoids an allocated edge record for degree-one
+states, and clones copy inline state directly. This implementation extends the
+idea to a tagged second target while retaining the bounded hash overflow pool.
+Primary labels come from the source's first-position successor; secondary labels
+come from the destination's first-position token. Clone retargeting preserves
+these labels. The pool bound follows from an injective mapping of non-primary
+edges to suffix paths whose last non-primary edge is the mapped edge; the full
+string follows primary edges only. Thus there are at most n-1 non-primary edges,
+and stored overflow edges are a subset. Tests exercise the tight distinct-token
+case, unary/binary zero-pool cases, and transitions to higher degree. This is a
+layout-specific argument, not a capacity guess from observed corpora.
+
+Native checksums now canonicalize semantic transitions instead of physical
+adjacency addresses. Both original-list and previous-hash A/B measurements are
+retained. No model forward, acceptance rule, TP consensus, or scheduling change.

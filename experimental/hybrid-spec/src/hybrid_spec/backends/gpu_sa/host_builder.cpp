@@ -22,7 +22,7 @@ extern "C" HYBRID_EXPORT int hybrid_sa_build_host(
   states[0] = 0;
   states[1] = -1;
   states[2] = -1;
-  states[3] = -1;
+  states[3] = states[4] = -1;
   Automaton a{history, states, edges, meta, capacity};
   for (int i = 0; i < count; ++i) {
     if (tokens[i] < 0 || tokens[i] >= vocab) {

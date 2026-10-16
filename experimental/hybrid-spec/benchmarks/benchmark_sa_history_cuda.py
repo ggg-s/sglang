@@ -31,15 +31,25 @@ def sequence(length, vocab):
     return result
 
 
-def measure(module, edge_fields, meta_fields, length, vocab, batch_size, repeats):
+def measure(
+    module,
+    state_fields,
+    edge_factor,
+    edge_fields,
+    meta_fields,
+    length,
+    vocab,
+    batch_size,
+    repeats,
+):
     k, tail = 8, 9
     capacity = length + tail + k + 1
     data = sequence(length + tail, vocab)
     prompt = torch.tensor(data[:length], dtype=torch.int64)
     host = [
         torch.empty(length, dtype=torch.int32),
-        torch.empty((2 * length + 1, 4), dtype=torch.int32),
-        torch.empty((3 * length + 1, edge_fields), dtype=torch.int32),
+        torch.empty((2 * length + 1, state_fields), dtype=torch.int32),
+        torch.empty((edge_factor * length + 1, edge_fields), dtype=torch.int32),
         torch.empty(meta_fields, dtype=torch.int32),
     ]
     library = ctypes.CDLL(module.__file__)
@@ -57,10 +67,12 @@ def measure(module, edge_fields, meta_fields, length, vocab, batch_size, repeats
     frozen.append(host[3].cuda())
     history = torch.empty((batch_size, capacity), dtype=torch.int32, device="cuda")
     states = torch.empty(
-        (batch_size, 2 * capacity + 1, 4), dtype=torch.int32, device="cuda"
+        (batch_size, 2 * capacity + 1, state_fields), dtype=torch.int32, device="cuda"
     )
     edges = torch.empty(
-        (batch_size, 3 * capacity + 1, edge_fields), dtype=torch.int32, device="cuda"
+        (batch_size, edge_factor * capacity + 1, edge_fields),
+        dtype=torch.int32,
+        device="cuda",
     )
     meta = torch.empty((batch_size, meta_fields), dtype=torch.int32, device="cuda")
     owners = torch.ones(batch_size, dtype=torch.int64, device="cuda")
@@ -132,19 +144,49 @@ def measure(module, edge_fields, meta_fields, length, vocab, batch_size, repeats
         or not (meta[:, 4] == 1).all().item()
     ):
         raise RuntimeError("captured append did not commit healthy history")
-    # Check every row and all semantic fields, beyond merely matching candidates.
+    # All rows use identical inputs. Check their complete stored state, then
+    # canonicalize row zero so different physical layouts can be compared.
+    ns, ne = meta[0, 1:3].tolist()
+    for tensor in (
+        meta,
+        history[:, : length + tail],
+        states[:, :ns],
+        edges[:, :ne],
+        tokens,
+        mask,
+    ):
+        if not torch.equal(tensor, tensor[:1].expand_as(tensor)):
+            raise RuntimeError("inconsistent CUDA batch rows")
+    cpu_history = history[0, : length + tail].cpu().tolist()
+    cpu_states = states[0, :ns].cpu().tolist()
+    cpu_edges = edges[0, :ne, :3].cpu().tolist()
     digest = hashlib.sha256()
-    for row in range(batch_size):
-        ns, ne = meta[row, 1:3].tolist()
-        for tensor in (
-            meta[row, :5],
-            history[row, : length + tail],
-            states[row, :ns],
-            edges[row, :ne, :3],
-            tokens[row],
-            mask[row],
-        ):
-            digest.update(tensor.contiguous().cpu().numpy().tobytes())
+    digest.update(
+        json.dumps(
+            [
+                meta[0, [0, 1, 3, 4]].tolist(),
+                cpu_history,
+                tokens[0].tolist(),
+                mask[0].item(),
+            ]
+        ).encode()
+    )
+    for state in cpu_states:
+        outgoing = []
+        if state_fields == 5:
+            if state[3] != -1:
+                outgoing.append((cpu_history[state[2] + 1], state[3]))
+            head = state[4]
+            if head < -1:
+                target = ~head
+                outgoing.append((cpu_history[cpu_states[target][2]], target))
+                head = -1
+        else:
+            head = state[3]
+        while head != -1:
+            token, target, head = cpu_edges[head]
+            outgoing.append((token, target))
+        digest.update(json.dumps([state[:3], sorted(outgoing)]).encode())
     return {
         "median_us": statistics.median(samples),
         "samples_us": samples,
@@ -154,7 +196,7 @@ def measure(module, edge_fields, meta_fields, length, vocab, batch_size, repeats
 
 def main():
     parser = argparse.ArgumentParser(description=__doc__)
-    parser.add_argument("--baseline-ref", default="44637fe669")
+    parser.add_argument("--baseline-ref", default="88f8d971eb")
     parser.add_argument("--lengths", nargs="+", type=int, default=[8192, 65536, 262144])
     parser.add_argument("--vocabs", nargs="+", type=int, default=[1, 2, 64, 8192])
     parser.add_argument("--batch-sizes", nargs="+", type=int, default=[1, 4, 32])
@@ -207,7 +249,14 @@ def main():
                 extra_cflags=["-O3"],
                 extra_cuda_cflags=["-O3"],
             )
-            modules[name] = module, edge_fields, meta_fields
+            compact = "STATE_FIELDS" in content
+            modules[name] = (
+                module,
+                5 if compact else 4,
+                1 if compact else 3,
+                edge_fields,
+                meta_fields,
+            )
         for length in args.lengths:
             for vocab in args.vocabs:
                 for batch_size in args.batch_sizes:

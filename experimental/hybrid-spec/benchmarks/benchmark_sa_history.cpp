@@ -7,6 +7,7 @@
 #include <cstdlib>
 #include <iostream>
 #include <memory>
+#include <utility>
 #include <vector>
 
 #ifdef HYBRID_SA_LEGACY_LAYOUT
@@ -14,6 +15,13 @@ constexpr int EDGE_FIELDS = 3, META_FIELDS = 5;
 #else
 constexpr int EDGE_FIELDS = Automaton::EDGE_FIELDS;
 constexpr int META_FIELDS = Automaton::META_FIELDS;
+#endif
+
+#ifdef HYBRID_SA_COMPACT_LAYOUT
+constexpr int STATE_FIELDS = Automaton::STATE_FIELDS;
+constexpr int EDGE_CAPACITY_FACTOR = Automaton::EDGE_CAPACITY_FACTOR;
+#else
+constexpr int STATE_FIELDS = 4, EDGE_CAPACITY_FACTOR = 3;
 #endif
 
 int main(int argc, char **argv) {
@@ -34,8 +42,8 @@ int main(int argc, char **argv) {
     token = random % vocab;
   }
   std::unique_ptr<int[]> history(new int[capacity]);
-  std::unique_ptr<int[]> states(new int[(2 * capacity + 1) * 4]);
-  std::unique_ptr<int[]> edges(new int[(3 * capacity + 1) * EDGE_FIELDS]);
+  std::unique_ptr<int[]> states(new int[(2 * capacity + 1) * STATE_FIELDS]);
+  std::unique_ptr<int[]> edges(new int[(EDGE_CAPACITY_FACTOR * capacity + 1) * EDGE_FIELDS]);
   int meta[META_FIELDS];
   Automaton sa{history.get(), states.get(), edges.get(), meta, capacity};
   using Clock = std::chrono::steady_clock;
@@ -47,6 +55,9 @@ int main(int argc, char **argv) {
 #endif
     states[0] = 0;
     states[1] = states[2] = states[3] = -1;
+#ifdef HYBRID_SA_COMPACT_LAYOUT
+    states[4] = -1;
+#endif
     auto start = Clock::now();
     for (int i = 0; i < length; ++i)
       sa.append(tokens[i]);
@@ -56,14 +67,38 @@ int main(int argc, char **argv) {
     auto done = Clock::now();
     if (!meta[4] || meta[0] != capacity)
       return 2;
-    // Hash only the shared semantic layout, so old/new results must agree.
+    // Canonical graph checksum: independent of inline/list storage and ordering.
     uint64_t checksum = 1469598103934665603ull;
-    for (int i = 0; i < meta[1] * 4; ++i)
-      checksum = (checksum ^ static_cast<uint32_t>(states[i])) * 1099511628211ull;
-    for (int i = 0; i < meta[2]; ++i)
+    auto mix = [&](int value) {
+      checksum = (checksum ^ static_cast<uint32_t>(value)) * 1099511628211ull;
+    };
+    mix(meta[0]);
+    mix(meta[1]);
+    mix(meta[3]);
+    for (int p = 0; p < meta[1]; ++p) {
       for (int field = 0; field < 3; ++field)
-        checksum = (checksum ^ static_cast<uint32_t>(sa.e(i, field))) *
-                   1099511628211ull;
+        mix(sa.s(p, field));
+      std::vector<std::pair<int, int>> outgoing;
+#ifdef HYBRID_SA_COMPACT_LAYOUT
+      if (sa.s(p, 3) != -1)
+        outgoing.emplace_back(history[sa.s(p, 2) + 1], sa.s(p, 3));
+      int head = sa.s(p, 4);
+      if (head < -1) {
+        outgoing.emplace_back(history[sa.s(~head, 2)], ~head);
+        head = -1;
+      }
+#else
+      int head = sa.s(p, 3);
+#endif
+      for (int edge = head; edge != -1; edge = sa.e(edge, 2))
+        outgoing.emplace_back(sa.e(edge, 0), sa.e(edge, 1));
+      std::sort(outgoing.begin(), outgoing.end());
+      mix(static_cast<int>(outgoing.size()));
+      for (auto [token, target] : outgoing) {
+        mix(token);
+        mix(target);
+      }
+    }
     if (repeat >= 0)
       std::cout << std::chrono::duration<double, std::micro>(built - start).count()
                 << ','

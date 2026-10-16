@@ -20,25 +20,33 @@ static void check_index(Automaton &sa) {
   }
   assert(std::count(seen.begin(), seen.end(), true) == sa.meta[6]);
   for (int p = 0; p < sa.meta[1]; ++p) {
-    for (int edge = sa.s(p, 3); edge != -1; edge = sa.e(edge, 2)) {
-      assert(sa.e(edge, 3) == p);
-      assert(seen[edge] == (sa.e(sa.s(p, 3), 4) != -2));
-      assert(sa.find(p, sa.e(edge, 0)) == edge);
+    if (sa.s(p, 3) != -1) {
+      assert(sa.s(p, 2) + 1 < sa.meta[0]);
+      assert(sa.find(p, sa.history[sa.s(p, 2) + 1]) == &sa.s(p, 3));
     }
-    assert(sa.find(p, -1) == -1);
+    if (sa.s(p, 4) < -1) {
+      int second = ~sa.s(p, 4);
+      assert(sa.find(p, sa.history[sa.s(second, 2)]) == &sa.s(p, 4));
+    }
+    for (int edge = sa.s(p, 4); edge >= 0; edge = sa.e(edge, 2)) {
+      assert(sa.e(edge, 3) == p);
+      assert(seen[edge] == (sa.e(sa.s(p, 4), 4) >= -1));
+      assert(sa.find(p, sa.e(edge, 0)) == &sa.e(edge, 1));
+    }
+    assert(sa.find(p, -1) == nullptr);
   }
 }
 
 static void check(const std::vector<int> &input) {
   int capacity = static_cast<int>(input.size());
   std::vector<int> history(capacity, -99);
-  std::vector<int> states((2 * capacity + 1) * 4, -99);
-  std::vector<int> edges((3 * capacity + 1) * Automaton::EDGE_FIELDS, -99);
+  std::vector<int> states((2 * capacity + 1) * Automaton::STATE_FIELDS, -99);
+  std::vector<int> edges((capacity + 1) * Automaton::EDGE_FIELDS, -99);
   int meta[Automaton::META_FIELDS] = {0, 1, 0, 0, 1, 1, 0};
   states[0] = 0;
   states[1] = -1;
   states[2] = -1;
-  states[3] = -1;
+  states[3] = states[4] = -1;
   Automaton sa{history.data(), states.data(), edges.data(), meta, capacity};
   for (int n = 1; n <= capacity; ++n) {
     sa.append(input[n - 1]);
@@ -58,12 +66,12 @@ static void check(const std::vector<int> &input) {
         }
       }
     }
-    int suffix = states[4 * meta[3] + 1];
-    int length = suffix <= 0 ? 0 : states[4 * suffix];
+    int suffix = states[Automaton::STATE_FIELDS * meta[3] + 1];
+    int length = suffix <= 0 ? 0 : states[Automaton::STATE_FIELDS * suffix];
     assert(length == best_length);
     if (length)
-      assert(states[4 * suffix + 2] == best_end);
-    assert(meta[1] <= 2 * capacity + 1 && meta[2] <= 3 * capacity + 1);
+      assert(states[Automaton::STATE_FIELDS * suffix + 2] == best_end);
+    assert(meta[1] <= 2 * capacity + 1 && meta[2] <= n - 1);
     check_index(sa);
   }
   // Build a prompt in compact host storage, copy only used POD prefixes to a
@@ -71,8 +79,8 @@ static void check(const std::vector<int> &input) {
   int prefix = (capacity + 1) / 2;
   std::vector<int64_t> input64(input.begin(), input.end());
   std::vector<int> host_history(prefix);
-  std::vector<int> host_states((2 * prefix + 1) * 4);
-  std::vector<int> host_edges((3 * prefix + 1) * Automaton::EDGE_FIELDS);
+  std::vector<int> host_states((2 * prefix + 1) * Automaton::STATE_FIELDS);
+  std::vector<int> host_edges((prefix + 1) * Automaton::EDGE_FIELDS);
   int host_meta[Automaton::META_FIELDS];
   int status = hybrid_sa_build_host(input64.data(), prefix, 2147483647,
                                    host_history.data(), host_states.data(),
@@ -81,7 +89,7 @@ static void check(const std::vector<int> &input) {
   std::vector<int> resumed_history(capacity), resumed_states(states.size()),
       resumed_edges(edges.size());
   std::copy_n(host_history.begin(), prefix, resumed_history.begin());
-  std::copy_n(host_states.begin(), host_meta[1] * 4, resumed_states.begin());
+  std::copy_n(host_states.begin(), host_meta[1] * Automaton::STATE_FIELDS, resumed_states.begin());
   std::copy_n(host_edges.begin(), host_meta[2] * Automaton::EDGE_FIELDS,
               resumed_edges.begin());
   Automaton resumed{resumed_history.data(), resumed_states.data(),
@@ -89,7 +97,7 @@ static void check(const std::vector<int> &input) {
   for (int i = prefix; i < capacity; ++i)
     resumed.append(input[i]);
   assert(std::equal(meta, meta + Automaton::META_FIELDS, host_meta));
-  assert(std::equal(states.begin(), states.begin() + meta[1] * 4,
+  assert(std::equal(states.begin(), states.begin() + meta[1] * Automaton::STATE_FIELDS,
                     resumed_states.begin()));
   assert(std::equal(edges.begin(), edges.begin() + meta[2] * Automaton::EDGE_FIELDS,
                     resumed_edges.begin()));
@@ -106,7 +114,39 @@ static void check(const std::vector<int> &input) {
   check_index(sa);
 }
 
+static void check_large_storage_bounds() {
+  const int n = 32768, guard = -98765;
+  for (int kind = 0; kind < 4; ++kind) {
+    std::vector<int64_t> tokens(n);
+    uint32_t random = 17;
+    for (int i = 0; i < n; ++i) {
+      random ^= random << 13;
+      random ^= random >> 17;
+      random ^= random << 5;
+      tokens[i] = kind == 0 ? i : kind == 1 ? 42 : kind == 2 ? random % 2
+                             : i < n / 2 ? 42 : i;
+    }
+    std::vector<int> history(n + 1, guard);
+    std::vector<int> states((2 * n + 1) * Automaton::STATE_FIELDS + 1, guard);
+    std::vector<int> edges((n + 1) * Automaton::EDGE_FIELDS + 1, guard);
+    int meta[Automaton::META_FIELDS];
+    assert(hybrid_sa_build_host(tokens.data(), n, n + 100, history.data(),
+                               states.data(), edges.data(), meta, n) == 0);
+    Automaton sa{history.data(), states.data(), edges.data(), meta, n};
+    assert(meta[2] <= n - 1);
+    if (kind == 0)
+      assert(meta[2] == n - 1); // Root fanout reaches the compact pool bound.
+    if (kind == 1 || kind == 2)
+      assert(meta[2] == 0 && meta[6] == 0); // No edge/hash maintenance at all.
+    check_index(sa);
+    sa.append(1);
+    assert(meta[4] == 0);
+    assert(history.back() == guard && states.back() == guard && edges.back() == guard);
+  }
+}
+
 int main() {
+  check_large_storage_bounds();
   for (int width = 1; width <= 12; ++width) {
     for (int bits = 0; bits < (1 << width); ++bits) {
       std::vector<int> tokens(width);
@@ -125,6 +165,7 @@ int main() {
     check(tokens);
   }
   check(std::vector<int>(512, 42));
+  check({2147483646, 0, 2147483646, 5, 0, 2147483646, 0, 5});
   // Force long collision chains, including absent-key probes, across splits.
   std::vector<int> collisions;
   for (int token = 0; collisions.size() < 48; ++token)

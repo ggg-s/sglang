@@ -8,23 +8,32 @@
 #define HYBRID_DEVICE
 #endif
 
-// Original implementation. One CUDA thread owns each automaton. No global
-// singleton, allocator, or atomics. CPU construction and captured GPU updates
-// share this relocatable layout.
-// State: length, suffix link, first end position, adjacency head.
-// Edge: token, destination, next adjacency edge, source, next hash edge, bucket.
-// The last column is an independent array of hash bucket heads, packed here so
-// importing used edge rows also imports every live bucket. Adjacency is retained
-// for clone enumeration; transition lookup uses exact (source, token) keys.
-// Meta: history length, states used, edges used, last state, healthy, hash base,
-// indexed edges (= live buckets). The hash never indexes a low-degree state.
+// One owner thread per automaton; relocatable CPU/CUDA POD storage.
+// State: length, suffix link, first end position, first target, secondary.
+// Secondary: -1 empty, ~target for a second inline edge, otherwise extra head.
+// All paths entering a state end in history[first_pos], so a second inline edge
+// needs no stored token. Retargeting to a clone preserves that first position.
+// The first edge's token is history[first_pos + 1]. New states first acquire
+// an edge at that position; clones copy the same first position and inline edge.
+// Extra edge: token, target, adjacency next, source, hash next, bucket head.
+// Every non-sink state has a primary edge. Following only primary edges reaches
+// the sink. Map each non-primary edge to a suffix whose LAST non-primary edge
+// is that edge: take any root path to its source, then the primary-only tail.
+// The mapping is injective since the automaton is deterministic. The whole
+// string uses only primary edges, so there are at most n-1 non-primary edges.
+// Stored extra edges are a subset (binary states inline their second target).
+// Reserve H+1 rows, including tiny inputs; no corpus-dependent capacity guess.
+// Meta: history length, states used, extra edges used, last, healthy, hash base,
+// indexed extra edges (= live buckets). Hashing is only for high fanout states.
 struct Automaton {
+  static constexpr int STATE_FIELDS = 5;
+  static constexpr int EDGE_CAPACITY_FACTOR = 1;
   static constexpr int EDGE_FIELDS = 6;
   static constexpr int META_FIELDS = 7;
   static constexpr int LINEAR_EDGES = 4;
   int *history, *states, *edges, *meta;
   int capacity;
-  HYBRID_DEVICE int &s(int i, int field) { return states[4 * i + field]; }
+  HYBRID_DEVICE int &s(int i, int field) { return states[STATE_FIELDS * i + field]; }
   HYBRID_DEVICE int &e(int i, int field) { return edges[EDGE_FIELDS * i + field]; }
   HYBRID_DEVICE static uint32_t hash(int p, int token) {
     uint32_t x = static_cast<uint32_t>(token) ^
@@ -43,22 +52,30 @@ struct Automaton {
     int b = key & (base - 1);
     return b < meta[6] - base ? key & (2 * base - 1) : b;
   }
-  HYBRID_DEVICE int find(int p, int token) {
-    int head = s(p, 3);
-    if (head == -1 || e(head, 0) == token)
-      return head;
-    // Generalize sa-spec's single-edge fast path to a bounded short list.
-    // -2 marks an unindexed edge; indexed chains use -1 as their terminator.
-    if (e(head, 4) == -2) {
-      for (int edge = e(head, 2); edge != -1; edge = e(edge, 2))
+  // A negative secondary field stores ~target directly; -1 means absent.
+  // Nonnegative values address an extra-edge list. Targets in that list and
+  // in the primary field are ordinary nonnegative state IDs.
+  HYBRID_DEVICE int *find(int p, int token) {
+    if (s(p, 3) == -1)
+      return nullptr;
+    if (history[s(p, 2) + 1] == token)
+      return &s(p, 3);
+    int head = s(p, 4);
+    if (head < 0)
+      return head != -1 && history[s(~head, 2)] == token ? &s(p, 4) : nullptr;
+    if (e(head, 4) < -1) {
+      for (int edge = head; edge != -1; edge = e(edge, 2))
         if (e(edge, 0) == token)
-          return edge;
-      return -1;
+          return &e(edge, 1);
+      return nullptr;
     }
     for (int edge = e(bucket(hash(p, token)), 5); edge != -1; edge = e(edge, 4))
       if (e(edge, 3) == p && e(edge, 0) == token)
-        return edge;
-    return -1;
+        return &e(edge, 1);
+    return nullptr;
+  }
+  HYBRID_DEVICE static int target(const int *edge) {
+    return *edge < 0 ? ~*edge : *edge;
   }
   HYBRID_DEVICE void grow_hash() {
     int count = meta[6];
@@ -96,35 +113,51 @@ struct Automaton {
     s(i, 0) = length;
     s(i, 1) = link;
     s(i, 2) = pos;
-    s(i, 3) = -1;
+    s(i, 3) = s(i, 4) = -1;
     return i;
   }
   HYBRID_DEVICE bool add_edge(int p, int token, int q) {
-    if (meta[2] >= 3 * capacity + 1) {
+    if (s(p, 3) == -1) {
+      s(p, 3) = q;
+      return true;
+    }
+    int second = s(p, 4);
+    if (second == -1) {
+      s(p, 4) = ~q;
+      return true;
+    }
+    if (second < -1) {
+      int old = ~second;
+      s(p, 4) = -1;
+      if (!add_extra(p, history[s(old, 2)], old))
+        return false;
+    }
+    return add_extra(p, token, q);
+  }
+  HYBRID_DEVICE bool add_extra(int p, int token, int q) {
+    if (meta[2] >= capacity + 1) {
       meta[4] = 0;
       return false;
     }
-    int edge = meta[2]++;
+    int head = s(p, 4), edge = meta[2]++;
     e(edge, 0) = token;
     e(edge, 1) = q;
-    e(edge, 2) = s(p, 3);
+    e(edge, 2) = head;
     e(edge, 3) = p;
-    e(edge, 4) = -2;
     e(edge, 5) = -1;
-    // Hash only high-fanout states. Pure copying/repetition creates many sparse
-    // states; indexing them adds work without any gain. Promotion is bounded.
-    int head = s(p, 3);
-    if (head != -1 && e(head, 4) != -2) {
+    if (head == -1) {
+      e(edge, 4) = -2;
+    } else if (e(head, 4) >= -1) {
       index_edge(edge);
     } else {
-      int count = 0;
-      for (int copy = head; copy != -1; copy = e(copy, 2))
-        ++count;
-      if (count == LINEAR_EDGES)
+      e(edge, 4) = e(head, 4) - 1;
+      // Three extra edges plus inline stay linear; promote at total degree 5.
+      // Remembering the degree avoids rescanning the list on each insertion.
+      if (e(edge, 4) == -LINEAR_EDGES - 1)
         for (int copy = edge; copy != -1; copy = e(copy, 2))
           index_edge(copy);
     }
-    s(p, 3) = edge;
+    s(p, 4) = edge;
     return true;
   }
   HYBRID_DEVICE void append(int token) {
@@ -139,25 +172,40 @@ struct Automaton {
     int current = new_state(s(meta[3], 0) + 1, 0, pos);
     if (current < 0)
       return;
-    int p = meta[3], edge = -1;
-    while (p >= 0 && (edge = find(p, token)) < 0) {
+    // A root with no secondary transition means the history has one symbol.
+    // Extending that run creates the next chain state, with no lookup/clone.
+    // The first different token takes the general path and disables this case.
+    if (s(0, 4) == -1 && token == history[0]) {
+      s(current, 1) = meta[3];
+      s(meta[3], 3) = current;
+      meta[3] = current;
+      return;
+    }
+    int p = meta[3];
+    int *edge = nullptr;
+    while (p >= 0 && (edge = find(p, token)) == nullptr) {
       if (!add_edge(p, token, current))
         return;
       p = s(p, 1);
     }
     if (p >= 0) {
-      int q = e(edge, 1);
+      int q = target(edge);
       if (s(p, 0) + 1 == s(q, 0)) {
         s(current, 1) = q;
       } else {
         int clone = new_state(s(p, 0) + 1, s(q, 1), s(q, 2));
         if (clone < 0)
           return;
-        for (int copy = s(q, 3); copy != -1; copy = e(copy, 2))
-          if (!add_edge(clone, e(copy, 0), e(copy, 1)))
-            return;
-        while (p >= 0 && (edge = find(p, token)) >= 0 && e(edge, 1) == q) {
-          e(edge, 1) = clone;
+        s(clone, 3) = s(q, 3);
+        if (s(q, 4) < 0) {
+          s(clone, 4) = s(q, 4);
+        } else {
+          for (int copy = s(q, 4); copy != -1; copy = e(copy, 2))
+            if (!add_extra(clone, e(copy, 0), e(copy, 1)))
+              return;
+        }
+        while (p >= 0 && (edge = find(p, token)) != nullptr && target(edge) == q) {
+          *edge = *edge < 0 ? ~clone : clone;
           p = s(p, 1);
         }
         s(q, 1) = s(current, 1) = clone;

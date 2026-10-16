@@ -15,7 +15,7 @@ class GPUSuffixAutomaton:
     def estimate_memory(config):
         h, n = config.max_history_tokens, config.max_requests
         return n * (
-            (h + (2 * h + 1) * 4 + (3 * h + 1) * 6 + 7) * 4
+            (h + (2 * h + 1) * 5 + (h + 1) * 6 + 7) * 4
             + 40
             + 4 * (config.num_drafts + 1)
         )
@@ -30,7 +30,7 @@ class GPUSuffixAutomaton:
         if self.device.index is None:
             self.device = torch.device("cuda", torch.cuda.current_device())
         self.module = load(
-            name="hybrid_spec_gpu_sa_v2",
+            name="hybrid_spec_gpu_sa_v3",
             sources=[
                 str(Path(__file__).with_name("suffix_automaton.cu")),
                 str(Path(__file__).with_name("host_builder.cpp")),
@@ -43,11 +43,9 @@ class GPUSuffixAutomaton:
         n, h = config.max_requests, config.max_history_tokens
         self.history = torch.empty((n, h), dtype=torch.int32, device=self.device)
         self.states = torch.empty(
-            (n, 2 * h + 1, 4), dtype=torch.int32, device=self.device
+            (n, 2 * h + 1, 5), dtype=torch.int32, device=self.device
         )
-        self.edges = torch.empty(
-            (n, 3 * h + 1, 6), dtype=torch.int32, device=self.device
-        )
+        self.edges = torch.empty((n, h + 1, 6), dtype=torch.int32, device=self.device)
         self.meta = torch.zeros((n, 7), dtype=torch.int32, device=self.device)
         self.owners = torch.zeros(n, dtype=torch.int64, device=self.device)
         self.limits = torch.zeros(n, dtype=torch.int64, device=self.device)
@@ -115,7 +113,7 @@ class GPUSuffixAutomaton:
             0 <= slot < self.config.max_requests
             and 0 <= length < h
             and 1 <= num_states <= min(host.states.shape[0], 2 * h + 1)
-            and 0 <= num_edges <= min(host.edges.shape[0], 3 * h + 1)
+            and 0 <= num_edges <= min(host.edges.shape[0], h + 1)
             and healthy == 1
             and hash_base > 0
             and hash_base & (hash_base - 1) == 0

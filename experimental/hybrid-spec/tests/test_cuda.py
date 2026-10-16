@@ -279,11 +279,12 @@ def test_feedback_fused_metrics_includes_neural_rows_without_slots():
     assert metrics.snapshot() == reference.snapshot()
 
 
-def test_long_history_hash_import_and_captured_splits():
+@pytest.mark.parametrize("alphabet", [1, 2, 4096])
+def test_long_history_hash_import_and_captured_splits(alphabet):
     """Imported hash buckets must grow correctly inside the production graph."""
     config = HybridConfig(8, 4, 1, 32768, history_mode="device", partial_drafts="zero")
     backend = GPUSuffixAutomaton(config, "cuda")
-    prompt = list(range(4096)) * 2 + [0, 1, 2, 3]
+    prompt = list(range(alphabet)) * (8192 // alphabet) + list(range(min(alphabet, 4)))
     backend.initialize_device_slot(0, 1, config.max_history_tokens)
     backend.import_host(0, backend.build_host(backend.prepare_host(prompt), 100000))
     slots = torch.tensor([0], device="cuda")
@@ -332,13 +333,17 @@ def test_long_history_hash_import_and_captured_splits():
     assert num_states == len(oracle.links)
     states = backend.states[0, :num_states].cpu().tolist()
     edges = backend.edges[0, : backend.meta[0, 2].item(), :3].cpu().tolist()
-    for p, (depth, link, pos, head) in enumerate(states):
+    for p, (depth, link, pos, inline, head) in enumerate(states):
         assert (depth, link, pos) == (
             oracle.lengths[p],
             oracle.links[p],
             oracle.first_pos[p],
         )
-        transitions = {}
+        transitions = {} if inline == -1 else {history[pos + 1]: inline}
+        if head < -1:
+            target = ~head
+            transitions[history[states[target][2]]] = target
+            head = -1
         while head != -1:
             token, target, head = edges[head]
             transitions[token] = target

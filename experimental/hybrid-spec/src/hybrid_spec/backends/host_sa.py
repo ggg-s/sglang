@@ -44,8 +44,8 @@ class NativeHostBuilder:
         return HostAutomaton(
             torch.tensor(history, dtype=torch.int64, device="cpu"),
             torch.empty(capacity, **kwargs),
-            torch.empty((2 * capacity + 1, 4), **kwargs),
-            torch.empty((3 * capacity + 1, 6), **kwargs),
+            torch.empty((2 * capacity + 1, 5), **kwargs),
+            torch.empty((capacity + 1, 6), **kwargs),
             torch.empty(7, **kwargs),
         )
 

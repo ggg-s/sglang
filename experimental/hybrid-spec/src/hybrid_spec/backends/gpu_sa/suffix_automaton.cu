@@ -16,19 +16,21 @@ __global__ void reset_kernel(int *states, int *meta, int slot, int h) {
   m[4] = 1;
   m[5] = 1;
   m[6] = 0;
-  int *root = states + static_cast<int64_t>(slot) * (2 * h + 1) * 4;
+  int *root = states + static_cast<int64_t>(slot) * (2 * h + 1) *
+                           Automaton::STATE_FIELDS;
   root[0] = 0;
   root[1] = -1;
   root[2] = -1;
-  root[3] = -1;
+  root[3] = root[4] = -1;
 }
 
 __global__ void append_kernel(int *history, int *states, int *edges, int *meta,
                               const int64_t *tokens, int count, int slot,
                               int version, int h) {
   Automaton a{history + static_cast<int64_t>(slot) * h,
-              states + static_cast<int64_t>(slot) * (2 * h + 1) * 4,
-              edges + static_cast<int64_t>(slot) * (3 * h + 1) *
+              states + static_cast<int64_t>(slot) * (2 * h + 1) *
+                           Automaton::STATE_FIELDS,
+              edges + static_cast<int64_t>(slot) * (h + 1) *
                           Automaton::EDGE_FIELDS,
               meta + slot * Automaton::META_FIELDS, h};
   if (a.meta[0] != version) {
@@ -64,13 +66,13 @@ __global__ void query_kernel(const int *history, const int *states,
   healthy[row] = m[4] != 0;
   if (!m[4] || m[0] == 0)
     return;
-  const int *s = states + slot * (2 * h + 1) * 4;
-  int suffix = s[4 * m[3] + 1];
+  const int *s = states + slot * (2 * h + 1) * Automaton::STATE_FIELDS;
+  int suffix = s[Automaton::STATE_FIELDS * m[3] + 1];
   if (suffix <= 0)
     return;
-  int start = s[4 * suffix + 2] + 1;
+  int start = s[Automaton::STATE_FIELDS * suffix + 2] + 1;
   int count = min(k, m[0] - start);
-  matches[row] = s[4 * suffix];
+  matches[row] = s[Automaton::STATE_FIELDS * suffix];
   valid[row] = count;
   for (int i = 0; i < count; ++i)
     tokens[static_cast<int64_t>(row) * k + i] = history[slot * h + start + i];
@@ -93,9 +95,10 @@ void check_storage(torch::Tensor history, torch::Tensor states,
   auto n = history.size(0), h = history.size(1);
   TORCH_CHECK(n < INT_MAX / Automaton::META_FIELDS && states.dim() == 3 &&
                   states.size(0) == n &&
-                  states.size(1) == 2 * h + 1 && states.size(2) == 4 &&
+                  states.size(1) == 2 * h + 1 &&
+                  states.size(2) == Automaton::STATE_FIELDS &&
                   edges.dim() == 3 && edges.size(0) == n &&
-                  edges.size(1) == 3 * h + 1 &&
+                  edges.size(1) == h + 1 &&
                   edges.size(2) == Automaton::EDGE_FIELDS && meta.dim() == 2 &&
                   meta.size(0) == n && meta.size(1) == Automaton::META_FIELDS,
               "invalid automaton storage shape");
@@ -104,8 +107,10 @@ void check_storage(torch::Tensor history, torch::Tensor states,
 void reset(torch::Tensor states, torch::Tensor meta, int64_t slot) {
   check_tensor(states, torch::kInt32, states.device());
   check_tensor(meta, torch::kInt32, states.device());
-  TORCH_CHECK(states.dim() == 3 && states.size(2) == 4 && states.size(1) >= 3 &&
-                  states.size(1) < INT_MAX / 4 && states.size(1) % 2 == 1 &&
+  TORCH_CHECK(states.dim() == 3 && states.size(2) == Automaton::STATE_FIELDS &&
+                  states.size(1) >= 3 &&
+                  states.size(1) < INT_MAX / Automaton::STATE_FIELDS &&
+                  states.size(1) % 2 == 1 &&
                   meta.dim() == 2 && meta.size(0) == states.size(0) &&
                   meta.size(1) == Automaton::META_FIELDS &&
                   meta.size(0) < INT_MAX / Automaton::META_FIELDS && slot >= 0 &&
@@ -216,8 +221,9 @@ __global__ void consume_query_kernel(
   int64_t slot = slots[row], generation = generations[row];
   if (slot < 0 || slot >= n || owners[slot] != generation)
     return;
-  Automaton a{history + slot * h, states + slot * (2 * h + 1) * 4,
-              edges + slot * (3 * h + 1) * Automaton::EDGE_FIELDS,
+  Automaton a{history + slot * h,
+              states + slot * (2 * h + 1) * Automaton::STATE_FIELDS,
+              edges + slot * (h + 1) * Automaton::EDGE_FIELDS,
               meta + slot * Automaton::META_FIELDS, h};
   int64_t *pm = pending_meta + slot * 3;
   if (pm[2] != 0) {
