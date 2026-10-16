@@ -217,6 +217,48 @@ TP 验收对 TP=1/2/4 分别重复上述矩阵，原生与 hybrid 服务必须�
 
 代码编辑数据可用 `prepare_code_edits_prompts.py --dataset edits_data.json --revision COMMIT --model-path MODEL --output-dir DIR` 准备同源的 diff/完整代码输入。只使用 `code` 和 `edit`，不把参考 `solution` 放入提示词。`run_workload_plan.py --plan PLAN --output-dir DIR` 可在每个测试服务加载后顺序运行多组提示词与输出上限；计划包含完整服务 argv、hybrid 配置、提示词路径、输出上限和并发。这样可以同时覆盖短 diff 与较长的代码复制场景，无需为每个工作负载重新加载模型。
 
+### sa-spec 原始模板：内网原生/插件对照
+
+`--template sa-spec` 使用 `sa_spec/bench/make_dataset.py`（参考提交 `1cc7e8c86b19`）的原始 completion 提示词，连同开头、结尾和标签之间的换行；不套 chat template，不添加 system/thinking 指令，不使用 `solution`。按文件顺序取前 N 条，超长直接报错，不截断或跳过样本。输出 `sa-spec-prompts.json` 供 SGLang `/generate` 使用，以及 `output_tokens=2048` 的 `sa-spec-dataset.jsonl` 供参考工具使用。原来的 paired 模式保持默认。
+
+下面命令在 Linux 服务器仓库根目录、现有服务的 Python/CUDA 环境执行。替换三个本地路径；`DRAFT` 是 **EAGLE3 头**，不是 Qwen3-0.6B。这里沿用 Qwen3-14B/EAGLE3 做 SGLang 内部 A/B，不声称复现 DeepSeek/TensorRT-LLM 的绝对性能。数据固定快照为 `glaiveai/code_edits_sample@dfdacc8eb57d576d0662645144bdba4cdba6a106`，对应 JSON SHA-256 为 `de3198ef872f268bda76c70ee27b5d184ef3d0ae18f3b68135eb5c2c54ea4c8a`。
+
+```bash
+git pull --ff-only
+python -m pip install -e './experimental/hybrid-spec[test]'
+
+export DATASET=/实际路径/edits_data.json
+export MODEL=/models/Qwen/Qwen3-14B
+export DRAFT=/实际路径/EAGLE3-Qwen3-14B
+export CUDA_VISIBLE_DEVICES=0,1
+export RUN_DIR="$PWD/validation-runs/sa-spec-$(date +%Y%m%d-%H%M%S)"
+mkdir -p "$RUN_DIR"
+sha256sum "$DATASET"
+
+python experimental/hybrid-spec/benchmarks/prepare_code_edits_prompts.py \
+  --dataset "$DATASET" \
+  --revision dfdacc8eb57d576d0662645144bdba4cdba6a106 \
+  --model-path "$MODEL" --template sa-spec --num-prompts 500 \
+  --max-prompt-tokens 14336 --output-dir "$RUN_DIR/data"
+
+python experimental/hybrid-spec/benchmarks/make_sa_spec_plan.py \
+  --data-dir "$RUN_DIR/data" --output "$RUN_DIR/plan.json" \
+  --model-path "$MODEL" --draft-model-path "$DRAFT" \
+  --algorithm EAGLE3 --tp-size 2 --num-drafts 8 \
+  --context-length 16384 --concurrencies 1 4 --port 39921
+
+python experimental/hybrid-spec/benchmarks/run_workload_plan.py \
+  --plan "$RUN_DIR/plan.json" --output-dir "$RUN_DIR/results"
+
+python -m json.tool "$RUN_DIR/results/summary.json"
+```
+
+运行前停止占用所选 GPU 的旧服务，并保持 39921 端口空闲。计划运行器按顺序启动原生、停止原生、启动插件、停止插件，不需手动另开服务。两侧共享模型、K、TP、调度、随机种子、输入、greedy 采样和 **2048 输出上限**；不设置 `ignore_eos`，可自然提前结束。通过原始 `/generate` 接口发送已准备的文本，不再次添加聊天模板。上下文为 16384，输入最多 14336，给输出预留 2048；超长时同时提高数据预算、计划上下文及实际显存预算，不悄悄过滤。首次可用 `--num-prompts 32` 做冒烟，正式对照再用前 500 条。
+
+插件配置由计划生成：`history_mode=device`、`min_match_len=4`、`partial_drafts=zero`、槽位数等于最大测试并发、历史容量等于上下文长度。默认使用 SGLang 的 overlap/chunked-prefill 设置；若要匹配旧部署，在生成计划时显式加 `--disable-overlap-schedule --chunked-prefill-size -1`，两侧会一致应用。`--repeats 3` 生成三组并交替原生/插件启动顺序，需加载模型六次；`--num-drafts 3` 可单独做 K=3 对照，不能拿原生 K=3 与插件 K=8 直接归因 SA 收益。
+
+每个并发先对全部样本预热，再清空缓存并正式计时。`summary.json` 包含端到端输出吞吐、平均请求时延、整体接受长度，以及 `sa_fraction`、`sa_mean_accept_length`、`neural_mean_accept_length`（含 bonus）；来源计数以验证行累计，不能当作独立用户请求数。缺少插件诊断时运行器直接报错。原始 token 序列及服务诊断保存在各结果 JSON，服务日志保存在 `*-server.log`；这些不是流式 TPOT 或正确性通过证明，仍需检查输出质量和两侧序列差异。原始模板的提示词字节相同不代表不同模型的 tokenizer、停止行为或推理后端相同。
+
 开发调试可读取 `draft_worker.draft_extension.metrics.snapshot()`，获取按来源统计的验证请求数、正确草稿数、接受 token 数（包含 bonus）。该诊断调用会同步，禁止放入每步热路径。生产路径只在 GPU 上累加。
 
 启用插件时，现有 `/get_server_info` 诊断返回的 worker 内部状态增加 `hybrid_spec` 字段，包含这些累计计数。读取前后差值可确认 SA 是否实际使用及接受情况；读取会同步，应放在计时区间之外。多 TP 时只读取一个 rank 的副本。

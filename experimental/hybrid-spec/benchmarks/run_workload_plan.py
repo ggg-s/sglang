@@ -35,6 +35,12 @@ def main():
             config = out / f"{name}-config.json"
             config.write_text(json.dumps(server["hybrid_config"], indent=2))
             env["HYBRID_SPEC_CONFIG"] = str(config)
+            # An inherited whitelist must not silently disable the experiment.
+            if "SGLANG_PLUGINS" in env:
+                plugins = env["SGLANG_PLUGINS"].split(",")
+                if "hybrid_spec" not in plugins:
+                    plugins.append("hybrid_spec")
+                env["SGLANG_PLUGINS"] = ",".join(plugins)
         print(f"START {name}", flush=True)
         with (out / f"{name}-server.log").open("w") as log:
             process = subprocess.Popen(
@@ -77,6 +83,11 @@ def main():
                         record = report["record"]
                         before = find_metrics(record["server_info_before"])
                         after = find_metrics(record["server_info_after"])
+                        if hybrid and (before is None or after is None):
+                            raise RuntimeError(
+                                "Hybrid diagnostics missing: the plugin was not "
+                                "loaded or the serving code is outdated"
+                            )
                         delta = (
                             {k: after[k] - before[k] for k in before}
                             if before is not None and after is not None
@@ -99,6 +110,26 @@ def main():
                                 for r in record["requests"]
                             ),
                         )
+                        if delta is not None:
+                            retrieval = delta["retrieval_requests"]
+                            neural = delta["neural_requests"]
+                            row.update(
+                                sa_fraction=(
+                                    retrieval / (retrieval + neural)
+                                    if retrieval + neural
+                                    else None
+                                ),
+                                sa_mean_accept_length=(
+                                    delta["retrieval_accept_tokens"] / retrieval
+                                    if retrieval
+                                    else None
+                                ),
+                                neural_mean_accept_length=(
+                                    delta["neural_accept_tokens"] / neural
+                                    if neural
+                                    else None
+                                ),
+                            )
                         summary.append(row)
                         (out / "summary.json").write_text(json.dumps(summary, indent=2))
                         print(f"DONE {row}", flush=True)
