@@ -219,7 +219,7 @@ TP 验收对 TP=1/2/4 分别重复上述矩阵，原生与 hybrid 服务必须�
 
 ### sa-spec 原始模板：内网原生/插件对照
 
-`--template sa-spec` 使用 `sa_spec/bench/make_dataset.py`（参考提交 `1cc7e8c86b19`）的原始 completion 提示词，连同开头、结尾和标签之间的换行；不套 chat template，不添加 system/thinking 指令，不使用 `solution`。按文件顺序取前 N 条，超长直接报错，不截断或跳过样本。输出 `sa-spec-prompts.json` 供 SGLang `/generate` 使用，以及 `output_tokens=2048` 的 `sa-spec-dataset.jsonl` 供参考工具使用。原来的 paired 模式保持默认。
+`--template sa-spec` 使用 `sa_spec/bench/make_dataset.py`（参考提交 `1cc7e8c86b19`）的原始 completion 提示词，连同开头、结尾和标签之间的换行；不套 chat template，不添加 system/thinking 指令，不使用 `solution`。按文件顺序取前 N 条，超长直接报错，不截断或跳过样本。额外输出 **`sa-spec-sglang.jsonl`**，供官方 `python -m sglang.benchmark.serving --dataset-name custom` 发压；该格式要求两轮 conversation，因此第二轮使用空字符串占位，只有第一轮原始 prompt 会发送给服务。原来的 `sa-spec-prompts.json`、TRT 格式 `sa-spec-dataset.jsonl` 和 paired 模式继续保留。
 
 下面命令在 Linux 服务器仓库根目录、现有服务的 Python/CUDA 环境执行。替换三个本地路径；`DRAFT` 是 **EAGLE3 头**，不是 Qwen3-0.6B。这里沿用 Qwen3-14B/EAGLE3 做 SGLang 内部 A/B，不声称复现 DeepSeek/TensorRT-LLM 的绝对性能。数据固定快照为 `glaiveai/code_edits_sample@dfdacc8eb57d576d0662645144bdba4cdba6a106`，对应 JSON SHA-256 为 `de3198ef872f268bda76c70ee27b5d184ef3d0ae18f3b68135eb5c2c54ea4c8a`。
 
@@ -253,11 +253,26 @@ python experimental/hybrid-spec/benchmarks/run_workload_plan.py \
 python -m json.tool "$RUN_DIR/results/summary.json"
 ```
 
-运行前停止占用所选 GPU 的旧服务，并保持 39921 端口空闲。计划运行器按顺序启动原生、停止原生、启动插件、停止插件，不需手动另开服务。两侧共享模型、K、TP、调度、随机种子、输入、greedy 采样和 **2048 输出上限**；不设置 `ignore_eos`，可自然提前结束。通过原始 `/generate` 接口发送已准备的文本，不再次添加聊天模板。上下文为 16384，输入最多 14336，给输出预留 2048；超长时同时提高数据预算、计划上下文及实际显存预算，不悄悄过滤。首次可用 `--num-prompts 32` 做冒烟，正式对照再用前 500 条。
+运行前停止占用所选 GPU 的旧服务，并保持 39921 端口空闲。计划运行器按顺序启动原生、停止原生、启动插件、停止插件，不需手动另开服务。**发请求和计算 TTFT/TPOT 全部调用官方 `sglang.benchmark.serving`，不再使用 `compare_servers.py`。** 两侧共享模型、K、TP、调度、随机种子、输入、greedy 采样和 **2048 输出上限**。显式传入 `--disable-ignore-eos`，使 `ignore_eos=false`，可以自然提前结束；不传 `--apply-chat-template` 或 `--disable-stream`，保持原始文本和流式测量。上下文为 16384，输入最多 14336，给输出预留 2048；超长时同时提高数据预算、计划上下文及实际显存预算，不悄悄过滤。首次可用 `--num-prompts 32` 做冒烟，正式对照再用前 500 条。旧数据目录缺少官方 JSONL 时须重新运行准备脚本；旧计划也须重新生成。
 
 插件配置由计划生成：`history_mode=device`、`min_match_len=4`、`partial_drafts=zero`、槽位数等于最大测试并发、历史容量等于上下文长度。默认使用 SGLang 的 overlap/chunked-prefill 设置；若要匹配旧部署，在生成计划时显式加 `--disable-overlap-schedule --chunked-prefill-size -1`，两侧会一致应用。`--repeats 3` 生成三组并交替原生/插件启动顺序，需加载模型六次；`--num-drafts 3` 可单独做 K=3 对照，不能拿原生 K=3 与插件 K=8 直接归因 SA 收益。
 
-每个并发先对全部样本预热，再清空缓存并正式计时。`summary.json` 包含端到端输出吞吐、平均请求时延、整体接受长度，以及 `sa_fraction`、`sa_mean_accept_length`、`neural_mean_accept_length`（含 bonus）；来源计数以验证行累计，不能当作独立用户请求数。缺少插件诊断时运行器直接报错。原始 token 序列及服务诊断保存在各结果 JSON，服务日志保存在 `*-server.log`；这些不是流式 TPOT 或正确性通过证明，仍需检查输出质量和两侧序列差异。原始模板的提示词字节相同不代表不同模型的 tokenizer、停止行为或推理后端相同。
+每个并发使用官方 warmup：重复第一个样本，输出最多 32 token，预热请求数等于并发；然后 `--flush-cache` 清空缓存并正式计时。官方 custom loader 会按 `--seed 42` 洗牌，两侧顺序一致；准备阶段已校验输入预算，运行器还检查成功数必须等于请求数，避免静默过滤/失败。`summary.json` 原样收录官方 `output_throughput`、`mean_ttft_ms`、`mean_tpot_ms`、`median_tpot_ms`、`p95_tpot_ms`、`p99_tpot_ms` 等字段。官方 TPOT 对每个输出长度大于 1 的成功请求计算 `(latency-TTFT)/(output_tokens-1)`，再汇总请求级均值/分位数，不是对吞吐取倒数；`accept_length` 采用官方服务统计口径。
+
+SA 来源指标 `sa_fraction`、`sa_mean_accept_length`、`neural_mean_accept_length` 来自发压进程前后诊断差值，**包含官方 warmup**，在结果中以 `hybrid_spec_delta_scope` 标明；计数单位是验证行，不是独立用户请求。它们不参与 TPOT 计算。官方原始 JSONL 保留 `--output-details` 生成的文本、输出长度、TTFT、ITL 和错误；`*-command.json` 保存真实发压 argv，`*-bench.log` 保存官方日志，`*-diagnostics.json` 保存插件诊断，`*-server.log` 保存服务日志。缺少插件诊断或请求未全部成功会报错；不覆盖已有官方结果。流式性能不等于正确性验证，仍需检查生成文本。原始模板字节相同也不代表不同模型的 tokenizer、停止行为或推理后端相同。
+
+如服务已经独立启动，下面是同一官方发压命令（切换服务后换一个结果文件名执行）。不要使用 TRT 格式 JSONL 代替 `sa-spec-sglang.jsonl`：
+
+```bash
+python -m sglang.benchmark.serving \
+  --backend sglang --base-url http://127.0.0.1:39921 \
+  --model "$MODEL" --tokenizer "$MODEL" \
+  --dataset-name custom --dataset-path "$RUN_DIR/data/sa-spec-sglang.jsonl" \
+  --num-prompts 500 --sharegpt-output-len 2048 --sharegpt-context-len 16384 \
+  --max-concurrency 4 --request-rate inf --seed 42 --temperature 0 \
+  --disable-ignore-eos --warmup-requests 4 --flush-cache \
+  --output-details --output-file "$RUN_DIR/official-c4.jsonl"
+```
 
 开发调试可读取 `draft_worker.draft_extension.metrics.snapshot()`，获取按来源统计的验证请求数、正确草稿数、接受 token 数（包含 bonus）。该诊断调用会同步，禁止放入每步热路径。生产路径只在 GPU 上累加。
 

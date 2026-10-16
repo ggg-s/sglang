@@ -1,4 +1,4 @@
-"""Write a sequential native/hybrid plan for original sa-spec prompts (2048 cap)."""
+"""Write an official SGLang native/hybrid benchmark plan (sa-spec, 2048 cap)."""
 
 import argparse
 import hashlib
@@ -46,6 +46,27 @@ def main():
         for prompt, row in zip(prompts, rows)
     ):
         parser.error("prompt contents differ from provenance; regenerate the data")
+    dataset_path = data / "sa-spec-sglang.jsonl"
+    if not dataset_path.is_file():
+        parser.error("missing official JSONL; regenerate data with --template sa-spec")
+    dataset = [
+        json.loads(line)
+        for line in dataset_path.read_text(encoding="utf-8").splitlines()
+        if line.strip()
+    ]
+    expected = [
+        {
+            "conversations": [
+                {"from": "human", "value": prompt},
+                {"from": "gpt", "value": ""},
+            ]
+        }
+        for prompt in prompts
+    ]
+    if dataset != expected:
+        parser.error(
+            "official JSONL differs from original prompts; regenerate the data"
+        )
     required = max(row["prompt_tokens"]["sa-spec"] for row in rows) + 2048
     if args.context_length < required:
         parser.error(f"--context-length must be at least {required} (prompt + 2048)")
@@ -110,11 +131,20 @@ def main():
                 server["hybrid_config"] = config
             servers.append(server)
     plan = dict(
+        benchmark="sglang",
+        model=args.model_path,
+        seed=42,
         servers=servers,
         startup_timeout=1800,
         concurrencies=args.concurrencies,
         workloads=[
-            dict(name="sa-spec-2048", prompts=str(prompts_path), max_tokens=2048)
+            dict(
+                name="sa-spec-2048",
+                dataset=str(dataset_path),
+                num_prompts=len(prompts),
+                max_tokens=2048,
+                context_length=args.context_length,
+            )
         ],
     )
     args.output.parent.mkdir(parents=True, exist_ok=True)

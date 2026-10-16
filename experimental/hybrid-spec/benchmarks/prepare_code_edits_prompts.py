@@ -107,6 +107,25 @@ def main():
             json.dumps(values, ensure_ascii=False, indent=2), encoding="utf-8"
         )
     if original:
+        # Official SGLang custom loader requires two turns. The empty assistant
+        # is only a schema placeholder: --sharegpt-output-len supplies the cap,
+        # and only the first turn is sent to /generate (no chat template).
+        with (args.output_dir / "sa-spec-sglang.jsonl").open(
+            "w", encoding="utf-8"
+        ) as stream:
+            for prompt in prompts["sa-spec"]:
+                stream.write(
+                    json.dumps(
+                        {
+                            "conversations": [
+                                {"from": "human", "value": prompt},
+                                {"from": "gpt", "value": ""},
+                            ]
+                        },
+                        ensure_ascii=False,
+                    )
+                    + "\n"
+                )
         with (args.output_dir / "sa-spec-dataset.jsonl").open(
             "w", encoding="utf-8"
         ) as stream:
