@@ -235,8 +235,22 @@ def test_configuration_fails_closed():
     device_config = HybridConfig(2, 2, 2, 32, history_mode="device")
     overlap_cfg = SimpleNamespace(**(vars(cfg) | {"disable_overlap_schedule": False}))
     validate_config(device_config, overlap_cfg)
-    with pytest.raises(ValueError, match="tp_size=1"):
-        validate_config(device_config, SimpleNamespace(**(vars(cfg) | {"tp_size": 2})))
+    for algorithm in ("EAGLE", "EAGLE3", "STANDALONE"):
+        for tp_size in (1, 2, 4, 8):
+            for overlap in (False, True):
+                validate_config(
+                    device_config,
+                    SimpleNamespace(
+                        **(
+                            vars(cfg)
+                            | {
+                                "tp_size": tp_size,
+                                "speculative_algorithm": algorithm,
+                                "disable_overlap_schedule": not overlap,
+                            }
+                        )
+                    ),
+                )
     # ServerArgs resolves an unspecified, disabled LoRA option to None.
     validate_config(config, SimpleNamespace(**(vars(cfg) | {"enable_lora": None})))
     for tp_size in (2, 4, 8):
@@ -432,6 +446,18 @@ def test_device_bridge_keeps_feedback_on_device_and_ignores_cpu_decode_history()
     with extension.bind(batch, draft) as view:
         assert view.slots.tolist() == [-1]
     extension.shutdown()
+
+
+def test_device_tp_rejects_process_group_only_communication():
+    """A CUDA device view must not capture the old CPU-history communicator."""
+    config = HybridConfig(2, 2, 1, 32, history_mode="device")
+    with pytest.raises(ValueError, match="graph-capable PyNccl"):
+        DeviceDraftExtension(
+            config,
+            SimpleNamespace(device=torch.device("cuda")),
+            100,
+            tp_sync=SimpleNamespace(communicator=None),
+        )
 
 
 @pytest.fixture

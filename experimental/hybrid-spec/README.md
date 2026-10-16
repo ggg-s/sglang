@@ -8,11 +8,11 @@
 
 verify 直接在设备上暂存 `predict/accept_index/accept_lens`，下一轮 draft 在 CUDA Graph 内消费增量、查询并选择来源。eager 使用相同设备算子。若 CPU 构建未完成，首次 draft 会等待该 future；不调用额外的 GPU 全局同步。异步 H2D 的 pinned 源缓冲保留到拷贝事件完成；异常、abort/flush、retract 和槽位复用会取消或丢弃旧任务结果，旧任务不能向新代际写入状态。
 
-该路径允许 TP=1 的 overlap 配置，但 **尚未完成 GPU/真实模型验收**。本地 CPU/native 测试不能替代 GPU 时间线、H2D 或真实模型验证。旧模式默认 `history_mode="cpu"`，保留关闭 overlap 的限制及现有验证证据；新路径不继承其通过结论。device 路径保留每批槽位/代际映射的 H2D、verify 反馈 kernel 和一次 host 构建/导入，并未证明零开销或性能收益。
+该路径允许单机 TP≥1 的 overlap 配置。多 TP 在每次设备查询后达成候选与资格共识，eager 和 Graph 使用 SGLang 的 PyNccl 通信器，任一 rank 不合格或候选不同则统一回退 neural；TP=1 不增加通信。**尚未完成 GPU/真实模型验收**。本地 CPU/native 测试不能替代 GPU 时间线、H2D 或真实模型验证。旧模式默认 `history_mode="cpu"`，保留关闭 overlap 的限制及现有验证证据；新路径不继承其通过结论。device 路径保留每批槽位/代际映射的 H2D、verify 反馈 kernel 和一次 host 构建/导入，并未证明零开销或性能收益。
 
 `configs/device-sa-spec.json` 给出 K=8、阈值 4、`partial_drafts="zero"` 的参考策略配置。启动时相应设置 `--speculative-num-steps 8 --speculative-num-draft-tokens 9`；测试 overlap 时移除 `--disable-overlap-schedule`。`zero` 复现参考集成对不足 K 个续写的尾部补零；这些仍是草稿，必须经过原生 target verify，不代表输出补零。默认 `partial_drafts="fallback"` 继续整条回退，可用于单独比较该策略差异。阈值设为大于历史容量的数值可测量“维护 SA、全部选择 MTP”的成本。
 
-device 模式以 generation 和 GPU 历史版本检查隔离旧反馈、槽位复用、重排和 Graph padding；prefill/retract 时重建索引。GPU 接受前缀可能包含 CPU EOS/停止截断前的尾部，不能将索引长度当作交付长度；原生停止处理保持不变。新路径只开放单卡实验，不开放 TP 多卡、chunk prefill、grammar 等其余未支持组合。
+device 模式以 generation 和 GPU 历史版本检查隔离旧反馈、槽位复用、重排和 Graph padding；prefill/retract 时重建索引。GPU 接受前缀可能包含 CPU EOS/停止截断前的尾部，不能将索引长度当作交付长度；原生停止处理保持不变。支持单机多 TP 实验，仍不开放 chunk prefill、grammar 等其余未支持组合。
 
 ## 实现与边界
 
@@ -21,12 +21,12 @@ device 模式以 generation 和 GPU 历史版本检查隔离旧反馈、槽位�
 | 检索 | 实例私有 GPU SA；device 模式由 CPU C++ 构建初始状态；Python CPU SA 仅作对照 |
 | 神经后端接入 | 普通 EAGLE/MTP、EAGLE3、Standalone 的 V2 共用 draft 路径；均需逐模型 GPU 验收 |
 | 参数 | NVIDIA CUDA、单机 TP≥1、纯文本、greedy、topk=1、K≥1、验证宽度 K+1 |
-| TP | CPU 历史模式各 rank 独立维护 SA 并达成选择共识；device 模式仅 TP=1 实验 |
+| TP | 两种历史模式均按 rank 复制 SA 并达成选择共识；device 模式在查询后、token 选择前执行共识，支持单机多 TP 实验 |
 | 执行 | eager 与 CUDA Graph 接口；K=1 走原生无循环内 forward 路径 |
 | 历史 | CPU 模式关闭 overlap、从 CPU 已提交历史取增量；device 模式使用 GPU verify 反馈 |
 | 生命周期 | 历史重复不追加；历史变化重建；请求对象代际、结束释放、弱引用清理、flush reset |
 | 混合线性注意力 | 实验接入 Qwen3.5/3.6 target + 原生 Qwen3.5 MTP，要求 `--language-only`；保留 GDN verify/commit 和 mRoPE |
-| 暂不开放 | CPU 模式 overlap、device 模式多 TP、DP/PP/EP/CP、多机、torch.compile、chunk prefill、混合 prefill/decode、随机采样、grammar、LoRA、其他混合线性注意力模型、多模态请求、多层 EAGLE、FROZEN_KV_MTP、动态预算、Arctic |
+| 暂不开放 | CPU 模式 overlap、DP/PP/EP/CP、多机、torch.compile、chunk prefill、混合 prefill/decode、随机采样、grammar、LoRA、其他混合线性注意力模型、多模态请求、多层 EAGLE、FROZEN_KV_MTP、动态预算、Arctic |
 
 默认 CPU 历史模式使用同步调度器已提交到 CPU 的输出，只上传确认增量，当前 anchor 已包含在历史中。device 模式使用 GPU verify 的接受前缀，可能包含最终 CPU EOS/停止截断前的尾部；不能将其计数或索引长度当作最终交付 token 统计。两者均不增加逐步 D2H 读取。
 
@@ -102,12 +102,12 @@ LoRA 关闭时，无需也无法通过 `--enable-lora` 显式传入 False；本�
 | `max_requests` | 可同时持有 SA 的请求数；无槽位时 neural fallback |
 | `max_history_tokens` | 单请求 prompt + 已提交输出容量；超出时 neural fallback |
 | `backend` | 服务只能使用 `gpu_sa`；`reference` 用于测试 |
-| `history_mode` | `cpu`（默认，旧同步路径）或 `device`（GPU 反馈与 Graph 内增量处理，实验 TP=1） |
+| `history_mode` | `cpu`（默认，旧同步路径）或 `device`（GPU 反馈与 Graph 内增量处理，支持单机多 TP 实验） |
 | `partial_drafts` | `fallback`（默认，不足 K 则整条回退）或 `zero`（参考实现的尾部补零草稿） |
 
 状态内存估计：`4 * max_requests * [H + 4*(2H+1) + 3*(3H+1) + 5]` 字节，加上每请求 `40 + 4*(K+1)` 字节的设备反馈元数据。示例约 36 MiB，另有查询与 Graph buffer。状态在 draft worker 构造时分配，早于 target KV 预算/分配；不修改原生 KV 规划。
 
-多 TP 的 SA 状态按 rank 复制，上述容量是每张卡的占用，不随 TP 分片缩小。每轮在当前 forward stream 上先广播 TP 组首 rank 的候选与 mask，再对本地资格及候选一致性做 MIN all-reduce；任一 rank 不满足条件或候选不同，所有 rank 对该行统一回退 neural。每轮两次设备通信，广播张量为 `8*B*(K+1)` 字节，归约张量为 `4*B` 字节（不代表实际链路流量）。没有逐 token 通信，也不增加 D2H 读回；TP=1 跳过通信。沿用 SGLang 的 TP batch 顺序/形状一致性约定，不能用于不同 rank 独立调度请求。
+多 TP 的 SA 状态按 rank 复制，上述容量是每张卡的占用，不随 TP 分片缩小。每轮在当前 forward stream 上先广播 TP 组首 rank 的候选与 mask，再对本地资格及候选一致性做 MIN all-reduce；任一 rank 不满足条件或候选不同，所有 rank 对该行统一回退 neural。CPU 历史模式在 draft 前通过进程组通信；device 模式在 `prepare()` 内完成本地查询后，通过 PyNccl 通信，Graph 将查询、通信和后续选择一起捕获，eager 也使用同一通信器。PyNccl 不可用时 device 多 TP 明确报错。全局 source rank 会转换成 PyNccl 所需的组内 rank。每轮两次设备通信，广播张量为 `8*B*(K+1)` 字节，归约张量为 `4*B` 字节（不代表实际链路流量）；device Graph 中 B 包括 padding。没有逐 token 通信，也不增加 D2H 读回；TP=1 跳过通信。沿用 SGLang 的 TP batch 顺序/形状一致性约定，不能用于不同 rank 独立调度请求。
 
 通信在 `bind()` 中完成，早于 eager 起草或 Graph staging/replay；不会捕获到 draft Graph 中。统计也是每 rank 的相同副本，汇总时只读取 TP 组首 rank，避免重复计数。
 

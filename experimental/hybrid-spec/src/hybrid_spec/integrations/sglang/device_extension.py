@@ -16,10 +16,11 @@ from hybrid_spec.observability.metrics import Metrics
 
 
 class DeviceOverride(DraftOverrideView):
-    def __init__(self, backend, slots, generations):
+    def __init__(self, backend, slots, generations, tp_sync=None):
         self.backend = backend
         self.slots = slots
         self.generations = generations
+        self.tp_sync = tp_sync
         super().__init__(
             torch.zeros(
                 (len(slots), backend.config.num_drafts),
@@ -33,20 +34,27 @@ class DeviceOverride(DraftOverrideView):
         self.backend.consume_and_query(
             self.slots, self.generations, seq_lens, self.tokens, self.use_retrieval
         )
+        if self.tp_sync is not None:
+            agreed = self.tp_sync.synchronize(self)
+            # Preserve graph storage and the mask alias used by verify metrics.
+            self.tokens.copy_(agreed.tokens)
+            self.use_retrieval.copy_(agreed.use_retrieval)
 
 
 class DeviceGraphBuffers:
-    def __init__(self, backend, max_bs):
+    def __init__(self, backend, max_bs, tp_sync=None):
         self.view = DeviceOverride(
             backend,
             torch.full((max_bs,), -1, dtype=torch.int64, device=backend.device),
             torch.zeros(max_bs, dtype=torch.int64, device=backend.device),
+            tp_sync,
         )
 
     def bind_capture_view(self, batch_size):
         # Views share storage with staging; the query writes outputs in graph.
         view = object.__new__(DeviceOverride)
         view.backend = self.view.backend
+        view.tp_sync = self.view.tp_sync
         for name in ("slots", "generations", "tokens", "use_retrieval"):
             setattr(view, name, getattr(self.view, name)[:batch_size])
         return view
@@ -76,11 +84,18 @@ class PrefillLease:
 
 class DeviceDraftExtension:
     def __init__(self, config, backend, vocab_size, tp_sync=None):
-        if tp_sync is not None:
-            raise ValueError("device history currently requires TP=1")
+        if (
+            tp_sync is not None
+            and backend.device.type == "cuda"
+            and tp_sync.communicator is None
+        ):
+            raise ValueError(
+                "device history TP requires a graph-capable PyNccl communicator"
+            )
         self.config = config
         self.backend = backend
         self.vocab_size = vocab_size
+        self.tp_sync = tp_sync
         self.metrics = Metrics()
         self.states = {}
         self.free_slots = list(range(config.max_requests))
@@ -93,7 +108,7 @@ class DeviceDraftExtension:
         )
 
     def create_graph_buffers(self, max_bs):
-        return DeviceGraphBuffers(self.backend, max_bs)
+        return DeviceGraphBuffers(self.backend, max_bs, self.tp_sync)
 
     def close_request(self, rid):
         # Finish callbacks may run on the scheduler thread. Never touch GPU
@@ -230,6 +245,7 @@ class DeviceDraftExtension:
             self.backend,
             torch.tensor(slots, dtype=torch.int64, device=self.backend.device),
             torch.tensor(generations, dtype=torch.int64, device=self.backend.device),
+            self.tp_sync,
         )
 
     @contextmanager

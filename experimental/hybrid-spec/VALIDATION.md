@@ -1,5 +1,27 @@
 # 验证记录
 
+## Device 历史模式多 TP（2026-10-16）
+
+此前 `history_mode="device"` 的 TP=1 限制来自缺失 Graph 内的 TP 共识，而非 SA 算法只能使用单卡。本轮允许单机 TP≥1，覆盖普通 EAGLE/MTP、EAGLE3、STANDALONE 的共用插件路径，仍保留其他配置限制。
+
+- 每个 rank 继续维护自己的 SA 和异步 host 构建。`DeviceOverride.prepare()` 在消费反馈、查询 SA 后广播组首 rank 的候选与资格，并用 MIN 归约本地一致性。任一 rank 无槽位、失效或候选不同，该行统一回退 neural；没有按本地 mask 跳过通信。
+- eager 与 Graph 使用现有 TP 组的 PyNccl 通信器；显式开启并恢复原有通信器状态，全局源 rank 转为组内 root。device 多 TP 缺少 PyNccl 时明确报错；CPU 历史模式沿用进程组路径。TP=1 不增加通信。
+- 共识结果写回已有 Graph tokens/mask 存储；verify 统计使用同步后的实际 mask。Graph 的 padding 行也参与固定形状通信，但保持不选择 SA。
+- 配置回归覆盖三种算法、TP=1/2/4/8、overlap 开/关；这只是校验与调用路径覆盖，不表示启动了这些模型服务。
+
+本地结果：
+
+| 检查 | 结果与边界 |
+| --- | --- |
+| 全部插件测试 | **112 passed, 7 skipped**；其中 6 项 CUDA、1 项 NCCL 因硬件不可用跳过 |
+| 真实 Gloo TP=1/2/4 | 通过；含全局 ranks `[1,3]` 子组、K=1/3、候选分歧、单 rank 全部回退、请求重排、仅单 rank 释放槽位、Graph 缓冲 padding 和 verify 统计 |
+| device CPU 桥接 | 使用可控的查询/构建边界与真实插件、进程组；Gloo adapter 检查 PyNccl 所需的组内 root、开启/恢复和原地通信语义，不能替代 NCCL |
+| 负对照 | 禁用 `DeviceOverride.prepare()` 内共识，真实 Gloo 双进程测试按预期断言失败：`MISSING_DEVICE_CONSENSUS_REJECTED_AS_EXPECTED` |
+| CUDA/NCCL 回归实现 | 新增 Graph 内实际 PyNccl 通信、真实 host SA 导入/GPU 反馈/查询、同版本不同候选、旧代际、重排和重复 replay 的检查；**本地未执行** |
+| 静态与打包 | 修改文件 Ruff 检查、27 个 Python 文件格式检查、`git diff --check`、wheel 构建及四个修改后源码的归档一致性检查通过 |
+
+服务器 `hz01` 本轮 SSH 返回 `ECONNREFUSED`，因此没有执行多卡模型启动、NCCL Graph、overlap 时序或性能验收。CPU/Gloo 通过不能外推 GPU/NCCL 通过，也不能证明多 TP 加速。
+
 ## CPU 初始 SA 构建与 prefill 重叠（2026-10-16）
 
 本轮继续完善 opt-in `history_mode="device"`；默认 CPU 历史模式与原生模型验证/停止处理不变。

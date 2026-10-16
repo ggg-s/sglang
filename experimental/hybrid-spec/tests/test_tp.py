@@ -1,6 +1,7 @@
 """Real process-group tests; CPU Gloo does not substitute for CUDA/NCCL."""
 
 import time
+from contextlib import contextmanager
 from datetime import timedelta
 from types import SimpleNamespace
 
@@ -11,6 +12,11 @@ import torch.multiprocessing as mp
 from hybrid_spec.backends.reference import ReferenceBackend
 from hybrid_spec.config import HybridConfig
 from hybrid_spec.core.contracts import DraftOverrideView
+from hybrid_spec.integrations.sglang.device_extension import (
+    DeviceDraftExtension,
+    DeviceGraphBuffers,
+    DeviceOverride,
+)
 from hybrid_spec.integrations.sglang.draft_extension import DraftExtension
 from hybrid_spec.integrations.sglang.graph_buffers import GraphBuffers
 from hybrid_spec.integrations.sglang.tp_sync import TPSynchronizer
@@ -26,6 +32,289 @@ class Request:
 
     def finished(self):
         return False
+
+    def get_fill_ids(self):
+        return self.origin_input_ids
+
+
+class GlooCommunicator:
+    """Exercise PyNccl's local-root/in-place contract with real CPU collectives.
+
+    This boundary replacement tests adapter semantics, not NCCL or capture.
+    """
+
+    available = True
+
+    def __init__(self, group):
+        self.group = group
+        self.ranks = dist.get_process_group_ranks(group)
+        self.disabled = True
+
+    @contextmanager
+    def change_state(self, enable):
+        previous = self.disabled
+        self.disabled = not enable
+        try:
+            yield
+        finally:
+            self.disabled = previous
+
+    def broadcast(self, tensor, src):
+        assert not self.disabled
+        dist.broadcast(tensor, src=self.ranks[src], group=self.group)
+
+    def all_reduce(self, tensor, op):
+        assert not self.disabled
+        dist.all_reduce(tensor, op=op, group=self.group)
+
+
+def _check_device_bridge(sync, ranks, device):
+    """Lookup precedes consensus; graph replay and metrics see unanimous masks.
+
+    Only the native lookup/build boundary is replaced. Process groups, request
+    leases, extension binding, graph staging, consensus and metrics are real.
+    """
+    rank = dist.get_rank()
+    for k in (1, 3):
+        config = HybridConfig(k, 2, 4, 32, history_mode="device")
+
+        class LookupBackend:
+            def __init__(self):
+                self.config, self.device = config, device
+                self.tokens = torch.arange(4 * k, device=device).reshape(4, k) + 10
+                self.mask = torch.ones(4, dtype=torch.bool, device=device)
+                self.feedback = None
+
+            def prepare_host(self, history):
+                return history
+
+            def build_host(self, host, vocab):
+                return host
+
+            def import_host(self, slot, host):
+                pass
+
+            def initialize_device_slot(self, *args):
+                pass
+
+            def stage_feedback(self, *args):
+                self.feedback = args
+
+            def consume_and_query(self, slots, generations, seq_lens, tokens, mask):
+                # GPU-safe test boundary so the NCCL case captures this too.
+                tokens.copy_(self.tokens[slots.clamp_min(0)])
+                mask.copy_((slots >= 0) & self.mask[slots.clamp_min(0)])
+
+        backend = LookupBackend()
+        extension = DeviceDraftExtension(config, backend, 100, tp_sync=sync)
+        requests = [Request(str(i)) for i in range(4)]
+        batch = SimpleNamespace(
+            reqs=requests,
+            seq_lens_cpu=torch.full((4,), 5),
+            seq_lens=torch.full((4,), 5, device=device),
+            forward_mode=SimpleNamespace(is_idle=lambda: False),
+            is_extend_in_batch=False,
+            has_grammar=False,
+            sampling_info=SimpleNamespace(is_all_greedy=True),
+        )
+        draft = SimpleNamespace(draft_override=None)
+        try:
+            ticket = extension.begin_prefill(batch)
+            extension.on_prefill(
+                batch,
+                SimpleNamespace(next_token_ids=torch.full((4,), 2, device=device)),
+                ticket,
+            )
+            buffers = extension.create_graph_buffers(8)
+            captured = buffers.bind_capture_view(8)
+            seq_lens = torch.ones(8, dtype=torch.int64, device=device)
+            neural = torch.full((8, k), 99, dtype=torch.int64, device=device)
+
+            def run():
+                captured.prepare(seq_lens)
+                return torch.cat(
+                    [captured.select_step(neural[:, :1], step) for step in range(k)],
+                    dim=1,
+                )
+
+            graph = None
+            if device.type == "cuda":
+                stream = torch.cuda.Stream()
+                stream.wait_stream(torch.cuda.current_stream())
+                with torch.cuda.stream(stream):
+                    for _ in range(3):
+                        output = run()
+                torch.cuda.current_stream().wait_stream(stream)
+                graph = torch.cuda.CUDAGraph()
+                with torch.cuda.graph(graph):
+                    output = run()
+
+            # State changes happen AFTER capture, including all-false local mask.
+            for mode in ("agree", "diverge", "one_rank_neural", "agree"):
+                backend.tokens.copy_(
+                    torch.arange(4 * k, device=device).reshape(4, k) + 10
+                )
+                backend.mask.fill_(True)
+                if mode == "diverge" and rank == ranks[-1]:
+                    backend.tokens[1, -1].add_(1)
+                    backend.mask[2] = False
+                if mode == "one_rank_neural" and rank == ranks[-1]:
+                    backend.mask.zero_()
+                # Reorder requests; slots and graph padding must stay row aligned.
+                batch.reqs = requests[::-1]
+                with extension.bind(batch, draft) as view:
+                    # The eager view must carry the same synchronizer as the
+                    # graph view. Query again below to test live graph inputs.
+                    view.prepare(batch.seq_lens)
+                    eager_mask = view.use_retrieval.clone()
+                    buffers.stage(view, 4, 8)
+                    seq_lens[:4].fill_(5)
+                    if graph is None:
+                        output = run()
+                    else:
+                        graph.replay()
+                    expected_mask = [True] * 4
+                    if mode == "diverge":
+                        expected_mask = [True, False, len(ranks) == 1, True]
+                    elif mode == "one_rank_neural":
+                        expected_mask = [False] * 4
+                    assert view.use_retrieval.tolist() == expected_mask
+                    assert eager_mask.tolist() == expected_mask
+                    root_tokens = torch.arange(4 * k, device=device).reshape(4, k) + 10
+                    if mode == "diverge" and len(ranks) == 1:
+                        root_tokens[1, -1].add_(1)
+                    assert torch.equal(captured.tokens[:4], root_tokens.flip(0))
+                    assert not captured.use_retrieval[4:].any()
+                    expected = neural.clone()
+                    for row, enabled in enumerate(expected_mask):
+                        if enabled:
+                            expected[row] = backend.tokens[3 - row]
+                    assert torch.equal(output, expected)
+                assert draft.draft_override is None
+                result = SimpleNamespace(
+                    next_token_ids=torch.tensor(
+                        [20, 21, 22, 23], dtype=torch.int32, device=device
+                    ),
+                    accept_index=torch.arange(4, dtype=torch.int32, device=device)[
+                        :, None
+                    ],
+                    accept_lens=torch.ones(4, dtype=torch.int32, device=device),
+                )
+                before = extension.metrics.snapshot()["retrieval_requests"]
+                extension.on_device_verify(result, batch)
+                assert extension.metrics.snapshot()[
+                    "retrieval_requests"
+                ] - before == sum(expected_mask)
+                assert backend.feedback[2] is result.next_token_ids
+
+            # Free a slot on only one rank; all ranks must still communicate and
+            # unanimously fall back for that row, even if lease maps differ.
+            if rank == ranks[-1]:
+                extension.close_request(requests[3].rid)
+            batch.reqs, batch.seq_lens = [requests[3]], batch.seq_lens[:1]
+            with extension.bind(batch, draft) as view:
+                buffers.stage(view, 1, 8)
+                if graph is None:
+                    output = run()
+                else:
+                    graph.replay()
+                assert not view.use_retrieval.any()
+                assert torch.equal(output, neural)
+        finally:
+            extension.shutdown()
+
+
+def _check_device_sync(group, ranks, device):
+    if device.type == "cpu":
+        for communicator in (None, GlooCommunicator(group)):
+            sync = TPSynchronizer(group, ranks[0], communicator)
+            _check_device_bridge(sync, ranks, device)
+            if communicator is not None:
+                assert communicator.disabled  # eager must restore caller state
+    else:
+        # Real SGLang PyNccl; no ProcessGroupNCCL collective is captured.
+        from sglang.srt.distributed.device_communicators.pynccl import (
+            PyNcclCommunicator,
+        )
+
+        cpu_group = dist.new_group(ranks=ranks, backend="gloo")
+        communicator = PyNcclCommunicator(cpu_group, device)
+        sync = TPSynchronizer(group, ranks[0], communicator)
+        _check_device_bridge(sync, ranks, device)
+        _check_device_kernel_consensus(sync, ranks, device)
+        assert communicator.disabled
+        dist.destroy_process_group(cpu_group)
+
+
+def _check_device_kernel_consensus(sync, ranks, device):
+    """Actual host import, feedback, SA lookup and NCCL captured together."""
+    from hybrid_spec.backends.gpu_sa import GPUSuffixAutomaton
+
+    config = HybridConfig(3, 2, 3, 64, history_mode="device")
+    backend = GPUSuffixAutomaton(config, device)
+    prompts = [[1, 2, 3, 4, 1], [4, 5, 6, 7, 4], [1, 2, 3, 4, 1]]
+    if dist.get_rank() == ranks[-1]:
+        prompts[1] = [4, 5, 8, 9, 4]  # same version, different continuation
+    for slot, prompt in enumerate(prompts):
+        backend.initialize_device_slot(slot, 10 + slot, 64)
+        backend.import_host(slot, backend.build_host(backend.prepare_host(prompt), 100))
+    buffers = DeviceGraphBuffers(backend, 4, sync)
+    captured = buffers.bind_capture_view(4)
+    seq_lens = torch.full((4,), 5, device=device, dtype=torch.int64)
+    stream = torch.cuda.Stream()
+    stream.wait_stream(torch.cuda.current_stream())
+    with torch.cuda.stream(stream):
+        for _ in range(3):
+            captured.prepare(seq_lens)
+    torch.cuda.current_stream().wait_stream(stream)
+    graph = torch.cuda.CUDAGraph()
+    with torch.cuda.graph(graph):
+        captured.prepare(seq_lens)
+
+    slots = torch.arange(3, device=device, dtype=torch.int64)
+    generations = slots + 10
+    backend.stage_feedback(
+        slots,
+        generations,
+        torch.tensor([2, 5, 2], dtype=torch.int32, device=device),
+        torch.arange(3, dtype=torch.int32, device=device)[:, None],
+        torch.ones(3, dtype=torch.int32, device=device),
+        seq_lens[:3],
+        False,
+        100,
+    )
+    if dist.get_rank() == ranks[-1]:
+        backend.owners[2].add_(1)  # only this rank has a stale generation
+    view = DeviceOverride(backend, slots, generations, sync)
+    buffers.stage(view, 3, 4)
+    graph.replay()
+    assert view.use_retrieval.tolist() == [True, False, False]
+    assert captured.tokens[0].tolist() == [3, 4, 1]
+    assert not captured.use_retrieval[3:].any()
+    versions = backend.meta[:, 0].clone()
+    graph.replay()
+    assert torch.equal(backend.meta[:, 0], versions)  # feedback consumed once
+
+    # Accepted prefix remains on device and drives the next captured query.
+    backend.stage_feedback(
+        slots[:1],
+        generations[:1],
+        torch.tensor([3, 4, 1, 2], dtype=torch.int32, device=device),
+        torch.arange(4, dtype=torch.int32, device=device)[None, :],
+        torch.tensor([4], dtype=torch.int32, device=device),
+        seq_lens[:1],
+        True,
+        100,
+    )
+    reordered = DeviceOverride(
+        backend, slots[:2].flip(0), generations[:2].flip(0), sync
+    )
+    buffers.stage(reordered, 2, 4)
+    seq_lens[:2].copy_(torch.tensor([5, 9], device=device))
+    graph.replay()
+    assert reordered.use_retrieval.tolist() == [False, True]
+    assert backend.history[0, :10].tolist() == [1, 2, 3, 4, 1, 2, 3, 4, 1, 2]
+    assert not captured.use_retrieval[2:].any()
 
 
 def _check_consensus(group, ranks, device):
@@ -149,12 +438,14 @@ def _worker(rank, world_size, init_method, backend):
     )
     try:
         _check_consensus(dist.group.WORLD, list(range(world_size)), device)
+        _check_device_sync(dist.group.WORLD, list(range(world_size)), device)
         if world_size == 4:
             # Source is global rank 1, not global rank 0 or subgroup rank 1.
             ranks = [1, 3]
             group = dist.new_group(ranks=ranks, timeout=timedelta(seconds=60))
             if rank in ranks:
                 _check_consensus(group, ranks, device)
+                _check_device_sync(group, ranks, device)
                 dist.destroy_process_group(group)
             dist.barrier()
     finally:

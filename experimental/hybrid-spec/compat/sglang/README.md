@@ -37,7 +37,12 @@ global rank in `get_tp_group().ranks` as the broadcast source. Each rank owns an
 SA replica. Before draft execution, the plugin broadcasts candidates and reduces
 eligibility/candidate agreement with MIN. A disagreement falls back on all ranks.
 This relies on the native TP scheduler providing the same ordered batch and K.
-Collectives run outside CUDA Graph capture/replay, on the current forward stream.
-TP=1 creates no synchronizer. This TP description applies to CPU history;
-device history currently requires TP=1 and does not inherit TP validation.
+CPU-history collectives run outside CUDA Graph capture/replay. Device history
+runs consensus inside `prepare(seq_lens)`, AFTER local SA lookup and BEFORE
+token selection. Eager and captured paths use the TP group's existing PyNccl
+communicator on the current stream, with explicit enable/restore and conversion
+from global source rank to group-relative root. Device TP fails if PyNccl is
+unavailable. Graph outputs are copied back into the existing tokens/mask storage,
+so verify metrics see the final unanimous mask. TP=1 creates no synchronizer.
+CPU Gloo bridge tests do not establish GPU/NCCL or model correctness.
 DP/PP/EP/CP and multi-node remain rejected.

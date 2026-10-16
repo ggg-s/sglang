@@ -124,15 +124,20 @@ def _attach(result, worker, *args, **kwargs):
         )
     validate_model(worker)
     config = _config()
-    # Construction occurs before the scheduler budgets/allocates model KV.
-    # cuda:<gpu_id> pins storage to this worker even with a different default device.
-    backend = GPUSuffixAutomaton(config, f"cuda:{worker.gpu_id}")
     tp_group = get_tp_group()
+    communicator = None
+    if config.history_mode == "device" and tp_group.world_size > 1:
+        communicator = tp_group.pynccl_comm
+        if communicator is None or not communicator.available:
+            raise ValueError("device history TP requires SGLang's PyNccl communicator")
     tp_sync = (
-        TPSynchronizer(tp_group.device_group, tp_group.ranks[0])
+        TPSynchronizer(tp_group.device_group, tp_group.ranks[0], communicator)
         if tp_group.world_size > 1
         else None
     )
+    # Construction occurs before the scheduler budgets/allocates model KV.
+    # cuda:<gpu_id> pins storage to this worker even with a different default device.
+    backend = GPUSuffixAutomaton(config, f"cuda:{worker.gpu_id}")
     extension_type = DraftExtension
     if config.history_mode == "device":
         from hybrid_spec.integrations.sglang.device_extension import (
