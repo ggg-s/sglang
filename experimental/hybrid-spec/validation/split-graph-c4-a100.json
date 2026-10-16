@@ -1,0 +1,287 @@
+{
+  "runs": [
+    {
+      "completed": 50,
+      "total_output_tokens": 80324,
+      "output_throughput": 807.2374445146183,
+      "mean_tpot_ms": 4.588772426089706,
+      "p95_tpot_ms": 6.065696994121162,
+      "mean_ttft_ms": 112.70602846518159,
+      "accept_length": 5.588263888888889,
+      "mode": "native",
+      "repeat": 1,
+      "duration": 99.5047994190827,
+      "sa_fraction": null
+    },
+    {
+      "completed": 50,
+      "total_output_tokens": 77808,
+      "output_throughput": 867.9336104340618,
+      "mean_tpot_ms": 4.374000617831105,
+      "p95_tpot_ms": 6.006471165394456,
+      "mean_ttft_ms": 103.56769196689129,
+      "accept_length": 6.080570938304344,
+      "mode": "native",
+      "repeat": 2,
+      "duration": 89.64740973804146,
+      "sa_fraction": null
+    },
+    {
+      "completed": 50,
+      "total_output_tokens": 82611,
+      "output_throughput": 857.2280311020354,
+      "mean_tpot_ms": 4.30498992066966,
+      "p95_tpot_ms": 6.486259179274425,
+      "mean_ttft_ms": 109.22870310023427,
+      "accept_length": 5.977259601501588,
+      "mode": "full",
+      "repeat": 1,
+      "duration": 96.36992375738919,
+      "sa_fraction": 0.4247660187185025
+    },
+    {
+      "completed": 50,
+      "total_output_tokens": 80018,
+      "output_throughput": 877.5288381246993,
+      "mean_tpot_ms": 4.276791551620744,
+      "p95_tpot_ms": 6.537185727700984,
+      "mean_ttft_ms": 108.49025703966618,
+      "accept_length": 6.075845886004087,
+      "mode": "full",
+      "repeat": 2,
+      "duration": 91.185607268475,
+      "sa_fraction": 0.4404896848787123
+    },
+    {
+      "completed": 50,
+      "total_output_tokens": 81438,
+      "output_throughput": 855.2077855413394,
+      "mean_tpot_ms": 4.460457165670482,
+      "p95_tpot_ms": 6.3920265572981805,
+      "mean_ttft_ms": 115.28033578768373,
+      "accept_length": 5.751268320180383,
+      "mode": "split",
+      "repeat": 1,
+      "duration": 95.22598060593009,
+      "sa_fraction": 0.3888302736160934,
+      "split_counter_delta": {
+        "prefix_ct": 3610,
+        "skip_ct": 137,
+        "tail_ct": 3473,
+        "decision_wait_ns": 5876427904,
+        "request_ct": 14217,
+        "skip_request_ct": 5528,
+        "tail_request_ct": 8689,
+        "mixed_ct": 2847,
+        "tail_batch_histogram": {
+          "0": 137,
+          "1": 595,
+          "2": 1081,
+          "3": 1256,
+          "4": 541
+        }
+      },
+      "skip_request_fraction": 0.3888302736160934,
+      "all_hit_batch_fraction": 0.03795013850415512,
+      "mixed_batch_fraction": 0.7886426592797784,
+      "decision_wait_mean_ms": 1.6278193639889196
+    },
+    {
+      "completed": 50,
+      "total_output_tokens": 84386,
+      "output_throughput": 837.3039017482403,
+      "mean_tpot_ms": 4.350964198814957,
+      "p95_tpot_ms": 6.218953222617812,
+      "mean_ttft_ms": 112.37191127613187,
+      "accept_length": 5.84055567074435,
+      "mode": "split",
+      "repeat": 2,
+      "duration": 100.78300103917718,
+      "sa_fraction": 0.4072161399159953,
+      "split_counter_delta": {
+        "prefix_ct": 3919,
+        "skip_ct": 147,
+        "tail_ct": 3772,
+        "decision_wait_ns": 6536745172,
+        "request_ct": 14523,
+        "skip_request_ct": 5914,
+        "tail_request_ct": 8609,
+        "mixed_ct": 2983,
+        "tail_batch_histogram": {
+          "0": 147,
+          "1": 982,
+          "2": 1212,
+          "3": 1109,
+          "4": 469
+        }
+      },
+      "skip_request_fraction": 0.4072161399159953,
+      "all_hit_batch_fraction": 0.03750956876754274,
+      "mixed_batch_fraction": 0.7611635621331972,
+      "decision_wait_mean_ms": 1.6679625343199795
+    }
+  ],
+  "aggregate_arithmetic_mean": {
+    "native": {
+      "output_throughput": 837.5855274743401,
+      "mean_tpot_ms": 4.481386521960406,
+      "runs": 2
+    },
+    "full": {
+      "output_throughput": 867.3784346133673,
+      "mean_tpot_ms": 4.290890736145202,
+      "runs": 2
+    },
+    "split": {
+      "output_throughput": 846.2558436447898,
+      "mean_tpot_ms": 4.405710682242719,
+      "runs": 2
+    }
+  },
+  "notes": [
+    "TPOT is the official streaming benchmark statistic.",
+    "Acceptance length is the server cumulative statistic, including warmups/pilot, not a per-run recomputation.",
+    "Split counters include official warmup and measurement; raw padding rows are excluded.",
+    "No task correctness evaluation was run, as requested."
+  ],
+  "split_vs_native": {
+    "output_throughput": 1.0351559197296911,
+    "mean_tpot_ms": -1.688670221746058
+  },
+  "split_vs_full": {
+    "output_throughput": -2.435222058292563,
+    "mean_tpot_ms": 2.6759000207184913
+  },
+  "input_length_vector_sha256": "5a21206b040cad8681d7166a646bc3dd448171abae4b46632aa466d4c0bdd1ba",
+  "input_alignment_verified": true,
+  "protocol": {
+    "created_utc": "2026-10-16T15:21:45.270099+00:00",
+    "base_commit": "cc120afd321df4aeef604415762da9180a51911f",
+    "model": "/root/rivermind-data/models/Qwen/Qwen3.5-35B-A3B-GPTQ-Int4",
+    "gpu": "NVIDIA A100-PCIE-40GB, 580.119.02, 40960 MiB",
+    "concurrency": 4,
+    "tp": 1,
+    "num_drafts": 8,
+    "verify_width": 9,
+    "sa_min_match_len": 4,
+    "neural_gate_tokens": 2,
+    "max_history_tokens": 16384,
+    "max_running_requests": 4,
+    "cuda_graph_max_bs_decode": 4,
+    "draft_attention_backend": "triton",
+    "target_attention_backend": "flashinfer",
+    "linear_attention_backend": "triton",
+    "target_dtype": "float16",
+    "target_quantization": "gptq_marlin",
+    "draft_quantization": "unquant",
+    "max_tokens": 2048,
+    "respect_eos": true,
+    "temperature": 0,
+    "seed": 42,
+    "num_prompts": 50,
+    "repeats": 2,
+    "warmup_requests": 4,
+    "official_client": "python -m sglang.benchmark.serving",
+    "prompt_template": "sa-spec original raw completion template",
+    "dataset": "glaiveai/code_edits_sample",
+    "correctness_evaluation": "not run, per user request",
+    "scope": "Performance comparison; no claim of output equivalence or quality validation",
+    "data_sha256": "dce8441724eed09c742fccbe3e29d5b6dda8959a0f1096c893da689e06280f2f",
+    "environment": {
+      "python": "3.12.13 | packaged by Anaconda, Inc. | (main, Mar 19 2026, 20:20:58) [GCC 14.3.0]",
+      "packages": {
+        "sglang": "0.0.0.dev1+g722f338ba",
+        "torch": "2.14.1",
+        "triton": "3.8.0",
+        "transformers": "5.19.0",
+        "flashinfer-python": "0.7.1"
+      },
+      "source_revision_note": "Editable distribution metadata is not the executed source revision; see base_commit and final-source-sha256.json."
+    }
+  },
+  "trace": {
+    "summary": {
+      "rows": 8,
+      "forward_counts": {
+        "7": 6,
+        "1": 2
+      },
+      "mean_graph_span_sum_us": 5329.017974853516,
+      "mean_total_span_us": 5834.229431152344,
+      "mean_inter_graph_gap_us": 505.2114562988281,
+      "by_forward_count": {
+        "1": {
+          "count": 2,
+          "graph_span_us": 1036.6796875
+        },
+        "7": {
+          "count": 6,
+          "graph_span_us": 7433.412679036458
+        }
+      }
+    },
+    "by_tail_rows": {
+      "1": {
+        "count": 3,
+        "mean_graph_span_ms": 5.537276692708333,
+        "mean_gemm_sum_ms": 4.422996333333334,
+        "mean_lm_head_sum_ms": 4.217405666666666
+      },
+      "2": {
+        "count": 2,
+        "mean_graph_span_ms": 5.749048583984375,
+        "mean_gemm_sum_ms": 4.821221,
+        "mean_lm_head_sum_ms": 4.248207000000001
+      },
+      "4": {
+        "count": 1,
+        "mean_graph_span_ms": 6.1360439453125,
+        "mean_gemm_sum_ms": 4.891074000000001,
+        "mean_lm_head_sum_ms": 4.2896
+      }
+    },
+    "row_forward_counts": [
+      28,
+      10,
+      10,
+      16,
+      10,
+      16,
+      4,
+      4
+    ],
+    "path": "/root/rivermind-data/validation/split-graph-c4-20261016/split/profile/traces/1792164889.336533/split-c4-1792164889.3382773-TP-0.trace.json.gz"
+  },
+  "validation": {
+    "local_cpu": "141 passed",
+    "a100_cpu_native_gloo": "148 passed, 1 skipped",
+    "correctness": "GSM8K/task correctness not run, as requested",
+    "a100_cuda": "15 passed",
+    "services_stopped": true
+  },
+  "memory": {
+    "split_draft_graph_gb": 0.41,
+    "full_draft_graph_gb": 0.03,
+    "source": "Native startup logging; rounded GB values, not whole-service allocation"
+  },
+  "conclusion": "No demonstrated extra performance benefit from per-request tail compaction at C4: compared with full MTP+SA, mean throughput -2.44%, TPOT +2.68%. Against native MTP, +1.04% throughput and -1.69% TPOT are smaller than observed native repeat variation.",
+  "evidence": {
+    "archive": "/root/rivermind-data/validation/split-graph-c4-evidence-20261016.zip",
+    "sha256": "ab5c7e4278bcab1a252ab452b287f73d421fe2914ed51fe239a5af9143eb4231",
+    "bytes": 11248767,
+    "files": 117
+  },
+  "runtime_source_sha256": {
+    "experimental/hybrid-spec/src/hybrid_spec/config.py": "b55a3b385b107b37c63e693f89cc24c462bae04109d56cc6e033a898d71a371f",
+    "experimental/hybrid-spec/src/hybrid_spec/integrations/sglang/compatibility.py": "6976eeb7d85225ca86224bf0f97032f58c2886c11a229287d1e8201d22fef788",
+    "experimental/hybrid-spec/src/hybrid_spec/integrations/sglang/split_graph.py": "40997834cd3f18869e834338d2519b3e2a8789186a35dcd5d0a3ba66f3f10a57",
+    "experimental/hybrid-spec/src/hybrid_spec/plugin.py": "6a3c2a89a0a2fe62071be2ffd3f468bedf586f46506a47c57b6d101f664ade6f",
+    "experimental/hybrid-spec/tests/test_core.py": "924b7806f3c2082bf723e302567eba962e6ea39e5f66678849be02b6adb5031c",
+    "experimental/hybrid-spec/tests/test_cuda.py": "be720b1d2df64138825fe26801514e641cfb5cc2e4fe8b523f4768fac7849154",
+    "experimental/hybrid-spec/tests/test_draft_recurrence.py": "2d888f470a88cd38edff6955f8b9b21af9333a8637502dba85b3f427e5819387",
+    "python/sglang/srt/speculative/eagle_draft_cuda_graph_runner.py": "85e35f12ceba1099e810667d88770b3fbba2af125c5077dee4c7c22db8bf8d14",
+    "python/sglang/srt/speculative/eagle_worker_v2.py": "5d4345ce62ed4fbd7dee5f888b604329f71641ddf967f30d02085965bb357d54",
+    "experimental/hybrid-spec/src/hybrid_spec/integrations/sglang/compact_graph.py": "2ba335f3e789768ef9d333f15c5da36cc95ccf414c795a7329707a6fa0d054a6",
+    "experimental/hybrid-spec/configs/device-qwen35-mtp-split-c4.json": "0047afcd1f4dd698c15b67e2bb3d9a7a308c8f4369b6ac0f174a15c6878ccad4"
+  }
+}

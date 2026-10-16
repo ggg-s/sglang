@@ -31,13 +31,17 @@ def validate_config(config, cfg):
         for name, expected in {
             "speculative_algorithm": "EAGLE",
             "tp_size": 1,
-            "max_running_requests": 1,
             "speculative_use_rejection_sampling": False,
             "disable_cuda_graph": False,
             "enable_memory_saver": False,
         }.items():
             if getattr(cfg, name, None) != expected:
                 errors.append(f"split draft graphs require {name}={expected!r}")
+        limit = getattr(cfg, "max_running_requests", None)
+        if type(limit) is not int or not 1 <= limit <= config.max_requests:
+            errors.append(
+                "split draft graphs require max_running_requests within max_requests<=4"
+            )
     if config.history_mode == "cpu" and not cfg.disable_overlap_schedule:
         errors.append("CPU history requires disable_overlap_schedule=True")
     # CLI store_true has no False spelling: no flag/no adapters leaves None,

@@ -1,4 +1,4 @@
-"""Experimental BS=1 split draft graph; the CPU decision intentionally syncs.
+"""Experimental small-batch split draft graphs; the CPU decision syncs.
 
 Prefix and tail use separate private pools: skipping a tail must not let a
 subsequent graph overwrite the prefix's hidden state or its complete SA chain.
@@ -33,14 +33,14 @@ class SplitDraftGraphBackend:
             raise ValueError("split draft graphs require the full CUDA graph backend")
         if (
             runner.topk != 1
-            or runner.max_bs != 1
+            or runner.max_bs > 4
             or runner.captured_req_width != 1
             or runner.eagle_worker.hot_token_id is not None
             or runner.eagle_worker.seed_dsa_topk_from_draft_extend
             or runner.model_runner.model_config.hf_config.architectures
             != ["Qwen3_5ForCausalLMMTP"]
         ):
-            raise ValueError("split draft graphs support only BS=1 Qwen3.5 MTP")
+            raise ValueError("split draft graphs support only BS<=4 Qwen3.5 MTP")
         self.delegate = delegate
         self.runner = runner
         self.mode = mode
@@ -51,6 +51,11 @@ class SplitDraftGraphBackend:
             "skip_ct": 0,
             "tail_ct": 0,
             "decision_wait_ns": 0,
+            "request_ct": 0,
+            "skip_request_ct": 0,
+            "tail_request_ct": 0,
+            "mixed_ct": 0,
+            "tail_batch_histogram": {str(n): 0 for n in range(5)},
         }
         # Expose actual branch counts without reading GPU counters in metrics.
         runner.eagle_worker.draft_extension.split_graph_counters = self.counters
@@ -71,6 +76,13 @@ class SplitDraftGraphBackend:
         self, shape_key, forward_fn, capture_inputs=None, post_warmup_hook=None
     ):
         batch = capture_inputs
+        if batch.batch_size > 1:
+            from .compact_graph import capture_compact
+
+            self.records[shape_key] = capture_compact(
+                self.runner, batch, forward_fn, self.stream, post_warmup_hook
+            )
+            return
         view = batch.spec_info.draft_override
         for _ in range(2):
             torch.cuda.synchronize()
@@ -91,7 +103,7 @@ class SplitDraftGraphBackend:
         active = prefix_ctx
         switched = False
 
-        def prefix_ready():
+        def prefix_ready(*_):
             nonlocal active, switched
             if switched:
                 raise RuntimeError("split draft prefix boundary reached twice")
@@ -119,10 +131,16 @@ class SplitDraftGraphBackend:
         self.records[shape_key] = SplitCapture(prefix, tail, output, batch, view)
 
     def can_run(self, forward_batch, shape_key):
-        return forward_batch.batch_size == 1 and shape_key in self.records
+        return 1 <= forward_batch.batch_size <= 4 and shape_key in self.records
 
     def replay(self, shape_key, static_forward_batch, **kwargs):
         record = self.records[shape_key]
+        from .compact_graph import CompactCapture, replay_compact
+
+        if isinstance(record, CompactCapture):
+            return replay_compact(
+                record, self.mode, self.counters, self.runner.raw_bs
+            )
         record.prefix.replay()
         begin = time.perf_counter_ns()
         # This includes unfinished prefix GPU work, not just the incremental
@@ -131,19 +149,28 @@ class SplitDraftGraphBackend:
             use_sa = bool(record.override.use_retrieval.item())
         self.counters["decision_wait_ns"] += time.perf_counter_ns() - begin
         self.counters["prefix_ct"] += 1
+        self.counters["request_ct"] += 1
         if use_sa and self.mode == "split":
             self.counters["skip_ct"] += 1
+            self.counters["skip_request_ct"] += 1
+            self.counters["tail_batch_histogram"]["0"] += 1
             # run_once normally restores positions after all seven forwards;
             # the prefix ran only one. All other input buffers are restaged.
             record.inputs.positions.sub_(1)
         else:
             self.counters["tail_ct"] += 1
+            self.counters["tail_request_ct"] += 1
+            self.counters["tail_batch_histogram"]["1"] += 1
             record.tail.replay()
         return record.output
 
     def cleanup(self):
         for record in self.records.values():
             record.prefix.reset()
-            record.tail.reset()
+            if hasattr(record, "tails"):
+                for tail in record.tails.values():
+                    tail.graph.reset()
+            else:
+                record.tail.reset()
         self.records.clear()
         self.delegate.cleanup()

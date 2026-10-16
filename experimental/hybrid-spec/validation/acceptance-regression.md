@@ -302,5 +302,6 @@ stop，未截断）。原生答对而 split 答错亦为 0，反向为 1（gsm8k
 [split-graph-a100.json](split-graph-a100.json)，包含测试协议、数据哈希、
 官方统计、分支计数、重复性与逐题质量对照。完整 trace、命令、原始生成、
 实际 benchmark 源码快照和最终验证日志保留在上述 A100 实验目录；本机亦
-下载原始证据归档。两段 Graph 属于默认关闭的单并发原型，尚未实现 GPU
-conditional node 或独立 SA stream，也不支持多请求压缩重排。
+下载原始证据归档。当时的两段 Graph 属于默认关闭的单并发原型，未实现 GPU
+conditional node、独立 SA stream 或多请求压缩重排。后续并发 4 的逐请求
+尾段压缩与独立对照见[并发 4 实验](split-graph-c4.md)。

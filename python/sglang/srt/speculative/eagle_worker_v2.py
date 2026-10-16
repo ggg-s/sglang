@@ -872,7 +872,15 @@ class EagleDraftWorker(EagleDraftWorkerBase):
                         draft_tokens_topk1[:, i + 1 : i + 2].copy_(topk_index)
                 hidden_states = logits_output.hidden_states
                 if i == 0 and prefix_ready is not None:
-                    prefix_ready()
+                    prefix_output = prefix_ready(
+                        forward_batch,
+                        topk_index,
+                        hidden_states,
+                        out_cache_loc,
+                        draft_tokens_topk1,
+                    )
+                    if prefix_output is not None:
+                        return prefix_output
 
         draft_probs = (
             torch.stack(draft_probs_list, dim=1) if needs_draft_probs else None

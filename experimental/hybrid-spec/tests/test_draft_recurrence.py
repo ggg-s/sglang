@@ -129,7 +129,7 @@ def test_selected_prefix_drives_model_and_verify_chain(
     )
     prefix_boundaries = []
     if gate and matrix and not hot:
-        view.on_prefix_ready = lambda: prefix_boundaries.append(len(inputs))
+        view.on_prefix_ready = lambda *_: prefix_boundaries.append(len(inputs))
     batch = SimpleNamespace(
         batch_size=2,
         forward_mode=SimpleNamespace(is_idle=lambda: False),

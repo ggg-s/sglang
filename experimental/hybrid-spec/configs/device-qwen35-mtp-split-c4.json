@@ -1,0 +1,11 @@
+{
+  "num_drafts": 8,
+  "min_match_len": 4,
+  "max_requests": 4,
+  "max_history_tokens": 16384,
+  "backend": "gpu_sa",
+  "history_mode": "device",
+  "partial_drafts": "fallback",
+  "num_neural_gate_tokens": 2,
+  "draft_graph_mode": "split"
+}

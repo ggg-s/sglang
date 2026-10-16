@@ -100,7 +100,7 @@ class EAGLEDraftCudaGraphRunner(DecodeCudaGraphRunner):
     """
 
     DRAFT_EXTENSION_API_VERSION = 2
-    DRAFT_SPLIT_GRAPH_API_VERSION = 1
+    DRAFT_SPLIT_GRAPH_API_VERSION = 2
 
     def __init__(
         self,

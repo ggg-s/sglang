@@ -46,10 +46,10 @@ class HybridConfig:
             self.history_mode != "device"
             or self.num_neural_gate_tokens != 2
             or self.num_drafts <= 2
-            or self.max_requests != 1
+            or self.max_requests > 4
         ):
             raise ValueError(
-                "split draft graphs require device history, one request, "
+                "split draft graphs require device history, at most four requests, "
                 "num_neural_gate_tokens=2 and num_drafts>2"
             )
 

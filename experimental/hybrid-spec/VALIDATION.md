@@ -1,5 +1,19 @@
 # 验证记录
 
+## 并发 4：混合批逐请求裁剪尾段（2026-10-16）
+
+已实现最多 4 请求的紧凑 MTP 尾段 Graph：整批先检查两个 neural token，
+只收集未命中 SA 的行执行剩余 6 次 MTP forward，最后写回原请求行。
+A100、TP=1、同一 50 条 edits、2048 输出上限，每种模式重复两轮，均使用
+Triton draft attention。原生/full/裁剪的平均吞吐为 837.59/867.38/846.26
+token/s，平均 TPOT 为 4.4814/4.2909/4.4057 ms。裁剪相对 full 吞吐
+−2.44%、TPOT +2.68%，本次没有额外性能收益；相对原生的约 1% 吞吐差异
+小于原生重复波动。约 39.8% 的 decode 请求行跳过尾段，但整批免尾段仅
+3.77%（含收尾小批）；小 batch 缩行后 LM head 耗时几乎不变。
+按用户要求未做 GSM8K/任务正确性评测。实现、逐轮数据、trace、边界和验证
+见[并发 4 实验](validation/split-graph-c4.md)。当前需要 split Graph API v2，
+默认仍为 full；CUDA SA 布局保持 v3。
+
 ## 并发 1 两段 Graph 提前退出（2026-10-16）
 
 已实现 opt-in `draft_graph_mode=split`：前两个 token 与 MTP 一致后跳过剩余

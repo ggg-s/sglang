@@ -133,11 +133,24 @@ def test_split_graph_alternating_skip_fallback_preserves_prefix_storage(mode):
     backend.records = {}
     backend.stream = torch.cuda.Stream()
     backend.mode = mode
-    backend.counters = dict(prefix_ct=0, skip_ct=0, tail_ct=0, decision_wait_ns=0)
+    backend.counters = {
+        "prefix_ct": 0,
+        "skip_ct": 0,
+        "tail_ct": 0,
+        "decision_wait_ns": 0,
+    }
+    backend.counters.update(
+        request_ct=0,
+        skip_request_ct=0,
+        tail_request_ct=0,
+        mixed_ct=0,
+        tail_batch_histogram={str(i): 0 for i in range(5)},
+    )
     candidates = torch.zeros((1, 4), dtype=torch.int64, device="cuda")
     eligibility = torch.ones(1, dtype=torch.bool, device="cuda")
     view = DraftOverrideView(candidates, torch.zeros_like(eligibility), 2)
     batch = SimpleNamespace(
+        batch_size=1,
         positions=torch.zeros(1, dtype=torch.int64, device="cuda"),
         spec_info=SimpleNamespace(draft_override=view),
     )
@@ -175,6 +188,185 @@ def test_split_graph_alternating_skip_fallback_preserves_prefix_storage(mode):
     assert backend.counters["prefix_ct"] == 5
     assert backend.counters["skip_ct"] == (2 if mode == "split" else 0)
     assert backend.counters["tail_ct"] == (3 if mode == "split" else 5)
+
+
+@pytest.mark.parametrize("mode", ["split", "split_no_skip"])
+def test_compact_tail_graph_reorders_rows_without_computing_sa_requests(
+    monkeypatch, mode
+):
+    """Compaction must gather recurrence/KV inputs and scatter to original rows.
+
+    Exercise all masks and a padded batch on real CUDA graphs. Only the model
+    and attention boundaries are synthetic; production gather/replay/scatter
+    and the native topk kernel execute unchanged.
+    """
+    from types import SimpleNamespace as NS
+
+    from hybrid_spec.integrations.sglang.compact_graph import (
+        capture_compact,
+        replay_compact,
+    )
+    from sglang.kernels.ops.speculative.topk1 import draft_topk1_postprocess
+    from sglang.srt.layers.attention import triton_backend
+
+    class Attention:
+        def __init__(self, *args):
+            self.attn_backends = [None] * 7
+
+        def init_cuda_graph_state(self, *args):
+            pass
+
+        def init_forward_metadata_out_graph(self, *args, **kwargs):
+            pass
+
+        def init_forward_metadata_in_graph(self, *args):
+            pass
+
+    monkeypatch.setattr(triton_backend, "TritonMultiStepDraftBackend", Attention)
+    device = "cuda"
+    steps = 8
+    seed = torch.tensor([2, 4, 6, 8], device=device)
+    initial_hidden = torch.tensor([[1.0], [3.0], [5.0], [7.0]], device=device)
+    base_positions = torch.tensor([11, 17, 23, 31], device=device)
+    cache = torch.arange(32, device=device).reshape(8, 4) + 40
+    reqs = torch.tensor([3, 0, 2, 1], device=device)
+    work = torch.zeros(4, dtype=torch.int64, device=device)
+    eligible = torch.ones(4, dtype=torch.bool, device=device)
+    view = DraftOverrideView(
+        torch.zeros((4, 8), dtype=torch.int64, device=device), eligible.clone(), 2
+    )
+    fb = NS(
+        batch_size=4,
+        positions=base_positions.clone(),
+        mrope_positions=base_positions.expand(3, 4).clone(),
+        seq_lens=base_positions.clone(),
+        req_pool_indices=reqs,
+        extend_seq_lens=torch.ones(4, dtype=torch.int32, device=device),
+        spec_info=NS(draft_override=view),
+        mark_forward_metadata_ready=lambda: None,
+    )
+
+    def model_forward(batch):
+        work.index_add_(
+            0, batch.req_pool_indices, torch.ones_like(batch.req_pool_indices)
+        )
+        token = (
+            batch.input_ids
+            + batch.spec_info.hidden_states[:, 0].long()
+            + batch.positions
+            + batch.mrope_positions[0]
+            + batch.req_pool_indices
+            + batch.out_cache_loc
+        ) % 128
+        logits = torch.full((batch.batch_size, 128), -100.0, device=device)
+        logits.scatter_(1, token[:, None], 1.0)
+        return NS(
+            logits_output=NS(
+                next_token_logits=logits, hidden_states=batch.input_ids[:, None].float()
+            )
+        )
+
+    model = NS(
+        kv_index_translator=NS(is_translating=False),
+        canary_manager=None,
+        model_config=NS(model_is_mrope=True),
+        forward=model_forward,
+    )
+    worker = NS(
+        speculative_num_steps=steps,
+        _topk1_parents_prealloc=torch.zeros((4, 7), device=device),
+        _topk1_score_indices_prealloc=torch.zeros((4, 8), device=device),
+    )
+    runner = NS(
+        draft_attn_backend=Attention(),
+        model_runner=model,
+        speculative_num_steps=steps,
+        eagle_worker=worker,
+    )
+
+    def prefix():
+        view.use_retrieval.copy_(eligible)
+        tokens = view.select_step(seed[:, None], 0)
+        drafts = view.tokens.clone()
+        drafts[:, :1].copy_(tokens)
+        fb.input_ids = tokens.flatten()
+        fb.spec_info.hidden_states = initial_hidden
+        fb.out_cache_loc = cache[0]
+        logits = model_forward(fb).logits_output
+        _, tokens = draft_topk1_postprocess(
+            logits.next_token_logits, fb.positions, drafts, 1
+        )
+        fb.mrope_positions.add_(1)
+        tokens = view.select_step(tokens, 1)
+        drafts[:, 1:2].copy_(tokens)
+        result = view.on_prefix_ready(fb, tokens, logits.hidden_states, cache, drafts)
+        fb.positions.sub_(7)
+        return result
+
+    stream = torch.cuda.Stream()
+    record = capture_compact(runner, fb, prefix, stream, None)
+    # Reuse the ordinary allocator after capture. Losing Python ownership of
+    # staging tensors can otherwise pass small toy runs until another graph
+    # allocates the same blocks (the real serving crash's trigger).
+    poison = [
+        torch.full((size, width), 47, dtype=dtype, device=device)
+        for _ in range(32)
+        for size in range(1, 5)
+        for width in (1, 8)
+        for dtype in (torch.int64, torch.float32, torch.bool)
+    ]
+    for raw_bs in (4, 3, 2):
+        for bits in range(1 << raw_bs):
+            # Independent scalar recurrence fixes the expected chain.
+            expected = []
+            for row in range(4):
+                token, hidden = int(seed[row]), int(initial_hidden[row, 0])
+                chain = [token]
+                for step in range(7):
+                    nxt = (
+                        token
+                        + hidden
+                        + int(base_positions[row]) * 2
+                        + step * 2
+                        + int(reqs[row])
+                        + int(cache[step, row])
+                    ) % 128
+                    hidden, token = token, nxt
+                    chain.append(token)
+                expected.append(chain)
+            candidates = torch.tensor(expected, device=device)
+            candidates[:, 2:] = 99
+            hit = [(bits >> i) & 1 == 1 and i < raw_bs for i in range(4)]
+            # Rejections happen at candidate one, preserving native prefix.
+            for row in range(4):
+                if not hit[row]:
+                    candidates[row, 1] = (candidates[row, 1] + 1) % 128
+                else:
+                    expected[row][2:] = [99] * 6
+            view.tokens.copy_(candidates)
+            fb.positions.copy_(base_positions)
+            fb.mrope_positions.copy_(base_positions.expand(3, 4))
+            work.zero_()
+            counters = {
+                "prefix_ct": 0,
+                "skip_ct": 0,
+                "tail_ct": 0,
+                "decision_wait_ns": 0,
+                "request_ct": 0,
+                "skip_request_ct": 0,
+                "tail_request_ct": 0,
+                "mixed_ct": 0,
+                "tail_batch_histogram": {str(i): 0 for i in range(5)},
+            }
+            output = replay_compact(record, mode, counters, raw_bs)[2]
+            assert output[:raw_bs].tolist() == expected[:raw_bs]
+            counts = work[reqs].tolist()
+            assert counts == [
+                1 + (6 if i < raw_bs and (mode == "split_no_skip" or not hit[i]) else 0)
+                for i in range(4)
+            ]
+            assert torch.equal(fb.positions, base_positions)
+    assert poison  # keep allocator pressure alive through every replay
 
 
 @pytest.mark.parametrize("partial", ["fallback", "zero"])

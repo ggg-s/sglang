@@ -864,7 +864,7 @@ def test_invalid_neural_gate_width(value):
     [
         {"draft_graph_mode": "unknown"},
         {"num_neural_gate_tokens": 1},
-        {"max_requests": 2},
+        {"max_requests": 5},
         {"history_mode": "cpu"},
         {"num_drafts": 2},
     ],
@@ -913,6 +913,26 @@ def test_split_graph_runtime_configuration_fails_closed():
     ):
         with pytest.raises(ValueError, match="split draft graphs require"):
             validate_config(config, SimpleNamespace(**(values | {field: value})))
+
+
+def test_compact_dispatch_uses_raw_count_before_runner_restores_padding(monkeypatch):
+    """The runner temporarily sets batch_size=4 for three live requests.
+
+    Dispatch must use raw_bs or a padded sink row enters the neural tail and
+    inflates request counters. The compact gather itself is tested on CUDA.
+    """
+    from hybrid_spec.integrations.sglang import compact_graph
+    from hybrid_spec.integrations.sglang.split_graph import SplitDraftGraphBackend
+
+    backend = object.__new__(SplitDraftGraphBackend)
+    backend.records = {4: compact_graph.CompactCapture(None, None, None, None, ())}
+    backend.mode = "split"
+    backend.counters = {}
+    backend.runner = SimpleNamespace(raw_bs=3)
+    monkeypatch.setattr(
+        compact_graph, "replay_compact", lambda record, mode, counters, raw_bs: raw_bs
+    )
+    assert backend.replay(4, SimpleNamespace(batch_size=4)) == 3
 
 
 def test_neural_gate_falls_back_before_divergence_and_resets_next_batch():
