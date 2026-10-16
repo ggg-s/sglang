@@ -1,5 +1,22 @@
 # 验证记录
 
+## 对照 sa-spec 的 device 热路径优化（2026-10-16）
+
+修改前 HEAD：`2d279d4f34`。直接对照本地 sa_spec 固定快照和已保存的 TRT-LLM #10951 集成，确认参考路径仍执行 MTP forward，在每步 sampler 选择 SA token 并将其用于下一步输入。没有将“保留 neural forward”误判为本实现独有的开销。
+
+本轮实现两项优化，均限 device 历史模式：
+
+1. **统计融合到已有反馈 kernel。** 原 `Metrics.record()` 每次 verify 单独执行六次 reduction，另有 dtype 转换、减法、乘法、stack 和计数累加。现在同一个 `feedback_kernel` 在收集接受路径时累加六个 int64 计数，每行更新所属来源的三项计数。统计发生在 slot/generation 校验之前，无 SA 槽或旧代际的 neural 行也计入；prefill 不计入 verify 统计。计数缓冲首次在消费 stream 分配，诊断仍显式同步读回，CPU 历史保留原实现。
+2. **固定请求映射不重复 staging。** 由 worker 构造的视图携带不可变的 host slot/generation key，连同 raw/padded batch size 检查。全部不变时跳过 slot 清零和两次 metadata 拷贝；重排、槽位复用、padding 形状变化均重新 staging。没有 host key 的可变视图仍每次拷贝。只缓存映射，不缓存 SA 查询、选择 mask 或 TP 共识结果。
+
+保留一次精确 TP all-reduce。参考库没有本实现的 rank-local fallback 协议，不能据此去掉共识。也未改变 K、阈值、候选、接受采样或 neural forward 次数，因此本轮目标是降低每轮成本，不声称提高接受长度。
+
+仍有值得单独测量的差异：sa_spec 转移边使用内联单边和哈希表，本实现使用链表扫描；高出度节点的查找成本随边数增加。容量扩大、host 构建、GPU 更新延迟需按历史长度和词表多样性扫描。没有原始 trace 或 GPU 测量证明它是当前 EAGLE3 退化的主因，本轮不混入 SA 布局重写。
+
+本地结果：`test_core.py` **38 passed**；`test_tp.py` **3 passed, 1 skipped**（真实 CPU Gloo TP=1/2/4、子组；NCCL 跳过）；`test_cuda.py` **7 skipped**。新增 CUDA 差分用例覆盖融合统计、无槽位行、过期代际、prefill 不计数。CPU 缓冲测试覆盖不变映射零写入、重排、代际变化、padding 缩小再扩大及可变视图。Ruff 修改文件检查、微基准 `--help` 和 `git diff --check` 通过。**本机无 CUDA/nvcc，未编译或执行修改后的 CUDA kernel，没有 GPU 加速比。**
+
+新增 `benchmarks/benchmark_device_overhead.py`：同进程交替测试原统计/融合统计、原映射 staging/固定映射复用，默认 B=1/4/32、K=8，每组 5 次、每次 200 轮，输出每次及中位数 stream/wall 微秒。两路反馈均包含相同的 pending 清空操作；它只隔离组件 eager 开销，不能代表端到端吞吐、GPU kernel 纯执行时间或 CUDA Graph 内耗时。安装插件后运行 README 命令，先执行 CUDA 差分测试，再做微基准及固定模型/数据/调度参数的 native/hybrid A/B。
+
 ## Device overlap + chunked prefill 接入（2026-10-16）
 
 修改前 HEAD：`b39fab6873`。device 历史原已允许 overlap；本轮放开其 chunked prefill 校验并补齐分块生命周期。CPU 历史仍要求 `--disable-overlap-schedule --chunked-prefill-size -1`，mixed prefill/decode 继续拒绝。

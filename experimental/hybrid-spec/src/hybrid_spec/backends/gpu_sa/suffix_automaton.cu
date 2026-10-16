@@ -2,6 +2,7 @@
 #include <c10/cuda/CUDAException.h>
 #include <c10/cuda/CUDAGuard.h>
 #include <climits>
+#include <optional>
 #include <torch/extension.h>
 
 #include "automaton.h"
@@ -160,12 +161,24 @@ __global__ void feedback_kernel(
     int *meta, const int64_t *owners, int *pending, int64_t *pending_meta,
     const int64_t *slots, const int64_t *generations, const int *predict,
     const int *indices, const int *lengths, const int64_t *seq_lens, int n,
-    int width, int index_width, int predict_size, bool has_anchor, int vocab) {
+    int width, int index_width, int predict_size, bool has_anchor, int vocab,
+    const bool *use_retrieval, int64_t *counts) {
   int row = blockIdx.x;
+  int count = lengths[row];
+  if (counts != nullptr) {
+    // Same six counters as Metrics: requests, correct drafts (without bonus),
+    // accept tokens (with bonus), each split into retrieval/neural. Record
+    // before slot validation: neural rows without an SA slot still count.
+    int source = use_retrieval[row] ? 0 : 1;
+    auto counters = reinterpret_cast<unsigned long long *>(counts);
+    atomicAdd(counters + source, 1ULL);
+    atomicAdd(counters + 2 + source,
+              static_cast<unsigned long long>(static_cast<int64_t>(count) - 1));
+    atomicAdd(counters + 4 + source, static_cast<unsigned long long>(count));
+  }
   int64_t slot = slots[row], generation = generations[row];
   if (slot < 0 || slot >= n || owners[slot] != generation)
     return;
-  int count = lengths[row];
   int64_t *pm = pending_meta + slot * 3;
   // Unconsumed feedback indicates a missing draft or duplicate delivery.
   bool valid = count > 0 && count <= width && count <= index_width && pm[2] == 0;
@@ -247,7 +260,9 @@ void stage_feedback(torch::Tensor meta, torch::Tensor owners,
                     torch::Tensor slots, torch::Tensor generations,
                     torch::Tensor predict, torch::Tensor indices,
                     torch::Tensor lengths, torch::Tensor seq_lens,
-                    bool has_anchor, int64_t vocab) {
+                    bool has_anchor, int64_t vocab,
+                    std::optional<torch::Tensor> use_retrieval,
+                    std::optional<torch::Tensor> counts) {
   check_device_metadata(meta, owners, pending, pending_meta, slots, generations,
                         seq_lens);
   for (const auto &t : {predict, indices, lengths})
@@ -256,6 +271,15 @@ void stage_feedback(torch::Tensor meta, torch::Tensor owners,
                   indices.size(0) == slots.size(0) && lengths.sizes() == slots.sizes() &&
                   vocab > 0 && vocab <= INT_MAX && predict.numel() < INT_MAX,
               "invalid verify feedback");
+  TORCH_CHECK(use_retrieval.has_value() == counts.has_value(),
+              "feedback metrics require both selection mask and counters");
+  if (counts.has_value()) {
+    check_tensor(*use_retrieval, torch::kBool, meta.device());
+    check_tensor(*counts, torch::kInt64, meta.device());
+    TORCH_CHECK(use_retrieval->sizes() == slots.sizes() && counts->dim() == 1 &&
+                    counts->numel() == 6,
+                "invalid feedback metrics shape");
+  }
   c10::cuda::CUDAGuard guard(meta.device());
   if (slots.numel()) {
     feedback_kernel<<<slots.numel(), 1, 0, at::cuda::getCurrentCUDAStream()>>>(
@@ -264,7 +288,8 @@ void stage_feedback(torch::Tensor meta, torch::Tensor owners,
         generations.data_ptr<int64_t>(), predict.data_ptr<int>(),
         indices.data_ptr<int>(), lengths.data_ptr<int>(), seq_lens.data_ptr<int64_t>(),
         meta.size(0), pending.size(1), indices.size(1), predict.numel(), has_anchor,
-        vocab);
+        vocab, use_retrieval ? use_retrieval->data_ptr<bool>() : nullptr,
+        counts ? counts->data_ptr<int64_t>() : nullptr);
     C10_CUDA_KERNEL_LAUNCH_CHECK();
   }
 }

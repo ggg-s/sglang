@@ -21,6 +21,12 @@ Device history includes pending GPU feedback, SA updates and lookup in the
 draft graph; CPU history stages local candidates and captures TP consensus.
 Version 2 requires the plugin's
 prefill and verify hooks for feedback; old CPU-history views need no `prepare`.
+Device verify accumulates the six existing source counters in the feedback
+kernel, including neural rows with no live SA slot. Prefill does not increment
+these counters. Diagnostic readback is still explicit and outside decode.
+Worker-created device views carry an immutable host mapping key. Graph staging
+may reuse slot/generation inputs only when that key and raw/padded batch sizes
+match; keyless mutable views always stage. Selection outputs are never cached.
 The prefill AROUND hook submits a GIL-free host build before target prefill,
 stages the GPU bonus after success and cancels matching leases on exceptions.
 With chunked prefill, device history does this only for final-chunk rows. The

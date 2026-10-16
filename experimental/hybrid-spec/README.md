@@ -36,6 +36,8 @@ GPU SA 使用每请求一个线程维护状态，尚未对大词表和长历史�
 
 针对根目录性能分析的后续改动与独立归因边界，见 [VALIDATION.md](VALIDATION.md) 顶部。当前两种历史模式都把 TP 共识放在 draft 的 `prepare()` 中，Graph 可捕获一次精确 MIN 归约；eager 在同一位置执行。不能根据某个 rank 的本地命中 mask 跳过通信。
 
+device 模式将六项来源统计融合到已有 GPU verify 反馈 kernel，避免每轮单独执行六次 PyTorch 归约及相关逐元素算子；诊断字段和 bonus 口径保持不变。Graph 槽位/代际映射在请求顺序、代际及捕获形状均不变时复用，避免重复清零和拷贝；SA 查询和 TP 共识仍每轮执行。CPU 历史保留原统计实现。该优化尚未在本机完成 CUDA 编译和 GPU 性能验证。
+
 `configs/device-k3.json` 提供与性能报告相同 K=3、阈值 4、整链 fallback 的设备历史配置，容量为 4×8192，约 2.25 MiB/卡，覆盖报告中并发 4、4096 输入 + 256 输出的负载。它同时改变历史模式和容量，仅作为运行配置，不是单变量归因证据；对照时应分别固定容量、固定历史模式。保留旧 `example.json` 以复现 CPU 路径。
 
 ## 安装
@@ -92,6 +94,17 @@ python -m sglang.launch_server \
 EAGLE3 / 普通 MTP 使用相应原生模型配置，分别保留原生 `EAGLE3` / `EAGLE` 算法身份，其他首版限制相同。先用 `--disable-cuda-graph` 验证 eager，再去掉该参数验收 Graph。
 
 上例启用 device 历史、overlap 和 2048 token 的 chunked prefill；不要添加 `--enable-mixed-chunk`。也可以省略 `--chunked-prefill-size` 使用 SGLang 为该模型解析的默认值。复现旧 CPU 历史基线时改回 `configs/example.json`，并恢复 `--disable-overlap-schedule --chunked-prefill-size -1`。做性能归因时分别比较两项都关闭、仅开启 overlap、两项都开启；native 与 hybrid 使用相同调度参数，且输入长度必须超过 chunk size 才实际覆盖分块路径。
+
+更新 CUDA 扩展代码后重启服务，PyTorch 会按源码变更重新编译。先验证 CUDA 算子，再运行无模型的组件微基准：
+
+```bash
+python -m pytest experimental/hybrid-spec/tests/test_cuda.py -q
+python experimental/hybrid-spec/benchmarks/benchmark_device_overhead.py \
+  --batch-sizes 1 4 32 --num-drafts 8 \
+  --output /tmp/hybrid-device-overhead.json
+```
+
+微基准交替比较原 PyTorch 统计/融合统计，以及原映射拷贝/固定映射缓存，记录各轮 CUDA event 区间与 wall time。反馈两路都包含 pending-state reset；结果只代表 eager 组件开销，包含 host launch gap，不能代替模型 TPOT 或整体加速比。
 
 Qwen3.6-35B-A3B-FP8 使用 `Qwen3_5MoeForConditionalGeneration` 架构。将上述算法改为 `EAGLE`，移除外部 draft model 路径，并添加 `--language-only`，使用 checkpoint 内置的 MTP。当前分支的 `--language-model-only` 不支持这个架构。该接入保留原生位置编码和 GDN 状态提交，只替换起草 token；实际多模态请求仍拒绝。启动成功和包级测试不能替代逐 token 对照验收。
 

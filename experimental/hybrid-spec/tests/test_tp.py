@@ -20,6 +20,7 @@ from hybrid_spec.integrations.sglang.device_extension import (
 from hybrid_spec.integrations.sglang.draft_extension import DraftExtension
 from hybrid_spec.integrations.sglang.graph_buffers import GraphBuffers
 from hybrid_spec.integrations.sglang.tp_sync import TPSynchronizer
+from hybrid_spec.observability.metrics import Metrics
 
 
 class Request:
@@ -92,8 +93,12 @@ def _check_device_bridge(sync, ranks, device):
             def initialize_device_slot(self, *args):
                 pass
 
-            def stage_feedback(self, *args):
+            def stage_feedback(self, *args, use_retrieval=None, counts=None):
                 self.feedback = args
+                if counts is not None:
+                    reference = Metrics()
+                    reference.record(use_retrieval, args[4])
+                    counts.add_(reference.counts)
 
             def consume_and_query(self, slots, generations, seq_lens, tokens, mask):
                 # GPU-safe test boundary so the NCCL case captures this too.

@@ -135,7 +135,18 @@ class GPUSuffixAutomaton:
         self.host_transfers.append((done, host))
 
     def stage_feedback(
-        self, slots, generations, predict, indices, lengths, seq_lens, has_anchor, vocab
+        self,
+        slots,
+        generations,
+        predict,
+        indices,
+        lengths,
+        seq_lens,
+        has_anchor,
+        vocab,
+        *,
+        use_retrieval=None,
+        counts=None,
     ):
         self._check_stream()
         self.module.stage_feedback(
@@ -151,6 +162,8 @@ class GPUSuffixAutomaton:
             seq_lens,
             has_anchor,
             vocab,
+            use_retrieval,
+            counts,
         )
 
     def consume_and_query(self, slots, generations, seq_lens, tokens, mask):

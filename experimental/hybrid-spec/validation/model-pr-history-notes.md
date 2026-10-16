@@ -40,3 +40,23 @@ by `device-k3.json` or `device-sa-spec.json`. The standalone library has no TP
 consensus protocol, which is not evidence that SGLang may safely remove consensus
 while allowing rank-local slot/version fallback. No new GPU performance claim
 is inferred from the reference implementation.
+
+## Device overhead follow-up (2026-10-16)
+
+Baseline: `2d279d4f34`. Reused the Qwen3-core PR #7745 evidence and current
+native draft/verify boundaries above; no model-specific forward changes.
+Re-read sa_spec `src/api.cu`, `src/sa_spec/util/flat_graph.hpp` and
+`flat_hash_map.hpp`, plus the locally retained TRT-LLM #10951 head
+`304ec62dd635cc7ad865c2ae35b4ae02910396d0` `reference-mtp.py` (acceptance,
+`sa_spec.extend`, per-step `draft_sampler`, and next-input update).
+
+The reference retains neural forward and selects SA tokens at each sampling
+step. The first optimization targets here are our additional six per-verify
+PyTorch statistics reductions and repeated stable graph-input copies, not
+moving the source-selection point or changing model recurrence. Metrics are
+fused into the existing private plugin feedback operator; no new public
+`sglang.kernels` entry point or experimental-package relocation is introduced.
+Reference hash-based transition lookup versus our linked adjacency scan is a
+separate long-history performance risk; changing layout needs its own CPU/GPU
+differential validation and length/vocabulary sweep. Source comparison alone
+does not establish its contribution to the supplied EAGLE3 slowdown.

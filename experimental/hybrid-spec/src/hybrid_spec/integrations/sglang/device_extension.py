@@ -21,6 +21,9 @@ class DeviceOverride(DraftOverrideView):
         self.slots = slots
         self.generations = generations
         self.tp_sync = tp_sync
+        # Only worker-created views provide this immutable host metadata key.
+        # Manually constructed views may mutate their tensors between stages.
+        self.mapping_key = None
         super().__init__(
             torch.zeros(
                 (len(slots), backend.config.num_drafts),
@@ -43,6 +46,7 @@ class DeviceOverride(DraftOverrideView):
 
 class DeviceGraphBuffers:
     def __init__(self, backend, max_bs, tp_sync=None):
+        self.staged_mapping = None
         self.view = DeviceOverride(
             backend,
             torch.full((max_bs,), -1, dtype=torch.int64, device=backend.device),
@@ -55,6 +59,7 @@ class DeviceGraphBuffers:
         view = object.__new__(DeviceOverride)
         view.backend = self.view.backend
         view.tp_sync = self.view.tp_sync
+        view.mapping_key = None
         for name in ("slots", "generations", "tokens", "use_retrieval"):
             setattr(view, name, getattr(self.view, name)[:batch_size])
         return view
@@ -64,9 +69,14 @@ class DeviceGraphBuffers:
             raise ValueError("invalid graph batch sizes")
         if view.slots.shape != (raw_bs,) or view.generations.shape != (raw_bs,):
             raise ValueError("override does not match the captured batch")
-        self.view.slots.fill_(-1)
-        self.view.slots[:raw_bs].copy_(view.slots)
-        self.view.generations[:raw_bs].copy_(view.generations)
+        mapping = (view.mapping_key, raw_bs, padded_bs)
+        if view.mapping_key is None or mapping != self.staged_mapping:
+            # Graphs only read this mapping. Unchanged batches need no GPU
+            # staging kernels; changing shape must still clear active padding.
+            self.view.slots[raw_bs:padded_bs].fill_(-1)
+            self.view.slots[:raw_bs].copy_(view.slots)
+            self.view.generations[:raw_bs].copy_(view.generations)
+            self.staged_mapping = mapping
         # Feedback consumes the actual captured query's selection mask.
         view.use_retrieval = self.view.use_retrieval[:raw_bs]
 
@@ -251,12 +261,14 @@ class DeviceDraftExtension:
                 state.build = None
 
     def _view(self, slots, generations):
-        return DeviceOverride(
+        view = DeviceOverride(
             self.backend,
             torch.tensor(slots, dtype=torch.int64, device=self.backend.device),
             torch.tensor(generations, dtype=torch.int64, device=self.backend.device),
             self.tp_sync,
         )
+        view.mapping_key = (tuple(slots), tuple(generations))
+        return view
 
     @contextmanager
     def bind(self, batch, draft_input):
@@ -304,7 +316,6 @@ class DeviceDraftExtension:
         view, self.pending_view = self.pending_view, None
         if view is None or batch.forward_mode.is_idle():
             return
-        self.metrics.record(view.use_retrieval, result.accept_lens)
         self.backend.stage_feedback(
             view.slots,
             view.generations,
@@ -314,4 +325,6 @@ class DeviceDraftExtension:
             batch.seq_lens,
             True,
             self.vocab_size,
+            use_retrieval=view.use_retrieval,
+            counts=self.metrics.ensure_buffer(self.backend.device),
         )

@@ -16,6 +16,13 @@ class Metrics:
     def __init__(self):
         self.counts = None
 
+    def ensure_buffer(self, device):
+        # Allocate on the first consuming forward stream, not the construction
+        # stream. The fused feedback kernel updates these same counters.
+        if self.counts is None:
+            self.counts = torch.zeros(len(self.names), dtype=torch.int64, device=device)
+        return self.counts
+
     def record(self, use_retrieval, num_accept_tokens):
         if use_retrieval.shape != num_accept_tokens.shape:
             raise ValueError("feedback rows differ from the draft selection")

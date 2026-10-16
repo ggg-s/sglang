@@ -18,6 +18,7 @@ from hybrid_spec.integrations.sglang.device_extension import (
     DeviceOverride,
 )
 from hybrid_spec.integrations.sglang.graph_buffers import GraphBuffers
+from hybrid_spec.observability.metrics import Metrics
 
 pytestmark = pytest.mark.skipif(
     not torch.cuda.is_available(), reason="requires NVIDIA CUDA"
@@ -213,3 +214,65 @@ def test_host_prefill_import_preserves_gpu_bonus_feedback():
     assert view.use_retrieval.tolist() == [True]
     assert view.tokens.tolist() == [[6, 7, 4]]
     assert backend.history[0, :6].tolist() == [4, 5, 6, 7, 4, 5]
+
+
+def test_feedback_fused_metrics_includes_neural_rows_without_slots():
+    """Fusing statistics must retain rows rejected by SA slot/generation checks."""
+    config = HybridConfig(3, 2, 2, 64, history_mode="device")
+    backend = GPUSuffixAutomaton(config, "cuda")
+    backend.initialize_device_slot(0, 10, 64)
+    backend.initialize_device_slot(1, 11, 64)
+    slots = torch.tensor([0, 1, -1], device="cuda")
+    generations = torch.tensor([10, 11, -1], device="cuda")
+    predict = torch.arange(12, dtype=torch.int32, device="cuda")
+    indices = predict.reshape(3, 4)
+    seq_lens = torch.full((3,), 5, device="cuda")
+    metrics = Metrics()
+    counts = metrics.ensure_buffer("cuda")
+    reference = Metrics()
+    for mask, lengths in (
+        ([False, True, False], [1, 2, 4]),
+        ([True, False, False], [3, 1, 2]),
+    ):
+        backend.pending_meta.zero_()
+        mask = torch.tensor(mask, device="cuda")
+        lengths = torch.tensor(lengths, dtype=torch.int32, device="cuda")
+        backend.stage_feedback(
+            slots,
+            generations,
+            predict,
+            indices,
+            lengths,
+            seq_lens,
+            True,
+            100,
+            use_retrieval=mask,
+            counts=counts,
+        )
+        reference.record(mask, lengths)
+        assert metrics.snapshot() == reference.snapshot()
+    assert counts.tolist() == [2, 4, 3, 4, 5, 8]
+    # A stale generation still contributes to neural stats, without modifying
+    # the replacement request's feedback. Prefill must not count as a verify.
+    pending = backend.pending_meta.clone()
+    generations[0] = 99
+    mask.zero_()
+    backend.stage_feedback(
+        slots,
+        generations,
+        predict,
+        indices,
+        lengths,
+        seq_lens,
+        True,
+        100,
+        use_retrieval=mask,
+        counts=counts,
+    )
+    reference.record(mask, lengths)
+    assert torch.equal(backend.pending_meta[0], pending[0])
+    assert metrics.snapshot() == reference.snapshot()
+    backend.stage_feedback(
+        slots, generations, predict, indices, lengths, seq_lens, False, 100
+    )
+    assert metrics.snapshot() == reference.snapshot()

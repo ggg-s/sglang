@@ -22,7 +22,10 @@ from hybrid_spec.integrations.sglang.compatibility import (
     validate_config,
     validate_model,
 )
-from hybrid_spec.integrations.sglang.device_extension import DeviceDraftExtension
+from hybrid_spec.integrations.sglang.device_extension import (
+    DeviceDraftExtension,
+    DeviceOverride,
+)
 from hybrid_spec.integrations.sglang.draft_extension import DraftExtension
 from hybrid_spec.integrations.sglang.graph_buffers import GraphBuffers
 from hybrid_spec.observability.metrics import Metrics
@@ -388,8 +391,12 @@ def test_device_bridge_keeps_feedback_on_device_and_ignores_cpu_decode_history()
         def import_host(self, slot, host):
             self.prompt = host
 
-        def stage_feedback(self, *args):
+        def stage_feedback(self, *args, use_retrieval=None, counts=None):
             self.feedback.append(args)
+            if counts is not None:
+                reference = Metrics()
+                reference.record(use_retrieval, args[4])
+                counts.add_(reference.counts)
 
         def consume_and_query(self, slots, generations, seq_lens, tokens, mask):
             tokens.fill_(7)
@@ -466,6 +473,55 @@ def test_tp_rejects_process_group_only_communication(extension_type):
             100,
             tp_sync=SimpleNamespace(communicator=None),
         )
+
+
+def test_device_graph_mapping_cache_preserves_padding_and_generation():
+    """Skipping stable mappings must still fence shape changes and slot reuse."""
+    config = HybridConfig(3, 2, 4, 32, history_mode="device")
+    backend = SimpleNamespace(config=config, device=torch.device("cpu"))
+    extension = DeviceDraftExtension(config, backend, 100)
+    buffers = extension.create_graph_buffers(4)
+    try:
+
+        def stage(slots, generations, padded):
+            view = extension._view(slots, generations)
+            buffers.stage(view, len(slots), padded)
+            assert buffers.view.slots[:padded].tolist() == slots + [-1] * (
+                padded - len(slots)
+            )
+            assert buffers.view.generations[: len(slots)].tolist() == generations
+            assert (
+                view.use_retrieval.data_ptr() == buffers.view.use_retrieval.data_ptr()
+            )
+            return view
+
+        view = stage([0, 1], [10, 11], 4)
+        versions = (buffers.view.slots._version, buffers.view.generations._version)
+        buffers.view.use_retrieval[:2].fill_(True)
+        # Tensor version counters prove no input-buffer writes are enqueued.
+        # Selection outputs remain live: they are not part of the cached input.
+        for _ in range(2):
+            buffers.stage(view, 2, 4)
+            assert (
+                buffers.view.slots._version,
+                buffers.view.generations._version,
+            ) == versions
+            assert view.use_retrieval.tolist() == [True, True]
+        stage([0], [10], 1)
+        stage([0], [10], 4)  # Growing the graph must clear previously active rows.
+        stage([0], [12], 4)  # Same slot, new request generation.
+        stage([1, 0], [11, 12], 4)  # Reordered batch.
+
+        # Views without an immutable host key retain the mutable tensor API.
+        mutable = DeviceOverride(backend, torch.tensor([1]), torch.tensor([11]))
+        buffers.stage(mutable, 1, 4)
+        mutable.slots[0] = 0
+        mutable.generations[0] = 13
+        buffers.stage(mutable, 1, 4)
+        assert buffers.view.slots.tolist() == [0, -1, -1, -1]
+        assert buffers.view.generations[0].item() == 13
+    finally:
+        extension.shutdown()
 
 
 @pytest.fixture
