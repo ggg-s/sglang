@@ -15,6 +15,7 @@ class HybridConfig:
     history_mode: str = "cpu"
     partial_drafts: str = "fallback"
     num_neural_gate_tokens: int = 0
+    draft_graph_mode: str = "full"
 
     def __post_init__(self):
         for name in (
@@ -39,6 +40,18 @@ class HybridConfig:
             or not 0 <= self.num_neural_gate_tokens <= self.num_drafts
         ):
             raise ValueError("num_neural_gate_tokens must be between 0 and num_drafts")
+        if self.draft_graph_mode not in ("full", "split", "split_no_skip"):
+            raise ValueError("draft_graph_mode must be full, split or split_no_skip")
+        if self.draft_graph_mode != "full" and (
+            self.history_mode != "device"
+            or self.num_neural_gate_tokens != 2
+            or self.num_drafts <= 2
+            or self.max_requests != 1
+        ):
+            raise ValueError(
+                "split draft graphs require device history, one request, "
+                "num_neural_gate_tokens=2 and num_drafts>2"
+            )
 
     @classmethod
     def from_file(cls, path: str):

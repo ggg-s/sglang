@@ -118,6 +118,65 @@ def test_cuda_graph_neural_gate_replay_resets_final_selection_mask():
     assert view.use_retrieval.tolist() == [True, True, True]
 
 
+@pytest.mark.parametrize("mode", ["split", "split_no_skip"])
+def test_split_graph_alternating_skip_fallback_preserves_prefix_storage(mode):
+    """A skipped tail must leave a complete chain and permit the next fallback.
+
+    Separate real CUDA graph pools must preserve the recurrent prefix when the
+    tail resumes, and reset both gate eligibility and positions on every round.
+    """
+    from types import SimpleNamespace
+
+    from hybrid_spec.integrations.sglang.split_graph import SplitDraftGraphBackend
+
+    backend = object.__new__(SplitDraftGraphBackend)
+    backend.records = {}
+    backend.stream = torch.cuda.Stream()
+    backend.mode = mode
+    backend.counters = dict(prefix_ct=0, skip_ct=0, tail_ct=0, decision_wait_ns=0)
+    candidates = torch.zeros((1, 4), dtype=torch.int64, device="cuda")
+    eligibility = torch.ones(1, dtype=torch.bool, device="cuda")
+    view = DraftOverrideView(candidates, torch.zeros_like(eligibility), 2)
+    batch = SimpleNamespace(
+        positions=torch.zeros(1, dtype=torch.int64, device="cuda"),
+        spec_info=SimpleNamespace(draft_override=view),
+    )
+
+    def forward():
+        view.use_retrieval.copy_(eligibility)
+        callback = getattr(view, "on_prefix_ready", None)
+        result = torch.empty_like(candidates)
+        if callback is not None:
+            result.copy_(candidates)
+        token = torch.ones((1, 1), dtype=torch.int64, device="cuda")
+        token = view.select_step(token, 0)
+        result[:, :1].copy_(token)
+        for step in range(1, 4):
+            token = view.select_step(token + 1, step)
+            result[:, step : step + 1].copy_(token)
+            batch.positions.add_(1)
+            if step == 1 and callback is not None:
+                callback()
+        batch.positions.sub_(3)
+        return result
+
+    backend.capture_one("bs1", forward, capture_inputs=batch)
+    for tokens, eligible, expected in [
+        ([1, 2, 70, 80], True, [1, 2, 70, 80]),
+        ([1, 9, 70, 80], True, [1, 2, 3, 4]),
+        ([9, 2, 70, 80], True, [1, 2, 3, 4]),
+        ([1, 2, 71, 81], False, [1, 2, 3, 4]),
+        ([1, 2, 72, 82], True, [1, 2, 72, 82]),
+    ]:
+        candidates.copy_(torch.tensor([tokens], device="cuda"))
+        eligibility.fill_(eligible)
+        assert backend.replay("bs1", batch).tolist() == [expected]
+        assert batch.positions.item() == 0
+    assert backend.counters["prefix_ct"] == 5
+    assert backend.counters["skip_ct"] == (2 if mode == "split" else 0)
+    assert backend.counters["tail_ct"] == (3 if mode == "split" else 5)
+
+
 @pytest.mark.parametrize("partial", ["fallback", "zero"])
 def test_device_feedback_graph_reorder_generation_and_replay(partial):
     config = HybridConfig(3, 2, 2, 64, history_mode="device", partial_drafts=partial)

@@ -95,6 +95,13 @@ class PrefillLease:
 
 
 class DeviceDraftExtension:
+    def wrap_graph_backend(self, backend, runner):
+        if self.config.draft_graph_mode == "full":
+            return backend
+        from hybrid_spec.integrations.sglang.split_graph import SplitDraftGraphBackend
+
+        return SplitDraftGraphBackend(backend, runner, self.config.draft_graph_mode)
+
     def __init__(self, config, backend, vocab_size, tp_sync=None):
         if (
             tp_sync is not None

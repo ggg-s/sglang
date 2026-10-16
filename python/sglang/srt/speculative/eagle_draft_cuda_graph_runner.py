@@ -100,6 +100,7 @@ class EAGLEDraftCudaGraphRunner(DecodeCudaGraphRunner):
     """
 
     DRAFT_EXTENSION_API_VERSION = 2
+    DRAFT_SPLIT_GRAPH_API_VERSION = 1
 
     def __init__(
         self,
@@ -288,6 +289,8 @@ class EAGLEDraftCudaGraphRunner(DecodeCudaGraphRunner):
         )
 
         self.backend = resolve_decode_backend(self)
+        if extension is not None and hasattr(extension, "wrap_graph_backend"):
+            self.backend = extension.wrap_graph_backend(self.backend, self)
 
         # Capture
         try:
@@ -550,7 +553,7 @@ class EAGLEDraftCudaGraphRunner(DecodeCudaGraphRunner):
                 self.backend.capture_one(
                     self._make_graph_key(num_seqs, variant_label=variant),
                     run_once,
-                    capture_inputs=None,
+                    capture_inputs=forward_batch,
                     post_warmup_hook=post_warmup_hook,
                 )
 

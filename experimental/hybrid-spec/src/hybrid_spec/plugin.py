@@ -124,6 +124,12 @@ def _attach(result, worker, *args, **kwargs):
         )
     validate_model(worker)
     config = _config()
+    if (
+        config.draft_graph_mode != "full"
+        and getattr(EAGLEDraftCudaGraphRunner, "DRAFT_SPLIT_GRAPH_API_VERSION", None)
+        != 1
+    ):
+        raise RuntimeError("split draft graphs require the draft split Graph API v1")
     tp_group = get_tp_group()
     communicator = None
     if tp_group.world_size > 1:
@@ -195,3 +201,7 @@ def _diagnostics(result, controller, *args, **kwargs):
     if extension is not None:
         # Explicit diagnostic readback only; never synchronize each decode step.
         result.internal_state["hybrid_spec"] = extension.metrics.snapshot()
+        if hasattr(extension, "split_graph_counters"):
+            result.internal_state["hybrid_spec_split_graph"] = dict(
+                extension.split_graph_counters
+            )

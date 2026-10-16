@@ -1,0 +1,257 @@
+{
+  "performance": {
+    "native": {
+      "completed": 50,
+      "accept_length": 6.027334337349398,
+      "output_throughput": 305.0391143977598,
+      "mean_tpot_ms": 3.2073143060232248,
+      "mean_ttft_ms": 71.52179297059774,
+      "total_output_tokens": 79888,
+      "sa_fraction": null
+    },
+    "full": {
+      "completed": 50,
+      "accept_length": 5.94313880126183,
+      "output_throughput": 300.66365773405107,
+      "mean_tpot_ms": 3.219393977255878,
+      "mean_ttft_ms": 72.3046075925231,
+      "total_output_tokens": 75184,
+      "sa_fraction": 0.41671260927778214
+    },
+    "split_no_skip": {
+      "completed": 50,
+      "accept_length": 5.912970430107527,
+      "output_throughput": 294.7470598898152,
+      "mean_tpot_ms": 3.3303881761430048,
+      "mean_ttft_ms": 74.5404945127666,
+      "total_output_tokens": 87844,
+      "sa_fraction": 0.4021462105969148,
+      "split_counter_delta": {
+        "prefix_ct": 14910,
+        "skip_ct": 0,
+        "tail_ct": 14910,
+        "decision_wait_ns": 14649637137
+      },
+      "skip_fraction": 0.0,
+      "mean_decision_wait_ms": 0.9825377020120725
+    },
+    "split": {
+      "completed": 50,
+      "accept_length": 6.0465099715099715,
+      "output_throughput": 342.307155651226,
+      "mean_tpot_ms": 2.8663545564074235,
+      "mean_ttft_ms": 69.0039093978703,
+      "total_output_tokens": 84830,
+      "sa_fraction": 0.4294443654966605,
+      "split_counter_delta": {
+        "prefix_ct": 14074,
+        "skip_ct": 6044,
+        "tail_ct": 8030,
+        "decision_wait_ns": 13699214252
+      },
+      "skip_fraction": 0.4294443654966605,
+      "mean_decision_wait_ms": 0.973370346170243
+    }
+  },
+  "quality": {
+    "native": {
+      "error_rate": 0.0,
+      "score": 0.96875,
+      "stop_rate": 0.98828125,
+      "truncated_rate": 0.01171875,
+      "num_examples": 256,
+      "correct": 248,
+      "truncated": 3
+    },
+    "full": {
+      "error_rate": 0.0,
+      "score": 0.96875,
+      "stop_rate": 0.984375,
+      "truncated_rate": 0.015625,
+      "num_examples": 256,
+      "correct": 248,
+      "truncated": 4
+    },
+    "split": {
+      "error_rate": 0.0,
+      "score": 0.97265625,
+      "stop_rate": 0.98828125,
+      "truncated_rate": 0.01171875,
+      "num_examples": 256,
+      "correct": 249,
+      "truncated": 3
+    }
+  },
+  "repeatability": {
+    "native": {
+      "num_repeat": 20,
+      "same_input_lengths": true,
+      "exact_texts": 2,
+      "median_common_prefix_chars": 374.5,
+      "repeat_performance": {
+        "accept_length": 5.896195652173913,
+        "output_throughput": 303.0011447186803,
+        "mean_tpot_ms": 3.247454077228215,
+        "total_output_tokens": 32670
+      }
+    },
+    "full": {
+      "num_repeat": 20,
+      "same_input_lengths": true,
+      "exact_texts": 1,
+      "median_common_prefix_chars": 410.5,
+      "repeat_performance": {
+        "accept_length": 5.8213333333333335,
+        "output_throughput": 296.4680720951891,
+        "mean_tpot_ms": 3.272482046856691,
+        "total_output_tokens": 34879
+      }
+    },
+    "split": {
+      "num_repeat": 20,
+      "same_input_lengths": true,
+      "exact_texts": 2,
+      "median_common_prefix_chars": 886.0,
+      "repeat_performance": {
+        "accept_length": 6.257539682539683,
+        "output_throughput": 354.95959191812375,
+        "mean_tpot_ms": 2.754518831390355,
+        "total_output_tokens": 31538
+      }
+    }
+  },
+  "paired_quality": {
+    "native_vs_split": {
+      "n": 256,
+      "baseline_correct_split_wrong": [],
+      "baseline_wrong_split_correct": [
+        "gsm8k-163"
+      ],
+      "same_generated_texts": 100
+    },
+    "full_vs_split": {
+      "n": 256,
+      "baseline_correct_split_wrong": [],
+      "baseline_wrong_split_correct": [
+        "gsm8k-161"
+      ],
+      "same_generated_texts": 95
+    }
+  },
+  "protocol": {
+    "model": "Qwen3.5-35B-A3B-GPTQ-Int4",
+    "gpu": "NVIDIA A100 PCIe 40GB",
+    "tp_size": 1,
+    "max_running_requests": 1,
+    "concurrency": 1,
+    "num_drafts": 8,
+    "num_verify_tokens": 9,
+    "min_match_len": 4,
+    "num_neural_gate_tokens": 2,
+    "max_history_tokens": 16384,
+    "num_prompts": 50,
+    "repeat_prompts": 20,
+    "gsm8k_examples": 256,
+    "max_output_tokens": 2048,
+    "temperature": 0,
+    "seed": 42,
+    "overlap_schedule": true,
+    "chunked_prefill_size": 4096,
+    "target_quantization": "gptq_marlin",
+    "draft_quantization": "unquant",
+    "dtype": "float16",
+    "conv_dtype": "float16",
+    "data_sha256": {
+      "sa-spec-sglang.jsonl": "dce8441724eed09c742fccbe3e29d5b6dda8959a0f1096c893da689e06280f2f",
+      "gsm8k.jsonl": "847d994feabce5912ed88fc4896162d47ebb01ee2f3e26cce39372f6624860fd"
+    },
+    "prompt_sha256": "2d5c67b6ae1eedc90dc0c41c360277adb7bc1c294cb0df8812eda3bffd5437a2"
+  },
+  "trace_summary": {
+    "split.trace.json.gz": {
+      "rows": 9,
+      "forward_counts": {
+        "7": 2,
+        "1": 7
+      },
+      "mean_graph_span_sum_us": 2222.6383463541665,
+      "mean_total_span_us": 2323.6987033420137,
+      "mean_inter_graph_gap_us": 101.06035698784723,
+      "by_forward_count": {
+        "1": {
+          "count": 7,
+          "graph_span_us": 979.9758998325893
+        },
+        "7": {
+          "count": 2,
+          "graph_span_us": 7026.728515625
+        }
+      }
+    },
+    "split_no_skip.trace.json.gz": {
+      "rows": 9,
+      "forward_counts": {
+        "7": 9
+      },
+      "mean_graph_span_sum_us": 6433.364095052083,
+      "mean_total_span_us": 7001.399549696181,
+      "mean_inter_graph_gap_us": 568.0354546440972,
+      "by_forward_count": {
+        "7": {
+          "count": 9,
+          "graph_span_us": 7001.399549696181
+        }
+      }
+    },
+    "full.trace.json.gz": {
+      "rows": 9,
+      "forward_counts": {
+        "7": 9
+      },
+      "mean_graph_span_sum_us": 6424.800591362848,
+      "mean_total_span_us": 6424.800591362848,
+      "mean_inter_graph_gap_us": 0,
+      "by_forward_count": {
+        "7": {
+          "count": 9,
+          "graph_span_us": 6424.800591362848
+        }
+      }
+    },
+    "native.trace.json.gz": {
+      "rows": 9,
+      "forward_counts": {
+        "7": 9
+      },
+      "mean_graph_span_sum_us": 6423.001708984375,
+      "mean_total_span_us": 6423.001708984375,
+      "mean_inter_graph_gap_us": 0,
+      "by_forward_count": {
+        "7": {
+          "count": 9,
+          "graph_span_us": 6423.001708984375
+        }
+      }
+    }
+  },
+  "validation": {
+    "cpu_local_passed": 140,
+    "cpu_native_gloo_a100_passed": 147,
+    "cpu_native_gloo_a100_skipped": 1,
+    "cuda_a100_passed": 13
+  },
+  "evidence_directory": "/root/rivermind-data/validation/split-graph-20261016",
+  "environment": {
+    "python": "3.12.13",
+    "sglang": "0.0.0.dev1+g722f338ba",
+    "torch": "2.14.1",
+    "triton": "3.8.0",
+    "transformers": "5.19.0",
+    "flashinfer-python": "0.7.1",
+    "source_base_commit": "588bbaa4239189813eafd64b293e56c91e1d9fc8"
+  },
+  "evidence_archive": {
+    "remote_path": "/root/rivermind-data/validation/split-graph-evidence-20261016.zip",
+    "sha256": "049dae0ee4599778ec535e0642e7112b052764778c2e5c88e0e924a9575a1c40"
+  }
+}

@@ -1,12 +1,25 @@
 # 验证记录
 
+## 并发 1 两段 Graph 提前退出（2026-10-16）
+
+已实现 opt-in `draft_graph_mode=split`：前两个 token 与 MTP 一致后跳过剩余
+MTP，不一致则续跑尾段；默认仍为 full。A100、TP=1、K=8、相同 50 条 edits、
+2048 输出上限，原生/full/split_no_skip/split 吞吐分别为
+305.04/300.66/294.75/342.31 token/s；本轮同步与拆图代价没有抵消收益。
+同一 GSM8K 256 题原生/full/split 为 248/248/249，未观察到新增答错；
+长输出有重复性差异，不能据此声称严格等价或所有负载稳定加速。
+最终 CPU/native/Gloo 147 passed、1 skipped，CUDA 13 passed。完整协议、
+trace 和限制见[分析记录](validation/acceptance-regression.md)。CUDA SA 仍为
+v3；此功能还需要更新 SGLang worker/runner 的 split Graph API v1。
+
 ## Qwen3.5 MTP 接受长度分析与 A100 对照（2026-10-16）
 
 新增可选 neural 前缀检查；默认关闭，CUDA 扩展布局保持 v3。A100 的原生与
 两组 SA 策略、官方 edits benchmark、全量 GSM8K CoT 及重复性限制见
 [接受长度分析](validation/acceptance-regression.md)。CPU/native/Gloo 141 passed、
 1 skipped，CUDA 11 passed；以下早期记录的“未验证”仅描述当时状态。
-尚未实现独立 SA CUDA stream 或 MTP 提前退出，多 GPU 新策略验收仍待完成。
+该阶段尚未实现 MTP 提前退出；随后原型见上节。独立 SA CUDA stream 与
+多 GPU 新策略验收仍待完成。
 
 ## 双转移内联：压缩状态并修复低多样性追加退化（2026-10-16）
 

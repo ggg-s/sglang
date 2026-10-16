@@ -122,8 +122,9 @@ N=4 相对本轮原生吞吐增加约 5.2% / 3.7%，但**不能据单轮对照�
 原始证据保存在 A100：
 `/root/rivermind-data/validation/sa-accept-fix-20261016`（第一轮及原生），
 `/root/rivermind-data/validation/sa-accept-fix-g4-20261016`（N=4，链接原生证据）。
-两组流水线均完成，测试服务已停止。配置仍属实验用途；独立 SA stream、
-MTP 提前退出与多 GPU 新策略验收均未实现或完成。
+上述两组流水线均完成，测试服务已停止。这里记录的是完整 Graph 版本；
+其后的并发 1 MTP 提前退出实验见下节。独立 SA stream 与多 GPU 新策略
+验收仍未实现或完成。
 
 ## MTP 草稿开销的分阶段 trace 分析
 
@@ -183,12 +184,123 @@ MTP Graph 的 76.2% / 71.3%。这不是完整服务耗时占比。采集中的�
 
 建议先用两个 Graph（前缀及余下 MTP）在 C1 做提前退出的计时原型，量化
 GPU→CPU 决策同步是否抵消收益；值得继续时再实现 GPU conditional subgraph，
-避免 host 同步。target verify 与后续 draft-extend 必须保留。当前代码仍然
-完整运行 MTP，不能把前缀保护或 SA side-stream 等同于提前退出。
+避免 host 同步。target verify 与后续 draft-extend 必须保留。上述 trace 对应
+完整 MTP 版本，不能把前缀保护或 SA side-stream 等同于提前退出。
 
 C1 新采集证据目录：
 `/root/rivermind-data/validation/draft-cost-20261016/profile-native-c1`。
 本地逐阶段机器可读结果与离线归因脚本保存在本次工作目录的
 `.tmp/hybrid-spec/accept-regression/draft-cost-analysis.json` 和
 `analyze-draft-cost.py`；完整 trace 保留在对应 A100 profile 目录。
-这次只做了 trace 测量，没有宣称新的提前退出实现或加速结果。
+该阶段只做 trace 测量；随后实现的提前退出原型与验收单独记录如下。
+
+## 并发 1 两段 Graph 原型
+
+新增默认关闭的 `draft_graph_mode`，不修改 SA CUDA 状态布局或 v3 扩展名：
+
+- `full`：原有完整 Graph。
+- `split_no_skip`：两段 Graph，中间读取 GPU mask，但始终执行尾段；仍按同一
+  前缀策略选择 SA，作为拆图及同步成本的控制组。
+- `split`：前两个 token 均相同且 SA 原本有效时跳过尾段；不一致则继续尾段。
+
+实验限定 device history、Qwen3.5 MTP、TP=1、topk=1、greedy、K>2、
+`num_neural_gate_tokens=2`、`max_requests=1`；启动同时要求
+`--max-running-requests 1 --cuda-graph-max-bs-decode 1`。memory saver、
+rejection sampling、hot-token 映射和 draft-extend DSA seed 均不开放。
+仅更新插件无法驱动旧 worker：需要新增的 draft split Graph API v1。
+
+runner 通过可选 extension backend 包装，在现有 MTP body 生成第二个候选后
+结束 prefix capture、开始 tail capture，不复制一份模型循环。第一个 neural
+候选来自前一轮 draft-extend，因此首段只做一次 inner forward。首段预先把
+完整 SA 候选写入结果矩阵，再覆盖已选择的前两个位置。成功时返回的仍是
+完整 K=8 候选，target 仍执行原生 9-token verify；没有重新验证历史匹配前缀。
+回退时尾段直接消费首段留下的 hidden state，不重算首个 forward。
+
+两段使用相互独立、与 target/extend 不共享的私有 Graph pool，防止可选尾段
+及其跨 Graph 中间张量被别的 replay 覆盖。命中后恢复首段增加的位置计数，
+其余输入按原生 execute 每轮重新 staging。verify、接受前缀反馈及 draft-extend
+全部保留，不依赖被跳过的 MTP 临时 KV；draft-extend 按接受结果填充后续状态。
+
+本地 CPU 140 passed；最终源码在 A100 的 CPU/native/Gloo 回归为
+147 passed、1 skipped，CUDA 13 passed，覆盖连续命中、首/第二 token
+不一致、资格关闭、跳过后再回退、位置恢复与真实双 Graph pool 的重放。
+CPU harness 执行实际 `draft_forward` body，确认边界位于第一次 inner forward
+之后；原有默认路径与 mRoPE 递推用例保持通过。
+
+### 原型 trace
+
+| 模式 | 捕获 decode 轮数 | 每轮 inner forward 数 | GPU 草稿跨度 |
+| --- | ---: | --- | --- |
+| split | 9 | 7 轮为 1 次，2 轮为 7 次 | 命中均值 0.9800 ms；回退 7.0267 ms |
+| split_no_skip | 9 | 全部 7 次 | 均值 7.0014 ms |
+| full | 9 | 全部 7 次 | 均值 6.4248 ms |
+
+split 的本次 profile 共观察到 21 次 inner forward（7×1+2×7），不是只替换
+token 后继续运行全部模型。该窗口的命中比例不同于正式 50 请求总体，不能
+用 7/9 作为负载的长期命中率。回退的两段间隙约 0.45 ms；控制组约
+0.57 ms，均为带 profiler 的观察值，不能直接作为无 profiler 的同步成本。
+诊断字段 `decision_wait_ns` 还包含未完成的首段 GPU 工作，不能把其约
+0.97–0.98 ms 的每轮均值都当成额外同步开销。
+
+### 服务对照协议
+
+同一 A100 PCIe 40GB、Qwen3.5-35B-A3B-GPTQ-Int4、TP=1、K=8，所有模式
+均限定并发 1、最大运行请求 1；target FP16/gptq_marlin、MTP unquantized、
+相同 conv/attention backend、seed=42，overlap 与 chunked prefill 保持开启。
+官方 `sglang.benchmark.serving`，同一 shuffle 后的 50 条原始 sa-spec edits
+completion 提示，输出上限 2048，保留 EOS。三组 SA 的最小匹配均为 4，
+neural 前缀检查均为 2，不能混入前文 N=4 或 min_match_len=16 的结果。
+split、full 与原生还各重复前 20 条，用于观察同进程重复性。
+正确性另用官方 `sgl-eval` CoT 模板的同一 GSM8K 256 题，输出上限 2048、
+num_threads=1；按题目 ID 检查题干/标准答案，记录双向正误变化及截断。
+
+实验目录：`/root/rivermind-data/validation/split-graph-20261016`。
+
+### 原型服务性能
+
+以下均为官方客户端报告的整体统计，未使用 profiler 耗时计算吞吐或 TPOT。
+
+| 模式 | 接受长度（含 bonus） | 输出 token/s | 平均 TPOT ms | 输出 token 数 |
+| --- | ---: | ---: | ---: | ---: |
+| 原生 MTP，无 SA | 6.0273 | 305.0391 | 3.2073 | 79888 |
+| MTP+SA，full | 5.9431 | 300.6637 | 3.2194 | 75184 |
+| MTP+SA，split_no_skip | 5.9130 | 294.7471 | 3.3304 | 87844 |
+| MTP+SA，split | 6.0465 | 342.3072 | 2.8664 | 84830 |
+
+本轮 split 相对原生吞吐增加约 12.2%，TPOT 降低约 10.6%；相对 full 吞吐
+增加约 13.9%，TPOT 降低约 11.0%。split_no_skip 相对 full 吞吐降低约
+2.0%、TPOT 增加约 3.4%。因此本轮观测到同步/拆图有成本，但没有抵消跳过
+MTP 的收益。不能把接受长度和输出数的差异全部排除为无关因素，也不能把
+全部改善归因给一次纯同步开销的精确差值。
+
+split 正式计数（包含官方预热）为 14074 次 prefix、6044 次 skip、8030 次
+tail，skip 比例 42.94%，与实际 SA 选择计数一致。控制组 14910 次 prefix
+全部执行 tail，skip 为 0，虽然约 40.2% 的轮次仍选择 SA 候选。这两个
+模式都进行每轮一次 CPU mask 读取，区别在于是否提交后续六次 MTP forward。
+
+同进程重复前 20 条，原生/full/split 完全相同的文本仅 2/1/2 条，共同
+前缀字符数中位数为 374.5/410.5/886。输入长度向量相同；这一重复性问题
+在原生与 full 上亦存在，不能归因于提前退出。长输出轨迹不同，且仅做一组
+固定 workload 对照，因此结果应视为该配置的实验观察，不能宣称所有负载
+稳定加速或逐 token 等价。
+
+### 原型正确性
+
+| 模式 | 正确 / 256 | 准确率 | 请求错误率 | 截断题数 |
+| --- | ---: | ---: | ---: | ---: |
+| 原生 MTP | 248 | 96.875% | 0 | 3 |
+| MTP+SA，full | 248 | 96.875% | 0 | 4 |
+| MTP+SA，split | 249 | 97.266% | 0 | 3 |
+
+full 答对而 split 答错的题目为 0，反向为 1（gsm8k-161，两者均正常
+stop，未截断）。原生答对而 split 答错亦为 0，反向为 1（gsm8k-163）。
+两组比较的原始生成文本完全一致分别为 95/256、100/256。该样本未观察到
+正确性下降，但不据这一题差异宣称模型质量提升或严格等价。这是 256 题
+原型验收，不能冒充前文 1319 题的全量结果。
+
+四组流水线和最终回归均已完成，测试服务已停止。结构化结果见
+[split-graph-a100.json](split-graph-a100.json)，包含测试协议、数据哈希、
+官方统计、分支计数、重复性与逐题质量对照。完整 trace、命令、原始生成、
+实际 benchmark 源码快照和最终验证日志保留在上述 A100 实验目录；本机亦
+下载原始证据归档。两段 Graph 属于默认关闭的单并发原型，尚未实现 GPU
+conditional node 或独立 SA stream，也不支持多请求压缩重排。

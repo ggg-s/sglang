@@ -127,6 +127,9 @@ def test_selected_prefix_drives_model_and_verify_chain(
     view = (
         None if mask is None else DraftOverrideView(retrieval, torch.tensor(mask), gate)
     )
+    prefix_boundaries = []
+    if gate and matrix and not hot:
+        view.on_prefix_ready = lambda: prefix_boundaries.append(len(inputs))
     batch = SimpleNamespace(
         batch_size=2,
         forward_mode=SimpleNamespace(is_idle=lambda: False),
@@ -161,6 +164,11 @@ def test_selected_prefix_drives_model_and_verify_chain(
         ),
     )
     drafts = ns["draft_forward"](worker, batch)[2]
+    if gate and matrix and not hot:
+        # Checking two candidates needs one inner forward: candidate zero was
+        # supplied by draft-extend. Moving the boundary wastes work or gates
+        # before the second candidate has been generated.
+        assert prefix_boundaries == ([1] if k > 1 else [])
     expected = torch.empty((2, k), dtype=torch.int64)
     for row in range(2):
         token = row + 1 + (10 if hot else 0)

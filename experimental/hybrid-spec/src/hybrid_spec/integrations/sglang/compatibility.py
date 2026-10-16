@@ -27,6 +27,17 @@ def validate_config(config, cfg):
     for name, expected in required.items():
         if getattr(cfg, name, None) != expected:
             errors.append(f"{name}={expected!r} required")
+    if config.draft_graph_mode != "full":
+        for name, expected in {
+            "speculative_algorithm": "EAGLE",
+            "tp_size": 1,
+            "max_running_requests": 1,
+            "speculative_use_rejection_sampling": False,
+            "disable_cuda_graph": False,
+            "enable_memory_saver": False,
+        }.items():
+            if getattr(cfg, name, None) != expected:
+                errors.append(f"split draft graphs require {name}={expected!r}")
     if config.history_mode == "cpu" and not cfg.disable_overlap_schedule:
         errors.append("CPU history requires disable_overlap_schedule=True")
     # CLI store_true has no False spelling: no flag/no adapters leaves None,

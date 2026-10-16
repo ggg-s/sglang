@@ -752,6 +752,7 @@ class EagleDraftWorker(EagleDraftWorkerBase):
         # every subsequent column. Other topk=1 paths retain the token list and
         # assemble it with one final cat instead of launching a copy per step.
         draft_tokens_topk1 = None
+        prefix_ready = getattr(override, "on_prefix_ready", None)
         if (
             topk1_chain_fits
             and (_is_cuda or _is_hip)
@@ -763,6 +764,10 @@ class EagleDraftWorker(EagleDraftWorkerBase):
                 dtype=topk_index.dtype,
                 device=topk_index.device,
             )
+            if prefix_ready is not None:
+                # The prefix graph must produce a complete verify chain even
+                # when the remaining neural forwards are never replayed.
+                draft_tokens_topk1.copy_(override.tokens)
             draft_tokens_topk1[:, :1].copy_(topk_index)
 
         # Forward multiple steps
@@ -866,6 +871,8 @@ class EagleDraftWorker(EagleDraftWorkerBase):
                         # verify chain and next forward must use the selection.
                         draft_tokens_topk1[:, i + 1 : i + 2].copy_(topk_index)
                 hidden_states = logits_output.hidden_states
+                if i == 0 and prefix_ready is not None:
+                    prefix_ready()
 
         draft_probs = (
             torch.stack(draft_probs_list, dim=1) if needs_draft_probs else None

@@ -859,6 +859,62 @@ def test_invalid_neural_gate_width(value):
         HybridConfig(2, 2, 2, 32, num_neural_gate_tokens=value)
 
 
+@pytest.mark.parametrize(
+    "change",
+    [
+        {"draft_graph_mode": "unknown"},
+        {"num_neural_gate_tokens": 1},
+        {"max_requests": 2},
+        {"history_mode": "cpu"},
+        {"num_drafts": 2},
+    ],
+)
+def test_split_graph_configuration_rejects_unsupported_state(change):
+    values = dict(
+        num_drafts=8,
+        min_match_len=4,
+        max_requests=1,
+        max_history_tokens=128,
+        history_mode="device",
+        num_neural_gate_tokens=2,
+        draft_graph_mode="split",
+    )
+    with pytest.raises(ValueError):
+        HybridConfig(**(values | change))
+
+
+def test_split_graph_runtime_configuration_fails_closed():
+    config = HybridConfig(
+        8,
+        4,
+        1,
+        128,
+        history_mode="device",
+        num_neural_gate_tokens=2,
+        draft_graph_mode="split",
+    )
+    values = vars(valid_config()) | {
+        "speculative_num_steps": 8,
+        "speculative_algorithm": "EAGLE",
+        "speculative_num_draft_tokens": 9,
+        "max_running_requests": 1,
+        "speculative_use_rejection_sampling": False,
+        "disable_cuda_graph": False,
+        "enable_memory_saver": False,
+    }
+    validate_config(config, SimpleNamespace(**values))
+    for field, value in (
+        ("speculative_algorithm", "STANDALONE"),
+        ("tp_size", 2),
+        ("max_running_requests", 2),
+        ("speculative_use_rejection_sampling", True),
+        ("disable_cuda_graph", True),
+        ("enable_memory_saver", True),
+    ):
+        with pytest.raises(ValueError, match="split draft graphs require"):
+            validate_config(config, SimpleNamespace(**(values | {field: value})))
+
+
 def test_neural_gate_falls_back_before_divergence_and_resets_next_batch():
     """A four-token suffix alone can replace a correct MTP prefix with a wrong one.
 

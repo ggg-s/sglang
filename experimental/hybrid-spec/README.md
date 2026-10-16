@@ -14,7 +14,9 @@ verify 直接在设备上暂存 `predict/accept_index/accept_lens`，下一轮 d
 
 `num_neural_gate_tokens` 默认为 0，保留上述 sa-spec 参考策略；取 1…K 时，先检查 SA 与原生 neural 草稿前 N 个 token 是否一致。检查范围内沿用 neural token；全部一致后才允许 SA 替换后续位置，任一步不一致则本轮余下位置均使用 neural。检查和 mask 更新可被 draft CUDA Graph 捕获，不增加模型 forward、逐步 D2H 或额外 TP collective。TP 仍沿用原生 neural token 在各 rank 一致的约定；这一新策略尚需多 GPU 模型验收。verify 统计读取检查后的最终 mask。
 
-`configs/device-qwen35-mtp.json` 是 Qwen3.5 MTP 的实验配置：K=8、匹配阈值 4、前 4 个 token 一致性检查、短候选整链回退。它与参考配置是不同的选路策略，不能把匹配命中率当作性能收益；模型、量化及负载改变后应重新测量。选择依据与 A100 对照见 [接受长度分析](validation/acceptance-regression.md)。本次仅修改 Python 选择逻辑，CUDA 状态布局仍为 v3，安装代码后重启服务即可加载新逻辑；没有实现跳过 MTP forward 或独立 CUDA stream。
+`configs/device-qwen35-mtp.json` 是 Qwen3.5 MTP 的实验配置：K=8、匹配阈值 4、前 4 个 token 一致性检查、短候选整链回退。它与参考配置是不同的选路策略，不能把匹配命中率当作性能收益；模型、量化及负载改变后应重新测量。选择依据与 A100 对照见 [接受长度分析](validation/acceptance-regression.md)。该配置仍运行完整 MTP；CUDA 状态布局保持 v3，安装代码后重启服务即可加载新逻辑，不需要重新编译 CUDA 插件。
+
+`configs/device-qwen35-mtp-split.json` 单独开启并发 1 的两段 Graph 实验：`draft_graph_mode="split"`，前两个 token 与 neural 一致时跳过剩余 MTP；不同则续跑尾段。必须设置 `--max-running-requests 1 --cuda-graph-max-bs-decode 1`，TP=1、greedy、Qwen3.5 MTP，保持 target verify 和 draft-extend。它需要本分支新增的 draft split Graph API v1；仅更新插件无法让旧 SGLang worker 提前退出。默认 `draft_graph_mode="full"` 仍运行完整 Graph；`split_no_skip` 保留相同拆图和 CPU 同步但始终运行尾段，专门用于测量同步代价。前缀/尾段使用独立私有池保护跨 Graph 中间状态，当前不支持 memory saver 或 draft-extend DSA seed。这项实验不是独立 CUDA stream；性能和正确性须以同协议 A100 对照为准。
 
 device 模式以 generation 和 GPU 历史版本检查隔离旧反馈、槽位复用、重排和 Graph padding；prefill/retract 时重建索引。允许实验性开启 overlap 和 chunked prefill：中间块不构建 SA、不接入临时采样 token；最后一块启动前快照完整历史（含已缓存/先前分块的前缀），后台构建与最后一块 prefill 重叠，返回后只暂存真实 bonus。CPU 构建未完成时首次 draft 仍会等待。GPU 接受前缀可能包含 CPU EOS/停止截断前的尾部，不能将索引长度当作交付长度；原生停止处理保持不变。支持单机多 TP 实验，仍不开放 mixed prefill/decode、grammar 等其余未支持组合。chunked prefill 的真实 GPU/模型验收尚未完成。
 
