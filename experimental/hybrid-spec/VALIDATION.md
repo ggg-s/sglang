@@ -3,7 +3,59 @@
 当前机制、优化阶段与跨实验结论的汇总入口见 [优化总览](OPTIMIZATIONS.md)。
 下文按阶段保留当时的协议、结果和验收限制。
 
+## DeepSeek V4 split 逐请求紧凑尾段（2026-10-17，待内网 GPU 验收）
+
+在上一阶段的 V4 接入上，将多请求分支改为 Qwen 已有的 gather/tail/scatter 调度。
+前缀仍运行整批首个 MTP forward，完成两个 neural token 的 gate 和 TP 共识；
+仅未命中 SA 的实际请求进入 1/2/3/4 行尾段 Graph，全部命中则跳过。
+例如 raw_bs=3、Graph 批大小 4、两行命中时，尾段只执行一行。
+`split_no_skip` 仍执行全部实际请求行；padding 始终排除。
+尾段计数/直方图现在记录紧凑批大小，查询重叠、gate=2、全局池及共识协议不变。
+
+V4 不套用 Triton metadata。紧凑尾段保留所选原生 backend 的具体类型（含子类），
+每个大小拥有独立状态、私有 Graph 池和 KV 计划，重新绑定所选请求的行表。
+KV 地址保存为连续的 request-major B×K 窗口，各 step 的写入视图与其共享存储。
+逐步 raw metadata 使用真实的该步写地址，原生 in-graph SWA 更新则接收完整窗口，
+仍按原来的 step id 取地址。warmup 后调用原生 hook 恢复 raw metadata，
+确保 raw→full GPU 构建器记录进 Graph；支持 V4 无 mRoPE 及多维 hidden state。
+所有中间存储保持所有权，运行时使用预分配行号，不增加逐步 CPU 长度读取。
+
+依据本地 DeepSeek V4 历史条目 #26239，再核对当前
+`deepseek_v4_backend.py` 与 `deepseek_v4_trtllm_backend.py`：原生 per-step KV
+写地址已进入 metadata，不能把第零步 raw metadata 直接复制给全部紧凑尾段。
+原生 NextN 的压缩比仍为 0，target 压缩 KV、verify 和 draft-extend 保持原生路径。
+这一源码核对不代表真实模型已经验收。
+
+本地验证：core **67 passed**、实际紧凑尾段 CPU recurrence **2 passed**、
+worker recurrence **94 passed**、真实 Gloo TP=1/2/4 **3 passed**，合计 **166 passed**。
+CPU 尾段测试直接执行本次 gather/metadata/forward/scatter 循环，仅替换 GPU 边界；
+使用非连续、反序请求和逐步 KV 编码驱动独立结果预期，覆盖 K=3/8、全部尾段大小、
+动态行/地址刷新、KV 计划隔离及 hidden state 递推。GPU capture/replay 测试扩展到
+Qwen/V4、K=3/8、split/split_no_skip、所有 mask 与 padding，并保留 allocator 压力。
+将所有 step 故意改为复用第零步 raw KV 地址，K=3/8 的 CPU 尾段测试均失败，
+确认结果检查能够发现逐步写地址混用。
+本机无 CUDA，**26 项 CUDA 与 1 项 NCCL 测试跳过**，不计为 GPU 通过。
+Ruff 语法/未定义检查、修改文件格式与 diff 检查通过；尚无新吞吐结果。
+
+内网在完整更新 SGLang/插件并重启后，使用 README 的 V4 配置和原生 dsv4 后端：
+
+```bash
+export PYTHONPATH="$PWD/experimental/hybrid-spec/src:$PWD/python${PYTHONPATH:+:$PYTHONPATH}"
+python -m pytest experimental/hybrid-spec/tests/test_core.py experimental/hybrid-spec/tests/test_compact_tail.py -q
+python -m pytest experimental/hybrid-spec/tests/test_draft_recurrence.py -q
+python -m pytest experimental/hybrid-spec/tests/test_cuda.py -q
+python -m pytest experimental/hybrid-spec/tests/test_tp.py -q
+```
+
+真实 V4 模型先验 TP=1/2/4、并发 1/4、K=3/8，覆盖全 SA/全 neural/混合命中、
+3→4 padding、请求重排、完成与槽位复用、跨请求全局池及 split_no_skip。
+与相同 TP/config 的 full 或原生 MTP 核对输出和接受长度；确认 trace 中混合批尾段
+模型行数等于未命中实际请求数，各 rank 选择一致，再做短吞吐对照。
+本次没有 GPU、NCCL Graph、真实 dsv4 模型或性能验收结论。
+
 ## DeepSeek V4 SA 与整批 split 接入（2026-10-17，待内网 GPU 验收）
+
+> 以下保留上一阶段的历史记录；当前逐请求实现及替代测试以上节为准。
 
 修复两处接入缺口：`validate_model` 将 V4 target/NextN draft 的原生 hybrid-SWA
 误判为完全未适配；`SplitDraftGraphBackend` 仅允许 Qwen3.5 MTP。

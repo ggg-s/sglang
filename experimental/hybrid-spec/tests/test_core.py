@@ -955,66 +955,70 @@ def test_dsv4_split_rejects_qwen_triton_attention(monkeypatch):
         native_split_backend(monkeypatch, "split", attention="triton")
 
 
-@pytest.mark.parametrize("mode", ["split", "split_no_skip"])
 @pytest.mark.parametrize("k", [3, 8])
-def test_dsv4_whole_batch_split_restores_positions_and_excludes_padding(
-    monkeypatch, mode, k
-):
-    from hybrid_spec.integrations.sglang.split_graph import SplitCapture
+def test_dsv4_compact_metadata_preserves_request_major_step_writes(k):
+    from hybrid_spec.integrations.sglang.compact_graph import _plan_dsv4_metadata
 
-    backend = native_split_backend(monkeypatch, mode)
-    assert not backend.compact_rows
-    positions = torch.arange(4) + 20
-    original = positions.clone()
-    mask = torch.zeros(4, dtype=torch.bool)
-    work = torch.zeros(4, dtype=torch.int64)
-    neural = torch.arange(4 * k).reshape(4, k)
-    candidates = neural.clone()
-    candidates[:, 2:] += 100
-    drafts = torch.empty_like(neural)
+    requests = torch.tensor([31, 7, 42, 13])
+    lengths = torch.tensor([151, 257, 389, 517])
+    # Independent ordinal encoding makes wrong row/step strides observable.
+    full_cache = requests[None, :] * 1000 + torch.arange(k)[:, None]
 
-    def prefix():
-        positions.add_(1)
-        work.add_(1)
-        drafts.copy_(candidates)
+    class Child:
+        def __init__(self, step, size):
+            self.step = step
+            self.req = torch.empty(size, dtype=torch.int64)
+            self.lens = torch.empty_like(self.req)
+            self.raw_write = torch.empty_like(self.req)
+            self.swa_write = torch.empty_like(self.req)
 
-    def tail():
-        positions.add_(k - 2).sub_(k - 1)
-        work.add_(k - 2)
-        drafts.copy_(torch.where(mask[:, None], candidates, neural))
+        def init_forward_metadata_out_graph(self, fb, in_capture):
+            assert fb.seq_lens_cpu is None
+            self.req.copy_(fb.req_pool_indices)
+            self.lens.copy_(fb.seq_lens)
+            self.raw_write.copy_(fb.out_cache_loc)
 
-    record = SplitCapture(
-        SimpleNamespace(replay=prefix),
-        SimpleNamespace(replay=tail),
-        drafts,
-        SimpleNamespace(positions=positions, batch_size=4),
-        SimpleNamespace(use_retrieval=mask),
-    )
-    backend.records[4] = record
-    for raw_bs in (4, 3, 1, 2, 4):
-        backend.runner.raw_bs = raw_bs
-        for bits in range(1 << raw_bs):
-            mask.copy_(
-                torch.tensor([bool(bits & (1 << i)) and i < raw_bs for i in range(4)])
-            )
-            work.zero_()
-            before = dict(backend.counters)
-            histogram = dict(backend.counters["tail_batch_histogram"])
-            output = backend.replay(4, record.inputs)
-            all_sa = bits == (1 << raw_bs) - 1 and mode == "split"
-            expected = torch.where(mask[:, None], candidates, neural)
-            assert torch.equal(output[:raw_bs], expected[:raw_bs])
-            assert torch.equal(positions, original)
-            assert work.tolist() == [1 if all_sa else k - 1] * 4
-            assert backend.counters["request_ct"] - before["request_ct"] == raw_bs
-            assert backend.counters["skip_request_ct"] - before["skip_request_ct"] == (
-                raw_bs if all_sa else 0
-            )
-            assert backend.counters["tail_request_ct"] - before["tail_request_ct"] == (
-                0 if all_sa else raw_bs
-            )
-            key = "0" if all_sa else "4"
-            assert backend.counters["tail_batch_histogram"][key] - histogram[key] == 1
+        def init_forward_metadata_in_graph(self, fb):
+            # Native SWA refresh reads the request-major full window by step.
+            assert fb.out_cache_loc.shape == (fb.batch_size * k,)
+            self.swa_write.copy_(fb.out_cache_loc.view(fb.batch_size, k)[:, self.step])
+
+    for size in range(1, 5):
+        children = [Child(step, size) for step in range(k)]
+        attention = SimpleNamespace(attn_backends=children)
+        cache_window = torch.empty((size, k), dtype=torch.int64)
+        cache = cache_window.T
+        flat = cache_window.flatten()
+        fb = SimpleNamespace(
+            batch_size=size,
+            req_pool_indices=torch.empty(size, dtype=torch.int64),
+            seq_lens=torch.empty(size, dtype=torch.int64),
+            seq_lens_cpu=None,
+            out_cache_loc=flat,
+        )
+        for selection in itertools.combinations(range(4), size):
+            # Also vary the row order: the request id is not the compact row id.
+            rows = torch.tensor(selection[::-1])
+            fb.req_pool_indices.copy_(requests[rows])
+            fb.seq_lens.copy_(lengths[rows])
+            torch.index_select(full_cache, 1, rows, out=cache)
+            _plan_dsv4_metadata(attention, fb, cache, flat, in_capture=True)
+            _plan_dsv4_metadata(attention, fb, cache, flat, in_capture=False)
+            assert fb.out_cache_loc is flat
+            for step in range(1, k - 1):
+                child = children[step]
+                actual = (
+                    child.raw_write + 2 * child.swa_write + 7 * child.req + child.lens
+                )
+                expected = torch.tensor(
+                    [
+                        3 * (int(requests[row]) * 1000 + step)
+                        + 7 * int(requests[row])
+                        + int(lengths[row])
+                        for row in selection[::-1]
+                    ]
+                )
+                assert torch.equal(actual, expected)
 
 
 def test_diagnostic_readback_preserves_native_state_and_counts():

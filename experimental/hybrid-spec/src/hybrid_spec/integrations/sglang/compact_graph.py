@@ -1,4 +1,4 @@
-"""Compact the unmatched rows before replaying the Qwen3.5 MTP tail.
+"""Compact the unmatched rows before replaying a Qwen3.5 or V4 MTP tail.
 
 Each tail size owns its attention metadata, buffers and private graph pool.
 The row mapping is dynamic; no model forward is replayed for selected SA rows.
@@ -39,8 +39,11 @@ class CompactCapture:
 def capture_compact(runner, batch, forward_fn, stream, post_warmup_hook, mode="split"):
     from sglang.srt.layers.attention.triton_backend import TritonMultiStepDraftBackend
 
-    if type(runner.draft_attn_backend) is not TritonMultiStepDraftBackend:
-        raise ValueError("multi-request split graphs require Triton draft attention")
+    dsv4 = _is_dsv4(runner)
+    if not dsv4 and type(runner.draft_attn_backend) is not TritonMultiStepDraftBackend:
+        raise ValueError(
+            "compact split graphs require Triton or native dsv4 draft attention"
+        )
     if runner.model_runner.kv_index_translator.is_translating:
         raise ValueError("compact tails do not support translated KV pools")
     if runner.model_runner.canary_manager is not None:
@@ -71,11 +74,7 @@ def capture_compact(runner, batch, forward_fn, stream, post_warmup_hook, mode="s
             if post_warmup_hook is not None:
                 post_warmup_hook()
         torch.cuda.synchronize()
-        prefix = torch.cuda.CUDAGraph()
-        with torch.cuda.graph(
-            prefix, pool=torch.cuda.graph_pool_handle(), stream=stream
-        ):
-            output = forward_fn()
+        prefix, output = _capture_graph(forward_fn, stream)
     finally:
         del view.on_prefix_ready
     record = CompactCapture(prefix, output, batch, view, state)
@@ -120,6 +119,7 @@ def _capture_tail(runner, record, size, stream):
     )
 
     original = record.inputs
+    dsv4 = _is_dsv4(runner)
     tokens, hidden, cache, drafts = record.state
     steps = runner.speculative_num_steps
     rows = torch.arange(size, device=tokens.device)
@@ -130,7 +130,11 @@ def _capture_tail(runner, record, size, stream):
     fb.seq_lens_sum = None  # use the backend's static safe upper bound
     fb.seq_lens_cpu = None
     fb.positions = torch.empty_like(original.positions[:size])
-    fb.mrope_positions = torch.empty_like(original.mrope_positions[:, :size])
+    fb.mrope_positions = (
+        None
+        if original.mrope_positions is None
+        else torch.empty_like(original.mrope_positions[:, :size])
+    )
     fb.seq_lens = torch.empty_like(original.seq_lens[:size])
     fb.req_pool_indices = torch.empty_like(original.req_pool_indices[:size])
     fb.extend_seq_lens = torch.ones_like(original.extend_seq_lens[:size])
@@ -138,15 +142,26 @@ def _capture_tail(runner, record, size, stream):
     fb.input_ids = torch.empty(size, device=tokens.device, dtype=tokens.dtype)
     fb.spec_info.hidden_states = torch.empty_like(hidden[:size])
     compact_drafts = torch.empty_like(drafts[:size])
-    compact_cache = torch.empty_like(cache[:, :size])
+    # Native V4 metadata consumes a request-major, flattened K-step window.
+    # Keep its per-step view as an alias, never a separately uploaded copy.
+    cache_window = torch.empty((size, steps), dtype=cache.dtype, device=cache.device)
+    compact_cache = cache_window.T
+    flat_cache = cache_window.view(-1)
+    fb.out_cache_loc = flat_cache
     mask = torch.empty(size, device=tokens.device, dtype=torch.bool)
     sa = torch.empty_like(drafts[:size])
-    attention = TritonMultiStepDraftBackend(runner.model_runner, 1, steps)
+    attention_type = (
+        type(runner.draft_attn_backend) if dsv4 else TritonMultiStepDraftBackend
+    )
+    attention = attention_type(runner.model_runner, 1, steps)
     attention.init_cuda_graph_state(size, size)
 
     def stage():
         torch.index_select(original.positions, 0, rows, out=fb.positions)
-        torch.index_select(original.mrope_positions, 1, rows, out=fb.mrope_positions)
+        if fb.mrope_positions is not None:
+            torch.index_select(
+                original.mrope_positions, 1, rows, out=fb.mrope_positions
+            )
         torch.index_select(original.seq_lens, 0, rows, out=fb.seq_lens)
         torch.index_select(original.req_pool_indices, 0, rows, out=fb.req_pool_indices)
         torch.index_select(cache, 1, rows, out=compact_cache)
@@ -159,7 +174,12 @@ def _capture_tail(runner, record, size, stream):
     # Metadata is planned with the original positions: its step i already
     # includes i draft KV slots. The model then resumes at position +1.
     stage()
-    attention.init_forward_metadata_out_graph(fb, in_capture=True)
+    # A copied ForwardBatch must not retain the full batch's KV plan/tables.
+    runner.model_runner.kv_index_translator.bind_runner_slots(fb)
+    if dsv4:
+        _plan_dsv4_metadata(attention, fb, compact_cache, flat_cache, in_capture=True)
+    else:
+        attention.init_forward_metadata_out_graph(fb, in_capture=True)
     fb.mark_forward_metadata_ready()
     seed_hidden = fb.spec_info.hidden_states
     seed_tokens = fb.input_ids
@@ -168,8 +188,16 @@ def _capture_tail(runner, record, size, stream):
         fb.spec_info.hidden_states = seed_hidden
         fb.input_ids = seed_tokens
         stage()
-        attention.init_forward_metadata_out_graph(fb, in_capture=False)
-        attention.init_forward_metadata_in_graph(fb)
+        # The previous replay leaves a single-step write view on fb. Restore
+        # the complete window before planning/capturing the next metadata set.
+        fb.out_cache_loc = flat_cache
+        if dsv4:
+            _plan_dsv4_metadata(
+                attention, fb, compact_cache, flat_cache, in_capture=False
+            )
+        else:
+            attention.init_forward_metadata_out_graph(fb, in_capture=False)
+            attention.init_forward_metadata_in_graph(fb)
         fb.positions.add_(1)
         for i in range(1, steps - 1):
             fb.out_cache_loc = compact_cache[i]
@@ -192,17 +220,52 @@ def _capture_tail(runner, record, size, stream):
     with torch.cuda.stream(stream):
         for _ in range(2):
             run()
+            if dsv4:
+                # V4 upgrades raw -> full metadata during warmup; reset its raw
+                # capture inputs so those GPU builders are recorded in graph.
+                attention.on_after_cuda_graph_warmup()
     torch.cuda.synchronize()
-    graph = torch.cuda.CUDAGraph()
-    with torch.cuda.graph(graph, pool=torch.cuda.graph_pool_handle(), stream=stream):
-        run()
+    graph, _ = _capture_graph(run, stream)
     return CompactTail(
         graph,
         rows,
         fb,
         attention,
-        (seed_hidden, seed_tokens, compact_drafts, compact_cache, mask, sa),
+        (seed_hidden, seed_tokens, compact_drafts, compact_cache, flat_cache, mask, sa),
     )
+
+
+def _capture_graph(forward_fn, stream):
+    graph = torch.cuda.CUDAGraph()
+    with torch.cuda.graph(graph, pool=torch.cuda.graph_pool_handle(), stream=stream):
+        output = forward_fn()
+    return graph, output
+
+
+def _is_dsv4(runner):
+    return (
+        getattr(runner.draft_attn_backend, "decode_attention_backend_str", None)
+        == "dsv4"
+    )
+
+
+def _plan_dsv4_metadata(attention, batch, cache, flat_cache, *, in_capture):
+    # Keep native step ids (1..K-2): step zero ran in the prefix. Each child
+    # owns its compact metadata and gets this request's actual write target.
+    # Unlike native full-batch replay, do not copy child zero's raw metadata to
+    # every step: raw_out_loc is also a per-step KV address.
+    try:
+        for step in range(1, cache.shape[0] - 1):
+            child = attention.attn_backends[step]
+            batch.out_cache_loc = cache[step]
+            child.init_forward_metadata_out_graph(batch, in_capture=in_capture)
+            if not in_capture:
+                # Native in-graph SWA refresh indexes the full request-major
+                # window by speculative_step_id, not a single-step vector.
+                batch.out_cache_loc = flat_cache
+                child.init_forward_metadata_in_graph(batch)
+    finally:
+        batch.out_cache_loc = flat_cache
 
 
 def replay_compact(record, counters, raw_bs):

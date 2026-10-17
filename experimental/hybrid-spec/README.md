@@ -29,11 +29,13 @@ DeepSeek V4 原生 MTP 现在有独立接入：只对 `DeepseekV4ForCausalLM` ta
 外部草稿和 DSpark 仍拒绝。纯文本 V4 可直接使用；有视觉能力的 checkpoint
 需要显式 text-only 配置，实际多模态输入仍会被请求检查拒绝。
 
-V4 的 `split` 保留原生 dsv4 注意力、per-step KV 地址和 SWA/压缩元数据：
-所有实际请求都通过 gate 时跳过整批尾段，混合命中时运行原始整批尾段。
-该路径不做 Qwen/Triton 的逐行紧凑裁剪，padding 不参与整批命中判定。
-`tail_request_ct` 记录实际进入尾段的请求数，`tail_batch_histogram` 记录模型行数
-（包含 Graph padding）。SA 查询重叠和单次 TP 共识继续生效，GPU 模型结果待内网验收。
+V4 的 `split` 现在与 Qwen 一样按请求裁剪：前两个 neural token 通过 SA gate
+的行保留完整 SA 草稿，其余行收集到独立的 1/2/3/4 行尾段 Graph，再写回原行。
+全部命中时不运行尾段，Graph padding 不进入尾段；例如 4 行中 3 行命中，尾段只跑 1 行。
+注意力仍使用当前选定的原生 dsv4 后端及其具体子类。每个紧凑批拥有独立的
+请求/KV 计划与逐步 metadata，保留原生 SWA 和 target 压缩/verify 路径。
+`tail_request_ct` 与 `tail_batch_histogram` 均按实际进入尾段的行数记录。
+SA 查询重叠、全局池和单次 TP 共识继续生效，真实 GPU 模型与吞吐待内网验收。
 
 配置模板为 `configs/device-dsv4-mtp-split-global-pool.json`。在已经可运行的
 原生 V4 MTP 命令上设置以下项，并保留原有模型、TP、量化和 KV 参数：
@@ -60,7 +62,7 @@ split 仍要求 K>2、gate=2。`max_history_tokens=16384` 包含完整 prompt �
 | 历史 | CPU 模式关闭 overlap、从 CPU 已提交历史取增量；device 模式使用 GPU verify 反馈 |
 | 生命周期 | 历史重复不追加；历史变化重建；请求对象代际、结束释放、弱引用清理、flush reset |
 | 混合线性注意力 | 实验接入 Qwen3.5/3.6 target + 原生 Qwen3.5 MTP，要求 `--language-only`；保留 GDN verify/commit 和 mRoPE |
-| 混合 SWA | 实验接入 DeepSeek V4 target + NextN MTP；split 使用原生整批尾段，其他 SWA 模型仍拒绝 |
+| 混合 SWA | 实验接入 DeepSeek V4 target + NextN MTP；split 使用原生 dsv4 注意力的逐请求尾段，其他 SWA 模型仍拒绝 |
 | 暂不开放 | CPU 模式 overlap/chunked prefill、DP/PP/EP/CP、多机、torch.compile、混合 prefill/decode、随机采样、grammar、LoRA、其他混合线性注意力模型、多模态请求、多层 EAGLE、FROZEN_KV_MTP、动态预算、Arctic |
 
 默认 CPU 历史模式使用同步调度器已提交到 CPU 的输出，只上传确认增量，当前 anchor 已包含在历史中。device 模式使用 GPU verify 的接受前缀，可能包含最终 CPU EOS/停止截断前的尾部；不能将其计数或索引长度当作最终交付 token 统计。两者均不增加逐步 D2H 读取。

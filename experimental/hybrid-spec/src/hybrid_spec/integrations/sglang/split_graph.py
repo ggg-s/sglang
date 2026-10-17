@@ -44,9 +44,8 @@ class SplitDraftGraphBackend:
             raise ValueError(
                 "split draft graphs support only BS<=4 Qwen3.5 or DeepSeek V4 MTP"
             )
-        self.compact_rows = architecture == ["Qwen3_5ForCausalLMMTP"]
         if (
-            not self.compact_rows
+            architecture == ["DeepseekV4ForCausalLMNextN"]
             and getattr(runner.draft_attn_backend, "decode_attention_backend_str", None)
             != "dsv4"
         ):
@@ -89,7 +88,7 @@ class SplitDraftGraphBackend:
         self, shape_key, forward_fn, capture_inputs=None, post_warmup_hook=None
     ):
         batch = capture_inputs
-        if batch.batch_size > 1 and self.compact_rows:
+        if batch.batch_size > 1:
             from .compact_graph import capture_compact
 
             self.records[shape_key] = capture_compact(
@@ -174,9 +173,7 @@ class SplitDraftGraphBackend:
             self.counters["tail_ct"] += 1
             self.counters["tail_request_ct"] += raw_bs
             self.counters["mixed_ct"] += int(0 < num_sa < raw_bs)
-            # V4 retains the original batch and per-step SWA/KV metadata.
-            # Mixed batches run the whole native tail; only unanimous hits
-            # skip it. Histogram records model rows, including graph padding.
+            # Single-request path. Multi-request graphs use compact dispatch.
             self.counters["tail_batch_histogram"][str(record.inputs.batch_size)] += 1
             record.tail.replay()
         return record.output
