@@ -1,0 +1,41 @@
+"""Isolate synthetic-model tests from full SGLang serving dependencies.
+
+The actual repository topk Triton kernel and ForwardContext are loaded unchanged.
+Only unused full-graph delegate and synthetic attention class boundaries are
+replaced; these tests already replace the model and attention computations.
+"""
+import importlib.util
+import sys
+from pathlib import Path
+from types import ModuleType
+import pytest
+
+ROOT = Path(__file__).parent / 'repo' / 'python'
+
+@pytest.fixture(autouse=True)
+def isolate_synthetic_model_imports(request, monkeypatch):
+    if request.node.originalname != 'test_compact_tail_graph_reorders_rows_without_computing_sa_requests':
+        return
+    packages = ('sglang', 'sglang.kernels', 'sglang.kernels.ops',
+                'sglang.kernels.ops.speculative', 'sglang.srt',
+                'sglang.srt.layers', 'sglang.srt.layers.attention',
+                'sglang.srt.model_executor',
+                'sglang.srt.model_executor.runner_backend')
+    for name in packages:
+        module = ModuleType(name)
+        module.__path__ = [str(ROOT.joinpath(*name.split('.')))]
+        monkeypatch.setitem(sys.modules, name, module)
+    for name in ('sglang.kernels.ops.speculative.topk1',
+                 'sglang.srt.model_executor.forward_context'):
+        spec = importlib.util.spec_from_file_location(
+            name, ROOT.joinpath(*name.split('.')).with_suffix('.py'))
+        module = importlib.util.module_from_spec(spec)
+        monkeypatch.setitem(sys.modules, name, module)
+        spec.loader.exec_module(module)
+    for name, class_name in (
+        ('sglang.srt.layers.attention.triton_backend', 'TritonMultiStepDraftBackend'),
+        ('sglang.srt.model_executor.runner_backend.full_cuda_graph_backend', 'FullCudaGraphBackend'),
+    ):
+        module = ModuleType(name)
+        setattr(module, class_name, type(class_name, (), {}))
+        monkeypatch.setitem(sys.modules, name, module)

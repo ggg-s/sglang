@@ -1,0 +1,54 @@
+{
+  "commit": "a3a0d112b6ff02d48a57855afb7d68e3b964bf30",
+  "python": "3.10.18",
+  "platform": "Linux-6.6.87.2-microsoft-standard-WSL2-x86_64-with-glibc2.39",
+  "torch": "2.8.0+cu128",
+  "torch_cuda": "12.8",
+  "triton": "3.4.0",
+  "pytest": "9.1.1",
+  "gpu": "NVIDIA GeForce RTX 4060 Laptop GPU",
+  "nvcc": "nvcc: NVIDIA (R) Cuda compiler driver\nCopyright (c) 2005-2023 NVIDIA Corporation\nBuilt on Fri_Jan__6_16:45:21_PST_2023\nCuda compilation tools, release 12.0, V12.0.140\nBuild cuda_12.0.r12.0/compiler.32267302_0",
+  "driver": "592.82",
+  "command": [
+    "/workspace/dsv4-lease-validation-20261017/venv310/bin/python",
+    "-m",
+    "pytest",
+    "-p",
+    "lean_cuda_plugin",
+    "experimental/hybrid-spec/tests",
+    "-q",
+    "--tb=short"
+  ],
+  "environment": {
+    "PATH": "/workspace/dsv4-lease-validation-20261017/venv310/bin:$PATH",
+    "PYTHONPATH": "/workspace/dsv4-lease-validation-20261017:experimental/hybrid-spec/src",
+    "CC": "gcc-12",
+    "CXX": "g++-12",
+    "CUDA_HOME": "/usr",
+    "MAX_JOBS": "2",
+    "TORCH_CUDA_ARCH_LIST": "8.9",
+    "GLOO_SOCKET_IFNAME": "lo"
+  },
+  "results": {
+    "passed": 218,
+    "skipped": 2,
+    "cpu_passed": 181,
+    "cuda_passed": 37,
+    "skips": [
+      "nccl-2",
+      "nccl-8"
+    ]
+  },
+  "sha256": {
+    "experimental/hybrid-spec/src/hybrid_spec/integrations/sglang/device_extension.py": "d4f5e14b0aa7fa79a19cda2e32d5f382c39b8f0ebf98e8bc49864c9fa40ca890",
+    "experimental/hybrid-spec/src/hybrid_spec/integrations/sglang/compact_graph.py": "172eb66bc4b1cb9ae8d5aa83854dde522f4c432db2f08d4045b952daeb958ced",
+    "experimental/hybrid-spec/src/hybrid_spec/integrations/sglang/split_graph.py": "823e564e6518be1ccc3f76097ec52dba9b8f664c96ae223039fcce3393460b4b",
+    "experimental/hybrid-spec/tests/test_core.py": "97cf91c07d2a832fdd3fae766675213d8ad8c2684ff9a3fb90d20dd57f4d5473",
+    "experimental/hybrid-spec/tests/test_cuda.py": "ed12d82fa138d67abb2fff6bb18a7a37edff40ad2d86137bfbd21169ad537aba",
+    "experimental/hybrid-spec/tests/test_tp.py": "e94a8b8564268cb7f99960d378d2db2bed4c6921ed1944021ece171076684241",
+    "python/sglang/kernels/ops/speculative/topk1.py": "9452a7b2c961d4f152c7705b2cc4b4e717937e0d9ecfa871725bfaefc42fb93e",
+    "python/sglang/srt/model_executor/forward_context.py": "63900e43eaf683bcc50991e56dac6d194566b9fcef2ed452ff8e5818e503d2d0"
+  },
+  "helper_sha256": "3323ed0e2561469672735868387cd9834507af9661a248238cf876245103639e",
+  "boundaries": "Eight compact CUDA cases replace the unused FullCudaGraphBackend marker class and the synthetic attention-container boundary. Exact repository topk Triton kernel and ForwardContext execute unchanged; production SA kernels, graph capture/replay and gather/scatter execute on GPU. This does not validate real DSV4 attention, weights, TP8 NCCL, accuracy or performance."
+}

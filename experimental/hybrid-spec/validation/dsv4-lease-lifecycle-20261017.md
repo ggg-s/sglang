@@ -32,6 +32,31 @@ metadata/KV 计划，逐步写地址、hidden state、位置和原行 scatter �
 包括 #26239 的 MTP Graph/metadata 约束；以当前 `deepseek_v4_backend.py`、
 `compact_graph.py`、`device_extension.py` 和 scheduler 调用链为修复依据。
 
+## 本次工作机结果
+
+修复提交 `a3a0d112b6ff02d48a57855afb7d68e3b964bf30` 已由 ai-workstation
+从 GitHub clone/pull 后验证。RTX 4060 Laptop 8GB、WSL2/Linux、Python 3.10.18、
+PyTorch 2.8.0+cu128、Triton 3.4.0、nvcc 12.0、GCC/G++ 12：
+**218 passed、2 skipped，24.24 秒**，其中 CPU/Gloo 181 项、CUDA 37 项。
+单卡跳过 NCCL 2/8 卡两项。结束后无测试进程，GPU 显存为 0 MiB。
+
+8 项 compact CUDA 测试使用额外的轻量导入辅助：替换未执行的完整 Graph delegate
+标记类，以及测试本来就要替换的合成 attention 容器边界；从该提交直接加载原生
+topk Triton kernel 和 ForwardContext。SA CUDA kernel、stream、Graph capture/replay、
+gather/scatter 均实际运行。这是合成模型边界的 GPU 契约测试，不是完整服务、真实
+DSV4 attention 或 TP8 模型验收；其余 29 项 CUDA 测试不使用此边界替换。
+新增 4 项 CUDA lease 用例在 max_requests=1/4、global pool 开/关下，各连续换入
+6 批请求并重放查询，逐项检查命中 mask 与完整候选链。
+
+原始日志、环境/源码哈希和辅助文件见 [4060 证据](dsv4-lease-4060/README.md)。
+工作机运行目录：`/workspace/dsv4-lease-validation-20261017/`。
+
+用户提供的 macOS Python 崩溃报告对应 21:53 的本地 Gloo 测试子进程。
+同次测试日志为 `uv_bind: operation not permitted`，报告栈在
+`gloo::transport::uv::Device` 调用 abort/SIGABRT；这是沙箱禁止本地 socket
+绑定触发的进程退出，不是这轮 DSV4 CUDA 崩溃。沙箱外本地 Gloo TP8 已通过；
+之后本次完整套件移到上述 Linux 工作机，避免重复触发 Mac 弹窗。
+
 ## GPU / TP 回归
 
 在完整更新的仓库根目录执行，插件和 SGLang 必须来自同一源码版本：
