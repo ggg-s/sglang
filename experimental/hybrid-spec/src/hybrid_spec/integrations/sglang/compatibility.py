@@ -30,7 +30,6 @@ def validate_config(config, cfg):
     if config.draft_graph_mode != "full":
         for name, expected in {
             "speculative_algorithm": "EAGLE",
-            "tp_size": 1,
             "speculative_use_rejection_sampling": False,
             "disable_cuda_graph": False,
             "enable_memory_saver": False,

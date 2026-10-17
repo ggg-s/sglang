@@ -17,11 +17,17 @@ from hybrid_spec.observability.metrics import Metrics
 
 
 class DeviceOverride(DraftOverrideView):
-    def __init__(self, backend, slots, generations, tp_sync=None):
+    def __init__(self, backend, slots, generations, tp_sync=None, query_stream=None):
         self.backend = backend
         self.slots = slots
         self.generations = generations
         self.tp_sync = tp_sync
+        self.query_stream = query_stream
+        self.defer_prefix = backend.config.draft_graph_mode != "full"
+        if self.defer_prefix:
+            self.first_neural_tokens = torch.empty(
+                (len(slots), 1), dtype=torch.int64, device=backend.device
+            )
         # Only worker-created views provide this immutable host metadata key.
         # Manually constructed views may mutate their tensors between stages.
         self.mapping_key = None
@@ -47,6 +53,18 @@ class DeviceOverride(DraftOverrideView):
         )
 
     def prepare(self, seq_lens):
+        if self.query_stream is None:
+            self._query(seq_lens)
+        else:
+            # Fork after feedback/import/staging, join before reading SA output.
+            # Capture records these dependencies; replay needs no host events.
+            self.query_stream.wait_stream(torch.cuda.current_stream())
+            with torch.cuda.stream(self.query_stream):
+                self._query(seq_lens)
+        if not self.defer_prefix:
+            self._synchronize()
+
+    def _query(self, seq_lens):
         shared = (
             {
                 "shared_slots": self.shared_slots,
@@ -64,21 +82,49 @@ class DeviceOverride(DraftOverrideView):
             self.use_retrieval,
             **shared,
         )
+
+    def _synchronize(self):
         if self.tp_sync is not None:
             agreed = self.tp_sync.synchronize(self)
             # Preserve graph storage and the mask alias used by verify metrics.
             self.tokens.copy_(agreed.tokens)
             self.use_retrieval.copy_(agreed.use_retrieval)
 
+    def select_step(self, neural_tokens, step):
+        if not self.defer_prefix or step > 1:
+            return super().select_step(neural_tokens, step)
+        if neural_tokens.shape not in ((len(self.slots),), (len(self.slots), 1)):
+            raise ValueError("hybrid selection requires one neural token per row")
+        if step == 0:
+            # Gate tokens always equal the neural prefix. Its first forward
+            # can run without reading either the query mask or SA candidates.
+            self.first_neural_tokens.copy_(neural_tokens.reshape(-1, 1))
+        else:
+            if self.query_stream is not None:
+                torch.cuda.current_stream().wait_stream(self.query_stream)
+            self.use_retrieval.logical_and_(
+                self.tokens[:, 0] == self.first_neural_tokens[:, 0]
+            )
+            self.use_retrieval.logical_and_(
+                self.tokens[:, 1] == neural_tokens.reshape(-1)
+            )
+            # All ranks participate, even with no local hits. Combining the
+            # final gate mask with exact candidate consensus guarantees the
+            # same skip/compact rows before any rank chooses a tail graph.
+            # Keep NCCL on the model stream, after its prefix collectives.
+            self._synchronize()
+        return neural_tokens
+
 
 class DeviceGraphBuffers:
-    def __init__(self, backend, max_bs, tp_sync=None):
+    def __init__(self, backend, max_bs, tp_sync=None, query_stream=None):
         self.staged_mapping = None
         self.view = DeviceOverride(
             backend,
             torch.full((max_bs,), -1, dtype=torch.int64, device=backend.device),
             torch.zeros(max_bs, dtype=torch.int64, device=backend.device),
             tp_sync,
+            query_stream,
         )
 
     def bind_capture_view(self, batch_size):
@@ -86,6 +132,10 @@ class DeviceGraphBuffers:
         view = object.__new__(DeviceOverride)
         view.backend = self.view.backend
         view.tp_sync = self.view.tp_sync
+        view.query_stream = self.view.query_stream
+        view.defer_prefix = self.view.defer_prefix
+        if view.defer_prefix:
+            view.first_neural_tokens = self.view.first_neural_tokens[:batch_size]
         view.mapping_key = None
         view.num_neural_gate_tokens = self.view.num_neural_gate_tokens
         for name in ("slots", "generations", "tokens", "use_retrieval"):
@@ -149,6 +199,12 @@ class DeviceDraftExtension:
         self.backend = backend
         self.vocab_size = vocab_size
         self.tp_sync = tp_sync
+        self.query_stream = None
+        if config.draft_graph_mode != "full" and backend.device.type == "cuda":
+            from sglang.srt.runtime_context import get_stream
+
+            # Lease outside graph capture; this stream never runs collectives.
+            self.query_stream = get_stream("hybrid_sa_query")
         self.metrics = Metrics()
         self.states = {}
         self.free_slots = list(range(config.num_sa_slots))
@@ -164,7 +220,7 @@ class DeviceDraftExtension:
         )
 
     def create_graph_buffers(self, max_bs):
-        return DeviceGraphBuffers(self.backend, max_bs, self.tp_sync)
+        return DeviceGraphBuffers(self.backend, max_bs, self.tp_sync, self.query_stream)
 
     def close_request(self, rid, *, retain=False):
         # Finish callbacks may run on the scheduler thread. Never touch GPU
@@ -332,6 +388,7 @@ class DeviceDraftExtension:
             torch.tensor(slots, dtype=torch.int64, device=self.backend.device),
             torch.tensor(generations, dtype=torch.int64, device=self.backend.device),
             self.tp_sync,
+            self.query_stream,
         )
         if self.config.enable_global_pool and shared:
             # Unused entries remain -1. Published order breaks exact donor ties.

@@ -80,7 +80,7 @@ class SplitDraftGraphBackend:
             from .compact_graph import capture_compact
 
             self.records[shape_key] = capture_compact(
-                self.runner, batch, forward_fn, self.stream, post_warmup_hook
+                self.runner, batch, forward_fn, self.stream, post_warmup_hook, self.mode
             )
             return
         view = batch.spec_info.draft_override
@@ -138,9 +138,7 @@ class SplitDraftGraphBackend:
         from .compact_graph import CompactCapture, replay_compact
 
         if isinstance(record, CompactCapture):
-            return replay_compact(
-                record, self.mode, self.counters, self.runner.raw_bs
-            )
+            return replay_compact(record, self.counters, self.runner.raw_bs)
         record.prefix.replay()
         begin = time.perf_counter_ns()
         # This includes unfinished prefix GPU work, not just the incremental

@@ -7,6 +7,7 @@ The row mapping is dynamic; no model forward is replayed for selected SA rows.
 from __future__ import annotations
 
 import copy
+import itertools
 import time
 from dataclasses import dataclass, field
 
@@ -32,9 +33,10 @@ class CompactCapture:
     override: object
     state: tuple
     tails: dict = field(default_factory=dict)
+    dispatch: dict = field(default_factory=dict)
 
 
-def capture_compact(runner, batch, forward_fn, stream, post_warmup_hook):
+def capture_compact(runner, batch, forward_fn, stream, post_warmup_hook, mode="split"):
     from sglang.srt.layers.attention.triton_backend import TritonMultiStepDraftBackend
 
     if type(runner.draft_attn_backend) is not TritonMultiStepDraftBackend:
@@ -83,7 +85,30 @@ def capture_compact(runner, batch, forward_fn, stream, post_warmup_hook):
     torch.cuda.synchronize()
     for size in range(1, batch.batch_size + 1):
         record.tails[size] = _capture_tail(runner, record, size, stream)
+    prepare_dispatch(record, mode)
     return record
+
+
+def prepare_dispatch(record, mode):
+    # At most four rows: precompute every raw-batch mask and retain its device
+    # row vector. Replay performs no tensor allocation or row-index H2D upload.
+    # Keys include raw size through tuple length, excluding graph padding.
+    device_rows = {}
+    for raw_bs in range(1, record.inputs.batch_size + 1):
+        for mask in itertools.product((False, True), repeat=raw_bs):
+            rows = tuple(
+                i for i, hit in enumerate(mask) if not hit or mode == "split_no_skip"
+            )
+            size = len(rows)
+            if size and rows not in device_rows:
+                device_rows[rows] = torch.tensor(
+                    rows, dtype=torch.int64, device=record.tails[size].rows.device
+                )
+            record.dispatch[mask] = (
+                size,
+                record.tails[size] if size else None,
+                device_rows.get(rows),
+            )
 
 
 def _capture_tail(runner, record, size, stream):
@@ -180,14 +205,13 @@ def _capture_tail(runner, record, size, stream):
     )
 
 
-def replay_compact(record, mode, counters, raw_bs):
+def replay_compact(record, counters, raw_bs):
     record.prefix.replay()
     begin = time.perf_counter_ns()
     with torch.profiler.record_function("hybrid_prefix_decision"):
         mask = record.override.use_retrieval[:raw_bs].tolist()
     counters["decision_wait_ns"] += time.perf_counter_ns() - begin
-    rows = [i for i, hit in enumerate(mask) if not hit or mode == "split_no_skip"]
-    size = len(rows)
+    size, tail, rows = record.dispatch[tuple(mask)]
     counters["prefix_ct"] += 1
     counters["request_ct"] += raw_bs
     counters["skip_request_ct"] += raw_bs - size
@@ -196,8 +220,7 @@ def replay_compact(record, mode, counters, raw_bs):
     counters["tail_batch_histogram"][str(size)] += 1
     if size:
         counters["tail_ct"] += 1
-        tail = record.tails[size]
-        tail.rows.copy_(torch.tensor(rows, device=tail.rows.device))
+        tail.rows.copy_(rows)
         tail.graph.replay()
     else:
         counters["skip_ct"] += 1

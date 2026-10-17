@@ -159,6 +159,7 @@ def _qsa_index_share_requested(hf_config) -> bool:
 
 class EagleDraftWorker(EagleDraftWorkerBase):
     DRAFT_EXTENSION_API_VERSION = 2
+    DRAFT_SPLIT_GRAPH_API_VERSION = 3
 
     def __init__(
         self,
@@ -764,7 +765,7 @@ class EagleDraftWorker(EagleDraftWorkerBase):
                 dtype=topk_index.dtype,
                 device=topk_index.device,
             )
-            if prefix_ready is not None:
+            if prefix_ready is not None and not getattr(override, "defer_prefix", False):
                 # The prefix graph must produce a complete verify chain even
                 # when the remaining neural forwards are never replayed.
                 draft_tokens_topk1.copy_(override.tokens)
@@ -872,6 +873,11 @@ class EagleDraftWorker(EagleDraftWorkerBase):
                         draft_tokens_topk1[:, i + 1 : i + 2].copy_(topk_index)
                 hidden_states = logits_output.hidden_states
                 if i == 0 and prefix_ready is not None:
+                    if getattr(override, "defer_prefix", False):
+                        # The query has joined and gate/TP consensus is final.
+                        # Leave both neural gate columns intact, but materialize
+                        # the SA tail so a skipped graph yields a complete chain.
+                        draft_tokens_topk1[:, 2:].copy_(override.tokens[:, 2:])
                     prefix_output = prefix_ready(
                         forward_batch,
                         topk_index,

@@ -230,6 +230,7 @@ def _check_device_sync(group, ranks, device):
             sync = TPSynchronizer(group, communicator)
             _check_device_bridge(sync, ranks, device)
             _check_cpu_history_bridge(sync, ranks, device)
+            _check_split_gate(sync, ranks, device)
             if communicator is not None:
                 assert communicator.disabled  # eager must restore caller state
     else:
@@ -244,15 +245,114 @@ def _check_device_sync(group, ranks, device):
         _check_device_bridge(sync, ranks, device)
         _check_cpu_history_bridge(sync, ranks, device)
         _check_device_kernel_consensus(sync, ranks, device)
+        _check_device_kernel_consensus(sync, ranks, device, mode="split")
+        _check_split_gate(sync, ranks, device)
         assert communicator.disabled
         dist.destroy_process_group(cpu_group)
 
 
-def _check_device_kernel_consensus(sync, ranks, device):
+def _check_split_gate(sync, ranks, device):
+    """Local gate/candidate divergence must never split ranks into different tails.
+
+    CPU exercises real Gloo groups; CUDA captures the query fork/join and real
+    PyNccl consensus. Only the SA lookup and neural prediction are boundaries.
+    """
+    config = HybridConfig(
+        8,
+        2,
+        4,
+        128,
+        history_mode="device",
+        num_neural_gate_tokens=2,
+        draft_graph_mode="split",
+    )
+    base = torch.arange(32, device=device).reshape(4, 8) + 10
+    candidates = base.clone()
+    eligible = torch.ones(4, dtype=torch.bool, device=device)
+    neural = torch.full_like(base, 99)
+
+    def query(slots, generations, seq_lens, tokens, mask):
+        tokens.copy_(candidates)
+        mask.copy_(eligible)
+
+    backend = SimpleNamespace(config=config, device=device, consume_and_query=query)
+    query_stream = torch.cuda.Stream() if device.type == "cuda" else None
+    buffers = DeviceGraphBuffers(backend, 4, sync, query_stream)
+    view = buffers.bind_capture_view(4)
+    seq_lens = torch.ones(4, dtype=torch.int64, device=device)
+
+    def run():
+        view.prepare(seq_lens)
+        first = view.select_step(neural[:, :1], 0)
+        # A stand-in neural op between fork and join, without reading SA output.
+        second = view.select_step(neural[:, 1:2] + 0, 1)
+        return torch.cat(
+            [first, second]
+            + [view.select_step(neural[:, i : i + 1], i) for i in range(2, 8)],
+            dim=1,
+        )
+
+    graph = None
+    if device.type == "cuda":
+        stream = torch.cuda.Stream()
+        stream.wait_stream(torch.cuda.current_stream())
+        with torch.cuda.stream(stream):
+            for _ in range(3):
+                output = run()
+        torch.cuda.current_stream().wait_stream(stream)
+        graph = torch.cuda.CUDAGraph()
+        with torch.cuda.graph(graph, stream=stream):
+            output = run()
+    mask_address = view.use_retrieval.data_ptr()
+    for mode in (
+        "agree",
+        "candidate_disagree",
+        "gate_disagree",
+        "rank_fallback",
+        "agree",
+    ):
+        candidates.copy_(base)
+        neural[:, :2].copy_(base[:, :2])
+        eligible.fill_(True)
+        if dist.get_rank() == ranks[-1]:
+            if mode == "candidate_disagree":
+                candidates[1, -1].add_(1)
+            elif mode == "gate_disagree":
+                neural[2, 1].add_(1)
+            elif mode == "rank_fallback":
+                eligible[3] = False
+        if graph is None:
+            output = run()
+        else:
+            graph.replay()
+        expected_mask = [
+            True,
+            not (mode == "candidate_disagree" and len(ranks) > 1),
+            mode != "gate_disagree",
+            mode != "rank_fallback",
+        ]
+        assert view.use_retrieval.tolist() == expected_mask
+        assert view.use_retrieval.data_ptr() == mask_address
+        expected = neural.clone()
+        for row, enabled in enumerate(expected_mask):
+            if enabled:
+                expected[row].copy_(candidates[row])
+        assert torch.equal(output, expected)
+
+
+def _check_device_kernel_consensus(sync, ranks, device, mode="full"):
     """Actual host import, feedback, SA lookup and NCCL captured together."""
     from hybrid_spec.backends.gpu_sa import GPUSuffixAutomaton
 
-    config = HybridConfig(3, 2, 3, 64, history_mode="device")
+    config = HybridConfig(
+        3,
+        2,
+        3,
+        64,
+        history_mode="device",
+        draft_graph_mode=mode,
+        num_neural_gate_tokens=2 if mode == "split" else 0,
+    )
     backend = GPUSuffixAutomaton(config, device)
     prompts = [[1, 2, 3, 4, 1], [4, 5, 6, 7, 4], [1, 2, 3, 4, 1]]
     if dist.get_rank() == ranks[-1]:
@@ -260,18 +360,26 @@ def _check_device_kernel_consensus(sync, ranks, device):
     for slot, prompt in enumerate(prompts):
         backend.initialize_device_slot(slot, 10 + slot, 64)
         backend.import_host(slot, backend.build_host(backend.prepare_host(prompt), 100))
-    buffers = DeviceGraphBuffers(backend, 4, sync)
+    query_stream = torch.cuda.Stream() if mode == "split" else None
+    buffers = DeviceGraphBuffers(backend, 4, sync, query_stream)
     captured = buffers.bind_capture_view(4)
     seq_lens = torch.full((4,), 5, device=device, dtype=torch.int64)
     stream = torch.cuda.Stream()
+
+    def run():
+        captured.prepare(seq_lens)
+        if mode == "split":
+            captured.select_step(torch.full((4, 1), 3, device=device), 0)
+            captured.select_step(torch.full((4, 1), 4, device=device), 1)
+
     stream.wait_stream(torch.cuda.current_stream())
     with torch.cuda.stream(stream):
         for _ in range(3):
-            captured.prepare(seq_lens)
+            run()
     torch.cuda.current_stream().wait_stream(stream)
     graph = torch.cuda.CUDAGraph()
     with torch.cuda.graph(graph):
-        captured.prepare(seq_lens)
+        run()
 
     slots = torch.arange(3, device=device, dtype=torch.int64)
     generations = slots + 10

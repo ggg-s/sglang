@@ -6,6 +6,10 @@
 >
 > 2026-10-17 增补：本分支新增默认关闭的跨请求全局池，详见
 > [全局池实现与验证](validation/global-pool.md)。下列 C1/C4 性能记录均来自未开启全局池的旧实验。
+>
+> 2026-10-17 再增补：split 已接入 SA 查询与首个 MTP forward 的 stream 重叠、
+> 预分配尾段行号和单机多 TP 统一决策。以下更新机制描述，GPU 性能与多卡模型
+> 仍待内网验收；本地检查及复现命令见 [验证记录](VALIDATION.md)。
 
 ## 目录
 
@@ -45,12 +49,13 @@ flowchart TB
     P --> M["原生 target prefill / draft-extend"]
     H --> I["首次 draft：等待必要的构建结果并导入有效状态"]
     M --> I
-    I --> Q["消费本请求已接受增量并查询 SA"]
+    I --> G{"draft_graph_mode"}
+    G -->|full| Q["消费增量并查询 SA"]
     Q --> T["TP 共识：TP=1 直接通过；多 TP 校验资格和候选"]
-    T --> G{"draft_graph_mode"}
-    G -->|full| F["完整 neural loop：逐位置选择 SA / neural"]
-    G -->|split| A["整批 prefix Graph：检查前两个 neural token"]
-    A --> B{"当前行是否通过 SA 检查？"}
+    T --> F["完整 neural loop：逐位置选择 SA / neural"]
+    G -->|split| A["prefix Graph：SA 消费/查询与首个 MTP forward 并行"]
+    A --> C["等待查询完成，gate=2 检查后统一候选与 mask 的 TP 共识"]
+    C --> B{"当前行是否通过 SA 检查？"}
     B -->|通过| S["该行保留完整 SA 草稿，跳过尾段"]
     B -->|未通过| N["收集未命中行，续跑对应大小的 tail Graph"]
     F --> V["原生 target verify"]
@@ -58,7 +63,7 @@ flowchart TB
     N --> V
     V --> E["原生状态提交与 draft-extend"]
     E --> R["GPU 暂存接受前缀、bonus 与来源统计"]
-    R --> Q
+    R --> G
 ```
 
 `split_no_skip` 用作控制模式：保留拆图与 CPU mask 读取，但始终执行尾段，
@@ -98,7 +103,8 @@ A100 实验的 chunk size，不能将“开启该参数”当成长 prompt 多�
 
 ### 3.2 TP 共识、反馈统计与固定映射
 
-多 TP 的候选共识放在 draft `prepare()` 中，紧跟 SA 查询，并可被 CUDA Graph 捕获。
+full 的多 TP 候选共识放在 draft `prepare()` 中，紧跟 SA 查询；split 则在
+首个 MTP forward 与查询汇合、两个 gate token 检查后执行，可被 CUDA Graph 捕获。
 一次精确 MIN 归约携带候选、按位取反的候选及资格：只有所有 rank 均合格且 token
 一致，才使用 SA。不能因某个 rank 本地未命中就跳过 collective；TP=1 不执行该通信。
 这一机制已接通，多 GPU 模型与真实 NCCL Graph 时间线仍需单独验收。
@@ -231,7 +237,7 @@ export HYBRID_SPEC_CONFIG="$PWD/experimental/hybrid-spec/configs/device-qwen35-m
 # --speculative-draft-attention-backend triton
 ```
 
-split 限定 TP=1、greedy、topk=1、Qwen3.5 MTP、CUDA Graph，最多 4 个请求；
+split 开放单机 TP≥1、greedy、topk=1、Qwen3.5 MTP、CUDA Graph，最多 4 个请求；
 多请求压缩仅支持 Triton draft attention、普通 KV 池，并拒绝 memory saver、
 KV canary 等未支持组合。full 的通用接入范围不能直接套用于 split。
 
@@ -239,7 +245,7 @@ KV canary 等未支持组合。full 的通用接入范围不能直接套用于 s
 | --- | --- | --- |
 | CUDA 扩展名 | `hybrid_spec_gpu_sa_v3` | 紧凑 SA 状态布局与原生算子 |
 | 通用 draft extension API | v2 | 插件与 SGLang 的起草接入 |
-| draft split Graph API | v2 | prefix 返回与紧凑尾段接入 |
+| draft split Graph API | v3 | worker/runner 同步更新；延迟查询读取与多 TP 决策 |
 
 哈希/布局升级到 v3 涉及 CUDA 扩展，应更新并重启，按源码变化完成 JIT 编译。
 后续前缀检查和 C1/C4 Graph 调度为 Python 改动，SA 布局仍是 v3，无需因此重编译 CUDA。
@@ -253,10 +259,10 @@ split 还必须同时更新 SGLang worker/runner；仅安装新版插件不够�
 | 同一批中 SA/neural 混合来源 | 已实现 |
 | C1 / 最多 C4 按条件跳过尾段 | 已实现，默认关闭；性能结论分别记录 |
 | 跨请求 SA、已完成请求共享历史 | 已接入默认关闭的 device 全局池，验证范围见专项记录 |
-| decode SA 独立 CUDA stream | 未实现；CPU 构建与 prefill 重叠不等于此能力 |
+| decode SA 独立 CUDA stream | split 已接入查询与首个 MTP forward 重叠，待 GPU 性能验收；full 沿用原路径 |
 | 完整 neural MTP 后统一覆盖候选 | 当前 full 仍在 loop 内逐位置选择，不是这一执行方式 |
 | 无 CPU 决定的 GPU conditional Graph | 未实现 |
-| split TP>1 / 任意大并发 | 不支持 |
+| split TP>1 / 任意大并发 | 开放单机多 TP 实验，待 GPU 验收；活跃并发仍限制最多 4 |
 | 多 GPU 模型新策略与 NCCL Graph 验收 | 待完成 |
 | 所有模型、长历史、长 prompt 分块下的稳定收益 | 未建立 |
 

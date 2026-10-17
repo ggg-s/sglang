@@ -989,10 +989,10 @@ def test_split_graph_runtime_configuration_fails_closed():
         "disable_cuda_graph": False,
         "enable_memory_saver": False,
     }
-    validate_config(config, SimpleNamespace(**values))
+    for tp_size in (1, 2, 4, 8):
+        validate_config(config, SimpleNamespace(**(values | {"tp_size": tp_size})))
     for field, value in (
         ("speculative_algorithm", "STANDALONE"),
-        ("tp_size", 2),
         ("max_running_requests", 2),
         ("speculative_use_rejection_sampling", True),
         ("disable_cuda_graph", True),
@@ -1017,9 +1017,70 @@ def test_compact_dispatch_uses_raw_count_before_runner_restores_padding(monkeypa
     backend.counters = {}
     backend.runner = SimpleNamespace(raw_bs=3)
     monkeypatch.setattr(
-        compact_graph, "replay_compact", lambda record, mode, counters, raw_bs: raw_bs
+        compact_graph, "replay_compact", lambda record, counters, raw_bs: raw_bs
     )
     assert backend.replay(4, SimpleNamespace(batch_size=4)) == 3
+
+
+@pytest.mark.parametrize("mode", ["split", "split_no_skip"])
+def test_precomputed_compact_dispatch_keeps_live_rows_and_buffer_addresses(mode):
+    from hybrid_spec.integrations.sglang.compact_graph import (
+        CompactCapture,
+        prepare_dispatch,
+        replay_compact,
+    )
+
+    mask = torch.zeros(4, dtype=torch.bool)
+    output = torch.zeros(4, dtype=torch.int64)
+    record = CompactCapture(
+        SimpleNamespace(replay=lambda: output.zero_()),
+        output,
+        SimpleNamespace(batch_size=4),
+        SimpleNamespace(use_retrieval=mask),
+        (),
+    )
+    for size in range(1, 5):
+        rows = torch.empty(size, dtype=torch.int64)
+        record.tails[size] = SimpleNamespace(
+            rows=rows,
+            graph=SimpleNamespace(
+                replay=lambda rows=rows: output.index_fill_(0, rows, 7)
+            ),
+        )
+    prepare_dispatch(record, mode)
+    addresses = {key: tail.rows.data_ptr() for key, tail in record.tails.items()}
+    counters = dict.fromkeys(
+        (
+            "prefix_ct",
+            "skip_ct",
+            "tail_ct",
+            "decision_wait_ns",
+            "request_ct",
+            "skip_request_ct",
+            "tail_request_ct",
+            "mixed_ct",
+        ),
+        0,
+    )
+    counters["tail_batch_histogram"] = {str(i): 0 for i in range(5)}
+    # Repeat changing masks/sizes: stale row vectors and padded rows must never
+    # execute, including split_no_skip's all-live-rows path.
+    for raw_bs in (4, 3, 1, 2, 4):
+        for bits in range(1 << raw_bs):
+            mask.zero_()
+            for i in range(raw_bs):
+                mask[i] = bool(bits & (1 << i))
+            replay_compact(record, counters, raw_bs)
+            expected = [
+                7
+                if i < raw_bs and (mode == "split_no_skip" or not bits & (1 << i))
+                else 0
+                for i in range(4)
+            ]
+            assert output.tolist() == expected
+            assert addresses == {
+                key: tail.rows.data_ptr() for key, tail in record.tails.items()
+            }
 
 
 def test_neural_gate_falls_back_before_divergence_and_resets_next_batch():

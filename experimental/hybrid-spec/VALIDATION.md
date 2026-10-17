@@ -3,6 +3,55 @@
 当前机制、优化阶段与跨实验结论的汇总入口见 [优化总览](OPTIMIZATIONS.md)。
 下文按阶段保留当时的协议、结果和验收限制。
 
+## Split 查询重叠、调度预分配与多 TP（2026-10-17，待 GPU 验收）
+
+仅修改 SA＋MTP 混合投机链路，保留 gate=2、候选排序和 target verify。
+split/split_no_skip 在 `hybrid_sa_query` 辅助 stream 消费反馈并查询，
+与生成第二个 neural token 的首个 MTP forward 重叠。前两个 gate token
+固定使用 neural；主 stream 等待查询完成后更新 gate mask，将候选和最终 mask
+打包执行一次 TP MIN 共识，再读取 mask、选择整批跳过或紧凑尾段。
+不在辅助 stream 运行 NCCL，不按本地命中结果省略 collective。
+候选分歧、任一 rank gate 失败或无有效候选时，所有 rank 对该行统一回退。
+
+最多 4 请求的所有 mask/实际批大小组合在 capture 后预分配行号 tensor，
+每轮仅复制已持有的设备行号，消除临时 tensor 创建与行号 H2D。
+保留一次 mask CPU 读取；其等待包含未完成的前缀 GPU 工作，不能声称全部消除。
+开启单机多 TP 配置校验；DP/PP/EP/CP、多机、最大活跃并发和其他限制不变。
+worker、runner、插件需要同时更新至 split Graph API v3，否则启动明确报错，
+避免新版插件在旧 worker 中过早读取尚未完成的查询。CUDA SA 源码与状态布局未改。
+
+本地分文件验证：core 61 passed，实际 worker recurrence 94 passed，
+真实 Gloo TP=1/2/4 为 3 passed；NCCL 2 卡项因本机无 CUDA 跳过。
+覆盖延迟查询完成后的整批跳过、gate 不匹配、所有 compact mask、raw/padded
+批大小切换、候选/神经前缀/资格的 rank 分歧和重放后恢复。
+Gloo 证明选择协议，CPU 模型边界替代验证 worker 候选链；两者均不替代 CUDA、
+NCCL Graph 或真实模型吞吐。新增真实 SA 辅助 stream Graph 测试与 NCCL split
+反馈/共识用例，留给内网 GPU 环境执行。本次未测新的吞吐，不报告性能增益。
+
+从仓库根目录，在内网已安装 SGLang/CUDA 依赖的环境中运行：
+
+```bash
+export PYTHONPATH="$PWD/experimental/hybrid-spec/src:$PWD/python${PYTHONPATH:+:$PYTHONPATH}"
+python -m pytest experimental/hybrid-spec/tests/test_core.py -q
+python -m pytest experimental/hybrid-spec/tests/test_draft_recurrence.py -q
+python -m pytest experimental/hybrid-spec/tests/test_cuda.py -q
+python -m pytest experimental/hybrid-spec/tests/test_shared_parallel_cuda.py -q
+python -m pytest experimental/hybrid-spec/tests/test_tp.py -q
+```
+
+`test_tp.py` 在同一台机器上至少有 2 张可见 NVIDIA GPU 时执行真实 PyNccl
+Graph 和原生 SA feedback/query；只有一张卡时该项会 skip，不能记为多 TP 通过。
+服务使用 `configs/device-qwen35-mtp-split-global-pool.json`，保持 K=8、gate=2、
+Triton draft attention、greedy，分别设置 `--tp-size 1/2/4` 和并发 1/4，
+检查整批 SA/全 neural/混合批、3→4 padding、请求结束与槽位复用、flush。
+`split_no_skip` 也应跑一次混合批以检查所有实际请求行都进入尾段。
+
+性能只需小对照：使用优化前 `671931d83a` 与当前版本的独立源码目录，
+同一模型/TP/配置/提示顺序/输出长度，预热后交替运行重复请求和不同代码请求，
+并发 1/4 各至少两轮。检查逐请求输出、接受长度和分支计数，再比较输出 token/s；
+改变 TP 时必须同时改变基线服务的 TP。短 trace 检查 SA 查询是否与首个 MTP
+forward 重叠、共识是否仍在主 stream、各 rank 尾段大小是否一致。
+
 ## 并发 4：混合批逐请求裁剪尾段（2026-10-16）
 
 已实现最多 4 请求的紧凑 MTP 尾段 Graph：整批先检查两个 neural token，

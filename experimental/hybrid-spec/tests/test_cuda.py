@@ -25,6 +25,88 @@ pytestmark = pytest.mark.skipif(
 )
 
 
+def test_split_query_stream_graph_feedback_publication_and_gate(monkeypatch):
+    """A delayed native query must see fresh feedback and join before gating.
+
+    Publish a donor after capture, mutate the gate between replays, then fence
+    its generation. The auxiliary stream executes actual SA kernels.
+    """
+    config = HybridConfig(
+        8,
+        2,
+        1,
+        128,
+        history_mode="device",
+        draft_graph_mode="split",
+        num_neural_gate_tokens=2,
+        enable_global_pool=True,
+        max_shared_requests=2,
+    )
+    backend = GPUSuffixAutomaton(config, "cuda")
+    for slot, prompt in enumerate(([99, 1], list(range(1, 11)))):
+        backend.initialize_device_slot(slot, 10 + slot, 128)
+        backend.import_host(slot, backend.build_host(backend.prepare_host(prompt), 200))
+    native_query = backend.consume_and_query
+
+    def delayed_query(*args, **kwargs):
+        torch.cuda._sleep(1_000_000)
+        native_query(*args, **kwargs)
+
+    monkeypatch.setattr(backend, "consume_and_query", delayed_query)
+    query_stream = torch.cuda.Stream()
+    buffers = DeviceGraphBuffers(backend, 1, query_stream=query_stream)
+    captured = buffers.bind_capture_view(1)
+    slots = torch.tensor([0], dtype=torch.int64, device="cuda")
+    generations = torch.tensor([10], dtype=torch.int64, device="cuda")
+    view = DeviceOverride(backend, slots, generations)
+    buffers.stage(view, 1, 1)
+    seq_lens = torch.tensor([2], dtype=torch.int64, device="cuda")
+    neural = torch.tensor([[3, 4, 80, 81, 82, 83, 84, 85]], device="cuda")
+
+    def run():
+        captured.prepare(seq_lens)
+        return torch.cat(
+            [captured.select_step(neural[:, i : i + 1] + 0, i) for i in range(8)],
+            dim=1,
+        )
+
+    stream = torch.cuda.Stream()
+    stream.wait_stream(torch.cuda.current_stream())
+    with torch.cuda.stream(stream):
+        for _ in range(3):
+            run()
+    torch.cuda.current_stream().wait_stream(stream)
+    graph = torch.cuda.CUDAGraph()
+    with torch.cuda.graph(graph, stream=stream):
+        output = run()
+    # Feed the anchor and publish a completed donor after capture.
+    backend.stage_feedback(
+        slots,
+        generations,
+        torch.tensor([2], dtype=torch.int32, device="cuda"),
+        torch.tensor([[0]], dtype=torch.int32, device="cuda"),
+        torch.tensor([1], dtype=torch.int32, device="cuda"),
+        seq_lens,
+        False,
+        200,
+    )
+    view.shared_slots[0] = 1
+    view.shared_generations[0] = 11
+    view.shared_lengths[0] = 10
+    buffers.stage(view, 1, 1)
+    for disagree in (False, True, False):
+        neural[0, 1] = 70 if disagree else 4
+        graph.replay()
+        assert view.use_retrieval.tolist() == [not disagree]
+        expected = neural if disagree else torch.arange(3, 11, device="cuda")[None, :]
+        assert torch.equal(output, expected)
+        assert backend.meta[0, 0].item() == 3  # feedback is consumed exactly once
+    backend.owners[1].add_(1)
+    graph.replay()
+    assert not view.use_retrieval.any().item()
+    assert torch.equal(output, neural)
+
+
 @pytest.mark.parametrize("partial", ["fallback", "zero"])
 def test_shared_history_graph_final_feedback_boundaries_and_generation(partial):
     """Final verify tokens must survive finish; stale/reused donors must not."""
@@ -487,7 +569,7 @@ def test_compact_tail_graph_reorders_rows_without_computing_sa_requests(
         return result
 
     stream = torch.cuda.Stream()
-    record = capture_compact(runner, fb, prefix, stream, None)
+    record = capture_compact(runner, fb, prefix, stream, None, mode)
     # Reuse the ordinary allocator after capture. Losing Python ownership of
     # staging tensors can otherwise pass small toy runs until another graph
     # allocates the same blocks (the real serving crash's trigger).
@@ -541,7 +623,7 @@ def test_compact_tail_graph_reorders_rows_without_computing_sa_requests(
                 "mixed_ct": 0,
                 "tail_batch_histogram": {str(i): 0 for i in range(5)},
             }
-            output = replay_compact(record, mode, counters, raw_bs)[2]
+            output = replay_compact(record, counters, raw_bs)[2]
             assert output[:raw_bs].tolist() == expected[:raw_bs]
             counts = work[reqs].tolist()
             assert counts == [

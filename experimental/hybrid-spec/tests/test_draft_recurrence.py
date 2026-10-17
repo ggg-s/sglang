@@ -11,7 +11,9 @@ from typing import List, Optional
 
 import pytest
 import torch
+from hybrid_spec.config import HybridConfig
 from hybrid_spec.core.contracts import DraftOverrideView
+from hybrid_spec.integrations.sglang.device_extension import DeviceOverride
 
 ROOT = Path(__file__).resolve().parents[3]
 
@@ -48,7 +50,7 @@ def load_functions(relative, names, namespace, class_name=None):
 )
 @pytest.mark.parametrize("mrope", [False, True])
 def test_selected_prefix_drives_model_and_verify_chain(
-    k, matrix, hot, mask, mrope, gate
+    k, matrix, hot, mask, mrope, gate, deferred=False, skip_tail=False
 ):
     def postprocess(logits, positions, drafts, step):
         index = logits.argmax(dim=-1, keepdim=True)
@@ -124,18 +126,61 @@ def test_selected_prefix_drives_model_and_verify_chain(
         retrieval[0, : min(gate, k)] = torch.arange(1, 1 + min(gate, k)) + (
             10 if hot else 0
         )
+    if skip_tail:
+        retrieval[1, :2] = torch.tensor([2, 3])
     view = (
         None if mask is None else DraftOverrideView(retrieval, torch.tensor(mask), gate)
     )
+    if deferred:
+        config = HybridConfig(
+            k,
+            2,
+            2,
+            128,
+            history_mode="device",
+            num_neural_gate_tokens=2,
+            draft_graph_mode="split",
+        )
+
+        def query(slots, generations, seq_lens, tokens, use_retrieval):
+            tokens.copy_(retrieval)
+            use_retrieval.copy_(torch.tensor(mask))
+
+        backend = SimpleNamespace(
+            config=config, device=torch.device("cpu"), consume_and_query=query
+        )
+
+        class CompletingOverride(DeviceOverride):
+            # Deterministically finish the query only after the first model
+            # forward. Premature reads of candidates see their initial zeros.
+            # This models a delayed lookup boundary, not CUDA stream behavior.
+            def prepare(self, seq_lens):
+                self.query_seq_lens = seq_lens
+
+            def select_step(self, neural_tokens, step):
+                if step == 1:
+                    self._query(self.query_seq_lens)
+                return super().select_step(neural_tokens, step)
+
+        view = CompletingOverride(
+            backend, torch.arange(2), torch.ones(2, dtype=torch.int64)
+        )
     prefix_boundaries = []
     if gate and matrix and not hot:
-        view.on_prefix_ready = lambda *_: prefix_boundaries.append(len(inputs))
+
+        def ready(fb, tokens, hidden, cache, drafts):
+            prefix_boundaries.append(len(inputs))
+            if skip_tail:
+                return None, None, drafts, None
+
+        view.on_prefix_ready = ready
     batch = SimpleNamespace(
         batch_size=2,
         forward_mode=SimpleNamespace(is_idle=lambda: False),
         out_cache_loc=torch.arange(2 * k),
         positions=torch.tensor([7, 19]),
         mrope_positions=torch.tensor([[7, 19]]).expand(3, -1).clone(),
+        seq_lens=torch.ones(2, dtype=torch.int64),
         spec_info=SimpleNamespace(
             topk_p=torch.ones((2, 1)),
             topk_index=torch.tensor([[1], [2]]),
@@ -181,9 +226,31 @@ def test_selected_prefix_drives_model_and_verify_chain(
             expected[row, step] = token
             token = (token + 1) % 8 + (10 if hot else 0)
     assert torch.equal(drafts, expected)
-    assert len(inputs) == k - 1
+    assert len(inputs) == (1 if skip_tail else k - 1)
     for step, tokens in enumerate(inputs):
         assert torch.equal(tokens, expected[:, step])
         assert torch.equal(positions[step], torch.tensor([7, 19]) + step)
         if mrope:
             assert torch.equal(mrope_positions[step], positions[step].expand(3, -1))
+
+
+@pytest.mark.parametrize("mask", [[True, True], [False, False], [True, False]])
+def test_deferred_gate_preserves_actual_worker_recurrence(mask):
+    # Exercises the real worker's deferred SA-chain materialization, including
+    # the column-zero mismatch row and a later step-one match on the other row.
+    test_selected_prefix_drives_model_and_verify_chain(
+        k=8, matrix=True, hot=False, mask=mask, mrope=True, gate=2, deferred=True
+    )
+
+
+def test_skipped_tail_contains_candidates_from_completed_query():
+    test_selected_prefix_drives_model_and_verify_chain(
+        k=8,
+        matrix=True,
+        hot=False,
+        mask=[True, True],
+        mrope=True,
+        gate=2,
+        deferred=True,
+        skip_tail=True,
+    )
