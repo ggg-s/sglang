@@ -34,8 +34,9 @@ batch-local `chunked_req` marks the intermediate row; its transient sampled
 token is discarded and it reserves no SA slot. Other final rows in that same
 batch remain eligible. The final chunk snapshots the full request history,
 including cached/earlier chunks, before launch. Re-prefill invalidates old
-leases even on intermediate chunks. CPU history still requires non-overlap
-scheduling and disabled chunked prefill; mixed prefill/decode remains rejected.
+leases even on intermediate chunks. The legacy GPU SA CPU-history mode still
+requires non-overlap scheduling and disabled chunked prefill; Arctic uses its
+own GPU feedback bridge described below. Mixed prefill/decode remains rejected.
 At the first draft consumer it imports used pinned CPU prefixes on the forward
 stream, preserving GPU bonus feedback. Copy sources are retained until a CUDA
 event completes; background construction never touches CUDA or request objects.
@@ -73,9 +74,12 @@ retains its existing token-list fallback for mapped vocabularies. Triton draft
 attention and native dsv4 MTP attention are supported; other model/backend and
 parallelism restrictions still apply. See the [4060 validation scope](../../validation/draft-algorithms-split-20261017.md).
 
-The optional official ArcticInference CPU suffix backend uses committed CPU
-history and the same staged graph buffers. It requires disabled overlap and
-chunked prefill (`--disable-overlap-schedule --chunked-prefill-size -1`).
+The optional official ArcticInference CPU suffix backend supports overlap and
+chunked prefill using the same verify/prefill hooks. It asynchronously copies
+packed GPU accept paths to pinned CPU memory and waits on their CUDA event at
+the next query consumer. Final-chunk snapshots include cached/earlier prefixes;
+intermediate bonus tokens are discarded. Private local trees follow GPU verify,
+while a separate shared tree receives only CPU-confirmed response increments.
 CPU lookup and H2D staging happen before replay; shared GatedOverride performs
 final gate/TP consensus before GPU row compaction. No worker API version change
 is needed beyond split v5. See [Arctic setup](../../validation/arctic-suffix.md).

@@ -60,11 +60,14 @@ device 模式以 generation 和 GPU 历史版本检查隔离旧反馈、槽位�
 
 `backend="arctic"` 使用 ArcticInference 官方 CPU 后缀树，可替换 GPU SA，支持
 MTP/EAGLE3/STANDALONE 的 full/split/split_no_skip。配置模板为
-`configs/arctic-suffix-split.json`；需 `history_mode="cpu"`、
-`--disable-overlap-schedule --chunked-prefill-size -1`。查询和候选上传在 Graph 外，
+`configs/arctic-suffix-split.json`，使用 `history_mode="cpu"`；现已允许 overlap
+和 chunked prefill，可移除 `--disable-overlap-schedule` 并使用默认分块值或
+`--chunked-prefill-size 2048`。GPU 验证接受路径异步回传，下一次 CPU 查询消费时
+等待 CUDA event；中间 prefill 块的临时 bonus 不入历史。查询和候选上传在 Graph 外，
 gate、TP 共识、GPU 动态行号及紧凑 tail 复用同一套实现。
 
-可选启用请求间 response 缓存，prompt 仅在请求内可见；完成时按最终 CPU 输出
+可选启用请求间 response 缓存，共享树仅收 CPU 已确认输出，GPU 私有尾部隔离，
+prompt 仅在请求内可见；完成时按最终 CPU 输出
 对账并独立限制保留 donor 数。当前固定 K、单链模式，未开放 Arctic 树状/变长
 verify 或原生 score 驱动混合策略。Arctic 不创建 GPU SA 池，需安装官方原生 suffix
 扩展。安装、参数、调度限制和验证范围见 [Arctic 接入](validation/arctic-suffix.md)。
@@ -106,13 +109,13 @@ split 支持 K≥1、gate=0…K。`max_history_tokens=16384` 包含完整 prompt
 | 参数 | NVIDIA CUDA、单机 TP≥1、纯文本、greedy、topk=1、K≥1、验证宽度 K+1 |
 | TP | 两种历史模式均按 rank 复制 SA，在采用 SA 后续候选前完成共识；split 将 gate 结果一起归约，支持单机多 TP 实验 |
 | 执行 | eager 与 CUDA Graph 接口；K=1 走原生无循环内 forward 路径 |
-| 历史 | CPU 模式关闭 overlap、从 CPU 已提交历史取增量；device 模式使用 GPU verify 反馈 |
+| 历史 | GPU SA 旧 CPU 模式关闭 overlap；device 模式使用 GPU verify 反馈；Arctic CPU 树通过接受路径 D2H 支持 overlap/chunked |
 | 生命周期 | 历史重复不追加；历史变化重建；请求对象代际、结束释放、弱引用清理、flush reset |
 | 混合线性注意力 | 实验接入 Qwen3.5/3.6 target + 原生 Qwen3.5 MTP，要求 `--language-only`；保留 GDN verify/commit 和 mRoPE |
 | 混合 SWA | 实验接入 DeepSeek V4 target + NextN MTP；split 使用原生 dsv4 注意力的逐请求尾段，其他 SWA 模型仍拒绝 |
-| 暂不开放 | CPU 模式 overlap/chunked prefill、DP/PP/EP/CP、多机、torch.compile、混合 prefill/decode、随机采样、grammar、LoRA、其他混合线性注意力模型、多模态请求、多层 EAGLE、FROZEN_KV_MTP、动态预算、Arctic 树状及变长验证 |
+| 暂不开放 | GPU SA 旧 CPU 模式 overlap/chunked prefill、DP/PP/EP/CP、多机、torch.compile、混合 prefill/decode、随机采样、grammar、LoRA、其他混合线性注意力模型、多模态请求、多层 EAGLE、FROZEN_KV_MTP、动态预算、Arctic 树状及变长验证 |
 
-默认 CPU 历史模式使用同步调度器已提交到 CPU 的输出，只上传确认增量，当前 anchor 已包含在历史中。device 模式使用 GPU verify 的接受前缀，可能包含最终 CPU EOS/停止截断前的尾部；不能将其计数或索引长度当作最终交付 token 统计。两者均不增加逐步 D2H 读取。
+默认 CPU 历史模式使用同步调度器已提交到 CPU 的输出，只上传确认增量，当前 anchor 已包含在历史中。device 模式使用 GPU verify 的接受前缀，可能包含最终 CPU EOS/停止截断前的尾部；不能将其计数或索引长度当作最终交付 token 统计。这两条 GPU SA 路径均不增加逐步 D2H 读取。Arctic 的 CPU 树则需要每批 GPU 接受路径 D2H 和消费等待，不能套用 GPU SA 的性能结论。
 
 默认 GPU SA 的最长重复后缀通过 suffix link 查询，续写采用该后缀的最早出现位置。候选不含 anchor。匹配长度与可用续写长度分别记录；默认续写不足、版本不符、无槽位、历史超容量、token 非法或预算不足时整条链回退 neural。`partial_drafts="zero"` 单独复现尾部补零；不会选择较短匹配来填满候选。
 
@@ -192,7 +195,7 @@ python experimental/hybrid-spec/benchmarks/benchmark_device_overhead.py \
 
 Qwen3.6-35B-A3B-FP8 使用 `Qwen3_5MoeForConditionalGeneration` 架构。将上述算法改为 `EAGLE`，移除外部 draft model 路径，并添加 `--language-only`，使用 checkpoint 内置的 MTP。当前分支的 `--language-model-only` 不支持这个架构。该接入保留原生位置编码和 GDN 状态提交，只替换起草 token；实际多模态请求仍拒绝。启动成功和包级测试不能替代逐 token 对照验收。
 
-多卡时将 `--tp-size 1` 改为 `--tp-size 2` 或 `--tp-size 4`，模型本身也必须支持对应 TP 分片。所有 rank 使用相同插件与 JSON 配置；target/draft 共享原生 TP 拓扑。保持 DP/PP/EP/CP 为 1、单机；CPU 历史模式关闭 overlap 和 chunked prefill，device 模式允许开启。多 TP 代码已接通，当前本机只完成 CPU 多进程通信测试，真实 NCCL/模型验收仍待部署环境执行。
+多卡时将 `--tp-size 1` 改为 `--tp-size 2` 或 `--tp-size 4`，模型本身也必须支持对应 TP 分片。所有 rank 使用相同插件与 JSON 配置；target/draft 共享原生 TP 拓扑。保持 DP/PP/EP/CP 为 1、单机；GPU SA 旧 CPU 历史模式关闭 overlap 和 chunked prefill，device 模式与 Arctic CPU 树允许开启。多 TP 代码已接通，当前本机只完成 CPU 多进程通信测试，真实 NCCL/模型验收仍待部署环境执行。
 
 `SGLANG_PLUGINS` 是现有插件白名单；如需其他插件，应在该值中保留它们。未设置 `HYBRID_SPEC_CONFIG` 时本插件不注册 hook；做原生基线时取消该变量并重启服务即可。
 

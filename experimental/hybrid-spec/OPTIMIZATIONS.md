@@ -23,7 +23,8 @@
 > [4060 验证及边界](validation/draft-algorithms-split-20261017.md)。
 
 Arctic 可选后端现已接入 full/split/split_no_skip，使用官方 CPU 后缀树和
-CPU 已确认历史，共用 GPU gate/TP/紧凑调度；要求关闭 overlap 与 chunked prefill。
+GPU 接受路径补齐请求私有历史、CPU 已确认输出构建共享树，共用 GPU gate/TP/紧凑调度；
+现已允许 overlap 与 chunked prefill，需要接受路径 D2H 和下次查询消费等待。
 安装和边界见 [Arctic 接入](validation/arctic-suffix.md)，不新增模型性能结论。
 
 ## 目录

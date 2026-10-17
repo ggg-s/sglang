@@ -57,14 +57,13 @@ class DraftExtension:
             if req.multimodal_inputs is not None:
                 raise ValueError("hybrid-spec does not index multimodal inputs")
             self._prepare_request(req)
-            history = req.origin_input_ids + req.output_ids
-            if not req.output_ids:
-                raise ValueError("hybrid-spec requires the committed prefill anchor")
+            history = self._request_history(req)
             requests.append(
                 (
                     req.rid,
                     history,
-                    req.sampling_params.max_new_tokens - len(req.output_ids),
+                    req.sampling_params.max_new_tokens
+                    - (len(history) - len(req.origin_input_ids)),
                 )
             )
         view = self.runtime.prepare(requests)
@@ -83,6 +82,11 @@ class DraftExtension:
             yield view
         finally:
             draft_input.draft_override = None
+
+    def _request_history(self, req):
+        if not req.output_ids:
+            raise ValueError("hybrid-spec requires the committed prefill anchor")
+        return req.origin_input_ids + req.output_ids
 
     def _prepare_request(self, req):
         pass

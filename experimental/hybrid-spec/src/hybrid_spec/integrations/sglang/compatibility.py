@@ -40,7 +40,11 @@ def validate_config(config, cfg):
             errors.append(
                 "split draft graphs require max_running_requests within max_requests"
             )
-    if config.history_mode == "cpu" and not cfg.disable_overlap_schedule:
+    if (
+        config.history_mode == "cpu"
+        and config.backend != "arctic"
+        and not cfg.disable_overlap_schedule
+    ):
         errors.append("CPU history requires disable_overlap_schedule=True")
     # CLI store_true has no False spelling: no flag/no adapters leaves None,
     # which SGLang treats as disabled. Never require literal enable_lora=False.
@@ -51,7 +55,11 @@ def validate_config(config, cfg):
     tp_size = getattr(cfg, "tp_size", None)
     if type(tp_size) is not int or tp_size < 1:
         errors.append("tp_size must be a positive integer")
-    if config.history_mode == "cpu" and cfg.chunked_prefill_size not in (None, -1):
+    if (
+        config.history_mode == "cpu"
+        and config.backend != "arctic"
+        and cfg.chunked_prefill_size not in (None, -1)
+    ):
         errors.append("CPU history requires chunked_prefill_size=-1")
     if cfg.speculative_algorithm not in ("EAGLE", "EAGLE3", "STANDALONE"):
         errors.append("only ordinary EAGLE/MTP, EAGLE3 and STANDALONE are wired")

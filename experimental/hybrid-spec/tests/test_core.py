@@ -1433,7 +1433,7 @@ def test_split_rejects_gate_outside_draft_budget(gate):
         )
 
 
-def test_arctic_split_requires_committed_cpu_history_configuration():
+def test_arctic_split_supports_overlap_and_chunked_cpu_suffix_queries():
     config = HybridConfig(
         2,
         1,
@@ -1456,9 +1456,22 @@ def test_arctic_split_requires_committed_cpu_history_configuration():
         validate_config(
             config, SimpleNamespace(**(values | {"speculative_algorithm": algorithm}))
         )
-    for change in ({"disable_overlap_schedule": False}, {"chunked_prefill_size": 2048}):
-        with pytest.raises(ValueError, match="CPU history"):
-            validate_config(config, SimpleNamespace(**(values | change)))
+    for algorithm, overlap, chunk_size in itertools.product(
+        ("EAGLE", "EAGLE3", "STANDALONE"), (False, True), (-1, 2048)
+    ):
+        validate_config(
+            config,
+            SimpleNamespace(
+                **(
+                    values
+                    | dict(
+                        speculative_algorithm=algorithm,
+                        disable_overlap_schedule=not overlap,
+                        chunked_prefill_size=chunk_size,
+                    )
+                )
+            ),
+        )
     with pytest.raises(ValueError, match="history_mode=cpu"):
         HybridConfig(2, 1, 8, 128, backend="arctic", history_mode="device")
 

@@ -14,19 +14,31 @@ MTP/EAGLE3/STANDALONE 保留原生 neural draft、target verify 和提交路径�
 - 当前 verify 布局固定 K。默认 `partial_drafts="fallback"`：不足 K 整轮回退；
   原有可选 `zero` 策略仍表示补零草稿并经 target verify，不等于变长验证。
   未接入 Arctic 的树状候选、动态 verify 宽度或 score 驱动的原生混合调度。
-- `history_mode="cpu"`，显式要求 `--disable-overlap-schedule` 与
-  `--chunked-prefill-size -1`。Arctic 读取 CPU 已确认历史，query/H2D 在 Graph 外
-  完成；split Graph 内只执行 gate/共识/选择。CPU 历史版本必须等于 GPU
-  `seq_lens+1`，否则该行统一回退。device 历史和 CPU overlap 组合明确拒绝。
+- `history_mode="cpu"` 表示 CPU 后缀树，现在允许 overlap 与 chunked prefill。
+  可移除 `--disable-overlap-schedule`，并设置 `--chunked-prefill-size 2048`
+  或采用模型默认分块值。仍不支持 `--enable-mixed-chunk`。
+- 私有树历史由 GPU prefill bonus 和 verify 的 `accept_index/accept_lens`
+  补齐，不依赖可能滞后的 `req.output_ids`。Graph 外将每批接受路径和版本打包，
+  异步拷贝到 pinned CPU 内存；下一次查询消费时等待对应 CUDA event。
+  query/H2D 仍在 Graph 外完成，split Graph 内只执行 gate/共识/选择。
+  历史必须等于 GPU `seq_lens+1`，版本/反馈异常、无槽位或超容量时按行回退。
+- 分块 prefill 的中间行不保留临时采样 bonus；最后一块启动前快照完整
+  `get_fill_ids()` 前缀，包含缓存和先前分块。重预填充撤销旧反馈，异常取消只
+  清理对应请求代际。GPU 私有尾部不代表最终交付输出。
 - 自身 prompt 私有；开启 `enable_global_pool` 时只有已确认 response 进入
-  Arctic 全局树，活跃 response 可供其他请求检索。完成时丢弃 local prompt，
+  Arctic 全局树，活跃 response 可供其他请求检索。私有树和共享树分别使用
+  官方 cache，按 upstream 的 score 规则选优（同分优先 local）；共享查询使用
+  空 local 的内部查询键，不占 donor 槽。GPU 尚未经过 CPU 停止裁剪的尾部只
+  进入私有树，绝不进入共享树。完成时丢弃 local prompt，
   最多保留 `max_shared_requests` 个完整 response，按 FIFO 淘汰。
   `max_requests` 只约束活跃请求，完成 donor 不占活跃槽。
 - 每次仅追加确认增量；改写/撤回历史会删除旧树并递增 generation。完成时
   从最终 CPU 输出重新对账，包括最后一轮尚未被下次 draft 消费的 token，
   排除停止条件裁掉的尾部。异常结束、弱引用失效、flush 和槽位复用清理旧状态。
-- Arctic CPU 树不消耗 GPU SA 状态池；仍有 CPU 查询、候选上传和 split Graph
-  的成本。GPU SA 的吞吐结果不能套用于 Arctic。
+- Arctic CPU 树不消耗 GPU SA 状态池；仍有接受路径 D2H、消费等待、CPU 查询、
+  候选 H2D 和 split Graph 的成本。启用共享池还会维护独立的已确认响应树。
+  允许 overlap 不等于 CPU 查询与 GPU 解码完全重叠，也不保证性能改善；
+  GPU SA 的吞吐结果不能套用于 Arctic。
 
 Triton draft attention 支持普通 EAGLE/MTP、EAGLE3 和 STANDALONE；DSV4 MTP
 继续使用原生 dsv4 draft attention。其他模型、并行和采样限制同主 README。
@@ -85,7 +97,19 @@ export HYBRID_SPEC_CONFIG="$PWD/experimental/hybrid-spec/configs/arctic-suffix-s
 offset 0.0、min token probability 0.1。更改 K 时同步修改 JSON 与服务 steps/token
 参数，并保持 G≤K。`enable_global_pool=false` 可单独评估请求内后缀树。
 
-## 验证
+## 调度验证
+
+新的 overlap/chunked 生命周期回归与原始接入证据分开记录，见
+[4060 调度验证](arctic-overlap-4060/README.md)。测试使用真实官方后缀树、CUDA
+接受路径拷贝与事件、构造的 prefill/verify batch；神经模型和 child attention
+计算仍为合成执行。DSV4 真实权重 TP8、真实调度器长输入及性能需在内网验收。
+
+建议内网以相同 JSON、K/G 和输入集，对 native/full/split 分别比较：
+两项关闭、仅 overlap、overlap+chunked。输入长度需超过 chunk size，并覆盖并发
+1/4/8、长短请求交错、EOS/stop/max_new_tokens、取消/重用/重预填充及共享池开关。
+保持 TP8、相同 `--speculative-draft-attention-backend dsv4`，交替启动顺序并重复 3 次。
+
+## 初次接入验证（历史记录）
 
 4060 完整回归已通过 663 项，跳过两项需要 2/8 卡的 NCCL 用例；另增加
 Arctic+dsv4 矩阵单独通过 46 项，两轮合计 **709 passed、2 skipped**。
