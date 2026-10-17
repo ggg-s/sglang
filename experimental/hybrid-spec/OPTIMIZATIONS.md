@@ -13,6 +13,10 @@
 > 同日修复 DeepSeek V4 SA 的 SWA 校验和 split 架构拦截，并将 V4 接入逐请求
 > 紧凑尾段：混合批只执行未命中行，注意力及 per-step KV 元数据仍使用原生 dsv4。
 > 模型 GPU 验收待完成；下文历史吞吐不能作为此次改动的性能结果。
+>
+> 2026-10-17 动态调度更新：移除 batch≤4 硬限制，GPU 生成稳定行号，CPU 只读
+> 行数；gate 支持 0…K，split API 升到 v4。4060 功能回归与边界见
+> [动态行号与 gate](validation/dynamic-rows-gate-20261017.md)，不新增模型吞吐结论。
 
 ## 目录
 
@@ -30,9 +34,9 @@
 寻找重复后缀，将历史续写作为候选，最终仍由原生 target verify 验证。
 当前主实验是 Qwen3.5-35B-A3B-GPTQ-Int4 的原生 MTP，SGLang 算法身份为 `EAGLE`。
 
-当前有三种执行方式：完整运行 MTP、并发 1 的条件尾段跳过，以及最多并发 4 的
-逐请求尾段压缩。默认 `draft_graph_mode="full"`，仍执行完整 neural draft。
-只有显式开启 `split`，才会在前两个 token 一致后省掉后续 MTP forward。
+当前支持完整运行 MTP 与按请求压缩尾段。默认 `draft_graph_mode="full"`，仍执行
+完整 neural draft。显式开启 `split` 后，按配置 gate 检查并省掉命中行的后续
+MTP forward；不再以 4 限制 batch，G=K 时没有可省略的尾段。
 
 截至目前的结论：
 
@@ -59,11 +63,11 @@ flowchart TB
     G -->|full| Q["消费增量并查询 SA"]
     Q --> T["TP 共识：TP=1 直接通过；多 TP 校验资格和候选"]
     T --> F["完整 neural loop：逐位置选择 SA / neural"]
-    G -->|split| A["prefix Graph：SA 消费/查询与首个 MTP forward 并行"]
-    A --> C["等待查询完成，gate=2 检查后统一候选与 mask 的 TP 共识"]
+    G -->|split| A["prefix Graph：SA 消费/查询；gate≥2 时与 neural 前缀并行"]
+    A --> C["等待查询完成，按配置 gate 检查后统一候选与 mask 的 TP 共识"]
     C --> B{"当前行是否通过 SA 检查？"}
     B -->|通过| S["该行保留完整 SA 草稿，跳过尾段"]
-    B -->|未通过| N["收集未命中行，续跑对应大小的 tail Graph"]
+    B -->|未通过| N["GPU 压缩行号，CPU 读行数，续跑对应大小的 tail Graph"]
     F --> V["原生 target verify"]
     S --> V
     N --> V
@@ -72,7 +76,7 @@ flowchart TB
     R --> G
 ```
 
-`split_no_skip` 用作控制模式：保留拆图与 CPU mask 读取，但始终执行尾段，
+`split_no_skip` 用作控制模式：保留拆图与 CPU 行数读取，让所有实际行执行尚余尾段，
 仍按相同策略选择 SA 候选。它不会关闭 SA。
 
 ### 历史与生命周期
@@ -110,7 +114,7 @@ A100 实验的 chunk size，不能将“开启该参数”当成长 prompt 多�
 ### 3.2 TP 共识、反馈统计与固定映射
 
 full 的多 TP 候选共识放在 draft `prepare()` 中，紧跟 SA 查询；split 则在
-首个 MTP forward 与查询汇合、两个 gate token 检查后执行，可被 CUDA Graph 捕获。
+配置宽度的 gate 就绪、查询汇合后执行，可被 CUDA Graph 捕获。
 一次精确 MIN 归约携带候选、按位取反的候选及资格：只有所有 rank 均合格且 token
 一致，才使用 SA。不能因某个 rank 本地未命中就跳过 collective；TP=1 不执行该通信。
 这一机制已接通，多 GPU 模型与真实 NCCL Graph 时间线仍需单独验收。
@@ -158,11 +162,11 @@ CPU 微基准的高分叉加速比不能直接推算 GPU 查询或模型 TPOT。
 
 ### 3.5 C1 两段 Graph：条件取消六次 MTP forward
 
-K=8 时，第一个 neural 候选已由前一轮 draft-extend 提供。因此 prefix Graph
+以 K=8、G=2 为例，第一个 neural 候选已由前一轮 draft-extend 提供。因此 prefix Graph
 只需一次 inner forward，就能检查前两个候选；通过则直接使用完整 SA 链，
 否则从 prefix hidden state 续跑剩余 6 次 forward，不从头重跑。
 
-两段之间每批有一次 CPU mask 读取和条件提交。`decision_wait_ns` 包含尚未完成的
+当前两段之间由 GPU 动态生成行号，CPU 读取一次行数后条件提交。`decision_wait_ns` 包含尚未完成的
 prefix GPU 工作，不能全当成额外同步成本。target verify 和 draft-extend 仍然运行。
 各 Graph 保持私有 pool，保护跨图中间状态。
 
@@ -243,7 +247,7 @@ export HYBRID_SPEC_CONFIG="$PWD/experimental/hybrid-spec/configs/device-qwen35-m
 # --speculative-draft-attention-backend triton
 ```
 
-split 开放单机 TP≥1、greedy、topk=1、Qwen3.5/V4 原生 MTP、CUDA Graph，最多 4 个请求；
+split 开放单机 TP≥1、greedy、topk=1、Qwen3.5/V4 原生 MTP、CUDA Graph；动态 GPU 行号压缩已移除最多 4 请求的硬限制；
 多请求压缩支持 Qwen 的 Triton 或 V4 的原生 `dsv4` draft attention；
 拒绝 translated KV 池、memory saver、KV canary 等未支持组合。
 full 的通用接入范围不能直接套用于 split。V4 保留原生注意力类型和逐步 KV 元数据，
@@ -253,7 +257,7 @@ full 的通用接入范围不能直接套用于 split。V4 保留原生注意力
 | --- | --- | --- |
 | CUDA 扩展名 | `hybrid_spec_gpu_sa_v3` | 紧凑 SA 状态布局与原生算子 |
 | 通用 draft extension API | v2 | 插件与 SGLang 的起草接入 |
-| draft split Graph API | v3 | worker/runner 同步更新；延迟查询读取与多 TP 决策 |
+| draft split Graph API | v4 | 动态 GPU 行号、可配置 gate 与前缀边界 |
 
 哈希/布局升级到 v3 涉及 CUDA 扩展，应更新并重启，按源码变化完成 JIT 编译。
 后续前缀检查和 C1/C4 Graph 调度为 Python 改动，SA 布局仍是 v3，无需因此重编译 CUDA。
@@ -265,12 +269,12 @@ split 还必须同时更新 SGLang worker/runner；仅安装新版插件不够�
 | 能力 | 当前状态 |
 | --- | --- |
 | 同一批中 SA/neural 混合来源 | 已实现 |
-| C1 / 最多 C4 按条件跳过尾段 | 已实现，默认关闭；性能结论分别记录 |
+| 按请求条件跳过尾段 | 已实现，默认关闭；性能结论分别记录 |
 | 跨请求 SA、已完成请求共享历史 | 已接入默认关闭的 device 全局池，验证范围见专项记录 |
-| decode SA 独立 CUDA stream | split 已接入查询与首个 MTP forward 重叠，待 GPU 性能验收；full 沿用原路径 |
+| decode SA 独立 CUDA stream | split 在 gate≥2 时可重叠查询与 neural 前缀，gate=0/1 无 inner forward 可重叠；full 沿用原路径 |
 | 完整 neural MTP 后统一覆盖候选 | 当前 full 仍在 loop 内逐位置选择，不是这一执行方式 |
 | 无 CPU 决定的 GPU conditional Graph | 未实现 |
-| split TP>1 / 任意大并发 | 开放单机多 TP 实验，待 GPU 验收；活跃并发仍限制最多 4 |
+| split TP>1 / 任意大并发 | 移除 batch≤4 硬限制，按 GPU 动态行号压缩；真实多 TP/更大并发仍需模型验收 |
 | 多 GPU 模型新策略与 NCCL Graph 验收 | 待完成 |
 | 所有模型、长历史、长 prompt 分块下的稳定收益 | 未建立 |
 

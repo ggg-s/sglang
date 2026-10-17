@@ -127,7 +127,7 @@ def test_selected_prefix_drives_model_and_verify_chain(
             10 if hot else 0
         )
     if skip_tail:
-        retrieval[1, :2] = torch.tensor([2, 3])
+        retrieval[1, :gate] = torch.arange(2, 2 + gate)
     view = (
         None if mask is None else DraftOverrideView(retrieval, torch.tensor(mask), gate)
     )
@@ -138,7 +138,7 @@ def test_selected_prefix_drives_model_and_verify_chain(
             2,
             128,
             history_mode="device",
-            num_neural_gate_tokens=2,
+            num_neural_gate_tokens=gate,
             draft_graph_mode="split",
         )
 
@@ -151,14 +151,14 @@ def test_selected_prefix_drives_model_and_verify_chain(
         )
 
         class CompletingOverride(DeviceOverride):
-            # Deterministically finish the query only after the first model
-            # forward. Premature reads of candidates see their initial zeros.
+            # Deterministically finish the query at the final gate token.
+            # Premature reads of candidates see their initial zeros.
             # This models a delayed lookup boundary, not CUDA stream behavior.
             def prepare(self, seq_lens):
                 self.query_seq_lens = seq_lens
 
             def select_step(self, neural_tokens, step):
-                if step == 1:
+                if step == max(0, gate - 1):
                     self._query(self.query_seq_lens)
                 return super().select_step(neural_tokens, step)
 
@@ -166,7 +166,7 @@ def test_selected_prefix_drives_model_and_verify_chain(
             backend, torch.arange(2), torch.ones(2, dtype=torch.int64)
         )
     prefix_boundaries = []
-    if gate and matrix and not hot:
+    if (gate or deferred) and matrix and not hot:
 
         def ready(fb, tokens, hidden, cache, drafts):
             prefix_boundaries.append(len(inputs))
@@ -209,11 +209,11 @@ def test_selected_prefix_drives_model_and_verify_chain(
         ),
     )
     drafts = ns["draft_forward"](worker, batch)[2]
-    if gate and matrix and not hot:
-        # Checking two candidates needs one inner forward: candidate zero was
-        # supplied by draft-extend. Moving the boundary wastes work or gates
-        # before the second candidate has been generated.
-        assert prefix_boundaries == ([1] if k > 1 else [])
+    if (gate or deferred) and matrix and not hot:
+        # Candidate zero comes from draft-extend. The gate needs G-1 inner
+        # forwards (zero for G=0), never an extra forward before dispatch.
+        width = max(1, gate)
+        assert prefix_boundaries == ([width - 1] if width <= k else [])
     expected = torch.empty((2, k), dtype=torch.int64)
     for row in range(2):
         token = row + 1 + (10 if hot else 0)
@@ -226,7 +226,7 @@ def test_selected_prefix_drives_model_and_verify_chain(
             expected[row, step] = token
             token = (token + 1) % 8 + (10 if hot else 0)
     assert torch.equal(drafts, expected)
-    assert len(inputs) == (1 if skip_tail else k - 1)
+    assert len(inputs) == (max(1, gate) - 1 if skip_tail else k - 1)
     for step, tokens in enumerate(inputs):
         assert torch.equal(tokens, expected[:, step])
         assert torch.equal(positions[step], torch.tensor([7, 19]) + step)
@@ -251,6 +251,38 @@ def test_skipped_tail_contains_candidates_from_completed_query():
         mask=[True, True],
         mrope=True,
         gate=2,
+        deferred=True,
+        skip_tail=True,
+    )
+
+
+@pytest.mark.parametrize(
+    "k,gate", [(1, 0), (1, 1), (2, 0), (2, 1), (2, 2), (8, 0), (8, 1), (8, 3), (8, 8)]
+)
+@pytest.mark.parametrize("mask", [[True, True], [False, False], [True, False]])
+def test_configurable_split_gate_uses_actual_worker(k, gate, mask):
+    test_selected_prefix_drives_model_and_verify_chain(
+        k=k,
+        matrix=True,
+        hot=False,
+        mask=mask,
+        mrope=True,
+        gate=gate,
+        deferred=True,
+    )
+
+
+@pytest.mark.parametrize(
+    "k,gate", [(1, 0), (1, 1), (2, 0), (2, 1), (2, 2), (8, 0), (8, 1), (8, 3), (8, 8)]
+)
+def test_configurable_skip_materializes_complete_chain(k, gate):
+    test_selected_prefix_drives_model_and_verify_chain(
+        k=k,
+        matrix=True,
+        hot=False,
+        mask=[True, True],
+        mrope=True,
+        gate=gate,
         deferred=True,
         skip_tail=True,
     )

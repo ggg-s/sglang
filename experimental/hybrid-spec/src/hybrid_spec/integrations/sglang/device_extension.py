@@ -25,8 +25,10 @@ class DeviceOverride(DraftOverrideView):
         self.query_stream = query_stream
         self.defer_prefix = backend.config.draft_graph_mode != "full"
         if self.defer_prefix:
-            self.first_neural_tokens = torch.empty(
-                (len(slots), 1), dtype=torch.int64, device=backend.device
+            self.neural_prefix = torch.empty(
+                (len(slots), max(0, backend.config.num_neural_gate_tokens - 1)),
+                dtype=torch.int64,
+                device=backend.device,
             )
         # Only worker-created views provide this immutable host metadata key.
         # Manually constructed views may mutate their tensors between stages.
@@ -91,29 +93,33 @@ class DeviceOverride(DraftOverrideView):
             self.use_retrieval.copy_(agreed.use_retrieval)
 
     def select_step(self, neural_tokens, step):
-        if not self.defer_prefix or step > 1:
+        if not self.defer_prefix:
             return super().select_step(neural_tokens, step)
         if neural_tokens.shape not in ((len(self.slots),), (len(self.slots), 1)):
             raise ValueError("hybrid selection requires one neural token per row")
-        if step == 0:
-            # Gate tokens always equal the neural prefix. Its first forward
-            # can run without reading either the query mask or SA candidates.
-            self.first_neural_tokens.copy_(neural_tokens.reshape(-1, 1))
-        else:
+        gate = self.num_neural_gate_tokens
+        if step < gate - 1:
+            # Run the complete neural gate prefix without reading SA output.
+            self.neural_prefix[:, step].copy_(neural_tokens.reshape(-1))
+            return neural_tokens
+        if step == max(0, gate - 1):
             if self.query_stream is not None:
                 torch.cuda.current_stream().wait_stream(self.query_stream)
-            self.use_retrieval.logical_and_(
-                self.tokens[:, 0] == self.first_neural_tokens[:, 0]
-            )
-            self.use_retrieval.logical_and_(
-                self.tokens[:, 1] == neural_tokens.reshape(-1)
-            )
+            if gate:
+                self.use_retrieval.logical_and_(
+                    (self.tokens[:, : gate - 1] == self.neural_prefix).all(dim=1)
+                )
+                self.use_retrieval.logical_and_(
+                    self.tokens[:, step] == neural_tokens.reshape(-1)
+                )
             # All ranks participate, even with no local hits. Combining the
             # final gate mask with exact candidate consensus guarantees the
             # same skip/compact rows before any rank chooses a tail graph.
             # Keep NCCL on the model stream, after its prefix collectives.
             self._synchronize()
-        return neural_tokens
+        if step < gate:
+            return neural_tokens
+        return super().select_step(neural_tokens, step)
 
 
 class DeviceGraphBuffers:
@@ -135,7 +141,7 @@ class DeviceGraphBuffers:
         view.query_stream = self.view.query_stream
         view.defer_prefix = self.view.defer_prefix
         if view.defer_prefix:
-            view.first_neural_tokens = self.view.first_neural_tokens[:batch_size]
+            view.neural_prefix = self.view.neural_prefix[:batch_size]
         view.mapping_key = None
         view.num_neural_gate_tokens = self.view.num_neural_gate_tokens
         for name in ("slots", "generations", "tokens", "use_retrieval"):

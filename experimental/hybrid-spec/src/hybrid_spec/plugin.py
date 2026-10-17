@@ -125,12 +125,12 @@ def _attach(result, worker, *args, **kwargs):
     validate_model(worker)
     config = _config()
     if config.draft_graph_mode != "full" and (
-        getattr(worker, "DRAFT_SPLIT_GRAPH_API_VERSION", None) != 3
+        getattr(worker, "DRAFT_SPLIT_GRAPH_API_VERSION", None) != 4
         or getattr(EAGLEDraftCudaGraphRunner, "DRAFT_SPLIT_GRAPH_API_VERSION", None)
-        != 3
+        != 4
     ):
         raise RuntimeError(
-            "split draft graphs require the worker and Graph split API v3"
+            "split draft graphs require the worker and Graph split API v4"
         )
     tp_group = get_tp_group()
     communicator = None

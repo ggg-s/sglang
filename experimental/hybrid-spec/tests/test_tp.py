@@ -252,6 +252,11 @@ def _check_device_sync(group, ranks, device):
 
 
 def _check_split_gate(sync, ranks, device):
+    for gate in (0, 1, 2, 3, 8):
+        _check_split_gate_width(sync, ranks, device, gate)
+
+
+def _check_split_gate_width(sync, ranks, device, gate):
     """Local gate/candidate divergence must never split ranks into different tails.
 
     CPU exercises real Gloo groups; CUDA captures the query fork/join and real
@@ -260,15 +265,15 @@ def _check_split_gate(sync, ranks, device):
     config = HybridConfig(
         8,
         2,
-        4,
+        8,
         128,
         history_mode="device",
-        num_neural_gate_tokens=2,
+        num_neural_gate_tokens=gate,
         draft_graph_mode="split",
     )
-    base = torch.arange(32, device=device).reshape(4, 8) + 10
+    base = torch.arange(64, device=device).reshape(8, 8) + 10
     candidates = base.clone()
-    eligible = torch.ones(4, dtype=torch.bool, device=device)
+    eligible = torch.ones(8, dtype=torch.bool, device=device)
     neural = torch.full_like(base, 99)
 
     def query(slots, generations, seq_lens, tokens, mask):
@@ -277,19 +282,14 @@ def _check_split_gate(sync, ranks, device):
 
     backend = SimpleNamespace(config=config, device=device, consume_and_query=query)
     query_stream = torch.cuda.Stream() if device.type == "cuda" else None
-    buffers = DeviceGraphBuffers(backend, 4, sync, query_stream)
-    view = buffers.bind_capture_view(4)
-    seq_lens = torch.ones(4, dtype=torch.int64, device=device)
+    buffers = DeviceGraphBuffers(backend, 8, sync, query_stream)
+    view = buffers.bind_capture_view(8)
+    seq_lens = torch.ones(8, dtype=torch.int64, device=device)
 
     def run():
         view.prepare(seq_lens)
-        first = view.select_step(neural[:, :1], 0)
-        # A stand-in neural op between fork and join, without reading SA output.
-        second = view.select_step(neural[:, 1:2] + 0, 1)
         return torch.cat(
-            [first, second]
-            + [view.select_step(neural[:, i : i + 1], i) for i in range(2, 8)],
-            dim=1,
+            [view.select_step(neural[:, i : i + 1] + 0, i) for i in range(8)], dim=1
         )
 
     graph = None
@@ -312,13 +312,13 @@ def _check_split_gate(sync, ranks, device):
         "agree",
     ):
         candidates.copy_(base)
-        neural[:, :2].copy_(base[:, :2])
+        neural[:, :gate].copy_(base[:, :gate])
         eligible.fill_(True)
         if dist.get_rank() == ranks[-1]:
             if mode == "candidate_disagree":
                 candidates[1, -1].add_(1)
             elif mode == "gate_disagree":
-                neural[2, 1].add_(1)
+                neural[2, max(0, gate - 1)].add_(1)
             elif mode == "rank_fallback":
                 eligible[3] = False
         if graph is None:
@@ -327,10 +327,10 @@ def _check_split_gate(sync, ranks, device):
             graph.replay()
         expected_mask = [
             True,
-            not (mode == "candidate_disagree" and len(ranks) > 1),
-            mode != "gate_disagree",
+            not (mode == "candidate_disagree" and (len(ranks) > 1 or gate == 8)),
+            mode != "gate_disagree" or gate == 0,
             mode != "rank_fallback",
-        ]
+        ] + [True] * 4
         assert view.use_retrieval.tolist() == expected_mask
         assert view.use_retrieval.data_ptr() == mask_address
         expected = neural.clone()

@@ -16,9 +16,28 @@ verify 直接在设备上暂存 `predict/accept_index/accept_lens`，下一轮 d
 
 `configs/device-qwen35-mtp.json` 是 Qwen3.5 MTP 的实验配置：K=8、匹配阈值 4、前 4 个 token 一致性检查、短候选整链回退。它与参考配置是不同的选路策略，不能把匹配命中率当作性能收益；模型、量化及负载改变后应重新测量。选择依据与 A100 对照见 [接受长度分析](validation/acceptance-regression.md)。该配置仍运行完整 MTP；CUDA 状态布局保持 v3，安装代码后重启服务即可加载新逻辑，不需要重新编译 CUDA 插件。
 
-`configs/device-qwen35-mtp-split.json` 开启并发 1 的两段 Graph 实验：`draft_graph_mode="split"`，前两个 token 与 neural 一致时跳过剩余 MTP；不同则续跑尾段。设置 `--max-running-requests 1 --cuda-graph-max-bs-decode 1`，greedy、Qwen3.5 MTP，保持 target verify 和 draft-extend。当前开放单机 TP≥1，GPU 多 TP 模型验收待完成。SA 查询在独立 stream 上与首个 MTP forward 重叠，在前两个 neural token 就绪后汇合；多 TP 将 gate mask 和候选一起做一次精确共识，然后各 rank 才决定是否运行尾段。需要同时更新 worker、runner、插件至 split Graph API v3，旧版会明确报错；CUDA SA 布局仍为 v3。默认 `draft_graph_mode="full"` 仍运行完整 Graph；`split_no_skip` 使用相同查询重叠、拆图和 CPU 同步，但始终运行尾段。前缀/尾段使用独立私有池保护跨 Graph 中间状态，当前不支持 memory saver 或 draft-extend DSA seed。新增重叠尚无 GPU 吞吐结果，验收方法见 [验证记录](VALIDATION.md)。
+`draft_graph_mode="split"` 将 MTP 按 gate 宽度拆成共享前缀和紧凑尾段。
+`num_neural_gate_tokens=G` 支持 0…K：G=0 不检查 neural 前缀，G=1 检查
+来自原生 draft-extend 的首 token，G≥2 运行 G−1 次 inner forward 检查前 G 个
+候选。命中行直接采用 SA 余下候选，未命中行从第 G+1 个 token 继续生成；G=0
+时从首候选起选择 SA/neural，neural 行仍从已有首候选继续。G=K 合法但没有
+可省略的尾段；G>K（如 K=2/G=3）启动时报错。K=1/2 均受支持。
 
-`configs/device-qwen35-mtp-split-c4.json` 将实验扩展到最多 4 个请求：设置 `--max-running-requests 4 --cuda-graph-max-bs-decode 4 --speculative-draft-attention-backend triton`。整批先检查两个 neural token，然后将未命中 SA 的请求压缩到独立的 1/2/3/4 行尾段 Graph，恢复对应请求的 hidden state、位置、KV 写入地址与注意力元数据，最后写回原行。命中行不进入尾段模型 forward；全部命中时不运行尾段。每轮仍读取一次 mask 到 CPU，但各 mask 对应的行号 tensor 已预先分配，运行时只做设备内复制，不再临时创建和上传行号。Graph padding 不进入实际尾段，缩小 GEMM 行数不保证同比例降低时延。当前仅支持 Triton draft attention、普通 KV 池，拒绝 KV canary；默认仍为完整 Graph。更新 SGLang 和插件 Python 后重启即可，CUDA SA 状态仍为 v3，无需重新编译。此前对照记录见[并发 4 实验](validation/split-graph-c4.md)。
+GPU 每轮稳定压缩出 neural 行号，排除 Graph padding；CPU 只读回一个行数，
+选择相应大小的 tail Graph。所有大小共用预分配行号缓冲区，不枚举 mask 组合，
+也不在热路径上传行号。已移除 batch≤4 硬限制；请求容量由 `max_requests`、
+`--max-running-requests` 和 decode Graph 配置决定。每个捕获前缀仍为各个可能
+尾段大小保留独立 metadata、暂存和私有 Graph 池，扩大批次会增加捕获显存。
+
+支持单机 TP≥1、greedy、topk=1、Qwen3.5 原生 MTP（Triton draft attention）和
+DeepSeek V4 原生 MTP（dsv4 draft attention）；其余约束见下文。
+SA 查询在独立 stream 执行，在 gate 边界汇合并做一次候选及最终 mask 的 TP 共识。
+G=0/1 没有可重叠的 neural inner forward；G≥2 可与前缀计算重叠。
+前缀/尾段使用独立私有池；`split_no_skip` 使用同一切分，但让所有实际请求行
+执行尚余尾段（G=K 时同样无尾段）。默认仍为 `full`，不支持 memory saver、
+KV canary 或 draft-extend DSA seed。worker、runner、插件需同时更新至 split API v4；
+SA 状态布局保持 v3。配置示例仍保留 G=2、B=1/4，不代表能力上限。
+详见 [动态行号与可配置 gate 验收](validation/dynamic-rows-gate-20261017.md)。
 
 device 模式以 generation 和 GPU 历史版本检查隔离旧反馈、槽位复用、重排和 Graph padding；prefill/retract 时重建索引。允许实验性开启 overlap 和 chunked prefill：中间块不构建 SA、不接入临时采样 token；最后一块启动前快照完整历史（含已缓存/先前分块的前缀），后台构建与最后一块 prefill 重叠，返回后只暂存真实 bonus。CPU 构建未完成时首次 draft 仍会等待。GPU 接受前缀可能包含 CPU EOS/停止截断前的尾部，不能将索引长度当作交付长度；原生停止处理保持不变。支持单机多 TP 实验，仍不开放 mixed prefill/decode、grammar 等其余未支持组合。chunked prefill 的真实 GPU/模型验收尚未完成。
 
@@ -29,8 +48,8 @@ DeepSeek V4 原生 MTP 现在有独立接入：只对 `DeepseekV4ForCausalLM` ta
 外部草稿和 DSpark 仍拒绝。纯文本 V4 可直接使用；有视觉能力的 checkpoint
 需要显式 text-only 配置，实际多模态输入仍会被请求检查拒绝。
 
-V4 的 `split` 现在与 Qwen 一样按请求裁剪：前两个 neural token 通过 SA gate
-的行保留完整 SA 草稿，其余行收集到独立的 1/2/3/4 行尾段 Graph，再写回原行。
+V4 的 `split` 与 Qwen 一样按请求裁剪：按配置宽度完成 gate 后，命中行保留
+完整 SA 草稿，其余行收集到对应大小的紧凑尾段 Graph，再写回原行。
 全部命中时不运行尾段，Graph padding 不进入尾段；例如 4 行中 3 行命中，尾段只跑 1 行。
 注意力仍使用当前选定的原生 dsv4 后端及其具体子类。每个紧凑批拥有独立的
 请求/KV 计划与逐步 metadata，保留原生 SWA 和 target 压缩/verify 路径。
@@ -49,7 +68,7 @@ export HYBRID_SPEC_CONFIG="$PWD/experimental/hybrid-spec/configs/device-dsv4-mtp
 ```
 
 K=8 是模板值；修改 K 时同时修改 JSON 的 `num_drafts` 和上述两个服务参数，
-split 仍要求 K>2、gate=2。`max_history_tokens=16384` 包含完整 prompt 和输出历史，
+split 支持 K≥1、gate=0…K。`max_history_tokens=16384` 包含完整 prompt 和输出历史，
 容量不足会回退 MTP，按实际上下文调整。worker/runner 的 split API 仍为 v3。
 
 | 项目 | 当前实现 |
@@ -198,7 +217,7 @@ neural 前缀检查、TP 候选共识、target verify 和 split 的现有约束�
 完成回调只修改 CPU 元数据，不在 scheduler 线程启动 CUDA。下一次 draft 在 forward stream
 消费最后的 verify 增量（split 在已等待 forward stream 的 SA 辅助 stream 中消费），按完成请求的最终 token 数截掉停止条件丢弃的尾部；若已写入超长尾部，
 该来源失效回退。未导入的后台构建不进入池，槽位复用有 generation 校验。
-跨请求查询兼容 `split`，要求 device 历史、gate=2、单机 TP≥1、greedy 和最多 4 个活跃请求等
+跨请求查询兼容 `split`，要求 device 历史、gate=0…K、单机 TP≥1、greedy 等
 现有 split 约束。增加保留槽位不会放宽活跃并发限制，也会增加显存和查询成本。
 组合示例为 `configs/device-qwen35-mtp-split-global-pool.json`：K=8、gate=2、
 4 个活跃槽位、16 个保留槽位、H=4096，与 6000D 对照中的 split 配置一致。

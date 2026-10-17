@@ -1,0 +1,65 @@
+{
+  "base_commit": "993fd124c5e119793d1b40a03eb5fc4f47e4c4bf",
+  "test_source": "Uncommitted isolated worktree, source hashes verified before commit",
+  "python": "3.10.18",
+  "platform": "Linux-6.6.87.2-microsoft-standard-WSL2-x86_64-with-glibc2.39",
+  "torch": "2.8.0+cu128",
+  "torch_cuda": "12.8",
+  "triton": "3.4.0",
+  "pytest": "9.1.1",
+  "gpu": "NVIDIA GeForce RTX 4060 Laptop GPU",
+  "nvcc": "nvcc: NVIDIA (R) Cuda compiler driver\nCopyright (c) 2005-2023 NVIDIA Corporation\nBuilt on Fri_Jan__6_16:45:21_PST_2023\nCuda compilation tools, release 12.0, V12.0.140\nBuild cuda_12.0.r12.0/compiler.32267302_0",
+  "driver": "592.82",
+  "command": [
+    "/workspace/dsv4-lease-validation-20261017/venv310/bin/python",
+    "-m",
+    "pytest",
+    "-p",
+    "lean_cuda_plugin",
+    "experimental/hybrid-spec/tests",
+    "-q",
+    "--tb=short",
+    "-rs"
+  ],
+  "environment": {
+    "PATH": "/workspace/dsv4-lease-validation-20261017/venv310/bin:$PATH",
+    "PYTHONPATH": "/workspace/dsv4-dynamic-20261017:experimental/hybrid-spec/src",
+    "CC": "gcc-12",
+    "CXX": "g++-12",
+    "CUDA_HOME": "/usr",
+    "MAX_JOBS": "2",
+    "TORCH_CUDA_ARCH_LIST": "8.9",
+    "GLOO_SOCKET_IFNAME": "lo"
+  },
+  "results": {
+    "passed": 363,
+    "skipped": 2,
+    "cpu_gloo_passed": 234,
+    "cuda_passed": 129,
+    "compact_cuda_cases": 92,
+    "dynamic_scan_cuda_cases": 10,
+    "seconds": 44.76,
+    "skips": [
+      "nccl-2",
+      "nccl-8"
+    ]
+  },
+  "sha256": {
+    "experimental/hybrid-spec/src/hybrid_spec/config.py": "fe7b6bcc3f6fd68f889cc9648f89ec20d0ced51173504ab42aee314d44561fc4",
+    "experimental/hybrid-spec/src/hybrid_spec/integrations/sglang/compact_graph.py": "60eaf1c2ace989210335f907887291648be150745a19c462dfa001af69413042",
+    "experimental/hybrid-spec/src/hybrid_spec/integrations/sglang/compatibility.py": "cac3e8bd4a324cc98e975b16d94a2e53e95cca18eddeeee419c744b9fc1334b0",
+    "experimental/hybrid-spec/src/hybrid_spec/integrations/sglang/device_extension.py": "aed7bc345d2144264e076d87fcbb552c273923830e76b63ac5b05fe1f7523058",
+    "experimental/hybrid-spec/src/hybrid_spec/integrations/sglang/split_graph.py": "e8784ed2767351d9af01a4cc36dcf5214dd64adfd2373300159158e40d6caf1e",
+    "experimental/hybrid-spec/src/hybrid_spec/plugin.py": "415e43006fb04e4b4a51393069725d7aee503b0b25c07d42434fda3799c15456",
+    "experimental/hybrid-spec/tests/test_compact_tail.py": "1c23dae79ff2f072360eb5680f42059d9dbee41037a2ac58ec640e46a206248d",
+    "experimental/hybrid-spec/tests/test_core.py": "bc81452f8fc0ff732ae3cc4be81da6666495a467923133fcc129a5e981c1098c",
+    "experimental/hybrid-spec/tests/test_cuda.py": "eebf660cab7912c8a2628311a8146bee83a0f1dd03ebf1825fcb3c78970a0046",
+    "experimental/hybrid-spec/tests/test_draft_recurrence.py": "36688e79c36d1298d6eaefb3b845a34a1c2d3e98de6efe38a1c2c93ee0994d69",
+    "experimental/hybrid-spec/tests/test_tp.py": "b0f69cdb3bfa54c486d626a4e7bd8bbeb5aba998878c6d3615a8f82eece46fa9",
+    "python/sglang/srt/speculative/eagle_draft_cuda_graph_runner.py": "50b7a8365cb36c4c296f6db316fea756c93d9995eb5be619a0bb32555741ba2c",
+    "python/sglang/srt/speculative/eagle_worker_v2.py": "3474f591c568e9965c78e6b9134f68eecbd08733cfec4da272ea8c67bdcff7d6",
+    "experimental/hybrid-spec/src/hybrid_spec/backends/gpu_sa/row_compaction.py": "919ae9469643d26ca71822513cb1c80e1b24821efa52c661959755f849e6e7f1"
+  },
+  "helper_sha256": "3323ed0e2561469672735868387cd9834507af9661a248238cf876245103639e",
+  "boundaries": "Compact CUDA cases use synthetic model/attention and isolate unused FullCudaGraphBackend and attention-container imports. Exact worker draft_forward body, native topk Triton kernel, ForwardContext, dynamic row kernel, and production prefix/tail capture/replay/gather/scatter run on GPU. Other CUDA cases run without that fixture substitution. No real DSV4 weights/attention, TP8 NCCL, model accuracy or throughput result."
+}

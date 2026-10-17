@@ -1094,8 +1094,12 @@ def test_dsv4_compact_metadata_preserves_request_major_step_writes(k):
             fb.req_pool_indices.copy_(requests[rows])
             fb.seq_lens.copy_(lengths[rows])
             torch.index_select(full_cache, 1, rows, out=cache)
-            _plan_dsv4_metadata(attention, fb, cache, flat, in_capture=True)
-            _plan_dsv4_metadata(attention, fb, cache, flat, in_capture=False)
+            _plan_dsv4_metadata(
+                attention, fb, cache, flat, start_step=1, in_capture=True
+            )
+            _plan_dsv4_metadata(
+                attention, fb, cache, flat, start_step=1, in_capture=False
+            )
             assert fb.out_cache_loc is flat
             for step in range(1, k - 1):
                 child = children[step]
@@ -1195,10 +1199,7 @@ def test_invalid_neural_gate_width(value):
     "change",
     [
         {"draft_graph_mode": "unknown"},
-        {"num_neural_gate_tokens": 1},
-        {"max_requests": 5},
         {"history_mode": "cpu"},
-        {"num_drafts": 2},
     ],
 )
 def test_split_graph_configuration_rejects_unsupported_state(change):
@@ -1267,32 +1268,46 @@ def test_compact_dispatch_uses_raw_count_before_runner_restores_padding(monkeypa
     assert backend.replay(4, SimpleNamespace(batch_size=4)) == 3
 
 
+@pytest.mark.parametrize("batch_size", [1, 8, 32])
 @pytest.mark.parametrize("mode", ["split", "split_no_skip"])
-def test_precomputed_compact_dispatch_keeps_live_rows_and_buffer_addresses(mode):
+def test_dynamic_compact_dispatch_keeps_live_rows_and_buffer_addresses(
+    monkeypatch, mode, batch_size
+):
     from hybrid_spec.integrations.sglang.compact_graph import (
         CompactCapture,
-        prepare_dispatch,
+        prepare_compaction,
         replay_compact,
     )
 
-    mask = torch.zeros(4, dtype=torch.bool)
-    output = torch.zeros(4, dtype=torch.int64)
+    mask = torch.zeros(batch_size, dtype=torch.bool)
+    output = torch.zeros(batch_size, dtype=torch.int64)
     record = CompactCapture(
         SimpleNamespace(replay=lambda: output.zero_()),
         output,
-        SimpleNamespace(batch_size=4),
+        SimpleNamespace(batch_size=batch_size),
         SimpleNamespace(use_retrieval=mask),
         (),
     )
-    for size in range(1, 5):
-        rows = torch.empty(size, dtype=torch.int64)
+    prepare_compaction(record, mode)
+    for size in range(1, batch_size + 1):
+        rows = record.rows[:size]
         record.tails[size] = SimpleNamespace(
             rows=rows,
             graph=SimpleNamespace(
                 replay=lambda rows=rows: output.index_fill_(0, rows, 7)
             ),
         )
-    prepare_dispatch(record, mode)
+
+    def compact(mask, rows, count, raw_bs, no_skip):
+        chosen = (
+            torch.arange(raw_bs) if no_skip else (~mask[:raw_bs]).nonzero().flatten()
+        )
+        rows[: len(chosen)].copy_(chosen)
+        count.fill_(len(chosen))
+
+    from hybrid_spec.integrations.sglang import compact_graph
+
+    monkeypatch.setattr(compact_graph, "compact_neural_rows", compact)
     addresses = {key: tail.rows.data_ptr() for key, tail in record.tails.items()}
     counters = dict.fromkeys(
         (
@@ -1307,11 +1322,14 @@ def test_precomputed_compact_dispatch_keeps_live_rows_and_buffer_addresses(mode)
         ),
         0,
     )
-    counters["tail_batch_histogram"] = {str(i): 0 for i in range(5)}
+    counters["tail_batch_histogram"] = {str(i): 0 for i in range(batch_size + 1)}
     # Repeat changing masks/sizes: stale row vectors and padded rows must never
     # execute, including split_no_skip's all-live-rows path.
-    for raw_bs in (4, 3, 1, 2, 4):
-        for bits in range(1 << raw_bs):
+    for raw_bs in (batch_size, max(1, batch_size - 1), 1, min(3, batch_size)):
+        bits_values = (
+            range(1 << raw_bs) if raw_bs <= 3 else (0, (1 << raw_bs) - 1, 1, 0x55, 0xAA)
+        )
+        for bits in bits_values:
             mask.zero_()
             for i in range(raw_bs):
                 mask[i] = bool(bits & (1 << i))
@@ -1320,7 +1338,7 @@ def test_precomputed_compact_dispatch_keeps_live_rows_and_buffer_addresses(mode)
                 7
                 if i < raw_bs and (mode == "split_no_skip" or not bits & (1 << i))
                 else 0
-                for i in range(4)
+                for i in range(batch_size)
             ]
             assert output.tolist() == expected
             assert addresses == {
@@ -1367,3 +1385,41 @@ def test_neural_gate_propagates_through_history_and_capture_views():
     assert (
         DeviceGraphBuffers(backend, 3).bind_capture_view(3).num_neural_gate_tokens == 2
     )
+
+
+@pytest.mark.parametrize(
+    "k,gate", [(1, 0), (1, 1), (2, 0), (2, 1), (2, 2), (8, 3), (8, 8)]
+)
+def test_split_gate_and_large_batch_configuration(k, gate):
+    config = HybridConfig(
+        k,
+        1,
+        32,
+        128,
+        history_mode="device",
+        num_neural_gate_tokens=gate,
+        draft_graph_mode="split",
+    )
+    cfg = valid_config()
+    cfg.speculative_algorithm = "EAGLE"
+    cfg.speculative_num_steps = k
+    cfg.speculative_num_draft_tokens = k + 1
+    cfg.max_running_requests = 32
+    cfg.speculative_use_rejection_sampling = False
+    cfg.disable_cuda_graph = False
+    cfg.enable_memory_saver = False
+    validate_config(config, cfg)
+
+
+@pytest.mark.parametrize("gate", [3, -1, True, 1.5])
+def test_split_rejects_gate_outside_draft_budget(gate):
+    with pytest.raises(ValueError, match="num_neural_gate_tokens"):
+        HybridConfig(
+            2,
+            1,
+            8,
+            128,
+            history_mode="device",
+            num_neural_gate_tokens=gate,
+            draft_graph_mode="split",
+        )

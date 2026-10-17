@@ -45,16 +45,8 @@ class HybridConfig:
             raise ValueError("num_neural_gate_tokens must be between 0 and num_drafts")
         if self.draft_graph_mode not in ("full", "split", "split_no_skip"):
             raise ValueError("draft_graph_mode must be full, split or split_no_skip")
-        if self.draft_graph_mode != "full" and (
-            self.history_mode != "device"
-            or self.num_neural_gate_tokens != 2
-            or self.num_drafts <= 2
-            or self.max_requests > 4
-        ):
-            raise ValueError(
-                "split draft graphs require device history, at most four requests, "
-                "num_neural_gate_tokens=2 and num_drafts>2"
-            )
+        if self.draft_graph_mode != "full" and self.history_mode != "device":
+            raise ValueError("split draft graphs require device history")
         if type(self.max_shared_requests) is not int or self.max_shared_requests < 0:
             raise ValueError("max_shared_requests must be a nonnegative integer")
         if (

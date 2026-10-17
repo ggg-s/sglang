@@ -385,103 +385,57 @@ def test_cuda_graph_neural_gate_replay_resets_final_selection_mask():
 
 
 @pytest.mark.parametrize("mode", ["split", "split_no_skip"])
-def test_split_graph_alternating_skip_fallback_preserves_prefix_storage(mode):
-    """A skipped tail must leave a complete chain and permit the next fallback.
-
-    Separate real CUDA graph pools must preserve the recurrent prefix when the
-    tail resumes, and reset both gate eligibility and positions on every round.
-    """
-    from types import SimpleNamespace
-
-    from hybrid_spec.integrations.sglang.split_graph import SplitDraftGraphBackend
-
-    backend = object.__new__(SplitDraftGraphBackend)
-    backend.records = {}
-    backend.stream = torch.cuda.Stream()
-    backend.mode = mode
-    backend.runner = SimpleNamespace(raw_bs=1)
-    backend.counters = {
-        "prefix_ct": 0,
-        "skip_ct": 0,
-        "tail_ct": 0,
-        "decision_wait_ns": 0,
-    }
-    backend.counters.update(
-        request_ct=0,
-        skip_request_ct=0,
-        tail_request_ct=0,
-        mixed_ct=0,
-        tail_batch_histogram={str(i): 0 for i in range(5)},
-    )
-    candidates = torch.zeros((1, 4), dtype=torch.int64, device="cuda")
-    eligibility = torch.ones(1, dtype=torch.bool, device="cuda")
-    view = DraftOverrideView(candidates, torch.zeros_like(eligibility), 2)
-    batch = SimpleNamespace(
-        batch_size=1,
-        positions=torch.zeros(1, dtype=torch.int64, device="cuda"),
-        spec_info=SimpleNamespace(draft_override=view),
-    )
-
-    def forward():
-        view.use_retrieval.copy_(eligibility)
-        callback = getattr(view, "on_prefix_ready", None)
-        result = torch.empty_like(candidates)
-        if callback is not None:
-            result.copy_(candidates)
-        token = torch.ones((1, 1), dtype=torch.int64, device="cuda")
-        token = view.select_step(token, 0)
-        result[:, :1].copy_(token)
-        for step in range(1, 4):
-            token = view.select_step(token + 1, step)
-            result[:, step : step + 1].copy_(token)
-            batch.positions.add_(1)
-            if step == 1 and callback is not None:
-                callback()
-        batch.positions.sub_(3)
-        return result
-
-    backend.capture_one("bs1", forward, capture_inputs=batch)
-    for tokens, eligible, expected in [
-        ([1, 2, 70, 80], True, [1, 2, 70, 80]),
-        ([1, 9, 70, 80], True, [1, 2, 3, 4]),
-        ([9, 2, 70, 80], True, [1, 2, 3, 4]),
-        ([1, 2, 71, 81], False, [1, 2, 3, 4]),
-        ([1, 2, 72, 82], True, [1, 2, 72, 82]),
-    ]:
-        candidates.copy_(torch.tensor([tokens], device="cuda"))
-        eligibility.fill_(eligible)
-        assert backend.replay("bs1", batch).tolist() == [expected]
-        assert batch.positions.item() == 0
-    assert backend.counters["prefix_ct"] == 5
-    assert backend.counters["skip_ct"] == (2 if mode == "split" else 0)
-    assert backend.counters["tail_ct"] == (3 if mode == "split" else 5)
-
-
-@pytest.mark.parametrize("mode", ["split", "split_no_skip"])
 @pytest.mark.parametrize("kind", ["triton", "dsv4"])
-@pytest.mark.parametrize("steps", [3, 8])
+@pytest.mark.parametrize(
+    "steps,gate,batch_size",
+    [
+        (k, g, b)
+        for k, g in (
+            (1, 0),
+            (1, 1),
+            (2, 0),
+            (2, 1),
+            (2, 2),
+            (3, 3),
+            (8, 0),
+            (8, 1),
+            (8, 2),
+            (8, 3),
+            (8, 8),
+        )
+        for b in (1, 8)
+    ]
+    + [(8, 3, 16)],
+)
 def test_compact_tail_graph_reorders_rows_without_computing_sa_requests(
-    monkeypatch, mode, kind, steps
+    monkeypatch, mode, kind, steps, gate, batch_size
 ):
-    """Compaction must gather recurrence/KV inputs and scatter to original rows.
+    """Run the actual worker body, topk, compaction and CUDA graph scheduling.
 
-    Exercise all masks and a padded batch on real CUDA graphs. Only the model
-    and attention boundaries are synthetic; production gather/replay/scatter
-    and the native topk kernel execute unchanged.
+    Model and attention metadata are synthetic. Recurrence, prefix boundary,
+    GPU row selection, original-row KV mapping and private pools are real.
     """
+    import contextlib
     from types import SimpleNamespace as NS
+    from typing import List, Optional
+
+    from test_draft_recurrence import load_functions
 
     from hybrid_spec.integrations.sglang.split_graph import SplitDraftGraphBackend
     from sglang.kernels.ops.speculative.topk1 import draft_topk1_postprocess
     from sglang.srt.layers.attention import triton_backend
-    from sglang.srt.model_executor.forward_context import get_attn_backend
+    from sglang.srt.model_executor.forward_context import (
+        ForwardContext,
+        forward_context,
+        get_attn_backend,
+    )
     from sglang.srt.model_executor.runner_backend.full_cuda_graph_backend import (
         FullCudaGraphBackend,
     )
 
     class Attention:
         def __init__(self, *args):
-            self.attn_backends = [None] * 7
+            self.attn_backends = [None] * steps
 
         def init_cuda_graph_state(self, *args):
             pass
@@ -525,37 +479,59 @@ def test_compact_tail_graph_reorders_rows_without_computing_sa_requests(
         def on_after_cuda_graph_warmup(self):
             pass
 
-    # Native TRT-LLM uses a subclass of the V4 multistep container. A compact
-    # tail must preserve the prototype's concrete class and step backends.
     class DerivedDsv4Attention(Dsv4Attention):
         pass
 
     device = "cuda"
+    width = max(1, gate)
+    prefix_steps = width - 1
+    tail_steps = steps - width
     hidden_width = 4 if kind == "dsv4" else 1
-    seed = torch.tensor([2, 4, 6, 8], device=device)
-    initial_hidden = (
-        torch.tensor([[1.0], [3.0], [5.0], [7.0]], device=device)
-        .expand(-1, hidden_width)
-        .clone()
+    seed = torch.arange(batch_size, device=device) * 2 + 2
+    initial_hidden = (seed[:, None] - 1).float().expand(-1, hidden_width).clone()
+    base_positions = torch.arange(batch_size, device=device) * 7 + 11
+    reqs = torch.arange(batch_size, device=device).roll(1).flip(0)
+    cache = reqs[None, :] * 100 + torch.arange(steps, device=device)[:, None] + 40
+    flat_cache = cache.T.contiguous().flatten()
+    work = torch.zeros(batch_size, dtype=torch.int64, device=device)
+    eligible = torch.ones(batch_size, dtype=torch.bool, device=device)
+    candidates = torch.zeros((batch_size, steps), dtype=torch.int64, device=device)
+    config = HybridConfig(
+        steps,
+        1,
+        batch_size,
+        128,
+        history_mode="device",
+        draft_graph_mode=mode,
+        num_neural_gate_tokens=gate,
     )
-    base_positions = torch.tensor([11, 17, 23, 31], device=device)
-    cache = torch.arange(steps * 4, device=device).reshape(steps, 4) + 40
-    reqs = torch.tensor([3, 0, 2, 1], device=device)
-    work = torch.zeros(4, dtype=torch.int64, device=device)
-    eligible = torch.ones(4, dtype=torch.bool, device=device)
-    view = DraftOverrideView(
-        torch.zeros((4, steps), dtype=torch.int64, device=device), eligible.clone(), 2
+
+    def query(slots, generations, seq_lens, tokens, mask):
+        tokens.copy_(candidates)
+        mask.copy_(eligible)
+
+    view = DeviceOverride(
+        NS(config=config, device=torch.device(device), consume_and_query=query),
+        reqs,
+        reqs + 1,
     )
     fb = NS(
-        batch_size=4,
+        batch_size=batch_size,
         positions=base_positions.clone(),
-        mrope_positions=base_positions.expand(3, 4).clone()
+        mrope_positions=base_positions.expand(3, -1).clone()
         if kind == "triton"
         else None,
         seq_lens=base_positions.clone(),
         req_pool_indices=reqs,
-        extend_seq_lens=torch.ones(4, dtype=torch.int32, device=device),
-        spec_info=NS(draft_override=view),
+        extend_seq_lens=torch.ones(batch_size, dtype=torch.int32, device=device),
+        spec_info=NS(
+            draft_override=view,
+            topk_p=torch.ones((batch_size, 1), device=device),
+            topk_index=seed[:, None],
+            hidden_states=initial_hidden,
+        ),
+        forward_mode=NS(is_idle=lambda: False),
+        sampling_info=NS(is_all_greedy=True),
         mark_forward_metadata_ready=lambda: None,
     )
 
@@ -578,6 +554,9 @@ def test_compact_tail_graph_reorders_rows_without_computing_sa_requests(
             rotary_pos = (
                 batch.mrope_positions[0] if kind == "triton" else batch.seq_lens
             )
+            # V4's synthetic native metadata includes its step in rotary_pos.
+            if kind == "dsv4":
+                rotary_pos = rotary_pos + batch.positions - base_positions
             write = batch.out_cache_loc * (3 if kind == "dsv4" else 1)
         token = (
             batch.input_ids
@@ -617,119 +596,176 @@ def test_compact_tail_graph_reorders_rows_without_computing_sa_requests(
         ),
         forward=model_forward,
     )
+    attention = Attention() if kind == "triton" else DerivedDsv4Attention()
     worker = NS(
         speculative_num_steps=steps,
         hot_token_id=None,
         seed_dsa_topk_from_draft_extend=False,
+        index_share_for_mtp_iteration=False,
         draft_extension=NS(),
-        _topk1_parents_prealloc=torch.zeros((4, steps - 1), device=device),
-        _topk1_score_indices_prealloc=torch.zeros((4, steps), device=device),
+        topk=1,
+        draft_attn_backend=attention,
+        draft_runner=model,
+        _topk1_parents_prealloc=torch.zeros(
+            (batch_size, max(0, steps - 1)), device=device
+        ),
+        _topk1_score_indices_prealloc=torch.zeros((batch_size, steps), device=device),
     )
     runner = NS(
-        draft_attn_backend=Attention() if kind == "triton" else DerivedDsv4Attention(),
+        draft_attn_backend=attention,
         model_runner=model,
         speculative_num_steps=steps,
         eagle_worker=worker,
         topk=1,
-        max_bs=4,
+        max_bs=batch_size,
         captured_req_width=1,
-        raw_bs=4,
+        raw_bs=batch_size,
+    )
+    ns = dict(
+        torch=torch,
+        contextlib=contextlib,
+        List=List,
+        Optional=Optional,
+        ForwardBatch=object,
+        EagleDraftInput=object,
+        _is_cuda=True,
+        _is_hip=False,
+        get_spec=lambda: NS(speculative_use_rejection_sampling=False),
+        maybe_detect_nan=lambda *a: None,
+        maybe_detect_inf=lambda *a: None,
+        maybe_detect_oob=lambda *a: None,
+        draft_topk1_postprocess=draft_topk1_postprocess,
+        forward_context=forward_context,
+        ForwardContext=ForwardContext,
+        IndexTopKShareState=NS(mtp_iteration=lambda *a, **kw: contextlib.nullcontext()),
+    )
+    load_functions(
+        "python/sglang/srt/speculative/eagle_utils.py",
+        ["per_step_draft_out_cache_loc"],
+        ns,
+    )
+    load_functions(
+        "python/sglang/srt/speculative/eagle_worker_v2.py",
+        ["draft_forward"],
+        ns,
+        "EagleDraftWorker",
     )
 
     def prefix():
-        view.use_retrieval.copy_(eligible)
-        tokens = view.select_step(seed[:, None], 0)
-        drafts = view.tokens.clone()
-        drafts[:, :1].copy_(tokens)
-        fb.input_ids = tokens.flatten()
         fb.spec_info.hidden_states = initial_hidden
-        fb.out_cache_loc = cache[0]
-        logits = model_forward(fb).logits_output
-        _, tokens = draft_topk1_postprocess(
-            logits.next_token_logits, fb.positions, drafts, 1
-        )
+        fb.out_cache_loc = flat_cache
         if fb.mrope_positions is not None:
-            fb.mrope_positions.add_(1)
-        tokens = view.select_step(tokens, 1)
-        drafts[:, 1:2].copy_(tokens)
-        result = view.on_prefix_ready(fb, tokens, logits.hidden_states, cache, drafts)
-        fb.positions.sub_(steps - 1)
+            fb.mrope_positions.copy_(base_positions.expand(3, -1))
+        result = ns["draft_forward"](worker, fb)
+        fb.positions.sub_(steps - 1)  # Actual runner's run_once restoration.
         return result
 
-    stream = torch.cuda.Stream()
     backend = SplitDraftGraphBackend(object.__new__(FullCudaGraphBackend), runner, mode)
-    backend.stream = stream
-    backend.capture_one(4, prefix, capture_inputs=fb)
-    # Reuse the ordinary allocator after capture. Losing Python ownership of
-    # staging tensors can otherwise pass small toy runs until another graph
-    # allocates the same blocks (the real serving crash's trigger).
+    backend.stream = torch.cuda.Stream()
+    backend.capture_one(batch_size, prefix, capture_inputs=fb)
+    assert backend.can_run(NS(batch_size=batch_size), batch_size)
+    record = backend.records[batch_size]
+    assert len(record.tails) == (batch_size if tail_steps else 0)
+    assert all(
+        t.rows.data_ptr() == record.rows.data_ptr() for t in record.tails.values()
+    )
     poison = [
-        torch.full((size, width), 47, dtype=dtype, device=device)
-        for _ in range(32)
-        for size in range(1, 5)
-        for width in (1, 8)
+        torch.full((size, 8), 47, dtype=dtype, device=device)
+        for size in range(1, batch_size + 1)
+        for _ in range(8)
         for dtype in (torch.int64, torch.float32, torch.bool)
     ]
-    for raw_bs in (4, 3, 2):
-        for bits in range(1 << raw_bs):
-            # Independent scalar recurrence fixes the expected chain.
-            expected = []
-            for row in range(4):
-                token, hidden = int(seed[row]), int(initial_hidden[row].sum())
-                chain = [token]
-                for step in range(steps - 1):
-                    nxt = (
-                        token
-                        + hidden
-                        + int(base_positions[row]) * 2
-                        + step * 2
-                        + int(reqs[row])
-                        + int(cache[step, row]) * (3 if kind == "dsv4" else 1)
-                    ) % 128
-                    hidden, token = token * hidden_width, nxt
-                    chain.append(token)
-                expected.append(chain)
-            candidates = torch.tensor(expected, device=device)
-            candidates[:, 2:] = 99
-            hit = [(bits >> i) & 1 == 1 and i < raw_bs for i in range(4)]
-            # Rejections happen at candidate one, preserving native prefix.
-            for row in range(4):
-                if not hit[row]:
-                    candidates[row, 1] = (candidates[row, 1] + 1) % 128
-                else:
-                    expected[row][2:] = [99] * (steps - 2)
-            view.tokens.copy_(candidates)
+    native = []
+    for row in range(batch_size):
+        token, hidden = int(seed[row]), int(initial_hidden[row].sum())
+        chain = [token]
+        for step in range(steps - 1):
+            nxt = (
+                token
+                + hidden
+                + int(base_positions[row]) * 2
+                + step * 2
+                + int(reqs[row])
+                + int(cache[step, row]) * (3 if kind == "dsv4" else 1)
+            ) % 128
+            hidden, token = token * hidden_width, nxt
+            chain.append(token)
+        native.append(chain)
+    for raw_bs in sorted(
+        {batch_size, max(1, batch_size - 1), 1, min(3, batch_size)}, reverse=True
+    ):
+        bits_values = (
+            range(1 << raw_bs)
+            if raw_bs <= 3
+            else [0, (1 << raw_bs) - 1, 1, 2, 0x55, 0xAA, 0x33]
+        )
+        for iteration, bits in enumerate(bits_values):
+            expected = [chain.copy() for chain in native]
+            hit = [i < raw_bs and bool(bits & (1 << i)) for i in range(batch_size)]
+            candidate = torch.tensor(native, device=device)
+            if gate == 0:
+                candidate.fill_(99 + iteration)
+                eligible.copy_(torch.tensor(hit, device=device))
+            else:
+                eligible.fill_(True)
+                candidate[:, gate:] = 99 + iteration
+                for row in range(batch_size):
+                    if not hit[row]:
+                        candidate[row, gate - 1] = (candidate[row, gate - 1] + 1) % 128
+            for row in range(batch_size):
+                if hit[row]:
+                    expected[row][gate:] = [99 + iteration] * (steps - gate)
+            candidates.copy_(candidate)
             fb.positions.copy_(base_positions)
-            if fb.mrope_positions is not None:
-                fb.mrope_positions.copy_(base_positions.expand(3, 4))
             work.zero_()
-            counters = {
-                "prefix_ct": 0,
-                "skip_ct": 0,
-                "tail_ct": 0,
-                "decision_wait_ns": 0,
-                "request_ct": 0,
-                "skip_request_ct": 0,
-                "tail_request_ct": 0,
-                "mixed_ct": 0,
-                "tail_batch_histogram": {str(i): 0 for i in range(5)},
-            }
-            backend.counters = counters
             runner.raw_bs = raw_bs
-            output = backend.replay(4, fb)[2]
+            output = backend.replay(batch_size, fb)[2]
             assert output[:raw_bs].tolist() == expected[:raw_bs]
             counts = work[reqs].tolist()
             assert counts == [
-                1
+                prefix_steps
                 + (
-                    steps - 2
+                    tail_steps
                     if i < raw_bs and (mode == "split_no_skip" or not hit[i])
                     else 0
                 )
-                for i in range(4)
+                for i in range(batch_size)
             ]
             assert torch.equal(fb.positions, base_positions)
-    assert poison  # keep allocator pressure alive through every replay
+            if tail_steps:
+                chosen = [
+                    i for i in range(raw_bs) if mode == "split_no_skip" or not hit[i]
+                ]
+                assert record.rows[: len(chosen)].tolist() == chosen
+    assert poison
+    counters = backend.counters
+    assert (
+        counters["request_ct"]
+        == counters["skip_request_ct"] + counters["tail_request_ct"]
+    )
+    assert counters["prefix_ct"] == counters["skip_ct"] + counters["tail_ct"]
+    assert counters["prefix_ct"] == sum(counters["tail_batch_histogram"].values())
+    assert counters["tail_request_ct"] == sum(
+        int(k) * v for k, v in counters["tail_batch_histogram"].items()
+    )
+
+
+@pytest.mark.parametrize("size", [1, 8, 33, 257, 4097])
+@pytest.mark.parametrize("no_skip", [False, True])
+def test_gpu_dynamic_rows_stable_scan_excludes_padding(size, no_skip):
+    from hybrid_spec.backends.gpu_sa.row_compaction import compact_neural_rows
+
+    rows = torch.empty(size, dtype=torch.int64, device="cuda")
+    count = torch.empty((), dtype=torch.int32, device="cuda")
+    index = torch.arange(size, device="cuda")
+    for raw_bs in (size, size // 2, 0, min(size, 1), size):
+        for mask in (index % 3 == 0, index >= 0, index < 0):
+            rows.fill_(-1)
+            compact_neural_rows(mask, rows, count, raw_bs, no_skip)
+            expected = [i for i in range(raw_bs) if no_skip or not bool(mask[i])]
+            assert int(count) == len(expected)
+            assert rows[: len(expected)].tolist() == expected
+            assert rows[len(expected) :].eq(-1).all()
 
 
 @pytest.mark.parametrize("partial", ["fallback", "zero"])

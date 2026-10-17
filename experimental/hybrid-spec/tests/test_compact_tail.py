@@ -16,9 +16,11 @@ from hybrid_spec.core.contracts import DraftOverrideView
 from hybrid_spec.integrations.sglang import compact_graph
 
 
-@pytest.mark.parametrize("k", [3, 8])
+@pytest.mark.parametrize(
+    "k,gate", [(2, 0), (2, 1), (3, 2), (8, 0), (8, 1), (8, 2), (8, 3)]
+)
 def test_dsv4_compact_tail_recurrence_refreshes_rows_kv_plan_and_step_metadata(
-    monkeypatch, k
+    monkeypatch, k, gate
 ):
     current = []
 
@@ -104,9 +106,10 @@ def test_dsv4_compact_tail_recurrence_refreshes_rows_kv_plan_and_step_metadata(
     prefix_tokens = torch.arange(4)[:, None] + 20
     candidates = torch.full((4, k), 71, dtype=torch.int64)
     candidates[:, 0] = torch.arange(4) + 10
-    candidates[:, 1:2].copy_(prefix_tokens)
+    width = max(1, gate)
+    candidates[:, width - 1 : width].copy_(prefix_tokens)
     drafts = candidates.clone()
-    view = DraftOverrideView(candidates, torch.zeros(4, dtype=torch.bool), 2)
+    view = DraftOverrideView(candidates, torch.zeros(4, dtype=torch.bool), gate)
     original_plan = NS(rows=requests, write=cache.T.contiguous().flatten())
     original = NS(
         batch_size=4,
@@ -163,8 +166,14 @@ def test_dsv4_compact_tail_recurrence_refreshes_rows_kv_plan_and_step_metadata(
         ),
     )
     record = compact_graph.CompactCapture(
-        None, None, original, view, (prefix_tokens, hidden, cache, drafts)
+        None,
+        None,
+        original,
+        view,
+        (prefix_tokens, hidden, cache, drafts),
+        prefix_width=width,
     )
+    compact_graph.prepare_compaction(record, "split")
     for size in range(1, 5):
         tail = compact_graph._capture_tail(runner, record, size, stream)
         assert type(tail.attention) is DerivedAttention
@@ -183,7 +192,7 @@ def test_dsv4_compact_tail_recurrence_refreshes_rows_kv_plan_and_step_metadata(
             for row in rows:
                 token = int(prefix_tokens[row, 0])
                 h = int(hidden[row].sum())
-                for step in range(1, k - 1):
+                for step in range(width - 1, k - 1):
                     nxt = (
                         token
                         + h
@@ -197,7 +206,8 @@ def test_dsv4_compact_tail_recurrence_refreshes_rows_kv_plan_and_step_metadata(
                     h, token = token * 4, nxt
             assert torch.equal(drafts, expected)
             assert work.tolist() == [
-                k - 2 if request in requests[list(rows)] else 0 for request in range(4)
+                k - width if request in requests[list(rows)] else 0
+                for request in range(4)
             ]
             assert original.kv_loc_plan is original_plan
             assert torch.equal(original.positions, initial_positions)

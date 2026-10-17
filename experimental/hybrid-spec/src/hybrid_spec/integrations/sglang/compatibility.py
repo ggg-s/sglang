@@ -39,7 +39,7 @@ def validate_config(config, cfg):
         limit = getattr(cfg, "max_running_requests", None)
         if type(limit) is not int or not 1 <= limit <= config.max_requests:
             errors.append(
-                "split draft graphs require max_running_requests within max_requests<=4"
+                "split draft graphs require max_running_requests within max_requests"
             )
     if config.history_mode == "cpu" and not cfg.disable_overlap_schedule:
         errors.append("CPU history requires disable_overlap_schedule=True")
