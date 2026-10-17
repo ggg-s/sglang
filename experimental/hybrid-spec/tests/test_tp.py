@@ -623,7 +623,8 @@ def _worker(rank, world_size, init_method, backend):
 
 
 @pytest.mark.parametrize(
-    "backend,world_size", [("gloo", 1), ("gloo", 2), ("gloo", 4), ("nccl", 2)]
+    "backend,world_size",
+    [("gloo", 1), ("gloo", 2), ("gloo", 4), ("gloo", 8), ("nccl", 2), ("nccl", 8)],
 )
 def test_tp_consensus_and_graph_staging(tmp_path, backend, world_size):
     if backend == "gloo" and not dist.is_gloo_available():
@@ -631,7 +632,7 @@ def test_tp_consensus_and_graph_staging(tmp_path, backend, world_size):
     if backend == "nccl" and (
         not dist.is_nccl_available() or torch.cuda.device_count() < world_size
     ):
-        pytest.skip("requires NCCL and two NVIDIA GPUs, plus nvcc for SA")
+        pytest.skip(f"requires NCCL and {world_size} NVIDIA GPUs, plus nvcc for SA")
     context = mp.spawn(
         _worker,
         args=(world_size, (tmp_path / "rendezvous").as_uri(), backend),

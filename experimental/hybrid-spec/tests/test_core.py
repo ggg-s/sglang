@@ -671,6 +671,98 @@ def host_prefill_case():
         extension.shutdown()
 
 
+@pytest.mark.parametrize("max_requests", [1, 4])
+@pytest.mark.parametrize("global_pool", [False, True])
+@pytest.mark.parametrize("installed", [False, True])
+def test_prefill_reclaims_finished_leases_before_capacity_check(
+    host_prefill_case, max_requests, global_pool, installed
+):
+    """Prefill-only finishes bypass the decode finish hook, even at c=4."""
+    extension, backend, batch, _, result = host_prefill_case
+    config = replace(
+        extension.config,
+        max_requests=max_requests,
+        enable_global_pool=global_pool,
+        max_shared_requests=int(global_pool),
+    )
+    extension.config = backend.config = config
+    extension.free_slots = list(range(config.num_sa_slots))
+
+    def request(rid):
+        req = Request(rid)
+        req.get_fill_ids = lambda: [1, 2, 3, 4, 1]
+        return req
+
+    def prefill(reqs):
+        batch.reqs = reqs
+        batch.seq_lens_cpu = batch.seq_lens = torch.full((len(reqs),), 5)
+        result.next_token_ids = torch.full((len(reqs),), 2)
+        ticket = extension.begin_prefill(batch)
+        extension.on_prefill(batch, result, ticket)
+        if installed:
+            with extension.bind(batch, SimpleNamespace(draft_override=None)):
+                pass
+        return ticket
+
+    active = [request(f"initial-{i}") for i in range(max_requests)]
+    assert all(state is not None for state in prefill(active))
+    # Shared-pool spare slots must not increase active-request capacity.
+    assert prefill([request("overflow")]) == (None,)
+    for iteration in range(6):
+        old = active.pop(0)
+        state = extension.states[old.rid]
+        survivors = dict(extension.states)
+        del survivors[old.rid]
+        old.done = True  # No explicit close_request / decode finish callback.
+        new = request(f"replacement-{iteration}")
+        ticket = prefill([new])
+        assert ticket[0] is not None, "finished lease blocked the next SA history"
+        assert old.rid not in extension.states
+        assert ticket[0].generation > state.generation
+        assert len(extension.states) == max_requests
+        for rid, survivor in survivors.items():
+            assert extension.states[rid] is survivor
+        expected_shared = (
+            [(state.slot, state.generation, 6)] if global_pool and installed else []
+        )
+        assert list(extension.shared) == expected_shared
+        occupied = [s.slot for s in extension.states.values()]
+        occupied += [slot for slot, _, _ in extension.shared]
+        assert sorted(occupied + extension.free_slots) == list(
+            range(config.num_sa_slots)
+        )
+        active.append(new)
+
+
+@pytest.mark.parametrize("global_pool", [False, True])
+def test_prefill_reclaims_dead_request_without_finish_callback(
+    host_prefill_case, global_pool
+):
+    extension, backend, batch, _, result = host_prefill_case
+    config = replace(
+        extension.config,
+        enable_global_pool=global_pool,
+        max_shared_requests=int(global_pool),
+    )
+    extension.config = backend.config = config
+    extension.free_slots = list(range(config.num_sa_slots))
+    orphan = Request("orphan")
+    orphan.get_fill_ids = lambda: [1, 2, 3, 4, 1]
+    batch.reqs = [orphan]
+    ticket = extension.begin_prefill(batch)
+    extension.on_prefill(batch, result, ticket)
+    state = ticket[0]
+    batch.reqs = [Request("replacement")]
+    batch.reqs[0].get_fill_ids = lambda: [1, 2, 3, 4, 1]
+    del orphan
+    assert state.request() is None
+    replacement = extension.begin_prefill(batch)[0]
+    assert replacement is not None, "dead request leaked its SA lease"
+    assert replacement.slot == state.slot
+    assert replacement.generation > state.generation
+    assert not extension.shared  # No confirmed final length for a dead request.
+
+
 @pytest.mark.parametrize("chunked", [False, True])
 def test_host_build_overlaps_prefill_and_imports_only_at_first_draft(
     host_prefill_case, chunked

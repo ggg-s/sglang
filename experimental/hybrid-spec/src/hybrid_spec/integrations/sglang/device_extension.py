@@ -274,6 +274,13 @@ class DeviceDraftExtension:
         ticket = []
         try:
             with self.lock:
+                # Prefill-only finishes (health checks, max_new_tokens=1) do
+                # not run the decode finish hook. Reclaim their leases before
+                # enforcing active capacity, even if shared slots remain free.
+                for rid, state in list(self.states.items()):
+                    req = state.request()
+                    if req is None or req.finished():
+                        self.close_request(rid, retain=True)
                 for row, req in enumerate(batch.reqs):
                     self.close_request(req.rid)
                     # A middle chunk's sampled token is discarded by SGLang.

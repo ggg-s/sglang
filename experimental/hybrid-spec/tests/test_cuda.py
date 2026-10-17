@@ -14,6 +14,7 @@ from hybrid_spec.core.contracts import (
     RequestSnapshot,
 )
 from hybrid_spec.integrations.sglang.device_extension import (
+    DeviceDraftExtension,
     DeviceGraphBuffers,
     DeviceOverride,
 )
@@ -822,6 +823,85 @@ def test_device_feedback_graph_reorder_generation_and_replay(partial):
     assert not capture_view.use_retrieval.any()
     assert backend.meta[0, 0].item() == 3
     assert backend.meta[0, 4].item() == 1
+
+
+@pytest.mark.parametrize("max_requests", [1, 4])
+@pytest.mark.parametrize("global_pool", [False, True])
+def test_finished_prefill_leases_recover_sa_through_graph_replay(
+    max_requests, global_pool
+):
+    """Short-request turnover must not starve subsequent captured SA queries."""
+    from types import SimpleNamespace as NS
+
+    class Request:
+        def __init__(self, rid):
+            self.rid = rid
+            self.origin_input_ids = [4, 5, 6, 7, 4]
+            self.output_ids = [5]
+            self.sampling_params = NS(max_new_tokens=32)
+            self.multimodal_inputs = None
+            self.done = False
+
+        def get_fill_ids(self):
+            return self.origin_input_ids
+
+        def finished(self):
+            return self.done
+
+    config = HybridConfig(
+        3,
+        2,
+        max_requests,
+        64,
+        history_mode="device",
+        enable_global_pool=global_pool,
+        max_shared_requests=2 if global_pool else 0,
+    )
+    backend = GPUSuffixAutomaton(config, "cuda")
+    extension = DeviceDraftExtension(config, backend, 100)
+    buffers = extension.create_graph_buffers(max_requests)
+    captured = buffers.bind_capture_view(max_requests)
+    seq_lens = torch.full((max_requests,), 5, device="cuda")
+    batch = NS(
+        seq_lens_cpu=seq_lens.cpu(),
+        seq_lens=seq_lens,
+        forward_mode=NS(is_idle=lambda: False),
+        is_extend_in_batch=False,
+        has_grammar=False,
+        sampling_info=NS(is_all_greedy=True),
+    )
+    result = NS(next_token_ids=torch.full((max_requests,), 5, device="cuda"))
+    completed = []
+    graph = None
+    try:
+        for wave in range(6):
+            batch.reqs = [Request(f"{wave}-{row}") for row in range(max_requests)]
+            ticket = extension.begin_prefill(batch)
+            assert all(state is not None for state in ticket)
+            extension.on_prefill(batch, result, ticket)
+            with extension.bind(batch, NS(draft_override=None)) as view:
+                buffers.stage(view, max_requests, max_requests)
+                if graph is None:
+                    stream = torch.cuda.Stream()
+                    stream.wait_stream(torch.cuda.current_stream())
+                    with torch.cuda.stream(stream):
+                        for _ in range(3):
+                            captured.prepare(seq_lens)
+                    torch.cuda.current_stream().wait_stream(stream)
+                    graph = torch.cuda.CUDAGraph()
+                    with torch.cuda.graph(graph, stream=stream):
+                        captured.prepare(seq_lens)
+                graph.replay()
+                assert captured.use_retrieval.tolist() == [True] * max_requests
+                assert captured.tokens.tolist() == [[6, 7, 4]] * max_requests
+            for req in batch.reqs:
+                req.done = True  # Deliberately omit the decode finish callback.
+            completed.extend(batch.reqs)
+        assert len(extension.states) == max_requests
+        assert len(extension.shared) == (2 if global_pool else 0)
+    finally:
+        torch.cuda.synchronize()
+        extension.shutdown()
 
 
 def test_host_prefill_import_preserves_gpu_bonus_feedback():
