@@ -159,7 +159,7 @@ def _qsa_index_share_requested(hf_config) -> bool:
 
 class EagleDraftWorker(EagleDraftWorkerBase):
     DRAFT_EXTENSION_API_VERSION = 2
-    DRAFT_SPLIT_GRAPH_API_VERSION = 4
+    DRAFT_SPLIT_GRAPH_API_VERSION = 5
 
     def __init__(
         self,
@@ -752,13 +752,15 @@ class EagleDraftWorker(EagleDraftWorkerBase):
         # Materialize the chain directly only when the Triton kernel can write
         # every subsequent column. Other topk=1 paths retain the token list and
         # assemble it with one final cat instead of launching a copy per step.
+        # Split also needs the dense chain for mapped vocabularies: select_step
+        # below replaces each local argmax column with its target-vocab token.
         draft_tokens_topk1 = None
         prefix_ready = getattr(override, "on_prefix_ready", None)
         prefix_width = max(1, getattr(override, "num_neural_gate_tokens", 2))
         if (
             topk1_chain_fits
             and (_is_cuda or _is_hip)
-            and self.hot_token_id is None
+            and (self.hot_token_id is None or prefix_ready is not None)
             and not needs_draft_probs
         ):
             draft_tokens_topk1 = torch.empty(

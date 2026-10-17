@@ -1,6 +1,6 @@
 # SGLang 混合投机扩展（实验）
 
-本目录实现 [DESIGN.md](DESIGN.md) 的固定长度、请求级来源选择。默认 `draft_graph_mode="full"` 照常运行完整 neural draft，由设备端 mask 在每个位置选择 SA 或 neural token；选定 token 同时进入下一步模型输入和最终验证链。显式开启 `split` 后，可在前两个候选一致时跳过对应请求的 MTP 尾段，当前实验范围为并发 1～4。
+本目录实现 [DESIGN.md](DESIGN.md) 的固定长度、请求级来源选择。默认 `draft_graph_mode="full"` 照常运行完整 neural draft，由设备端 mask 在每个位置选择 SA 或 neural token；选定 token 同时进入下一步模型输入和最终验证链。显式开启 `split` 后，可按配置 gate 跳过 SA 命中请求的 neural 尾段，使用 GPU 动态行号压缩，不再限定 batch≤4。
 
 当前优化、执行流程、配置区别、A100 性能结论和未实现项见 [OPTIMIZATIONS.md](OPTIMIZATIONS.md)。SA 独立按请求存储；device 模式可显式开启跨活跃请求和完成请求的全局检索池。CPU 语义测试与 CUDA/真实模型验收是不同层次；详细验证记录见 [VALIDATION.md](VALIDATION.md)。未测模型不得视为已支持。
 
@@ -16,7 +16,8 @@ verify 直接在设备上暂存 `predict/accept_index/accept_lens`，下一轮 d
 
 `configs/device-qwen35-mtp.json` 是 Qwen3.5 MTP 的实验配置：K=8、匹配阈值 4、前 4 个 token 一致性检查、短候选整链回退。它与参考配置是不同的选路策略，不能把匹配命中率当作性能收益；模型、量化及负载改变后应重新测量。选择依据与 A100 对照见 [接受长度分析](validation/acceptance-regression.md)。该配置仍运行完整 MTP；CUDA 状态布局保持 v3，安装代码后重启服务即可加载新逻辑，不需要重新编译 CUDA 插件。
 
-`draft_graph_mode="split"` 将 MTP 按 gate 宽度拆成共享前缀和紧凑尾段。
+`draft_graph_mode="split"` 将 EAGLE/MTP、EAGLE3 和 STANDALONE 的 neural draft
+按 gate 宽度拆成共享前缀和紧凑尾段。
 `num_neural_gate_tokens=G` 支持 0…K：G=0 不检查 neural 前缀，G=1 检查
 来自原生 draft-extend 的首 token，G≥2 运行 G−1 次 inner forward 检查前 G 个
 候选。命中行直接采用 SA 余下候选，未命中行从第 G+1 个 token 继续生成；G=0
@@ -29,15 +30,29 @@ GPU 每轮稳定压缩出 neural 行号，排除 Graph padding；CPU 只读回�
 `--max-running-requests` 和 decode Graph 配置决定。每个捕获前缀仍为各个可能
 尾段大小保留独立 metadata、暂存和私有 Graph 池，扩大批次会增加捕获显存。
 
-支持单机 TP≥1、greedy、topk=1、Qwen3.5 原生 MTP（Triton draft attention）和
-DeepSeek V4 原生 MTP（dsv4 draft attention）；其余约束见下文。
+支持单机 TP≥1、greedy、topk=1；EAGLE/MTP、EAGLE3 和 STANDALONE
+共用 Triton draft attention 的紧凑路径，DeepSeek V4 原生 MTP 使用 dsv4 draft
+attention。模型仍需满足下文的纯文本、attention 和词表兼容约束。
 SA 查询在独立 stream 执行，在 gate 边界汇合并做一次候选及最终 mask 的 TP 共识。
 G=0/1 没有可重叠的 neural inner forward；G≥2 可与前缀计算重叠。
 前缀/尾段使用独立私有池；`split_no_skip` 使用同一切分，但让所有实际请求行
 执行尚余尾段（G=K 时同样无尾段）。默认仍为 `full`，不支持 memory saver、
-KV canary 或 draft-extend DSA seed。worker、runner、插件需同时更新至 split API v4；
+KV canary 或 draft-extend DSA seed。worker、runner、插件需同时更新至 split API v5；
 SA 状态布局保持 v3。配置示例仍保留 G=2、B=1/4，不代表能力上限。
 详见 [动态行号与可配置 gate 验收](validation/dynamic-rows-gate-20261017.md)。
+
+EAGLE3 的 hot-token 映射在 prefix/tail 的 gate 比较和 token 选择前统一转换为
+目标词表 ID；SA 候选始终使用目标词表。STANDALONE 保留原生独立 embedding/head，
+紧凑 tail 不分配或收集不存在的 recurrent hidden state。EAGLE3 的 hidden state
+按实际 prefix 输出的宽度收集，支持 seed 与循环输出宽度不同。
+
+三种算法可共用 `configs/device-draft-split.json`：在各自已可运行的原生命令上，
+保留 `--speculative-algorithm EAGLE` / `EAGLE3` / `STANDALONE` 的原始身份，
+设置 `--speculative-draft-attention-backend triton`、`--speculative-eagle-topk 1`、
+`--speculative-num-steps 8 --speculative-num-draft-tokens 9`；模板的容量为 8，
+相应设置 `--max-running-requests 8 --cuda-graph-max-bs-decode 8`。
+不支持的 FlashInfer 等 draft attention、translated KV 池仍明确拒绝。
+4060 验证范围和复现方法见 [三种算法 split 接入](validation/draft-algorithms-split-20261017.md)。
 
 device 模式以 generation 和 GPU 历史版本检查隔离旧反馈、槽位复用、重排和 Graph padding；prefill/retract 时重建索引。允许实验性开启 overlap 和 chunked prefill：中间块不构建 SA、不接入临时采样 token；最后一块启动前快照完整历史（含已缓存/先前分块的前缀），后台构建与最后一块 prefill 重叠，返回后只暂存真实 bonus。CPU 构建未完成时首次 draft 仍会等待。GPU 接受前缀可能包含 CPU EOS/停止截断前的尾部，不能将索引长度当作交付长度；原生停止处理保持不变。支持单机多 TP 实验，仍不开放 mixed prefill/decode、grammar 等其余未支持组合。chunked prefill 的真实 GPU/模型验收尚未完成。
 
@@ -69,7 +84,7 @@ export HYBRID_SPEC_CONFIG="$PWD/experimental/hybrid-spec/configs/device-dsv4-mtp
 
 K=8 是模板值；修改 K 时同时修改 JSON 的 `num_drafts` 和上述两个服务参数，
 split 支持 K≥1、gate=0…K。`max_history_tokens=16384` 包含完整 prompt 和输出历史，
-容量不足会回退 MTP，按实际上下文调整。worker/runner 的 split API 仍为 v3。
+容量不足会回退 MTP，按实际上下文调整。worker/runner 的 split API 为 v5。
 
 | 项目 | 当前实现 |
 | --- | --- |
@@ -231,7 +246,7 @@ neural 前缀检查、TP 候选共识、target verify 和 split 的现有约束�
 
 多 TP 的 SA 状态按 rank 复制，上述容量是每张卡的占用，不随 TP 分片缩小。每轮将 `[tokens, ~tokens, eligibility]` 打包做一次 MIN all-reduce；按位取反逆转 int64 的有符号顺序，因此归约后 `min(tokens) == ~min(~tokens)` 逐位置成立当且仅当所有 rank 的候选完全相同。资格也必须全部为真。任一 rank 不满足条件或候选不同，所有 rank 对该行统一回退 neural；不需要广播或指定源 rank。归约输入为 `8*B*(2K+1)` 字节（不代表实际链路流量），Graph 中 B 包括 padding。沿用 SGLang 的 TP batch 顺序/形状一致性约定，不能用于不同 rank 独立调度请求。
 
-full 模式在 `prepare()` 中、token 选择前通过现有 PyNccl 执行共识；CPU 历史模式在 `bind()` 中只准备本地候选，Graph staging 后由捕获视图完成共识；device 模式先在 Graph 内消费反馈/查询，再做共识。split 先运行固定 neural 前缀，查询完成后检查两个 gate token，将最终 gate mask 一起纳入同一次候选共识。通信只在模型主 stream 执行，各 rank 无条件参与，之后 CPU 决策和紧凑尾段行号一致。eager 使用相同逻辑位置和通信器；多 TP 缺少 PyNccl 时明确报错。没有按本地 mask 分支、逐 token 通信或新增 D2H 读回；TP=1 不创建同步器。统计读取最终共识 mask；每 rank 为相同副本，汇总时只读取 TP 组首 rank，避免重复计数。K=1 沿用原生无 draft Graph 的 eager 入口，不声称通信被捕获。
+full 模式在 `prepare()` 中、token 选择前通过现有 PyNccl 执行共识；CPU 历史模式在 `bind()` 中只准备本地候选，Graph staging 后由捕获视图完成共识；device 模式先在 Graph 内消费反馈/查询，再做共识。split 先运行配置宽度的 neural 前缀，查询完成后检查 G 个 gate token，将最终 gate mask 一起纳入同一次候选共识。通信只在模型主 stream 执行，各 rank 无条件参与，之后 CPU 决策和紧凑尾段行号一致。eager 使用相同逻辑位置和通信器；多 TP 缺少 PyNccl 时明确报错。没有按本地 mask 分支、逐 token 通信或新增 D2H 读回；TP=1 不创建同步器。统计读取最终共识 mask；每 rank 为相同副本，汇总时只读取 TP 组首 rank，避免重复计数。K=1 沿用原生无 draft Graph 的 eager 入口，不声称通信被捕获。
 
 初始化、导入和反馈写入仍绑定首次实际起草使用的 forward stream，并等待初始化事件；禁止无依赖地跨 stream 使用。split 的查询辅助 stream 由运行时以 `hybrid_sa_query` 角色持有，在 capture 外创建，每次查询先等待 forward stream，前缀 gate 前由主 stream 等待查询完成。Graph 捕获 fork/join 依赖；全部 GPU 读写在进入尾段前汇合。同一 worker 的 Graph replay 串行，padding mask 每轮清零，不支持并发 replay。
 

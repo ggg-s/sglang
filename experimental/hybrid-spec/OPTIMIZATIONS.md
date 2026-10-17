@@ -17,6 +17,10 @@
 > 2026-10-17 动态调度更新：移除 batch≤4 硬限制，GPU 生成稳定行号，CPU 只读
 > 行数；gate 支持 0…K，split API 升到 v4。4060 功能回归与边界见
 > [动态行号与 gate](validation/dynamic-rows-gate-20261017.md)，不新增模型吞吐结论。
+>
+> 同日三算法接入：EAGLE3 和 STANDALONE 也使用相同 split 调度，补充词表映射、
+> 空 recurrent hidden state 和 native Triton KV 索引回归；当前 split API 为 v5。
+> [4060 验证及边界](validation/draft-algorithms-split-20261017.md)。
 
 ## 目录
 
@@ -50,7 +54,7 @@ CPU 微基准、CUDA 功能测试、profiler 时间和官方服务性能分别�
 
 ## 2. 请求运行流程
 
-下图的逐行 split 分支适用于 Qwen 与 V4；两者共用紧凑调度，分别保留
+下图的逐行 split 分支适用于 EAGLE/MTP、EAGLE3 和 STANDALONE；共用紧凑调度，保留
 Triton 与原生 dsv4 注意力。V4 每个尾段批单独规划请求行和逐步 KV 写入地址。
 
 ```mermaid
@@ -247,17 +251,17 @@ export HYBRID_SPEC_CONFIG="$PWD/experimental/hybrid-spec/configs/device-qwen35-m
 # --speculative-draft-attention-backend triton
 ```
 
-split 开放单机 TP≥1、greedy、topk=1、Qwen3.5/V4 原生 MTP、CUDA Graph；动态 GPU 行号压缩已移除最多 4 请求的硬限制；
-多请求压缩支持 Qwen 的 Triton 或 V4 的原生 `dsv4` draft attention；
+split 开放单机 TP≥1、greedy、topk=1、EAGLE/MTP、EAGLE3、STANDALONE、CUDA Graph；动态 GPU 行号压缩已移除最多 4 请求的硬限制；
+多请求压缩使用 Triton 或 V4 的原生 `dsv4` draft attention；
 拒绝 translated KV 池、memory saver、KV canary 等未支持组合。
-full 的通用接入范围不能直接套用于 split。V4 保留原生注意力类型和逐步 KV 元数据，
+其他 attention 后端的 full 接入范围不能直接套用于 split。V4 保留原生注意力类型和逐步 KV 元数据，
 仅收集未命中请求执行尾段；padding 不计入尾段大小。
 
 | 版本标记 | 当前值 | 作用 |
 | --- | --- | --- |
 | CUDA 扩展名 | `hybrid_spec_gpu_sa_v3` | 紧凑 SA 状态布局与原生算子 |
 | 通用 draft extension API | v2 | 插件与 SGLang 的起草接入 |
-| draft split Graph API | v4 | 动态 GPU 行号、可配置 gate 与前缀边界 |
+| draft split Graph API | v5 | 动态 GPU 行号、可配置 gate、EAGLE3 词表映射及 STANDALONE 空 hidden state |
 
 哈希/布局升级到 v3 涉及 CUDA 扩展，应更新并重启，按源码变化完成 JIT 编译。
 后续前缀检查和 C1/C4 Graph 调度为 Python 改动，SA 布局仍是 v3，无需因此重编译 CUDA。

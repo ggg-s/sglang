@@ -1235,10 +1235,18 @@ def test_split_graph_runtime_configuration_fails_closed():
         "disable_cuda_graph": False,
         "enable_memory_saver": False,
     }
-    for tp_size in (1, 2, 4, 8):
-        validate_config(config, SimpleNamespace(**(values | {"tp_size": tp_size})))
+    for algorithm in ("EAGLE", "EAGLE3", "STANDALONE"):
+        for tp_size in (1, 2, 4, 8):
+            validate_config(
+                config,
+                SimpleNamespace(
+                    **(
+                        values
+                        | {"tp_size": tp_size, "speculative_algorithm": algorithm}
+                    )
+                ),
+            )
     for field, value in (
-        ("speculative_algorithm", "STANDALONE"),
         ("max_running_requests", 2),
         ("speculative_use_rejection_sampling", True),
         ("disable_cuda_graph", True),

@@ -29,7 +29,6 @@ def validate_config(config, cfg):
             errors.append(f"{name}={expected!r} required")
     if config.draft_graph_mode != "full":
         for name, expected in {
-            "speculative_algorithm": "EAGLE",
             "speculative_use_rejection_sampling": False,
             "disable_cuda_graph": False,
             "enable_memory_saver": False,

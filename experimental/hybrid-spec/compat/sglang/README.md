@@ -62,3 +62,13 @@ pending view's mask to this storage so verify metrics see the final consensus.
 K=1 retains the native eager draft path; TP=1 creates no synchronizer.
 CPU Gloo bridge tests do not establish GPU/NCCL or model correctness.
 DP/PP/EP/CP and multi-node remain rejected.
+
+Split graphs additionally require worker and runner split API version 5. EAGLE/MTP,
+EAGLE3 and STANDALONE share the GPU dynamic row compaction and gate=0..K path.
+The prefix callback receives a dense target-vocabulary draft chain even with a
+hot-token map; mapped IDs are written after selection in both prefix and tail.
+The compact tail supports an absent recurrent hidden state (STANDALONE), and
+otherwise stages the actual prefix output shape (including EAGLE3). Full mode
+retains its existing token-list fallback for mapped vocabularies. Triton draft
+attention and native dsv4 MTP attention are supported; other model/backend and
+parallelism restrictions still apply. See the [4060 validation scope](../../validation/draft-algorithms-split-20261017.md).

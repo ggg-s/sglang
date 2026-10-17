@@ -1,4 +1,4 @@
-"""Compact the unmatched rows before replaying a Qwen3.5 or V4 MTP tail.
+"""Compact unmatched rows before replaying an EAGLE/MTP or standalone tail.
 
 Each tail size owns its attention metadata, buffers and private graph pool.
 The row mapping is dynamic; no model forward is replayed for selected SA rows.
@@ -141,7 +141,9 @@ def _capture_tail(runner, record, size, stream):
     fb.extend_seq_lens = torch.ones_like(original.extend_seq_lens[:size])
     fb.extend_seq_lens_cpu = [1] * size
     fb.input_ids = torch.empty(size, device=tokens.device, dtype=tokens.dtype)
-    fb.spec_info.hidden_states = torch.empty_like(hidden[:size])
+    fb.spec_info.hidden_states = (
+        torch.empty_like(hidden[:size]) if hidden is not None else None
+    )
     compact_drafts = torch.empty_like(drafts[:size])
     # Native V4 metadata consumes a request-major, flattened K-step window.
     # Keep its per-step view as an alias, never a separately uploaded copy.
@@ -166,7 +168,8 @@ def _capture_tail(runner, record, size, stream):
         torch.index_select(original.seq_lens, 0, rows, out=fb.seq_lens)
         torch.index_select(original.req_pool_indices, 0, rows, out=fb.req_pool_indices)
         torch.index_select(cache, 1, rows, out=compact_cache)
-        torch.index_select(hidden, 0, rows, out=fb.spec_info.hidden_states)
+        if hidden is not None:
+            torch.index_select(hidden, 0, rows, out=fb.spec_info.hidden_states)
         torch.index_select(drafts, 0, rows, out=compact_drafts)
         torch.index_select(record.override.use_retrieval, 0, rows, out=mask)
         torch.index_select(record.override.tokens, 0, rows, out=sa)
@@ -214,6 +217,11 @@ def _capture_tail(runner, record, size, stream):
         fb.positions.add_(start_step)
         for i in range(start_step, steps - 1):
             fb.out_cache_loc = compact_cache[i]
+            if runner.model_runner.model_config.hf_config.architectures == [
+                "Qwen3MoeForCausalLMMTP"
+            ]:
+                # Match native draft_forward's fused RoPE/KV-store contract.
+                fb.out_cache_loc = fb.out_cache_loc.contiguous()
             with forward_context(
                 ForwardContext(attn_backend=attention.attn_backends[i])
             ):
@@ -221,6 +229,8 @@ def _capture_tail(runner, record, size, stream):
             _, topk = draft_topk1_postprocess(
                 logits.next_token_logits, fb.positions, compact_drafts, i + 1
             )
+            if runner.eagle_worker.hot_token_id is not None:
+                topk = runner.eagle_worker.hot_token_id[topk]
             topk = torch.where(mask[:, None], sa[:, i + 1 : i + 2], topk)
             compact_drafts[:, i + 1 : i + 2].copy_(topk)
             fb.input_ids = topk.flatten()

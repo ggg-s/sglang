@@ -384,8 +384,74 @@ def test_cuda_graph_neural_gate_replay_resets_final_selection_mask():
     assert view.use_retrieval.tolist() == [True, True, True]
 
 
+def native_triton_metadata_methods(monkeypatch):
+    """Load unchanged multi-step planning and its real Triton KV index kernel.
+
+    Child attention execution and the model remain synthetic. This exercises
+    the native request/step read-table math inside each compact tail graph.
+    """
+    import importlib.util
+    import sys
+    from types import ModuleType
+    from types import SimpleNamespace as NS
+    from typing import Optional
+
+    import triton
+    from test_draft_recurrence import ROOT, load_functions
+
+    utils = ModuleType("sglang.srt.utils")
+    for name in ("cpu", "hip", "musa", "npu", "xpu"):
+        setattr(utils, "is_" + name, lambda: False)
+    utils.is_cuda = lambda: True
+    utils.next_power_of_2 = triton.next_power_of_2
+    monkeypatch.setitem(sys.modules, utils.__name__, utils)
+    name = "sglang.kernels.ops.speculative.cache_locs"
+    spec = importlib.util.spec_from_file_location(
+        name, ROOT / "python/sglang/kernels/ops/speculative/cache_locs.py"
+    )
+    kernels = importlib.util.module_from_spec(spec)
+    monkeypatch.setitem(sys.modules, name, kernels)
+    spec.loader.exec_module(kernels)
+    ns = dict(
+        torch=torch,
+        ForwardBatch=object,
+        ForwardMode=NS(DECODE=object()),
+        Optional=Optional,
+        next_power_of_2=triton.next_power_of_2,
+        generate_draft_decode_kv_indices=kernels.generate_draft_decode_kv_indices,
+    )
+    load_functions(
+        "python/sglang/srt/speculative/spec_utils.py",
+        ["draft_kv_indices_buffer_width", "draft_kv_indices_used_len"],
+        ns,
+    )
+    load_functions(
+        "python/sglang/srt/model_executor/forward_batch_info.py",
+        ["build_inner_fb_view"],
+        ns,
+    )
+    module = ModuleType("sglang.srt.model_executor.forward_batch_info")
+    module.build_inner_fb_view = ns["build_inner_fb_view"]
+    monkeypatch.setitem(sys.modules, module.__name__, module)
+    names = [
+        "common_template",
+        "init_cuda_graph_state",
+        "init_forward_metadata_out_graph",
+        "init_forward_metadata_in_graph",
+    ]
+    load_functions(
+        "python/sglang/srt/layers/attention/triton_backend.py",
+        names,
+        ns,
+        "TritonMultiStepDraftBackend",
+    )
+    return {name: ns[name] for name in names}
+
+
 @pytest.mark.parametrize("mode", ["split", "split_no_skip"])
-@pytest.mark.parametrize("kind", ["triton", "dsv4"])
+@pytest.mark.parametrize(
+    "kind", ["triton", "dsv4", "eagle3", "eagle3_hot", "standalone"]
+)
 @pytest.mark.parametrize(
     "steps,gate,batch_size",
     [
@@ -412,14 +478,14 @@ def test_compact_tail_graph_reorders_rows_without_computing_sa_requests(
 ):
     """Run the actual worker body, topk, compaction and CUDA graph scheduling.
 
-    Model and attention metadata are synthetic. Recurrence, prefix boundary,
+    Model and child attention are synthetic. EAGLE3/STANDALONE use the native
+    multi-step metadata methods and KV index kernel. Recurrence, prefix boundary,
     GPU row selection, original-row KV mapping and private pools are real.
     """
     import contextlib
+    from dataclasses import replace
     from types import SimpleNamespace as NS
     from typing import List, Optional
-
-    from test_draft_recurrence import load_functions
 
     from hybrid_spec.integrations.sglang.split_graph import SplitDraftGraphBackend
     from sglang.kernels.ops.speculative.topk1 import draft_topk1_postprocess
@@ -432,10 +498,41 @@ def test_compact_tail_graph_reorders_rows_without_computing_sa_requests(
     from sglang.srt.model_executor.runner_backend.full_cuda_graph_backend import (
         FullCudaGraphBackend,
     )
+    from test_draft_recurrence import load_functions
+
+    native_metadata = kind in ("eagle3", "eagle3_hot", "standalone")
+
+    class Child:
+        max_kv_splits = 1
+
+        def init_cuda_graph_state(self, *args, **kwargs):
+            self.cuda_graph_num_kv_splits = kwargs["cuda_graph_num_kv_splits_buf"]
+
+        def init_forward_metadata_out_graph(self, batch, in_capture):
+            self.indptr = batch.spec_info.kv_indptr
+            self.indices = batch.spec_info.kv_indices
+
+        def init_forward_metadata_in_graph(self, batch):
+            pass
+
+        def get_num_kv_splits(self, output, seq_lens):
+            output.fill_(1)
 
     class Attention:
-        def __init__(self, *args):
+        def __init__(self, model=None, topk=1, speculative_num_steps=steps):
             self.attn_backends = [None] * steps
+            if native_metadata:
+                self.attn_backends = [Child() for _ in range(steps - 1)]
+                self.topk = topk
+                self.speculative_num_steps = steps
+                self.device = "cuda"
+                self.max_context_len = 256
+                self.kv_indptr = torch.zeros(
+                    (steps, batch_size + 1), dtype=torch.int32, device="cuda"
+                )
+                self.kv_index_translator = translator
+                self.page_size = 1
+                self.draft_window_size = self.draft_sink_size = 0
 
         def init_cuda_graph_state(self, *args):
             pass
@@ -446,6 +543,9 @@ def test_compact_tail_graph_reorders_rows_without_computing_sa_requests(
         def init_forward_metadata_in_graph(self, *args):
             pass
 
+    if native_metadata:
+        for name, method in native_triton_metadata_methods(monkeypatch).items():
+            setattr(Attention, name, method)
     monkeypatch.setattr(triton_backend, "TritonMultiStepDraftBackend", Attention)
 
     class Dsv4Child:
@@ -486,13 +586,47 @@ def test_compact_tail_graph_reorders_rows_without_computing_sa_requests(
     width = max(1, gate)
     prefix_steps = width - 1
     tail_steps = steps - width
-    hidden_width = 4 if kind == "dsv4" else 1
+    standalone = kind == "standalone"
+    eagle3 = kind.startswith("eagle3")
+    hot_tokens = (
+        torch.arange(128, device=device).flip(0) * 2 + 1
+        if kind == "eagle3_hot"
+        else None
+    )
+    hidden_width = 4 if kind == "dsv4" or eagle3 else 1
+    # EAGLE3 can begin with concatenated target features, then recur with
+    # the draft hidden width. STANDALONE carries no recurrent features.
+    seed_width = 3 * hidden_width if eagle3 else hidden_width
     seed = torch.arange(batch_size, device=device) * 2 + 2
-    initial_hidden = (seed[:, None] - 1).float().expand(-1, hidden_width).clone()
+    initial_hidden = (
+        None
+        if standalone
+        else (seed[:, None] - 1).float().expand(-1, seed_width).clone()
+    )
     base_positions = torch.arange(batch_size, device=device) * 7 + 11
     reqs = torch.arange(batch_size, device=device).roll(1).flip(0)
     cache = reqs[None, :] * 100 + torch.arange(steps, device=device)[:, None] + 40
     flat_cache = cache.T.contiguous().flatten()
+    table = (
+        torch.arange(batch_size, device=device)[:, None] * 1000
+        + torch.arange(256, device=device)[None, :]
+    )
+    for row in range(batch_size):
+        table[reqs[row], base_positions[row] + torch.arange(steps, device=device)] = (
+            cache[:, row]
+        )
+
+    def read_source(plan, req_pool_indices, bs):
+        assert plan.rows is req_pool_indices
+        return NS(
+            row_ids=req_pool_indices,
+            ids=table,
+            row_stride=256,
+            entry_page_size=1,
+            v2p=None,
+        )
+
+    translator = NS(is_translating=False, read_source=read_source)
     work = torch.zeros(batch_size, dtype=torch.int64, device=device)
     eligible = torch.ones(batch_size, dtype=torch.bool, device=device)
     candidates = torch.zeros((batch_size, steps), dtype=torch.int64, device=device)
@@ -552,15 +686,44 @@ def test_compact_tail_graph_reorders_rows_without_computing_sa_requests(
         else:
             req = batch.req_pool_indices
             rotary_pos = (
-                batch.mrope_positions[0] if kind == "triton" else batch.seq_lens
+                batch.mrope_positions[0]
+                if kind == "triton"
+                else batch.seq_lens
+                if kind == "dsv4"
+                else batch.positions
             )
             # V4's synthetic native metadata includes its step in rotary_pos.
             if kind == "dsv4":
                 rotary_pos = rotary_pos + batch.positions - base_positions
             write = batch.out_cache_loc * (3 if kind == "dsv4" else 1)
+        read_checksum = 0
+        if native_metadata:
+            offsets = torch.arange(256, device=device)[None, :]
+            if batch is fb:
+                # Independent dense reference for the full batch's KV list.
+                read_checksum = torch.where(
+                    offsets <= batch.positions[:, None],
+                    table[batch.req_pool_indices],
+                    0,
+                ).sum(dim=1)
+            else:
+                child = get_attn_backend()
+                lengths = child.indptr[1:] - child.indptr[:-1]
+                addresses = child.indptr[:-1, None] + offsets
+                # Masked gather for the ragged native read lists.
+                read_checksum = torch.where(
+                    offsets < lengths[:, None],
+                    child.indices[addresses.clamp(max=child.indices.numel() - 1)],
+                    0,
+                ).sum(dim=1)
         token = (
-            batch.input_ids
-            + batch.spec_info.hidden_states.long().sum(dim=1)
+            read_checksum
+            + batch.input_ids
+            + (
+                0
+                if batch.spec_info.hidden_states is None
+                else batch.spec_info.hidden_states.long().sum(dim=1)
+            )
             + batch.positions
             + rotary_pos
             + req
@@ -571,18 +734,23 @@ def test_compact_tail_graph_reorders_rows_without_computing_sa_requests(
         return NS(
             logits_output=NS(
                 next_token_logits=logits,
-                hidden_states=batch.input_ids[:, None]
-                .float()
-                .expand(-1, hidden_width)
-                .clone(),
+                hidden_states=(
+                    None
+                    if standalone
+                    else batch.input_ids[:, None]
+                    .float()
+                    .expand(-1, hidden_width)
+                    .clone()
+                ),
             )
         )
 
     def bind_slots(batch):
         batch.kv_loc_plan = NS(rows=batch.req_pool_indices, write=batch.out_cache_loc)
 
+    translator.bind_runner_slots = bind_slots
     model = NS(
-        kv_index_translator=NS(is_translating=False, bind_runner_slots=bind_slots),
+        kv_index_translator=translator,
         canary_manager=None,
         model_config=NS(
             model_is_mrope=kind == "triton",
@@ -591,15 +759,19 @@ def test_compact_tail_graph_reorders_rows_without_computing_sa_requests(
                     "Qwen3_5ForCausalLMMTP"
                     if kind == "triton"
                     else "DeepseekV4ForCausalLMNextN"
+                    if kind == "dsv4"
+                    else "LlamaForCausalLMEagle3"
+                    if eagle3
+                    else "LlamaForCausalLM"
                 ]
             ),
         ),
         forward=model_forward,
     )
-    attention = Attention() if kind == "triton" else DerivedDsv4Attention()
+    attention = DerivedDsv4Attention() if kind == "dsv4" else Attention()
     worker = NS(
         speculative_num_steps=steps,
-        hot_token_id=None,
+        hot_token_id=hot_tokens,
         seed_dsa_topk_from_draft_extend=False,
         index_share_for_mtp_iteration=False,
         draft_extension=NS(),
@@ -635,6 +807,7 @@ def test_compact_tail_graph_reorders_rows_without_computing_sa_requests(
         maybe_detect_inf=lambda *a: None,
         maybe_detect_oob=lambda *a: None,
         draft_topk1_postprocess=draft_topk1_postprocess,
+        fast_topk=torch.topk,
         forward_context=forward_context,
         ForwardContext=ForwardContext,
         IndexTopKShareState=NS(mtp_iteration=lambda *a, **kw: contextlib.nullcontext()),
@@ -649,6 +822,25 @@ def test_compact_tail_graph_reorders_rows_without_computing_sa_requests(
         ["draft_forward"],
         ns,
         "EagleDraftWorker",
+    )
+
+    load_functions(
+        "python/sglang/srt/speculative/spec_utils.py",
+        [
+            "select_top_k_tokens",
+            "_select_top_k_tokens_first",
+            "_select_top_k_tokens_later",
+        ],
+        ns,
+    )
+    full_view = DeviceOverride(
+        NS(
+            config=replace(config, draft_graph_mode="full"),
+            device=torch.device(device),
+            consume_and_query=query,
+        ),
+        reqs,
+        reqs + 1,
     )
 
     def prefix():
@@ -677,18 +869,26 @@ def test_compact_tail_graph_reorders_rows_without_computing_sa_requests(
     ]
     native = []
     for row in range(batch_size):
-        token, hidden = int(seed[row]), int(initial_hidden[row].sum())
+        token = int(seed[row] if hot_tokens is None else hot_tokens[seed[row]])
+        hidden = 0 if standalone else int(initial_hidden[row].sum())
         chain = [token]
         for step in range(steps - 1):
+            read_checksum = (
+                int(table[reqs[row], : int(base_positions[row]) + step + 1].sum())
+                if native_metadata
+                else 0
+            )
             nxt = (
-                token
+                read_checksum
+                + token
                 + hidden
                 + int(base_positions[row]) * 2
                 + step * 2
                 + int(reqs[row])
                 + int(cache[step, row]) * (3 if kind == "dsv4" else 1)
             ) % 128
-            hidden, token = token * hidden_width, nxt
+            nxt = nxt if hot_tokens is None else int(hot_tokens[nxt])
+            hidden, token = 0 if standalone else token * hidden_width, nxt
             chain.append(token)
         native.append(chain)
     for raw_bs in sorted(
@@ -737,6 +937,14 @@ def test_compact_tail_graph_reorders_rows_without_computing_sa_requests(
                     i for i in range(raw_bs) if mode == "split_no_skip" or not hit[i]
                 ]
                 assert record.rows[: len(chosen)].tolist() == chosen
+            # Execute the un-split worker with the same candidates and gate.
+            # Verify every live row, including mapped vocab and hidden=None.
+            fb.spec_info.draft_override = full_view
+            try:
+                full_output = prefix()[2]
+                assert torch.equal(output[:raw_bs], full_output[:raw_bs])
+            finally:
+                fb.spec_info.draft_override = view
     assert poison
     counters = backend.counters
     assert (

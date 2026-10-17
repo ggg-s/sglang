@@ -157,12 +157,16 @@ def test_dsv4_compact_tail_recurrence_refreshes_rows_kv_plan_and_step_metadata(
         )
 
     runner = NS(
+        eagle_worker=NS(hot_token_id=None),
         draft_attn_backend=DerivedAttention(None, 1, k),
         speculative_num_steps=k,
         model_runner=NS(
             kv_index_translator=NS(bind_runner_slots=bind),
             forward=forward,
-            model_config=NS(model_is_mrope=False),
+            model_config=NS(
+                model_is_mrope=False,
+                hf_config=NS(architectures=["DeepseekV4ForCausalLMNextN"]),
+            ),
         ),
     )
     record = compact_graph.CompactCapture(

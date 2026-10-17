@@ -166,7 +166,7 @@ def test_selected_prefix_drives_model_and_verify_chain(
             backend, torch.arange(2), torch.ones(2, dtype=torch.int64)
         )
     prefix_boundaries = []
-    if (gate or deferred) and matrix and not hot:
+    if (gate or deferred) and matrix:
 
         def ready(fb, tokens, hidden, cache, drafts):
             prefix_boundaries.append(len(inputs))
@@ -209,7 +209,7 @@ def test_selected_prefix_drives_model_and_verify_chain(
         ),
     )
     drafts = ns["draft_forward"](worker, batch)[2]
-    if (gate or deferred) and matrix and not hot:
+    if (gate or deferred) and matrix:
         # Candidate zero comes from draft-extend. The gate needs G-1 inner
         # forwards (zero for G=0), never an extra forward before dispatch.
         width = max(1, gate)
@@ -285,4 +285,17 @@ def test_configurable_skip_materializes_complete_chain(k, gate):
         gate=gate,
         deferred=True,
         skip_tail=True,
+    )
+
+
+@pytest.mark.parametrize("gate", [0, 1, 3, 8])
+def test_mapped_split_prefix_keeps_target_vocab_tokens(gate):
+    test_selected_prefix_drives_model_and_verify_chain(
+        k=8,
+        matrix=True,
+        hot=True,
+        mask=[True, False],
+        mrope=False,
+        gate=gate,
+        deferred=True,
     )

@@ -21,13 +21,11 @@ class SplitDraftGraphBackend:
         if (
             runner.topk != 1
             or runner.captured_req_width != 1
-            or runner.eagle_worker.hot_token_id is not None
             or runner.eagle_worker.seed_dsa_topk_from_draft_extend
-            or architecture
-            not in (["Qwen3_5ForCausalLMMTP"], ["DeepseekV4ForCausalLMNextN"])
         ):
             raise ValueError(
-                "split draft graphs support only Qwen3.5 or DeepSeek V4 MTP"
+                "split draft graphs require topk=1, one token per request "
+                "and no draft-extend DSA seed"
             )
         if (
             architecture == ["DeepseekV4ForCausalLMNextN"]
