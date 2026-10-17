@@ -3,6 +3,38 @@
 当前机制、优化阶段与跨实验结论的汇总入口见 [优化总览](OPTIMIZATIONS.md)。
 下文按阶段保留当时的协议、结果和验收限制。
 
+## DeepSeek V4 SA 与整批 split 接入（2026-10-17，待内网 GPU 验收）
+
+修复两处接入缺口：`validate_model` 将 V4 target/NextN draft 的原生 hybrid-SWA
+误判为完全未适配；`SplitDraftGraphBackend` 仅允许 Qwen3.5 MTP。
+现在按确切架构对和纯文本条件放行 V4，DSpark、其他草稿、其他 SWA 架构仍拒绝。
+split 使用原生 dsv4 多步注意力，不复用 Triton compact tail。全实际请求 gate 通过时
+整批跳过；混合/全不命中时运行原始整批尾段，保留 metadata、KV 写地址和请求顺序。
+只用 raw_bs 范围的共识 mask 作决策，padding 不阻止整批跳过，也不计入请求数；
+尾段直方图仍按实际模型 padded 行数记录。gate=2、查询重叠、单次 TP 共识与
+native target verify/draft-extend 保持原有协议。V4 尚未支持逐行裁剪。
+
+历史参考：本地 `model-pr-history-knowledge/sglang/deepseek-v4/README.en.md`
+的 #26239 记录指出，V4 多步草稿的 per-step KV 地址已经进入 backend metadata。
+随后核对当前 `deepseek_v4_backend.py::DeepseekV4MultiStepBackend`、
+`init_forward_metadata_in_graph` 及 `deepseek_v4_nextn.py`：原生 MTP 层使用
+`COMPRESS_RATIO_NEXTN_LAYER=0`，target 的压缩/verify 路径继续由原生后端负责。
+据此选择保持原生 batch/metadata 的两段 Graph，避免将 Qwen 的紧凑元数据套到 V4。
+历史笔记与源码核查均不代表新的 GPU 正确性或性能结果。
+
+本地 core 69 passed（含 V4 正/反向模型校验和 K=3/8 所有小批 mask/padding 的整批调度），
+worker recurrence 94 passed，真实 Gloo TP=1/2/4 为 3 passed，总计 166 passed。
+无 CUDA 的本机跳过 CUDA/NCCL，不能计为 GPU 通过。新增真实 CUDA Graph 捕获测试
+`test_dsv4_whole_batch_graph_capture_keeps_native_rows`，其模型和注意力边界为合成实现，
+验证本次 split capture/replay/skip；不验证真实 V4 压缩 KV 或模型精度。
+此前的 `is_hybrid_swa` 拒绝及 Qwen-only split 拒绝均可在修复前源码复现。
+
+内网按 README 的 V4 配置与 `--speculative-draft-attention-backend dsv4` 启动，
+先验证并发 1/4、TP=1/2/4、全命中/全不命中/混合命中、3→4 padding、请求结束
+和槽位复用，再对同一 TP 的 full/原生 MTP 核对输出与接受长度；性能另做短对照。
+模板 K=8、验证宽度 9；服务参数必须与 JSON 一致。保留原生可运行的 target
+attention、量化与 KV 配置，不使用 Qwen 示例里的 Triton draft attention。
+
 ## Split 查询重叠、调度预分配与多 TP（2026-10-17，待 GPU 验收）
 
 仅修改 SA＋MTP 混合投机链路，保留 gate=2、候选排序和 target verify。

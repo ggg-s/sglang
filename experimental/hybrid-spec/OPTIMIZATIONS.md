@@ -10,6 +10,8 @@
 > 2026-10-17 再增补：split 已接入 SA 查询与首个 MTP forward 的 stream 重叠、
 > 预分配尾段行号和单机多 TP 统一决策。以下更新机制描述，GPU 性能与多卡模型
 > 仍待内网验收；本地检查及复现命令见 [验证记录](VALIDATION.md)。
+> 同日修复 DeepSeek V4 SA 的 SWA 校验和 split 架构拦截：V4 使用原生整批尾段，
+> 全命中才跳过，混合批不做 Qwen 的逐行裁剪；模型 GPU 验收待完成。
 
 ## 目录
 
@@ -42,6 +44,9 @@
 CPU 微基准、CUDA 功能测试、profiler 时间和官方服务性能分别记录，不互相替代。
 
 ## 2. 请求运行流程
+
+下图的逐行 split 分支描述 Qwen 路线；V4 在相同前缀共识后按整批决策，
+只有所有实际请求都通过时跳过，否则保留原始整批尾段。
 
 ```mermaid
 flowchart TB
@@ -237,9 +242,10 @@ export HYBRID_SPEC_CONFIG="$PWD/experimental/hybrid-spec/configs/device-qwen35-m
 # --speculative-draft-attention-backend triton
 ```
 
-split 开放单机 TP≥1、greedy、topk=1、Qwen3.5 MTP、CUDA Graph，最多 4 个请求；
+split 开放单机 TP≥1、greedy、topk=1、Qwen3.5/V4 原生 MTP、CUDA Graph，最多 4 个请求；
 多请求压缩仅支持 Triton draft attention、普通 KV 池，并拒绝 memory saver、
 KV canary 等未支持组合。full 的通用接入范围不能直接套用于 split。
+V4 使用 `dsv4` draft attention，只做整批提前退出，保留原生批布局和 KV 元数据。
 
 | 版本标记 | 当前值 | 作用 |
 | --- | --- | --- |

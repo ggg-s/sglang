@@ -868,6 +868,155 @@ def test_qwen_linear_attention_requires_text_only_mtp_pair(moe):
         setattr(obj, field, original)
 
 
+def dsv4_worker():
+    def config(architecture):
+        return SimpleNamespace(
+            hf_config=SimpleNamespace(architectures=[architecture]),
+            is_hybrid_swa=True,
+            is_multimodal=False,
+            model_is_mrope=False,
+        )
+
+    return SimpleNamespace(
+        target_worker=SimpleNamespace(
+            model_runner=SimpleNamespace(model_config=config("DeepseekV4ForCausalLM"))
+        ),
+        draft_runner=SimpleNamespace(model_config=config("DeepseekV4ForCausalLMNextN")),
+    )
+
+
+@pytest.mark.parametrize("swa", [True, False])
+def test_dsv4_native_mtp_sa_is_not_rejected_as_generic_hybrid_swa(swa):
+    # The target and draft both advertise hybrid SWA even though the native
+    # V4 MTP path already owns its per-step KV/window metadata.
+    worker = dsv4_worker()
+    for config in (
+        worker.target_worker.model_runner.model_config,
+        worker.draft_runner.model_config,
+    ):
+        config.is_hybrid_swa = swa
+    validate_model(worker)
+
+
+def test_dsv4_sa_exception_requires_mtp_pair_and_text_only():
+    worker = dsv4_worker()
+    target = worker.target_worker.model_runner.model_config
+    draft = worker.draft_runner.model_config
+    for obj, field, value in (
+        (target.hf_config, "architectures", ["LlamaForCausalLM"]),
+        (draft.hf_config, "architectures", ["DeepseekV4ForCausalLMDSpark"]),
+        (draft.hf_config, "architectures", ["Qwen3ForCausalLM"]),
+        (target, "is_multimodal", True),
+        (draft, "model_is_mrope", True),
+    ):
+        original = getattr(obj, field)
+        setattr(obj, field, value)
+        with pytest.raises(ValueError, match="DeepSeek V4"):
+            validate_model(worker)
+        setattr(obj, field, original)
+    # Text-only use of a vision-capable V4 checkpoint remains explicit.
+    target.is_multimodal = True
+    target.hf_config.language_only = True
+    validate_model(worker)
+    # An unrelated hybrid SWA model does not inherit the V4 exception.
+    target.hf_config.architectures = ["Step3p5ForCausalLM"]
+    draft.hf_config.architectures = ["Step3p5MTP"]
+    with pytest.raises(ValueError, match="hybrid sliding-window"):
+        validate_model(worker)
+
+
+def native_split_backend(monkeypatch, mode, attention="dsv4"):
+    # Replace only the CUDA backend type boundary. Dispatch and counter/position
+    # bookkeeping use the production split implementation on real CPU tensors.
+    from hybrid_spec.integrations.sglang.split_graph import SplitDraftGraphBackend
+
+    name = "sglang.srt.model_executor.runner_backend.full_cuda_graph_backend"
+    module = ModuleType(name)
+    module.FullCudaGraphBackend = type("FullCudaGraphBackend", (), {})
+    monkeypatch.setitem(sys.modules, name, module)
+    worker = dsv4_worker()
+    worker.hot_token_id = None
+    worker.seed_dsa_topk_from_draft_extend = False
+    worker.draft_extension = SimpleNamespace()
+    runner = SimpleNamespace(
+        topk=1,
+        max_bs=4,
+        captured_req_width=1,
+        eagle_worker=worker,
+        model_runner=worker.draft_runner,
+        raw_bs=4,
+        draft_attn_backend=SimpleNamespace(decode_attention_backend_str=attention),
+    )
+    return SplitDraftGraphBackend(module.FullCudaGraphBackend(), runner, mode)
+
+
+def test_dsv4_split_rejects_qwen_triton_attention(monkeypatch):
+    with pytest.raises(ValueError, match="native dsv4 draft attention"):
+        native_split_backend(monkeypatch, "split", attention="triton")
+
+
+@pytest.mark.parametrize("mode", ["split", "split_no_skip"])
+@pytest.mark.parametrize("k", [3, 8])
+def test_dsv4_whole_batch_split_restores_positions_and_excludes_padding(
+    monkeypatch, mode, k
+):
+    from hybrid_spec.integrations.sglang.split_graph import SplitCapture
+
+    backend = native_split_backend(monkeypatch, mode)
+    assert not backend.compact_rows
+    positions = torch.arange(4) + 20
+    original = positions.clone()
+    mask = torch.zeros(4, dtype=torch.bool)
+    work = torch.zeros(4, dtype=torch.int64)
+    neural = torch.arange(4 * k).reshape(4, k)
+    candidates = neural.clone()
+    candidates[:, 2:] += 100
+    drafts = torch.empty_like(neural)
+
+    def prefix():
+        positions.add_(1)
+        work.add_(1)
+        drafts.copy_(candidates)
+
+    def tail():
+        positions.add_(k - 2).sub_(k - 1)
+        work.add_(k - 2)
+        drafts.copy_(torch.where(mask[:, None], candidates, neural))
+
+    record = SplitCapture(
+        SimpleNamespace(replay=prefix),
+        SimpleNamespace(replay=tail),
+        drafts,
+        SimpleNamespace(positions=positions, batch_size=4),
+        SimpleNamespace(use_retrieval=mask),
+    )
+    backend.records[4] = record
+    for raw_bs in (4, 3, 1, 2, 4):
+        backend.runner.raw_bs = raw_bs
+        for bits in range(1 << raw_bs):
+            mask.copy_(
+                torch.tensor([bool(bits & (1 << i)) and i < raw_bs for i in range(4)])
+            )
+            work.zero_()
+            before = dict(backend.counters)
+            histogram = dict(backend.counters["tail_batch_histogram"])
+            output = backend.replay(4, record.inputs)
+            all_sa = bits == (1 << raw_bs) - 1 and mode == "split"
+            expected = torch.where(mask[:, None], candidates, neural)
+            assert torch.equal(output[:raw_bs], expected[:raw_bs])
+            assert torch.equal(positions, original)
+            assert work.tolist() == [1 if all_sa else k - 1] * 4
+            assert backend.counters["request_ct"] - before["request_ct"] == raw_bs
+            assert backend.counters["skip_request_ct"] - before["skip_request_ct"] == (
+                raw_bs if all_sa else 0
+            )
+            assert backend.counters["tail_request_ct"] - before["tail_request_ct"] == (
+                0 if all_sa else raw_bs
+            )
+            key = "0" if all_sa else "4"
+            assert backend.counters["tail_batch_histogram"][key] - histogram[key] == 1
+
+
 def test_diagnostic_readback_preserves_native_state_and_counts():
     metrics = Metrics()
     metrics.record(torch.tensor([True, False]), torch.tensor([2, 1]))

@@ -65,24 +65,48 @@ def validate_config(config, cfg):
 def validate_model(worker):
     target = worker.target_worker.model_runner.model_config
     draft = worker.draft_runner.model_config
+    target_arch = getattr(target.hf_config, "architectures", [])
+    draft_arch = getattr(draft.hf_config, "architectures", [])
+    dsv4_mtp = target_arch == ["DeepseekV4ForCausalLM"] and draft_arch == [
+        "DeepseekV4ForCausalLMNextN"
+    ]
+    if not dsv4_mtp and any(
+        arch.startswith("DeepseekV4") for arch in target_arch + draft_arch
+    ):
+        raise ValueError(
+            "hybrid-spec DeepSeek V4 requires a DeepseekV4ForCausalLM target "
+            "and its DeepseekV4ForCausalLMNextN MTP draft"
+        )
     qwen_mtp = (
-        getattr(target.hf_config, "architectures", [])
+        target_arch
         in (
             ["Qwen3_5ForConditionalGeneration"],
             ["Qwen3_5MoeForConditionalGeneration"],
             ["Qwen3_5ForCausalLM"],
             ["Qwen3_5MoeForCausalLM"],
         )
-        and getattr(draft.hf_config, "architectures", []) == ["Qwen3_5ForCausalLMMTP"]
+        and draft_arch == ["Qwen3_5ForCausalLMMTP"]
         and getattr(target.hf_config, "language_only", False)
         and getattr(draft.hf_config, "language_only", False)
     )
 
     for model_config in (target, draft):
-        if getattr(model_config, "is_hybrid_swa", False):
+        if getattr(model_config, "is_hybrid_swa", False) and not dsv4_mtp:
             raise ValueError(
                 "hybrid-spec does not support hybrid sliding-window attention"
             )
+        if dsv4_mtp:
+            if model_config.model_is_mrope or (
+                model_config.is_multimodal
+                and not getattr(model_config.hf_config, "language_only", False)
+            ):
+                raise ValueError(
+                    "hybrid-spec DeepSeek V4 MTP requires text-only serving"
+                )
+            # V4's native MTP owns SWA metadata and KV window planning. SA
+            # replaces token IDs before native forwards/verify; it never crops
+            # the SWA/compressed pools or rewrites compression commit state.
+            continue
         if qwen_mtp:
             # Qwen3.6 uses the Qwen3.5 architecture. Its MTP layer is full
             # attention; the target's GDN verify writes intermediate states and

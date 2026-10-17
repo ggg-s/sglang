@@ -107,6 +107,89 @@ def test_split_query_stream_graph_feedback_publication_and_gate(monkeypatch):
     assert torch.equal(output, neural)
 
 
+@pytest.mark.parametrize("mode", ["split", "split_no_skip"])
+@pytest.mark.parametrize("k", [3, 8])
+def test_dsv4_whole_batch_graph_capture_keeps_native_rows(mode, k):
+    """Real CUDA capture/skip/replay, with synthetic model/attention boundaries.
+
+    This checks the new V4 graph route, not V4 compression or model accuracy.
+    All model rows remain in a mixed tail, including the padded sink row.
+    """
+    from types import SimpleNamespace as NS
+
+    from hybrid_spec.integrations.sglang.split_graph import SplitDraftGraphBackend
+    from sglang.srt.model_executor.runner_backend.full_cuda_graph_backend import (
+        FullCudaGraphBackend,
+    )
+
+    device = "cuda"
+    positions = torch.arange(4, device=device) + 20
+    original = positions.clone()
+    neural = torch.arange(4 * k, device=device).reshape(4, k)
+    candidates = neural.clone()
+    eligible = torch.ones(4, dtype=torch.bool, device=device)
+    view = DraftOverrideView(candidates, torch.empty_like(eligible), 2)
+    drafts = torch.empty_like(neural)
+    work = torch.zeros(4, dtype=torch.int64, device=device)
+    batch = NS(batch_size=4, positions=positions, spec_info=NS(draft_override=view))
+    runner = NS(
+        topk=1,
+        max_bs=4,
+        captured_req_width=1,
+        raw_bs=4,
+        eagle_worker=NS(
+            hot_token_id=None,
+            seed_dsa_topk_from_draft_extend=False,
+            draft_extension=NS(),
+        ),
+        model_runner=NS(
+            model_config=NS(hf_config=NS(architectures=["DeepseekV4ForCausalLMNextN"]))
+        ),
+        draft_attn_backend=NS(decode_attention_backend_str="dsv4"),
+    )
+    # The delegate is unused by this test's capture; its type is validated by
+    # production __init__, while the split backend owns both real graph pools.
+    backend = SplitDraftGraphBackend(object.__new__(FullCudaGraphBackend), runner, mode)
+    backend.stream = torch.cuda.Stream()
+
+    def run():
+        view.use_retrieval.copy_(eligible)
+        drafts.copy_(candidates)
+        drafts[:, :1].copy_(view.select_step(neural[:, :1], 0))
+        for step in range(1, k):
+            positions.add_(1)
+            work.add_(1)
+            drafts[:, step : step + 1].copy_(
+                view.select_step(neural[:, step : step + 1], step)
+            )
+            if step == 1 and (ready := getattr(view, "on_prefix_ready", None)):
+                ready()
+        positions.sub_(k - 1)
+        return None, None, drafts, None
+
+    backend.capture_one(4, run, capture_inputs=batch)
+    for raw_bs in (4, 3, 1, 2, 4):
+        runner.raw_bs = raw_bs
+        for bits in range(1 << raw_bs):
+            candidates.copy_(neural)
+            candidates[:, 2:].add_(100)
+            eligible.copy_(torch.tensor([i < raw_bs for i in range(4)], device=device))
+            for row in range(raw_bs):
+                if not bits & (1 << row):
+                    candidates[row, 1].add_(1)  # a real gate rejection
+            work.zero_()
+            output = backend.replay(4, batch)[2]
+            all_sa = bits == (1 << raw_bs) - 1 and mode == "split"
+            expected_mask = torch.tensor(
+                [i < raw_bs and bool(bits & (1 << i)) for i in range(4)], device=device
+            )
+            expected = torch.where(expected_mask[:, None], candidates, neural)
+            assert torch.equal(output[:raw_bs], expected[:raw_bs])
+            assert torch.equal(view.use_retrieval, expected_mask)
+            assert torch.equal(positions, original)
+            assert work.tolist() == [1 if all_sa else k - 1] * 4
+
+
 @pytest.mark.parametrize("partial", ["fallback", "zero"])
 def test_shared_history_graph_final_feedback_boundaries_and_generation(partial):
     """Final verify tokens must survive finish; stale/reused donors must not."""

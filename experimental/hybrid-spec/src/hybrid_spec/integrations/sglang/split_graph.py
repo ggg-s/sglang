@@ -31,16 +31,29 @@ class SplitDraftGraphBackend:
 
         if type(delegate) is not FullCudaGraphBackend:
             raise ValueError("split draft graphs require the full CUDA graph backend")
+        architecture = runner.model_runner.model_config.hf_config.architectures
         if (
             runner.topk != 1
             or runner.max_bs > 4
             or runner.captured_req_width != 1
             or runner.eagle_worker.hot_token_id is not None
             or runner.eagle_worker.seed_dsa_topk_from_draft_extend
-            or runner.model_runner.model_config.hf_config.architectures
-            != ["Qwen3_5ForCausalLMMTP"]
+            or architecture
+            not in (["Qwen3_5ForCausalLMMTP"], ["DeepseekV4ForCausalLMNextN"])
         ):
-            raise ValueError("split draft graphs support only BS<=4 Qwen3.5 MTP")
+            raise ValueError(
+                "split draft graphs support only BS<=4 Qwen3.5 or DeepSeek V4 MTP"
+            )
+        self.compact_rows = architecture == ["Qwen3_5ForCausalLMMTP"]
+        if (
+            not self.compact_rows
+            and getattr(runner.draft_attn_backend, "decode_attention_backend_str", None)
+            != "dsv4"
+        ):
+            raise ValueError(
+                "DeepSeek V4 split requires native dsv4 draft attention; "
+                "use --speculative-draft-attention-backend dsv4"
+            )
         self.delegate = delegate
         self.runner = runner
         self.mode = mode
@@ -76,7 +89,7 @@ class SplitDraftGraphBackend:
         self, shape_key, forward_fn, capture_inputs=None, post_warmup_hook=None
     ):
         batch = capture_inputs
-        if batch.batch_size > 1:
+        if batch.batch_size > 1 and self.compact_rows:
             from .compact_graph import capture_compact
 
             self.records[shape_key] = capture_compact(
@@ -144,21 +157,27 @@ class SplitDraftGraphBackend:
         # This includes unfinished prefix GPU work, not just the incremental
         # cost of synchronizing. Compare split_no_skip against full for cost.
         with torch.profiler.record_function("hybrid_prefix_decision"):
-            use_sa = bool(record.override.use_retrieval.item())
+            raw_bs = self.runner.raw_bs
+            mask = record.override.use_retrieval[:raw_bs].tolist()
+        num_sa = sum(mask)
         self.counters["decision_wait_ns"] += time.perf_counter_ns() - begin
         self.counters["prefix_ct"] += 1
-        self.counters["request_ct"] += 1
-        if use_sa and self.mode == "split":
+        self.counters["request_ct"] += raw_bs
+        if raw_bs > 0 and num_sa == raw_bs and self.mode == "split":
             self.counters["skip_ct"] += 1
-            self.counters["skip_request_ct"] += 1
+            self.counters["skip_request_ct"] += raw_bs
             self.counters["tail_batch_histogram"]["0"] += 1
-            # run_once normally restores positions after all seven forwards;
+            # run_once normally restores positions after all K-1 forwards;
             # the prefix ran only one. All other input buffers are restaged.
             record.inputs.positions.sub_(1)
         else:
             self.counters["tail_ct"] += 1
-            self.counters["tail_request_ct"] += 1
-            self.counters["tail_batch_histogram"]["1"] += 1
+            self.counters["tail_request_ct"] += raw_bs
+            self.counters["mixed_ct"] += int(0 < num_sa < raw_bs)
+            # V4 retains the original batch and per-step SWA/KV metadata.
+            # Mixed batches run the whole native tail; only unanimous hits
+            # skip it. Histogram records model rows, including graph padding.
+            self.counters["tail_batch_histogram"][str(record.inputs.batch_size)] += 1
             record.tail.replay()
         return record.output
 

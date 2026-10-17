@@ -24,16 +24,43 @@ device 模式以 generation 和 GPU 历史版本检查隔离旧反馈、槽位�
 
 ## 实现与边界
 
+DeepSeek V4 原生 MTP 现在有独立接入：只对 `DeepseekV4ForCausalLM` target +
+`DeepseekV4ForCausalLMNextN` draft 放行 `is_hybrid_swa`，其余未适配 SWA 模型、
+外部草稿和 DSpark 仍拒绝。纯文本 V4 可直接使用；有视觉能力的 checkpoint
+需要显式 text-only 配置，实际多模态输入仍会被请求检查拒绝。
+
+V4 的 `split` 保留原生 dsv4 注意力、per-step KV 地址和 SWA/压缩元数据：
+所有实际请求都通过 gate 时跳过整批尾段，混合命中时运行原始整批尾段。
+该路径不做 Qwen/Triton 的逐行紧凑裁剪，padding 不参与整批命中判定。
+`tail_request_ct` 记录实际进入尾段的请求数，`tail_batch_histogram` 记录模型行数
+（包含 Graph padding）。SA 查询重叠和单次 TP 共识继续生效，GPU 模型结果待内网验收。
+
+配置模板为 `configs/device-dsv4-mtp-split-global-pool.json`。在已经可运行的
+原生 V4 MTP 命令上设置以下项，并保留原有模型、TP、量化和 KV 参数：
+
+```bash
+export HYBRID_SPEC_CONFIG="$PWD/experimental/hybrid-spec/configs/device-dsv4-mtp-split-global-pool.json"
+# --speculative-algorithm EAGLE
+# --speculative-num-steps 8 --speculative-num-draft-tokens 9 --speculative-eagle-topk 1
+# --speculative-draft-attention-backend dsv4
+# --max-running-requests 4 --cuda-graph-max-bs-decode 4
+```
+
+K=8 是模板值；修改 K 时同时修改 JSON 的 `num_drafts` 和上述两个服务参数，
+split 仍要求 K>2、gate=2。`max_history_tokens=16384` 包含完整 prompt 和输出历史，
+容量不足会回退 MTP，按实际上下文调整。worker/runner 的 split API 仍为 v3。
+
 | 项目 | 当前实现 |
 | --- | --- |
 | 检索 | 实例私有 GPU SA；device 模式由 CPU C++ 构建初始状态；Python CPU SA 仅作对照 |
 | 神经后端接入 | 普通 EAGLE/MTP、EAGLE3、Standalone 的 V2 共用 draft 路径；均需逐模型 GPU 验收 |
 | 参数 | NVIDIA CUDA、单机 TP≥1、纯文本、greedy、topk=1、K≥1、验证宽度 K+1 |
-| TP | 两种历史模式均按 rank 复制 SA 并达成选择共识；device 模式在查询后、token 选择前执行共识，支持单机多 TP 实验 |
+| TP | 两种历史模式均按 rank 复制 SA，在采用 SA 后续候选前完成共识；split 将 gate 结果一起归约，支持单机多 TP 实验 |
 | 执行 | eager 与 CUDA Graph 接口；K=1 走原生无循环内 forward 路径 |
 | 历史 | CPU 模式关闭 overlap、从 CPU 已提交历史取增量；device 模式使用 GPU verify 反馈 |
 | 生命周期 | 历史重复不追加；历史变化重建；请求对象代际、结束释放、弱引用清理、flush reset |
 | 混合线性注意力 | 实验接入 Qwen3.5/3.6 target + 原生 Qwen3.5 MTP，要求 `--language-only`；保留 GDN verify/commit 和 mRoPE |
+| 混合 SWA | 实验接入 DeepSeek V4 target + NextN MTP；split 使用原生整批尾段，其他 SWA 模型仍拒绝 |
 | 暂不开放 | CPU 模式 overlap/chunked prefill、DP/PP/EP/CP、多机、torch.compile、混合 prefill/decode、随机采样、grammar、LoRA、其他混合线性注意力模型、多模态请求、多层 EAGLE、FROZEN_KV_MTP、动态预算、Arctic |
 
 默认 CPU 历史模式使用同步调度器已提交到 CPU 的输出，只上传确认增量，当前 anchor 已包含在历史中。device 模式使用 GPU verify 的接受前缀，可能包含最终 CPU EOS/停止截断前的尾部；不能将其计数或索引长度当作最终交付 token 统计。两者均不增加逐步 D2H 读取。
