@@ -1,0 +1,10 @@
+{
+  "baseline_head": "2d53a3d2d2f25254b3c63a116749e73907a66b7f",
+  "branch": "codex/hybrid-suffix-speculation",
+  "serial_sha256": "55df8ac6104f875c9b85a6bfcad8130e1e285ae4ce21c36bec567a199ff29882",
+  "parallel_sha256": "e6ffb38df0f0a92f9db17bc35bf7bfcea7650e00573544e0c1112545e7282f2e",
+  "production_paths_changed_for_parallel_query": [
+    "experimental/hybrid-spec/src/hybrid_spec/backends/gpu_sa/suffix_automaton.cu"
+  ],
+  "reference_trt_commit": "7ebcf4debcac29b3f6225cb4affff3ecf05514aa"
+}

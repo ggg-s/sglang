@@ -1,0 +1,14 @@
+{
+  "measured_cases": 72,
+  "measured_requests": 5760,
+  "measured_output_tokens": 737280,
+  "all_measurements_ok": true,
+  "source_match": {
+    "files": 5616,
+    "mismatches": []
+  },
+  "final_gpu_memory_mib": "0",
+  "original_remote_checkout_status": "",
+  "main_driver_sha256": "113741133db9366fdf2d3ac86bf03114f341006c12c53477ae2a6e467fc89a2f",
+  "control_driver_sha256": "f1db584b30f1d76639fa1d3cac60ebf0da4cb3d24896b58247e8d6622eef3253"
+}

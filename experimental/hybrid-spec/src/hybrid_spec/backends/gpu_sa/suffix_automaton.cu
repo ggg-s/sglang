@@ -251,6 +251,128 @@ __global__ void consume_query_kernel(
   mask[row] = true;
 }
 
+// Consume all published slots before any cross-request reader runs. Completed
+// sources also trim the last verify delta to the CPU-confirmed stop boundary.
+// Published slots are unique and generation-fenced; padding never owns a slot.
+__global__ void finalize_shared_kernel(
+    int *history, int *states, int *edges, int *meta, const int64_t *owners,
+    const int *pending, int64_t *pending_meta, const int64_t *slots,
+    const int64_t *generations, const int64_t *lengths, int n, int h, int k) {
+  int row = blockIdx.x;
+  int64_t slot = slots[row], generation = generations[row];
+  if (slot < 0 || slot >= n || owners[slot] != generation)
+    return;
+  Automaton a{history + slot * h,
+              states + slot * (2 * h + 1) * Automaton::STATE_FIELDS,
+              edges + slot * (h + 1) * Automaton::EDGE_FIELDS,
+              meta + slot * Automaton::META_FIELDS, h};
+  int64_t *pm = pending_meta + slot * 3;
+  int64_t final_length = lengths[row];
+  if (final_length >= 0 && final_length < a.meta[0]) {
+    // A previous replay already indexed a discarded tail. Do not expose it:
+    // this bounded implementation drops the donor instead of rebuilding it.
+    a.meta[4] = 0;
+    pm[2] = 0;
+    return;
+  }
+  if (pm[2] != 0) {
+    int64_t count = pm[2];
+    pm[2] = 0;
+    if (pm[0] != generation || pm[1] != a.meta[0] || count < 0 || count > k + 1)
+      a.meta[4] = 0;
+    else {
+      if (final_length >= 0 && count > final_length - a.meta[0])
+        count = final_length - a.meta[0];
+      for (int j = 0; j < count && a.meta[4]; ++j)
+        a.append(pending[slot * (k + 1) + j]);
+    }
+  }
+  if (final_length >= 0 && a.meta[0] != final_length)
+    a.meta[4] = 0;
+}
+
+struct SharedMatch {
+  int length, continuation, index, start;
+
+  __device__ bool beats(const SharedMatch &other) const {
+    if (length != other.length)
+      return length > other.length;
+    if (continuation != other.continuation)
+      return continuation > other.continuation;
+    // Publication order breaks ties, including across threads/strided scans.
+    return index < other.index;
+  }
+};
+
+constexpr int MAX_SHARED_QUERY_THREADS = 128;
+
+__global__ void shared_query_kernel(
+    int *history, int *states, int *edges, int *meta, const int64_t *owners,
+    const int64_t *limits, const int64_t *slots, const int64_t *generations,
+    const int64_t *seq_lens, const int64_t *shared_slots,
+    const int64_t *shared_generations, int64_t *tokens, bool *mask,
+    int n, int h, int k, int num_shared, int max_context, int min_match,
+    bool zero_partial) {
+  int row = blockIdx.x;
+  int64_t slot = slots[row];
+  if (slot < 0 || slot >= n || owners[slot] != generations[row])
+    return;
+  int *m = meta + slot * Automaton::META_FIELDS;
+  if (!m[4] || m[0] != seq_lens[row] + 1 ||
+      static_cast<int64_t>(m[0]) + k + 1 > limits[slot])
+    return;
+  int *s = states + slot * (2 * h + 1) * Automaton::STATE_FIELDS;
+  int suffix = s[m[3] * Automaton::STATE_FIELDS + 1];
+  int own_length = mask[row] && suffix > 0 ? s[suffix * Automaton::STATE_FIELDS] : 0;
+  SharedMatch best{0, 0, INT_MAX, 0};
+  int context = min(m[0], max_context);
+  // Like TensorRT-LLM's global SA search, each block handles one request and
+  // threads search independent, read-only source automata before reducing.
+  // Striding also covers pools larger than the bounded block size.
+  for (int i = threadIdx.x; i < num_shared; i += blockDim.x) {
+    int64_t other = shared_slots[i];
+    if (other < 0 || other >= n || other == slot ||
+        owners[other] != shared_generations[i])
+      continue;
+    Automaton a{history + other * h,
+                states + other * (2 * h + 1) * Automaton::STATE_FIELDS,
+                edges + other * (h + 1) * Automaton::EDGE_FIELDS,
+                meta + other * Automaton::META_FIELDS, h};
+    if (!a.meta[4] || a.meta[0] == 0)
+      continue;
+    int length = 0;
+    int state = a.match_suffix(history + slot * h + m[0] - context, context, length, true);
+    if (state <= 0 || length < min_match || length <= own_length)
+      continue;
+    int start = a.s(state, 2) + 1;
+    int count = min(k, a.meta[0] - start);
+    if (count <= 0 || (count < k && !zero_partial))
+      continue;
+    // Filter partial continuations before ranking. Own history wins equal
+    // matches; eligible donors rank by match, uncapped tail, publication order.
+    SharedMatch candidate{length, a.meta[0] - start, i, start};
+    if (candidate.beats(best))
+      best = candidate;
+  }
+  __shared__ SharedMatch matches[MAX_SHARED_QUERY_THREADS];
+  matches[threadIdx.x] = best;
+  __syncthreads();
+  for (int stride = blockDim.x / 2; stride; stride >>= 1) {
+    if (threadIdx.x < stride &&
+        matches[threadIdx.x + stride].beats(matches[threadIdx.x]))
+      matches[threadIdx.x] = matches[threadIdx.x + stride];
+    __syncthreads();
+  }
+  if (threadIdx.x == 0 && matches[0].index != INT_MAX) {
+    best = matches[0];
+    int64_t donor = shared_slots[best.index];
+    int count = min(k, best.continuation);
+    for (int j = 0; j < k; ++j)
+      tokens[row * k + j] = j < count ? history[donor * h + best.start + j] : 0;
+    mask[row] = true;
+  }
+}
+
 void check_device_metadata(torch::Tensor meta, torch::Tensor owners,
                            torch::Tensor pending, torch::Tensor pending_meta,
                            torch::Tensor slots, torch::Tensor generations,
@@ -315,7 +437,10 @@ void consume_and_query(
     torch::Tensor meta, torch::Tensor owners, torch::Tensor limits,
     torch::Tensor pending, torch::Tensor pending_meta, torch::Tensor slots,
     torch::Tensor generations, torch::Tensor seq_lens, torch::Tensor tokens,
-    torch::Tensor mask, int64_t min_match, bool zero_partial) {
+    torch::Tensor mask, int64_t min_match, bool zero_partial,
+    std::optional<torch::Tensor> shared_slots,
+    std::optional<torch::Tensor> shared_generations,
+    std::optional<torch::Tensor> shared_lengths, int64_t max_context) {
   check_storage(history, states, edges, meta);
   check_device_metadata(meta, owners, pending, pending_meta, slots, generations,
                         seq_lens);
@@ -328,7 +453,32 @@ void consume_and_query(
                   mask.sizes() == slots.sizes() && min_match > 0 && min_match <= INT_MAX,
               "invalid device query outputs");
   c10::cuda::CUDAGuard guard(meta.device());
+  TORCH_CHECK(shared_slots.has_value() == shared_generations.has_value() &&
+                  shared_slots.has_value() == shared_lengths.has_value(),
+              "shared slots, generations and lengths must be provided together");
+  if (shared_slots) {
+    check_tensor(*shared_slots, torch::kInt64, meta.device());
+    check_tensor(*shared_generations, torch::kInt64, meta.device());
+    check_tensor(*shared_lengths, torch::kInt64, meta.device());
+    TORCH_CHECK(shared_slots->dim() == 1 &&
+                    shared_slots->sizes() == shared_generations->sizes() &&
+                    shared_slots->sizes() == shared_lengths->sizes() &&
+                    shared_slots->numel() <= history.size(0) &&
+                    max_context > 0 && max_context <= INT_MAX,
+                "invalid shared history metadata");
+  }
   if (slots.numel()) {
+    if (shared_slots && shared_slots->numel()) {
+      finalize_shared_kernel<<<shared_slots->numel(), 1, 0,
+                               at::cuda::getCurrentCUDAStream()>>>(
+          history.data_ptr<int>(), states.data_ptr<int>(), edges.data_ptr<int>(),
+          meta.data_ptr<int>(), owners.data_ptr<int64_t>(), pending.data_ptr<int>(),
+          pending_meta.data_ptr<int64_t>(), shared_slots->data_ptr<int64_t>(),
+          shared_generations->data_ptr<int64_t>(), shared_lengths->data_ptr<int64_t>(),
+          history.size(0),
+          history.size(1), tokens.size(1));
+      C10_CUDA_KERNEL_LAUNCH_CHECK();
+    }
     consume_query_kernel<<<slots.numel(), 1, 0, at::cuda::getCurrentCUDAStream()>>>(
         history.data_ptr<int>(), states.data_ptr<int>(), edges.data_ptr<int>(),
         meta.data_ptr<int>(), owners.data_ptr<int64_t>(), limits.data_ptr<int64_t>(),
@@ -337,6 +487,21 @@ void consume_and_query(
         seq_lens.data_ptr<int64_t>(), tokens.data_ptr<int64_t>(), mask.data_ptr<bool>(),
         history.size(0), history.size(1), tokens.size(1), min_match, zero_partial);
     C10_CUDA_KERNEL_LAUNCH_CHECK();
+    if (shared_slots && shared_slots->numel()) {
+      int threads = 32;
+      while (threads < shared_slots->numel() && threads < MAX_SHARED_QUERY_THREADS)
+        threads *= 2;
+      shared_query_kernel<<<slots.numel(), threads, 0,
+                            at::cuda::getCurrentCUDAStream()>>>(
+          history.data_ptr<int>(), states.data_ptr<int>(), edges.data_ptr<int>(),
+          meta.data_ptr<int>(), owners.data_ptr<int64_t>(), limits.data_ptr<int64_t>(),
+          slots.data_ptr<int64_t>(), generations.data_ptr<int64_t>(),
+          seq_lens.data_ptr<int64_t>(), shared_slots->data_ptr<int64_t>(),
+          shared_generations->data_ptr<int64_t>(), tokens.data_ptr<int64_t>(),
+          mask.data_ptr<bool>(), history.size(0), history.size(1), tokens.size(1),
+          shared_slots->numel(), max_context, min_match, zero_partial);
+      C10_CUDA_KERNEL_LAUNCH_CHECK();
+    }
   }
 }
 

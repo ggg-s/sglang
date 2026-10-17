@@ -1,0 +1,5 @@
+{
+  "observed": "Container processes disappeared after 11 completed split-off points; host/GPU UUID unchanged; no driver exit status; cause unconfirmed",
+  "interrupted_control_cases_excluded": 11,
+  "policy": "Preserve interrupted artifacts and rerun the complete 18-point split-off control on the same GPU and source"
+}

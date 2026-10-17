@@ -3,6 +3,9 @@
 > 记录日期：2026-10-16。源码依据：`codex/hybrid-suffix-speculation` 分支截至
 > `972aa160983b42cae3cadd5662b8d4f3d4aa7b03`。本页汇总当前实现与已有实测，
 > 不代表新增了一轮性能或正确性验收。
+>
+> 2026-10-17 增补：本分支新增默认关闭的跨请求全局池，详见
+> [全局池实现与验证](validation/global-pool.md)。下列 C1/C4 性能记录均来自未开启全局池的旧实验。
 
 ## 目录
 
@@ -30,7 +33,7 @@
 - SA v3 将历史状态预算降至约 68 字节/token，并缓解低多样性历史的追加退化。
 - C1 两段 Graph 在该轮 A100 edits 实验中，相对原生吞吐约 +12.2%、TPOT 约 −10.6%。
 - C4 已实现真正的按行裁剪，但本轮相对完整 MTP+SA 吞吐 −2.44%、TPOT +2.68%，没有额外收益。
-- **并发 SA 是多个请求各查自己的历史；当前没有跨请求共享索引或已完成请求缓存。**
+- 默认仍各查本请求；开启 `enable_global_pool` 后可跨活跃槽位查询，并按容量保留完成请求。
 
 CPU 微基准、CUDA 功能测试、profiler 时间和官方服务性能分别记录，不互相替代。
 
@@ -63,17 +66,21 @@ flowchart TB
 
 ### 历史与生命周期
 
-每个请求分配独立 slot，保存历史、SA 状态、转移边和 generation。请求结束释放 slot，
+每个请求分配独立 slot，保存历史、SA 状态、转移边和 generation。默认请求结束释放 slot，
 新请求复用时初始化新代际；旧反馈和旧后台构建结果不能写入新代际。
 flush、retract、请求重排和 Graph padding 都必须保持这一映射。
 
+开启可选全局池后，已导入的活跃 slot 之间可以互查；完成请求按 `max_shared_requests`
+上限保留，按完成顺序 FIFO 淘汰。保留来源的最终反馈按 CPU 确认的停止边界截断；
+已索引的丢弃尾部会使该来源失效。flush 也清除保留来源。各请求始终保持独立文本边界。
+
 历史包括本请求的 prompt 和用于起草的已接受前缀。device 模式的 GPU 反馈可能包含
 CPU EOS/停止条件截断前的尾部，因此索引长度不能直接当成交付 token 数。
-历史超容量时回退 neural；当前没有自动滑动窗口淘汰或跨请求保留。
+历史超容量时回退 neural；当前没有自动滑动窗口淘汰。
 
-例如，请求 A 生成过某段代码，请求 B 不会检索 A 的 SA。若这段代码本来就包含在
+默认配置下，请求 A 生成过某段代码，请求 B 不会检索 A 的 SA。若这段代码本来就包含在
 B 的 prompt 中，B 可以从自身历史匹配。提高 `max_requests` 仅增加可维护的请求槽位，
-不会开启跨请求检索。
+不会开启跨请求检索；必须显式开启 `enable_global_pool`。
 
 ## 3. 已完成的优化
 
@@ -245,7 +252,7 @@ split 还必须同时更新 SGLang worker/runner；仅安装新版插件不够�
 | --- | --- |
 | 同一批中 SA/neural 混合来源 | 已实现 |
 | C1 / 最多 C4 按条件跳过尾段 | 已实现，默认关闭；性能结论分别记录 |
-| 跨请求 SA、已完成请求共享历史 | 未实现 |
+| 跨请求 SA、已完成请求共享历史 | 已接入默认关闭的 device 全局池，验证范围见专项记录 |
 | decode SA 独立 CUDA stream | 未实现；CPU 构建与 prefill 重叠不等于此能力 |
 | 完整 neural MTP 后统一覆盖候选 | 当前 full 仍在 loop 内逐位置选择，不是这一执行方式 |
 | 无 CPU 决定的 GPU conditional Graph | 未实现 |
@@ -253,8 +260,9 @@ split 还必须同时更新 SGLang worker/runner；仅安装新版插件不够�
 | 多 GPU 模型新策略与 NCCL Graph 验收 | 待完成 |
 | 所有模型、长历史、长 prompt 分块下的稳定收益 | 未建立 |
 
-后续若探索跨请求 SA，需要设计共享索引、来源与请求边界、淘汰和生命周期；
-它不会由扩大槽位数自然获得。C4 后续优化需围绕暴露的同步/搬运和仍执行的 LM head
+全局池收益取决于历史复用率和查询成本，不能由增加来源数推断接受率或吞吐改善。
+6000D 的串行开/关池及并行扫描对照分别记录在专项验证文档中。
+C4 后续优化需围绕暴露的同步/搬运和仍执行的 LM head
 成本重新建立对照，不能把减少 row-forward 数直接等同于服务加速。
 
 ## 7. 证据与代码入口
@@ -262,6 +270,7 @@ split 还必须同时更新 SGLang worker/runner；仅安装新版插件不够�
 - [验证记录](VALIDATION.md)：早期设备路径、哈希/压缩微基准与后续验收。
 - [接受长度分析与 C1 对照](validation/acceptance-regression.md)、[C1 原始统计](validation/split-graph-a100.json)。
 - [C4 实验说明](validation/split-graph-c4.md)、[C4 原始统计和源码哈希](validation/split-graph-c4-a100.json)。
+- [跨请求池及开/关池对照](validation/global-pool.md)、[6000D 串行/并行扫描对照](validation/sa-parallel-6000d-throughput/report.md)。
 - [设备历史与请求生命周期](src/hybrid_spec/integrations/sglang/device_extension.py)、[SA 状态机](src/hybrid_spec/backends/gpu_sa/automaton.h)。
 - [TP 共识](src/hybrid_spec/integrations/sglang/tp_sync.py)、[两段 Graph](src/hybrid_spec/integrations/sglang/split_graph.py)、[多请求紧凑尾段](src/hybrid_spec/integrations/sglang/compact_graph.py)。
 
@@ -269,5 +278,5 @@ split 还必须同时更新 SGLang worker/runner；仅安装新版插件不够�
 `b39fab6873`、反馈/映射开销 `44637fe669`、高分叉哈希 `88f8d971eb`、紧凑 v3
 `72ca3efb63`、前缀检查 `971e44e18c`、C1 split `cc120afd32`、C4 split `972aa16098`。
 
-快速回忆：SA 历史按请求隔离；匹配门槛、候选检查长度与验证宽度是三件事；
+快速回忆：SA 独立按请求存储，跨请求检索必须显式开启；匹配门槛、候选检查长度与验证宽度是三件事；
 full 不省 MTP，split 才有条件省；C1 的实测改善不能外推为 C4 或跨请求收益。

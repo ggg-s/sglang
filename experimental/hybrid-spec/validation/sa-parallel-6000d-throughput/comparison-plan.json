@@ -1,0 +1,38 @@
+{
+  "order": [
+    [
+      "serial",
+      "full"
+    ],
+    [
+      "parallel",
+      "full"
+    ],
+    [
+      "parallel",
+      "split"
+    ],
+    [
+      "serial",
+      "split"
+    ]
+  ],
+  "scenarios": [
+    "unique-cold",
+    "repeat-warm"
+  ],
+  "concurrencies": [
+    1,
+    4
+  ],
+  "rounds": 3,
+  "requests_per_case": 80,
+  "output_tokens_per_request": 128,
+  "source_changes": [
+    "experimental/hybrid-spec/src/hybrid_spec/backends/gpu_sa/suffix_automaton.cu"
+  ],
+  "micro_output_parity": "12/12 exact tokens, masks and input hashes",
+  "serial_root": "/tmp/sglang-global-pool-6000d-20261017",
+  "parallel_root": "/tmp/sglang-sa-parallel-6000d-20261017",
+  "control": "Only production source difference is shared_query_kernel and its launch block size; same model, data, config and benchmark client"
+}

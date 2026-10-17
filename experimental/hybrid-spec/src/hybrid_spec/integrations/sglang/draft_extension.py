@@ -89,7 +89,7 @@ class DraftExtension:
         finally:
             draft_input.draft_override = None
 
-    def close_request(self, rid):
+    def close_request(self, rid, *, retain=False):
         self.runtime.close_request(rid)
         self.identities.pop(rid, None)
 

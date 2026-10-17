@@ -13,7 +13,7 @@ from hybrid_spec.core.contracts import RetrievalCandidates
 class GPUSuffixAutomaton:
     @staticmethod
     def estimate_memory(config):
-        h, n = config.max_history_tokens, config.max_requests
+        h, n = config.max_history_tokens, config.num_sa_slots
         return n * (
             (h + (2 * h + 1) * 5 + (h + 1) * 6 + 7) * 4
             + 40
@@ -40,7 +40,7 @@ class GPUSuffixAutomaton:
         )
         self.host_builder = NativeHostBuilder(self.module.__file__)
         self.host_transfers = []
-        n, h = config.max_requests, config.max_history_tokens
+        n, h = config.num_sa_slots, config.max_history_tokens
         self.history = torch.empty((n, h), dtype=torch.int32, device=self.device)
         self.states = torch.empty(
             (n, 2 * h + 1, 5), dtype=torch.int32, device=self.device
@@ -110,7 +110,7 @@ class GPUSuffixAutomaton:
         )
         h = self.config.max_history_tokens
         if not (
-            0 <= slot < self.config.max_requests
+            0 <= slot < self.config.num_sa_slots
             and 0 <= length < h
             and 1 <= num_states <= min(host.states.shape[0], 2 * h + 1)
             and 0 <= num_edges <= min(host.edges.shape[0], h + 1)
@@ -170,7 +170,18 @@ class GPUSuffixAutomaton:
             counts,
         )
 
-    def consume_and_query(self, slots, generations, seq_lens, tokens, mask):
+    def consume_and_query(
+        self,
+        slots,
+        generations,
+        seq_lens,
+        tokens,
+        mask,
+        *,
+        shared_slots=None,
+        shared_generations=None,
+        shared_lengths=None,
+    ):
         # Called on the native capture stream during capture and on its forward
         # stream during replay. No host readback, allocation or stream binding.
         self.module.consume_and_query(
@@ -189,4 +200,8 @@ class GPUSuffixAutomaton:
             mask,
             self.config.min_match_len,
             self.config.partial_drafts == "zero",
+            shared_slots,
+            shared_generations,
+            shared_lengths,
+            self.config.shared_context_tokens,
         )

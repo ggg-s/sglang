@@ -1,0 +1,584 @@
+[
+  {
+    "sources": 20,
+    "batch": 1,
+    "workload": "different",
+    "total_query_us_samples": [
+      2195.5535888671875,
+      2195.8140563964844,
+      2196.689453125,
+      2196.815185546875,
+      2196.656951904297
+    ],
+    "total_query_us_median": 2196.656951904297,
+    "shared_kernel_us_median": 2192.785,
+    "shared_kernel_us_min": 2190.353,
+    "shared_kernel_us_max": 2194.833,
+    "tokens": [
+      [
+        0,
+        0,
+        0,
+        0,
+        0,
+        0,
+        0,
+        0
+      ]
+    ],
+    "mask": [
+      false
+    ],
+    "inputs_sha256": "ff6b2c0f55d8326c49aa22f9cff38367353b6d1091cb568bf6b081c63860ace1"
+  },
+  {
+    "sources": 20,
+    "batch": 1,
+    "workload": "matching",
+    "total_query_us_samples": [
+      599.8371124267578,
+      599.9684906005859,
+      600.0780868530273,
+      599.9347305297852,
+      599.8860931396484
+    ],
+    "total_query_us_median": 599.9347305297852,
+    "shared_kernel_us_median": 596.076,
+    "shared_kernel_us_min": 593.34,
+    "shared_kernel_us_max": 599.355,
+    "tokens": [
+      [
+        101,
+        101,
+        101,
+        101,
+        101,
+        101,
+        101,
+        101
+      ]
+    ],
+    "mask": [
+      true
+    ],
+    "inputs_sha256": "61b73607b25b9ba129a2648969f734b96be8ad56d339ff2eb7aa15a346587a31"
+  },
+  {
+    "sources": 20,
+    "batch": 4,
+    "workload": "different",
+    "total_query_us_samples": [
+      1977.1815490722656,
+      1976.6775512695312,
+      1977.0603942871094,
+      1976.8887329101562,
+      1976.9171142578125
+    ],
+    "total_query_us_median": 1976.9171142578125,
+    "shared_kernel_us_median": 1972.6585,
+    "shared_kernel_us_min": 1969.587,
+    "shared_kernel_us_max": 1977.683,
+    "tokens": [
+      [
+        0,
+        0,
+        0,
+        0,
+        0,
+        0,
+        0,
+        0
+      ],
+      [
+        0,
+        0,
+        0,
+        0,
+        0,
+        0,
+        0,
+        0
+      ],
+      [
+        0,
+        0,
+        0,
+        0,
+        0,
+        0,
+        0,
+        0
+      ],
+      [
+        0,
+        0,
+        0,
+        0,
+        0,
+        0,
+        0,
+        0
+      ]
+    ],
+    "mask": [
+      false,
+      false,
+      false,
+      false
+    ],
+    "inputs_sha256": "96897f663163794023e0b8f38c367a9cc9d2b5b50dae35db8e0ab935223e137f"
+  },
+  {
+    "sources": 20,
+    "batch": 4,
+    "workload": "matching",
+    "total_query_us_samples": [
+      612.3564910888672,
+      612.400016784668,
+      612.2608184814453,
+      612.5443267822266,
+      612.4668884277344
+    ],
+    "total_query_us_median": 612.400016784668,
+    "shared_kernel_us_median": 608.7315,
+    "shared_kernel_us_min": 604.923,
+    "shared_kernel_us_max": 611.964,
+    "tokens": [
+      [
+        104,
+        104,
+        104,
+        104,
+        104,
+        104,
+        104,
+        104
+      ],
+      [
+        104,
+        104,
+        104,
+        104,
+        104,
+        104,
+        104,
+        104
+      ],
+      [
+        104,
+        104,
+        104,
+        104,
+        104,
+        104,
+        104,
+        104
+      ],
+      [
+        104,
+        104,
+        104,
+        104,
+        104,
+        104,
+        104,
+        104
+      ]
+    ],
+    "mask": [
+      true,
+      true,
+      true,
+      true
+    ],
+    "inputs_sha256": "0b57483bcdc20889009239c33dd01cda09c682cff0c4c143715dfad3c3c2f26f"
+  },
+  {
+    "sources": 64,
+    "batch": 1,
+    "workload": "different",
+    "total_query_us_samples": [
+      7262.1942138671875,
+      7263.28369140625,
+      7260.8209228515625,
+      7261.9952392578125,
+      7259.9755859375
+    ],
+    "total_query_us_median": 7261.9952392578125,
+    "shared_kernel_us_median": 7254.321,
+    "shared_kernel_us_min": 7244.017,
+    "shared_kernel_us_max": 7260.784,
+    "tokens": [
+      [
+        0,
+        0,
+        0,
+        0,
+        0,
+        0,
+        0,
+        0
+      ]
+    ],
+    "mask": [
+      false
+    ],
+    "inputs_sha256": "7b5a168629e9a09a69b0eff67d4526f885864d3f0bdc70b8471a66b27aad8f26"
+  },
+  {
+    "sources": 64,
+    "batch": 1,
+    "workload": "matching",
+    "total_query_us_samples": [
+      1960.6398010253906,
+      1959.7636413574219,
+      1959.5321655273438,
+      1959.1804504394531,
+      1959.0811157226562
+    ],
+    "total_query_us_median": 1959.5321655273438,
+    "shared_kernel_us_median": 1955.3315,
+    "shared_kernel_us_min": 1952.052,
+    "shared_kernel_us_max": 1960.116,
+    "tokens": [
+      [
+        101,
+        101,
+        101,
+        101,
+        101,
+        101,
+        101,
+        101
+      ]
+    ],
+    "mask": [
+      true
+    ],
+    "inputs_sha256": "9b6730d77b38e5306b3ae3c9b2e819ecd01a3ad53a86deda334df43ed6ebe57e"
+  },
+  {
+    "sources": 64,
+    "batch": 4,
+    "workload": "different",
+    "total_query_us_samples": [
+      7116.4422607421875,
+      7113.311767578125,
+      7113.336181640625,
+      7115.5926513671875,
+      7117.7593994140625
+    ],
+    "total_query_us_median": 7115.5926513671875,
+    "shared_kernel_us_median": 7111.9245,
+    "shared_kernel_us_min": 7103.893,
+    "shared_kernel_us_max": 7120.532,
+    "tokens": [
+      [
+        0,
+        0,
+        0,
+        0,
+        0,
+        0,
+        0,
+        0
+      ],
+      [
+        0,
+        0,
+        0,
+        0,
+        0,
+        0,
+        0,
+        0
+      ],
+      [
+        0,
+        0,
+        0,
+        0,
+        0,
+        0,
+        0,
+        0
+      ],
+      [
+        0,
+        0,
+        0,
+        0,
+        0,
+        0,
+        0,
+        0
+      ]
+    ],
+    "mask": [
+      false,
+      false,
+      false,
+      false
+    ],
+    "inputs_sha256": "34fca97d5207fca702efcf55d6c5afd9675635ae607f898cfba06fefdfe31c17"
+  },
+  {
+    "sources": 64,
+    "batch": 4,
+    "workload": "matching",
+    "total_query_us_samples": [
+      2001.8185424804688,
+      2001.9850158691406,
+      2001.614990234375,
+      2002.8826904296875,
+      2001.6900634765625
+    ],
+    "total_query_us_median": 2001.8185424804688,
+    "shared_kernel_us_median": 1996.9955,
+    "shared_kernel_us_min": 1993.332,
+    "shared_kernel_us_max": 2001.843,
+    "tokens": [
+      [
+        104,
+        104,
+        104,
+        104,
+        104,
+        104,
+        104,
+        104
+      ],
+      [
+        104,
+        104,
+        104,
+        104,
+        104,
+        104,
+        104,
+        104
+      ],
+      [
+        104,
+        104,
+        104,
+        104,
+        104,
+        104,
+        104,
+        104
+      ],
+      [
+        104,
+        104,
+        104,
+        104,
+        104,
+        104,
+        104,
+        104
+      ]
+    ],
+    "mask": [
+      true,
+      true,
+      true,
+      true
+    ],
+    "inputs_sha256": "38140bcb007b6fb1c20e96708278abf026a600f6346a5c038bf756fc10fd3724"
+  },
+  {
+    "sources": 257,
+    "batch": 1,
+    "workload": "different",
+    "total_query_us_samples": [
+      29349.8486328125,
+      29359.6630859375,
+      29358.8330078125,
+      29355.9912109375,
+      29352.42431640625
+    ],
+    "total_query_us_median": 29355.9912109375,
+    "shared_kernel_us_median": 29350.0985,
+    "shared_kernel_us_min": 29331.523,
+    "shared_kernel_us_max": 29368.835,
+    "tokens": [
+      [
+        0,
+        0,
+        0,
+        0,
+        0,
+        0,
+        0,
+        0
+      ]
+    ],
+    "mask": [
+      false
+    ],
+    "inputs_sha256": "0c6ef4bd946266ddec3663f8a8a50ba729debd9ad94c07ed3449ffd2d776c946"
+  },
+  {
+    "sources": 257,
+    "batch": 1,
+    "workload": "matching",
+    "total_query_us_samples": [
+      7941.2530517578125,
+      7943.7310791015625,
+      7945.2862548828125,
+      7943.4307861328125,
+      7944.90234375
+    ],
+    "total_query_us_median": 7943.7310791015625,
+    "shared_kernel_us_median": 7939.99,
+    "shared_kernel_us_min": 7936.15,
+    "shared_kernel_us_max": 7947.639,
+    "tokens": [
+      [
+        101,
+        101,
+        101,
+        101,
+        101,
+        101,
+        101,
+        101
+      ]
+    ],
+    "mask": [
+      true
+    ],
+    "inputs_sha256": "386f87f84e01a24c67725cb18e2d5c97818d3094b24685889393644000e1a6ae"
+  },
+  {
+    "sources": 257,
+    "batch": 4,
+    "workload": "different",
+    "total_query_us_samples": [
+      29548.91357421875,
+      29544.0087890625,
+      29545.6494140625,
+      29544.63134765625,
+      29541.7333984375
+    ],
+    "total_query_us_median": 29544.63134765625,
+    "shared_kernel_us_median": 29538.1835,
+    "shared_kernel_us_min": 29520.184,
+    "shared_kernel_us_max": 29561.368,
+    "tokens": [
+      [
+        0,
+        0,
+        0,
+        0,
+        0,
+        0,
+        0,
+        0
+      ],
+      [
+        0,
+        0,
+        0,
+        0,
+        0,
+        0,
+        0,
+        0
+      ],
+      [
+        0,
+        0,
+        0,
+        0,
+        0,
+        0,
+        0,
+        0
+      ],
+      [
+        0,
+        0,
+        0,
+        0,
+        0,
+        0,
+        0,
+        0
+      ]
+    ],
+    "mask": [
+      false,
+      false,
+      false,
+      false
+    ],
+    "inputs_sha256": "8737d3fddc66b74b51740e40340ba7d24e204938be70a8a5ca5b98e36ac4d4d2"
+  },
+  {
+    "sources": 257,
+    "batch": 4,
+    "workload": "matching",
+    "total_query_us_samples": [
+      8108.072509765625,
+      8110.4443359375,
+      8107.89794921875,
+      8109.2144775390625,
+      8110.5963134765625
+    ],
+    "total_query_us_median": 8109.2144775390625,
+    "shared_kernel_us_median": 8101.915999999999,
+    "shared_kernel_us_min": 8091.069,
+    "shared_kernel_us_max": 8111.261,
+    "tokens": [
+      [
+        104,
+        104,
+        104,
+        104,
+        104,
+        104,
+        104,
+        104
+      ],
+      [
+        104,
+        104,
+        104,
+        104,
+        104,
+        104,
+        104,
+        104
+      ],
+      [
+        104,
+        104,
+        104,
+        104,
+        104,
+        104,
+        104,
+        104
+      ],
+      [
+        104,
+        104,
+        104,
+        104,
+        104,
+        104,
+        104,
+        104
+      ]
+    ],
+    "mask": [
+      true,
+      true,
+      true,
+      true
+    ],
+    "inputs_sha256": "ec5186068444ae5f88f7ec530444aba6841430e317e6b47c6123e9706600462f"
+  }
+]

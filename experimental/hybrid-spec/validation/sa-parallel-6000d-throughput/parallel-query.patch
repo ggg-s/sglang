@@ -1,0 +1,102 @@
+--- a/experimental/hybrid-spec/src/hybrid_spec/backends/gpu_sa/suffix_automaton.cu
++++ b/experimental/hybrid-spec/src/hybrid_spec/backends/gpu_sa/suffix_automaton.cu
+@@ -291,6 +291,21 @@
+     a.meta[4] = 0;
+ }
+
++struct SharedMatch {
++  int length, continuation, index, start;
++
++  __device__ bool beats(const SharedMatch &other) const {
++    if (length != other.length)
++      return length > other.length;
++    if (continuation != other.continuation)
++      return continuation > other.continuation;
++    // Publication order breaks ties, including across threads/strided scans.
++    return index < other.index;
++  }
++};
++
++constexpr int MAX_SHARED_QUERY_THREADS = 128;
++
+ __global__ void shared_query_kernel(
+     int *history, int *states, int *edges, int *meta, const int64_t *owners,
+     const int64_t *limits, const int64_t *slots, const int64_t *generations,
+@@ -308,11 +323,13 @@
+     return;
+   int *s = states + slot * (2 * h + 1) * Automaton::STATE_FIELDS;
+   int suffix = s[m[3] * Automaton::STATE_FIELDS + 1];
+-  int best = mask[row] && suffix > 0 ? s[suffix * Automaton::STATE_FIELDS] : 0;
+-  int64_t donor = -1;
+-  int best_start = 0, best_count = 0, best_continuation = 0;
++  int own_length = mask[row] && suffix > 0 ? s[suffix * Automaton::STATE_FIELDS] : 0;
++  SharedMatch best{0, 0, INT_MAX, 0};
+   int context = min(m[0], max_context);
+-  for (int i = 0; i < num_shared; ++i) {
++  // Like TensorRT-LLM's global SA search, each block handles one request and
++  // threads search independent, read-only source automata before reducing.
++  // Striding also covers pools larger than the bounded block size.
++  for (int i = threadIdx.x; i < num_shared; i += blockDim.x) {
+     int64_t other = shared_slots[i];
+     if (other < 0 || other >= n || other == slot ||
+         owners[other] != shared_generations[i])
+@@ -325,26 +342,33 @@
+       continue;
+     int length = 0;
+     int state = a.match_suffix(history + slot * h + m[0] - context, context, length, true);
+-    if (state <= 0 || length < min_match || length < best)
++    if (state <= 0 || length < min_match || length <= own_length)
+       continue;
+     int start = a.s(state, 2) + 1;
+     int count = min(k, a.meta[0] - start);
+     if (count <= 0 || (count < k && !zero_partial))
+       continue;
+-    // Equal matches prefer own history; between donors prefer a longer tail,
+-    // then the most recent generation (the host publishes that order).
+-    int continuation = a.meta[0] - start;
+-    if (length == best && (donor < 0 || continuation <= best_continuation))
+-      continue;
+-    donor = other;
+-    best = length;
+-    best_start = start;
+-    best_count = count;
+-    best_continuation = continuation;
+-  }
+-  if (donor >= 0) {
++    // Filter partial continuations before ranking. Own history wins equal
++    // matches; eligible donors rank by match, uncapped tail, publication order.
++    SharedMatch candidate{length, a.meta[0] - start, i, start};
++    if (candidate.beats(best))
++      best = candidate;
++  }
++  __shared__ SharedMatch matches[MAX_SHARED_QUERY_THREADS];
++  matches[threadIdx.x] = best;
++  __syncthreads();
++  for (int stride = blockDim.x / 2; stride; stride >>= 1) {
++    if (threadIdx.x < stride &&
++        matches[threadIdx.x + stride].beats(matches[threadIdx.x]))
++      matches[threadIdx.x] = matches[threadIdx.x + stride];
++    __syncthreads();
++  }
++  if (threadIdx.x == 0 && matches[0].index != INT_MAX) {
++    best = matches[0];
++    int64_t donor = shared_slots[best.index];
++    int count = min(k, best.continuation);
+     for (int j = 0; j < k; ++j)
+-      tokens[row * k + j] = j < best_count ? history[donor * h + best_start + j] : 0;
++      tokens[row * k + j] = j < count ? history[donor * h + best.start + j] : 0;
+     mask[row] = true;
+   }
+ }
+@@ -464,7 +488,10 @@
+         history.size(0), history.size(1), tokens.size(1), min_match, zero_partial);
+     C10_CUDA_KERNEL_LAUNCH_CHECK();
+     if (shared_slots && shared_slots->numel()) {
+-      shared_query_kernel<<<slots.numel(), 1, 0,
++      int threads = 32;
++      while (threads < shared_slots->numel() && threads < MAX_SHARED_QUERY_THREADS)
++        threads *= 2;
++      shared_query_kernel<<<slots.numel(), threads, 0,
+                             at::cuda::getCurrentCUDAStream()>>>(
+           history.data_ptr<int>(), states.data_ptr<int>(), edges.data_ptr<int>(),
+           meta.data_ptr<int>(), owners.data_ptr<int64_t>(), limits.data_ptr<int64_t>(),

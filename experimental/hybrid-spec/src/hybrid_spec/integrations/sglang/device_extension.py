@@ -5,6 +5,7 @@ from __future__ import annotations
 import heapq
 import threading
 import weakref
+from collections import deque
 from concurrent.futures import Future, ThreadPoolExecutor
 from contextlib import contextmanager
 from dataclasses import dataclass
@@ -24,6 +25,17 @@ class DeviceOverride(DraftOverrideView):
         # Only worker-created views provide this immutable host metadata key.
         # Manually constructed views may mutate their tensors between stages.
         self.mapping_key = None
+        if backend.config.enable_global_pool:
+            self.shared_slots = torch.full(
+                (backend.config.num_sa_slots,),
+                -1,
+                dtype=torch.int64,
+                device=backend.device,
+            )
+            self.shared_generations = torch.zeros_like(self.shared_slots)
+            # -1 means a live source. Completed sources carry the CPU-confirmed
+            # final length, excluding any verify tail discarded at EOS/stop.
+            self.shared_lengths = torch.full_like(self.shared_slots, -1)
         super().__init__(
             torch.zeros(
                 (len(slots), backend.config.num_drafts),
@@ -35,8 +47,22 @@ class DeviceOverride(DraftOverrideView):
         )
 
     def prepare(self, seq_lens):
+        shared = (
+            {
+                "shared_slots": self.shared_slots,
+                "shared_generations": self.shared_generations,
+                "shared_lengths": self.shared_lengths,
+            }
+            if self.backend.config.enable_global_pool
+            else {}
+        )
         self.backend.consume_and_query(
-            self.slots, self.generations, seq_lens, self.tokens, self.use_retrieval
+            self.slots,
+            self.generations,
+            seq_lens,
+            self.tokens,
+            self.use_retrieval,
+            **shared,
         )
         if self.tp_sync is not None:
             agreed = self.tp_sync.synchronize(self)
@@ -64,6 +90,10 @@ class DeviceGraphBuffers:
         view.num_neural_gate_tokens = self.view.num_neural_gate_tokens
         for name in ("slots", "generations", "tokens", "use_retrieval"):
             setattr(view, name, getattr(self.view, name)[:batch_size])
+        if self.view.backend.config.enable_global_pool:
+            view.shared_slots = self.view.shared_slots
+            view.shared_generations = self.view.shared_generations
+            view.shared_lengths = self.view.shared_lengths
         return view
 
     def stage(self, view, raw_bs, padded_bs):
@@ -78,6 +108,10 @@ class DeviceGraphBuffers:
             self.view.slots[raw_bs:padded_bs].fill_(-1)
             self.view.slots[:raw_bs].copy_(view.slots)
             self.view.generations[:raw_bs].copy_(view.generations)
+            if self.view.backend.config.enable_global_pool:
+                self.view.shared_slots.copy_(view.shared_slots)
+                self.view.shared_generations.copy_(view.shared_generations)
+                self.view.shared_lengths.copy_(view.shared_lengths)
             self.staged_mapping = mapping
         # Feedback consumes the actual captured query's selection mask.
         view.use_retrieval = self.view.use_retrieval[:raw_bs]
@@ -117,7 +151,10 @@ class DeviceDraftExtension:
         self.tp_sync = tp_sync
         self.metrics = Metrics()
         self.states = {}
-        self.free_slots = list(range(config.max_requests))
+        self.free_slots = list(range(config.num_sa_slots))
+        # Completed requests keep their own automata. Never concatenate texts;
+        # global query only reads after all per-slot updates have completed.
+        self.shared = deque()
         self.generation = 0
         self.lock = threading.RLock()
         self.pending_view = None
@@ -129,12 +166,27 @@ class DeviceDraftExtension:
     def create_graph_buffers(self, max_bs):
         return DeviceGraphBuffers(self.backend, max_bs, self.tp_sync)
 
-    def close_request(self, rid):
+    def close_request(self, rid, *, retain=False):
         # Finish callbacks may run on the scheduler thread. Never touch GPU
         # state there: the next forward initializes a new generation in stream.
         with self.lock:
             state = self.states.pop(rid, None)
             if state is not None:
+                req = state.request()
+                if (
+                    retain
+                    and self.config.enable_global_pool
+                    and self.config.max_shared_requests
+                    and req is not None
+                    and state.device_initialized
+                    and state.build is None
+                ):
+                    length = len(req.origin_input_ids) + len(req.output_ids)
+                    self.shared.append((state.slot, state.generation, length))
+                    if len(self.shared) > self.config.max_shared_requests:
+                        slot, _, _ = self.shared.popleft()
+                        heapq.heappush(self.free_slots, slot)
+                    return
                 if state.build is not None:
                     state.build.cancel()
                 heapq.heappush(self.free_slots, state.slot)
@@ -145,7 +197,8 @@ class DeviceDraftExtension:
                 if state.build is not None:
                     state.build.cancel()
             self.states.clear()
-            self.free_slots = list(range(self.config.max_requests))
+            self.shared.clear()
+            self.free_slots = list(range(self.config.num_sa_slots))
             # Retain the generation counter across flush, fencing old feedback.
 
     def shutdown(self):
@@ -176,7 +229,11 @@ class DeviceDraftExtension:
                         ticket.append(None)
                         continue
                     length = int(batch.seq_lens_cpu[row])
-                    if not self.free_slots or length >= self.config.max_history_tokens:
+                    if (
+                        len(self.states) >= self.config.max_requests
+                        or not self.free_slots
+                        or length >= self.config.max_history_tokens
+                    ):
                         ticket.append(None)
                         continue
                     history = tuple(req.get_fill_ids()[:length])
@@ -269,14 +326,31 @@ class DeviceDraftExtension:
                     raise
                 state.build = None
 
-    def _view(self, slots, generations):
+    def _view(self, slots, generations, shared=()):
         view = DeviceOverride(
             self.backend,
             torch.tensor(slots, dtype=torch.int64, device=self.backend.device),
             torch.tensor(generations, dtype=torch.int64, device=self.backend.device),
             self.tp_sync,
         )
-        view.mapping_key = (tuple(slots), tuple(generations))
+        if self.config.enable_global_pool and shared:
+            # Unused entries remain -1. Published order breaks exact donor ties.
+            view.shared_slots[: len(shared)] = torch.tensor(
+                [slot for slot, _, _ in shared],
+                dtype=torch.int64,
+                device=self.backend.device,
+            )
+            view.shared_generations[: len(shared)] = torch.tensor(
+                [generation for _, generation, _ in shared],
+                dtype=torch.int64,
+                device=self.backend.device,
+            )
+            view.shared_lengths[: len(shared)] = torch.tensor(
+                [length for _, _, length in shared],
+                dtype=torch.int64,
+                device=self.backend.device,
+            )
+        view.mapping_key = (tuple(slots), tuple(generations), shared)
         return view
 
     @contextmanager
@@ -310,9 +384,23 @@ class DeviceDraftExtension:
                 else:
                     slots.append(state.slot)
                     generations.append(state.generation)
-        binding_key = (tuple(slots), tuple(generations))
+            shared = ()
+            if self.config.enable_global_pool:
+                live = [
+                    (state.slot, state.generation, -1)
+                    for state in self.states.values()
+                    if state.device_initialized and state.build is None
+                ]
+                shared = tuple(
+                    sorted(
+                        live + list(self.shared),
+                        key=lambda entry: entry[1],
+                        reverse=True,
+                    )
+                )
+        binding_key = (tuple(slots), tuple(generations), shared)
         if self.last_binding is None or self.last_binding[0] != binding_key:
-            self.last_binding = (binding_key, self._view(slots, generations))
+            self.last_binding = (binding_key, self._view(slots, generations, shared))
         view = self.last_binding[1]
         self.pending_view = view
         draft_input.draft_override = view

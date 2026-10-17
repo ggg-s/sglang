@@ -25,6 +25,189 @@ pytestmark = pytest.mark.skipif(
 )
 
 
+@pytest.mark.parametrize("partial", ["fallback", "zero"])
+def test_shared_history_graph_final_feedback_boundaries_and_generation(partial):
+    """Final verify tokens must survive finish; stale/reused donors must not."""
+    config = HybridConfig(
+        2,
+        2,
+        1,
+        64,
+        history_mode="device",
+        max_shared_requests=2,
+        partial_drafts=partial,
+        enable_global_pool=True,
+    )
+    backend = GPUSuffixAutomaton(config, "cuda")
+
+    def install(slot, generation, history):
+        backend.initialize_device_slot(slot, generation, 100)
+        backend.append(
+            slot, HistoryDelta(RequestKey(str(slot), generation), 0, tuple(history))
+        )
+
+    install(0, 10, [1, 2])
+    install(1, 11, [5, 6, 7, 8])
+    install(2, 12, [9, 1, 2])
+    final = [3, 4] if partial == "fallback" else [3]
+    device = {"device": "cuda", "dtype": torch.int64}
+    backend.stage_feedback(
+        torch.tensor([0], **device),
+        torch.tensor([10], **device),
+        torch.tensor(final, device="cuda", dtype=torch.int32),
+        torch.tensor([list(range(len(final)))], device="cuda", dtype=torch.int32),
+        torch.tensor([len(final)], device="cuda", dtype=torch.int32),
+        torch.tensor([1], **device),
+        True,
+        100,
+    )
+    view = DeviceOverride(
+        backend, torch.tensor([2], **device), torch.tensor([12], **device)
+    )
+    buffers = DeviceGraphBuffers(backend, 2)
+    captured = buffers.bind_capture_view(2)
+    buffers.stage(view, 1, 2)
+    seq_lens = torch.tensor([2, 0], **device)
+    graph = torch.cuda.CUDAGraph()
+    with torch.cuda.graph(graph):
+        captured.prepare(seq_lens)
+    # Publication occurs after capture, with an unchanged active batch.
+    assert backend.pending_meta[0, 2].item() == len(final)
+    view.shared_slots.copy_(torch.tensor([0, 1, -1], **device))
+    view.shared_generations.copy_(torch.tensor([10, 11, 0], **device))
+    view.shared_lengths.copy_(torch.tensor([2 + len(final), 4, -1], **device))
+    buffers.stage(view, 1, 2)
+    for _ in range(2):
+        graph.replay()
+        assert captured.tokens[0].tolist() == (final + [0])[:2]
+        assert captured.use_retrieval.tolist() == [True, False]
+        assert backend.meta[0, 0].item() == 2 + len(final)
+        assert backend.pending_meta[0, 2].item() == 0
+    # A suffix spanning two donor documents must never be synthesized.
+    install(2, 12, [4, 5])
+    seq_lens[0] = 1
+    graph.replay()
+    assert not captured.use_retrieval.any().item()
+    install(2, 12, [9, 1, 2])
+    seq_lens[0] = 2
+    # A slot reused after FIFO eviction is fenced even if an old mapping replays.
+    install(0, 20, [1, 2, 8, 9])
+    graph.replay()
+    assert not captured.use_retrieval.any().item()
+    # Publishing the new generation makes it eligible, without recapture.
+    view.shared_generations[0] = 20
+    view.shared_lengths[0] = 4
+    buffers.stage(view, 1, 2)
+    graph.replay()
+    assert captured.tokens[0].tolist() == [8, 9]
+    assert captured.use_retrieval.tolist() == [True, False]
+    # Among foreign sources, a longer continuation beats publication order.
+    install(1, 11, [1, 2, 6, 7, 8, 9])
+    view.shared_lengths[1] = 6
+    buffers.stage(view, 1, 2)
+    graph.replay()
+    assert captured.tokens[0].tolist() == [6, 7]
+    # Longest foreign match [5,6,1,2] ends at the donor's boundary; the
+    # earlier [1,2] occurrence still supplies a valid [3,4] continuation.
+    install(1, 11, [1, 2, 3, 4, 5, 6, 1, 2])
+    install(2, 12, [9, 5, 6, 1, 2])
+    seq_lens[0] = 4
+    view.shared_lengths[1] = 8
+    buffers.stage(view, 1, 2)
+    graph.replay()
+    assert captured.tokens[0].tolist() == [3, 4]
+    view.shared_slots.fill_(-1)
+    buffers.stage(view, 1, 2)
+    graph.replay()
+    assert not captured.use_retrieval.any().item()
+
+
+def test_global_pool_reads_other_active_rows_after_all_updates():
+    """A row must see another row's current feedback, independent of row order."""
+    config = HybridConfig(2, 2, 2, 64, history_mode="device", enable_global_pool=True)
+    backend = GPUSuffixAutomaton(config, "cuda")
+    device = {"device": "cuda", "dtype": torch.int64}
+    for slot, history in enumerate(([1, 2], [9, 1, 2])):
+        backend.initialize_device_slot(slot, slot + 1, 100)
+        backend.append(
+            slot, HistoryDelta(RequestKey(str(slot), slot + 1), 0, tuple(history))
+        )
+    backend.stage_feedback(
+        torch.tensor([0], **device),
+        torch.tensor([1], **device),
+        torch.tensor([3, 4], device="cuda", dtype=torch.int32),
+        torch.tensor([[0, 1]], device="cuda", dtype=torch.int32),
+        torch.tensor([2], device="cuda", dtype=torch.int32),
+        torch.tensor([1], **device),
+        True,
+        100,
+    )
+    view = DeviceOverride(
+        backend, torch.tensor([1, 0, -1], **device), torch.tensor([2, 1, -1], **device)
+    )
+    view.shared_slots.copy_(torch.tensor([0, 1], **device))
+    view.shared_generations.copy_(torch.tensor([1, 2], **device))
+    seq_lens = torch.tensor([2, 3, 0], **device)
+    for _ in range(2):
+        view.prepare(seq_lens)
+        assert view.tokens[0].tolist() == [3, 4]
+        assert view.use_retrieval.tolist() == [True, False, False]
+        assert backend.meta[0, 0].item() == 4
+    # Local history wins equal-length matches even with a longer foreign tail.
+    backend.initialize_device_slot(1, 2, 100)
+    backend.append(1, HistoryDelta(RequestKey("1", 2), 0, (1, 2, 7, 8, 1, 2)))
+    seq_lens[0] = 5
+    view.prepare(seq_lens)
+    assert view.tokens[0].tolist() == [7, 8]
+
+
+def test_completed_pool_trims_uncommitted_stop_tail():
+    """CPU stop truncation may discard part of the last target-verified delta."""
+    config = HybridConfig(
+        2,
+        2,
+        1,
+        64,
+        history_mode="device",
+        enable_global_pool=True,
+        max_shared_requests=1,
+        partial_drafts="zero",
+    )
+    backend = GPUSuffixAutomaton(config, "cuda")
+    device = {"device": "cuda", "dtype": torch.int64}
+    for slot, history in enumerate(([1, 2], [9, 1, 2])):
+        backend.initialize_device_slot(slot, slot + 1, 100)
+        backend.append(
+            slot, HistoryDelta(RequestKey(str(slot), slot + 1), 0, tuple(history))
+        )
+    backend.stage_feedback(
+        torch.tensor([0], **device),
+        torch.tensor([1], **device),
+        torch.tensor([3, 99, 98], device="cuda", dtype=torch.int32),
+        torch.tensor([[0, 1, 2]], device="cuda", dtype=torch.int32),
+        torch.tensor([3], device="cuda", dtype=torch.int32),
+        torch.tensor([1], **device),
+        True,
+        100,
+    )
+    view = DeviceOverride(
+        backend, torch.tensor([1], **device), torch.tensor([2], **device)
+    )
+    view.shared_slots.copy_(torch.tensor([0, -1], **device))
+    view.shared_generations.copy_(torch.tensor([1, 0], **device))
+    view.shared_lengths.copy_(torch.tensor([3, -1], **device))
+    seq_lens = torch.tensor([2], **device)
+    view.prepare(seq_lens)
+    assert view.use_retrieval.item()
+    assert view.tokens.tolist() == [[3, 0]]
+    assert backend.meta[0, 0].item() == 3
+    # A pre-existing discarded tail cannot be truncated in-place in an SA.
+    backend.append(0, HistoryDelta(RequestKey("0", 1), 3, (99,)))
+    view.prepare(seq_lens)
+    assert not view.use_retrieval.item()
+    assert not backend.meta[0, 4].item()
+
+
 def test_cuda_sa_differential_capacity_reorder_and_slot_reuse():
     config = HybridConfig(3, 1, 16, 128)
     backend = GPUSuffixAutomaton(config, "cuda")

@@ -16,6 +16,9 @@ class HybridConfig:
     partial_drafts: str = "fallback"
     num_neural_gate_tokens: int = 0
     draft_graph_mode: str = "full"
+    enable_global_pool: bool = False
+    max_shared_requests: int = 0
+    shared_context_tokens: int = 128
 
     def __post_init__(self):
         for name in (
@@ -52,6 +55,23 @@ class HybridConfig:
                 "split draft graphs require device history, at most four requests, "
                 "num_neural_gate_tokens=2 and num_drafts>2"
             )
+        if type(self.max_shared_requests) is not int or self.max_shared_requests < 0:
+            raise ValueError("max_shared_requests must be a nonnegative integer")
+        if (
+            type(self.shared_context_tokens) is not int
+            or self.shared_context_tokens < 1
+        ):
+            raise ValueError("shared_context_tokens must be a positive integer")
+        if type(self.enable_global_pool) is not bool:
+            raise ValueError("enable_global_pool must be a boolean")
+        if self.max_shared_requests and not self.enable_global_pool:
+            raise ValueError("max_shared_requests requires enable_global_pool=true")
+        if self.enable_global_pool and self.history_mode != "device":
+            raise ValueError("shared history requires history_mode=device")
+
+    @property
+    def num_sa_slots(self):
+        return self.max_requests + self.max_shared_requests
 
     @classmethod
     def from_file(cls, path: str):

@@ -162,7 +162,7 @@ def _attach(result, worker, *args, **kwargs):
 def _finished(result, worker, *, rid, natural_stop):
     draft = worker.draft_worker
     if draft is not None and draft.draft_extension is not None:
-        draft.draft_extension.close_request(rid)
+        draft.draft_extension.close_request(rid, retain=True)
 
 
 def _reset(result, worker, *args, **kwargs):

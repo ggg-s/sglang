@@ -1,0 +1,2078 @@
+[
+  {
+    "mode": "full-global",
+    "scenario": "repeat-cold",
+    "concurrency": 1,
+    "round": 1,
+    "mismatch_indices": [
+      9,
+      34,
+      49,
+      53,
+      60
+    ],
+    "examples": [
+      {
+        "request_index": 9,
+        "first_differing_char": 383,
+        "baseline_context": "y_usage = []\n        self.gpu_utilization = []\n        self.layer_activation_memory = []\n        \n    def collect_batch_metrics(self, model_output, target, batch_start_time, layer_activations=None):\n ",
+        "candidate_context": "y_usage = []\n        self.gpu_utilization = []\n        self.per_layer_activation_memory = []\n        \n    def collect_batch_metrics(self, model_output, target, batch_start_time, layer_activations=None"
+      },
+      {
+        "request_index": 34,
+        "first_differing_char": 358,
+        "baseline_context": "acking_algorithm='probabilistic', \n                           multi_fiber_support=False, volume_fraction_threshold=0.1):\n        \"\"\"\n        Configures fiber tracking parameters for DTI analysis.",
+        "candidate_context": "acking_algorithm='probabilistic', \n                         multi_fiber_support=False, volume_fraction_threshold=0.1):\n        \"\"\"\n        Configures fiber tracking parameters for DTI analysis."
+      },
+      {
+        "request_index": 49,
+        "first_differing_char": 495,
+        "baseline_context": "t_batch_metrics(self, model_output, target, batch_start_time, layer_activations=None):\n        \"\"\"\n        Collects performance",
+        "candidate_context": "t_batch_metrics(self, model_output, target, batch_start_time):\n        \"\"\"\n        Collects performance metrics for each training batch"
+      }
+    ],
+    "requests": 80,
+    "scope": "Decoded text comparison; not an accuracy evaluation or exact token-ID assertion"
+  },
+  {
+    "mode": "full-global",
+    "scenario": "repeat-cold",
+    "concurrency": 1,
+    "round": 2,
+    "mismatch_indices": [
+      31,
+      37,
+      38,
+      41,
+      62
+    ],
+    "examples": [
+      {
+        "request_index": 31,
+        "first_differing_char": 495,
+        "baseline_context": "t_batch_metrics(self, model_output, target, batch_start_time, layer_activations=None):\n        \"\"\"\n        Collects performance",
+        "candidate_context": "t_batch_metrics(self, model_output, target, batch_start_time):\n        \"\"\"\n        Collects performance metrics for each training batch"
+      },
+      {
+        "request_index": 37,
+        "first_differing_char": 383,
+        "baseline_context": "y_usage = []\n        self.gpu_utilization = []\n        self.layer_activation_memory = []\n        \n    def collect_batch_metrics(self, model_output, target, batch_start_time, layer_activations=None):\n ",
+        "candidate_context": "y_usage = []\n        self.gpu_utilization = []\n        self.per_layer_activation_memory = []\n        \n    def collect_batch_metrics(self, model_output, target, batch_start_time, layer_activations=None"
+      },
+      {
+        "request_index": 38,
+        "first_differing_char": 383,
+        "baseline_context": "y_usage = []\n        self.gpu_utilization = []\n        self.layer_activation_memory = []\n        \n    def collect_batch_metrics(self, model_output, target, batch_start_time, layer_activations=None):\n ",
+        "candidate_context": "y_usage = []\n        self.gpu_utilization = []\n        self.per_layer_activation_memory = []\n        \n    def collect_batch_metrics(self, model_output, target, batch_start_time, layer_activations=None"
+      }
+    ],
+    "requests": 80,
+    "scope": "Decoded text comparison; not an accuracy evaluation or exact token-ID assertion"
+  },
+  {
+    "mode": "full-global",
+    "scenario": "repeat-cold",
+    "concurrency": 1,
+    "round": 3,
+    "mismatch_indices": [
+      19,
+      33,
+      34,
+      45
+    ],
+    "examples": [
+      {
+        "request_index": 19,
+        "first_differing_char": 495,
+        "baseline_context": "t_batch_metrics(self, model_output, target, batch_start_time, layer_activations=None):\n        \"\"\"\n        Collects performance",
+        "candidate_context": "t_batch_metrics(self, model_output, target, batch_start_time):\n        \"\"\"\n        Collects performance metrics for each training batch"
+      },
+      {
+        "request_index": 33,
+        "first_differing_char": 383,
+        "baseline_context": "y_usage = []\n        self.gpu_utilization = []\n        self.layer_activation_memory = []\n        \n    def collect_batch_metrics(self, model_output, target, batch_start_time, layer_activations=None):\n ",
+        "candidate_context": "y_usage = []\n        self.gpu_utilization = []\n        self.per_layer_activation_memory = []\n        \n    def collect_batch_metrics(self, model_output, target, batch_start_time, layer_activations=None"
+      },
+      {
+        "request_index": 34,
+        "first_differing_char": 383,
+        "baseline_context": "y_usage = []\n        self.gpu_utilization = []\n        self.layer_activation_memory = []\n        \n    def collect_batch_metrics(self, model_output, target, batch_start_time, layer_activations=None):\n ",
+        "candidate_context": "y_usage = []\n        self.gpu_utilization = []\n        self.per_layer_activation_memory = []\n        \n    def collect_batch_metrics(self, model_output, target, batch_start_time, layer_activations=None"
+      }
+    ],
+    "requests": 80,
+    "scope": "Decoded text comparison; not an accuracy evaluation or exact token-ID assertion"
+  },
+  {
+    "mode": "split-global",
+    "scenario": "repeat-cold",
+    "concurrency": 1,
+    "round": 1,
+    "mismatch_indices": [
+      9,
+      34,
+      49,
+      53,
+      60
+    ],
+    "examples": [
+      {
+        "request_index": 9,
+        "first_differing_char": 383,
+        "baseline_context": "y_usage = []\n        self.gpu_utilization = []\n        self.layer_activation_memory = []\n        \n    def collect_batch_metrics(self, model_output, target, batch_start_time, layer_activations=None):\n ",
+        "candidate_context": "y_usage = []\n        self.gpu_utilization = []\n        self.per_layer_activation_memory = []\n        \n    def collect_batch_metrics(self, model_output, target, batch_start_time, layer_activations=None"
+      },
+      {
+        "request_index": 34,
+        "first_differing_char": 358,
+        "baseline_context": "acking_algorithm='probabilistic', \n                           multi_fiber_support=False, volume_fraction_threshold=0.1):\n        \"\"\"\n        Configures fiber tracking parameters for DTI analysis.",
+        "candidate_context": "acking_algorithm='probabilistic', \n                         multi_fiber_support=False, volume_fraction_threshold=0.1):\n        \"\"\"\n        Configures fiber tracking parameters for DTI analysis."
+      },
+      {
+        "request_index": 49,
+        "first_differing_char": 495,
+        "baseline_context": "t_batch_metrics(self, model_output, target, batch_start_time, layer_activations=None):\n        \"\"\"\n        Collects performance",
+        "candidate_context": "t_batch_metrics(self, model_output, target, batch_start_time):\n        \"\"\"\n        Collects performance metrics for each training batch"
+      }
+    ],
+    "requests": 80,
+    "scope": "Decoded text comparison; not an accuracy evaluation or exact token-ID assertion"
+  },
+  {
+    "mode": "split-global",
+    "scenario": "repeat-cold",
+    "concurrency": 1,
+    "round": 2,
+    "mismatch_indices": [
+      31,
+      37,
+      38,
+      41,
+      62
+    ],
+    "examples": [
+      {
+        "request_index": 31,
+        "first_differing_char": 495,
+        "baseline_context": "t_batch_metrics(self, model_output, target, batch_start_time, layer_activations=None):\n        \"\"\"\n        Collects performance",
+        "candidate_context": "t_batch_metrics(self, model_output, target, batch_start_time):\n        \"\"\"\n        Collects performance metrics for each training batch"
+      },
+      {
+        "request_index": 37,
+        "first_differing_char": 383,
+        "baseline_context": "y_usage = []\n        self.gpu_utilization = []\n        self.layer_activation_memory = []\n        \n    def collect_batch_metrics(self, model_output, target, batch_start_time, layer_activations=None):\n ",
+        "candidate_context": "y_usage = []\n        self.gpu_utilization = []\n        self.per_layer_activation_memory = []\n        \n    def collect_batch_metrics(self, model_output, target, batch_start_time, layer_activations=None"
+      },
+      {
+        "request_index": 38,
+        "first_differing_char": 383,
+        "baseline_context": "y_usage = []\n        self.gpu_utilization = []\n        self.layer_activation_memory = []\n        \n    def collect_batch_metrics(self, model_output, target, batch_start_time, layer_activations=None):\n ",
+        "candidate_context": "y_usage = []\n        self.gpu_utilization = []\n        self.per_layer_activation_memory = []\n        \n    def collect_batch_metrics(self, model_output, target, batch_start_time, layer_activations=None"
+      }
+    ],
+    "requests": 80,
+    "scope": "Decoded text comparison; not an accuracy evaluation or exact token-ID assertion"
+  },
+  {
+    "mode": "split-global",
+    "scenario": "repeat-cold",
+    "concurrency": 1,
+    "round": 3,
+    "mismatch_indices": [
+      19,
+      33,
+      34,
+      45
+    ],
+    "examples": [
+      {
+        "request_index": 19,
+        "first_differing_char": 495,
+        "baseline_context": "t_batch_metrics(self, model_output, target, batch_start_time, layer_activations=None):\n        \"\"\"\n        Collects performance",
+        "candidate_context": "t_batch_metrics(self, model_output, target, batch_start_time):\n        \"\"\"\n        Collects performance metrics for each training batch"
+      },
+      {
+        "request_index": 33,
+        "first_differing_char": 383,
+        "baseline_context": "y_usage = []\n        self.gpu_utilization = []\n        self.layer_activation_memory = []\n        \n    def collect_batch_metrics(self, model_output, target, batch_start_time, layer_activations=None):\n ",
+        "candidate_context": "y_usage = []\n        self.gpu_utilization = []\n        self.per_layer_activation_memory = []\n        \n    def collect_batch_metrics(self, model_output, target, batch_start_time, layer_activations=None"
+      },
+      {
+        "request_index": 34,
+        "first_differing_char": 383,
+        "baseline_context": "y_usage = []\n        self.gpu_utilization = []\n        self.layer_activation_memory = []\n        \n    def collect_batch_metrics(self, model_output, target, batch_start_time, layer_activations=None):\n ",
+        "candidate_context": "y_usage = []\n        self.gpu_utilization = []\n        self.per_layer_activation_memory = []\n        \n    def collect_batch_metrics(self, model_output, target, batch_start_time, layer_activations=None"
+      }
+    ],
+    "requests": 80,
+    "scope": "Decoded text comparison; not an accuracy evaluation or exact token-ID assertion"
+  },
+  {
+    "mode": "split-off",
+    "scenario": "repeat-cold",
+    "concurrency": 1,
+    "round": 1,
+    "mismatch_indices": [],
+    "examples": [],
+    "requests": 80,
+    "scope": "Decoded text comparison; not an accuracy evaluation or exact token-ID assertion"
+  },
+  {
+    "mode": "split-off",
+    "scenario": "repeat-cold",
+    "concurrency": 1,
+    "round": 2,
+    "mismatch_indices": [],
+    "examples": [],
+    "requests": 80,
+    "scope": "Decoded text comparison; not an accuracy evaluation or exact token-ID assertion"
+  },
+  {
+    "mode": "split-off",
+    "scenario": "repeat-cold",
+    "concurrency": 1,
+    "round": 3,
+    "mismatch_indices": [],
+    "examples": [],
+    "requests": 80,
+    "scope": "Decoded text comparison; not an accuracy evaluation or exact token-ID assertion"
+  },
+  {
+    "mode": "full-global",
+    "scenario": "repeat-cold",
+    "concurrency": 4,
+    "round": 1,
+    "mismatch_indices": [
+      15,
+      20,
+      24,
+      27,
+      31,
+      33,
+      35,
+      38,
+      39,
+      44,
+      46,
+      48,
+      49,
+      51,
+      52,
+      54,
+      59,
+      70,
+      71,
+      75,
+      76
+    ],
+    "examples": [
+      {
+        "request_index": 15,
+        "first_differing_char": 358,
+        "baseline_context": "acking_algorithm='probabilistic', \n                           multi_fiber_support=False, volume_fraction_threshold=0.1):\n        \"\"\"\n        Configures fiber tracking parameters for DTI analysis.",
+        "candidate_context": "acking_algorithm='probabilistic', \n                         multi_fiber_support=False, volume_fraction_threshold=0.1):\n        \"\"\"\n        Configures fiber tracking parameters for DTI analysis."
+      },
+      {
+        "request_index": 20,
+        "first_differing_char": 325,
+        "baseline_context": "OIN = \"join\"\n    MANAGE = \"manage\"\n\n@dataclass\nclass ChannelConfig:\n    identifier: str\n    display_name: str\n    channel_type: ChannelType\n    validator: Callable\n    permissions: Dict[PermissionType",
+        "candidate_context": "OIN = \"join\"\n    MANAGE = \"manage\"\n\n@dataclass\nclass ChannelPermission:\n    role_id: str\n    permissions: List[PermissionType]\n\n@dataclass\nclass ChannelConfig:\n    identifier: str\n    display_name: st"
+      },
+      {
+        "request_index": 24,
+        "first_differing_char": 59,
+        "baseline_context": "```python\nfrom datetime import datetime\nfrom typing import Dict, List, Tuple, Any\n\nclass TaskManagementService:\n    def __init__(self, db_session, logger):\n        self.db = db_session\n        self.l",
+        "candidate_context": "```python\nfrom datetime import datetime\nfrom typing import List, Dict, Any\n\nclass TaskManagementService:\n    def __init__(self, db_session, logger):\n        self.db = db_session\n        self.logger ="
+      }
+    ],
+    "requests": 80,
+    "scope": "Decoded text comparison; not an accuracy evaluation or exact token-ID assertion"
+  },
+  {
+    "mode": "full-global",
+    "scenario": "repeat-cold",
+    "concurrency": 4,
+    "round": 2,
+    "mismatch_indices": [
+      11,
+      15,
+      16,
+      17,
+      18,
+      23,
+      28,
+      32,
+      39,
+      40,
+      52,
+      56,
+      59,
+      61,
+      68,
+      69,
+      70,
+      73
+    ],
+    "examples": [
+      {
+        "request_index": 11,
+        "first_differing_char": 372,
+        "baseline_context": " self.critical_threshold = max_pressure * 0.95\n        self.history: List[float] = []\n        self.max_history_size = 100\n\n    def read_pressure(self) -> float:\n        # Simulated pressure reading lo",
+        "candidate_context": " self.critical_threshold = max_pressure * 0.95\n        self.pressure_history: List[float] = []\n        self.max_history_size = 100\n\n    def read_pressure(self) -> float:\n        # Simulated pressure r"
+      },
+      {
+        "request_index": 15,
+        "first_differing_char": 409,
+        "baseline_context": "patterns = {\n            'credit_card': re.compile(r'\\b(?:\\d[ -]*?){13,16}\\b'),\n            'ssn':",
+        "candidate_context": "patterns = {\n            'credit_card': re.compile(r'\\b(?:\\d{4}[-\\s]?){3}\\d{4}\\b'),\n            '"
+      },
+      {
+        "request_index": 16,
+        "first_differing_char": 220,
+        "baseline_context": "ailed metadata.\n    \n    Logs method inputs, outputs, timing information, and memory usage for audit,\n    debugging, and performance monitoring purposes in a financial system.\n    Supports JSON serial",
+        "candidate_context": "ailed metadata.\n    \n    Logs method inputs, outputs, timing, and memory usage for audit and debugging\n    purposes in a financial system. Supports JSON serialization of complex objects.\n    \"\"\"\n    d"
+      }
+    ],
+    "requests": 80,
+    "scope": "Decoded text comparison; not an accuracy evaluation or exact token-ID assertion"
+  },
+  {
+    "mode": "full-global",
+    "scenario": "repeat-cold",
+    "concurrency": 4,
+    "round": 3,
+    "mismatch_indices": [
+      14,
+      15,
+      19,
+      26,
+      27,
+      30,
+      34,
+      38,
+      40,
+      44,
+      45,
+      50,
+      52,
+      58,
+      59,
+      60,
+      61,
+      62,
+      66,
+      69,
+      71,
+      73,
+      79
+    ],
+    "examples": [
+      {
+        "request_index": 14,
+        "first_differing_char": 214,
+        "baseline_context": "OICE = \"voice\"\n    TEXT = \"text\"\n    CATEGORY = \"category\"\n\n@dataclass\nclass ChannelPermissions:\n    view_roles: List[str] = field(default_factory=list)\n    join_roles: List[str] = field(default_facto",
+        "candidate_context": "OICE = \"voice\"\n    TEXT = \"text\"\n    CATEGORY = \"category\"\n\nclass PermissionType(Enum):\n    VIEW = \"view\"\n    JOIN = \"join\"\n    MANAGE = \"manage\"\n\n@dataclass\nclass ChannelConfig:\n    identifier: str\n "
+      },
+      {
+        "request_index": 15,
+        "first_differing_char": 214,
+        "baseline_context": "OICE = \"voice\"\n    TEXT = \"text\"\n    CATEGORY = \"category\"\n\nclass PermissionType(Enum):\n    VIEW = \"view\"\n    JOIN = \"join\"\n    MANAGE = \"manage\"\n\n@dataclass\nclass ChannelConfig:\n    identifier: str\n ",
+        "candidate_context": "OICE = \"voice\"\n    TEXT = \"text\"\n    CATEGORY = \"category\"\n\n@dataclass\nclass ChannelPermissions:\n    view_roles: List[str] = field(default_factory=list)\n    join_roles: List[str] = field(default_facto"
+      },
+      {
+        "request_index": 19,
+        "first_differing_char": 499,
+        "baseline_context": "t_batch_metrics(self, model_output, target, batch_start_time):\n        \"\"\"\n        Collects performance metrics for each training",
+        "candidate_context": "t_batch_metrics(self, model_output, target, batch_start_time, model=None):\n        \"\"\"\n        Collects performance metrics"
+      }
+    ],
+    "requests": 80,
+    "scope": "Decoded text comparison; not an accuracy evaluation or exact token-ID assertion"
+  },
+  {
+    "mode": "split-global",
+    "scenario": "repeat-cold",
+    "concurrency": 4,
+    "round": 1,
+    "mismatch_indices": [
+      15,
+      20,
+      24,
+      27,
+      31,
+      33,
+      35,
+      38,
+      39,
+      44,
+      46,
+      48,
+      49,
+      51,
+      52,
+      59,
+      68,
+      70,
+      71,
+      72,
+      76
+    ],
+    "examples": [
+      {
+        "request_index": 15,
+        "first_differing_char": 358,
+        "baseline_context": "acking_algorithm='probabilistic', \n                           multi_fiber_support=False, volume_fraction_threshold=0.1):\n        \"\"\"\n        Configures fiber tracking parameters for DTI analysis.",
+        "candidate_context": "acking_algorithm='probabilistic', \n                         multi_fiber_support=False, volume_fraction_threshold=0.1):\n        \"\"\"\n        Configures fiber tracking parameters for DTI analysis."
+      },
+      {
+        "request_index": 20,
+        "first_differing_char": 325,
+        "baseline_context": "OIN = \"join\"\n    MANAGE = \"manage\"\n\n@dataclass\nclass ChannelConfig:\n    identifier: str\n    display_name: str\n    channel_type: ChannelType\n    validator: Callable\n    permissions: Dict[PermissionType",
+        "candidate_context": "OIN = \"join\"\n    MANAGE = \"manage\"\n\n@dataclass\nclass ChannelPermission:\n    role_id: str\n    permissions: List[PermissionType]\n\n@dataclass\nclass ChannelConfig:\n    identifier: str\n    display_name: st"
+      },
+      {
+        "request_index": 24,
+        "first_differing_char": 59,
+        "baseline_context": "```python\nfrom datetime import datetime\nfrom typing import Dict, List, Tuple, Any\n\nclass TaskManagementService:\n    def __init__(self, db_session, logger):\n        self.db = db_session\n        self.l",
+        "candidate_context": "```python\nfrom datetime import datetime\nfrom typing import List, Dict, Any\n\nclass TaskManagementService:\n    def __init__(self, db_session, logger):\n        self.db = db_session\n        self.logger ="
+      }
+    ],
+    "requests": 80,
+    "scope": "Decoded text comparison; not an accuracy evaluation or exact token-ID assertion"
+  },
+  {
+    "mode": "split-global",
+    "scenario": "repeat-cold",
+    "concurrency": 4,
+    "round": 2,
+    "mismatch_indices": [
+      11,
+      15,
+      16,
+      17,
+      18,
+      23,
+      28,
+      32,
+      39,
+      40,
+      41,
+      44,
+      52,
+      60,
+      61,
+      65,
+      67,
+      69
+    ],
+    "examples": [
+      {
+        "request_index": 11,
+        "first_differing_char": 372,
+        "baseline_context": " self.critical_threshold = max_pressure * 0.95\n        self.history: List[float] = []\n        self.max_history_size = 100\n\n    def read_pressure(self) -> float:\n        # Simulated pressure reading lo",
+        "candidate_context": " self.critical_threshold = max_pressure * 0.95\n        self.pressure_history: List[float] = []\n        self.max_history_size = 100\n\n    def read_pressure(self) -> float:\n        # Simulated pressure r"
+      },
+      {
+        "request_index": 15,
+        "first_differing_char": 409,
+        "baseline_context": "patterns = {\n            'credit_card': re.compile(r'\\b(?:\\d[ -]*?){13,16}\\b'),\n            'ssn':",
+        "candidate_context": "patterns = {\n            'credit_card': re.compile(r'\\b(?:\\d{4}[-\\s]?){3}\\d{4}\\b'),\n            '"
+      },
+      {
+        "request_index": 16,
+        "first_differing_char": 220,
+        "baseline_context": "ailed metadata.\n    \n    Logs method inputs, outputs, timing information, and memory usage for audit,\n    debugging, and performance monitoring purposes in a financial system.\n    Supports JSON serial",
+        "candidate_context": "ailed metadata.\n    \n    Logs method inputs, outputs, timing, and memory usage for audit and debugging\n    purposes in a financial system. Supports JSON serialization of complex objects.\n    \"\"\"\n    d"
+      }
+    ],
+    "requests": 80,
+    "scope": "Decoded text comparison; not an accuracy evaluation or exact token-ID assertion"
+  },
+  {
+    "mode": "split-global",
+    "scenario": "repeat-cold",
+    "concurrency": 4,
+    "round": 3,
+    "mismatch_indices": [
+      3,
+      5,
+      10,
+      15,
+      30,
+      33,
+      34,
+      44,
+      45,
+      50,
+      52,
+      59,
+      60,
+      62,
+      66,
+      69,
+      71,
+      73
+    ],
+    "examples": [
+      {
+        "request_index": 3,
+        "first_differing_char": 367,
+        "baseline_context": "_amounts = {\n            'USD': 10000.0,\n            'EUR': 9000.0,\n            'GBP': 8000.0,\n            'JPY': ",
+        "candidate_context": "_amounts = {\n            'USD': 10000.0,\n            'EUR': 10000.0,\n            'GBP': 10000.0,\n            'JPY"
+      },
+      {
+        "request_index": 5,
+        "first_differing_char": 53,
+        "baseline_context": "```python\nimport time\nfrom typing import Dict, List, Tuple\n\nclass VacuumSensor:\n    def __init__(self, name: str, max_pressure: float, location: str):\n        self.name = name\n        self.max_",
+        "candidate_context": "```python\nimport time\nfrom typing import Dict, List, Optional\n\nclass VacuumSensor:\n    def __init__(self, name: str, max_pressure: float, location: str):\n        self.name = name\n        self.m"
+      },
+      {
+        "request_index": 10,
+        "first_differing_char": 53,
+        "baseline_context": "```python\nimport time\nfrom typing import Dict, List, Optional, Tuple\n\nclass VacuumSensor:\n    def __init__(self, name: str, max_pressure: float, location: str):\n        self.name = name\n       ",
+        "candidate_context": "```python\nimport time\nfrom typing import Dict, List, Tuple\n\nclass VacuumSensor:\n    def __init__(self, name: str, max_pressure: float, location: str):\n        self.name = name\n        self.max_"
+      }
+    ],
+    "requests": 80,
+    "scope": "Decoded text comparison; not an accuracy evaluation or exact token-ID assertion"
+  },
+  {
+    "mode": "split-off",
+    "scenario": "repeat-cold",
+    "concurrency": 4,
+    "round": 1,
+    "mismatch_indices": [
+      20,
+      24,
+      27,
+      31,
+      33,
+      38,
+      39,
+      43,
+      44,
+      46,
+      48,
+      49,
+      51,
+      52,
+      54,
+      59,
+      60,
+      66,
+      68,
+      71,
+      75,
+      76
+    ],
+    "examples": [
+      {
+        "request_index": 20,
+        "first_differing_char": 325,
+        "baseline_context": "OIN = \"join\"\n    MANAGE = \"manage\"\n\n@dataclass\nclass ChannelConfig:\n    identifier: str\n    display_name: str\n    channel_type: ChannelType\n    validator: Callable\n    permissions: Dict[PermissionType",
+        "candidate_context": "OIN = \"join\"\n    MANAGE = \"manage\"\n\n@dataclass\nclass ChannelPermission:\n    role_id: str\n    permissions: List[PermissionType]\n\n@dataclass\nclass ChannelConfig:\n    identifier: str\n    display_name: st"
+      },
+      {
+        "request_index": 24,
+        "first_differing_char": 10,
+        "baseline_context": "```python\nfrom datetime import datetime\nfrom typing import Dict, List, Tuple, Any\n\nclass TaskManagementService:\n    def __init__(self, db_session, log",
+        "candidate_context": "```python\nimport datetime\nfrom collections import defaultdict\n\nclass TaskManagementService:\n    def __init__(self, db_session, logger):\n        self.d"
+      },
+      {
+        "request_index": 27,
+        "first_differing_char": 379,
+        "baseline_context": " self.critical_threshold = max_pressure * 0.95\n        self.pressure_history: List[Tuple[float, float]] = []  # (timestamp, pressure)\n        self.max_history_size = 100\n\n    def read",
+        "candidate_context": " self.critical_threshold = max_pressure * 0.95\n        self.history: List[Tuple[float, float]] = []  # (timestamp, pressure)\n        self.max_history_size = 100\n\n    def read_pressure(self"
+      }
+    ],
+    "requests": 80,
+    "scope": "Decoded text comparison; not an accuracy evaluation or exact token-ID assertion"
+  },
+  {
+    "mode": "split-off",
+    "scenario": "repeat-cold",
+    "concurrency": 4,
+    "round": 2,
+    "mismatch_indices": [
+      30,
+      34,
+      40,
+      44,
+      52,
+      56,
+      59,
+      60,
+      61,
+      69,
+      73
+    ],
+    "examples": [
+      {
+        "request_index": 30,
+        "first_differing_char": 281,
+        "baseline_context": "3.resource('s3', region_name=aws_region)\n        \n        # Define patterns for sensitive data detection\n        self.sensitive_patterns = {\n            'credit_card': re.compile(r'\\b(?:\\d{4}[-\\s]?){3",
+        "candidate_context": "3.resource('s3', region_name=aws_region)\n        \n        # Patterns for sensitive data detection\n        self.sensitive_patterns = {\n            'credit_card': re.compile(r'\\b(?:\\d{4}[-\\s]?){3}\\d{4}\\"
+      },
+      {
+        "request_index": 34,
+        "first_differing_char": 288,
+        "baseline_context": "   metadata: Dict[str, Any]\n\nclass RealEstatePredictor:\n    def __init__(self, model_name: str, logger: logging.Logger):\n        self.model_name = model_name\n        self.logger = logger\n        self.",
+        "candidate_context": "   metadata: Dict[str, Any]\n\nclass RealEstatePredictor:\n    # Seasonal multipliers for Northern Hemisphere (Month 1-12)\n    # Jan: Low, Feb: Low, Mar: Rising, Apr: High, May: High, Jun: Peak,\n    # Ju"
+      },
+      {
+        "request_index": 40,
+        "first_differing_char": 281,
+        "baseline_context": "3.resource('s3', region_name=aws_region)\n        \n        # Define patterns for sensitive data detection\n        self.sensitive_patterns = {\n            'credit_card': re.compile(r'\\b(?:\\d[ -]*?){13,1",
+        "candidate_context": "3.resource('s3', region_name=aws_region)\n        \n        # Patterns for sensitive data detection\n        self.sensitive_patterns = {\n            'credit_card': re.compile(r'\\b(?:\\d{4}[-\\s]?){3}\\d{4}\\"
+      }
+    ],
+    "requests": 80,
+    "scope": "Decoded text comparison; not an accuracy evaluation or exact token-ID assertion"
+  },
+  {
+    "mode": "split-off",
+    "scenario": "repeat-cold",
+    "concurrency": 4,
+    "round": 3,
+    "mismatch_indices": [
+      3,
+      5,
+      14,
+      15,
+      16,
+      24,
+      26,
+      34,
+      38,
+      40,
+      44,
+      48,
+      52,
+      58,
+      59,
+      62,
+      66,
+      71,
+      73,
+      79
+    ],
+    "examples": [
+      {
+        "request_index": 3,
+        "first_differing_char": 367,
+        "baseline_context": "_amounts = {\n            'USD': 10000.0,\n            'EUR': 9000.0,\n            'GBP': 8000.0,\n            'JPY': ",
+        "candidate_context": "_amounts = {\n            'USD': 10000.0,\n            'EUR': 10000.0,\n            'GBP': 10000.0,\n            'JPY"
+      },
+      {
+        "request_index": 5,
+        "first_differing_char": 53,
+        "baseline_context": "```python\nimport time\nfrom typing import Dict, List, Tuple\n\nclass VacuumSensor:\n    def __init__(self, name: str, max_pressure: float, location: str):\n        self.name = name\n        self.max_",
+        "candidate_context": "```python\nimport time\nfrom typing import Dict, List, Optional\n\nclass VacuumSensor:\n    def __init__(self, name: str, max_pressure: float, location: str):\n        self.name = name\n        self.m"
+      },
+      {
+        "request_index": 14,
+        "first_differing_char": 214,
+        "baseline_context": "OICE = \"voice\"\n    TEXT = \"text\"\n    CATEGORY = \"category\"\n\n@dataclass\nclass ChannelPermissions:\n    view_roles: List[str] = field(default_factory=list)\n    join_roles: List[str] = field(default_facto",
+        "candidate_context": "OICE = \"voice\"\n    TEXT = \"text\"\n    CATEGORY = \"category\"\n\nclass PermissionType(Enum):\n    VIEW = \"view\"\n    JOIN = \"join\"\n    MANAGE = \"manage\"\n\n@dataclass\nclass ChannelPermission:\n    permission_ty"
+      }
+    ],
+    "requests": 80,
+    "scope": "Decoded text comparison; not an accuracy evaluation or exact token-ID assertion"
+  },
+  {
+    "mode": "full-global",
+    "scenario": "repeat-warm",
+    "concurrency": 1,
+    "round": 1,
+    "mismatch_indices": [
+      3,
+      9,
+      34,
+      49,
+      53,
+      60
+    ],
+    "examples": [
+      {
+        "request_index": 3,
+        "first_differing_char": 383,
+        "baseline_context": "y_usage = []\n        self.gpu_utilization = []\n        self.layer_activation_memory = []\n        \n    def collect_batch_metrics(self, model_output, target, batch_start_time, layer_activations=None):\n ",
+        "candidate_context": "y_usage = []\n        self.gpu_utilization = []\n        self.per_layer_activation_memory = []\n        \n    def collect_batch_metrics(self, model_output, target, batch_start_time, layer_activations=None"
+      },
+      {
+        "request_index": 9,
+        "first_differing_char": 383,
+        "baseline_context": "y_usage = []\n        self.gpu_utilization = []\n        self.layer_activation_memory = []\n        \n    def collect_batch_metrics(self, model_output, target, batch_start_time, layer_activations=None):\n ",
+        "candidate_context": "y_usage = []\n        self.gpu_utilization = []\n        self.per_layer_activation_memory = []\n        \n    def collect_batch_metrics(self, model_output, target, batch_start_time, layer_activations=None"
+      },
+      {
+        "request_index": 34,
+        "first_differing_char": 358,
+        "baseline_context": "acking_algorithm='probabilistic', \n                           multi_fiber_support=False, volume_fraction_threshold=0.1):\n        \"\"\"\n        Configures fiber tracking parameters for DTI analysis.",
+        "candidate_context": "acking_algorithm='probabilistic', \n                         multi_fiber_support=False, volume_fraction_threshold=0.1):\n        \"\"\"\n        Configures fiber tracking parameters for DTI analysis."
+      }
+    ],
+    "requests": 80,
+    "scope": "Decoded text comparison; not an accuracy evaluation or exact token-ID assertion"
+  },
+  {
+    "mode": "full-global",
+    "scenario": "repeat-warm",
+    "concurrency": 1,
+    "round": 2,
+    "mismatch_indices": [
+      31,
+      37,
+      38,
+      41,
+      62
+    ],
+    "examples": [
+      {
+        "request_index": 31,
+        "first_differing_char": 495,
+        "baseline_context": "t_batch_metrics(self, model_output, target, batch_start_time, layer_activations=None):\n        \"\"\"\n        Collects performance",
+        "candidate_context": "t_batch_metrics(self, model_output, target, batch_start_time):\n        \"\"\"\n        Collects performance metrics for each training batch"
+      },
+      {
+        "request_index": 37,
+        "first_differing_char": 383,
+        "baseline_context": "y_usage = []\n        self.gpu_utilization = []\n        self.layer_activation_memory = []\n        \n    def collect_batch_metrics(self, model_output, target, batch_start_time, layer_activations=None):\n ",
+        "candidate_context": "y_usage = []\n        self.gpu_utilization = []\n        self.per_layer_activation_memory = []\n        \n    def collect_batch_metrics(self, model_output, target, batch_start_time, layer_activations=None"
+      },
+      {
+        "request_index": 38,
+        "first_differing_char": 383,
+        "baseline_context": "y_usage = []\n        self.gpu_utilization = []\n        self.layer_activation_memory = []\n        \n    def collect_batch_metrics(self, model_output, target, batch_start_time, layer_activations=None):\n ",
+        "candidate_context": "y_usage = []\n        self.gpu_utilization = []\n        self.per_layer_activation_memory = []\n        \n    def collect_batch_metrics(self, model_output, target, batch_start_time, layer_activations=None"
+      }
+    ],
+    "requests": 80,
+    "scope": "Decoded text comparison; not an accuracy evaluation or exact token-ID assertion"
+  },
+  {
+    "mode": "full-global",
+    "scenario": "repeat-warm",
+    "concurrency": 1,
+    "round": 3,
+    "mismatch_indices": [
+      19,
+      33,
+      34,
+      45
+    ],
+    "examples": [
+      {
+        "request_index": 19,
+        "first_differing_char": 495,
+        "baseline_context": "t_batch_metrics(self, model_output, target, batch_start_time, layer_activations=None):\n        \"\"\"\n        Collects performance",
+        "candidate_context": "t_batch_metrics(self, model_output, target, batch_start_time):\n        \"\"\"\n        Collects performance metrics for each training batch"
+      },
+      {
+        "request_index": 33,
+        "first_differing_char": 383,
+        "baseline_context": "y_usage = []\n        self.gpu_utilization = []\n        self.layer_activation_memory = []\n        \n    def collect_batch_metrics(self, model_output, target, batch_start_time, layer_activations=None):\n ",
+        "candidate_context": "y_usage = []\n        self.gpu_utilization = []\n        self.per_layer_activation_memory = []\n        \n    def collect_batch_metrics(self, model_output, target, batch_start_time, layer_activations=None"
+      },
+      {
+        "request_index": 34,
+        "first_differing_char": 383,
+        "baseline_context": "y_usage = []\n        self.gpu_utilization = []\n        self.layer_activation_memory = []\n        \n    def collect_batch_metrics(self, model_output, target, batch_start_time, layer_activations=None):\n ",
+        "candidate_context": "y_usage = []\n        self.gpu_utilization = []\n        self.per_layer_activation_memory = []\n        \n    def collect_batch_metrics(self, model_output, target, batch_start_time, layer_activations=None"
+      }
+    ],
+    "requests": 80,
+    "scope": "Decoded text comparison; not an accuracy evaluation or exact token-ID assertion"
+  },
+  {
+    "mode": "split-global",
+    "scenario": "repeat-warm",
+    "concurrency": 1,
+    "round": 1,
+    "mismatch_indices": [
+      3,
+      9,
+      34,
+      49,
+      53,
+      60
+    ],
+    "examples": [
+      {
+        "request_index": 3,
+        "first_differing_char": 383,
+        "baseline_context": "y_usage = []\n        self.gpu_utilization = []\n        self.layer_activation_memory = []\n        \n    def collect_batch_metrics(self, model_output, target, batch_start_time, layer_activations=None):\n ",
+        "candidate_context": "y_usage = []\n        self.gpu_utilization = []\n        self.per_layer_activation_memory = []\n        \n    def collect_batch_metrics(self, model_output, target, batch_start_time, layer_activations=None"
+      },
+      {
+        "request_index": 9,
+        "first_differing_char": 383,
+        "baseline_context": "y_usage = []\n        self.gpu_utilization = []\n        self.layer_activation_memory = []\n        \n    def collect_batch_metrics(self, model_output, target, batch_start_time, layer_activations=None):\n ",
+        "candidate_context": "y_usage = []\n        self.gpu_utilization = []\n        self.per_layer_activation_memory = []\n        \n    def collect_batch_metrics(self, model_output, target, batch_start_time, layer_activations=None"
+      },
+      {
+        "request_index": 34,
+        "first_differing_char": 358,
+        "baseline_context": "acking_algorithm='probabilistic', \n                           multi_fiber_support=False, volume_fraction_threshold=0.1):\n        \"\"\"\n        Configures fiber tracking parameters for DTI analysis.",
+        "candidate_context": "acking_algorithm='probabilistic', \n                         multi_fiber_support=False, volume_fraction_threshold=0.1):\n        \"\"\"\n        Configures fiber tracking parameters for DTI analysis."
+      }
+    ],
+    "requests": 80,
+    "scope": "Decoded text comparison; not an accuracy evaluation or exact token-ID assertion"
+  },
+  {
+    "mode": "split-global",
+    "scenario": "repeat-warm",
+    "concurrency": 1,
+    "round": 2,
+    "mismatch_indices": [
+      31,
+      37,
+      38,
+      41,
+      62
+    ],
+    "examples": [
+      {
+        "request_index": 31,
+        "first_differing_char": 495,
+        "baseline_context": "t_batch_metrics(self, model_output, target, batch_start_time, layer_activations=None):\n        \"\"\"\n        Collects performance",
+        "candidate_context": "t_batch_metrics(self, model_output, target, batch_start_time):\n        \"\"\"\n        Collects performance metrics for each training batch"
+      },
+      {
+        "request_index": 37,
+        "first_differing_char": 383,
+        "baseline_context": "y_usage = []\n        self.gpu_utilization = []\n        self.layer_activation_memory = []\n        \n    def collect_batch_metrics(self, model_output, target, batch_start_time, layer_activations=None):\n ",
+        "candidate_context": "y_usage = []\n        self.gpu_utilization = []\n        self.per_layer_activation_memory = []\n        \n    def collect_batch_metrics(self, model_output, target, batch_start_time, layer_activations=None"
+      },
+      {
+        "request_index": 38,
+        "first_differing_char": 383,
+        "baseline_context": "y_usage = []\n        self.gpu_utilization = []\n        self.layer_activation_memory = []\n        \n    def collect_batch_metrics(self, model_output, target, batch_start_time, layer_activations=None):\n ",
+        "candidate_context": "y_usage = []\n        self.gpu_utilization = []\n        self.per_layer_activation_memory = []\n        \n    def collect_batch_metrics(self, model_output, target, batch_start_time, layer_activations=None"
+      }
+    ],
+    "requests": 80,
+    "scope": "Decoded text comparison; not an accuracy evaluation or exact token-ID assertion"
+  },
+  {
+    "mode": "split-global",
+    "scenario": "repeat-warm",
+    "concurrency": 1,
+    "round": 3,
+    "mismatch_indices": [
+      19,
+      33,
+      34,
+      45
+    ],
+    "examples": [
+      {
+        "request_index": 19,
+        "first_differing_char": 495,
+        "baseline_context": "t_batch_metrics(self, model_output, target, batch_start_time, layer_activations=None):\n        \"\"\"\n        Collects performance",
+        "candidate_context": "t_batch_metrics(self, model_output, target, batch_start_time):\n        \"\"\"\n        Collects performance metrics for each training batch"
+      },
+      {
+        "request_index": 33,
+        "first_differing_char": 383,
+        "baseline_context": "y_usage = []\n        self.gpu_utilization = []\n        self.layer_activation_memory = []\n        \n    def collect_batch_metrics(self, model_output, target, batch_start_time, layer_activations=None):\n ",
+        "candidate_context": "y_usage = []\n        self.gpu_utilization = []\n        self.per_layer_activation_memory = []\n        \n    def collect_batch_metrics(self, model_output, target, batch_start_time, layer_activations=None"
+      },
+      {
+        "request_index": 34,
+        "first_differing_char": 383,
+        "baseline_context": "y_usage = []\n        self.gpu_utilization = []\n        self.layer_activation_memory = []\n        \n    def collect_batch_metrics(self, model_output, target, batch_start_time, layer_activations=None):\n ",
+        "candidate_context": "y_usage = []\n        self.gpu_utilization = []\n        self.per_layer_activation_memory = []\n        \n    def collect_batch_metrics(self, model_output, target, batch_start_time, layer_activations=None"
+      }
+    ],
+    "requests": 80,
+    "scope": "Decoded text comparison; not an accuracy evaluation or exact token-ID assertion"
+  },
+  {
+    "mode": "split-off",
+    "scenario": "repeat-warm",
+    "concurrency": 1,
+    "round": 1,
+    "mismatch_indices": [],
+    "examples": [],
+    "requests": 80,
+    "scope": "Decoded text comparison; not an accuracy evaluation or exact token-ID assertion"
+  },
+  {
+    "mode": "split-off",
+    "scenario": "repeat-warm",
+    "concurrency": 1,
+    "round": 2,
+    "mismatch_indices": [],
+    "examples": [],
+    "requests": 80,
+    "scope": "Decoded text comparison; not an accuracy evaluation or exact token-ID assertion"
+  },
+  {
+    "mode": "split-off",
+    "scenario": "repeat-warm",
+    "concurrency": 1,
+    "round": 3,
+    "mismatch_indices": [],
+    "examples": [],
+    "requests": 80,
+    "scope": "Decoded text comparison; not an accuracy evaluation or exact token-ID assertion"
+  },
+  {
+    "mode": "full-global",
+    "scenario": "repeat-warm",
+    "concurrency": 4,
+    "round": 1,
+    "mismatch_indices": [
+      8,
+      15,
+      20,
+      24,
+      27,
+      29,
+      31,
+      33,
+      34,
+      35,
+      38,
+      39,
+      44,
+      46,
+      48,
+      49,
+      51,
+      52,
+      59,
+      68,
+      71,
+      72,
+      74,
+      76
+    ],
+    "examples": [
+      {
+        "request_index": 8,
+        "first_differing_char": 409,
+        "baseline_context": "patterns = {\n            'credit_card': re.compile(r'\\b(?:\\d[ -]*?){13,16}\\b'),\n            'ssn':",
+        "candidate_context": "patterns = {\n            'credit_card': re.compile(r'\\b(?:\\d{4}[-\\s]?){3}\\d{4}\\b'),\n            '"
+      },
+      {
+        "request_index": 15,
+        "first_differing_char": 358,
+        "baseline_context": "acking_algorithm='probabilistic', \n                           multi_fiber_support=False, volume_fraction_threshold=0.1):\n        \"\"\"\n        Configures fiber tracking parameters for DTI analysis.",
+        "candidate_context": "acking_algorithm='probabilistic', \n                         multi_fiber_support=False, volume_fractions=None):\n        \"\"\"\n        Configures fiber tracking parameters for DTI analysis.\n        \n"
+      },
+      {
+        "request_index": 20,
+        "first_differing_char": 214,
+        "baseline_context": "OICE = \"voice\"\n    TEXT = \"text\"\n    CATEGORY = \"category\"\n\nclass PermissionType(Enum):\n    VIEW = \"view\"\n    JOIN = \"join\"\n    MANAGE = \"manage\"\n\n@dataclass\nclass ChannelConfig:\n    identifier: str\n ",
+        "candidate_context": "OICE = \"voice\"\n    TEXT = \"text\"\n    CATEGORY = \"category\"\n\n@dataclass\nclass ChannelPermissions:\n    view_roles: List[str] = field(default_factory=list)\n    join_roles: List[str] = field(default_facto"
+      }
+    ],
+    "requests": 80,
+    "scope": "Decoded text comparison; not an accuracy evaluation or exact token-ID assertion"
+  },
+  {
+    "mode": "full-global",
+    "scenario": "repeat-warm",
+    "concurrency": 4,
+    "round": 2,
+    "mismatch_indices": [
+      1,
+      3,
+      5,
+      11,
+      16,
+      17,
+      18,
+      19,
+      23,
+      28,
+      32,
+      37,
+      38,
+      39,
+      40,
+      41,
+      43,
+      44,
+      52,
+      56,
+      59,
+      61,
+      62,
+      65,
+      67,
+      68,
+      69,
+      70
+    ],
+    "examples": [
+      {
+        "request_index": 1,
+        "first_differing_char": 393,
+        "baseline_context": "patterns = {\n            'credit_card': re.compile(r'\\b(?:\\d[ -]*?){13,16}\\b'),\n            'ssn': re.compile",
+        "candidate_context": "patterns = {\n            'credit_card': re.compile(r'\\b(?:\\d{4}[-\\s]?){3}\\d{4}\\b'),\n            'ssn"
+      },
+      {
+        "request_index": 3,
+        "first_differing_char": 468,
+        "baseline_context": "at]] = []  # (timestamp, pressure)\n        self.max_history_length = 100\n\n    def read_pressure(self",
+        "candidate_context": "at]] = []  # (timestamp, pressure)\n        self.max_history_size = 100\n\n    def read_pressure(self"
+      },
+      {
+        "request_index": 5,
+        "first_differing_char": 74,
+        "baseline_context": " datetime import datetime\nfrom typing import List, Dict, Any, Tuple\n\nclass TaskManagementService:\n    def __init__(self, db_session, logger):\n        self.db = db_session\n        self.logger = logger\n",
+        "candidate_context": " datetime import datetime\nfrom typing import List, Dict, Any\n\nclass TaskManagementService:\n    def __init__(self, db_session, logger):\n        self.db = db_session\n        self.logger = logger\n\n    de"
+      }
+    ],
+    "requests": 80,
+    "scope": "Decoded text comparison; not an accuracy evaluation or exact token-ID assertion"
+  },
+  {
+    "mode": "full-global",
+    "scenario": "repeat-warm",
+    "concurrency": 4,
+    "round": 3,
+    "mismatch_indices": [
+      0,
+      5,
+      10,
+      14,
+      15,
+      16,
+      24,
+      26,
+      30,
+      33,
+      34,
+      38,
+      44,
+      45,
+      47,
+      50,
+      52,
+      58,
+      59,
+      60,
+      61,
+      62,
+      66,
+      69,
+      71,
+      72,
+      73
+    ],
+    "examples": [
+      {
+        "request_index": 0,
+        "first_differing_char": 409,
+        "baseline_context": "patterns = {\n            'credit_card': re.compile(r'\\b(?:\\d[ -]*?){13,16}\\b'),\n            'ssn':",
+        "candidate_context": "patterns = {\n            'credit_card': re.compile(r'\\b(?:\\d{4}[-\\s]?){3}\\d{4}\\b'),\n            '"
+      },
+      {
+        "request_index": 5,
+        "first_differing_char": 459,
+        "baseline_context": "at]] = []  # (timestamp, pressure)\n        self.max_history_size = 100\n\n    def read_pressure(self) ->",
+        "candidate_context": "at]] = []  # (timestamp, pressure)\n        self.max_history_length = 100\n\n    def read_pressure(self) ->"
+      },
+      {
+        "request_index": 10,
+        "first_differing_char": 53,
+        "baseline_context": "```python\nimport time\nfrom typing import Dict, List, Optional, Tuple\n\nclass VacuumSensor:\n    def __init__(self, name: str, max_pressure: float, location: str):\n        self.name = name\n       ",
+        "candidate_context": "```python\nimport time\nfrom typing import Dict, List, Tuple\n\nclass VacuumSensor:\n    def __init__(self, name: str, max_pressure: float, location: str):\n        self.name = name\n        self.max_"
+      }
+    ],
+    "requests": 80,
+    "scope": "Decoded text comparison; not an accuracy evaluation or exact token-ID assertion"
+  },
+  {
+    "mode": "split-global",
+    "scenario": "repeat-warm",
+    "concurrency": 4,
+    "round": 1,
+    "mismatch_indices": [
+      8,
+      15,
+      20,
+      24,
+      27,
+      31,
+      33,
+      34,
+      35,
+      38,
+      39,
+      44,
+      46,
+      48,
+      49,
+      51,
+      52,
+      54,
+      59,
+      66,
+      68,
+      71,
+      74,
+      76
+    ],
+    "examples": [
+      {
+        "request_index": 8,
+        "first_differing_char": 409,
+        "baseline_context": "patterns = {\n            'credit_card': re.compile(r'\\b(?:\\d[ -]*?){13,16}\\b'),\n            'ssn':",
+        "candidate_context": "patterns = {\n            'credit_card': re.compile(r'\\b(?:\\d{4}[-\\s]?){3}\\d{4}\\b'),\n            '"
+      },
+      {
+        "request_index": 15,
+        "first_differing_char": 358,
+        "baseline_context": "acking_algorithm='probabilistic', \n                           multi_fiber_support=False, volume_fraction_threshold=0.1):\n        \"\"\"\n        Configures fiber tracking parameters for DTI analysis.",
+        "candidate_context": "acking_algorithm='probabilistic', \n                         multi_fiber_support=False, volume_fractions=None):\n        \"\"\"\n        Configures fiber tracking parameters for DTI analysis.\n        \n"
+      },
+      {
+        "request_index": 20,
+        "first_differing_char": 214,
+        "baseline_context": "OICE = \"voice\"\n    TEXT = \"text\"\n    CATEGORY = \"category\"\n\nclass PermissionType(Enum):\n    VIEW = \"view\"\n    JOIN = \"join\"\n    MANAGE = \"manage\"\n\n@dataclass\nclass ChannelConfig:\n    identifier: str\n ",
+        "candidate_context": "OICE = \"voice\"\n    TEXT = \"text\"\n    CATEGORY = \"category\"\n\n@dataclass\nclass ChannelPermissions:\n    view_roles: List[str] = field(default_factory=list)\n    join_roles: List[str] = field(default_facto"
+      }
+    ],
+    "requests": 80,
+    "scope": "Decoded text comparison; not an accuracy evaluation or exact token-ID assertion"
+  },
+  {
+    "mode": "split-global",
+    "scenario": "repeat-warm",
+    "concurrency": 4,
+    "round": 2,
+    "mismatch_indices": [
+      1,
+      3,
+      5,
+      11,
+      16,
+      17,
+      18,
+      19,
+      23,
+      28,
+      32,
+      37,
+      39,
+      44,
+      52,
+      56,
+      59,
+      61,
+      65,
+      67,
+      68,
+      69,
+      70
+    ],
+    "examples": [
+      {
+        "request_index": 1,
+        "first_differing_char": 393,
+        "baseline_context": "patterns = {\n            'credit_card': re.compile(r'\\b(?:\\d[ -]*?){13,16}\\b'),\n            'ssn': re.compile",
+        "candidate_context": "patterns = {\n            'credit_card': re.compile(r'\\b(?:\\d{4}[-\\s]?){3}\\d{4}\\b'),\n            'ssn"
+      },
+      {
+        "request_index": 3,
+        "first_differing_char": 468,
+        "baseline_context": "at]] = []  # (timestamp, pressure)\n        self.max_history_length = 100\n\n    def read_pressure(self",
+        "candidate_context": "at]] = []  # (timestamp, pressure)\n        self.max_history_size = 100\n\n    def read_pressure(self"
+      },
+      {
+        "request_index": 5,
+        "first_differing_char": 74,
+        "baseline_context": " datetime import datetime\nfrom typing import List, Dict, Any, Tuple\n\nclass TaskManagementService:\n    def __init__(self, db_session, logger):\n        self.db = db_session\n        self.logger = logger\n",
+        "candidate_context": " datetime import datetime\nfrom typing import List, Dict, Any\n\nclass TaskManagementService:\n    def __init__(self, db_session, logger):\n        self.db = db_session\n        self.logger = logger\n\n    de"
+      }
+    ],
+    "requests": 80,
+    "scope": "Decoded text comparison; not an accuracy evaluation or exact token-ID assertion"
+  },
+  {
+    "mode": "split-global",
+    "scenario": "repeat-warm",
+    "concurrency": 4,
+    "round": 3,
+    "mismatch_indices": [
+      0,
+      5,
+      10,
+      14,
+      15,
+      16,
+      26,
+      30,
+      34,
+      40,
+      44,
+      45,
+      47,
+      48,
+      50,
+      52,
+      58,
+      59,
+      60,
+      61,
+      62,
+      66,
+      69,
+      71,
+      73
+    ],
+    "examples": [
+      {
+        "request_index": 0,
+        "first_differing_char": 409,
+        "baseline_context": "patterns = {\n            'credit_card': re.compile(r'\\b(?:\\d[ -]*?){13,16}\\b'),\n            'ssn':",
+        "candidate_context": "patterns = {\n            'credit_card': re.compile(r'\\b(?:\\d{4}[-\\s]?){3}\\d{4}\\b'),\n            '"
+      },
+      {
+        "request_index": 5,
+        "first_differing_char": 459,
+        "baseline_context": "at]] = []  # (timestamp, pressure)\n        self.max_history_size = 100\n\n    def read_pressure(self) ->",
+        "candidate_context": "at]] = []  # (timestamp, pressure)\n        self.max_history_length = 100\n\n    def read_pressure(self) ->"
+      },
+      {
+        "request_index": 10,
+        "first_differing_char": 53,
+        "baseline_context": "```python\nimport time\nfrom typing import Dict, List, Optional, Tuple\n\nclass VacuumSensor:\n    def __init__(self, name: str, max_pressure: float, location: str):\n        self.name = name\n       ",
+        "candidate_context": "```python\nimport time\nfrom typing import Dict, List, Tuple\n\nclass VacuumSensor:\n    def __init__(self, name: str, max_pressure: float, location: str):\n        self.name = name\n        self.max_"
+      }
+    ],
+    "requests": 80,
+    "scope": "Decoded text comparison; not an accuracy evaluation or exact token-ID assertion"
+  },
+  {
+    "mode": "split-off",
+    "scenario": "repeat-warm",
+    "concurrency": 4,
+    "round": 1,
+    "mismatch_indices": [
+      20,
+      24,
+      27,
+      31,
+      33,
+      38,
+      39,
+      43,
+      44,
+      46,
+      48,
+      49,
+      51,
+      52,
+      54,
+      59,
+      60,
+      66,
+      68,
+      71,
+      75,
+      76
+    ],
+    "examples": [
+      {
+        "request_index": 20,
+        "first_differing_char": 325,
+        "baseline_context": "OIN = \"join\"\n    MANAGE = \"manage\"\n\n@dataclass\nclass ChannelConfig:\n    identifier: str\n    display_name: str\n    channel_type: ChannelType\n    validator: Callable\n    permissions: Dict[PermissionType",
+        "candidate_context": "OIN = \"join\"\n    MANAGE = \"manage\"\n\n@dataclass\nclass ChannelPermission:\n    role_id: str\n    permissions: List[PermissionType]\n\n@dataclass\nclass ChannelConfig:\n    identifier: str\n    display_name: st"
+      },
+      {
+        "request_index": 24,
+        "first_differing_char": 10,
+        "baseline_context": "```python\nfrom datetime import datetime\nfrom typing import Dict, List, Tuple, Any\n\nclass TaskManagementService:\n    def __init__(self, db_session, log",
+        "candidate_context": "```python\nimport datetime\nfrom collections import defaultdict\n\nclass TaskManagementService:\n    def __init__(self, db_session, logger):\n        self.d"
+      },
+      {
+        "request_index": 27,
+        "first_differing_char": 379,
+        "baseline_context": " self.critical_threshold = max_pressure * 0.95\n        self.pressure_history: List[Tuple[float, float]] = []  # (timestamp, pressure)\n        self.max_history_size = 100\n\n    def read",
+        "candidate_context": " self.critical_threshold = max_pressure * 0.95\n        self.history: List[Tuple[float, float]] = []  # (timestamp, pressure)\n        self.max_history_size = 100\n\n    def read_pressure(self"
+      }
+    ],
+    "requests": 80,
+    "scope": "Decoded text comparison; not an accuracy evaluation or exact token-ID assertion"
+  },
+  {
+    "mode": "split-off",
+    "scenario": "repeat-warm",
+    "concurrency": 4,
+    "round": 2,
+    "mismatch_indices": [
+      30,
+      34,
+      40,
+      44,
+      52,
+      56,
+      59,
+      60,
+      61,
+      69,
+      73
+    ],
+    "examples": [
+      {
+        "request_index": 30,
+        "first_differing_char": 281,
+        "baseline_context": "3.resource('s3', region_name=aws_region)\n        \n        # Define patterns for sensitive data detection\n        self.sensitive_patterns = {\n            'credit_card': re.compile(r'\\b(?:\\d{4}[-\\s]?){3",
+        "candidate_context": "3.resource('s3', region_name=aws_region)\n        \n        # Patterns for sensitive data detection\n        self.sensitive_patterns = {\n            'credit_card': re.compile(r'\\b(?:\\d{4}[-\\s]?){3}\\d{4}\\"
+      },
+      {
+        "request_index": 34,
+        "first_differing_char": 288,
+        "baseline_context": "   metadata: Dict[str, Any]\n\nclass RealEstatePredictor:\n    def __init__(self, model_name: str, logger: logging.Logger):\n        self.model_name = model_name\n        self.logger = logger\n        self.",
+        "candidate_context": "   metadata: Dict[str, Any]\n\nclass RealEstatePredictor:\n    # Seasonal multipliers for Northern Hemisphere (Month 1-12)\n    # Jan: Low, Feb: Low, Mar: Rising, Apr: High, May: High, Jun: Peak,\n    # Ju"
+      },
+      {
+        "request_index": 40,
+        "first_differing_char": 281,
+        "baseline_context": "3.resource('s3', region_name=aws_region)\n        \n        # Define patterns for sensitive data detection\n        self.sensitive_patterns = {\n            'credit_card': re.compile(r'\\b(?:\\d[ -]*?){13,1",
+        "candidate_context": "3.resource('s3', region_name=aws_region)\n        \n        # Patterns for sensitive data detection\n        self.sensitive_patterns = {\n            'credit_card': re.compile(r'\\b(?:\\d{4}[-\\s]?){3}\\d{4}\\"
+      }
+    ],
+    "requests": 80,
+    "scope": "Decoded text comparison; not an accuracy evaluation or exact token-ID assertion"
+  },
+  {
+    "mode": "split-off",
+    "scenario": "repeat-warm",
+    "concurrency": 4,
+    "round": 3,
+    "mismatch_indices": [
+      3,
+      5,
+      14,
+      15,
+      16,
+      24,
+      26,
+      34,
+      38,
+      40,
+      44,
+      48,
+      52,
+      58,
+      59,
+      62,
+      66,
+      71,
+      73,
+      79
+    ],
+    "examples": [
+      {
+        "request_index": 3,
+        "first_differing_char": 367,
+        "baseline_context": "_amounts = {\n            'USD': 10000.0,\n            'EUR': 9000.0,\n            'GBP': 8000.0,\n            'JPY': ",
+        "candidate_context": "_amounts = {\n            'USD': 10000.0,\n            'EUR': 10000.0,\n            'GBP': 10000.0,\n            'JPY"
+      },
+      {
+        "request_index": 5,
+        "first_differing_char": 53,
+        "baseline_context": "```python\nimport time\nfrom typing import Dict, List, Tuple\n\nclass VacuumSensor:\n    def __init__(self, name: str, max_pressure: float, location: str):\n        self.name = name\n        self.max_",
+        "candidate_context": "```python\nimport time\nfrom typing import Dict, List, Optional\n\nclass VacuumSensor:\n    def __init__(self, name: str, max_pressure: float, location: str):\n        self.name = name\n        self.m"
+      },
+      {
+        "request_index": 14,
+        "first_differing_char": 214,
+        "baseline_context": "OICE = \"voice\"\n    TEXT = \"text\"\n    CATEGORY = \"category\"\n\n@dataclass\nclass ChannelPermissions:\n    view_roles: List[str] = field(default_factory=list)\n    join_roles: List[str] = field(default_facto",
+        "candidate_context": "OICE = \"voice\"\n    TEXT = \"text\"\n    CATEGORY = \"category\"\n\nclass PermissionType(Enum):\n    VIEW = \"view\"\n    JOIN = \"join\"\n    MANAGE = \"manage\"\n\n@dataclass\nclass ChannelPermission:\n    permission_ty"
+      }
+    ],
+    "requests": 80,
+    "scope": "Decoded text comparison; not an accuracy evaluation or exact token-ID assertion"
+  },
+  {
+    "mode": "full-global",
+    "scenario": "unique-cold",
+    "concurrency": 1,
+    "round": 1,
+    "mismatch_indices": [
+      15,
+      17,
+      41,
+      53
+    ],
+    "examples": [
+      {
+        "request_index": 15,
+        "first_differing_char": 358,
+        "baseline_context": "acking_algorithm='probabilistic', \n                           multi_fiber_support=False, volume_fraction_threshold=0.1):\n        \"\"\"\n        Configures fiber tracking parameters for DTI analysis.",
+        "candidate_context": "acking_algorithm='probabilistic', \n                         multi_fiber_support=False, volume_fraction_threshold=0.1):\n        \"\"\"\n        Configures fiber tracking parameters for DTI analysis."
+      },
+      {
+        "request_index": 17,
+        "first_differing_char": 324,
+        "baseline_context": "tricMatcher:\n    def __init__(self, threshold: float = 0.7, metric: Literal['hamming', 'tanimoto', 'dice'] = 'hamming'):\n        self.threshold = threshold\n        self.metric = metric\n        \n    de",
+        "candidate_context": "tricMatcher:\n    def __init__(self, threshold: float = 0.7, similarity_metric: Literal['hamming', 'tanimoto', 'dice'] = 'hamming'):\n        self.threshold = threshold\n        self.similarity_metric = "
+      },
+      {
+        "request_index": 41,
+        "first_differing_char": 653,
+        "baseline_context": "arameters for\n            - sparsity (float): Percentage of matrix elements that should be non-zero (0.0 to",
+        "candidate_context": "arameters for\n            - sparsity (float): Percentage of non-zero elements (0.0 to 1.0"
+      }
+    ],
+    "requests": 80,
+    "scope": "Decoded text comparison; not an accuracy evaluation or exact token-ID assertion"
+  },
+  {
+    "mode": "full-global",
+    "scenario": "unique-cold",
+    "concurrency": 1,
+    "round": 2,
+    "mismatch_indices": [
+      14,
+      20,
+      68
+    ],
+    "examples": [
+      {
+        "request_index": 14,
+        "first_differing_char": 324,
+        "baseline_context": "tricMatcher:\n    def __init__(self, threshold: float = 0.7, metric: Literal['hamming', 'tanimoto', 'dice'] = 'hamming'):\n        self.threshold = threshold\n        self.metric = metric\n        \n    de",
+        "candidate_context": "tricMatcher:\n    def __init__(self, threshold: float = 0.7, similarity_metric: Literal['hamming', 'tanimoto', 'dice'] = 'hamming'):\n        self.threshold = threshold\n        self.similarity_metric = "
+      },
+      {
+        "request_index": 20,
+        "first_differing_char": 653,
+        "baseline_context": "arameters for\n            - sparsity (float): Percentage of matrix elements that should be non-zero (0.0 to",
+        "candidate_context": "arameters for\n            - sparsity (float): Percentage of non-zero elements (0.0 to 1.0"
+      },
+      {
+        "request_index": 68,
+        "first_differing_char": 358,
+        "baseline_context": "acking_algorithm='probabilistic', \n                           multi_fiber_support=False, volume_fraction_threshold=0.1):\n        \"\"\"\n        Configures fiber tracking parameters for DTI analysis.",
+        "candidate_context": "acking_algorithm='probabilistic', \n                         multi_fiber_support=False, volume_fraction_threshold=0.1):\n        \"\"\"\n        Configures fiber tracking parameters for DTI analysis."
+      }
+    ],
+    "requests": 80,
+    "scope": "Decoded text comparison; not an accuracy evaluation or exact token-ID assertion"
+  },
+  {
+    "mode": "full-global",
+    "scenario": "unique-cold",
+    "concurrency": 1,
+    "round": 3,
+    "mismatch_indices": [
+      42,
+      57,
+      69,
+      73
+    ],
+    "examples": [
+      {
+        "request_index": 42,
+        "first_differing_char": 63,
+        "baseline_context": "python\nimport pandas as pd\nfrom typing import List, Optional, Tuple\nfrom dataclasses import dataclass\nfrom enum import Enum\nimport numpy as np\nimport colorsys\n\nclass ColorPalette(Enum):\n    SUNSET = [",
+        "candidate_context": "python\nimport pandas as pd\nfrom typing import List, Optional\nfrom dataclasses import dataclass\nfrom enum import Enum\nimport numpy as np\nimport colorsys\nimport re\n\nclass ColorPalette(Enum):\n    SUNSET "
+      },
+      {
+        "request_index": 57,
+        "first_differing_char": 324,
+        "baseline_context": "tricMatcher:\n    def __init__(self, threshold: float = 0.7, metric: Literal['hamming', 'tanimoto', 'dice'] = 'hamming'):\n        self.threshold = threshold\n        self.metric = metric\n        \n    de",
+        "candidate_context": "tricMatcher:\n    def __init__(self, threshold: float = 0.7, similarity_metric: Literal['hamming', 'tanimoto', 'dice'] = 'hamming'):\n        self.threshold = threshold\n        self.similarity_metric = "
+      },
+      {
+        "request_index": 69,
+        "first_differing_char": 358,
+        "baseline_context": "acking_algorithm='probabilistic', \n                           multi_fiber_support=False, volume_fraction_threshold=0.1):\n        \"\"\"\n        Configures fiber tracking parameters for DTI analysis.",
+        "candidate_context": "acking_algorithm='probabilistic', \n                         multi_fiber_support=False, volume_fraction_threshold=0.1):\n        \"\"\"\n        Configures fiber tracking parameters for DTI analysis."
+      }
+    ],
+    "requests": 80,
+    "scope": "Decoded text comparison; not an accuracy evaluation or exact token-ID assertion"
+  },
+  {
+    "mode": "split-global",
+    "scenario": "unique-cold",
+    "concurrency": 1,
+    "round": 1,
+    "mismatch_indices": [
+      15,
+      17,
+      41,
+      53
+    ],
+    "examples": [
+      {
+        "request_index": 15,
+        "first_differing_char": 358,
+        "baseline_context": "acking_algorithm='probabilistic', \n                           multi_fiber_support=False, volume_fraction_threshold=0.1):\n        \"\"\"\n        Configures fiber tracking parameters for DTI analysis.",
+        "candidate_context": "acking_algorithm='probabilistic', \n                         multi_fiber_support=False, volume_fraction_threshold=0.1):\n        \"\"\"\n        Configures fiber tracking parameters for DTI analysis."
+      },
+      {
+        "request_index": 17,
+        "first_differing_char": 324,
+        "baseline_context": "tricMatcher:\n    def __init__(self, threshold: float = 0.7, metric: Literal['hamming', 'tanimoto', 'dice'] = 'hamming'):\n        self.threshold = threshold\n        self.metric = metric\n        \n    de",
+        "candidate_context": "tricMatcher:\n    def __init__(self, threshold: float = 0.7, similarity_metric: Literal['hamming', 'tanimoto', 'dice'] = 'hamming'):\n        self.threshold = threshold\n        self.similarity_metric = "
+      },
+      {
+        "request_index": 41,
+        "first_differing_char": 653,
+        "baseline_context": "arameters for\n            - sparsity (float): Percentage of matrix elements that should be non-zero (0.0 to",
+        "candidate_context": "arameters for\n            - sparsity (float): Percentage of non-zero elements (0.0 to 1.0"
+      }
+    ],
+    "requests": 80,
+    "scope": "Decoded text comparison; not an accuracy evaluation or exact token-ID assertion"
+  },
+  {
+    "mode": "split-global",
+    "scenario": "unique-cold",
+    "concurrency": 1,
+    "round": 2,
+    "mismatch_indices": [
+      14,
+      20,
+      68
+    ],
+    "examples": [
+      {
+        "request_index": 14,
+        "first_differing_char": 324,
+        "baseline_context": "tricMatcher:\n    def __init__(self, threshold: float = 0.7, metric: Literal['hamming', 'tanimoto', 'dice'] = 'hamming'):\n        self.threshold = threshold\n        self.metric = metric\n        \n    de",
+        "candidate_context": "tricMatcher:\n    def __init__(self, threshold: float = 0.7, similarity_metric: Literal['hamming', 'tanimoto', 'dice'] = 'hamming'):\n        self.threshold = threshold\n        self.similarity_metric = "
+      },
+      {
+        "request_index": 20,
+        "first_differing_char": 653,
+        "baseline_context": "arameters for\n            - sparsity (float): Percentage of matrix elements that should be non-zero (0.0 to",
+        "candidate_context": "arameters for\n            - sparsity (float): Percentage of non-zero elements (0.0 to 1.0"
+      },
+      {
+        "request_index": 68,
+        "first_differing_char": 358,
+        "baseline_context": "acking_algorithm='probabilistic', \n                           multi_fiber_support=False, volume_fraction_threshold=0.1):\n        \"\"\"\n        Configures fiber tracking parameters for DTI analysis.",
+        "candidate_context": "acking_algorithm='probabilistic', \n                         multi_fiber_support=False, volume_fraction_threshold=0.1):\n        \"\"\"\n        Configures fiber tracking parameters for DTI analysis."
+      }
+    ],
+    "requests": 80,
+    "scope": "Decoded text comparison; not an accuracy evaluation or exact token-ID assertion"
+  },
+  {
+    "mode": "split-global",
+    "scenario": "unique-cold",
+    "concurrency": 1,
+    "round": 3,
+    "mismatch_indices": [
+      42,
+      57,
+      69,
+      73
+    ],
+    "examples": [
+      {
+        "request_index": 42,
+        "first_differing_char": 63,
+        "baseline_context": "python\nimport pandas as pd\nfrom typing import List, Optional, Tuple\nfrom dataclasses import dataclass\nfrom enum import Enum\nimport numpy as np\nimport colorsys\n\nclass ColorPalette(Enum):\n    SUNSET = [",
+        "candidate_context": "python\nimport pandas as pd\nfrom typing import List, Optional\nfrom dataclasses import dataclass\nfrom enum import Enum\nimport numpy as np\nimport colorsys\nimport re\n\nclass ColorPalette(Enum):\n    SUNSET "
+      },
+      {
+        "request_index": 57,
+        "first_differing_char": 324,
+        "baseline_context": "tricMatcher:\n    def __init__(self, threshold: float = 0.7, metric: Literal['hamming', 'tanimoto', 'dice'] = 'hamming'):\n        self.threshold = threshold\n        self.metric = metric\n        \n    de",
+        "candidate_context": "tricMatcher:\n    def __init__(self, threshold: float = 0.7, similarity_metric: Literal['hamming', 'tanimoto', 'dice'] = 'hamming'):\n        self.threshold = threshold\n        self.similarity_metric = "
+      },
+      {
+        "request_index": 69,
+        "first_differing_char": 358,
+        "baseline_context": "acking_algorithm='probabilistic', \n                           multi_fiber_support=False, volume_fraction_threshold=0.1):\n        \"\"\"\n        Configures fiber tracking parameters for DTI analysis.",
+        "candidate_context": "acking_algorithm='probabilistic', \n                         multi_fiber_support=False, volume_fraction_threshold=0.1):\n        \"\"\"\n        Configures fiber tracking parameters for DTI analysis."
+      }
+    ],
+    "requests": 80,
+    "scope": "Decoded text comparison; not an accuracy evaluation or exact token-ID assertion"
+  },
+  {
+    "mode": "split-off",
+    "scenario": "unique-cold",
+    "concurrency": 1,
+    "round": 1,
+    "mismatch_indices": [],
+    "examples": [],
+    "requests": 80,
+    "scope": "Decoded text comparison; not an accuracy evaluation or exact token-ID assertion"
+  },
+  {
+    "mode": "split-off",
+    "scenario": "unique-cold",
+    "concurrency": 1,
+    "round": 2,
+    "mismatch_indices": [],
+    "examples": [],
+    "requests": 80,
+    "scope": "Decoded text comparison; not an accuracy evaluation or exact token-ID assertion"
+  },
+  {
+    "mode": "split-off",
+    "scenario": "unique-cold",
+    "concurrency": 1,
+    "round": 3,
+    "mismatch_indices": [],
+    "examples": [],
+    "requests": 80,
+    "scope": "Decoded text comparison; not an accuracy evaluation or exact token-ID assertion"
+  },
+  {
+    "mode": "full-global",
+    "scenario": "unique-cold",
+    "concurrency": 4,
+    "round": 1,
+    "mismatch_indices": [
+      6,
+      8,
+      14,
+      15,
+      20,
+      22,
+      23,
+      27,
+      33,
+      35,
+      38,
+      39,
+      42,
+      44,
+      46,
+      47,
+      59,
+      60,
+      61,
+      70,
+      71,
+      73,
+      74
+    ],
+    "examples": [
+      {
+        "request_index": 6,
+        "first_differing_char": 143,
+        "baseline_context": "onnect_timeout=None, read_timeout=None, total_timeout=None, max_retries=3, base_backoff=1.0, max_backoff=30.0):\n        self.connect_timeout = self._validate_timeout(connect_timeout)\n        self.read",
+        "candidate_context": "onnect_timeout=None, read_timeout=None, total_timeout=None, \n                 max_retries=3, base_backoff=1.0, max_backoff=30.0, jitter=True):\n        self.connect_timeout = self._validate_timeout(con"
+      },
+      {
+        "request_index": 8,
+        "first_differing_char": 270,
+        "baseline_context": "urce = boto3.resource('s3', region_name=aws_region)\n        # Patterns for sensitive data detection\n        self.sensitive_patterns = {\n            'credit_card': re.compile(r'\\b(?:\\d[ -]*?){13,16}\\b'",
+        "candidate_context": "urce = boto3.resource('s3', region_name=aws_region)\n        \n        # Define patterns for sensitive data detection\n        self.sensitive_patterns = {\n            'credit_card': re.compile(r'\\b(?:\\d{"
+      },
+      {
+        "request_index": 14,
+        "first_differing_char": 175,
+        "baseline_context": "validate_links(content, base_url=\"\"):\n    \"\"\"\n    Validates links in the documentation content.\n    \n    Args:\n        content (str): The documentation content to check.\n        base_url (str): The ba",
+        "candidate_context": "validate_links(content, base_url=\"\"):\n    \"\"\"\n    Validates HTTP/HTTPS links in the given content.\n    \n    Args:\n        content (str): The documentation content to check.\n        base_url (str): The"
+      }
+    ],
+    "requests": 80,
+    "scope": "Decoded text comparison; not an accuracy evaluation or exact token-ID assertion"
+  },
+  {
+    "mode": "full-global",
+    "scenario": "unique-cold",
+    "concurrency": 4,
+    "round": 2,
+    "mismatch_indices": [
+      13,
+      15,
+      19,
+      21,
+      22,
+      25,
+      28,
+      29,
+      31,
+      39,
+      41,
+      42,
+      43,
+      51,
+      57,
+      63,
+      65,
+      67,
+      68,
+      70,
+      73,
+      75,
+      78
+    ],
+    "examples": [
+      {
+        "request_index": 13,
+        "first_differing_char": 143,
+        "baseline_context": "onnect_timeout=None, read_timeout=None, total_timeout=None, max_retries=3, base_backoff=1.0, max_backoff=30.0):\n        self.connect_timeout = self._validate_timeout(connect_timeout)\n        self.read",
+        "candidate_context": "onnect_timeout=None, read_timeout=None, total_timeout=None, \n                 max_retries=3, base_backoff=1.0, max_backoff=30.0, jitter=True):\n        self.connect_timeout = self._validate_timeout(con"
+      },
+      {
+        "request_index": 15,
+        "first_differing_char": 160,
+        "baseline_context": "natives\nfrom django.template.loader import render_to_string\nimport logging\n\nlogger = logging.getLogger(__name__)\n\ndef send_notification_email(recipient_list: list[str], \n                          temp",
+        "candidate_context": "natives\nfrom django.template.loader import render_to_string\nfrom django.utils.log import logger\n\ndef send_notification_email(recipient_list: list[str], \n                          template_data: dict,\n"
+      },
+      {
+        "request_index": 19,
+        "first_differing_char": 189,
+        "baseline_context": "t__(self, iou_threshold=0.5, negative_ratio=3, device='cuda'):\n        super(ObjectDetectionLoss, self).__init__()\n        self.iou_threshold = iou_threshold\n        self.negative_ratio = negative_rat",
+        "candidate_context": "t__(self, iou_threshold=0.5, negative_ratio=3, device='cuda', alpha=0.25, gamma=2.0):\n        super(ObjectDetectionLoss, self).__init__()\n        self.iou_threshold = iou_threshold\n        self.negati"
+      }
+    ],
+    "requests": 80,
+    "scope": "Decoded text comparison; not an accuracy evaluation or exact token-ID assertion"
+  },
+  {
+    "mode": "full-global",
+    "scenario": "unique-cold",
+    "concurrency": 4,
+    "round": 3,
+    "mismatch_indices": [
+      4,
+      5,
+      9,
+      10,
+      12,
+      13,
+      15,
+      19,
+      28,
+      29,
+      30,
+      33,
+      34,
+      41,
+      44,
+      47,
+      49,
+      53,
+      59,
+      66,
+      67,
+      69,
+      71,
+      73
+    ],
+    "examples": [
+      {
+        "request_index": 4,
+        "first_differing_char": 177,
+        "baseline_context": "logging import getLogger\n\nlogger = getLogger(__name__)\n\ndef initialize_django_environment(settings_module: str = 'production.settings',\n                               env_file: Optional[Path] = None) ",
+        "candidate_context": "logging import getLogger\n\nlogger = getLogger(__name__)\n\ndef load_environment_variables(env_file: Path) -> None:\n    \"\"\"\n    Load environment variables from a .env file.\n    \n    Args:\n        env_file"
+      },
+      {
+        "request_index": 5,
+        "first_differing_char": 398,
+        "baseline_context": "content_threshold: float = 0.9\n    last_updated: datetime = field(default_factory=datetime.now)\n    excluded_categories: List[str] = field(default_factory=list)\n    custom_regex_patterns: List[str] = ",
+        "candidate_context": "content_threshold: float = 0.9\n    last_updated: datetime = datetime.now()\n    excluded_categories: List[str] = None\n    custom_regex_patterns: List[str] = None\n    \n    def __post_init__(self):\n"
+      },
+      {
+        "request_index": 9,
+        "first_differing_char": 285,
+        "baseline_context": "               learning_rate=0.001, use_residual=True, task_weights=None):\n        self.sequence_length = sequence_length\n        self.n_filters = n_filters\n        self.n_conv_layers = n_conv_layers\n",
+        "candidate_context": "               learning_rate=0.001, use_residual=True, task_names=None, \n                 task_loss_weights=None):\n        self.sequence_length = sequence_length\n        self.n_filters = n_filters\n   "
+      }
+    ],
+    "requests": 80,
+    "scope": "Decoded text comparison; not an accuracy evaluation or exact token-ID assertion"
+  },
+  {
+    "mode": "split-global",
+    "scenario": "unique-cold",
+    "concurrency": 4,
+    "round": 1,
+    "mismatch_indices": [
+      6,
+      8,
+      14,
+      15,
+      20,
+      23,
+      24,
+      26,
+      27,
+      33,
+      37,
+      38,
+      39,
+      42,
+      44,
+      49,
+      60,
+      61,
+      66,
+      70,
+      73,
+      74,
+      75
+    ],
+    "examples": [
+      {
+        "request_index": 6,
+        "first_differing_char": 143,
+        "baseline_context": "onnect_timeout=None, read_timeout=None, total_timeout=None, max_retries=3, base_backoff=1.0, max_backoff=30.0):\n        self.connect_timeout = self._validate_timeout(connect_timeout)\n        self.read",
+        "candidate_context": "onnect_timeout=None, read_timeout=None, total_timeout=None, \n                 max_retries=3, base_backoff=1.0, max_backoff=30.0, jitter=True):\n        self.connect_timeout = self._validate_timeout(con"
+      },
+      {
+        "request_index": 8,
+        "first_differing_char": 270,
+        "baseline_context": "urce = boto3.resource('s3', region_name=aws_region)\n        # Patterns for sensitive data detection\n        self.sensitive_patterns = {\n            'credit_card': re.compile(r'\\b(?:\\d[ -]*?){13,16}\\b'",
+        "candidate_context": "urce = boto3.resource('s3', region_name=aws_region)\n        self.sensitive_patterns = {\n            'credit_card': re.compile(r'\\b(?:\\d{4}[-\\s]?){3}\\d{4}\\b'),\n            'ssn': re.compile(r'\\b\\d{"
+      },
+      {
+        "request_index": 14,
+        "first_differing_char": 148,
+        "baseline_context": "arse import urlparse\n\n\ndef validate_links(content, base_url=\"\"):\n    \"\"\"\n    Validates links in the documentation content.\n    \n    Args:\n        content (str): The documentation content to check.\n   ",
+        "candidate_context": "arse import urlparse\n\n\ndef validate_links(content, base_url=None):\n    \"\"\"\n    Validates links in the documentation content.\n    \n    Args:\n        content (str): The documentation content to check\n  "
+      }
+    ],
+    "requests": 80,
+    "scope": "Decoded text comparison; not an accuracy evaluation or exact token-ID assertion"
+  },
+  {
+    "mode": "split-global",
+    "scenario": "unique-cold",
+    "concurrency": 4,
+    "round": 2,
+    "mismatch_indices": [
+      3,
+      13,
+      15,
+      16,
+      17,
+      19,
+      20,
+      21,
+      25,
+      28,
+      29,
+      31,
+      36,
+      38,
+      39,
+      42,
+      56,
+      57,
+      58,
+      61,
+      63,
+      67,
+      70,
+      72,
+      73,
+      75,
+      78
+    ],
+    "examples": [
+      {
+        "request_index": 3,
+        "first_differing_char": 421,
+        "baseline_context": "   self.pressure_history: List[Tuple[float, float]] = []  # (timestamp, pressure)\n        self.max_history_size = 100\n\n    def read_pressure(self",
+        "candidate_context": "   self.pressure_history: List[Tuple[float, float]] = []  # List of (timestamp, pressure)\n        self.max_history_size = 100\n\n    def read"
+      },
+      {
+        "request_index": 13,
+        "first_differing_char": 143,
+        "baseline_context": "onnect_timeout=None, read_timeout=None, total_timeout=None, max_retries=3, base_backoff=1.0, max_backoff=30.0):\n        self.connect_timeout = self._validate_timeout(connect_timeout)\n        self.read",
+        "candidate_context": "onnect_timeout=None, read_timeout=None, total_timeout=None, \n                 max_retries=3, base_backoff=1.0, max_backoff=60.0, jitter=True):\n        self.connect_timeout = self._validate_timeout(con"
+      },
+      {
+        "request_index": 15,
+        "first_differing_char": 160,
+        "baseline_context": "natives\nfrom django.template.loader import render_to_string\nimport logging\n\nlogger = logging.getLogger(__name__)\n\ndef send_notification_email(recipient_list: list[str], \n                          temp",
+        "candidate_context": "natives\nfrom django.template.loader import render_to_string\nfrom django.utils.log import logger\n\ndef send_notification_email(recipient_list: list[str], \n                          template_data: dict,\n"
+      }
+    ],
+    "requests": 80,
+    "scope": "Decoded text comparison; not an accuracy evaluation or exact token-ID assertion"
+  },
+  {
+    "mode": "split-global",
+    "scenario": "unique-cold",
+    "concurrency": 4,
+    "round": 3,
+    "mismatch_indices": [
+      4,
+      5,
+      12,
+      13,
+      15,
+      19,
+      28,
+      30,
+      33,
+      34,
+      38,
+      40,
+      44,
+      49,
+      50,
+      53,
+      58,
+      59,
+      66,
+      70,
+      71
+    ],
+    "examples": [
+      {
+        "request_index": 4,
+        "first_differing_char": 177,
+        "baseline_context": "logging import getLogger\n\nlogger = getLogger(__name__)\n\ndef initialize_django_environment(settings_module: str = 'production.settings',\n                               env_file: Optional[Path] = None) ",
+        "candidate_context": "logging import getLogger\n\nlogger = getLogger(__name__)\n\ndef load_environment_variables(env_file: Path) -> None:\n    \"\"\"\n    Load environment variables from a .env file.\n    \n    Args:\n        env_file"
+      },
+      {
+        "request_index": 5,
+        "first_differing_char": 398,
+        "baseline_context": "content_threshold: float = 0.9\n    last_updated: datetime = field(default_factory=datetime.now)\n    excluded_categories: List[str] = field(default_factory=list)\n    custom_regex_patterns: List[str] = ",
+        "candidate_context": "content_threshold: float = 0.9\n    last_updated: datetime = datetime.now()\n    excluded_categories: List[str] = None\n    custom_regex_patterns: List[str] = None\n    \n    def __post_init__(self):\n"
+      },
+      {
+        "request_index": 12,
+        "first_differing_char": 442,
+        "baseline_context": "      'negotiated': 'NEGOTIATED_TENDER'\n        }\n        # Configuration for attachments\n        self.allowed_extensions = {'.pdf', '.doc', '.",
+        "candidate_context": "      'negotiated': 'NEGOTIATED_TENDER'\n        }\n        # Default configuration for attachments if not provided in config\n        self.attachment_config = config.get"
+      }
+    ],
+    "requests": 80,
+    "scope": "Decoded text comparison; not an accuracy evaluation or exact token-ID assertion"
+  },
+  {
+    "mode": "split-off",
+    "scenario": "unique-cold",
+    "concurrency": 4,
+    "round": 1,
+    "mismatch_indices": [
+      32,
+      37,
+      38,
+      39,
+      44,
+      46,
+      59,
+      60,
+      61,
+      63,
+      66,
+      70,
+      71,
+      73,
+      74
+    ],
+    "examples": [
+      {
+        "request_index": 32,
+        "first_differing_char": 242,
+        "baseline_context": "_experiment_data(self, experiment_json, include_files=True, date_range=None, assay_type=None):\n        \"\"\"Process experimental data and return formatted results\n        \n        Args:\n            expe",
+        "candidate_context": "_experiment_data(self, experiment_json, include_files=True, start_date=None, end_date=None, assay_type=None):\n        \"\"\"Process experimental data and return formatted results\"\"\"\n        # Filter by d"
+      },
+      {
+        "request_index": 37,
+        "first_differing_char": 519,
+        "baseline_context": "ing_rate\n        self.use_residual = use_residual\n        # Default weights if not provided: profile",
+        "candidate_context": "ing_rate\n        self.use_residual = use_residual\n        # task_weights is a dict mapping output"
+      },
+      {
+        "request_index": 38,
+        "first_differing_char": 471,
+        "baseline_context": "f, total_courses: int, dependencies: list[tuple[int, int]], \n                                 credits: list[int] = None) -> list[int]:\n        \"\"\"\n       ",
+        "candidate_context": "f, total_courses: int, dependencies: list[tuple[int, int]], credits: list[int] = None) -> list[int]:\n        \"\"\"\n        Generates a"
+      }
+    ],
+    "requests": 80,
+    "scope": "Decoded text comparison; not an accuracy evaluation or exact token-ID assertion"
+  },
+  {
+    "mode": "split-off",
+    "scenario": "unique-cold",
+    "concurrency": 4,
+    "round": 2,
+    "mismatch_indices": [
+      3,
+      13,
+      15,
+      17,
+      20,
+      21,
+      25,
+      28,
+      29,
+      36,
+      41,
+      42,
+      51,
+      52,
+      56,
+      57,
+      63,
+      67,
+      73
+    ],
+    "examples": [
+      {
+        "request_index": 3,
+        "first_differing_char": 421,
+        "baseline_context": "   self.pressure_history: List[Tuple[float, float]] = []  # (timestamp, pressure)\n        self.max_history_size = 100\n\n    def read_pressure(self",
+        "candidate_context": "   self.pressure_history: List[Tuple[float, float]] = []  # List of (timestamp, pressure)\n        self.max_history_size = 100\n\n    def read"
+      },
+      {
+        "request_index": 13,
+        "first_differing_char": 143,
+        "baseline_context": "onnect_timeout=None, read_timeout=None, total_timeout=None, max_retries=3, base_backoff=1.0, max_backoff=30.0):\n        self.connect_timeout = self._validate_timeout(connect_timeout)\n        self.read",
+        "candidate_context": "onnect_timeout=None, read_timeout=None, total_timeout=None, \n                 retry_timeout=None, max_retries=3, backoff_factor=1.0, jitter=True):\n        self.connect_timeout = self._validate_timeout"
+      },
+      {
+        "request_index": 15,
+        "first_differing_char": 160,
+        "baseline_context": "natives\nfrom django.template.loader import render_to_string\nimport logging\n\nlogger = logging.getLogger(__name__)\n\ndef send_notification_email(recipient_list: list[str], \n                          temp",
+        "candidate_context": "natives\nfrom django.template.loader import render_to_string\nfrom django.utils.log import logger\n\ndef render_text_template(template_data: dict) -> str:\n    \"\"\"Placeholder for text template rendering lo"
+      }
+    ],
+    "requests": 80,
+    "scope": "Decoded text comparison; not an accuracy evaluation or exact token-ID assertion"
+  },
+  {
+    "mode": "split-off",
+    "scenario": "unique-cold",
+    "concurrency": 4,
+    "round": 3,
+    "mismatch_indices": [
+      53,
+      59,
+      60,
+      70,
+      71
+    ],
+    "examples": [
+      {
+        "request_index": 53,
+        "first_differing_char": 181,
+        "baseline_context": "efined elsewhere or provided in the environment\n# If not, a simple placeholder is needed for the code to be syntactically correct in isolation,\n# but based on the prompt, we assume the environment has",
+        "candidate_context": "efined elsewhere or provided in the environment\n# If not, a minimal implementation might be needed, but we preserve the original structure.\nclass EventDispatcher:\n    def __init__(self):\n        self."
+      },
+      {
+        "request_index": 59,
+        "first_differing_char": 295,
+        "baseline_context": "ster: Maximum number of credits allowed in a single semester\n        \"\"\"\n        self.max_credits_per_semester = max_credits_per_semester\n        self.credits_map = {}\n\n    def set_course_credits(self",
+        "candidate_context": "ster: Maximum number of credits allowed in a single semester.\n        \"\"\"\n        self.max_credits_per_semester = max_credits_per_semester\n\n    def generate_course_sequence(self, total_courses: int, d"
+      },
+      {
+        "request_index": 60,
+        "first_differing_char": 84,
+        "baseline_context": "mport torch.nn as nn\nimport torch.nn.functional as F\n\nclass ObjectDetectionLoss(nn.Module):\n    def __init__(self, iou_threshold=0.5, negative_ratio=3, device='cuda', alpha=0.25, gamma=2.0):\n        s",
+        "candidate_context": "mport torch.nn as nn\nimport torch.nn.functional as F\n\nclass FocalLoss(nn.Module):\n    def __init__(self, alpha=1, gamma=2, reduction='none'):\n        super(FocalLoss, self).__init__()\n        self.alp"
+      }
+    ],
+    "requests": 80,
+    "scope": "Decoded text comparison; not an accuracy evaluation or exact token-ID assertion"
+  }
+]

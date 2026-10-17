@@ -1,0 +1,223 @@
+{
+  "compared": 1920,
+  "different": 0,
+  "cases": [
+    {
+      "scenario": "repeat-warm",
+      "concurrency": 1,
+      "graph": "full",
+      "round": 1,
+      "compared": 80,
+      "different": 0,
+      "different_request_indices": []
+    },
+    {
+      "scenario": "repeat-warm",
+      "concurrency": 1,
+      "graph": "full",
+      "round": 2,
+      "compared": 80,
+      "different": 0,
+      "different_request_indices": []
+    },
+    {
+      "scenario": "repeat-warm",
+      "concurrency": 1,
+      "graph": "full",
+      "round": 3,
+      "compared": 80,
+      "different": 0,
+      "different_request_indices": []
+    },
+    {
+      "scenario": "repeat-warm",
+      "concurrency": 1,
+      "graph": "split",
+      "round": 1,
+      "compared": 80,
+      "different": 0,
+      "different_request_indices": []
+    },
+    {
+      "scenario": "repeat-warm",
+      "concurrency": 1,
+      "graph": "split",
+      "round": 2,
+      "compared": 80,
+      "different": 0,
+      "different_request_indices": []
+    },
+    {
+      "scenario": "repeat-warm",
+      "concurrency": 1,
+      "graph": "split",
+      "round": 3,
+      "compared": 80,
+      "different": 0,
+      "different_request_indices": []
+    },
+    {
+      "scenario": "repeat-warm",
+      "concurrency": 4,
+      "graph": "full",
+      "round": 1,
+      "compared": 80,
+      "different": 0,
+      "different_request_indices": []
+    },
+    {
+      "scenario": "repeat-warm",
+      "concurrency": 4,
+      "graph": "full",
+      "round": 2,
+      "compared": 80,
+      "different": 0,
+      "different_request_indices": []
+    },
+    {
+      "scenario": "repeat-warm",
+      "concurrency": 4,
+      "graph": "full",
+      "round": 3,
+      "compared": 80,
+      "different": 0,
+      "different_request_indices": []
+    },
+    {
+      "scenario": "repeat-warm",
+      "concurrency": 4,
+      "graph": "split",
+      "round": 1,
+      "compared": 80,
+      "different": 0,
+      "different_request_indices": []
+    },
+    {
+      "scenario": "repeat-warm",
+      "concurrency": 4,
+      "graph": "split",
+      "round": 2,
+      "compared": 80,
+      "different": 0,
+      "different_request_indices": []
+    },
+    {
+      "scenario": "repeat-warm",
+      "concurrency": 4,
+      "graph": "split",
+      "round": 3,
+      "compared": 80,
+      "different": 0,
+      "different_request_indices": []
+    },
+    {
+      "scenario": "unique-cold",
+      "concurrency": 1,
+      "graph": "full",
+      "round": 1,
+      "compared": 80,
+      "different": 0,
+      "different_request_indices": []
+    },
+    {
+      "scenario": "unique-cold",
+      "concurrency": 1,
+      "graph": "full",
+      "round": 2,
+      "compared": 80,
+      "different": 0,
+      "different_request_indices": []
+    },
+    {
+      "scenario": "unique-cold",
+      "concurrency": 1,
+      "graph": "full",
+      "round": 3,
+      "compared": 80,
+      "different": 0,
+      "different_request_indices": []
+    },
+    {
+      "scenario": "unique-cold",
+      "concurrency": 1,
+      "graph": "split",
+      "round": 1,
+      "compared": 80,
+      "different": 0,
+      "different_request_indices": []
+    },
+    {
+      "scenario": "unique-cold",
+      "concurrency": 1,
+      "graph": "split",
+      "round": 2,
+      "compared": 80,
+      "different": 0,
+      "different_request_indices": []
+    },
+    {
+      "scenario": "unique-cold",
+      "concurrency": 1,
+      "graph": "split",
+      "round": 3,
+      "compared": 80,
+      "different": 0,
+      "different_request_indices": []
+    },
+    {
+      "scenario": "unique-cold",
+      "concurrency": 4,
+      "graph": "full",
+      "round": 1,
+      "compared": 80,
+      "different": 0,
+      "different_request_indices": []
+    },
+    {
+      "scenario": "unique-cold",
+      "concurrency": 4,
+      "graph": "full",
+      "round": 2,
+      "compared": 80,
+      "different": 0,
+      "different_request_indices": []
+    },
+    {
+      "scenario": "unique-cold",
+      "concurrency": 4,
+      "graph": "full",
+      "round": 3,
+      "compared": 80,
+      "different": 0,
+      "different_request_indices": []
+    },
+    {
+      "scenario": "unique-cold",
+      "concurrency": 4,
+      "graph": "split",
+      "round": 1,
+      "compared": 80,
+      "different": 0,
+      "different_request_indices": []
+    },
+    {
+      "scenario": "unique-cold",
+      "concurrency": 4,
+      "graph": "split",
+      "round": 2,
+      "compared": 80,
+      "different": 0,
+      "different_request_indices": []
+    },
+    {
+      "scenario": "unique-cold",
+      "concurrency": 4,
+      "graph": "split",
+      "round": 3,
+      "compared": 80,
+      "different": 0,
+      "different_request_indices": []
+    }
+  ],
+  "note": "Fixed-128-token greedy FP8 runs; C4 arrival/batch timing can change outputs. Exact kernel semantics are separately checked against a CPU text oracle and serial microbenchmark outputs. This is not a task accuracy evaluation."
+}

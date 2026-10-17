@@ -145,7 +145,66 @@ static void check_large_storage_bounds() {
   }
 }
 
+static void check_external_suffixes() {
+  // Exhaustive substring search is independent of SA traversal and catches
+  // clone states whose maximum length exceeds the matched context length.
+  for (int width = 1; width <= 7; ++width) {
+    for (int bits = 0; bits < (1 << width); ++bits) {
+      std::vector<int64_t> input(width);
+      for (int i = 0; i < width; ++i)
+        input[i] = (bits >> i) & 1;
+      std::vector<int> history(width), states((2 * width + 1) * 5),
+          edges((width + 1) * 6);
+      int meta[7];
+      assert(hybrid_sa_build_host(input.data(), width, 3, history.data(),
+                                 states.data(), edges.data(), meta, width) == 0);
+      Automaton sa{history.data(), states.data(), edges.data(), meta, width};
+      for (int qwidth = 1; qwidth <= 6; ++qwidth) {
+        for (int qbits = 0; qbits < (1 << qwidth); ++qbits) {
+          std::vector<int> query(qwidth + 1, 2); // Absent token forces root fallback.
+          for (int i = 0; i < qwidth; ++i)
+            query[i + 1] = (qbits >> i) & 1;
+          int best = 0, end = -1;
+          for (int length = std::min(width, qwidth); length > 0 && !best; --length) {
+            for (int start = 0; start + length <= width; ++start) {
+              if (std::equal(query.end() - length, query.end(), history.begin() + start)) {
+                best = length;
+                end = start + length - 1;
+                break;
+              }
+            }
+          }
+          int length = 0;
+          int state = sa.match_suffix(query.data(), query.size(), length);
+          assert(length == best);
+          if (state)
+            assert(sa.s(state, 2) == end);
+          else
+            assert(best == 0);
+          // The serving lookup must find a shorter repeat when the longest
+          // match ends at the donor boundary and has no continuation.
+          best = 0;
+          end = -1;
+          for (int size = std::min(width - 1, qwidth); size > 0 && !best; --size) {
+            for (int start = 0; start + size < width; ++start) {
+              if (std::equal(query.end() - size, query.end(), history.begin() + start)) {
+                best = size;
+                end = start + size - 1;
+                break;
+              }
+            }
+          }
+          state = sa.match_suffix(query.data(), query.size(), length, true);
+          assert(length == best);
+          assert((state == 0 && best == 0) || (state > 0 && sa.s(state, 2) == end));
+        }
+      }
+    }
+  }
+}
+
 int main() {
+  check_external_suffixes();
   check_large_storage_bounds();
   for (int width = 1; width <= 12; ++width) {
     for (int bits = 0; bits < (1 << width); ++bits) {

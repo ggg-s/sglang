@@ -2,7 +2,7 @@
 
 本目录实现 [DESIGN.md](DESIGN.md) 的固定长度、请求级来源选择。默认 `draft_graph_mode="full"` 照常运行完整 neural draft，由设备端 mask 在每个位置选择 SA 或 neural token；选定 token 同时进入下一步模型输入和最终验证链。显式开启 `split` 后，可在前两个候选一致时跳过对应请求的 MTP 尾段，当前实验范围为并发 1～4。
 
-当前优化、执行流程、配置区别、A100 性能结论和未实现项见 [OPTIMIZATIONS.md](OPTIMIZATIONS.md)。SA 历史按请求隔离，当前不支持跨请求共享。CPU 语义测试与 CUDA/真实模型验收是不同层次；详细验证记录见 [VALIDATION.md](VALIDATION.md)。未测模型不得视为已支持。
+当前优化、执行流程、配置区别、A100 性能结论和未实现项见 [OPTIMIZATIONS.md](OPTIMIZATIONS.md)。SA 独立按请求存储；device 模式可显式开启跨活跃请求和完成请求的全局检索池。CPU 语义测试与 CUDA/真实模型验收是不同层次；详细验证记录见 [VALIDATION.md](VALIDATION.md)。未测模型不得视为已支持。
 
 新增 opt-in `history_mode="device"` 路径，用于对齐 Baseten `sa_spec` 的 GPU 增量更新与调度方式。prefill 前快照 prompt 并准备 pinned CPU 缓冲，由后台线程使用与 CUDA 相同的 C++ 状态机构建初始 SA；本机 native 调用释放 GIL，与 target prefill/draft-extend 并行。prefill 返回时只暂存 GPU bonus，首次 draft 才消费构建结果，并在 forward stream 上异步拷贝已使用的状态前缀。不再在 GPU 上逐 token 构建 prompt SA，也不在每轮 decode 读取或重建 CPU 输出历史。
 
@@ -145,8 +145,37 @@ LoRA 关闭时，无需也无法通过 `--enable-lora` 显式传入 False；本�
 | `backend` | 服务只能使用 `gpu_sa`；`reference` 用于测试 |
 | `history_mode` | `cpu`（默认，旧同步路径）或 `device`（GPU 反馈与 Graph 内增量处理，支持单机多 TP 实验） |
 | `partial_drafts` | `fallback`（默认，不足 K 则整条回退）或 `zero`（参考实现的尾部补零草稿） |
+| `enable_global_pool` | 默认 `false`；`device` 模式下跨已发布的活跃请求和保留请求查询 SA |
+| `max_shared_requests` | 完成请求保留上限，默认 0；需开启全局池；达到上限按完成顺序 FIFO 淘汰 |
+| `shared_context_tokens` | 跨请求查询最多使用当前历史最后多少个 token，默认 128；本请求查询保持原行为 |
 
-状态内存估计：`4 * max_requests * [H + 5*(2H+1) + 6*(H+1) + 7]` 字节，加上每请求 `40 + 4*(K+1)` 字节的设备反馈元数据。`configs/example.json` 约 34 MiB，另有查询与 Graph buffer。状态在 draft worker 构造时分配，早于 target KV 预算/分配；不修改原生 KV 规划。
+状态内存估计：`4 * (max_requests + max_shared_requests) * [H + 5*(2H+1) + 6*(H+1) + 7]` 字节，加上每槽位 `40 + 4*(K+1)` 字节的设备反馈元数据。`configs/example.json` 约 34 MiB，另有查询与 Graph buffer。状态在 draft worker 构造时分配，早于 target KV 预算/分配；不修改原生 KV 规划。
+
+### 可选的跨请求 SA 历史
+
+`configs/device-qwen35-mtp-global-pool.json` 在 4 个活跃请求之外预留 16 个完成请求槽位。
+显式设置 `enable_global_pool=true` 后，同一 worker 内已导入初始 SA 的活跃请求也能互查；
+`max_shared_requests=0` 表示只共享活跃历史，不保留完成请求。默认关闭，CPU 历史模式不支持。
+这会允许后来的请求检索其他请求的 prompt/输出，只应在允许共享这些内容的同一信任范围内开启；
+池不按用户或会话分区，不跨 worker、进程或重启持久化。flush 会清除活跃和保留映射。
+
+每个来源仍保持独立自动机，查询不会拼接不同请求。先统一消费已发布槽位的 GPU 反馈，
+再进行只读跨槽位查询。每个请求一个 CUDA block，线程并行扫描来源并归约；超过
+128 个来源时分步扫描，候选排序不变。来源末尾无续写时沿 suffix link 回退。
+保留本请求的候选作为基线，选择满足原有完整度策略的更长匹配。
+匹配长度相同时优先本请求；其他来源之间优先较长续写，仍相同则优先较新 generation。
+neural 前缀检查、TP 候选共识、target verify 和 split 的现有约束继续生效。
+
+完成回调只修改 CPU 元数据，不在 scheduler 线程启动 CUDA。下一次 draft 在 forward stream
+消费最后的 verify 增量，按完成请求的最终 token 数截掉停止条件丢弃的尾部；若已写入超长尾部，
+该来源失效回退。未导入的后台构建不进入池，槽位复用有 generation 校验。
+跨请求查询兼容 `split`，仍要求 device 历史、gate=2、TP=1、greedy 和最多 4 个活跃请求等
+现有 split 约束。增加保留槽位不会放宽活跃并发限制，也会增加显存和查询成本。
+组合示例为 `configs/device-qwen35-mtp-split-global-pool.json`：K=8、gate=2、
+4 个活跃槽位、16 个保留槽位、H=4096，与 6000D 对照中的 split 配置一致。
+吞吐取决于历史重复程度，不能从查询加速直接推断整体收益。
+并行查询保持 v3 存储布局；更新后重启服务，扩展会按 CUDA 源码变化自动重新编译。
+参考来源、实现差异和验证范围见 [全局池记录](validation/global-pool.md)。
 
 转移边参考 sa-spec 的内联设计：每个状态直接保存第一条转移；第二条转移用同一辅助字段的负值编码，第三条起才分配边记录，超过 4 条出边才维护哈希。单一重复历史直接延长链，二值历史完全不使用边池。转移标签由已有历史和 first-position 恢复，clone 与重定向保持这一不变量。额外边数有 `n−1` 上界，预留边池从 `3H+1` 缩为 `H+1`；哈希仍逐桶分裂、精确比较键，CPU 状态可以直接导入较大 GPU 槽位继续扩展。重置不扫描整池。
 

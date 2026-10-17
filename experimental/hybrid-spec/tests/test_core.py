@@ -2,6 +2,7 @@ import importlib
 import itertools
 import sys
 import threading
+from dataclasses import replace
 from pathlib import Path
 from types import ModuleType, SimpleNamespace
 from unittest.mock import patch
@@ -460,6 +461,92 @@ def test_device_bridge_keeps_feedback_on_device_and_ignores_cpu_decode_history()
     with extension.bind(batch, draft) as view:
         assert view.slots.tolist() == [-1]
     extension.shutdown()
+
+
+@pytest.mark.parametrize(
+    "overrides",
+    [
+        {"max_shared_requests": -1},
+        {"max_shared_requests": True},
+        {"shared_context_tokens": 0},
+        {"shared_context_tokens": True},
+        {"max_shared_requests": 1},
+        {"enable_global_pool": 1},
+        {"enable_global_pool": True, "history_mode": "cpu"},
+    ],
+)
+def test_shared_history_rejects_invalid_capacity_and_cpu_mode(overrides):
+    with pytest.raises(ValueError):
+        HybridConfig(2, 2, 1, 32, **overrides)
+
+
+def test_shared_history_finish_eviction_graph_mapping_and_flush(host_prefill_case):
+    """A finished donor changes graph inputs even when active rows stay fixed."""
+    extension, backend, batch, _, result = host_prefill_case
+    config = replace(
+        extension.config, max_requests=2, max_shared_requests=1, enable_global_pool=True
+    )
+    extension.config = backend.config = config
+    extension.free_slots = list(range(config.num_sa_slots))
+    a = batch.reqs[0]
+    b = Request("b")
+    b.get_fill_ids = lambda: b.origin_input_ids
+    batch.reqs = [a, b]
+    batch.seq_lens_cpu = batch.seq_lens = torch.tensor([5, 5])
+    result.next_token_ids = torch.tensor([2, 2])
+    ticket = extension.begin_prefill(batch)
+    extension.on_prefill(batch, result, ticket)
+    draft = SimpleNamespace(draft_override=None)
+    # Install both prompts before finishing a. Pending prefill-only builds must
+    # not be retained because their device SA has not yet been imported.
+    with extension.bind(batch, draft):
+        pass
+    a_slot = extension.states["a"].slot
+    a_generation = extension.states["a"].generation
+    batch.reqs = [b]
+    batch.seq_lens_cpu = batch.seq_lens = torch.tensor([5])
+    buffers = extension.create_graph_buffers(2)
+    capture = buffers.bind_capture_view(2)
+    with extension.bind(batch, draft) as before:
+        buffers.stage(before, 1, 2)
+        assert capture.shared_slots.tolist() == [extension.states["b"].slot, a_slot, -1]
+        assert capture.shared_lengths.tolist() == [-1, -1, -1]
+    # Scheduler finish is CPU-only and may happen on another thread.
+    thread = threading.Thread(
+        target=extension.close_request, args=("a",), kwargs={"retain": True}
+    )
+    thread.start()
+    thread.join(timeout=5)
+    assert not thread.is_alive()
+    extension.close_request("a", retain=True)  # Duplicate delivery is harmless.
+    with extension.bind(batch, draft) as after:
+        assert after is not before
+        buffers.stage(after, 1, 2)
+        assert capture.shared_slots.tolist() == [extension.states["b"].slot, a_slot, -1]
+        assert capture.shared_generations.tolist() == [
+            a_generation + 1,
+            a_generation,
+            0,
+        ]
+        assert capture.shared_lengths.tolist() == [-1, 6, -1]
+        assert capture.slots[1].item() == -1
+    b_slot = extension.states["b"].slot
+    extension.close_request("b", retain=True)
+    assert list(extension.shared) == [(b_slot, a_generation + 1, 6)]
+    assert a_slot in extension.free_slots and b_slot not in extension.free_slots
+    extension.reset()
+    with extension.bind(batch, draft) as cleared:
+        buffers.stage(cleared, 1, 2)
+        assert capture.shared_slots.tolist() == [-1, -1, -1]
+        assert capture.slots.tolist() == [-1, -1]
+    # Aborts/retractions use the ordinary close path and do not publish a donor.
+    batch.reqs = [a]
+    ticket = extension.begin_prefill(batch)
+    result.next_token_ids = torch.tensor([2])
+    extension.on_prefill(batch, result, ticket)
+    extension.close_request("a", retain=True)
+    assert not extension.shared  # Host build not installed.
+    assert sorted(extension.free_slots) == list(range(config.num_sa_slots))
 
 
 @pytest.mark.parametrize("extension_type", [DraftExtension, DeviceDraftExtension])

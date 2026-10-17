@@ -1,0 +1,278 @@
+{
+  "date": "2026-10-17",
+  "branch": "codex/hybrid-suffix-speculation",
+  "baseline_commit": "2d53a3d2d2",
+  "host": "hz01-ssh.gpuhome.cc:30167",
+  "gpu": "NVIDIA RTX 6000D",
+  "gpu_count": 1,
+  "compute_capability": "12.0",
+  "torch": "2.14.1+cu130",
+  "cuda_toolkit": "13.0",
+  "python": "3.12.13",
+  "runtime": "Isolated current local Python source via PYTHONPATH; remote original checkout 53e1300 unchanged; Python TreeCore fallback selected",
+  "remote_workdir": "/tmp/sglang-global-pool-6000d-20261017",
+  "remote_evidence": "/root/rivermind-data/validation/global-pool-20261017",
+  "runtime_source_match": {
+    "files": 5616,
+    "mismatches": [],
+    "manifest_sha256": "97daa39867beb5c050c50a2cc9cffd213356ae570339bddfa562db536e79f315"
+  },
+  "source_archive_sha256": "e34e83db915e125a5f5181e4a11444fe3b1e5e9431a63ddcfeccf1354dde18dd",
+  "package_source_sha256": {
+    "src/hybrid_spec/__init__.py": "2840db96ca3469e67428171bc7383cef0355190b4f6861d4391cdb9e77a335b7",
+    "src/hybrid_spec/backends/__init__.py": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
+    "src/hybrid_spec/backends/gpu_sa/__init__.py": "9c9aa727d0d72029bceb2de433286bd518d3906a615dc94ca06c8862f5bf3d68",
+    "src/hybrid_spec/backends/gpu_sa/automaton.h": "27b2d6ac245a2f3c5e5b81352ac4abe209449f39425a826d8b6a331395402faf",
+    "src/hybrid_spec/backends/gpu_sa/host_builder.cpp": "47f8658d71b69e1a49d681b77e5a67fd53e77355565f9f10e15b78df80db5628",
+    "src/hybrid_spec/backends/gpu_sa/host_builder.h": "bb5acba08594af8d6f8e170098c28a4f1935d0bd3aafe7c15090f37e78abe8f2",
+    "src/hybrid_spec/backends/gpu_sa/suffix_automaton.cu": "55df8ac6104f875c9b85a6bfcad8130e1e285ae4ce21c36bec567a199ff29882",
+    "src/hybrid_spec/backends/host_sa.py": "f172d1ed60982a23c5f3224eafed1bce52781591e1605571da7aaa45d2d45218",
+    "src/hybrid_spec/backends/reference.py": "5e4f5b565bcd7f5c644459003a429ef2db30b6242a79fade288b23cf5ed163f6",
+    "src/hybrid_spec/config.py": "fd8cc9e6be0e97e12e7eaf9048d3d2eb8c348d259c60543253e38926006c8984",
+    "src/hybrid_spec/core/__init__.py": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
+    "src/hybrid_spec/core/contracts.py": "5761fc71822577f073679fdf231f995c7d94b81c0145c07cf3d143b0aecfa678",
+    "src/hybrid_spec/core/request_state.py": "0c9d3cb471096410d44562f5b5357abc45bd6a91bb85f4113125124cb36494b4",
+    "src/hybrid_spec/core/runtime.py": "64f7066997c32d1269b2ffc8f399a7173597a4e888572a3d49fbb8fab6ac829e",
+    "src/hybrid_spec/integrations/__init__.py": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
+    "src/hybrid_spec/integrations/sglang/__init__.py": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
+    "src/hybrid_spec/integrations/sglang/compact_graph.py": "2ba335f3e789768ef9d333f15c5da36cc95ccf414c795a7329707a6fa0d054a6",
+    "src/hybrid_spec/integrations/sglang/compatibility.py": "850ddbb46e1edcc53a9ccc8e532dd6dbb52261fa2083f8d8465aeed6d7a24047",
+    "src/hybrid_spec/integrations/sglang/device_extension.py": "ec74bbbc007031e03c971d56ec4757812bcc39fdc05d4b2943d9dda6d3465e41",
+    "src/hybrid_spec/integrations/sglang/draft_extension.py": "174e0354d9af7956518d8c047a61fa7d46669c80ef04e9f25a3c292a58726116",
+    "src/hybrid_spec/integrations/sglang/graph_buffers.py": "990854587c6395fd4d669deb2e5c0942233582c144bf4ed3cc80268d9d012f0b",
+    "src/hybrid_spec/integrations/sglang/split_graph.py": "40997834cd3f18869e834338d2519b3e2a8789186a35dcd5d0a3ba66f3f10a57",
+    "src/hybrid_spec/integrations/sglang/tp_sync.py": "7ccff524aae6865ef1096f028fc4806f2c98b7410916b330a435cee68425432a",
+    "src/hybrid_spec/observability/__init__.py": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
+    "src/hybrid_spec/observability/metrics.py": "fc20d5bba779666d105d9ee36b9c969bf2b9e0f60400ea592aae15ad396cd5d8",
+    "src/hybrid_spec/plugin.py": "9791a506427d6b0feccb80cb1ebfffb5bab7b03d4899e510b4ff94db39245939",
+    "src/hybrid_spec/selection/__init__.py": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
+    "src/hybrid_spec/selection/policy.py": "41d0e31cc5fa84438998554f1c36acf7683a9eddc5552e66d15b0c5e58b5031a",
+    "tests/native/automaton_test.cpp": "831397f5995b29cf0bbd26ba3091e84799703b6c2be9f99f7d2278358117b2b4",
+    "tests/native/host_builder_probe.cpp": "12b43afd15e5c525ebd0691c91aa81494b4f735e0f1c6be7a08632e497324029",
+    "tests/test_core.py": "6e4ab113e6e396f3097ca796dd6fd88a6f45b667198b8a0483943cd2caefe23d",
+    "tests/test_cuda.py": "78b29ba8781f8ffa32ac4298a2dddec2e5334f590466b89a1bfe9447501f613f",
+    "tests/test_draft_recurrence.py": "2d888f470a88cd38edff6955f8b9b21af9333a8637502dba85b3f427e5819387",
+    "tests/test_native.py": "df1c3cbf0f837bb0b106d48e47f5c9fe5c8d01ebbd80cfe1115e884216336ee9",
+    "tests/test_tp.py": "5af73e2d4b064711eb2b2e7b6b5752ab2a4e6317a3bfb60c7af39d26bfad9720"
+  },
+  "tests": {
+    "command": "python -m pytest experimental/hybrid-spec/tests -q --disable-warnings",
+    "env": {
+      "TORCH_CUDA_ARCH_LIST": "12.0",
+      "MAX_JOBS": "2",
+      "TORCH_EXTENSIONS_DIR": "/tmp/sglang-global-pool-6000d-20261017/torch-extensions"
+    },
+    "passed": 175,
+    "skipped": 1,
+    "warnings": 51,
+    "seconds": 76.26,
+    "cuda_cases": 19,
+    "skip_reason": "NCCL requires two NVIDIA GPUs",
+    "gloo_world_sizes": [
+      1,
+      2,
+      4
+    ]
+  },
+  "model": "Qwen3.6-35B-A3B-FP8",
+  "launch_script": "#!/usr/bin/env bash\nset -euo pipefail\nsource /root/rivermind-data/activate-sglang.sh\ncd /tmp/sglang-global-pool-6000d-20261017\nexport PYTHONPATH=$PWD/experimental/hybrid-spec/src:$PWD/python\nexport HYBRID_SPEC_CONFIG=$PWD/smoke-config.json\nexport TORCH_EXTENSIONS_DIR=$PWD/torch-extensions\nexport TORCH_CUDA_ARCH_LIST=12.0\nexport MAX_JOBS=2\nexport CUDA_VISIBLE_DEVICES=0\nexec python -m sglang.launch_server \\\n --model-path /root/rivermind-data/models/Qwen/Qwen3.6-35B-A3B-FP8 \\\n --language-only --speculative-algorithm EAGLE --speculative-num-steps 8 \\\n --speculative-eagle-topk 1 --speculative-num-draft-tokens 9 \\\n --speculative-moe-runner-backend triton --linear-attn-backend triton \\\n --speculative-draft-attention-backend triton --tp-size 1 \\\n --context-length 4096 --max-running-requests 2 --max-mamba-cache-size 20 \\\n --mem-fraction-static 0.8 --random-seed 42 --watchdog-timeout 300 \\\n --cuda-graph-max-bs-decode 2 --host 127.0.0.1 --port 39981\n",
+  "model_smoke": {
+    "full_pool": {
+      "config": {
+        "num_drafts": 8,
+        "min_match_len": 4,
+        "max_requests": 2,
+        "max_history_tokens": 4096,
+        "backend": "gpu_sa",
+        "history_mode": "device",
+        "partial_drafts": "fallback",
+        "num_neural_gate_tokens": 0,
+        "draft_graph_mode": "full",
+        "enable_global_pool": true,
+        "max_shared_requests": 2,
+        "shared_context_tokens": 128
+      },
+      "responses": "global-pool-6000d-full-smoke.json",
+      "second_retrieval_batches": 7,
+      "after_flush_retrieval_batches": 0,
+      "second_matches_fresh_token_ids": true,
+      "sequential_token_parity_vs_pool_disabled": {
+        "first": true,
+        "second": true,
+        "after_flush": true
+      },
+      "concurrent_token_parity_vs_pool_disabled": null,
+      "split_after_second": null,
+      "split_after_concurrent": null
+    },
+    "full_disabled": {
+      "config": {
+        "num_drafts": 8,
+        "min_match_len": 4,
+        "max_requests": 2,
+        "max_history_tokens": 4096,
+        "backend": "gpu_sa",
+        "history_mode": "device",
+        "partial_drafts": "fallback",
+        "num_neural_gate_tokens": 0,
+        "draft_graph_mode": "full",
+        "enable_global_pool": false,
+        "max_shared_requests": 0,
+        "shared_context_tokens": 128
+      },
+      "responses": "global-pool-6000d-disabled-smoke.json",
+      "second_retrieval_batches": 0,
+      "after_flush_retrieval_batches": 0,
+      "second_matches_fresh_token_ids": true,
+      "sequential_token_parity_vs_pool_disabled": {
+        "first": true,
+        "second": true,
+        "after_flush": true
+      },
+      "concurrent_token_parity_vs_pool_disabled": [
+        true,
+        true
+      ],
+      "split_after_second": null,
+      "split_after_concurrent": null
+    },
+    "split_no_skip": {
+      "config": {
+        "num_drafts": 8,
+        "min_match_len": 4,
+        "max_requests": 2,
+        "max_history_tokens": 4096,
+        "backend": "gpu_sa",
+        "history_mode": "device",
+        "partial_drafts": "fallback",
+        "num_neural_gate_tokens": 2,
+        "draft_graph_mode": "split_no_skip",
+        "enable_global_pool": true,
+        "max_shared_requests": 2,
+        "shared_context_tokens": 128
+      },
+      "responses": "global-pool-6000d-split-no-skip-smoke.json",
+      "second_retrieval_batches": 7,
+      "after_flush_retrieval_batches": 0,
+      "second_matches_fresh_token_ids": true,
+      "sequential_token_parity_vs_pool_disabled": {
+        "first": true,
+        "second": true,
+        "after_flush": true
+      },
+      "concurrent_token_parity_vs_pool_disabled": [
+        true,
+        true
+      ],
+      "split_after_second": {
+        "prefix_ct": 28,
+        "skip_ct": 0,
+        "tail_ct": 28,
+        "decision_wait_ns": 35263876,
+        "request_ct": 28,
+        "skip_request_ct": 0,
+        "tail_request_ct": 28,
+        "mixed_ct": 0,
+        "tail_batch_histogram": {
+          "0": 0,
+          "1": 28,
+          "2": 0,
+          "3": 0,
+          "4": 0
+        }
+      },
+      "split_after_concurrent": {
+        "prefix_ct": 53,
+        "skip_ct": 0,
+        "tail_ct": 53,
+        "decision_wait_ns": 67782532,
+        "request_ct": 67,
+        "skip_request_ct": 0,
+        "tail_request_ct": 67,
+        "mixed_ct": 0,
+        "tail_batch_histogram": {
+          "0": 0,
+          "1": 39,
+          "2": 14,
+          "3": 0,
+          "4": 0
+        }
+      }
+    },
+    "split": {
+      "config": {
+        "num_drafts": 8,
+        "min_match_len": 4,
+        "max_requests": 2,
+        "max_history_tokens": 4096,
+        "backend": "gpu_sa",
+        "history_mode": "device",
+        "partial_drafts": "fallback",
+        "num_neural_gate_tokens": 2,
+        "draft_graph_mode": "split",
+        "enable_global_pool": true,
+        "max_shared_requests": 2,
+        "shared_context_tokens": 128
+      },
+      "responses": "global-pool-6000d-split-smoke.json",
+      "second_retrieval_batches": 7,
+      "after_flush_retrieval_batches": 0,
+      "second_matches_fresh_token_ids": true,
+      "sequential_token_parity_vs_pool_disabled": {
+        "first": true,
+        "second": true,
+        "after_flush": true
+      },
+      "concurrent_token_parity_vs_pool_disabled": [
+        true,
+        true
+      ],
+      "split_after_second": {
+        "prefix_ct": 28,
+        "skip_ct": 7,
+        "tail_ct": 21,
+        "decision_wait_ns": 35570878,
+        "request_ct": 28,
+        "skip_request_ct": 7,
+        "tail_request_ct": 21,
+        "mixed_ct": 0,
+        "tail_batch_histogram": {
+          "0": 7,
+          "1": 21,
+          "2": 0,
+          "3": 0,
+          "4": 0
+        }
+      },
+      "split_after_concurrent": {
+        "prefix_ct": 53,
+        "skip_ct": 14,
+        "tail_ct": 39,
+        "decision_wait_ns": 68482840,
+        "request_ct": 67,
+        "skip_request_ct": 21,
+        "tail_request_ct": 46,
+        "mixed_ct": 0,
+        "tail_batch_histogram": {
+          "0": 14,
+          "1": 32,
+          "2": 7,
+          "3": 0,
+          "4": 0
+        }
+      }
+    }
+  },
+  "setup_attempts": "Initial split and split_no_skip harness attempts used unsupported gate=4; rejected at startup by existing validation. Final successful split runs use gate=2.",
+  "limits": [
+    "One short code prompt; 18 successful generation requests across four fresh servers",
+    "No general accuracy or performance claim",
+    "No real multi-GPU NCCL verification",
+    "Real concurrent split sample has mixed_ct=0; component tests cover mixed masks"
+  ],
+  "cleanup": {
+    "temporary_servers_stopped": true,
+    "gpu_memory_mib": 0,
+    "original_remote_checkout_clean": true
+  }
+}

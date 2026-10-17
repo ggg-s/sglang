@@ -77,6 +77,35 @@ struct Automaton {
   HYBRID_DEVICE static int target(const int *edge) {
     return *edge < 0 ? ~*edge : *edge;
   }
+  // Longest suffix of an external request's context present in this SA.
+  // Each donor is a separate text, so a lookup can never cross requests.
+  HYBRID_DEVICE int match_suffix(const int *context, int count, int &length,
+                                bool require_continuation = false) {
+    int state = 0;
+    length = 0;
+    for (int i = 0; i < count; ++i) {
+      int *edge = find(state, context[i]);
+      while (state && edge == nullptr) {
+        state = s(state, 1);
+        length = s(state, 0);
+        edge = find(state, context[i]);
+      }
+      if (edge != nullptr) {
+        state = target(edge);
+        ++length;
+      } else {
+        state = 0;
+        length = 0;
+      }
+    }
+    // A longest match at the source's end may have no future tokens. Follow
+    // suffix links to an earlier occurrence instead of dropping the source.
+    while (require_continuation && state && s(state, 2) + 1 >= meta[0]) {
+      state = s(state, 1);
+      length = s(state, 0);
+    }
+    return state;
+  }
   HYBRID_DEVICE void grow_hash() {
     int count = meta[6];
     e(count, 5) = -1;

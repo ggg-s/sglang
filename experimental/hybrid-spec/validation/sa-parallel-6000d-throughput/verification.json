@@ -1,0 +1,34 @@
+{
+  "cases": 48,
+  "requests": 3840,
+  "output_tokens": 491520,
+  "same_input_files": true,
+  "same_output_budget": true,
+  "prefix_cache_tokens": 0,
+  "all_request_errors_empty": true,
+  "prompt_files_sha256": {
+    "provenance.json": "37a719e70d7ab942e2a51ac979c7ff1b5bf88bfd000b5a876a6eb0531618bc05",
+    "unique.jsonl": "32ab3b41689fdcf509fab0a5755036c455ecc36781f1dc9d9da12156e05097ab",
+    "repeat.jsonl": "85cb17cd85293f5f9cfae2f2a3e94541924dee7fd0ba54a5462f68dac131ef72"
+  },
+  "split_mixed_batches": 3422,
+  "split_skipped_batches": 12134,
+  "source_checks": {
+    "serial": {
+      "files": 5616,
+      "mismatches": []
+    },
+    "parallel": {
+      "files": 5616,
+      "mismatches": []
+    }
+  },
+  "final_gpu_memory_mib": "0",
+  "original_remote_checkout_status": "",
+  "gpu": "name, uuid, driver_version, memory.total [MiB], power.limit [W]\nNVIDIA RTX 6000D, GPU-688a25a3-5392-6ca9-7ee5-2cad0e65088d, 580.119.02, 85651 MiB, 600.00 W\n",
+  "tests": [
+    "......................................s                                  [100%]",
+    "182 passed, 1 skipped, 51 warnings in 76.60s (0:01:16)",
+    "sys:1: DeprecationWarning: builtin type swigvarlink has no __module__ attribute"
+  ]
+}

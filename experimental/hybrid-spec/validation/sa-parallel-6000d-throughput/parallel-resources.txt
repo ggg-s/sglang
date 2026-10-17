@@ -1,0 +1,25 @@
+
+Fatbin elf code:
+================
+arch = sm_120
+code version = [1,8]
+host = linux
+compile_size = 64bit
+
+Resource usage:
+ Common:
+  GLOBAL:28 CONSTANT[4]:224
+ Function _Z19shared_query_kernelPiS_S_S_PKlS1_S1_S1_S1_S1_S1_PlPbiiiiiib:
+  REG:44 STACK:0 SHARED:3072 LOCAL:0 CONSTANT[0]:1025 TEXTURE:0 SURFACE:0 SAMPLER:0
+ Function _Z22finalize_shared_kernelPiS_S_S_PKlPKiPlS1_S1_S1_iii:
+  REG:40 STACK:0 SHARED:0 LOCAL:0 CONSTANT[0]:988 TEXTURE:0 SURFACE:0 SAMPLER:0
+ Function _Z20consume_query_kernelPiS_S_S_PKlS1_PKiPlS1_S1_S1_S4_Pbiiiib:
+  REG:46 STACK:0 SHARED:0 LOCAL:0 CONSTANT[0]:1017 TEXTURE:0 SURFACE:0 SAMPLER:0
+ Function _Z15feedback_kernelPiPKlS_PlS1_S1_PKiS4_S4_S1_iiiibiPKbS2_:
+  REG:32 STACK:0 SHARED:0 LOCAL:0 CONSTANT[0]:1016 TEXTURE:0 SURFACE:0 SAMPLER:0
+ Function _Z12query_kernelPKiS0_S0_PKlPlS3_S3_S3_Pbiiii:
+  REG:28 STACK:0 SHARED:0 LOCAL:0 CONSTANT[0]:984 TEXTURE:0 SURFACE:0 SAMPLER:0
+ Function _Z13append_kernelPiS_S_S_PKliiii:
+  REG:40 STACK:0 SHARED:0 LOCAL:0 CONSTANT[0]:952 TEXTURE:0 SURFACE:0 SAMPLER:0
+ Function _Z12reset_kernelPiS_ii:
+  REG:14 STACK:0 SHARED:0 LOCAL:0 CONSTANT[0]:920 TEXTURE:0 SURFACE:0 SAMPLER:0

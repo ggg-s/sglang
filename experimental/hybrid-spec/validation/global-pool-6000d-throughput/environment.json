@@ -1,0 +1,26 @@
+{
+  "python": "3.12.13",
+  "packages": {
+    "sglang": "0.0.0.dev1+g1b0f58030",
+    "torch": "2.14.1",
+    "sgl-kernel": null,
+    "sglang-kernel": "0.4.9",
+    "flashinfer-python": "0.7.1",
+    "triton": "3.8.0",
+    "transformers": "5.19.0",
+    "nvidia-nccl-cu13": "2.30.7"
+  },
+  "source_baseline": "2d53a3d2d2+uncommitted-global-pool",
+  "runtime_source_match": {
+    "files": 5616,
+    "mismatches": []
+  },
+  "runtime_root": "/tmp/sglang-global-pool-6000d-20261017",
+  "environment": {
+    "PYTHONPATH": "/tmp/sglang-global-pool-6000d-20261017/experimental/hybrid-spec/src:/tmp/sglang-global-pool-6000d-20261017/python",
+    "TORCH_EXTENSIONS_DIR": "/tmp/sglang-global-pool-6000d-20261017/torch-extensions",
+    "TORCH_CUDA_ARCH_LIST": "12.0",
+    "CUDA_VISIBLE_DEVICES": "0",
+    "MAX_JOBS": "2"
+  }
+}

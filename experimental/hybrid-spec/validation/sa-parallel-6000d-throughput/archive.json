@@ -1,0 +1,11 @@
+{
+  "local_archive": "/private/tmp/sa-parallel-6000d-20261017-evidence.tar.gz",
+  "remote_archive": "/root/rivermind-data/validation/sa-parallel-6000d-20261017-evidence.tar.gz",
+  "bytes": 34396431,
+  "sha256": "47ae0f1a7d3beab2ab34a290aa6f1e017ce7e7178d236f3f1de3fbcc581d48b1",
+  "verified_evidence_files": 335,
+  "verified_archived_source_files": {
+    "serial": 5616,
+    "parallel": 5616
+  }
+}

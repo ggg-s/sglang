@@ -1,0 +1,134 @@
+[
+  {
+    "sources": 20,
+    "batch": 1,
+    "workload": "different",
+    "serial_shared_kernel_us": 2192.785,
+    "parallel_shared_kernel_us": 910.78,
+    "shared_kernel_speedup": 2.407590197413206,
+    "serial_total_query_us": 2196.656951904297,
+    "parallel_total_query_us": 915.1083374023438,
+    "exact_output_parity": true
+  },
+  {
+    "sources": 20,
+    "batch": 1,
+    "workload": "matching",
+    "serial_shared_kernel_us": 596.076,
+    "parallel_shared_kernel_us": 61.568,
+    "shared_kernel_speedup": 9.681587837837839,
+    "serial_total_query_us": 599.9347305297852,
+    "parallel_total_query_us": 65.41999816894531,
+    "exact_output_parity": true
+  },
+  {
+    "sources": 20,
+    "batch": 4,
+    "workload": "different",
+    "serial_shared_kernel_us": 1972.6585,
+    "parallel_shared_kernel_us": 888.556,
+    "shared_kernel_speedup": 2.220072229549966,
+    "serial_total_query_us": 1976.9171142578125,
+    "parallel_total_query_us": 892.786865234375,
+    "exact_output_parity": true
+  },
+  {
+    "sources": 20,
+    "batch": 4,
+    "workload": "matching",
+    "serial_shared_kernel_us": 608.7315,
+    "parallel_shared_kernel_us": 62.32,
+    "shared_kernel_speedup": 9.767835365853658,
+    "serial_total_query_us": 612.400016784668,
+    "parallel_total_query_us": 66.00639820098877,
+    "exact_output_parity": true
+  },
+  {
+    "sources": 64,
+    "batch": 1,
+    "workload": "different",
+    "serial_shared_kernel_us": 7254.321,
+    "parallel_shared_kernel_us": 1086.2669999999998,
+    "shared_kernel_speedup": 6.678211710380598,
+    "serial_total_query_us": 7261.9952392578125,
+    "parallel_total_query_us": 1090.0353240966797,
+    "exact_output_parity": true
+  },
+  {
+    "sources": 64,
+    "batch": 1,
+    "workload": "matching",
+    "serial_shared_kernel_us": 1955.3315,
+    "parallel_shared_kernel_us": 93.616,
+    "shared_kernel_speedup": 20.886723423346435,
+    "serial_total_query_us": 1959.5321655273438,
+    "parallel_total_query_us": 97.47119903564453,
+    "exact_output_parity": true
+  },
+  {
+    "sources": 64,
+    "batch": 4,
+    "workload": "different",
+    "serial_shared_kernel_us": 7111.9245,
+    "parallel_shared_kernel_us": 1111.995,
+    "shared_kernel_speedup": 6.39564431494746,
+    "serial_total_query_us": 7115.5926513671875,
+    "parallel_total_query_us": 1116.32080078125,
+    "exact_output_parity": true
+  },
+  {
+    "sources": 64,
+    "batch": 4,
+    "workload": "matching",
+    "serial_shared_kernel_us": 1996.9955,
+    "parallel_shared_kernel_us": 96.71950000000001,
+    "shared_kernel_speedup": 20.64728932635094,
+    "serial_total_query_us": 2001.8185424804688,
+    "parallel_total_query_us": 100.47280311584473,
+    "exact_output_parity": true
+  },
+  {
+    "sources": 257,
+    "batch": 1,
+    "workload": "different",
+    "serial_shared_kernel_us": 29350.0985,
+    "parallel_shared_kernel_us": 2278.8385,
+    "shared_kernel_speedup": 12.87941137557576,
+    "serial_total_query_us": 29355.9912109375,
+    "parallel_total_query_us": 2282.0559692382812,
+    "exact_output_parity": true
+  },
+  {
+    "sources": 257,
+    "batch": 1,
+    "workload": "matching",
+    "serial_shared_kernel_us": 7939.99,
+    "parallel_shared_kernel_us": 185.055,
+    "shared_kernel_speedup": 42.90610899462322,
+    "serial_total_query_us": 7943.7310791015625,
+    "parallel_total_query_us": 188.3278465270996,
+    "exact_output_parity": true
+  },
+  {
+    "sources": 257,
+    "batch": 4,
+    "workload": "different",
+    "serial_shared_kernel_us": 29538.1835,
+    "parallel_shared_kernel_us": 2321.111,
+    "shared_kernel_speedup": 12.72588148520256,
+    "serial_total_query_us": 29544.63134765625,
+    "parallel_total_query_us": 2324.714813232422,
+    "exact_output_parity": true
+  },
+  {
+    "sources": 257,
+    "batch": 4,
+    "workload": "matching",
+    "serial_shared_kernel_us": 8101.915999999999,
+    "parallel_shared_kernel_us": 189.92000000000002,
+    "shared_kernel_speedup": 42.65962510530749,
+    "serial_total_query_us": 8109.2144775390625,
+    "parallel_total_query_us": 193.7656021118164,
+    "exact_output_parity": true
+  }
+]

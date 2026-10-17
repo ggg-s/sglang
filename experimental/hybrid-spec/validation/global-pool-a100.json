@@ -1,0 +1,78 @@
+{
+  "date": "2026-10-17",
+  "branch": "codex/hybrid-suffix-speculation",
+  "baseline_commit": "2d53a3d2d2",
+  "reference_commit": "7ebcf4debcac29b3f6225cb4affff3ecf05514aa",
+  "gpu": "NVIDIA A100-PCIE-40GB",
+  "torch": "2.14.1+cu130",
+  "tests": {
+    "command": "python -m pytest experimental/hybrid-spec/tests -q --disable-warnings",
+    "passed": 175,
+    "skipped": 1,
+    "seconds": 103.85,
+    "skip_reason": "NCCL requires two NVIDIA GPUs",
+    "cuda_cases": 19,
+    "gloo_world_sizes": [
+      1,
+      2,
+      4
+    ]
+  },
+  "source_sha256": {
+    "src/hybrid_spec/__init__.py": "2840db96ca3469e67428171bc7383cef0355190b4f6861d4391cdb9e77a335b7",
+    "src/hybrid_spec/backends/__init__.py": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
+    "src/hybrid_spec/backends/gpu_sa/__init__.py": "9c9aa727d0d72029bceb2de433286bd518d3906a615dc94ca06c8862f5bf3d68",
+    "src/hybrid_spec/backends/gpu_sa/automaton.h": "27b2d6ac245a2f3c5e5b81352ac4abe209449f39425a826d8b6a331395402faf",
+    "src/hybrid_spec/backends/gpu_sa/host_builder.cpp": "47f8658d71b69e1a49d681b77e5a67fd53e77355565f9f10e15b78df80db5628",
+    "src/hybrid_spec/backends/gpu_sa/host_builder.h": "bb5acba08594af8d6f8e170098c28a4f1935d0bd3aafe7c15090f37e78abe8f2",
+    "src/hybrid_spec/backends/gpu_sa/suffix_automaton.cu": "55df8ac6104f875c9b85a6bfcad8130e1e285ae4ce21c36bec567a199ff29882",
+    "src/hybrid_spec/backends/host_sa.py": "f172d1ed60982a23c5f3224eafed1bce52781591e1605571da7aaa45d2d45218",
+    "src/hybrid_spec/backends/reference.py": "5e4f5b565bcd7f5c644459003a429ef2db30b6242a79fade288b23cf5ed163f6",
+    "src/hybrid_spec/config.py": "fd8cc9e6be0e97e12e7eaf9048d3d2eb8c348d259c60543253e38926006c8984",
+    "src/hybrid_spec/core/__init__.py": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
+    "src/hybrid_spec/core/contracts.py": "5761fc71822577f073679fdf231f995c7d94b81c0145c07cf3d143b0aecfa678",
+    "src/hybrid_spec/core/request_state.py": "0c9d3cb471096410d44562f5b5357abc45bd6a91bb85f4113125124cb36494b4",
+    "src/hybrid_spec/core/runtime.py": "64f7066997c32d1269b2ffc8f399a7173597a4e888572a3d49fbb8fab6ac829e",
+    "src/hybrid_spec/integrations/__init__.py": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
+    "src/hybrid_spec/integrations/sglang/__init__.py": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
+    "src/hybrid_spec/integrations/sglang/compact_graph.py": "2ba335f3e789768ef9d333f15c5da36cc95ccf414c795a7329707a6fa0d054a6",
+    "src/hybrid_spec/integrations/sglang/compatibility.py": "850ddbb46e1edcc53a9ccc8e532dd6dbb52261fa2083f8d8465aeed6d7a24047",
+    "src/hybrid_spec/integrations/sglang/device_extension.py": "ec74bbbc007031e03c971d56ec4757812bcc39fdc05d4b2943d9dda6d3465e41",
+    "src/hybrid_spec/integrations/sglang/draft_extension.py": "174e0354d9af7956518d8c047a61fa7d46669c80ef04e9f25a3c292a58726116",
+    "src/hybrid_spec/integrations/sglang/graph_buffers.py": "990854587c6395fd4d669deb2e5c0942233582c144bf4ed3cc80268d9d012f0b",
+    "src/hybrid_spec/integrations/sglang/split_graph.py": "40997834cd3f18869e834338d2519b3e2a8789186a35dcd5d0a3ba66f3f10a57",
+    "src/hybrid_spec/integrations/sglang/tp_sync.py": "7ccff524aae6865ef1096f028fc4806f2c98b7410916b330a435cee68425432a",
+    "src/hybrid_spec/observability/__init__.py": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
+    "src/hybrid_spec/observability/metrics.py": "fc20d5bba779666d105d9ee36b9c969bf2b9e0f60400ea592aae15ad396cd5d8",
+    "src/hybrid_spec/plugin.py": "9791a506427d6b0feccb80cb1ebfffb5bab7b03d4899e510b4ff94db39245939",
+    "src/hybrid_spec/selection/__init__.py": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
+    "src/hybrid_spec/selection/policy.py": "41d0e31cc5fa84438998554f1c36acf7683a9eddc5552e66d15b0c5e58b5031a"
+  },
+  "runtime_source_match": {
+    "files": 28,
+    "mismatches": []
+  },
+  "model_smoke": {
+    "model": "Qwen3.5-35B-A3B-GPTQ-Int4",
+    "native_commit": "972aa16098",
+    "config": {
+      "num_drafts": 8,
+      "min_match_len": 4,
+      "max_requests": 2,
+      "max_history_tokens": 4096,
+      "backend": "gpu_sa",
+      "history_mode": "device",
+      "partial_drafts": "fallback",
+      "num_neural_gate_tokens": 0,
+      "draft_graph_mode": "full",
+      "enable_global_pool": true,
+      "max_shared_requests": 2,
+      "shared_context_tokens": 128
+    },
+    "second_retrieval_batches": 7,
+    "after_flush_retrieval_batches": 1,
+    "second_matches_fresh_text": true,
+    "responses": "global-pool-a100-smoke.json",
+    "formal_accuracy_or_throughput_benchmark": false
+  }
+}
