@@ -450,7 +450,18 @@ def native_triton_metadata_methods(monkeypatch):
 
 @pytest.mark.parametrize("mode", ["split", "split_no_skip"])
 @pytest.mark.parametrize(
-    "kind", ["triton", "dsv4", "eagle3", "eagle3_hot", "standalone"]
+    "kind",
+    [
+        "triton",
+        "dsv4",
+        "eagle3",
+        "eagle3_hot",
+        "standalone",
+        "arctic_triton",
+        "arctic_dsv4",
+        "arctic_eagle3_hot",
+        "arctic_standalone",
+    ],
 )
 @pytest.mark.parametrize(
     "steps,gate,batch_size",
@@ -500,6 +511,8 @@ def test_compact_tail_graph_reorders_rows_without_computing_sa_requests(
     )
     from test_draft_recurrence import load_functions
 
+    arctic = kind.startswith("arctic_")
+    kind = kind.removeprefix("arctic_")
     native_metadata = kind in ("eagle3", "eagle3_hot", "standalone")
 
     class Child:
@@ -644,11 +657,33 @@ def test_compact_tail_graph_reorders_rows_without_computing_sa_requests(
         tokens.copy_(candidates)
         mask.copy_(eligible)
 
-    view = DeviceOverride(
-        NS(config=config, device=torch.device(device), consume_and_query=query),
-        reqs,
-        reqs + 1,
-    )
+    extension = buffers = None
+    if arctic:
+        from hybrid_spec.backends.arctic import ArcticBackend
+        from hybrid_spec.integrations.sglang.arctic_extension import (
+            ArcticDraftExtension,
+        )
+        from hybrid_spec.integrations.sglang.gated_override import GatedOverride
+        from test_arctic import Request
+
+        config = replace(
+            config,
+            backend="arctic",
+            history_mode="cpu",
+            min_match_len=1,
+            arctic_max_spec_factor=0.0,
+            arctic_max_spec_offset=float(steps),
+        )
+        extension = ArcticDraftExtension(config, ArcticBackend(config, device), 8192)
+        buffers = extension.create_graph_buffers(batch_size)
+        view = buffers.bind_capture_view(batch_size)
+        cpu_requests = [Request(f"r{row}", [], []) for row in range(batch_size)]
+    else:
+        view = DeviceOverride(
+            NS(config=config, device=torch.device(device), consume_and_query=query),
+            reqs,
+            reqs + 1,
+        )
     fb = NS(
         batch_size=batch_size,
         positions=base_positions.clone(),
@@ -774,7 +809,7 @@ def test_compact_tail_graph_reorders_rows_without_computing_sa_requests(
         hot_token_id=hot_tokens,
         seed_dsa_topk_from_draft_extend=False,
         index_share_for_mtp_iteration=False,
-        draft_extension=NS(),
+        draft_extension=extension if arctic else NS(),
         topk=1,
         draft_attn_backend=attention,
         draft_runner=model,
@@ -833,14 +868,18 @@ def test_compact_tail_graph_reorders_rows_without_computing_sa_requests(
         ],
         ns,
     )
-    full_view = DeviceOverride(
-        NS(
-            config=replace(config, draft_graph_mode="full"),
-            device=torch.device(device),
-            consume_and_query=query,
-        ),
-        reqs,
-        reqs + 1,
+    full_view = (
+        None
+        if arctic
+        else DeviceOverride(
+            NS(
+                config=replace(config, draft_graph_mode="full"),
+                device=torch.device(device),
+                consume_and_query=query,
+            ),
+            reqs,
+            reqs + 1,
+        )
     )
 
     def prefix():
@@ -852,7 +891,12 @@ def test_compact_tail_graph_reorders_rows_without_computing_sa_requests(
         fb.positions.sub_(steps - 1)  # Actual runner's run_once restoration.
         return result
 
-    backend = SplitDraftGraphBackend(object.__new__(FullCudaGraphBackend), runner, mode)
+    delegate = object.__new__(FullCudaGraphBackend)
+    backend = (
+        extension.wrap_graph_backend(delegate, runner)
+        if arctic
+        else SplitDraftGraphBackend(delegate, runner, mode)
+    )
     backend.stream = torch.cuda.Stream()
     backend.capture_one(batch_size, prefix, capture_inputs=fb)
     assert backend.can_run(NS(batch_size=batch_size), batch_size)
@@ -916,6 +960,35 @@ def test_compact_tail_graph_reorders_rows_without_computing_sa_requests(
                 if hit[row]:
                     expected[row][gate:] = [99 + iteration] * (steps - gate)
             candidates.copy_(candidate)
+            if arctic:
+                for row, req in enumerate(cpu_requests[:raw_bs]):
+                    anchor = 2048 + row
+                    start = anchor if gate or hit[row] else anchor + 1000
+                    chain = candidate[row].tolist()
+                    req.origin_input_ids = (
+                        [start] + chain + [0] * (int(base_positions[row]) - steps - 1)
+                    )
+                    req.output_ids = [anchor]
+                cpu_batch = NS(
+                    reqs=cpu_requests[:raw_bs],
+                    is_extend_in_batch=False,
+                    has_grammar=False,
+                    sampling_info=NS(is_all_greedy=True),
+                    seq_lens=base_positions[:raw_bs],
+                )
+                with extension.bind(cpu_batch, NS(draft_override=None)) as staged:
+                    buffers.stage(staged, raw_bs, batch_size)
+                    full_view = GatedOverride(
+                        buffers.tokens.clone(),
+                        buffers.use_retrieval.clone(),
+                        gate,
+                    )
+                # This path uses the actual official CPU suffix tree, not query().
+                assert view.tokens[:raw_bs][staged.use_retrieval].tolist() == [
+                    candidate[row].tolist()
+                    for row in range(raw_bs)
+                    if staged.use_retrieval[row]
+                ]
             fb.positions.copy_(base_positions)
             work.zero_()
             runner.raw_bs = raw_bs

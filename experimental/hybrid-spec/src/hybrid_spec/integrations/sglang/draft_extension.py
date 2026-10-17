@@ -47,7 +47,7 @@ class DraftExtension:
         for rid, ref in list(self.identities.items()):
             req = ref()
             if req is None or req.finished():
-                self.close_request(rid)
+                self.close_request(rid, retain=req is not None and req.finished())
         requests = []
         for req in batch.reqs:
             ref = self.identities.get(req.rid)
@@ -56,6 +56,7 @@ class DraftExtension:
                 self.identities[req.rid] = weakref.ref(req)
             if req.multimodal_inputs is not None:
                 raise ValueError("hybrid-spec does not index multimodal inputs")
+            self._prepare_request(req)
             history = req.origin_input_ids + req.output_ids
             if not req.output_ids:
                 raise ValueError("hybrid-spec requires the committed prefill anchor")
@@ -75,19 +76,26 @@ class DraftExtension:
             device=self.device,
         )
         view.use_retrieval &= batch.seq_lens + 1 == expected
-        if self.tp_sync is not None:
-            view = TPOverride(
-                view.tokens,
-                view.use_retrieval,
-                self.tp_sync,
-                self.config.num_neural_gate_tokens,
-            )
+        view = self._wrap_view(view)
         self.pending_view = view
         draft_input.draft_override = view
         try:
             yield view
         finally:
             draft_input.draft_override = None
+
+    def _prepare_request(self, req):
+        pass
+
+    def _wrap_view(self, view):
+        if self.tp_sync is not None:
+            return TPOverride(
+                view.tokens,
+                view.use_retrieval,
+                self.tp_sync,
+                self.config.num_neural_gate_tokens,
+            )
+        return view
 
     def close_request(self, rid, *, retain=False):
         self.runtime.close_request(rid)

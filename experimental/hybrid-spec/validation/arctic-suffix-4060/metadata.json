@@ -1,0 +1,129 @@
+{
+  "base_commit": "53fdad7f27aa888dd5b440dc284f4ea2725120e4",
+  "test_source": "Uncommitted isolated worktree; full suite then 46 newly added Arctic+dsv4 parameter cases; production Python unchanged between runs.",
+  "python": "3.10.18",
+  "platform": "Linux-6.6.87.2-microsoft-standard-WSL2-x86_64-with-glibc2.39",
+  "torch": "2.8.0+cu128",
+  "torch_cuda": "12.8",
+  "triton": "3.4.0",
+  "pytest": "9.1.1",
+  "gpu": "NVIDIA GeForce RTX 4060 Laptop GPU",
+  "nvcc": "nvcc: NVIDIA (R) Cuda compiler driver\nCopyright (c) 2005-2023 NVIDIA Corporation\nBuilt on Fri_Jan__6_16:45:21_PST_2023\nCuda compilation tools, release 12.0, V12.0.140\nBuild cuda_12.0.r12.0/compiler.32267302_0",
+  "driver": "592.82",
+  "environment": {
+    "PATH": "/workspace/dsv4-lease-validation-20261017/venv310/bin:$PATH",
+    "PYTHONPATH": "/workspace/arctic-suffix-20261017/ArcticInference:/workspace/arctic-suffix-20261017:experimental/hybrid-spec/src",
+    "CC": "gcc-12",
+    "CXX": "g++-12",
+    "CUDA_HOME": "/usr",
+    "MAX_JOBS": "2",
+    "TORCH_CUDA_ARCH_LIST": "8.9",
+    "GLOO_SOCKET_IFNAME": "lo"
+  },
+  "results": {
+    "distinct_passed": 709,
+    "skipped": 2,
+    "cpu_host_gloo_passed": 254,
+    "cuda_passed": 455,
+    "compact_cuda_cases": 414,
+    "arctic_compact_cuda_cases": 184,
+    "arctic_full_cuda_cases": 4,
+    "skips": [
+      "nccl-2",
+      "nccl-8"
+    ]
+  },
+  "sha256": {
+    "experimental/hybrid-spec/src/hybrid_spec/backends/arctic.py": "89dda04b30c44eee1a04353234fe74e63971cb31417770d7aad12fcec1b59ca1",
+    "experimental/hybrid-spec/src/hybrid_spec/backends/gpu_sa/row_compaction.py": "919ae9469643d26ca71822513cb1c80e1b24821efa52c661959755f849e6e7f1",
+    "experimental/hybrid-spec/src/hybrid_spec/config.py": "1e4fb86aebe146996c25f3d15b5fa6b91e329abceb2d8c2f97ed5ae480fa2aa3",
+    "experimental/hybrid-spec/src/hybrid_spec/core/contracts.py": "5761fc71822577f073679fdf231f995c7d94b81c0145c07cf3d143b0aecfa678",
+    "experimental/hybrid-spec/src/hybrid_spec/core/request_state.py": "0c9d3cb471096410d44562f5b5357abc45bd6a91bb85f4113125124cb36494b4",
+    "experimental/hybrid-spec/src/hybrid_spec/core/runtime.py": "438c685b027d84ee6dd8c0bf83b2f71033d56f56a4f0f574fc884852a1fe8c43",
+    "experimental/hybrid-spec/src/hybrid_spec/integrations/sglang/arctic_extension.py": "cdf68b45dbec9f386dbcb59b9f2c156d853ad18fb506d034cc0b3ddd061ee6d7",
+    "experimental/hybrid-spec/src/hybrid_spec/integrations/sglang/compact_graph.py": "d4b69796bf5151562c1cf15fa7380de633c4a4c2602000d0ea621dca479b1ed5",
+    "experimental/hybrid-spec/src/hybrid_spec/integrations/sglang/compatibility.py": "4e07b49420d0f27452aa000aeb2f703f9029263591505ebdd0e2939f12fbc933",
+    "experimental/hybrid-spec/src/hybrid_spec/integrations/sglang/device_extension.py": "2cec69ace22509cc641af78c1857ab8294638a52d31610f9e268a5edd08d0b4d",
+    "experimental/hybrid-spec/src/hybrid_spec/integrations/sglang/draft_extension.py": "708c65872e1da7afa2eba727fce938a12ddc39f48a1397c15ad4767b8453d7c8",
+    "experimental/hybrid-spec/src/hybrid_spec/integrations/sglang/gated_override.py": "cfd31912e8a55dc69eb16bd1c1e59d028fe0d7d6897687e5c44e93b13d619638",
+    "experimental/hybrid-spec/src/hybrid_spec/integrations/sglang/graph_buffers.py": "b8b95aa25be7054375daf847eae0076cfd9de265302615da80062d495abce1e3",
+    "experimental/hybrid-spec/src/hybrid_spec/integrations/sglang/split_graph.py": "acdfc9627d340eab23d0052b0b93a4d648f920be50d6b2b298d28addc10b3799",
+    "experimental/hybrid-spec/src/hybrid_spec/integrations/sglang/tp_sync.py": "7ccff524aae6865ef1096f028fc4806f2c98b7410916b330a435cee68425432a",
+    "experimental/hybrid-spec/src/hybrid_spec/plugin.py": "b62050fd65d39342f2db1b6866d4911c69e837d0c653c10d48a1d15da0616db6",
+    "experimental/hybrid-spec/src/hybrid_spec/selection/policy.py": "41d0e31cc5fa84438998554f1c36acf7683a9eddc5552e66d15b0c5e58b5031a",
+    "experimental/hybrid-spec/tests/test_arctic.py": "5c34111a9afda20137a82843652a5793216a960fb5a0ac14c71bd9c0aa58c003",
+    "experimental/hybrid-spec/tests/test_core.py": "d4ed547cb7b910b6f9ae12010898fa0a831843a4126224edf8258ed29083c54b",
+    "experimental/hybrid-spec/tests/test_cuda.py": "db1bbdd61db5ce268046ca08255ca35a9d09b96c1907d74c58856d393460c29f",
+    "experimental/hybrid-spec/tests/test_draft_recurrence.py": "199557cff145179d6bdcb4fd14e045c5139c949a8240d3494d4591c1113df8a3",
+    "experimental/hybrid-spec/tests/test_tp.py": "5f51d29844474313ef7411671aaba4b37664a4c115f40657a1d75fa1faec78d0",
+    "python/sglang/kernels/ops/speculative/cache_locs.py": "f37b1613526ed34e8b9aafe8a7898a2b9c2f394fd5555798aa131a7c1e9f90f4",
+    "python/sglang/kernels/ops/speculative/topk1.py": "9452a7b2c961d4f152c7705b2cc4b4e717937e0d9ecfa871725bfaefc42fb93e",
+    "python/sglang/srt/layers/attention/triton_backend.py": "7b614b08ef06eff8fe999988e1a5553d9d8fba2bf8d8ae3def85738bfe451062",
+    "python/sglang/srt/model_executor/forward_batch_info.py": "19a306d63df5e1c6ceaa489efbf4f10df577ffcbd5e8f2de98a1e778066cad2a",
+    "python/sglang/srt/speculative/eagle_draft_cuda_graph_runner.py": "30795e33c9927eb0a6610daf95638f3c2842a8bcbf82d1090cc6b7058d207d1e",
+    "python/sglang/srt/speculative/eagle_utils.py": "2b911876df84d863a594c5bf111f18f78b11bac90ce033252c1c6de8804a0a87",
+    "python/sglang/srt/speculative/eagle_worker_v2.py": "945e7506dcc3f8d493aa2c2fbcb071aed97d90fa4fa3ceeb675709132afda541",
+    "python/sglang/srt/speculative/spec_utils.py": "436a9774befc34bd91ed74e555c70388c1468b9cd7af2ccbba8fe020beb05bd9",
+    "python/sglang/srt/speculative/standalone_worker_v2.py": "2501179e3cc5020e40b43a422e18f898bb7ef361ffafdae8c2a74d1ab0f7cdda"
+  },
+  "helper_sha256": "3323ed0e2561469672735868387cd9834507af9661a248238cf876245103639e",
+  "boundaries": "Real official Arctic CPU suffix queries, history/cache lifecycle and H2D staging; real graph capture/replay, native topk, GPU row compaction and production compact tail. Arctic MTP, dsv4 MTP, EAGLE3 mapped-vocab and STANDALONE shapes. EAGLE3/STANDALONE use real native Triton metadata methods and KV index kernel. Neural model and child attention execution remain synthetic; lean helper isolates complete serving imports. No real model weights/serving, TP8 NCCL, throughput or model accuracy result.",
+  "post_test_gpu": "0 MiB, 0% utilization, no pytest process",
+  "runs": [
+    {
+      "name": "full_regression",
+      "passed": 663,
+      "skipped": 2,
+      "seconds": 337.74,
+      "command": [
+        "/workspace/dsv4-lease-validation-20261017/venv310/bin/python",
+        "-m",
+        "pytest",
+        "-p",
+        "lean_cuda_plugin",
+        "experimental/hybrid-spec/tests",
+        "-q",
+        "--tb=short",
+        "-rs"
+      ],
+      "test_cuda_sha256": "df0d52d4027e29e5bbfbd354007e17d48909f68e81a6921347cac673af970544"
+    },
+    {
+      "name": "additional_arctic_dsv4",
+      "passed": 46,
+      "skipped": 0,
+      "seconds": 19.56,
+      "command": [
+        "/workspace/dsv4-lease-validation-20261017/venv310/bin/python",
+        "-m",
+        "pytest",
+        "-p",
+        "lean_cuda_plugin",
+        "experimental/hybrid-spec/tests/test_cuda.py",
+        "-k",
+        "arctic_dsv4",
+        "-q",
+        "--tb=short",
+        "-rs"
+      ],
+      "test_cuda_sha256": "db1bbdd61db5ce268046ca08255ca35a9d09b96c1907d74c58856d393460c29f"
+    }
+  ],
+  "arctic": {
+    "commit": "9d4643881608178f0f58a33d1b61919ca246997f",
+    "native_build": "Official suffix-only CMakeLists.txt, C++20, GCC 13.3.0, cmake 4.4.4; no upstream source modifications. Import through PYTHONPATH; no full Arctic/vLLM installation or Torch replacement.",
+    "nanobind": "2.9.2",
+    "sha256": {
+      "arctic_inference/suffix_decoding/cache.py": "91c48e6cb335edbd202c8f440e5766df54315ea2d8e40decf8f7a130f3a5e126",
+      "arctic_inference/suffix_decoding/__init__.py": "e2736d5f6d3472e74f2f25795de8f754ddb3279e9cf497b13f54e8fa164dd5bd",
+      "csrc/suffix_decoding/bindings.cc": "4fbc28596b4cdfa898e3341468fc6debed5a33bb4d9df37566907071ae60f41d",
+      "csrc/suffix_decoding/suffix_tree.cc": "cbd8b63b13fbf0beaab4e8736a54d52891b1aac959c5d292d083d88ed37dfc7c",
+      "csrc/suffix_decoding/suffix_tree.h": "d3c9a51fc57a974d680510bee8cfb1ba0a6f5ce6c582ed472cb5ef975b2f5aec",
+      "csrc/suffix_decoding/int32_map.h": "49fd3c8ffb900630f145958211d2e121a3347583ef4cf42910572ad2166e54ef",
+      "csrc/suffix_decoding/CMakeLists.txt": "d0ba0a52b33dc97466f3fe17a2f0207c7e6e3e2cf8b42409e99c3d12ecf13ff2"
+    },
+    "binary": "_C.cpython-310-x86_64-linux-gnu.so",
+    "binary_sha256": "45504001ee3746d8ccb318126f1e0433bacac036bedf79a48b41069906174fde"
+  },
+  "shared_gate_check": "_synchronize and select_step AST match base DeviceOverride except len(self.slots) -> self.tokens.shape[0]. Constructor and staged/device differences covered by CPU/Gloo/CUDA regression."
+}

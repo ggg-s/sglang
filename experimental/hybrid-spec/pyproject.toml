@@ -12,6 +12,7 @@ dependencies = ["torch>=2.5"]
 
 [project.optional-dependencies]
 test = ["pytest>=8", "msgspec"]
+arctic = ["arctic-inference", "numpy"]
 
 [project.entry-points."sglang.srt.plugins"]
 hybrid_spec = "hybrid_spec.plugin:register"

@@ -56,6 +56,19 @@ EAGLE3 的 hot-token 映射在 prefix/tail 的 gate 比较和 token 选择前统
 
 device 模式以 generation 和 GPU 历史版本检查隔离旧反馈、槽位复用、重排和 Graph padding；prefill/retract 时重建索引。允许实验性开启 overlap 和 chunked prefill：中间块不构建 SA、不接入临时采样 token；最后一块启动前快照完整历史（含已缓存/先前分块的前缀），后台构建与最后一块 prefill 重叠，返回后只暂存真实 bonus。CPU 构建未完成时首次 draft 仍会等待。GPU 接受前缀可能包含 CPU EOS/停止截断前的尾部，不能将索引长度当作交付长度；原生停止处理保持不变。支持单机多 TP 实验，仍不开放 mixed prefill/decode、grammar 等其余未支持组合。chunked prefill 的真实 GPU/模型验收尚未完成。
 
+## Arctic Suffix 可选后端
+
+`backend="arctic"` 使用 ArcticInference 官方 CPU 后缀树，可替换 GPU SA，支持
+MTP/EAGLE3/STANDALONE 的 full/split/split_no_skip。配置模板为
+`configs/arctic-suffix-split.json`；需 `history_mode="cpu"`、
+`--disable-overlap-schedule --chunked-prefill-size -1`。查询和候选上传在 Graph 外，
+gate、TP 共识、GPU 动态行号及紧凑 tail 复用同一套实现。
+
+可选启用请求间 response 缓存，prompt 仅在请求内可见；完成时按最终 CPU 输出
+对账并独立限制保留 donor 数。当前固定 K、单链模式，未开放 Arctic 树状/变长
+verify 或原生 score 驱动混合策略。Arctic 不创建 GPU SA 池，需安装官方原生 suffix
+扩展。安装、参数、调度限制和验证范围见 [Arctic 接入](validation/arctic-suffix.md)。
+
 ## 实现与边界
 
 DeepSeek V4 原生 MTP 现在有独立接入：只对 `DeepseekV4ForCausalLM` target +
@@ -97,11 +110,11 @@ split 支持 K≥1、gate=0…K。`max_history_tokens=16384` 包含完整 prompt
 | 生命周期 | 历史重复不追加；历史变化重建；请求对象代际、结束释放、弱引用清理、flush reset |
 | 混合线性注意力 | 实验接入 Qwen3.5/3.6 target + 原生 Qwen3.5 MTP，要求 `--language-only`；保留 GDN verify/commit 和 mRoPE |
 | 混合 SWA | 实验接入 DeepSeek V4 target + NextN MTP；split 使用原生 dsv4 注意力的逐请求尾段，其他 SWA 模型仍拒绝 |
-| 暂不开放 | CPU 模式 overlap/chunked prefill、DP/PP/EP/CP、多机、torch.compile、混合 prefill/decode、随机采样、grammar、LoRA、其他混合线性注意力模型、多模态请求、多层 EAGLE、FROZEN_KV_MTP、动态预算、Arctic |
+| 暂不开放 | CPU 模式 overlap/chunked prefill、DP/PP/EP/CP、多机、torch.compile、混合 prefill/decode、随机采样、grammar、LoRA、其他混合线性注意力模型、多模态请求、多层 EAGLE、FROZEN_KV_MTP、动态预算、Arctic 树状及变长验证 |
 
 默认 CPU 历史模式使用同步调度器已提交到 CPU 的输出，只上传确认增量，当前 anchor 已包含在历史中。device 模式使用 GPU verify 的接受前缀，可能包含最终 CPU EOS/停止截断前的尾部；不能将其计数或索引长度当作最终交付 token 统计。两者均不增加逐步 D2H 读取。
 
-最长重复后缀通过 suffix link 查询，续写采用该后缀的最早出现位置。候选不含 anchor。匹配长度与可用续写长度分别记录；默认续写不足、版本不符、无槽位、历史超容量、token 非法或预算不足时整条链回退 neural。`partial_drafts="zero"` 单独复现尾部补零；不会选择较短匹配来填满候选。
+默认 GPU SA 的最长重复后缀通过 suffix link 查询，续写采用该后缀的最早出现位置。候选不含 anchor。匹配长度与可用续写长度分别记录；默认续写不足、版本不符、无槽位、历史超容量、token 非法或预算不足时整条链回退 neural。`partial_drafts="zero"` 单独复现尾部补零；不会选择较短匹配来填满候选。
 
 GPU SA 使用每请求一个线程维护状态，当前 v3 已引入高分叉哈希、双转移内联、增量分桶和低多样性快路径，历史状态预算约 68 字节/token。CPU 微基准的长历史改善不能直接推算 GPU 查询或模型 TPOT。默认 CPU 历史模式的前缀检查随历史长度增长；device 模式只在 prefill/retract 快照一次历史，后台线程不触碰请求对象或 CUDA。
 
@@ -113,7 +126,7 @@ device 模式将六项来源统计融合到已有 GPU verify 反馈 kernel，避
 
 ## 安装
 
-服务运行要求 Linux、与 PyTorch 匹配的 NVIDIA CUDA Toolkit（含 nvcc）、C++ 编译器和 ninja；在已可运行此 SGLang checkout 的环境操作：
+默认 GPU SA 服务运行要求 Linux、与 PyTorch 匹配的 NVIDIA CUDA Toolkit（含 nvcc）、C++ 编译器和 ninja；在已可运行此 SGLang checkout 的环境操作：
 
 ```bash
 python -m pip install ninja

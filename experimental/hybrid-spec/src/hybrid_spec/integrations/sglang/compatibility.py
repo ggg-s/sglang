@@ -55,7 +55,7 @@ def validate_config(config, cfg):
         errors.append("CPU history requires chunked_prefill_size=-1")
     if cfg.speculative_algorithm not in ("EAGLE", "EAGLE3", "STANDALONE"):
         errors.append("only ordinary EAGLE/MTP, EAGLE3 and STANDALONE are wired")
-    if config.backend != "gpu_sa":
+    if config.backend not in ("gpu_sa", "arctic"):
         errors.append("reference backend is test-only")
     if errors:
         raise ValueError("hybrid-spec unsupported configuration: " + "; ".join(errors))

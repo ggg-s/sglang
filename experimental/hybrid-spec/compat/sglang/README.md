@@ -72,3 +72,10 @@ otherwise stages the actual prefix output shape (including EAGLE3). Full mode
 retains its existing token-list fallback for mapped vocabularies. Triton draft
 attention and native dsv4 MTP attention are supported; other model/backend and
 parallelism restrictions still apply. See the [4060 validation scope](../../validation/draft-algorithms-split-20261017.md).
+
+The optional official ArcticInference CPU suffix backend uses committed CPU
+history and the same staged graph buffers. It requires disabled overlap and
+chunked prefill (`--disable-overlap-schedule --chunked-prefill-size -1`).
+CPU lookup and H2D staging happen before replay; shared GatedOverride performs
+final gate/TP consensus before GPU row compaction. No worker API version change
+is needed beyond split v5. See [Arctic setup](../../validation/arctic-suffix.md).

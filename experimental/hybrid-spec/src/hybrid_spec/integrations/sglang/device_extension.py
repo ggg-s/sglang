@@ -12,24 +12,17 @@ from dataclasses import dataclass
 
 import torch
 
-from hybrid_spec.core.contracts import DraftOverrideView
+from hybrid_spec.integrations.sglang.gated_override import GatedOverride
 from hybrid_spec.observability.metrics import Metrics
 
 
-class DeviceOverride(DraftOverrideView):
+class DeviceOverride(GatedOverride):
     def __init__(self, backend, slots, generations, tp_sync=None, query_stream=None):
         self.backend = backend
         self.slots = slots
         self.generations = generations
         self.tp_sync = tp_sync
         self.query_stream = query_stream
-        self.defer_prefix = backend.config.draft_graph_mode != "full"
-        if self.defer_prefix:
-            self.neural_prefix = torch.empty(
-                (len(slots), max(0, backend.config.num_neural_gate_tokens - 1)),
-                dtype=torch.int64,
-                device=backend.device,
-            )
         # Only worker-created views provide this immutable host metadata key.
         # Manually constructed views may mutate their tensors between stages.
         self.mapping_key = None
@@ -52,6 +45,9 @@ class DeviceOverride(DraftOverrideView):
             ),
             torch.zeros(len(slots), dtype=torch.bool, device=backend.device),
             backend.config.num_neural_gate_tokens,
+            tp_sync=tp_sync,
+            defer_prefix=backend.config.draft_graph_mode != "full",
+            query_stream=query_stream,
         )
 
     def prepare(self, seq_lens):
@@ -84,42 +80,6 @@ class DeviceOverride(DraftOverrideView):
             self.use_retrieval,
             **shared,
         )
-
-    def _synchronize(self):
-        if self.tp_sync is not None:
-            agreed = self.tp_sync.synchronize(self)
-            # Preserve graph storage and the mask alias used by verify metrics.
-            self.tokens.copy_(agreed.tokens)
-            self.use_retrieval.copy_(agreed.use_retrieval)
-
-    def select_step(self, neural_tokens, step):
-        if not self.defer_prefix:
-            return super().select_step(neural_tokens, step)
-        if neural_tokens.shape not in ((len(self.slots),), (len(self.slots), 1)):
-            raise ValueError("hybrid selection requires one neural token per row")
-        gate = self.num_neural_gate_tokens
-        if step < gate - 1:
-            # Run the complete neural gate prefix without reading SA output.
-            self.neural_prefix[:, step].copy_(neural_tokens.reshape(-1))
-            return neural_tokens
-        if step == max(0, gate - 1):
-            if self.query_stream is not None:
-                torch.cuda.current_stream().wait_stream(self.query_stream)
-            if gate:
-                self.use_retrieval.logical_and_(
-                    (self.tokens[:, : gate - 1] == self.neural_prefix).all(dim=1)
-                )
-                self.use_retrieval.logical_and_(
-                    self.tokens[:, step] == neural_tokens.reshape(-1)
-                )
-            # All ranks participate, even with no local hits. Combining the
-            # final gate mask with exact candidate consensus guarantees the
-            # same skip/compact rows before any rank chooses a tail graph.
-            # Keep NCCL on the model stream, after its prefix collectives.
-            self._synchronize()
-        if step < gate:
-            return neural_tokens
-        return super().select_step(neural_tokens, step)
 
 
 class DeviceGraphBuffers:

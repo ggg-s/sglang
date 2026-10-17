@@ -6,6 +6,8 @@
 >
 > SA 参考：Baseten `sa_spec` 的 `1cc7e8c86b1914a9c05eb60fb11ebe52daf47969`；TensorRT-LLM SA/MTP 合入快照 `e99d74f1da60be174a4e34b412c4891460b9ff70`。这两个版本用于设计溯源，不表示兼容任意后续版本。
 
+> 2026-10-17：Arctic 官方 CPU 单链后端已接入 full/split；当前实现的调度要求和验证范围见 [Arctic 接入](validation/arctic-suffix.md)。本文其余规划不作为已实现能力清单。
+
 ## 目录
 
 - [1. 目标与首版边界](#scope)

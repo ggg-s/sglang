@@ -10,7 +10,7 @@ from hybrid_spec.selection.policy import select_requests
 
 
 class HybridRuntime:
-    """One worker, one stream; committed history only, no shared-request cache."""
+    """One worker, one stream; committed history only; the backend owns its indexes."""
 
     def __init__(self, config, backend, vocab_size):
         self.config = config

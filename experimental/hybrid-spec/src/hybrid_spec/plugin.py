@@ -109,7 +109,6 @@ def _attach(result, worker, *args, **kwargs):
         EAGLEDraftCudaGraphRunner,
     )
 
-    from hybrid_spec.backends.gpu_sa import GPUSuffixAutomaton
     from hybrid_spec.integrations.sglang.compatibility import validate_model
     from hybrid_spec.integrations.sglang.draft_extension import DraftExtension
     from hybrid_spec.integrations.sglang.tp_sync import TPSynchronizer
@@ -145,8 +144,19 @@ def _attach(result, worker, *args, **kwargs):
     )
     # Construction occurs before the scheduler budgets/allocates model KV.
     # cuda:<gpu_id> pins storage to this worker even with a different default device.
-    backend = GPUSuffixAutomaton(config, f"cuda:{worker.gpu_id}")
     extension_type = DraftExtension
+    if config.backend == "arctic":
+        from hybrid_spec.backends.arctic import ArcticBackend
+        from hybrid_spec.integrations.sglang.arctic_extension import (
+            ArcticDraftExtension,
+        )
+
+        backend = ArcticBackend(config, f"cuda:{worker.gpu_id}")
+        extension_type = ArcticDraftExtension
+    else:
+        from hybrid_spec.backends.gpu_sa import GPUSuffixAutomaton
+
+        backend = GPUSuffixAutomaton(config, f"cuda:{worker.gpu_id}")
     if config.history_mode == "device":
         from hybrid_spec.integrations.sglang.device_extension import (
             DeviceDraftExtension,

@@ -253,10 +253,11 @@ def _check_device_sync(group, ranks, device):
 
 def _check_split_gate(sync, ranks, device):
     for gate in (0, 1, 2, 3, 8):
-        _check_split_gate_width(sync, ranks, device, gate)
+        for staged in (False, True):
+            _check_split_gate_width(sync, ranks, device, gate, staged)
 
 
-def _check_split_gate_width(sync, ranks, device, gate):
+def _check_split_gate_width(sync, ranks, device, gate, staged):
     """Local gate/candidate divergence must never split ranks into different tails.
 
     CPU exercises real Gloo groups; CUDA captures the query fork/join and real
@@ -282,7 +283,11 @@ def _check_split_gate_width(sync, ranks, device, gate):
 
     backend = SimpleNamespace(config=config, device=device, consume_and_query=query)
     query_stream = torch.cuda.Stream() if device.type == "cuda" else None
-    buffers = DeviceGraphBuffers(backend, 8, sync, query_stream)
+    buffers = (
+        GraphBuffers(8, 8, device, sync, gate, defer_prefix=True)
+        if staged
+        else DeviceGraphBuffers(backend, 8, sync, query_stream)
+    )
     view = buffers.bind_capture_view(8)
     seq_lens = torch.ones(8, dtype=torch.int64, device=device)
 
@@ -321,6 +326,8 @@ def _check_split_gate_width(sync, ranks, device, gate):
                 neural[2, max(0, gate - 1)].add_(1)
             elif mode == "rank_fallback":
                 eligible[3] = False
+        if staged:
+            buffers.stage(DraftOverrideView(candidates, eligible), 8, 8)
         if graph is None:
             output = run()
         else:

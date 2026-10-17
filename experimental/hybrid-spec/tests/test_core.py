@@ -1431,3 +1431,51 @@ def test_split_rejects_gate_outside_draft_budget(gate):
             num_neural_gate_tokens=gate,
             draft_graph_mode="split",
         )
+
+
+def test_arctic_split_requires_committed_cpu_history_configuration():
+    config = HybridConfig(
+        2,
+        1,
+        8,
+        128,
+        backend="arctic",
+        history_mode="cpu",
+        draft_graph_mode="split",
+        num_neural_gate_tokens=2,
+        enable_global_pool=True,
+        max_shared_requests=16,
+    )
+    values = vars(valid_config()) | {
+        "max_running_requests": 8,
+        "speculative_use_rejection_sampling": False,
+        "disable_cuda_graph": False,
+        "enable_memory_saver": False,
+    }
+    for algorithm in ("EAGLE", "EAGLE3", "STANDALONE"):
+        validate_config(
+            config, SimpleNamespace(**(values | {"speculative_algorithm": algorithm}))
+        )
+    for change in ({"disable_overlap_schedule": False}, {"chunked_prefill_size": 2048}):
+        with pytest.raises(ValueError, match="CPU history"):
+            validate_config(config, SimpleNamespace(**(values | change)))
+    with pytest.raises(ValueError, match="history_mode=cpu"):
+        HybridConfig(2, 1, 8, 128, backend="arctic", history_mode="device")
+
+
+@pytest.mark.parametrize(
+    "field,value",
+    [
+        ("arctic_max_tree_depth", 0),
+        ("arctic_max_tree_depth", True),
+        ("arctic_max_spec_factor", -1),
+        ("arctic_max_spec_factor", float("nan")),
+        ("arctic_max_spec_offset", float("inf")),
+        ("arctic_max_spec_offset", True),
+        ("arctic_min_token_prob", -0.1),
+        ("arctic_min_token_prob", 1.1),
+    ],
+)
+def test_arctic_parameters_reject_invalid_probabilities_and_bounds(field, value):
+    with pytest.raises(ValueError, match="arctic_"):
+        HybridConfig(2, 1, 8, 128, backend="arctic", **{field: value})
