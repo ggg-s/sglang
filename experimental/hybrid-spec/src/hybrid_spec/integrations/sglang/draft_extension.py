@@ -98,6 +98,7 @@ class DraftExtension:
                 view.use_retrieval,
                 self.tp_sync,
                 self.config.num_neural_gate_tokens,
+                query_metadata=view.query_metadata,
             )
         return view
 

@@ -201,6 +201,12 @@ def _attach(result, worker, *args, **kwargs):
         worker.target_worker.model_runner.model_config.vocab_size,
         tp_sync=tp_sync,
     )
+    if config.dynamic_verify and config.backend == "arctic":
+        from hybrid_spec.backends.gpu_sa import GPUSuffixAutomaton
+
+        # Compile before capture; create the calibration tensors lazily on the
+        # owning forward stream, exactly like the device-history feedback.
+        GPUSuffixAutomaton.load_module()
 
 
 def _finished(result, worker, *, rid, natural_stop):
@@ -213,6 +219,7 @@ def _reset(result, worker, *args, **kwargs):
     draft = worker.draft_worker
     if draft is not None and draft.draft_extension is not None:
         draft.draft_extension.reset()
+        draft.draft_extension.dynamic_verify = None
 
 
 def _verify(result, worker, *args, **kwargs):
@@ -228,6 +235,14 @@ def _verify(result, worker, *args, **kwargs):
                 result,
                 worker.target_worker.model_runner.decode_cuda_graph_runner,
             )
+        dynamic = getattr(extension, "dynamic_verify", None)
+        if dynamic is not None:
+            batch = args[0] if args else kwargs["batch"]
+            if not batch.forward_mode.is_idle():
+                if result.can_run_cuda_graph:
+                    graph = worker.target_worker.model_runner.decode_cuda_graph_runner
+                    dynamic.graph_tokens = graph._ragged_graph_size
+                dynamic.feedback(result.accept_lens)
         if on_device_verify := getattr(extension, "on_device_verify", None):
             on_device_verify(result, args[0] if args else kwargs["batch"])
         else:
@@ -236,6 +251,8 @@ def _verify(result, worker, *args, **kwargs):
 
 def _prefill(original, worker, batch, *args, **kwargs):
     extension = getattr(worker.draft_worker, "draft_extension", None)
+    if getattr(extension, "dynamic_verify", None) is not None:
+        extension.dynamic_verify.discard_timing()
     if extension is None or not hasattr(extension, "begin_prefill"):
         return original(worker, batch, *args, **kwargs)
     ticket = extension.begin_prefill(batch)
@@ -263,6 +280,10 @@ def _diagnostics(result, controller, *args, **kwargs):
             result.internal_state["hybrid_spec_split_graph"] = dict(
                 extension.split_graph_counters
             )
+        if getattr(extension, "dynamic_verify", None) is not None:
+            result.internal_state["hybrid_spec_dynamic_verify"] = (
+                extension.dynamic_verify.snapshot()
+            )
 
 
 def _configure_verify(result, worker, batch, **kwargs):
@@ -277,9 +298,15 @@ def _configure_verify(result, worker, batch, **kwargs):
 def _verify_token_buckets(result, runner):
     config = _config()
     if config.verify_mode == "compact" and not runner.model_runner.is_draft_worker:
-        from hybrid_spec.integrations.sglang.compact_verify import token_buckets
-
+        # Worker construction precedes attention initialization. Validate the
+        # concrete backend here, when the target builds its capture grid.
+        if not getattr(runner.attn_backend, "supports_ragged_verify_graph", False):
+            raise ValueError(
+                "compact verify requires a ragged-capable target attention backend"
+            )
         from sglang.srt.utils import get_cuda_graph_batch_size_alignment
+
+        from hybrid_spec.integrations.sglang.compact_verify import token_buckets
 
         alignment = get_cuda_graph_batch_size_alignment(
             gathered_buffer_required=runner.require_gathered_buffer,
@@ -290,3 +317,15 @@ def _verify_token_buckets(result, runner):
 def _begin_draft(worker, batch, **kwargs):
     if worker.draft_extension is not None:
         worker.draft_extension.compact_num_neural = None
+        extension = worker.draft_extension
+        if extension.config.dynamic_verify and not batch.forward_mode.is_idle():
+            from hybrid_spec.integrations.sglang.compact_verify import (
+                get_dynamic_verify,
+            )
+
+            device = getattr(extension, "device", None)
+            if device is None:
+                device = extension.backend.device
+            get_dynamic_verify(extension, device).begin(batch)
+        elif getattr(extension, "dynamic_verify", None) is not None:
+            extension.dynamic_verify.discard_timing()

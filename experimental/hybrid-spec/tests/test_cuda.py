@@ -26,7 +26,8 @@ pytestmark = pytest.mark.skipif(
 )
 
 
-def test_split_query_stream_graph_feedback_publication_and_gate(monkeypatch):
+@pytest.mark.parametrize("dynamic", [False, True])
+def test_split_query_stream_graph_feedback_publication_and_gate(monkeypatch, dynamic):
     """A delayed native query must see fresh feedback and join before gating.
 
     Publish a donor after capture, mutate the gate between replays, then fence
@@ -42,6 +43,8 @@ def test_split_query_stream_graph_feedback_publication_and_gate(monkeypatch):
         num_neural_gate_tokens=2,
         enable_global_pool=True,
         max_shared_requests=2,
+        verify_mode="compact" if dynamic else "static",
+        dynamic_verify=dynamic,
     )
     backend = GPUSuffixAutomaton(config, "cuda")
     for slot, prompt in enumerate(([99, 1], list(range(1, 11)))):
@@ -102,10 +105,15 @@ def test_split_query_stream_graph_feedback_publication_and_gate(monkeypatch):
         expected = neural if disagree else torch.arange(3, 11, device="cuda")[None, :]
         assert torch.equal(output, expected)
         assert backend.meta[0, 0].item() == 3  # feedback is consumed exactly once
+        if dynamic:
+            assert view.query_metadata.tolist() == [[2, 1]]
+            assert view.query_metadata.data_ptr() == captured.query_metadata.data_ptr()
     backend.owners[1].add_(1)
     graph.replay()
     assert not view.use_retrieval.any().item()
     assert torch.equal(output, neural)
+    if dynamic:
+        assert view.query_metadata.tolist() == [[0, 0]]
 
 
 @pytest.mark.parametrize("partial", ["fallback", "zero"])

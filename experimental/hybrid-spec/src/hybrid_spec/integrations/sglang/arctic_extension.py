@@ -199,6 +199,7 @@ class ArcticDraftExtension(DraftExtension):
             self.config.num_neural_gate_tokens,
             tp_sync=self.tp_sync,
             defer_prefix=self.config.draft_graph_mode != "full",
+            query_metadata=view.query_metadata,
         )
 
     def create_graph_buffers(self, max_bs):

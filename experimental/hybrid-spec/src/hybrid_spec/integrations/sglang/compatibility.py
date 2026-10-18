@@ -89,11 +89,6 @@ def validate_model(worker, config=None):
             raise ValueError(
                 "compact verify currently requires non-Mamba, non-mRoPE targets"
             )
-        backend = worker.target_worker.model_runner.attn_backend
-        if not getattr(backend, "supports_ragged_verify_graph", False):
-            raise ValueError(
-                "compact verify requires a ragged-capable target attention backend"
-            )
     dsv4_mtp = target_arch == ["DeepseekV4ForCausalLM"] and draft_arch == [
         "DeepseekV4ForCausalLMNextN"
     ]

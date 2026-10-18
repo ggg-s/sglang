@@ -48,6 +48,11 @@ class DeviceOverride(GatedOverride):
             tp_sync=tp_sync,
             defer_prefix=backend.config.draft_graph_mode != "full",
             query_stream=query_stream,
+            query_metadata=(
+                torch.zeros((len(slots), 2), dtype=torch.int64, device=backend.device)
+                if backend.config.dynamic_verify
+                else None
+            ),
         )
 
     def prepare(self, seq_lens):
@@ -72,6 +77,8 @@ class DeviceOverride(GatedOverride):
             if self.backend.config.enable_global_pool
             else {}
         )
+        if self.query_metadata is not None:
+            shared["query_metadata"] = self.query_metadata
         self.backend.consume_and_query(
             self.slots,
             self.generations,
@@ -106,6 +113,11 @@ class DeviceGraphBuffers:
         view.num_neural_gate_tokens = self.view.num_neural_gate_tokens
         for name in ("slots", "generations", "tokens", "use_retrieval"):
             setattr(view, name, getattr(self.view, name)[:batch_size])
+        view.query_metadata = (
+            self.view.query_metadata[:batch_size]
+            if self.view.query_metadata is not None
+            else None
+        )
         if self.view.backend.config.enable_global_pool:
             view.shared_slots = self.view.shared_slots
             view.shared_generations = self.view.shared_generations
@@ -131,6 +143,11 @@ class DeviceGraphBuffers:
             self.staged_mapping = mapping
         # Feedback consumes the actual captured query's selection mask.
         view.use_retrieval = self.view.use_retrieval[:raw_bs]
+        view.query_metadata = (
+            self.view.query_metadata[:raw_bs]
+            if self.view.query_metadata is not None
+            else None
+        )
 
 
 @dataclass

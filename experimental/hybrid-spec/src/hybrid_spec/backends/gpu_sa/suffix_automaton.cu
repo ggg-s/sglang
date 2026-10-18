@@ -2,6 +2,7 @@
 #include <c10/cuda/CUDAException.h>
 #include <c10/cuda/CUDAGuard.h>
 #include <climits>
+#include <cmath>
 #include <optional>
 #include <torch/extension.h>
 
@@ -213,9 +214,13 @@ __global__ void consume_query_kernel(
     const int64_t *limits, const int *pending, int64_t *pending_meta,
     const int64_t *slots, const int64_t *generations, const int64_t *seq_lens,
     int64_t *tokens, bool *mask, int n, int h, int k, int min_match,
-    bool zero_partial) {
+    bool zero_partial, int64_t *query_metadata) {
   int row = blockIdx.x;
   mask[row] = false;
+  if (query_metadata) {
+    query_metadata[row * 2] = 0;
+    query_metadata[row * 2 + 1] = 0;
+  }
   for (int j = 0; j < k; ++j)
     tokens[row * k + j] = 0;
   int64_t slot = slots[row], generation = generations[row];
@@ -249,6 +254,8 @@ __global__ void consume_query_kernel(
   for (int j = 0; j < count; ++j)
     tokens[row * k + j] = a.history[start + j];
   mask[row] = true;
+  if (query_metadata)
+    query_metadata[row * 2] = a.s(suffix, 0);
 }
 
 // Consume all published slots before any cross-request reader runs. Completed
@@ -312,7 +319,7 @@ __global__ void shared_query_kernel(
     const int64_t *seq_lens, const int64_t *shared_slots,
     const int64_t *shared_generations, int64_t *tokens, bool *mask,
     int n, int h, int k, int num_shared, int max_context, int min_match,
-    bool zero_partial) {
+    bool zero_partial, int64_t *query_metadata) {
   int row = blockIdx.x;
   int64_t slot = slots[row];
   if (slot < 0 || slot >= n || owners[slot] != generations[row])
@@ -370,6 +377,10 @@ __global__ void shared_query_kernel(
     for (int j = 0; j < k; ++j)
       tokens[row * k + j] = j < count ? history[donor * h + best.start + j] : 0;
     mask[row] = true;
+    if (query_metadata) {
+      query_metadata[row * 2] = best.length;
+      query_metadata[row * 2 + 1] = 1;
+    }
   }
 }
 
@@ -440,7 +451,8 @@ void consume_and_query(
     torch::Tensor mask, int64_t min_match, bool zero_partial,
     std::optional<torch::Tensor> shared_slots,
     std::optional<torch::Tensor> shared_generations,
-    std::optional<torch::Tensor> shared_lengths, int64_t max_context) {
+    std::optional<torch::Tensor> shared_lengths, int64_t max_context,
+    std::optional<torch::Tensor> query_metadata) {
   check_storage(history, states, edges, meta);
   check_device_metadata(meta, owners, pending, pending_meta, slots, generations,
                         seq_lens);
@@ -452,6 +464,13 @@ void consume_and_query(
                   tokens.size(1) + 1 == pending.size(1) &&
                   mask.sizes() == slots.sizes() && min_match > 0 && min_match <= INT_MAX,
               "invalid device query outputs");
+  if (query_metadata) {
+    check_tensor(*query_metadata, torch::kInt64, meta.device());
+    TORCH_CHECK(query_metadata->dim() == 2 &&
+                    query_metadata->size(0) == slots.numel() &&
+                    query_metadata->size(1) == 2,
+                "invalid query metadata shape");
+  }
   c10::cuda::CUDAGuard guard(meta.device());
   TORCH_CHECK(shared_slots.has_value() == shared_generations.has_value() &&
                   shared_slots.has_value() == shared_lengths.has_value(),
@@ -485,7 +504,8 @@ void consume_and_query(
         pending.data_ptr<int>(), pending_meta.data_ptr<int64_t>(),
         slots.data_ptr<int64_t>(), generations.data_ptr<int64_t>(),
         seq_lens.data_ptr<int64_t>(), tokens.data_ptr<int64_t>(), mask.data_ptr<bool>(),
-        history.size(0), history.size(1), tokens.size(1), min_match, zero_partial);
+        history.size(0), history.size(1), tokens.size(1), min_match, zero_partial,
+        query_metadata ? query_metadata->data_ptr<int64_t>() : nullptr);
     C10_CUDA_KERNEL_LAUNCH_CHECK();
     if (shared_slots && shared_slots->numel()) {
       int threads = 32;
@@ -499,13 +519,174 @@ void consume_and_query(
           seq_lens.data_ptr<int64_t>(), shared_slots->data_ptr<int64_t>(),
           shared_generations->data_ptr<int64_t>(), tokens.data_ptr<int64_t>(),
           mask.data_ptr<bool>(), history.size(0), history.size(1), tokens.size(1),
-          shared_slots->numel(), max_context, min_match, zero_partial);
+          shared_slots->numel(), max_context, min_match, zero_partial,
+          query_metadata ? query_metadata->data_ptr<int64_t>() : nullptr);
       C10_CUDA_KERNEL_LAUNCH_CHECK();
     }
   }
 }
 
+// Small hybrid verification batches need one launch rather than dozens of
+// eager tensor operations. Larger shapes retain the Torch reference path.
+constexpr int CALIBRATION_BLOCK = 256;
+
+__global__ void calibration_buckets_kernel(const bool *retrieval,
+    const int64_t *metadata, int64_t *buckets, int bs) {
+  int row = blockIdx.x * blockDim.x + threadIdx.x;
+  if (row >= bs) return;
+  int64_t match = metadata[row * 2];
+  int bin = (match > 4) + (match > 8) + (match > 16) + (match > 32);
+  buckets[row] = retrieval[row] ? 1 + 5 * (metadata[row * 2 + 1] > 0) + bin : 0;
+}
+
+torch::Tensor calibration_buckets(torch::Tensor retrieval, torch::Tensor metadata) {
+  check_tensor(retrieval, torch::kBool, metadata.device());
+  check_tensor(metadata, torch::kInt64, metadata.device());
+  TORCH_CHECK(retrieval.dim() == 1 && metadata.dim() == 2 &&
+      metadata.size(0) == retrieval.numel() && metadata.size(1) == 2,
+      "invalid calibration query metadata");
+  c10::cuda::CUDAGuard guard(metadata.device());
+  auto out = torch::empty({retrieval.numel()}, metadata.options());
+  if (retrieval.numel()) {
+    calibration_buckets_kernel<<<(retrieval.numel()+127)/128,128,0,
+        at::cuda::getCurrentCUDAStream()>>>(retrieval.data_ptr<bool>(),
+        metadata.data_ptr<int64_t>(),out.data_ptr<int64_t>(),retrieval.numel());
+    C10_CUDA_KERNEL_LAUNCH_CHECK();
+  }
+  return out;
+}
+
+__global__ void calibration_feedback_kernel(int64_t *checks, int64_t *correct,
+    const int64_t *buckets, const int *caps, const int *accept, int bs, int k) {
+  int i = blockIdx.x * blockDim.x + threadIdx.x;
+  if (i >= bs * k) return;
+  int row = i / k, depth = i % k, count = accept[row] - 1;
+  int64_t bucket = buckets[row];
+  if (bucket < 0 || bucket >= 11 || count < 0 || count > caps[row] ||
+      depth >= caps[row] || depth > count) return;
+  atomicAdd(reinterpret_cast<unsigned long long *>(checks + bucket*k+depth), 1ULL);
+  if (depth < count)
+    atomicAdd(reinterpret_cast<unsigned long long *>(correct + bucket*k+depth), 1ULL);
+}
+
+void check_calibration(torch::Tensor checks, torch::Tensor correct,
+    torch::Tensor buckets, torch::Tensor caps) {
+  for (const auto &t : {checks,correct,buckets})
+    check_tensor(t, torch::kInt64, checks.device());
+  check_tensor(caps, torch::kInt32, checks.device());
+  TORCH_CHECK(checks.dim()==2 && checks.size(0)==11 && checks.size(1)>0 &&
+      correct.sizes()==checks.sizes() && buckets.dim()==1 &&
+      caps.sizes()==buckets.sizes(), "invalid calibration tensors");
+}
+
+void calibration_feedback(torch::Tensor checks, torch::Tensor correct,
+    torch::Tensor buckets, torch::Tensor caps, torch::Tensor accept) {
+  check_calibration(checks,correct,buckets,caps);
+  check_tensor(accept,torch::kInt32,checks.device());
+  TORCH_CHECK(accept.sizes()==caps.sizes(),"invalid calibration feedback counts");
+  c10::cuda::CUDAGuard guard(checks.device());
+  int n = caps.numel()*checks.size(1);
+  if (n) {
+    calibration_feedback_kernel<<<(n+127)/128,128,0,at::cuda::getCurrentCUDAStream()>>>(
+        checks.data_ptr<int64_t>(),correct.data_ptr<int64_t>(),buckets.data_ptr<int64_t>(),
+        caps.data_ptr<int>(),accept.data_ptr<int>(),caps.numel(),checks.size(1));
+    C10_CUDA_KERNEL_LAUNCH_CHECK();
+  }
+}
+
+__global__ void calibration_select_kernel(const int64_t *checks,
+    const int64_t *correct, const int64_t *buckets, const int *caps,
+    const int64_t *grid, const float *costs, int *lengths, int bs, int k,
+    int g, int min_samples, int min_drafts, float strength, float prior,
+    bool has_costs, int explore) {
+  __shared__ float scores[CALIBRATION_BLOCK], priority[CALIBRATION_BLOCK];
+  __shared__ float objectives[CALIBRATION_BLOCK];
+  __shared__ int ranks[CALIBRATION_BLOCK], required[CALIBRATION_BLOCK];
+  __shared__ int budgets[CALIBRATION_BLOCK], selected;
+  int tid=threadIdx.x, n=bs*k;
+  if (tid < bs) {
+    int bucket=buckets[tid];
+    required[tid]=checks[bucket*k] < min_samples ? caps[tid] : min_drafts;
+  }
+  if (tid < n) {
+    int row=tid/k, depth=tid%k, bucket=buckets[row];
+    float score=1;
+    for (int j=0;j<=depth;++j)
+      score *= (static_cast<float>(correct[bucket*k+j])+strength*prior) /
+               (static_cast<float>(checks[bucket*k+j])+strength);
+    scores[tid]=depth < caps[row] ? score : 0;
+  }
+  __syncthreads();
+  if (tid < n) {
+    int row=tid/k, depth=tid%k;
+    priority[tid]=depth < required[row] ? 2.0f :
+                  (depth < caps[row] ? scores[tid] : -1.0f);
+  }
+  __syncthreads();
+  if (tid < n) {
+    int rank=0;
+    for (int j=0;j<n;++j)
+      rank += priority[j] > priority[tid] || (priority[j]==priority[tid] && j<tid);
+    ranks[tid]=rank;
+  }
+  __syncthreads();
+  if (tid < g) {
+    int total=0, minimum=0;
+    for (int j=0;j<bs;++j) { total+=caps[j]; minimum+=required[j]; }
+    int budget=min(static_cast<int>(grid[tid])-bs,total);
+    budgets[tid]=budget;
+    int physical=0;
+    while (physical+1<g && grid[physical] < budget+bs) ++physical;
+    float cost=has_costs ? costs[physical] : (tid==g-1 ? 1.0f : INFINITY);
+    float utility=bs;
+    for (int j=0;j<n;++j) if (ranks[j]<budget) utility+=scores[j];
+    objectives[tid]=budget>=minimum && isfinite(cost) && cost>0 ? utility/cost : -1;
+  }
+  __syncthreads();
+  if (tid==0) {
+    int best=g-1;
+    float value=-1;
+    for (int j=0;j<g;++j) if (objectives[j]>value) { value=objectives[j]; best=j; }
+    if (explore>=0) {
+      int minimum=0;
+      for (int j=0;j<bs;++j) minimum+=required[j];
+      best=budgets[explore]>=minimum ? explore : g-1;
+    }
+    selected=budgets[best];
+  }
+  __syncthreads();
+  if (tid < bs) {
+    int count=0;
+    for (int j=0;j<caps[tid];++j) count+=ranks[tid*k+j]<selected;
+    lengths[tid]=count;
+  }
+}
+
+torch::Tensor calibration_select(torch::Tensor checks, torch::Tensor correct,
+    torch::Tensor buckets, torch::Tensor caps, torch::Tensor grid,
+    torch::Tensor costs, int min_samples, int min_drafts, double strength,
+    double prior, bool has_costs, int explore) {
+  check_calibration(checks,correct,buckets,caps);
+  check_tensor(grid,torch::kInt64,checks.device());
+  check_tensor(costs,torch::kFloat32,checks.device());
+  TORCH_CHECK(caps.numel()>0 && caps.numel()*checks.size(1)<=CALIBRATION_BLOCK &&
+      grid.dim()==1 && grid.numel()>0 && grid.numel()<=CALIBRATION_BLOCK &&
+      costs.sizes()==grid.sizes() && explore>=-1 && explore<grid.numel(),
+      "calibration selection exceeds fused shape bounds");
+  c10::cuda::CUDAGuard guard(checks.device());
+  auto out=torch::empty_like(caps);
+  calibration_select_kernel<<<1,CALIBRATION_BLOCK,0,at::cuda::getCurrentCUDAStream()>>>(
+      checks.data_ptr<int64_t>(),correct.data_ptr<int64_t>(),buckets.data_ptr<int64_t>(),
+      caps.data_ptr<int>(),grid.data_ptr<int64_t>(),costs.data_ptr<float>(),out.data_ptr<int>(),
+      caps.numel(),checks.size(1),grid.numel(),min_samples,min_drafts,strength,prior,has_costs,explore);
+  C10_CUDA_KERNEL_LAUNCH_CHECK();
+  return out;
+}
+
 PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
+  m.def("calibration_buckets", &calibration_buckets);
+  m.def("calibration_feedback", &calibration_feedback);
+  m.def("calibration_select", &calibration_select);
   m.def("reset", &reset);
   m.def("append", &append);
   m.def("query", &query);

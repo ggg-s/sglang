@@ -1,4 +1,5 @@
 import torch
+
 from hybrid_spec.core.contracts import DraftOverrideView, RetrievalCandidates
 
 
@@ -22,4 +23,11 @@ def select_requests(
         & (remaining >= num_drafts + 1)
         & ((candidates.tokens >= 0) & (candidates.tokens < vocab_size)).all(dim=1)
     )
-    return DraftOverrideView(candidates.tokens, mask)
+    sources = candidates.retrieval_sources
+    if sources is None:
+        sources = torch.zeros_like(candidates.match_lens)
+    return DraftOverrideView(
+        candidates.tokens,
+        mask,
+        query_metadata=torch.stack((candidates.match_lens, sources), dim=1),
+    )

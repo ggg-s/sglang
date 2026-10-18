@@ -1,0 +1,39 @@
+{
+  "tokens_checked": 640,
+  "below_max_logprob": 0,
+  "equal_score_different_topk_order": 2,
+  "minimum_logprob_delta": 0,
+  "divergence_chosen": [
+    -1.8312536478042603,
+    785,
+    null
+  ],
+  "divergence_top5": [
+    [
+      -1.8312536478042603,
+      1654,
+      null
+    ],
+    [
+      -1.8312536478042603,
+      785,
+      null
+    ],
+    [
+      -1.8937536478042603,
+      73594,
+      null
+    ],
+    [
+      -2.1750035285949707,
+      13874,
+      null
+    ],
+    [
+      -2.3781285285949707,
+      1249,
+      null
+    ]
+  ],
+  "scope": "Argmax membership uses the maximum value; top-k order among equal scores is not an argmax tie-breaking contract."
+}

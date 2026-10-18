@@ -16,7 +16,7 @@ pytestmark = pytest.mark.skipif(
 
 def _serial_candidates(histories, sources, num_drafts, min_match, context, partial):
     """Independent text search oracle, including eligibility before ranking."""
-    outputs, masks = [], []
+    outputs, masks, metadata = [], [], []
     for slot in range(4):
         own = histories[slot]
         sa = SuffixAutomaton()
@@ -28,6 +28,7 @@ def _serial_candidates(histories, sources, num_drafts, min_match, context, parti
         own_valid = valid
         best = (own_match if valid else 0, 0, 0)
         tokens = own_tokens if valid else []
+        shared = False
         suffix = own[-context:]
         for index, donor in enumerate(sources):
             if donor < 0 or donor == slot:
@@ -59,9 +60,11 @@ def _serial_candidates(histories, sources, num_drafts, min_match, context, parti
                 best = rank
                 tokens = history[start : start + num_drafts]
                 valid = True
+                shared = True
         outputs.append((tokens + [0] * num_drafts)[:num_drafts])
         masks.append(valid)
-    return outputs + [[0] * num_drafts], masks + [False]
+        metadata.append([best[0], int(shared)] if valid else [0, 0])
+    return outputs + [[0] * num_drafts], masks + [False], metadata + [[0, 0]]
 
 
 @pytest.mark.parametrize("num_sources", [20, 64, 257])
@@ -89,6 +92,7 @@ def test_shared_parallel_matches_text_oracle_in_graph(num_sources, partial):
     source_lengths = torch.full_like(sources, -1)
     tokens = torch.zeros((5, 4), **device)
     mask = torch.zeros(5, device="cuda", dtype=torch.bool)
+    metadata = torch.zeros((5, 2), **device)
 
     def query():
         backend.consume_and_query(
@@ -100,6 +104,7 @@ def test_shared_parallel_matches_text_oracle_in_graph(num_sources, partial):
             shared_slots=sources,
             shared_generations=source_generations,
             shared_lengths=source_lengths,
+            query_metadata=metadata,
         )
 
     graph = torch.cuda.CUDAGraph()
@@ -144,13 +149,14 @@ def test_shared_parallel_matches_text_oracle_in_graph(num_sources, partial):
             ]
             sources.copy_(torch.tensor(published, **device))
             source_generations.copy_(torch.tensor(source_gens, **device))
-            expected_tokens, expected_mask = _serial_candidates(
+            expected_tokens, expected_mask, expected_metadata = _serial_candidates(
                 histories, expected_sources, 4, 2, 13, partial
             )
             for _ in range(2):
                 graph.replay()
                 assert mask.tolist() == expected_mask
                 assert tokens.tolist() == expected_tokens
+                assert metadata.tolist() == expected_metadata
 
 
 def test_shared_parallel_ties_across_lanes_and_strides():

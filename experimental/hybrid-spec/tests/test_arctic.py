@@ -70,6 +70,7 @@ def test_native_arctic_candidates_match_upstream_and_history_is_incremental(
     )
     assert view.tokens.tolist() == [expected.token_ids] == [[5, 6, 7, 8]]
     assert view.use_retrieval.tolist() == [True]
+    assert view.query_metadata.tolist() == [[expected.match_len, 0]]
     state = runtime.states["a"]
     first_key = state.key
     # Replaying the same CPU history must not append it again.
@@ -96,7 +97,9 @@ def test_native_arctic_global_cache_retains_only_responses_and_fifo():
     runtime.close_request("donor", retain=True)
     assert donor not in backend.cache.active_requests
     assert donor in backend.global_cache.cached_requests
-    assert add(runtime, "probe", [1, 2, 3], [4]).tokens.tolist() == [[5, 6, 7, 8]]
+    probe = add(runtime, "probe", [1, 2, 3], [4])
+    assert probe.tokens.tolist() == [[5, 6, 7, 8]]
+    assert probe.query_metadata[:, 1].tolist() == [1]
     view = add(runtime, "probe", [91, 92, 93], [94])
     assert not view.use_retrieval.item()  # Another request's prompt is private.
     runtime.close_request("probe")

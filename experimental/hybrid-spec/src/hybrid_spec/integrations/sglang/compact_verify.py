@@ -27,6 +27,11 @@ def token_buckets(config, base, max_bs, alignment=1):
                 buckets.add(bs * neural_width + num_sa * (width - neural_width))
         for bs in range(1, min(max_bs, config.max_requests) + 1):
             buckets.add(bs * neural_width)
+            if config.dynamic_verify:
+                # A bounded capacity grid, independent of the number of possible
+                # per-row length combinations. Native alignment is applied below.
+                buckets.add(bs * (config.dynamic_verify_min_drafts + 1))
+                buckets.update((bs * width * q + 3) // 4 for q in (1, 2, 3))
     # Retain the runner's native TP/SP token alignment. New compact tiers
     # bypass the request-count filter used to build the original capture grid.
     if maximum % alignment:
@@ -45,7 +50,6 @@ def configure_verify(result, worker, batch):
     if config.verify_mode == "static" or batch.forward_mode.is_idle():
         return
     from msgspec.structs import replace
-
     from sglang.srt.speculative.eagle_compact_verify import cap_verify_chain
     from sglang.srt.speculative.ragged_verify import RaggedVerifyLayout, round_up_grid
 
@@ -55,6 +59,25 @@ def configure_verify(result, worker, batch):
     verify_lens = torch.where(
         view.use_retrieval, config.num_drafts + 1, config.neural_drafts + 1
     ).to(torch.int32)
+    dynamic = None
+    if config.dynamic_verify:
+        dynamic = get_dynamic_verify(worker.draft_extension, view.tokens.device)
+        graph = worker.target_worker.model_runner.decode_cuda_graph_runner
+        dense = len(batch.seq_lens) * (config.num_drafts + 1)
+        grid = (
+            graph.capture_num_tokens
+            if graph
+            else token_buckets(config, [dense], len(batch.seq_lens))
+        )
+        full = round_up_grid(dense, grid)
+        choices = [
+            n
+            for n in grid
+            if len(batch.seq_lens) * (config.dynamic_verify_min_drafts + 1) <= n <= full
+        ]
+        verify_lens = dynamic.select(
+            view, verify_lens - 1, choices, dynamic.context_key
+        )
     cap_verify_chain(result, verify_lens)
     counters = getattr(worker.draft_extension, "compact_verify_counters", None)
     if counters is None:
@@ -69,7 +92,9 @@ def configure_verify(result, worker, batch):
     # host count when available; otherwise read one sum, never per-row masks.
     num_neural = getattr(worker.draft_extension, "compact_num_neural", None)
     dense_tokens = len(batch.seq_lens) * (config.num_drafts + 1)
-    if config.num_drafts == config.neural_drafts:
+    if dynamic is not None:
+        logical = int(verify_lens.sum().item())
+    elif config.num_drafts == config.neural_drafts:
         logical = dense_tokens
     elif num_neural is None:
         logical = int(verify_lens.sum().item())
@@ -95,6 +120,18 @@ def configure_verify(result, worker, batch):
     counters["dense_token_ct"] += dense_tokens
     histogram = counters["graph_token_histogram"]
     histogram[str(target_tokens)] = histogram.get(str(target_tokens), 0) + 1
+    if dynamic is not None:
+        dynamic.mark_verify(target_tokens)
+
+
+def get_dynamic_verify(extension, device):
+    if getattr(extension, "dynamic_verify", None) is None:
+        from hybrid_spec.selection.online_verify import DynamicVerify
+
+        extension.dynamic_verify = DynamicVerify(
+            extension.config, device, getattr(extension, "tp_sync", None)
+        )
+    return extension.dynamic_verify
 
 
 def finalize_verify_counters(extension, result, graph):

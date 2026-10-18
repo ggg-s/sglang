@@ -16,8 +16,9 @@ class GatedOverride(DraftOverrideView):
         defer_prefix=False,
         query_stream=None,
         neural_prefix=None,
+        query_metadata=None,
     ):
-        super().__init__(tokens, use_retrieval, num_neural_gate_tokens)
+        super().__init__(tokens, use_retrieval, num_neural_gate_tokens, query_metadata)
         self.tp_sync = tp_sync
         self.defer_prefix = defer_prefix
         self.query_stream = query_stream

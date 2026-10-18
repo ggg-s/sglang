@@ -38,6 +38,7 @@ class RetrievalCandidates:
     match_lens: torch.Tensor
     versions: torch.Tensor
     healthy: torch.Tensor
+    retrieval_sources: torch.Tensor | None = None
 
 
 @dataclass
@@ -45,6 +46,7 @@ class DraftOverrideView:
     tokens: torch.Tensor
     use_retrieval: torch.Tensor
     num_neural_gate_tokens: int = 0
+    query_metadata: torch.Tensor | None = None
 
     def select_step(self, neural_tokens: torch.Tensor, step: int):
         # topk=1 has exactly one token per row. Preserve [B] or [B,1], never

@@ -4,11 +4,13 @@ Serving dependencies are isolated at import/forward-batch boundaries. Neural
 weights and a full scheduler are not exercised by this component suite.
 """
 
+import ast
 import importlib.util
 import sys
 from contextlib import nullcontext
 from pathlib import Path
-from types import ModuleType, SimpleNamespace as NS
+from types import ModuleType
+from types import SimpleNamespace as NS
 from typing import Optional
 
 import pytest
@@ -18,6 +20,257 @@ from hybrid_spec.integrations.sglang.compact_verify import token_buckets
 from test_draft_recurrence import load_functions
 
 ROOT = Path(__file__).resolve().parents[3]
+
+
+def dynamic_config(**kwargs):
+    return HybridConfig(
+        8,
+        2,
+        16,
+        128,
+        history_mode="device",
+        draft_graph_mode="split",
+        num_neural_drafts=3,
+        verify_mode="compact",
+        dynamic_verify=True,
+        **kwargs,
+    )
+
+
+def test_online_feedback_censors_tail_and_separates_sources():
+    """Neither a cropped chain nor descendants of a mismatch are failures."""
+    from hybrid_spec.selection.online_verify import OnlineAcceptance
+
+    model = OnlineAcceptance(dynamic_config(), "cpu")
+    view = NS(
+        use_retrieval=torch.tensor([False, True, True, True]),
+        query_metadata=torch.tensor([[99, 1], [4, 0], [4, 1], [17, 0]]),
+    )
+    buckets = model.buckets(view)
+    assert buckets.tolist() == [0, 1, 6, 4]
+    model.update(buckets, torch.tensor([3, 8, 8, 2]), torch.tensor([4, 4, 1, 3]))
+    assert model.check_ct[0].tolist() == [1, 1, 1, 0, 0, 0, 0, 0]
+    assert model.correct_ct[0].tolist() == [1, 1, 1, 0, 0, 0, 0, 0]
+    assert model.check_ct[1].tolist() == [1, 1, 1, 1, 0, 0, 0, 0]
+    assert model.correct_ct[1].tolist() == [1, 1, 1, 0, 0, 0, 0, 0]
+    assert model.check_ct[6].tolist() == [1, 0, 0, 0, 0, 0, 0, 0]
+    assert not model.correct_ct[6].any()
+    assert model.check_ct[4].tolist() == [1, 1, 0, 0, 0, 0, 0, 0]
+    before = model.check_ct.clone()
+    model.update(buckets, torch.ones(4), torch.tensor([0, 3, -1, 999]))
+    assert torch.equal(model.check_ct, before)
+    scores = model.survival(buckets)
+    assert (scores[:, 1:] <= scores[:, :-1]).all()
+    assert torch.isfinite(scores).all()
+
+
+@pytest.mark.parametrize("aliased_capacity", [False, True])
+def test_dynamic_lengths_match_exhaustive_prefix_cost_oracle(aliased_capacity):
+    """Global allocation must maximise utility over real physical graph costs."""
+    import itertools
+
+    from hybrid_spec.selection.online_verify import DynamicVerify
+
+    chooser = DynamicVerify(dynamic_config(), "cpu")
+    view = NS(
+        use_retrieval=torch.tensor([True, False, True]),
+        query_metadata=torch.tensor([[4, 0], [0, 0], [4, 1]]),
+    )
+    chooser.model.check_ct.fill_(1000)
+    chooser.model.correct_ct.fill_(950)
+    chooser.model.correct_ct[0].fill_(200)
+    chooser.model.correct_ct[6].fill_(600)
+    key = (3, 512)
+    costs = (
+        {6: 1.0, 9: 4.0, 12: 0.001} if aliased_capacity else {6: 1.0, 9: 1.1, 12: 4.0}
+    )
+    for n, cost in costs.items():
+        chooser.observe_cost(key, n, 0.4, cost)
+    caps = torch.tensor([3, 1, 2] if aliased_capacity else [3, 3, 3])
+    lens = chooser.select(view, caps, list(costs), key) - 1
+    scores = chooser.model.survival(chooser.model.buckets(view))
+
+    def objective(lengths):
+        physical = next(n for n in costs if n >= 3 + sum(lengths))
+        utility = 3 + sum(scores[i, :n].sum().item() for i, n in enumerate(lengths))
+        return utility / (0.4 + costs[physical])
+
+    best = max(
+        objective(x)
+        for x in itertools.product(*(range(1, n + 1) for n in caps.tolist()))
+    )
+    assert objective(lens.tolist()) == pytest.approx(best)
+    if aliased_capacity:
+        # The apparently cheap 12-token graph cannot actually be selected:
+        # all available candidates fit in 9, which is the expensive tier.
+        assert lens.tolist() == [1, 1, 1]
+    else:
+        assert lens[0] > lens[1]
+        # Extra logical tokens within the same physical graph should be used.
+        assert sum(lens).item() + 3 == 9
+    chooser.feedback(lens + 1)
+    before = chooser.model.check_ct.clone()
+    chooser.feedback(lens + 1)  # A duplicated/idle callback cannot label twice.
+    assert torch.equal(before, chooser.model.check_ct)
+
+
+def test_dynamic_cold_start_exploration_and_abort_reset():
+    from hybrid_spec.selection.online_verify import DynamicVerify
+
+    chooser = DynamicVerify(dynamic_config(dynamic_verify_explore_interval=2), "cpu")
+    view = NS(
+        use_retrieval=torch.tensor([True, False]),
+        query_metadata=torch.zeros((2, 2), dtype=torch.long),
+    )
+    caps = torch.tensor([8, 3])
+    key = (2, 512)
+    assert chooser.select(view, caps, [4, 8, 12, 18], key).tolist() == [9, 4]
+    # Cropping cannot start just because a small graph has a cheap cost sample.
+    chooser.observe_cost(key, 4, 0, 0.01)
+    assert chooser.select(view, caps, [4, 8, 12, 18], key).tolist() == [9, 4]
+    chooser.model.check_ct.fill_(100)
+    chooser.model.correct_ct.zero_()
+    chooser.observe_cost(key, 18, 0, 100)
+    seen = []
+    for _ in range(20):
+        lengths = chooser.select(view, caps, [4, 8, 12, 18], key) - 1
+        seen.append(lengths.tolist())
+    assert [8, 3] in seen and [1, 1] in seen
+    before = chooser.model.check_ct.clone()
+    chooser.begin(NS(reqs=[]))  # Failed iteration must not train a new batch.
+    chooser.feedback(torch.tensor([1, 1]))
+    assert torch.equal(before, chooser.model.check_ct)
+
+
+def test_cuda_dynamic_plugin_labels_before_history_consumer_and_flushes(cuda_modules):
+    from hybrid_spec import plugin
+
+    config = dynamic_config()
+    extension = NS(config=config, backend=NS(device="cuda"), tp_sync=None)
+    extension.pending_view = NS(
+        tokens=torch.zeros((2, 8), dtype=torch.long, device="cuda"),
+        use_retrieval=torch.tensor([True, False], device="cuda"),
+        query_metadata=torch.tensor([[8, 0], [0, 0]], device="cuda"),
+    )
+    extension.on_device_verify = lambda result, batch: setattr(
+        extension, "pending_view", None
+    )
+    extension.reset = lambda: setattr(extension, "pending_view", None)
+    worker = NS(
+        draft_extension=extension,
+        target_worker=NS(model_runner=NS(decode_cuda_graph_runner=None)),
+    )
+    batch = NS(
+        reqs=[NS(origin_input_ids=[1], output_ids=[2])] * 2,
+        seq_lens=torch.tensor([1, 1], device="cuda"),
+        forward_mode=NS(is_idle=lambda: False),
+    )
+    plugin._begin_draft(worker, batch)
+    vi = NS(
+        draft_token_num=9,
+        retrieve_next_token=torch.arange(1, 10, device="cuda").repeat(2, 1),
+    )
+    plugin._configure_verify(vi, worker, batch)
+    controller = extension.dynamic_verify
+    plugin._verify(
+        NS(can_run_cuda_graph=False, accept_lens=torch.tensor([3, 2], device="cuda")),
+        NS(draft_worker=worker, target_worker=worker.target_worker),
+        batch,
+    )
+    assert controller.model.correct_ct.sum().item() == 3
+    assert controller.model.check_ct.sum().item() == 5
+    assert extension.pending_view is None
+    # Native draft-extend runs after _verify. Its time belongs to this cycle;
+    # only the next draft boundary closes the sample.
+    assert not controller.timings
+    plugin._begin_draft(worker, batch)
+    torch.cuda.synchronize()
+    assert controller.snapshot()["cost_sample_ct"] == 1
+    controller.completed = (
+        controller.context_key,
+        13,
+        controller.start,
+        controller.start,
+    )
+    idle = NS(forward_mode=NS(is_idle=lambda: True))
+    plugin._begin_draft(worker, idle)
+    assert controller.completed is None
+    controller.completed = (controller.context_key, 13, None, None)
+    plugin._prefill(
+        lambda *a, **kw: None,
+        NS(draft_worker=NS(draft_extension=NS(dynamic_verify=controller))),
+        batch,
+    )
+    assert controller.completed is None
+    plugin._reset(None, NS(draft_worker=worker))
+    assert extension.dynamic_verify is None
+
+
+@pytest.mark.parametrize(
+    "kwargs",
+    [
+        {"dynamic_verify": 1},
+        {"dynamic_verify_min_samples": 0},
+        {"dynamic_verify_explore_interval": 0},
+        {"dynamic_verify_prior_strength": float("nan")},
+        {"dynamic_verify_prior_strength": 1e300},
+        {"dynamic_verify_prior_rate": 1},
+        {"dynamic_verify_min_drafts": 4},
+        {"partial_drafts": "zero"},
+    ],
+)
+def test_dynamic_invalid_config(kwargs):
+    from dataclasses import replace
+
+    with pytest.raises(ValueError):
+        replace(dynamic_config(), **kwargs)
+
+
+@pytest.mark.parametrize("bs", [1, 4, 16, 33])
+def test_cuda_fused_online_policy_and_feedback_match_cpu_reference(cuda_modules, bs):
+    """One-block policy and >256-position fallback must share the same labels."""
+    from dataclasses import replace
+
+    from hybrid_spec.selection.online_verify import DynamicVerify
+
+    config = replace(dynamic_config(dynamic_verify_explore_interval=2), max_requests=64)
+    cpu = DynamicVerify(config, "cpu")
+    gpu = DynamicVerify(config, "cuda")
+    rng = torch.Generator().manual_seed(7301 + bs)
+    mask = torch.arange(bs) % 3 != 0
+    metadata = torch.tensor([[i % 40, i % 2] for i in range(bs)])
+    caps = torch.where(mask, 8, 3).int()
+    key = (bs, 512)
+    grid = token_buckets(config, [bs * 9], bs)
+    choices = [n for n in grid if bs * 2 <= n <= bs * 9]
+    for iteration in range(8):
+        check = torch.randint(0, 100, cpu.model.check_ct.shape, generator=rng)
+        correct = (check * torch.rand(check.shape, generator=rng)).long()
+        cpu.model.check_ct.copy_(check)
+        cpu.model.correct_ct.copy_(correct)
+        gpu.model.check_ct.copy_(check)
+        gpu.model.correct_ct.copy_(correct)
+        if iteration:
+            for n in choices:
+                cost = 1 + ((n * 7) % 23) / 10
+                cpu.observe_cost(key, n, 0.2, cost)
+                gpu.observe_cost(key, n, 0.2, cost)
+
+        def view(device):
+            return NS(
+                tokens=torch.zeros((bs, 8), dtype=torch.long, device=device),
+                use_retrieval=mask.to(device),
+                query_metadata=metadata.to(device),
+            )
+
+        expected = cpu.select(view("cpu"), caps, choices, key)
+        actual = gpu.select(view("cuda"), caps.cuda(), choices, key)
+        assert actual.cpu().tolist() == expected.tolist()
+        num_accept = torch.minimum(expected, torch.arange(bs).int() % 5 + 1)
+        cpu.feedback(num_accept)
+        gpu.feedback(num_accept.cuda())
+        assert torch.equal(gpu.model.check_ct.cpu(), cpu.model.check_ct)
+        assert torch.equal(gpu.model.correct_ct.cpu(), cpu.model.correct_ct)
 
 
 def load_module(monkeypatch, name, relative):
@@ -183,8 +436,9 @@ def cuda_modules(monkeypatch, compact_module):
 @pytest.mark.parametrize("neural,gate", [(3, 1), (2, 3), (1, 8), (8, 8)])
 @pytest.mark.parametrize("coarse", [False, True])
 @pytest.mark.parametrize("alignment", [1, 8])
+@pytest.mark.parametrize("dynamic", [False, True])
 def test_cuda_mixed_verify_graph_tier_switches_and_native_commit(
-    monkeypatch, cuda_modules, neural, gate, coarse, alignment
+    monkeypatch, cuda_modules, neural, gate, coarse, alignment, dynamic
 ):
     from hybrid_spec.integrations.sglang.compact_verify import configure_verify
     from sglang.kernels.ops.speculative.dspark.dspark_verify_window import (
@@ -207,6 +461,8 @@ def test_cuda_mixed_verify_graph_tier_switches_and_native_commit(
         num_neural_gate_tokens=gate,
         verify_mode="compact",
         verify_token_buckets=(16, 32, 144) if coarse else (),
+        dynamic_verify=dynamic,
+        dynamic_verify_explore_interval=2,
     )
     grid = token_buckets(config, [9, 18, 36, 72, 144], 16, alignment)
     cache_table = torch.arange(32 * 128, device="cuda").view(32, 128)
@@ -249,7 +505,11 @@ def test_cuda_mixed_verify_graph_tier_switches_and_native_commit(
         mask = torch.tensor([i < num_sa for i in range(bs)], device="cuda").roll(
             iteration % bs
         )
-        worker.draft_extension.pending_view = NS(use_retrieval=mask)
+        worker.draft_extension.pending_view = NS(
+            use_retrieval=mask,
+            tokens=torch.zeros((bs, 8), device="cuda", dtype=torch.long),
+            query_metadata=torch.tensor([[4, i % 2] for i in range(bs)], device="cuda"),
+        )
         req = torch.arange(bs, device="cuda").roll(iteration % bs)
         prefix = torch.arange(bs, device="cuda", dtype=torch.int32) + 5 + iteration
         dense = (
@@ -270,7 +530,23 @@ def test_cuda_mixed_verify_graph_tier_switches_and_native_commit(
             req_pool_indices=req,
             device="cuda",
             forward_mode=NS(is_idle=lambda: False),
+            reqs=[NS(origin_input_ids=[1] * 16, output_ids=[]) for _ in range(bs)],
         )
+        if dynamic:
+            from hybrid_spec.integrations.sglang.compact_verify import (
+                get_dynamic_verify,
+            )
+
+            chooser = get_dynamic_verify(worker.draft_extension, "cuda")
+            chooser.begin(batch)
+            # Different sources have different target correctness. The native
+            # verifier below supplies the next feedback; model calls are real.
+            if iteration == 0:
+                chooser.model.check_ct.fill_(100)
+                chooser.model.correct_ct.fill_(95)
+                chooser.model.correct_ct[0].fill_(40)
+            for n in grid:
+                chooser.observe_cost(chooser.context_key, n, 0.2, 0.2 + n * 0.1)
         configure_verify(vi, worker, batch)
         layout = vi.compact_verify_layout
         bucket = layout.graph_num_tokens
@@ -376,6 +652,10 @@ def test_cuda_mixed_verify_graph_tier_switches_and_native_commit(
             num_draft_tokens=9,
         )
         accept = correct + 1
+        if dynamic:
+            before = chooser.model.check_ct.sum().item()
+            chooser.feedback(accept)
+            assert chooser.model.check_ct.sum().item() > before
         new_seq, bonus, _, draft_inputs = prepare_verify_commit_outputs(
             predict,
             indices,
@@ -877,6 +1157,117 @@ def test_capture_shape_preserves_nonmultiple_token_tiers():
         with pytest.raises(Prepared):
             ns["capture_one_shape"](runner, tier, None)
     assert seen == [(4, 4), (4, 9), (4, 13)]
+
+
+@pytest.mark.parametrize("tp_rank", [0, 1])
+@pytest.mark.parametrize("ragged", [False, True])
+def test_inherited_capture_loop_without_target_initialization(tp_rank, ragged):
+    """Draft subclasses skip target __init__ but execute its capture loop."""
+    path = ROOT / "python/sglang/srt/model_executor/runner/decode_cuda_graph_runner.py"
+    definition = next(
+        n
+        for n in ast.parse(path.read_text()).body
+        if isinstance(n, ast.ClassDef) and n.name == "DecodeCudaGraphRunner"
+    )
+    definition.bases = []
+    definition.body = [
+        n
+        for n in definition.body
+        if isinstance(n, ast.Assign)
+        or isinstance(n, ast.FunctionDef)
+        and n.name == "_capture_one_stream"
+    ]
+    patched, captured = [], []
+
+    def patch(model, compile_enabled, *, num_tokens, tp_group):
+        patched.append((compile_enabled, num_tokens))
+        return nullcontext(model)
+
+    class Progress(list):
+        def set_description(self, text):
+            pass
+
+    ns = dict(
+        Optional=Optional,
+        get_available_gpu_memory=lambda *a, **k: 1,
+        get_parallel=lambda: NS(tp_rank=tp_rank, tp_group=None),
+        tqdm=NS(tqdm=Progress),
+        torch_compile_decoration=NS(patch_model=patch),
+        _set_capture_lora_variant=lambda *a: None,
+        _set_capture_attention_variant=lambda *a: None,
+    )
+    exec(compile(ast.Module(body=[definition], type_ignores=[]), str(path), "exec"), ns)
+
+    class DraftRunner(ns["DecodeCudaGraphRunner"]):
+        def __init__(self):
+            self.model_runner = NS(device="cuda", gpu_id=0, model=object())
+            self.capture_bs = [1, 4]
+            self.captured_req_width = 3
+            self.compile_bs = [4]
+            self.record_nolora_graph = False
+            self.attention_graph_variants = None
+            if ragged:
+                self.ragged_verify_mode = True
+                self.capture_num_tokens = [4, 12]
+
+        def _set_profile_trace_tag(self, *args):
+            pass
+
+        def capture_one_shape(self, size, *args):
+            captured.append(size)
+
+    DraftRunner()._capture_one_stream()
+    assert captured == ([12, 4] if ragged else [4, 1])
+    assert patched == [(True, 12), (False, 4 if ragged else 3)]
+
+
+@pytest.mark.parametrize("supported", [False, True])
+def test_compact_backend_validation_waits_for_attention_initialization(
+    monkeypatch, supported
+):
+    from hybrid_spec import plugin
+    from hybrid_spec.integrations.sglang.compatibility import validate_model
+
+    monkeypatch.setitem(
+        sys.modules,
+        "sglang.srt.configs.hybrid_arch",
+        NS(mambaish_config=lambda config: None),
+    )
+    model = NS(
+        hf_config=NS(architectures=["Qwen3ForCausalLM"]),
+        model_is_mrope=False,
+        is_multimodal=False,
+        is_hybrid_swa=False,
+    )
+    config = dynamic_config()
+    # Real worker constructors attach the extension before initializing any
+    # target attention backend. Architecture validation must work at this point.
+    validate_model(
+        NS(
+            target_worker=NS(model_runner=NS(model_config=model)),
+            draft_runner=NS(model_config=model),
+        ),
+        config,
+    )
+    monkeypatch.setattr(plugin, "_config", lambda: config)
+    monkeypatch.setitem(
+        sys.modules,
+        "sglang.srt.utils",
+        NS(get_cuda_graph_batch_size_alignment=lambda **kwargs: 1),
+    )
+    runner = NS(
+        model_runner=NS(is_draft_worker=False),
+        attn_backend=NS(supports_ragged_verify_graph=supported),
+        max_bs=4,
+        require_gathered_buffer=False,
+    )
+    if supported:
+        assert plugin._verify_token_buckets([9, 36], runner) == token_buckets(
+            config, [9, 36], 4
+        )
+    else:
+        with pytest.raises(ValueError, match="ragged-capable"):
+            plugin._verify_token_buckets([9, 36], runner)
 
 
 @pytest.mark.parametrize("alignment", [1, 2, 8, 16])

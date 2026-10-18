@@ -32,6 +32,7 @@ class GraphBuffers:
             (max_bs, num_drafts), device=device, dtype=torch.int64
         )
         self.use_retrieval = torch.zeros(max_bs, device=device, dtype=torch.bool)
+        self.query_metadata = torch.zeros((max_bs, 2), device=device, dtype=torch.int64)
 
     def bind_capture_view(self, batch_size):
         if self.defer_prefix:
@@ -42,6 +43,7 @@ class GraphBuffers:
                 tp_sync=self.tp_sync,
                 defer_prefix=True,
                 neural_prefix=self.neural_prefix[:batch_size],
+                query_metadata=self.query_metadata[:batch_size],
             )
         if self.tp_sync is not None:
             return TPOverride(
@@ -49,11 +51,13 @@ class GraphBuffers:
                 self.use_retrieval[:batch_size],
                 self.tp_sync,
                 self.num_neural_gate_tokens,
+                query_metadata=self.query_metadata[:batch_size],
             )
         return DraftOverrideView(
             self.tokens[:batch_size],
             self.use_retrieval[:batch_size],
             self.num_neural_gate_tokens,
+            query_metadata=self.query_metadata[:batch_size],
         )
 
     def stage(self, view, raw_bs, padded_bs):
@@ -67,3 +71,9 @@ class GraphBuffers:
         self.use_retrieval[:raw_bs].copy_(view.use_retrieval)
         # prepare() updates this mask in graph, after staging local eligibility.
         view.use_retrieval = self.use_retrieval[:raw_bs]
+        self.query_metadata[raw_bs:].zero_()
+        if view.query_metadata is not None:
+            self.query_metadata[:raw_bs].copy_(view.query_metadata)
+        else:
+            self.query_metadata[:raw_bs].zero_()
+        view.query_metadata = self.query_metadata[:raw_bs]

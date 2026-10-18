@@ -1,0 +1,36 @@
+{
+  "scope": "TP1 chooser + feedback overhead, synthetic scores/costs, no target model.",
+  "iterations_per_sample": 100,
+  "results": [
+    {
+      "batch_size": 1,
+      "median_us": 232.09758990560658,
+      "samples_us": [
+        229.19543989701197,
+        232.09758990560658,
+        236.41242005396634
+      ],
+      "last_logical_tokens": 9
+    },
+    {
+      "batch_size": 4,
+      "median_us": 323.12060007825494,
+      "samples_us": [
+        323.12060007825494,
+        566.5869000949897,
+        237.50546999508515
+      ],
+      "last_logical_tokens": 24
+    },
+    {
+      "batch_size": 16,
+      "median_us": 225.76871007913724,
+      "samples_us": [
+        221.91281997947954,
+        225.76871007913724,
+        229.35168002732098
+      ],
+      "last_logical_tokens": 88
+    }
+  ]
+}

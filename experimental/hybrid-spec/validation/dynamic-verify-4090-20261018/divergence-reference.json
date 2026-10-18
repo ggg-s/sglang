@@ -1,0 +1,35 @@
+{
+  "scope": "Independent Transformers FP32 eager full-prefill reference at the shared first-divergence prefix; does not establish FP16 path equivalence.",
+  "first_difference": 2,
+  "native_token": 1654,
+  "compact_token": 785,
+  "top5": [
+    {
+      "token": 1654,
+      "text": "We",
+      "logit": 20.353397369384766
+    },
+    {
+      "token": 785,
+      "text": "The",
+      "logit": 20.335729598999023
+    },
+    {
+      "token": 73594,
+      "text": "```",
+      "logit": 20.290687561035156
+    },
+    {
+      "token": 13874,
+      "text": "``",
+      "logit": 19.997791290283203
+    },
+    {
+      "token": 1249,
+      "text": "To",
+      "logit": 19.799158096313477
+    }
+  ],
+  "top2_margin": 0.017667770385742188,
+  "torch": "2.14.1+cu130"
+}

@@ -1,0 +1,22 @@
+{
+  "num_drafts": 8,
+  "min_match_len": 4,
+  "max_requests": 4,
+  "max_history_tokens": 16384,
+  "backend": "gpu_sa",
+  "history_mode": "device",
+  "partial_drafts": "fallback",
+  "num_neural_gate_tokens": 1,
+  "draft_graph_mode": "split",
+  "enable_global_pool": true,
+  "max_shared_requests": 16,
+  "shared_context_tokens": 128,
+  "num_neural_drafts": 3,
+  "verify_mode": "compact",
+  "dynamic_verify": true,
+  "dynamic_verify_min_samples": 32,
+  "dynamic_verify_explore_interval": 32,
+  "dynamic_verify_prior_strength": 4.0,
+  "dynamic_verify_prior_rate": 0.8,
+  "dynamic_verify_min_drafts": 1
+}

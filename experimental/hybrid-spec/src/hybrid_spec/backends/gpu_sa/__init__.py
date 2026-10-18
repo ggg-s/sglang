@@ -20,17 +20,12 @@ class GPUSuffixAutomaton:
             + 4 * (config.num_drafts + 1)
         )
 
-    def __init__(self, config, device):
+    @staticmethod
+    def load_module():
         from torch.utils.cpp_extension import load
 
-        self.config = config
-        self.device = torch.device(device)
-        if self.device.type != "cuda" or torch.version.hip:
-            raise ValueError("gpu_sa requires NVIDIA CUDA")
-        if self.device.index is None:
-            self.device = torch.device("cuda", torch.cuda.current_device())
-        self.module = load(
-            name="hybrid_spec_gpu_sa_v3",
+        return load(
+            name="hybrid_spec_gpu_sa_v4",
             sources=[
                 str(Path(__file__).with_name("suffix_automaton.cu")),
                 str(Path(__file__).with_name("host_builder.cpp")),
@@ -38,6 +33,15 @@ class GPUSuffixAutomaton:
             extra_cflags=["-O3"],
             extra_cuda_cflags=["-O3"],
         )
+
+    def __init__(self, config, device):
+        self.config = config
+        self.device = torch.device(device)
+        if self.device.type != "cuda" or torch.version.hip:
+            raise ValueError("gpu_sa requires NVIDIA CUDA")
+        if self.device.index is None:
+            self.device = torch.device("cuda", torch.cuda.current_device())
+        self.module = self.load_module()
         self.host_builder = NativeHostBuilder(self.module.__file__)
         self.host_transfers = []
         n, h = config.num_sa_slots, config.max_history_tokens
@@ -181,6 +185,7 @@ class GPUSuffixAutomaton:
         shared_slots=None,
         shared_generations=None,
         shared_lengths=None,
+        query_metadata=None,
     ):
         # Called on the native capture stream during capture and on its forward
         # stream during replay. No host readback, allocation or stream binding.
@@ -204,4 +209,5 @@ class GPUSuffixAutomaton:
             shared_generations,
             shared_lengths,
             self.config.shared_context_tokens,
+            query_metadata,
         )

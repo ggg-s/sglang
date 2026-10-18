@@ -27,6 +27,12 @@ class HybridConfig:
     num_neural_drafts: int | None = None
     verify_mode: str = "static"
     verify_token_buckets: tuple[int, ...] = ()
+    dynamic_verify: bool = False
+    dynamic_verify_min_samples: int = 32
+    dynamic_verify_explore_interval: int = 32
+    dynamic_verify_prior_strength: float = 4.0
+    dynamic_verify_prior_rate: float = 0.8
+    dynamic_verify_min_drafts: int = 1
 
     def __post_init__(self):
         for name in (
@@ -70,6 +76,39 @@ class HybridConfig:
             raise ValueError("verify_token_buckets must contain positive integers")
         if self.verify_token_buckets and self.verify_mode != "compact":
             raise ValueError("verify_token_buckets requires compact verify")
+        if type(self.dynamic_verify) is not bool:
+            raise ValueError("dynamic_verify must be a boolean")
+        for name in (
+            "dynamic_verify_min_samples",
+            "dynamic_verify_explore_interval",
+            "dynamic_verify_min_drafts",
+        ):
+            if type(getattr(self, name)) is not int or getattr(self, name) < 1:
+                raise ValueError(f"{name} must be a positive integer")
+        for name in ("dynamic_verify_prior_strength", "dynamic_verify_prior_rate"):
+            value = getattr(self, name)
+            if (
+                type(value) not in (int, float)
+                or not math.isfinite(value)
+                or value <= 0
+            ):
+                raise ValueError(f"{name} must be finite and positive")
+        if self.dynamic_verify_prior_rate >= 1:
+            raise ValueError("dynamic_verify_prior_rate must be smaller than one")
+        if not 1e-30 <= self.dynamic_verify_prior_strength <= 1e30:
+            raise ValueError(
+                "dynamic_verify_prior_strength must fit finite float32 arithmetic"
+            )
+        if self.dynamic_verify_min_samples > 0x7FFFFFFF:
+            raise ValueError("dynamic_verify_min_samples must fit int32")
+        if self.dynamic_verify_min_drafts > neural:
+            raise ValueError("dynamic_verify_min_drafts exceeds neural draft budget")
+        if self.dynamic_verify and (
+            self.verify_mode != "compact" or self.partial_drafts != "fallback"
+        ):
+            raise ValueError(
+                "dynamic_verify requires compact verify and full candidates"
+            )
         if self.backend == "arctic" and self.history_mode != "cpu":
             raise ValueError("Arctic suffix requires history_mode=cpu")
         if (

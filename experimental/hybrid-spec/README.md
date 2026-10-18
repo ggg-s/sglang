@@ -1,5 +1,9 @@
 # SGLang 混合投机扩展（实验）
 
+新增显式开启的 [在线校准与动态验证](DYNAMIC_VERIFY.md)：SA/suffix 和 neural
+统一从 target 验证反馈估计接受率，结合实际 CUDA Graph 档位耗时选择每请求验证长度。
+保留 gate、split 和原草稿上限，默认不改变已有固定长度行为。
+
 本目录实现 [DESIGN.md](DESIGN.md) 的固定长度、请求级来源选择。默认 `draft_graph_mode="full"` 照常运行完整 neural draft，由设备端 mask 在每个位置选择 SA 或 neural token；选定 token 同时进入下一步模型输入和最终验证链。显式开启 `split` 后，可按配置 gate 跳过 SA 命中请求的 neural 尾段，使用 GPU 动态行号压缩，不再限定 batch≤4。
 
 当前优化、执行流程、配置区别、A100 性能结论和未实现项见 [OPTIMIZATIONS.md](OPTIMIZATIONS.md)。SA 独立按请求存储；device 模式可显式开启跨活跃请求和完成请求的全局检索池。CPU 语义测试与 CUDA/真实模型验收是不同层次；详细验证记录见 [VALIDATION.md](VALIDATION.md)。未测模型不得视为已支持。

@@ -11,8 +11,15 @@ from hybrid_spec.core.contracts import DraftOverrideView
 class TPOverride(DraftOverrideView):
     """Consensus at the draft consumer, including captured CPU-history views."""
 
-    def __init__(self, tokens, use_retrieval, tp_sync, num_neural_gate_tokens=0):
-        super().__init__(tokens, use_retrieval, num_neural_gate_tokens)
+    def __init__(
+        self,
+        tokens,
+        use_retrieval,
+        tp_sync,
+        num_neural_gate_tokens=0,
+        query_metadata=None,
+    ):
+        super().__init__(tokens, use_retrieval, num_neural_gate_tokens, query_metadata)
         self.tp_sync = tp_sync
 
     def prepare(self, seq_lens):
@@ -59,3 +66,16 @@ class TPSynchronizer:
         tokens = packet[:, :k].contiguous()
         agree = packet[:, -1].bool() & (tokens == ~packet[:, k : 2 * k]).all(dim=1)
         return DraftOverrideView(tokens, agree)
+
+    def minimum(self, values):
+        """Canonical dynamic metadata/counts, always in identical collective order."""
+        if self.world_size == 1 or not values.numel():
+            return values
+        values = values.contiguous().clone()
+        comm = self.communicator
+        with nullcontext() if comm is None else comm.change_state(enable=True):
+            if comm is None:
+                dist.all_reduce(values, op=dist.ReduceOp.MIN, group=self.group)
+            else:
+                comm.all_reduce(values, op=dist.ReduceOp.MIN)
+        return values

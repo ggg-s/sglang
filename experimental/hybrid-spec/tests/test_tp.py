@@ -437,6 +437,47 @@ def _check_device_kernel_consensus(sync, ranks, device, mode="full"):
 def _check_consensus(group, ranks, device):
     rank = dist.get_rank()
     sync = TPSynchronizer(group)
+    from hybrid_spec.selection.online_verify import DynamicVerify
+
+    dynamic = DynamicVerify(
+        HybridConfig(
+            3,
+            2,
+            4,
+            32,
+            history_mode="device",
+            verify_mode="compact",
+            dynamic_verify=True,
+        ),
+        device,
+        sync,
+    )
+    dynamic.model.check_ct.fill_(100)
+    dynamic.model.correct_ct.fill_(80)
+    view = DraftOverrideView(
+        torch.zeros((2, 3), device=device, dtype=torch.long),
+        torch.tensor([True, False], device=device),
+        query_metadata=torch.tensor(
+            [[4 + (rank - ranks[0]) * 16, 0], [0, 0]], device=device
+        ),
+    )
+    for size in (4, 6, 8):
+        dynamic.observe_cost(
+            (2, 512), size, 0.2, (size if rank == ranks[0] else 8 / size)
+        )
+    lens = dynamic.select(
+        view, torch.tensor([3, 3], device=device), [4, 6, 8], (2, 512)
+    )
+    copies = [torch.empty_like(lens) for _ in ranks]
+    dist.all_gather(copies, lens, group=group)
+    assert all(torch.equal(lens, copy) for copy in copies)
+    previous_correct = dynamic.model.correct_ct.clone()
+    dynamic.feedback(
+        torch.ones(2, device=device, dtype=torch.int32) + int(rank != ranks[0])
+    )
+    assert dynamic.model.check_ct[1, 0].item() == 101
+    assert dynamic.model.check_ct[0, 0].item() == 101
+    assert torch.equal(dynamic.model.correct_ct, previous_correct)
     # Exact agreement must distinguish extrema and permutations with identical
     # sums; a sum/hash or negation with signed overflow is not sufficient.
     extrema = torch.tensor([[-(2**63), 2**63 - 1], [3, 5], [7, 9]], device=device)

@@ -132,6 +132,7 @@ class ArcticBackend:
         matches = torch.zeros_like(valid)
         versions = torch.zeros_like(valid)
         healthy = torch.zeros(bs, dtype=torch.bool)
+        sources = torch.zeros_like(valid)
         for row, slot in enumerate(snapshot.slots):
             state = self.slots.get(slot)
             if state is None or state.key != snapshot.keys[row]:
@@ -159,6 +160,7 @@ class ArcticBackend:
                 # Match upstream's local-wins-on-tie score policy.
                 if shared.score > draft.score:
                     draft = shared
+                    sources[row] = 1
             count = len(draft.token_ids)
             if count > num_drafts or draft.parents != list(range(-1, count - 1)):
                 raise ValueError("Arctic must return at most K single-chain candidates")
@@ -170,5 +172,8 @@ class ArcticBackend:
         # Bulk staging on the worker stream precedes graph replay. These copies
         # finish before the CPU tensors go out of scope (non_blocking=False).
         return RetrievalCandidates(
-            *(x.to(self.device) for x in (tokens, valid, matches, versions, healthy))
+            *(
+                x.to(self.device)
+                for x in (tokens, valid, matches, versions, healthy, sources)
+            )
         )

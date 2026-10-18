@@ -1,0 +1,9 @@
+{
+  "removed": [
+    "/root/rivermind-data/models/palmfuture/Qwen3.6-35B-A3B-GPTQ-Int4",
+    "/root/rivermind-data/models/palmfuture/Qwen3.6-35B-A3B-GPTQ-Int4-MTP-unquant"
+  ],
+  "all_absent": true,
+  "freed_bytes": 24465334272,
+  "restore_cancelled": true
+}

@@ -1,0 +1,914 @@
+{
+  "base_commit": "9b88ffa22256aae50ad5269331b01b4b85de0842",
+  "python": "3.12.13",
+  "torch": "2.14.1+cu130",
+  "cuda": "13.0",
+  "triton": "3.8.0",
+  "gpu": "NVIDIA GeForce RTX 4090, 49140 MiB, 1 MiB, 580.119.02",
+  "source_sha256": {
+    "experimental/hybrid-spec/DYNAMIC_VERIFY.md": "2b18c14b4dab34e34023d3c5d271fb4473cef46e27cbd0a8b2517075770cccf8",
+    "experimental/hybrid-spec/README.md": "d3ecf0e642b7cf3c2cf3db44b5491f65fa61858d0096bdd8078ae9f44aac497f",
+    "experimental/hybrid-spec/configs/device-dsv4-mtp-dynamic-verify.json": "0c7cf0f8901ca0972d90f67b8d8625e631f0d7b12b1fa8d5cd2a54d769f92d3d",
+    "experimental/hybrid-spec/src/hybrid_spec/backends/arctic.py": "b075dd2b6dcd019175d9c648127fdd73c01a82d3aadb08651eec0fff07718e33",
+    "experimental/hybrid-spec/src/hybrid_spec/backends/gpu_sa/__init__.py": "9bcc3292d6d811e7c09681c34ce3a00758bd5322d6a3ce254d3d083968e6044e",
+    "experimental/hybrid-spec/src/hybrid_spec/backends/gpu_sa/suffix_automaton.cu": "6fa7bcfdf51fe83c38e9b238255213d50fd4ce661aba63d1523c79eaf70f565a",
+    "experimental/hybrid-spec/src/hybrid_spec/config.py": "fe6a99701a8e220c597db130ce5a8b5326328b4bf33235e6a08b8ec68a7443eb",
+    "experimental/hybrid-spec/src/hybrid_spec/core/contracts.py": "70a8489245e04d2e89c957575a3a8c1b1bba910b60a9918fa46f95bf9b27fa08",
+    "experimental/hybrid-spec/src/hybrid_spec/integrations/sglang/arctic_extension.py": "391b6a33229425aa9cdbfc2145943c3927b7044846b54f8877337e44df4f83ca",
+    "experimental/hybrid-spec/src/hybrid_spec/integrations/sglang/compact_verify.py": "8ea0775f3b55d3ebfe2db75e8db53f989ad8f3901cae06927bc272199dc00e83",
+    "experimental/hybrid-spec/src/hybrid_spec/integrations/sglang/device_extension.py": "1742e32fc46032ee4367570272caa5e918e25a6a654551451a334592e92f042e",
+    "experimental/hybrid-spec/src/hybrid_spec/integrations/sglang/draft_extension.py": "4393a696362e844dcf9201bafee5bb07ba2cf32cac93eb0b400fc7cecb8dadbe",
+    "experimental/hybrid-spec/src/hybrid_spec/integrations/sglang/gated_override.py": "6ae5686672b8fccd44fd7850d3b0e1172f98cb43bca64ba4f74f2e0fa58d084e",
+    "experimental/hybrid-spec/src/hybrid_spec/integrations/sglang/graph_buffers.py": "c7e9a93c98c42b575a0176e4a4d00ec18304f2c02b39aade278bbd60929198c4",
+    "experimental/hybrid-spec/src/hybrid_spec/integrations/sglang/tp_sync.py": "6e1221696059e7ae508b63d96325b50bcb02d840b99b93381546446fae96ce56",
+    "experimental/hybrid-spec/src/hybrid_spec/plugin.py": "f696331ad8678e98dfcf2f1a8817a9e6bed10e9028afcb2f44820cbc219792c2",
+    "experimental/hybrid-spec/src/hybrid_spec/selection/online_verify.py": "651957b23557ab3f791c88fc13e90451a8627a1321b88322220542ea1c8af9ff",
+    "experimental/hybrid-spec/src/hybrid_spec/selection/policy.py": "e4d7ba9efbae2afb0e97afa537d98a15a7052dc75698adadfacb0fac2b81fb60",
+    "experimental/hybrid-spec/tests/test_arctic.py": "36e03947f4948b960f6628572e1890b86d52e489b3082b54173a648a8f7770e7",
+    "experimental/hybrid-spec/tests/test_compact_verify.py": "389da2a3984bbe7a652ba38a3562d3cb47d5e7d8fc7ba3def143d4fb1b7c8845",
+    "experimental/hybrid-spec/tests/test_cuda.py": "5b1d1ac7b0f20fa8d18fda27704329ceb01e9de3250165de125b5261dc0ef9b6",
+    "experimental/hybrid-spec/tests/test_shared_parallel_cuda.py": "336f973417becae0a118a49c03082489c5f6cb045fced50e89241ad2bd773315",
+    "experimental/hybrid-spec/tests/test_tp.py": "98458775ba2088f26a88eb953d8b3ff04457650b36eca890ef13ece13bce1162",
+    "python/sglang/srt/model_executor/runner/decode_cuda_graph_runner.py": "757e26601ca824fc394845f29210c03647c8bcfdfb513e96478b37a799b20730",
+    "experimental/hybrid-spec/src/hybrid_spec/integrations/sglang/compatibility.py": "3f4e49b7886e2cd704f384c461812f45587a9a3dee2d97230e83aa2c466d0450"
+  },
+  "rows": [
+    {
+      "case": "native",
+      "completed": 53,
+      "output_tokens": 7552,
+      "hybrid": null,
+      "split": null,
+      "compact": null,
+      "dynamic": {},
+      "check_ct": 0,
+      "correct_ct": 0
+    },
+    {
+      "case": "fixed",
+      "completed": 53,
+      "output_tokens": 7552,
+      "hybrid": {
+        "retrieval_requests": 760,
+        "neural_requests": 317,
+        "retrieval_correct_drafts": 5785,
+        "neural_correct_drafts": 764,
+        "retrieval_accept_tokens": 6545,
+        "neural_accept_tokens": 1081
+      },
+      "split": {
+        "prefix_ct": 165,
+        "skip_ct": 41,
+        "tail_ct": 124,
+        "decision_wait_ns": 39074969,
+        "request_ct": 1077,
+        "skip_request_ct": 760,
+        "tail_request_ct": 317,
+        "mixed_ct": 84,
+        "tail_batch_histogram": {
+          "0": 41,
+          "1": 51,
+          "2": 29,
+          "3": 15,
+          "4": 12,
+          "5": 5,
+          "6": 3,
+          "7": 6,
+          "8": 0,
+          "9": 1,
+          "10": 1,
+          "11": 1,
+          "12": 0,
+          "13": 0,
+          "14": 0,
+          "15": 0,
+          "16": 0
+        }
+      },
+      "compact": {
+        "verify_ct": 165,
+        "logical_token_ct": 8108,
+        "target_token_ct": 8283,
+        "dense_token_ct": 9693,
+        "graph_token_histogram": {
+          "4": 30,
+          "9": 21,
+          "26": 14,
+          "16": 1,
+          "8": 9,
+          "13": 8,
+          "18": 1,
+          "144": 15,
+          "117": 7,
+          "126": 6,
+          "99": 4,
+          "90": 4,
+          "81": 6,
+          "63": 1,
+          "57": 2,
+          "52": 5,
+          "47": 1,
+          "48": 3,
+          "43": 1,
+          "39": 3,
+          "44": 1,
+          "30": 2,
+          "22": 3,
+          "17": 1,
+          "135": 6,
+          "108": 4,
+          "36": 4,
+          "31": 2
+        }
+      },
+      "dynamic": {},
+      "check_ct": 0,
+      "correct_ct": 0
+    },
+    {
+      "case": "dynamic",
+      "completed": 53,
+      "output_tokens": 7552,
+      "hybrid": {
+        "retrieval_requests": 818,
+        "neural_requests": 333,
+        "retrieval_correct_drafts": 5699,
+        "neural_correct_drafts": 744,
+        "retrieval_accept_tokens": 6517,
+        "neural_accept_tokens": 1077
+      },
+      "split": {
+        "prefix_ct": 167,
+        "skip_ct": 32,
+        "tail_ct": 135,
+        "decision_wait_ns": 39168796,
+        "request_ct": 1151,
+        "skip_request_ct": 818,
+        "tail_request_ct": 333,
+        "mixed_ct": 95,
+        "tail_batch_histogram": {
+          "0": 32,
+          "1": 54,
+          "2": 39,
+          "3": 13,
+          "4": 12,
+          "5": 5,
+          "6": 2,
+          "7": 7,
+          "8": 1,
+          "9": 1,
+          "10": 0,
+          "11": 1,
+          "12": 0,
+          "13": 0,
+          "14": 0,
+          "15": 0,
+          "16": 0
+        }
+      },
+      "compact": {
+        "verify_ct": 167,
+        "logical_token_ct": 8050,
+        "target_token_ct": 8141,
+        "dense_token_ct": 10359,
+        "graph_token_histogram": {
+          "4": 29,
+          "9": 18,
+          "26": 16,
+          "16": 1,
+          "8": 8,
+          "13": 11,
+          "18": 1,
+          "144": 3,
+          "117": 36,
+          "99": 1,
+          "90": 2,
+          "88": 7,
+          "75": 1,
+          "81": 3,
+          "68": 1,
+          "57": 2,
+          "52": 10,
+          "43": 3,
+          "48": 1,
+          "44": 2,
+          "39": 2,
+          "30": 4,
+          "17": 2,
+          "12": 2,
+          "126": 1
+        }
+      },
+      "dynamic": {
+        "verify_ct": 167,
+        "explore_ct": 2,
+        "cost_sample_ct": 161,
+        "costs_ms": {
+          "1:512": {
+            "4": [
+              6.5192834468475,
+              9.684047845404145
+            ],
+            "9": [
+              1.3261598766419254,
+              9.287482029634615
+            ]
+          },
+          "4:512": {
+            "26": [
+              5.95874675574221,
+              9.689272736679396
+            ],
+            "16": [
+              5.283967971801758,
+              18.96246337890625
+            ]
+          },
+          "2:512": {
+            "8": [
+              5.195639256800414,
+              8.261921374858856
+            ],
+            "13": [
+              4.570099266381604,
+              7.517350820412719
+            ],
+            "18": [
+              1.1674879789352417,
+              7.629695892333984
+            ]
+          },
+          "16:512": {
+            "144": [
+              5.893210332393647,
+              17.2529386138916
+            ],
+            "117": [
+              3.983574257692697,
+              10.735962116316644
+            ],
+            "99": [
+              5.504096031188965,
+              10.864543914794922
+            ],
+            "90": [
+              5.548031806945801,
+              12.96895980834961
+            ]
+          },
+          "12:512": {
+            "88": [
+              5.591394420782567,
+              9.90180501085186
+            ],
+            "75": [
+              5.436416149139404,
+              9.575424194335938
+            ],
+            "81": [
+              5.426176071166992,
+              10.097663879394531
+            ],
+            "68": [
+              5.647456169128418,
+              14.030752182006836
+            ]
+          },
+          "8:512": {
+            "57": [
+              5.775872039794922,
+              10.40784640312195
+            ],
+            "52": [
+              5.01487312788733,
+              8.528350933457146
+            ]
+          },
+          "7:512": {
+            "43": [
+              7.300474753379822,
+              8.093173723220826
+            ],
+            "48": [
+              5.402624130249023,
+              7.828479766845703
+            ]
+          },
+          "6:512": {
+            "44": [
+              5.633238458633422,
+              7.901318168640136
+            ],
+            "39": [
+              5.363772773742676,
+              7.7668352127075195
+            ]
+          },
+          "5:512": {
+            "30": [
+              5.407006726264954,
+              8.167857084751128
+            ]
+          },
+          "3:512": {
+            "17": [
+              5.7342945575714115,
+              8.45424656867981
+            ],
+            "12": [
+              5.479417610168458,
+              9.222045135498046
+            ]
+          },
+          "14:512": {
+            "117": [
+              5.819392204284668,
+              11.479040145874023
+            ]
+          },
+          "11:512": {
+            "90": [
+              5.527552127838135,
+              11.152544021606445
+            ]
+          },
+          "9:512": {
+            "81": [
+              5.517151832580566,
+              10.458111763000488
+            ]
+          },
+          "15:512": {
+            "126": [
+              5.5614399909973145,
+              12.266559600830078
+            ]
+          },
+          "13:512": {
+            "117": [
+              5.578591823577881,
+              10.868736267089844
+            ]
+          },
+          "10:512": {
+            "81": [
+              5.832704067230225,
+              11.588607788085938
+            ]
+          }
+        }
+      },
+      "check_ct": 6573,
+      "correct_ct": 6443
+    },
+    {
+      "case": "gate3-neural2",
+      "completed": 53,
+      "output_tokens": 7552,
+      "hybrid": {
+        "retrieval_requests": 777,
+        "neural_requests": 506,
+        "retrieval_correct_drafts": 5530,
+        "neural_correct_drafts": 738,
+        "retrieval_accept_tokens": 6307,
+        "neural_accept_tokens": 1244
+      },
+      "split": {
+        "prefix_ct": 203,
+        "skip_ct": 203,
+        "tail_ct": 0,
+        "decision_wait_ns": 0,
+        "request_ct": 1283,
+        "skip_request_ct": 1283,
+        "tail_request_ct": 0,
+        "mixed_ct": 0,
+        "tail_batch_histogram": {
+          "0": 203,
+          "1": 0,
+          "2": 0,
+          "3": 0,
+          "4": 0,
+          "5": 0,
+          "6": 0,
+          "7": 0,
+          "8": 0,
+          "9": 0,
+          "10": 0,
+          "11": 0,
+          "12": 0,
+          "13": 0,
+          "14": 0,
+          "15": 0,
+          "16": 0
+        }
+      },
+      "compact": {
+        "verify_ct": 203,
+        "logical_token_ct": 7805,
+        "target_token_ct": 7829,
+        "dense_token_ct": 11547,
+        "graph_token_histogram": {
+          "3": 36,
+          "9": 19,
+          "24": 21,
+          "12": 12,
+          "6": 18,
+          "99": 8,
+          "108": 19,
+          "102": 9,
+          "81": 3,
+          "66": 11,
+          "48": 1,
+          "39": 3,
+          "30": 6,
+          "36": 7,
+          "42": 3,
+          "33": 7,
+          "27": 8,
+          "8": 1,
+          "21": 3,
+          "15": 2,
+          "135": 5,
+          "117": 1
+        }
+      },
+      "dynamic": {
+        "verify_ct": 203,
+        "explore_ct": 19,
+        "cost_sample_ct": 197,
+        "costs_ms": {
+          "1:512": {
+            "3": [
+              5.1380865044772674,
+              8.381308240479585
+            ],
+            "9": [
+              4.374158265944852,
+              9.291158422007653
+            ]
+          },
+          "4:512": {
+            "24": [
+              5.301812742361549,
+              9.156833371688524
+            ],
+            "12": [
+              4.633567810058594,
+              11.02444839477539
+            ],
+            "8": [
+              4.986879825592041,
+              8.469504356384277
+            ]
+          },
+          "2:512": {
+            "6": [
+              4.66119072022292,
+              7.514837600654194
+            ],
+            "12": [
+              4.556998437684902,
+              7.41042036653924
+            ]
+          },
+          "16:512": {
+            "99": [
+              8.145072872815135,
+              14.883952909469608
+            ],
+            "108": [
+              5.234219928862535,
+              10.576508649052052
+            ],
+            "102": [
+              5.060566902160645,
+              10.528504886627196
+            ],
+            "81": [
+              5.291056156158447,
+              10.795340633392335
+            ],
+            "135": [
+              5.024514644241335,
+              11.006810351181032
+            ],
+            "117": [
+              5.1466240882873535,
+              13.109248161315918
+            ],
+            "33": [
+              5.073791980743408,
+              9.988096237182617
+            ]
+          },
+          "12:512": {
+            "66": [
+              5.274198759663965,
+              9.303713321131124
+            ],
+            "48": [
+              5.1077117919921875,
+              18.580480575561523
+            ],
+            "102": [
+              5.329536862173082,
+              9.629838945446016
+            ],
+            "24": [
+              5.138432025909424,
+              9.085951805114746
+            ]
+          },
+          "9:512": {
+            "39": [
+              6.82679352760315,
+              11.22570905685425
+            ]
+          },
+          "8:512": {
+            "30": [
+              5.108038520812989,
+              10.224006366729737
+            ],
+            "36": [
+              4.753843212127686,
+              8.085888385772705
+            ],
+            "42": [
+              4.776153502464295,
+              8.304179258346558
+            ]
+          },
+          "7:512": {
+            "33": [
+              5.0017440111875535,
+              7.6212058277416235
+            ],
+            "27": [
+              4.709407806396484,
+              7.365695953369141
+            ]
+          },
+          "6:512": {
+            "30": [
+              4.953662352085114,
+              7.2734883799552925
+            ],
+            "36": [
+              4.749601796674728,
+              7.5401224374771125
+            ]
+          },
+          "5:512": {
+            "27": [
+              4.945844800501347,
+              7.606931347316267
+            ],
+            "39": [
+              4.740096092224121,
+              8.623104095458984
+            ]
+          },
+          "3:512": {
+            "21": [
+              4.918308296203613,
+              7.592636790275574
+            ],
+            "15": [
+              4.74758095741272,
+              8.666921234130859
+            ]
+          },
+          "11:512": {
+            "99": [
+              5.544051265716553,
+              9.494140434265137
+            ],
+            "81": [
+              5.5839362144470215,
+              10.869791984558105
+            ]
+          },
+          "10:512": {
+            "66": [
+              5.301152229309082,
+              11.428863525390625
+            ]
+          },
+          "15:512": {
+            "108": [
+              5.7190399169921875,
+              12.33407974243164
+            ]
+          }
+        }
+      },
+      "check_ct": 6408,
+      "correct_ct": 6268
+    },
+    {
+      "case": "gate8-neural1",
+      "completed": 53,
+      "output_tokens": 7552,
+      "hybrid": {
+        "retrieval_requests": 767,
+        "neural_requests": 965,
+        "retrieval_correct_drafts": 4971,
+        "neural_correct_drafts": 829,
+        "retrieval_accept_tokens": 5738,
+        "neural_accept_tokens": 1794
+      },
+      "split": {
+        "prefix_ct": 298,
+        "skip_ct": 298,
+        "tail_ct": 0,
+        "decision_wait_ns": 0,
+        "request_ct": 1732,
+        "skip_request_ct": 1732,
+        "tail_request_ct": 0,
+        "mixed_ct": 0,
+        "tail_batch_histogram": {
+          "0": 298,
+          "1": 0,
+          "2": 0,
+          "3": 0,
+          "4": 0,
+          "5": 0,
+          "6": 0,
+          "7": 0,
+          "8": 0,
+          "9": 0,
+          "10": 0,
+          "11": 0,
+          "12": 0,
+          "13": 0,
+          "14": 0,
+          "15": 0,
+          "16": 0
+        }
+      },
+      "compact": {
+        "verify_ct": 298,
+        "logical_token_ct": 7677,
+        "target_token_ct": 7692,
+        "dense_token_ct": 15588,
+        "graph_token_histogram": {
+          "2": 74,
+          "9": 14,
+          "22": 20,
+          "8": 7,
+          "4": 37,
+          "11": 6,
+          "88": 23,
+          "61": 5,
+          "54": 21,
+          "24": 13,
+          "31": 1,
+          "32": 4,
+          "23": 8,
+          "30": 20,
+          "28": 2,
+          "33": 8,
+          "26": 3,
+          "17": 2,
+          "13": 8,
+          "6": 2,
+          "102": 8,
+          "65": 3,
+          "72": 1,
+          "68": 3,
+          "27": 4,
+          "47": 1
+        }
+      },
+      "dynamic": {
+        "verify_ct": 298,
+        "explore_ct": 32,
+        "cost_sample_ct": 292,
+        "costs_ms": {
+          "1:512": {
+            "2": [
+              12.729237094640924,
+              7.24149151404573
+            ],
+            "9": [
+              13.007096144533643,
+              10.10180574125853
+            ]
+          },
+          "4:512": {
+            "22": [
+              14.827595881342452,
+              8.585951292416361
+            ],
+            "8": [
+              14.357842824075702,
+              9.497587436434749
+            ]
+          },
+          "2:512": {
+            "4": [
+              13.946359201502192,
+              7.355659708785943
+            ],
+            "11": [
+              13.792553920621874,
+              7.072049775662423
+            ]
+          },
+          "16:512": {
+            "88": [
+              16.282871380668283,
+              10.91342694924745
+            ],
+            "61": [
+              16.006086261558536,
+              10.542212744522097
+            ],
+            "32": [
+              15.335328102111816,
+              15.392767906188965
+            ],
+            "102": [
+              15.81201119770813,
+              10.43736545251217
+            ],
+            "33": [
+              15.591423988342285,
+              9.86524772644043
+            ]
+          },
+          "12:512": {
+            "54": [
+              15.94445457619927,
+              9.41189263340704
+            ],
+            "24": [
+              15.726650919857025,
+              9.413890633296969
+            ],
+            "31": [
+              15.640576362609863,
+              9.220319747924805
+            ],
+            "68": [
+              16.144235382080076,
+              11.75786889076233
+            ]
+          },
+          "9:512": {
+            "32": [
+              16.93235402107239,
+              16.492971630096438
+            ]
+          },
+          "8:512": {
+            "23": [
+              14.798296259463694,
+              8.199724662798308
+            ],
+            "30": [
+              14.71082809238914,
+              7.717910134553116
+            ],
+            "65": [
+              14.657535552978516,
+              7.68614387512207
+            ]
+          },
+          "7:512": {
+            "28": [
+              15.099801445007326,
+              8.794829177856446
+            ]
+          },
+          "6:512": {
+            "33": [
+              14.727475093553545,
+              7.847264717297554
+            ],
+            "26": [
+              14.466386909484864,
+              7.657888555526734
+            ],
+            "47": [
+              14.929920196533203,
+              7.783423900604248
+            ]
+          },
+          "5:512": {
+            "24": [
+              14.77532438690758,
+              7.663818547971249
+            ],
+            "17": [
+              14.470633602142335,
+              7.668016004562379
+            ]
+          },
+          "3:512": {
+            "13": [
+              14.354722352857115,
+              7.624248278665449
+            ],
+            "6": [
+              14.241894054412843,
+              8.521414089202882
+            ],
+            "27": [
+              14.219875578880313,
+              7.526183649539949
+            ]
+          },
+          "15:512": {
+            "65": [
+              16.549989891052245,
+              11.29605131149292
+            ]
+          },
+          "14:512": {
+            "72": [
+              16.246912002563477,
+              11.253664016723633
+            ]
+          }
+        }
+      },
+      "check_ct": 5938,
+      "correct_ct": 5800
+    }
+  ],
+  "output_token_comparisons": [
+    {
+      "case": "fixed",
+      "baseline": "native",
+      "compared": 53,
+      "identical": 52,
+      "differences": [
+        {
+          "c": 4,
+          "wave": 0,
+          "row": 1,
+          "first_difference": 2
+        }
+      ]
+    },
+    {
+      "case": "dynamic",
+      "baseline": "native",
+      "compared": 53,
+      "identical": 52,
+      "differences": [
+        {
+          "c": 4,
+          "wave": 0,
+          "row": 1,
+          "first_difference": 2
+        }
+      ]
+    },
+    {
+      "case": "dynamic",
+      "baseline": "fixed",
+      "compared": 53,
+      "identical": 53,
+      "differences": []
+    },
+    {
+      "case": "gate3-neural2",
+      "baseline": "native",
+      "compared": 53,
+      "identical": 52,
+      "differences": [
+        {
+          "c": 4,
+          "wave": 0,
+          "row": 1,
+          "first_difference": 2
+        }
+      ]
+    },
+    {
+      "case": "gate8-neural1",
+      "baseline": "native",
+      "compared": 53,
+      "identical": 52,
+      "differences": [
+        {
+          "c": 4,
+          "wave": 0,
+          "row": 1,
+          "first_difference": 2
+        }
+      ]
+    }
+  ],
+  "scope": [
+    "Real Qwen3-0.6B weights for both target and standalone draft, FP16, TP1, Triton attention; not DSV4/MTP or EAGLE3 end-to-end.",
+    "Five cases, concurrency 1/4/16; three c16 waves with per-request output lengths 96/128/160/192.",
+    "Native and fixed compact controls, dynamic default configuration, gate3/neural2 and gate8/neural1; the two boundary cases lower cold/explore intervals to8.",
+    "Generation requested output logprobs for token-id comparison; correctness smoke, no serving-performance claim.",
+    "Qwen3.6 target and MTP model files removed on explicit user request; old service restoration cancelled.",
+    "Failed initial startup exposed missing inherited draft graph mode; corrected in final source and covered by four CPU capture-loop regressions."
+  ]
+}

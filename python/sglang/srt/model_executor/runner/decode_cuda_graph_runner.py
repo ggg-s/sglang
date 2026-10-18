@@ -226,6 +226,10 @@ class DecodeCudaGraphRunner(BaseCudaGraphRunner):
 
     COMPACT_VERIFY_API_VERSION = 1
 
+    # Specialized draft runners reuse capture() without this class's __init__.
+    # Their shapes remain request counts; only target initialization opts in.
+    ragged_verify_mode = False
+
     dllm_input_preparation = None
     dllm_attention = None
 
