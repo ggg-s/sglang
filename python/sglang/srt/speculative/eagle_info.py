@@ -1,6 +1,6 @@
 import logging
 from dataclasses import dataclass, field
-from typing import Callable, List, Optional
+from typing import TYPE_CHECKING, Callable, List, Optional
 
 import torch
 
@@ -9,6 +9,9 @@ from sglang.srt.mem_cache.kv_loc_plan import IdSpaceKind, KVLocPlan
 from sglang.srt.model_executor.forward_batch_info import CaptureHiddenMode
 from sglang.srt.runtime_context import get_spec
 from sglang.srt.speculative.spec_info import SpecInput, SpecInputType
+
+if TYPE_CHECKING:
+    from sglang.srt.speculative.ragged_verify import RaggedVerifyLayout
 
 logger = logging.getLogger(__name__)
 
@@ -38,6 +41,10 @@ class EagleVerifyInput(SpecInput):
     # The iteration's plan when the draft planned the verify window
     # (`prepared_out_cache_loc`); verify and draft extend take it.
     kv_loc_plan: Optional[KVLocPlan] = None
+
+    # Optional chain cutoff and physically packed target verify layout.
+    verify_lens: Optional[torch.Tensor] = None
+    compact_verify_layout: Optional["RaggedVerifyLayout"] = None
 
     # Shape info for padding
     num_tokens_per_req: int = -1  # -1 auto-fills from draft_token_num.
@@ -100,6 +107,18 @@ class EagleVerifyInput(SpecInput):
         """CSR verify args. ``paged_kernel_lens`` excludes the verify tokens and
         is widened here; the translator packs the read ids straight into
         ``kv_indices``."""
+        if self.ragged_verify_layout is not None:
+            from sglang.srt.speculative.dflash_info import DFlashVerifyInput
+
+            return DFlashVerifyInput.generate_attn_arg_prefill(
+                self,
+                req_pool_indices=req_pool_indices,
+                paged_kernel_lens=paged_kernel_lens,
+                paged_kernel_lens_sum=paged_kernel_lens_sum,
+                translator=translator,
+                plan=plan,
+                kind=kind,
+            )
         device = req_pool_indices.device
         batch_size = req_pool_indices.numel()
         qo_indptr = torch.arange(

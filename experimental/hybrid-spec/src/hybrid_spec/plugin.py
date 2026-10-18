@@ -31,6 +31,22 @@ def register():
     ):
         HookRegistry.register(path, _attach, HookType.AFTER)
     HookRegistry.register(
+        "sglang.srt.speculative.eagle_worker_v2.EagleDraftWorker.draft",
+        _begin_draft,
+        HookType.BEFORE,
+    )
+    HookRegistry.register(
+        "sglang.srt.speculative.eagle_worker_v2.EagleDraftWorker.draft",
+        _configure_verify,
+        HookType.AFTER,
+    )
+    HookRegistry.register(
+        "sglang.srt.model_executor.runner.decode_cuda_graph_runner."
+        "DecodeCudaGraphRunner._build_ragged_verify_token_buckets",
+        _verify_token_buckets,
+        HookType.AFTER,
+    )
+    HookRegistry.register(
         "sglang.srt.speculative.base_spec_worker.BaseSpecWorker.note_request_finished",
         _finished,
         HookType.AFTER,
@@ -77,7 +93,14 @@ def _validate(server_args):
 
     from hybrid_spec.integrations.sglang.compatibility import validate_config
 
-    validate_config(_config(), resolved_view(server_args))
+    config = _config()
+    validate_config(config, resolved_view(server_args))
+    if config.verify_mode == "compact":
+        os.environ["SGLANG_RAGGED_VERIFY_MODE"] = "compact"
+    elif os.environ.get("SGLANG_RAGGED_VERIFY_MODE", "static") == "compact":
+        raise ValueError(
+            "HYBRID_SPEC_CONFIG must select verify_mode=compact with ragged graphs"
+        )
 
 
 def _validate_factory(algorithm, server_args):
@@ -121,8 +144,17 @@ def _attach(result, worker, *args, **kwargs):
         raise RuntimeError(
             "hybrid-spec requires the SGLang draft extension API v2 patch"
         )
-    validate_model(worker)
     config = _config()
+    if config.verify_mode == "compact":
+        from sglang.srt.model_executor.runner.decode_cuda_graph_runner import (
+            DecodeCudaGraphRunner,
+        )
+
+        if getattr(DecodeCudaGraphRunner, "COMPACT_VERIFY_API_VERSION", None) != 1:
+            raise RuntimeError(
+                "compact verify requires the SGLang compact verify API v1 patch"
+            )
+    validate_model(worker, config)
     if config.draft_graph_mode != "full" and (
         getattr(worker, "DRAFT_SPLIT_GRAPH_API_VERSION", None) != 5
         or getattr(EAGLEDraftCudaGraphRunner, "DRAFT_SPLIT_GRAPH_API_VERSION", None)
@@ -186,6 +218,16 @@ def _reset(result, worker, *args, **kwargs):
 def _verify(result, worker, *args, **kwargs):
     extension = worker.draft_worker.draft_extension
     if extension is not None:
+        from hybrid_spec.integrations.sglang.compact_verify import (
+            finalize_verify_counters,
+        )
+
+        if getattr(extension, "pending_verify_tokens", None) is not None:
+            finalize_verify_counters(
+                extension,
+                result,
+                worker.target_worker.model_runner.decode_cuda_graph_runner,
+            )
         if on_device_verify := getattr(extension, "on_device_verify", None):
             on_device_verify(result, args[0] if args else kwargs["batch"])
         else:
@@ -213,7 +255,38 @@ def _diagnostics(result, controller, *args, **kwargs):
     if extension is not None:
         # Explicit diagnostic readback only; never synchronize each decode step.
         result.internal_state["hybrid_spec"] = extension.metrics.snapshot()
+        if hasattr(extension, "compact_verify_counters"):
+            result.internal_state["hybrid_spec_compact_verify"] = dict(
+                extension.compact_verify_counters
+            )
         if hasattr(extension, "split_graph_counters"):
             result.internal_state["hybrid_spec_split_graph"] = dict(
                 extension.split_graph_counters
             )
+
+
+def _configure_verify(result, worker, batch, **kwargs):
+    if worker.draft_extension is not None:
+        from hybrid_spec.integrations.sglang.compact_verify import configure_verify
+
+        configure_verify(
+            result[0] if isinstance(result, tuple) else result, worker, batch
+        )
+
+
+def _verify_token_buckets(result, runner):
+    config = _config()
+    if config.verify_mode == "compact" and not runner.model_runner.is_draft_worker:
+        from hybrid_spec.integrations.sglang.compact_verify import token_buckets
+
+        from sglang.srt.utils import get_cuda_graph_batch_size_alignment
+
+        alignment = get_cuda_graph_batch_size_alignment(
+            gathered_buffer_required=runner.require_gathered_buffer,
+        )
+        return token_buckets(config, result, runner.max_bs, alignment)
+
+
+def _begin_draft(worker, batch, **kwargs):
+    if worker.draft_extension is not None:
+        worker.draft_extension.compact_num_neural = None

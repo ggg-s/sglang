@@ -633,14 +633,15 @@ def run_eagle_verify(
         # Some values such as custom_mask and position depend on the output of draft,
         # so the previous plan step used the wrong values. Here, we need to run the related
         # computation again to update them to the correct values.
-        target_worker.model_runner.attn_backend.update_verify_buffers_to_fill_after_draft(
-            verify_input,
-            (
-                target_worker.model_runner.decode_cuda_graph_runner.bs
-                if can_run_cuda_graph
-                else None
-            ),
-        )
+        if verify_input.compact_verify_layout is None:
+            target_worker.model_runner.attn_backend.update_verify_buffers_to_fill_after_draft(
+                verify_input,
+                (
+                    target_worker.model_runner.decode_cuda_graph_runner.bs
+                    if can_run_cuda_graph
+                    else None
+                ),
+            )
 
     # Must stay ahead of the target verify launch below.
     grammar_tree = (
@@ -676,6 +677,10 @@ def run_eagle_verify(
         pp_proxy_tensors=pp_proxy_tensors,
     )
     logits_output = forward_batch_output.logits_output
+    if verify_input.compact_verify_layout is not None:
+        from sglang.srt.speculative.eagle_compact_verify import scatter_verify_output
+
+        scatter_verify_output(verify_input, logits_output)
 
     # Generate vocab mask for constrained decoding
     grammar_mask = None

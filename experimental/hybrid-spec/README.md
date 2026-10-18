@@ -72,6 +72,63 @@ prompt 仅在请求内可见；完成时按最终 CPU 输出
 verify 或原生 score 驱动混合策略。Arctic 不创建 GPU SA 池，需安装官方原生 suffix
 扩展。安装、参数、调度限制和验证范围见 [Arctic 接入](validation/arctic-suffix.md)。
 
+## SA / neural 独立长度与 compact verify
+
+`num_drafts` 设置 SA 长度及原生窗口上限；`num_neural_drafts` 设置回退行的长度，
+默认与 SA 相同，范围为 1…`num_drafts`。两者不同时需 `draft_graph_mode=split`，
+并选 `verify_mode=padded` 或 `compact`。服务参数仍按最大窗口设置：
+SA=8 / neural=3 对应 `--speculative-num-steps 8 --speculative-num-draft-tokens 9`。
+
+- `static`：原来的等长路径，默认值。
+- `padded`：SA / neural 按各自长度截断接受链，target 仍计算完整窗口，作为归因对照。
+- `compact`：相同候选策略，将有效 token、位置和 KV 写入列打包后运行 target；
+  logits / hidden states 映射回原槽位，再交给原生接受、KV 提交和 draft-extend。
+
+`num_neural_gate_tokens` 可独立设置为 0…SA 长度。gate=3、neural=2 时，
+先探测三个 neural token 来决定来源；若回退，只验证两个 draft 加 anchor，
+第三个 gate token 不进入接受链。实际 neural 探测深度至少为 gate，所以更大的
+gate 仍有计算成本。没有剩余 neural 尾段时不捕获/回放该尾段图；此时 `skip_request_ct` 统计未执行
+尾段的行，不能直接当作 SA 选中行数。
+
+示例配置：`configs/device-dsv4-mtp-compact-verify.json`（SA=8 / neural=3 / gate=1），
+其配对对照为 `configs/device-dsv4-mtp-padded-verify.json`。沿用已验证的 V4 命令，设置：
+
+```bash
+export SGLANG_PLUGINS=hybrid_spec
+export HYBRID_SPEC_CONFIG="$PWD/experimental/hybrid-spec/configs/device-dsv4-mtp-compact-verify.json"
+# --speculative-algorithm EAGLE --speculative-eagle-topk 1
+# --speculative-num-steps 8 --speculative-num-draft-tokens 9
+# --speculative-draft-attention-backend dsv4
+# --max-running-requests 4 --cuda-graph-max-bs-decode 4
+```
+
+插件在启动校验时启用原生 `SGLANG_RAGGED_VERIFY_MODE=compact`。每个 token 档位
+只捕获一次，回放前刷新固定地址的长度/偏移等 metadata；不枚举来源 mask。
+默认补齐 c≤8 的所有 SA / neural 混合 token 总数，并保留完整窗口和纯 neural 档位。
+例如 c=1 有 4/9，c=2 有 8/13/18；c=4 的 2 SA + 2 neural 为 26。
+`verify_token_buckets` 可显式提供正整数列表控制档位数量；完整窗口档位始终保留，
+同时遵守原生 TP/SP 对齐：例如需要 8 对齐时，4/9/13 会映射到 8/16/16，
+实际图行数可能超过有效 token 数。完整窗口的对齐档位也始终保留。
+档位增加会增加启动捕图时间及显存占用。
+Graph 最大 batch 建议与本轮最大并发一致，避免为用不到的大批次捕图。
+
+常见 split 路径复用其已有 neural 行数，不额外读回来源 mask；没有尾段计数可复用
+时（例如 gate 大于 neural 长度）读回一个总 token 数来选档。各 TP rank 依赖已有
+候选/mask 共识选择相同档位。诊断 `hybrid_spec_compact_verify` 区分有效 token 数
+`logical_token_ct`、实际 target 图/forward 行数 `target_token_ct`、未压缩窗口
+`dense_token_ct`，以及 `graph_token_histogram`；实际交付 token 数仍看原生接受统计。
+
+compact 目前要求非 Mamba、非 mRoPE、支持 ragged verify 的 target attention，
+适用于已接线的 MTP / EAGLE3 / STANDALONE，及 GPU SA / Arctic 两种候选来源。
+Qwen3.5/3.6 GDN MTP 暂不开放此新模式，原等长路径保留。DSV4 的原生 ragged 路径
+不支持 CP 或实验性 online c128 MTP；不要开启 `SGLANG_EXPERIMENTAL_ONLINE_C128_MTP`。
+其余单机 TP、greedy、topk=1、无 LoRA/grammar/mixed chunk 限制继续生效。
+
+内网请固定同一来源策略比较：原 SA8/neural8、SA8/neural3 padded、SA8/neural3 compact，
+覆盖 c=1/4，gate=1/3，并用交替顺序多次重复。4060 组件验证范围和证据见
+[compact verify 验证记录](validation/compact-verify-4060/README.md)；DSV4 TP8 模型质量、
+压缩 KV 运行状态、真实 scheduler 以及吞吐仍须内网验收。
+
 ## 实现与边界
 
 DeepSeek V4 原生 MTP 现在有独立接入：只对 `DeepseekV4ForCausalLM` target +

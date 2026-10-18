@@ -582,6 +582,8 @@ class TritonAttnBackend(AttentionBackend):
             return self.target_verify_num_tokens_per_req
         return spec_info.num_tokens_per_req
 
+    supports_ragged_verify_graph = True
+
     def _update_target_verify_buffers(
         self,
         plan: KVLocPlan,
@@ -600,6 +602,10 @@ class TritonAttnBackend(AttentionBackend):
             dtype=torch.int32,
             device=self.device,
         )
+        layout = getattr(spec_info, "ragged_verify_layout", None)
+        if layout is not None:
+            layout = layout.padded_to_bucket(padded_bs=bs, cap=num_tokens_per_req)
+            qo_indptr.copy_(layout.qo_indptr_device)
         kv_indptr = self._fill_kv_indptr_and_indices(
             plan, bs, seq_lens, req_pool_indices, self.cuda_graph_kv_indices
         )
@@ -955,6 +961,9 @@ class TritonAttnBackend(AttentionBackend):
                 dtype=torch.int32,
                 device=self.device,
             )
+            layout = getattr(spec_info, "ragged_verify_layout", None)
+            if layout is not None:
+                qo_indptr = layout.qo_indptr_device
             # gpu_only: seq_lens_sum may be None; over-allocate is safe (ragged write).
             seq_lens_sum = forward_batch.seq_lens_sum
             if seq_lens_sum is None:

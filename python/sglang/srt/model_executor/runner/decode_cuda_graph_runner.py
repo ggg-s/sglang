@@ -224,6 +224,8 @@ class DecodeCudaGraphRunner(BaseCudaGraphRunner):
     pluggable self.backend that handles the actual capture/replay.
     """
 
+    COMPACT_VERIFY_API_VERSION = 1
+
     dllm_input_preparation = None
     dllm_attention = None
 
@@ -494,10 +496,12 @@ class DecodeCudaGraphRunner(BaseCudaGraphRunner):
         # host every replay), and capturing one freezes the capture-time
         # plan — drafts go stale and accept length collapses to ~1.
         enable_metadata_glue = envs.SGLANG_ENABLE_METADATA_GLUE_GRAPH.get()
-        if enable_metadata_glue and model_runner.spec_algorithm.is_dflash_family():
+        if enable_metadata_glue and (
+            model_runner.spec_algorithm.is_dflash_family() or self.ragged_verify_mode
+        ):
             logger.warning(
                 "SGLANG_ENABLE_METADATA_GLUE_GRAPH is incompatible with "
-                "DFlash-family speculative decoding (host-fed fast verify "
+                "DFlash-family or compact speculative decoding (host-fed verify "
                 "plans must re-run on the host every replay); disabling the "
                 "metadata glue graph."
             )
@@ -1187,9 +1191,19 @@ class DecodeCudaGraphRunner(BaseCudaGraphRunner):
         )
         # Reverse so cuda graphs share memory better.
         capture_range = (
-            tqdm.tqdm(list(reversed(self.capture_bs)))
+            tqdm.tqdm(
+                list(
+                    reversed(
+                        self.capture_num_tokens
+                        if self.ragged_verify_mode
+                        else self.capture_bs
+                    )
+                )
+            )
             if get_parallel().tp_rank == 0
-            else reversed(self.capture_bs)
+            else reversed(
+                self.capture_num_tokens if self.ragged_verify_mode else self.capture_bs
+            )
         )
         lora_variants = (
             [("lora", True), ("nolora", False)]
@@ -1218,10 +1232,18 @@ class DecodeCudaGraphRunner(BaseCudaGraphRunner):
                     self._set_profile_trace_tag(
                         bs, stream_idx, variant_label, attention_variant
                     )
+                    compile_bs = (
+                        bs // self.captured_req_width if self.ragged_verify_mode else bs
+                    )
+                    compile_size_supported = (
+                        not self.ragged_verify_mode or bs % self.captured_req_width == 0
+                    )
                     with torch_compile_decoration.patch_model(
                         self.model_runner.model,
-                        bs in self.compile_bs,
-                        num_tokens=bs * self.captured_req_width,
+                        compile_size_supported and compile_bs in self.compile_bs,
+                        num_tokens=bs
+                        if self.ragged_verify_mode
+                        else bs * self.captured_req_width,
                         tp_group=get_parallel().tp_group,
                     ) as forward:
                         self.capture_one_shape(
@@ -1241,7 +1263,7 @@ class DecodeCudaGraphRunner(BaseCudaGraphRunner):
         variant_label: Optional[str] = None,
         attention_variant: Optional[str] = None,
     ):
-        num_tokens = size * self.captured_req_width
+        num_tokens = size if self.ragged_verify_mode else size * self.captured_req_width
         bs = self._ragged_capture_slots(num_tokens) if self.ragged_verify_mode else size
 
         # Sanity-check: --debug-cuda-graph requires breakable backend.
@@ -1709,6 +1731,11 @@ class DecodeCudaGraphRunner(BaseCudaGraphRunner):
                     seq_lens_sum=None,
                     seq_lens_cpu=None,
                 )
+                spec_info.ragged_verify_layout = self._capture_ragged_verify_layout(
+                    num_tokens
+                )
+                if self.ragged_verify_mode:
+                    spec_info.custom_mask = None
                 # MTP models (e.g. deepseek_nextn) read spec_info.hidden_states
                 spec_info.hidden_states = torch.zeros(
                     (num_tokens, self.model_runner.model_config.hidden_size),

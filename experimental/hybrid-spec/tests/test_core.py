@@ -1269,11 +1269,15 @@ def test_compact_dispatch_uses_raw_count_before_runner_restores_padding(monkeypa
     backend.records = {4: compact_graph.CompactCapture(None, None, None, None, ())}
     backend.mode = "split"
     backend.counters = {}
-    backend.runner = SimpleNamespace(raw_bs=3)
+    extension = SimpleNamespace(compact_num_neural=99)
+    backend.runner = SimpleNamespace(
+        raw_bs=3, eagle_worker=SimpleNamespace(draft_extension=extension)
+    )
     monkeypatch.setattr(
         compact_graph, "replay_compact", lambda record, counters, raw_bs: raw_bs
     )
     assert backend.replay(4, SimpleNamespace(batch_size=4)) == 3
+    assert extension.compact_num_neural is None
 
 
 @pytest.mark.parametrize("batch_size", [1, 8, 32])

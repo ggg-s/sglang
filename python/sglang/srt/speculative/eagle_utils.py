@@ -528,6 +528,10 @@ def eagle_prepare_for_verify(
 ):
     # Imports must stay lazy (import-cycle safety) but only need to resolve
     # once, not on every decode cycle of this hot path.
+    if verify_input.compact_verify_layout is not None:
+        from sglang.srt.speculative.eagle_compact_verify import prepare_compact_verify
+
+        return prepare_compact_verify(verify_input, batch, target_worker)
     global _PREPARE_FOR_VERIFY_DEPS
     if _PREPARE_FOR_VERIFY_DEPS is None:
         from sglang.kernels.ops.speculative.cache_locs import (

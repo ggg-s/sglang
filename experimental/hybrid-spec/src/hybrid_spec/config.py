@@ -24,6 +24,9 @@ class HybridConfig:
     arctic_max_spec_factor: float = 1.0
     arctic_max_spec_offset: float = 0.0
     arctic_min_token_prob: float = 0.1
+    num_neural_drafts: int | None = None
+    verify_mode: str = "static"
+    verify_token_buckets: tuple[int, ...] = ()
 
     def __post_init__(self):
         for name in (
@@ -50,6 +53,23 @@ class HybridConfig:
             raise ValueError("num_neural_gate_tokens must be between 0 and num_drafts")
         if self.draft_graph_mode not in ("full", "split", "split_no_skip"):
             raise ValueError("draft_graph_mode must be full, split or split_no_skip")
+        if self.verify_mode not in ("static", "padded", "compact"):
+            raise ValueError("verify_mode must be static, padded or compact")
+        neural = self.neural_drafts
+        if type(neural) is not int or not 1 <= neural <= self.num_drafts:
+            raise ValueError("num_neural_drafts must be between 1 and num_drafts")
+        if neural != self.num_drafts and (
+            self.verify_mode == "static" or self.draft_graph_mode != "split"
+        ):
+            raise ValueError(
+                "different draft lengths require split and padded/compact verify"
+            )
+        if not isinstance(self.verify_token_buckets, (tuple, list)) or any(
+            type(n) is not int or n < 1 for n in self.verify_token_buckets
+        ):
+            raise ValueError("verify_token_buckets must contain positive integers")
+        if self.verify_token_buckets and self.verify_mode != "compact":
+            raise ValueError("verify_token_buckets requires compact verify")
         if self.backend == "arctic" and self.history_mode != "cpu":
             raise ValueError("Arctic suffix requires history_mode=cpu")
         if (
@@ -95,6 +115,14 @@ class HybridConfig:
             raise ValueError("arctic_min_token_prob must be between 0 and 1")
         if self.backend == "arctic" and self.num_sa_slots > 0x7FFFFFFF:
             raise ValueError("Arctic request capacity must fit int32")
+
+    @property
+    def neural_drafts(self):
+        return (
+            self.num_drafts
+            if self.num_neural_drafts is None
+            else self.num_neural_drafts
+        )
 
     @property
     def num_sa_slots(self):

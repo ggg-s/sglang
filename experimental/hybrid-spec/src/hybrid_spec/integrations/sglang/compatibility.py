@@ -40,6 +40,14 @@ def validate_config(config, cfg):
             errors.append(
                 "split draft graphs require max_running_requests within max_requests"
             )
+    if config.verify_mode == "compact":
+        for name in (
+            "enable_two_batch_overlap",
+            "disable_cuda_graph_padding",
+            "enable_memory_saver",
+        ):
+            if getattr(cfg, name, False):
+                errors.append(f"compact verify requires {name}=False")
     if (
         config.history_mode == "cpu"
         and config.backend != "arctic"
@@ -69,11 +77,23 @@ def validate_config(config, cfg):
         raise ValueError("hybrid-spec unsupported configuration: " + "; ".join(errors))
 
 
-def validate_model(worker):
+def validate_model(worker, config=None):
     target = worker.target_worker.model_runner.model_config
     draft = worker.draft_runner.model_config
     target_arch = getattr(target.hf_config, "architectures", [])
     draft_arch = getattr(draft.hf_config, "architectures", [])
+    if config is not None and config.verify_mode == "compact":
+        from sglang.srt.configs.hybrid_arch import mambaish_config
+
+        if target.model_is_mrope or mambaish_config(target) is not None:
+            raise ValueError(
+                "compact verify currently requires non-Mamba, non-mRoPE targets"
+            )
+        backend = worker.target_worker.model_runner.attn_backend
+        if not getattr(backend, "supports_ragged_verify_graph", False):
+            raise ValueError(
+                "compact verify requires a ragged-capable target attention backend"
+            )
     dsv4_mtp = target_arch == ["DeepseekV4ForCausalLM"] and draft_arch == [
         "DeepseekV4ForCausalLMNextN"
     ]

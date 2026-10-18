@@ -36,6 +36,7 @@ class CompactCapture:
     rows: torch.Tensor | None = None
     num_neural: torch.Tensor | None = None
     no_skip: bool = False
+    runtime_num_neural: int | None = None
 
 
 def compact_neural_rows(mask, rows, count, raw_bs, no_skip):
@@ -61,6 +62,12 @@ def capture_compact(runner, batch, forward_fn, stream, post_warmup_hook, mode="s
     state = None
     worker = runner.eagle_worker
     prefix_width = max(1, view.num_neural_gate_tokens)
+    neural_steps = getattr(getattr(worker, "draft_extension", None), "config", None)
+    neural_steps = (
+        neural_steps.neural_drafts
+        if neural_steps is not None
+        else runner.speculative_num_steps
+    )
 
     def prefix_ready(fb, tokens, hidden, cache, drafts):
         nonlocal state
@@ -95,7 +102,7 @@ def capture_compact(runner, batch, forward_fn, stream, post_warmup_hook, mode="s
     # tensors. Tail warmup must consume a real prefix, never uninitialized IDs.
     prefix.replay()
     torch.cuda.synchronize()
-    if prefix_width < runner.speculative_num_steps:
+    if prefix_width < neural_steps:
         for size in range(1, batch.batch_size + 1):
             record.tails[size] = _capture_tail(runner, record, size, stream)
     return record
@@ -122,6 +129,10 @@ def _capture_tail(runner, record, size, stream):
     dsv4 = _is_dsv4(runner)
     tokens, hidden, cache, drafts = record.state
     steps = runner.speculative_num_steps
+    config = getattr(
+        getattr(runner.eagle_worker, "draft_extension", None), "config", None
+    )
+    neural_steps = config.neural_drafts if config is not None else steps
     start_step = record.prefix_width - 1
     rows = record.rows[:size]
     fb = copy.copy(original)
@@ -187,6 +198,7 @@ def _capture_tail(runner, record, size, stream):
             compact_cache,
             flat_cache,
             start_step=start_step,
+            stop_step=neural_steps - 1,
             in_capture=True,
         )
     else:
@@ -209,13 +221,14 @@ def _capture_tail(runner, record, size, stream):
                 compact_cache,
                 flat_cache,
                 start_step=start_step,
+                stop_step=neural_steps - 1,
                 in_capture=False,
             )
         else:
             attention.init_forward_metadata_out_graph(fb, in_capture=False)
             attention.init_forward_metadata_in_graph(fb)
         fb.positions.add_(start_step)
-        for i in range(start_step, steps - 1):
+        for i in range(start_step, neural_steps - 1):
             fb.out_cache_loc = compact_cache[i]
             if runner.model_runner.model_config.hf_config.architectures == [
                 "Qwen3MoeForCausalLMMTP"
@@ -272,13 +285,17 @@ def _is_dsv4(runner):
     )
 
 
-def _plan_dsv4_metadata(attention, batch, cache, flat_cache, *, start_step, in_capture):
+def _plan_dsv4_metadata(
+    attention, batch, cache, flat_cache, *, start_step, in_capture, stop_step=None
+):
     # Keep native step ids: earlier steps ran in the prefix. Each child
     # owns its compact metadata and gets this request's actual write target.
     # Unlike native full-batch replay, do not copy child zero's raw metadata to
     # every step: raw_out_loc is also a per-step KV address.
     try:
-        for step in range(start_step, cache.shape[0] - 1):
+        for step in range(
+            start_step, cache.shape[0] - 1 if stop_step is None else stop_step
+        ):
             child = attention.attn_backends[step]
             batch.out_cache_loc = cache[step]
             child.init_forward_metadata_out_graph(batch, in_capture=in_capture)
@@ -308,6 +325,7 @@ def replay_compact(record, counters, raw_bs):
         with torch.profiler.record_function("hybrid_prefix_decision"):
             size = int(record.num_neural.item())
         counters["decision_wait_ns"] += time.perf_counter_ns() - begin
+    record.runtime_num_neural = size if record.tails else None
     counters["prefix_ct"] += 1
     counters["request_ct"] += raw_bs
     counters["skip_request_ct"] += raw_bs - size

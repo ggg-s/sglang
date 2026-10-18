@@ -90,9 +90,12 @@ class SplitDraftGraphBackend:
     def replay(self, shape_key, static_forward_batch, **kwargs):
         from .compact_graph import replay_compact
 
-        return replay_compact(
-            self.records[shape_key], self.counters, self.runner.raw_bs
+        record = self.records[shape_key]
+        output = replay_compact(record, self.counters, self.runner.raw_bs)
+        self.runner.eagle_worker.draft_extension.compact_num_neural = (
+            record.runtime_num_neural
         )
+        return output
 
     def cleanup(self):
         for record in self.records.values():

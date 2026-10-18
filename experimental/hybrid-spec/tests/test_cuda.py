@@ -448,7 +448,6 @@ def native_triton_metadata_methods(monkeypatch):
     return {name: ns[name] for name in names}
 
 
-@pytest.mark.parametrize("mode", ["split", "split_no_skip"])
 @pytest.mark.parametrize(
     "kind",
     [
@@ -464,9 +463,9 @@ def native_triton_metadata_methods(monkeypatch):
     ],
 )
 @pytest.mark.parametrize(
-    "steps,gate,batch_size",
+    "steps,gate,batch_size,neural,mode",
     [
-        (k, g, b)
+        (k, g, b, None, mode)
         for k, g in (
             (1, 0),
             (1, 1),
@@ -481,11 +480,18 @@ def native_triton_metadata_methods(monkeypatch):
             (8, 8),
         )
         for b in (1, 8)
+        for mode in ("split", "split_no_skip")
     ]
-    + [(8, 3, 16)],
+    + [(8, 3, 16, None, mode) for mode in ("split", "split_no_skip")]
+    + [
+        (8, 3, 8, 2, "split"),
+        (8, 1, 8, 3, "split"),
+        (8, 8, 8, 1, "split"),
+        (8, 3, 1, 2, "split"),
+    ],
 )
 def test_compact_tail_graph_reorders_rows_without_computing_sa_requests(
-    monkeypatch, mode, kind, steps, gate, batch_size
+    monkeypatch, mode, kind, steps, gate, batch_size, neural
 ):
     """Run the actual worker body, topk, compaction and CUDA graph scheduling.
 
@@ -598,7 +604,7 @@ def test_compact_tail_graph_reorders_rows_without_computing_sa_requests(
     device = "cuda"
     width = max(1, gate)
     prefix_steps = width - 1
-    tail_steps = steps - width
+    tail_steps = max(0, (neural or steps) - width)
     standalone = kind == "standalone"
     eagle3 = kind.startswith("eagle3")
     hot_tokens = (
@@ -651,6 +657,8 @@ def test_compact_tail_graph_reorders_rows_without_computing_sa_requests(
         history_mode="device",
         draft_graph_mode=mode,
         num_neural_gate_tokens=gate,
+        num_neural_drafts=neural,
+        verify_mode="padded" if neural is not None else "static",
     )
 
     def query(slots, generations, seq_lens, tokens, mask):
@@ -809,7 +817,7 @@ def test_compact_tail_graph_reorders_rows_without_computing_sa_requests(
         hot_token_id=hot_tokens,
         seed_dsa_topk_from_draft_extend=False,
         index_share_for_mtp_iteration=False,
-        draft_extension=extension if arctic else NS(),
+        draft_extension=extension if arctic else NS(config=config),
         topk=1,
         draft_attn_backend=attention,
         draft_runner=model,
@@ -873,7 +881,12 @@ def test_compact_tail_graph_reorders_rows_without_computing_sa_requests(
         if arctic
         else DeviceOverride(
             NS(
-                config=replace(config, draft_graph_mode="full"),
+                config=replace(
+                    config,
+                    draft_graph_mode="full",
+                    num_neural_drafts=None,
+                    verify_mode="static",
+                ),
                 device=torch.device(device),
                 consume_and_query=query,
             ),
@@ -993,7 +1006,9 @@ def test_compact_tail_graph_reorders_rows_without_computing_sa_requests(
             work.zero_()
             runner.raw_bs = raw_bs
             output = backend.replay(batch_size, fb)[2]
-            assert output[:raw_bs].tolist() == expected[:raw_bs]
+            for row in range(raw_bs):
+                limit = steps if hit[row] else (neural or steps)
+                assert output[row, :limit].tolist() == expected[row][:limit]
             counts = work[reqs].tolist()
             assert counts == [
                 prefix_steps
@@ -1015,7 +1030,9 @@ def test_compact_tail_graph_reorders_rows_without_computing_sa_requests(
             fb.spec_info.draft_override = full_view
             try:
                 full_output = prefix()[2]
-                assert torch.equal(output[:raw_bs], full_output[:raw_bs])
+                for row in range(raw_bs):
+                    limit = steps if hit[row] else (neural or steps)
+                    assert torch.equal(output[row, :limit], full_output[row, :limit])
             finally:
                 fb.spec_info.draft_override = view
     assert poison
