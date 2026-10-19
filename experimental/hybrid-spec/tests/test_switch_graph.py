@@ -92,6 +92,82 @@ def test_switch_cost_profile_requires_matching_dispatch():
     costs, fixed = {(1, 512): {9: (0.2, 0.4)}}, {(1, 512): 0.2}
     fused = cost_profile(switch, costs, fixed)
     parse_cost_profile(fused, switch)
+    joined = replace(switch, conditional_draft_graph_joined=True)
+    with pytest.raises(ValueError, match="does not match hybrid config"):
+        parse_cost_profile(fused, joined)
+    parse_cost_profile(cost_profile(joined, costs, fixed), joined)
     fused["config"].pop("conditional_draft_graph_revision")
     with pytest.raises(ValueError, match="does not match hybrid config"):
         parse_cost_profile(fused, switch)
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="requires NVIDIA CUDA")
+@pytest.mark.parametrize("batch_size", [1, 3, 8, 32, 257])
+def test_joined_replay_queues_distinct_raw_batches_without_host_scalar_race(batch_size):
+    """Queued launches must retain their own raw_bs, including graph padding.
+
+    A reused pinned scalar would make queued steps see the last host value.
+    Accumulate per-row execution and histogram to catch that without fencing
+    between successive launches. Prefix must run exactly once per replay.
+    """
+    from hybrid_spec.integrations.sglang.compact_graph import (
+        CompactCapture,
+        _capture_graph,
+        prepare_compaction,
+        replay_compact,
+    )
+
+    stream = torch.cuda.Stream()
+    mask = torch.zeros(batch_size, dtype=torch.bool, device="cuda")
+    output = torch.zeros(batch_size, dtype=torch.int64, device="cuda")
+    prefix_ct = torch.zeros((), dtype=torch.int64, device="cuda")
+
+    def prefix_body():
+        prefix_ct.add_(1)
+
+    prefix, _ = _capture_graph(prefix_body, stream, keep_graph=True)
+    record = CompactCapture(
+        prefix, output, NS(batch_size=batch_size), NS(use_retrieval=mask), ()
+    )
+    prepare_compaction(record, "split")
+    for size in range(1, batch_size + 1):
+
+        def tail(size=size):
+            output.index_add_(
+                0,
+                record.rows[:size],
+                torch.ones(size, dtype=torch.int64, device="cuda"),
+            )
+
+        record.tails[size] = NS(forward=tail)
+    with torch.cuda.stream(stream):
+        for tail in record.tails.values():
+            tail.forward()
+    torch.cuda.synchronize()
+    dispatcher = record.conditional = ConditionalTailGraph(
+        record, stream, dispatch="switch", joined=True
+    )
+    output.zero_()
+    prefix_ct.zero_()
+    counters = {"prefix_ct": 0, "request_ct": 0}
+    batches = [
+        batch_size,
+        1,
+        max(1, batch_size - 1),
+        min(batch_size, 3),
+        1,
+        batch_size,
+    ] * 3
+    expected = [sum(row < raw for raw in batches) for row in range(batch_size)]
+    torch.cuda._sleep(20_000_000)
+    for raw_bs in batches:
+        replay_compact(record, counters, raw_bs)
+    assert output.cpu().tolist() == expected
+    assert prefix_ct.item() == len(batches)
+    histogram, mixed = dispatcher.snapshot()
+    assert histogram == [batches.count(n) for n in range(batch_size + 1)]
+    assert mixed == 0
+    assert counters == {"prefix_ct": len(batches), "request_ct": sum(batches)}
+    torch.cuda.synchronize()
+    dispatcher.reset()
+    prefix.reset()

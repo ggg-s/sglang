@@ -12,6 +12,10 @@ SWITCH 要求 CUDA runtime 和 nvcc 工具链均 >=12.8，以及 Ninja、兼容�
 C++ 编译器与 PyTorch `CUDAGraph(keep_graph=True)` / raw graph 接口；
 首次启用会在捕图前 JIT 编译插件内的小型 CUDA 适配器。
 
+可额外设置 `"conditional_draft_graph_joined": true`，把 prefix、行压缩和
+SWITCH 放进同一张主图；仅支持 SWITCH，默认关闭。
+模板为 [device-draft-split-joined.json](configs/device-draft-split-joined.json)。
+
 ## 执行方式
 
 普通 split：
@@ -27,7 +31,7 @@ prefix replay → GPU 压缩行 → conditional tail graph replay
                                   └→ GPU 按 num_neural 选择固定形状的尾段
 ```
 
-这版保留 prefix 和行压缩的独立启动，没有把整个 draft 合成一张图。
+默认分段模式保留 prefix 和行压缩的独立启动。
 移除的是中间选择 tail 的 `.item()`；最终 compact verify 确定 target Graph
 token 档位时原有的 host 读回仍可能存在，不能据此宣称整轮无同步。
 
@@ -51,6 +55,18 @@ SWITCH 生产路径在行压缩 kernel 内写入 `live_bs`，不再单独 `fill_
 histogram/mixed 仍逐步准确累计。直接调用 dispatcher 而未经过行压缩时，
 `replay(raw_bs)` 保留 fill，防止缩批使用旧 batch。prefix 仍未合图；
 不承诺减少 Graph 启动数或显存。
+
+joined 模式会保留 prefix 的 raw graph/private pool，把它作为新主图的
+child node，在同一主图中捕获行压缩并原生创建 SWITCH；不能把含条件节点的
+旧 SWITCH 图直接克隆成 child graph。主图开始有一个 4-byte batch 写入节点，
+每轮通过 `cudaGraphExecMemsetNodeSetParams` 更新它的整数值，然后只 replay
+一次。行压缩从固定 GPU 地址读取实际 `raw_bs`，循环受捕图容量 B 限制，
+仅选取 `row < raw_bs` 的有效行；统计也使用这个实际 batch。
+更新参数只影响之后的 launch，已排队的 launch 保留原值；没有复用 pinned
+host scalar 的覆写竞态，没有额外 GPU 读回。输入节点更新成本包含在计时中。
+这减少 host 提交次数，但增加图内 batch 写入和 prefix child 的设备开销，
+是否划算仍以完整一轮 wall 测量为准。主图 template/node handle、prefix 和
+各 leaf 的 Graph/private pool 都保留到 cleanup。
 
 `num_neural=0` 时跳过所有 tail；其余大小按平衡 IF 树选一条分支，
 避免每轮对所有大小逐个执行条件判断。压缩行号仍稳定排序，只包含实际请求，
@@ -100,6 +116,8 @@ B=32 时当前 IF 树是主要新增成本，消除 `.item()` 仍可能回退。
 包含接入方式、659 项回归及 IF/SWITCH 开销对照。
 [统计/batch 融合记录](validation/conditional-switch-fused-4060-20261019/README.md)
 包含当前 SWITCH 的 673 项回归及与原 SWITCH、`.item()` 的整轮交错对照。
+[合图记录](validation/conditional-joined-4060-20261019/README.md) 包含 joined
+模式的 700 项回归、固定 batch 与循环变长的三路完整轮对照。
 TP2 条件 collective 和真实模型服务仍待验收；skip 不代表验证通过。
 在已可运行的原生模型命令上设置：
 
@@ -133,3 +151,4 @@ CPU 侧只即时维护 `prefix_ct` / `request_ct`，不要直接把进程内的
 默认关闭时仍兼容此前没有该字段的旧表。
 IF 与 SWITCH 使用不同的耗时表指纹，切换 dispatch 后也需要重跑离线表。
 融合版 SWITCH 的指纹另含 revision=2，旧 SWITCH 的表也会被拒绝。
+joined=true 也进入耗时表指纹，不能沿用分段 SWITCH 的表。

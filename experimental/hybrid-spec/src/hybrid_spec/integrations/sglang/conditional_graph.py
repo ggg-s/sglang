@@ -41,18 +41,23 @@ def _switch_adapter():
     from torch.utils.cpp_extension import load
 
     return load(
-        name="hybrid_spec_switch_graph_v2",
+        name="hybrid_spec_switch_graph_v3",
         sources=[str(Path(__file__).with_name("switch_graph.cu"))],
         extra_cuda_cflags=["-O3"],
     )
 
 
 class ConditionalTailGraph:
-    def __init__(self, record, stream, *, dispatch="if"):
+    def __init__(self, record, stream, *, dispatch="if", joined=False):
         require_conditional_graph(dispatch)
+        if joined and dispatch != "switch":
+            raise ValueError("joined graph requires SWITCH dispatch")
         # Compile before capture, on every TP rank. No rank-local fallback.
         adapter = _switch_adapter() if dispatch == "switch" else None
         self.dispatch = dispatch
+        self.joined = joined
+        # The parent child-node clone retains addresses, not PyTorch pools.
+        self.prefix_owner = record.prefix if joined else None
         self.leaf_graphs = []
         self.batch_size = record.inputs.batch_size
         count = record.num_neural
@@ -63,7 +68,7 @@ class ConditionalTailGraph:
             self.batch_size + 2, dtype=torch.int64, device=count.device
         )
         one = torch.ones(1, dtype=torch.int64, device=count.device)
-        self.graph = torch.cuda.CUDAGraph()
+        self.graph = torch.cuda.CUDAGraph(keep_graph=joined)
 
         def branch(predicate, body):
             self.graph.begin_capture_to_if_node(predicate)
@@ -96,6 +101,20 @@ class ConditionalTailGraph:
                 statistics()
             self.stats.zero_()
         torch.cuda.synchronize()
+        if joined:
+            from hybrid_spec.backends.gpu_sa.row_compaction import compact_neural_rows
+
+            # Warm the pointer-based, capacity-bounded scan before capture.
+            with torch.cuda.stream(stream):
+                compact_neural_rows(
+                    record.override.use_retrieval,
+                    record.rows,
+                    count,
+                    self.live_bs,
+                    False,
+                    capacity=self.batch_size,
+                )
+            torch.cuda.synchronize()
         try:
             if adapter is not None:
                 # Capture with PyTorch so allocator bookkeeping stays owned
@@ -112,6 +131,21 @@ class ConditionalTailGraph:
             with torch.cuda.graph(
                 self.graph, pool=torch.cuda.graph_pool_handle(), stream=stream
             ):
+                if joined:
+                    self.batch_node = adapter.capture_batch(
+                        self.live_bs.data_ptr(), self.batch_size, stream.cuda_stream
+                    )
+                    adapter.capture_child(
+                        record.prefix.raw_cuda_graph(), stream.cuda_stream
+                    )
+                    compact_neural_rows(
+                        record.override.use_retrieval,
+                        record.rows,
+                        count,
+                        self.live_bs,
+                        False,
+                        capacity=self.batch_size,
+                    )
                 if adapter is None:
                     branch(count > 0, lambda: capture_range(1, self.batch_size))
                     statistics()
@@ -123,6 +157,11 @@ class ConditionalTailGraph:
                         self.stats.data_ptr(),
                         self.live_bs.data_ptr(),
                     )
+            if joined:
+                self.graph.instantiate()
+                self.graph_exec = self.graph.raw_cuda_graph_exec()
+                self.raw_bs_ptr = self.live_bs.data_ptr()
+                self.update_batch = adapter.update_batch
         except Exception as exc:
             # Do not retry/fall back independently on a TP rank after partial
             # collective capture. Restart all ranks with the option disabled.
@@ -136,7 +175,11 @@ class ConditionalTailGraph:
     def replay(self, raw_bs, *, batch_prepared=False):
         # Production SWITCH compaction already wrote this on the same stream.
         # Direct callers retain the explicit fill to avoid a stale raw batch.
-        if not batch_prepared:
+        if self.joined:
+            if not 0 < raw_bs <= self.batch_size:
+                raise ValueError("raw batch must fit joined graph capacity")
+            self.update_batch(self.graph_exec, self.batch_node, self.raw_bs_ptr, raw_bs)
+        elif not batch_prepared:
             self.live_bs.fill_(raw_bs)
         self.graph.replay()
 

@@ -38,6 +38,7 @@ class HybridConfig:
     dynamic_verify_cost_table_path: str | None = None
     conditional_draft_graph: bool = False
     conditional_draft_graph_dispatch: str = "if"
+    conditional_draft_graph_joined: bool = False
 
     def __post_init__(self):
         for name in (
@@ -76,6 +77,11 @@ class HybridConfig:
                 "conditional_draft_graph_dispatch requires if or switch "
                 "and switch requires conditional_draft_graph=true"
             )
+        if type(self.conditional_draft_graph_joined) is not bool or (
+            self.conditional_draft_graph_joined
+            and self.conditional_draft_graph_dispatch != "switch"
+        ):
+            raise ValueError("conditional_draft_graph_joined requires SWITCH dispatch")
         if self.verify_mode not in ("static", "padded", "compact"):
             raise ValueError("verify_mode must be static, padded or compact")
         neural = self.neural_drafts

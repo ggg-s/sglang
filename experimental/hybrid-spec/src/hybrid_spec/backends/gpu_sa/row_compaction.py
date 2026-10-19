@@ -13,12 +13,19 @@ def _compact_neural_rows(
     raw_bs,
     NO_SKIP: tl.constexpr,
     WRITE_LIVE_BS: tl.constexpr,
+    READ_RAW_BS: tl.constexpr,
+    CAPACITY: tl.constexpr,
     BLOCK: tl.constexpr,
 ):
     # One ordered scan, including batches larger than a block. Atomic append
     # would allow different row permutations across TP ranks.
     offset = 0
-    for start in range(tl.cdiv(raw_bs, BLOCK)):
+    if READ_RAW_BS:
+        raw_bs = tl.load(raw_bs)
+        limit = CAPACITY
+    else:
+        limit = raw_bs
+    for start in range(tl.cdiv(limit, BLOCK)):
         row = start * BLOCK + tl.arange(0, BLOCK)
         hit = tl.load(mask + row, row < raw_bs, other=0)
         take = (row < raw_bs) & ((~hit) | NO_SKIP)
@@ -30,8 +37,19 @@ def _compact_neural_rows(
         tl.store(live_bs, raw_bs)
 
 
-def compact_neural_rows(mask, rows, count, raw_bs, no_skip, *, live_bs=None):
+def compact_neural_rows(
+    mask, rows, count, raw_bs, no_skip, *, live_bs=None, capacity=None
+):
     """Write stable original-row indices and one count, without allocations."""
     _compact_neural_rows[(1,)](
-        mask, rows, count, live_bs, raw_bs, no_skip, live_bs is not None, 256
+        mask,
+        rows,
+        count,
+        live_bs,
+        raw_bs,
+        no_skip,
+        live_bs is not None,
+        capacity is not None,
+        capacity or 0,
+        256,
     )

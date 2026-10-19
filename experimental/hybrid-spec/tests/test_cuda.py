@@ -504,6 +504,10 @@ def native_triton_metadata_methods(monkeypatch):
         pytest.param(8, 1, 8, None, "split", "switch", id="switch-b8"),
         pytest.param(8, 2, 3, 3, "split", "switch", id="switch-source-caps-b3"),
         pytest.param(8, 8, 8, None, "split", "switch", id="switch-no-tail"),
+        pytest.param(8, 0, 1, None, "split", "joined", id="joined-b1"),
+        pytest.param(8, 1, 8, None, "split", "joined", id="joined-b8"),
+        pytest.param(8, 2, 3, 3, "split", "joined", id="joined-source-caps-b3"),
+        pytest.param(8, 8, 8, None, "split", "joined", id="joined-no-tail"),
     ],
 )
 def test_compact_tail_graph_reorders_rows_without_computing_sa_requests(
@@ -538,7 +542,9 @@ def test_compact_tail_graph_reorders_rows_without_computing_sa_requests(
             require_conditional_graph,
         )
 
-        require_conditional_graph("switch" if conditional == "switch" else "if")
+        require_conditional_graph(
+            "switch" if conditional in ("switch", "joined") else "if"
+        )
 
     arctic = kind.startswith("arctic_")
     kind = kind.removeprefix("arctic_")
@@ -680,7 +686,10 @@ def test_compact_tail_graph_reorders_rows_without_computing_sa_requests(
         history_mode="device",
         draft_graph_mode=mode,
         conditional_draft_graph=bool(conditional),
-        conditional_draft_graph_dispatch="switch" if conditional == "switch" else "if",
+        conditional_draft_graph_dispatch="switch"
+        if conditional in ("switch", "joined")
+        else "if",
+        conditional_draft_graph_joined=conditional == "joined",
         num_neural_gate_tokens=gate,
         num_neural_drafts=neural,
         verify_mode="padded" if neural is not None else "static",
@@ -911,6 +920,7 @@ def test_compact_tail_graph_reorders_rows_without_computing_sa_requests(
                     draft_graph_mode="full",
                     conditional_draft_graph=False,
                     conditional_draft_graph_dispatch="if",
+                    conditional_draft_graph_joined=False,
                     num_neural_drafts=None,
                     verify_mode="static",
                 ),

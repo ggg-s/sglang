@@ -22,6 +22,7 @@ def cost_config(config):
         # Preserve tables produced before this opt-in was introduced.
         and (k != "conditional_draft_graph" or v)
         and (k != "conditional_draft_graph_dispatch" or v != "if")
+        and (k != "conditional_draft_graph_joined" or v)
     }
     if config.conditional_draft_graph_dispatch == "switch":
         # The fused setter and compaction remove per-round kernels. A table

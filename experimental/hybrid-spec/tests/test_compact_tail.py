@@ -88,6 +88,7 @@ def test_conditional_dispatch_never_reads_count_for_metrics_or_verify(monkeypatc
     backend = object.__new__(SplitDraftGraphBackend)
     backend.conditional = True
     backend.conditional_dispatch = "if"
+    backend.conditional_joined = False
     backend.records = {4: record}
     backend.counters = dict.fromkeys(
         (

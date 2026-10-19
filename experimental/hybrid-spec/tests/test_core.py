@@ -1205,6 +1205,8 @@ def test_invalid_neural_gate_width(value):
         {"conditional_draft_graph": True, "draft_graph_mode": "split_no_skip"},
         {"conditional_draft_graph_dispatch": "switch"},
         {"conditional_draft_graph_dispatch": "invalid"},
+        {"conditional_draft_graph_joined": True},
+        {"conditional_draft_graph_joined": 1},
     ],
 )
 def test_split_graph_configuration_rejects_unsupported_state(change):

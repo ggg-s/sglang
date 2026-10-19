@@ -18,6 +18,77 @@ void check(cudaError_t error) {
   }
 }
 
+struct Capture {
+  cudaStream_t stream;
+  cudaGraph_t graph;
+  const cudaGraphNode_t* dependencies;
+  size_t size;
+
+  explicit Capture(uintptr_t stream_ptr)
+      : stream(reinterpret_cast<cudaStream_t>(stream_ptr)) {
+    cudaStreamCaptureStatus status;
+#if CUDART_VERSION >= 13000
+    check(cudaStreamGetCaptureInfo(stream, &status, nullptr, &graph,
+                                  &dependencies, nullptr, &size));
+#else
+    check(cudaStreamGetCaptureInfo_v2(stream, &status, nullptr, &graph,
+                                     &dependencies, &size));
+#endif
+    if (status != cudaStreamCaptureStatusActive) {
+      throw std::runtime_error("joined adapter requires active capture");
+    }
+  }
+
+  void advance(cudaGraphNode_t node) {
+#if CUDART_VERSION >= 13000
+    check(cudaStreamUpdateCaptureDependencies(
+        stream, &node, nullptr, 1, cudaStreamSetCaptureDependencies));
+#else
+    check(cudaStreamUpdateCaptureDependencies_v2(
+        stream, &node, nullptr, 1, cudaStreamSetCaptureDependencies));
+#endif
+  }
+};
+
+cudaMemsetParams batch_params(uintptr_t pointer, unsigned int value) {
+  cudaMemsetParams params{};
+  params.dst = reinterpret_cast<void*>(pointer);
+  params.value = value;
+  params.elementSize = sizeof(int);
+  params.width = 1;
+  params.height = 1;
+  return params;
+}
+
+uintptr_t capture_batch(uintptr_t pointer, unsigned int value, uintptr_t stream) {
+  Capture capture(stream);
+  auto params = batch_params(pointer, value);
+  cudaGraphNode_t node;
+  check(cudaGraphAddMemsetNode(&node, capture.graph, capture.dependencies,
+                               capture.size, &params));
+  capture.advance(node);
+  return reinterpret_cast<uintptr_t>(node);
+}
+
+void update_batch(uintptr_t exec, uintptr_t node, uintptr_t pointer,
+                  unsigned int value) {
+  auto params = batch_params(pointer, value);
+  // CUDA snapshots updated parameters for future launches; already queued
+  // launches keep their value. No reused pinned-host scalar or extra launch.
+  check(cudaGraphExecMemsetNodeSetParams(
+      reinterpret_cast<cudaGraphExec_t>(exec),
+      reinterpret_cast<cudaGraphNode_t>(node), &params));
+}
+
+void capture_child(uintptr_t child, uintptr_t stream) {
+  Capture capture(stream);
+  cudaGraphNode_t node;
+  check(cudaGraphAddChildGraphNode(
+      &node, capture.graph, capture.dependencies, capture.size,
+      reinterpret_cast<cudaGraph_t>(child)));
+  capture.advance(node);
+}
+
 __global__ void set_switch_handle(cudaGraphConditionalHandle handle,
                                   const int* count, unsigned long long* stats,
                                   const int* live_bs, unsigned int capacity) {
@@ -105,6 +176,9 @@ void capture_switch(uintptr_t count_ptr, const std::vector<uintptr_t>& leaves,
 }  // namespace
 
 PYBIND11_MODULE(TORCH_EXTENSION_NAME, module) {
+  module.def("capture_batch", &capture_batch);
+  module.def("update_batch", &update_batch);
+  module.def("capture_child", &capture_child);
   module.def("capture_switch", &capture_switch, pybind11::arg("count_ptr"),
              pybind11::arg("leaves"), pybind11::arg("stream_ptr"),
              pybind11::arg("stats_ptr") = 0, pybind11::arg("live_bs_ptr") = 0);

@@ -1,0 +1,40 @@
+{
+  "source_base": "0f6240e1ba",
+  "source_sha256": {
+    "experimental/hybrid-spec/src/hybrid_spec/config.py": "940553d0bfb11522632d3f01c92081bf5ae936573debc7e012604142b34af3e1",
+    "experimental/hybrid-spec/src/hybrid_spec/backends/gpu_sa/row_compaction.py": "ddcdeab9e71d538de4fd395efe33b935b99aa06fcfa593faa0b114580c809c26",
+    "experimental/hybrid-spec/src/hybrid_spec/integrations/sglang/compact_graph.py": "5a5dbd337d43bba3e0394ef4b81879d8ed68eb0e3a1e9908cccc59c5ce70cd3d",
+    "experimental/hybrid-spec/src/hybrid_spec/integrations/sglang/conditional_graph.py": "916ecdd193c42551cc689f9f32a407f83dd544a80676b4a80901166056050ce1",
+    "experimental/hybrid-spec/src/hybrid_spec/integrations/sglang/switch_graph.cu": "53570bdb985df81c472ae234448450bacaba725357e8a4febc298dd3058ee828",
+    "experimental/hybrid-spec/src/hybrid_spec/integrations/sglang/split_graph.py": "6f362fbd92717532e73f768b43cfe4aada63d11f3ee5ab55fb22518035319e92",
+    "experimental/hybrid-spec/src/hybrid_spec/selection/verify_costs.py": "06690f9064eb3fdac5427f9617ea4405911b3d705267cb8f00da78b6230b58a8",
+    "experimental/hybrid-spec/tests/test_switch_graph.py": "444ffefff3e90059de093f24fc7b38d9246057cafdf65f40b1203bb7d350a0fa",
+    "experimental/hybrid-spec/tests/test_cuda.py": "ecce4b2495bbef7b9f405f54943f5a920464b2f465a1d0fd41051dac7a3d3dda",
+    "experimental/hybrid-spec/tests/test_core.py": "b61bdd27261dd94c204adb5823cd1720572a8bd9cff8f1d7bb9f207d8cea82ad",
+    "experimental/hybrid-spec/tests/test_compact_tail.py": "8bd633f6a91999fe655d05777056236c6d0ad37cf47609fd34e33058acdfc3d9",
+    "experimental/hybrid-spec/tests/test_tp.py": "0583c0ca65a55ef329e4a2a59c651870bc9128913aa57320240117f7ec4d9a67"
+  },
+  "baselines_sha256": {
+    "8f9d113455": {
+      "backends/gpu_sa/row_compaction.py": "919ae9469643d26ca71822513cb1c80e1b24821efa52c661959755f849e6e7f1",
+      "integrations/sglang/compact_graph.py": "8de4da11753d5c180533b8ff76495f27e08f000d23a9b5af457216fb5a171619",
+      "integrations/sglang/conditional_graph.py": "0bccc9d8cfe5b9dddc8a2836cd20fb16706bea433497eb91e21256c6aaf6a8a8",
+      "integrations/sglang/switch_graph.cu": "8467f53a5023a0468294becbb81e3d7b9dce6804562415791315fcdcacb9ed65"
+    },
+    "0f6240e1ba": {
+      "backends/gpu_sa/row_compaction.py": "87e669fbeea22e2d4db19e1f8edd2868bad0a9457d39f40e2321832e12a92a0e",
+      "integrations/sglang/compact_graph.py": "42a9c84c0176e56349b1ede8e500141886e7de2b8371af6c12fe0ea324b506fe",
+      "integrations/sglang/conditional_graph.py": "b061c449aeb3d0a4fb9659c38bcc334e961e6455e5d63e1f49a32d78e400ad37",
+      "integrations/sglang/switch_graph.cu": "79ca51238bc71f71eadf480b189e32bcbf637b4e1202e69398f63f9ad72da890"
+    }
+  },
+  "baseline_import_relocation": "Only row-kernel import module names relocated for side-by-side execution; original item and fused dispatcher/graph sources kept. Shared prefix recaptured with keep_graph=True so joined can use its raw graph; execution/inputs/tail identical.",
+  "helpers": {
+    "compare_rounds.py": "fc77492ff343df9d8ceae481e348e13b99b52dec2cb7980fe393fc2c04872b78",
+    "ablate_dispatch.py": "3942f409075ee8b8a6b05bd1c79518e0af69f1f68e5ac7020bdb228ba45ea20d",
+    "dispatch_probe.py": "5e7aa5c05f35586edaa218ff78528b0b6630ba6a4b1ca49bb2430424b6b10005"
+  },
+  "server": "ai-workstation",
+  "timing": "100 interleaved warmups including all variable raw_bs cycle values;15 blocks x100 iterations;shuffle three modes within every iteration;wall includes final CUDA synchronize and per-replay batch node update. Fixed and cycling raw_bs cases;seeds327/911. GPU event spans entire fused/joined round with 2M-cycle sleep before start, not old dispatch-only scope.",
+  "scope": "TP1 synthetic small GEMM draft round, no target verify/model weights/NCCL. No cached raw_bs update: cudaGraphExecMemsetNodeSetParams called every joined replay."
+}

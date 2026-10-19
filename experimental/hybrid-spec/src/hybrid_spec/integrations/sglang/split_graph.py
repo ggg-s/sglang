@@ -44,6 +44,9 @@ class SplitDraftGraphBackend:
         self.conditional_dispatch = getattr(
             config, "conditional_draft_graph_dispatch", "if"
         )
+        self.conditional_joined = getattr(
+            config, "conditional_draft_graph_joined", False
+        )
         if self.conditional:
             from .conditional_graph import require_conditional_graph
 
@@ -129,6 +132,7 @@ class SplitDraftGraphBackend:
         result["conditional_draft_graph"] = self.conditional
         if self.conditional:
             result["conditional_draft_graph_dispatch"] = self.conditional_dispatch
+            result["conditional_draft_graph_joined"] = self.conditional_joined
         for record in self.records.values():
             if record.conditional is None:
                 continue

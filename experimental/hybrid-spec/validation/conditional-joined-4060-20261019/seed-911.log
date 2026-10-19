@@ -1,0 +1,45 @@
+/workspace/conditional-graph-20261019/venv/lib/python3.12/site-packages/torch/cuda/graphs.py:630: UserWarning: The CUDA Graph is empty. This usually means that the graph was attempted to be captured on wrong device or stream. (Triggered internally at /__w/pytorch/pytorch/aten/src/ATen/cuda/CUDAGraph.cpp:249.)
+  super().capture_end_pre()
+USDT:2026-10-19 19:48:18 19901:19901 SyncActivityProfilerHandler.cpp:39] profiler_start
+USDT:2026-10-19 19:48:18 19901:19901 SyncActivityProfilerHandler.cpp:46] profiler_stop
+USDT:2026-10-19 19:48:18 19901:19901 SyncActivityProfilerHandler.cpp:39] profiler_start
+USDT:2026-10-19 19:48:18 19901:19901 SyncActivityProfilerHandler.cpp:46] profiler_stop
+USDT:2026-10-19 19:48:18 19901:19901 SyncActivityProfilerHandler.cpp:39] profiler_start
+USDT:2026-10-19 19:48:18 19901:19901 SyncActivityProfilerHandler.cpp:46] profiler_stop
+1 0 {'host': 88.07, 'fused': 57.75, 'joined': 37.25}
+USDT:2026-10-19 19:48:19 19901:19901 SyncActivityProfilerHandler.cpp:39] profiler_start
+USDT:2026-10-19 19:48:19 19901:19901 SyncActivityProfilerHandler.cpp:46] profiler_stop
+USDT:2026-10-19 19:48:19 19901:19901 SyncActivityProfilerHandler.cpp:39] profiler_start
+USDT:2026-10-19 19:48:19 19901:19901 SyncActivityProfilerHandler.cpp:46] profiler_stop
+USDT:2026-10-19 19:48:19 19901:19901 SyncActivityProfilerHandler.cpp:39] profiler_start
+USDT:2026-10-19 19:48:19 19901:19901 SyncActivityProfilerHandler.cpp:46] profiler_stop
+1 1 {'host': 118.0, 'fused': 71.54, 'joined': 49.63}
+3 1 {'host': 115.89, 'fused': 70.18, 'joined': 47.52}
+USDT:2026-10-19 19:48:21 19901:19901 SyncActivityProfilerHandler.cpp:39] profiler_start
+USDT:2026-10-19 19:48:21 19901:19901 SyncActivityProfilerHandler.cpp:46] profiler_stop
+USDT:2026-10-19 19:48:21 19901:19901 SyncActivityProfilerHandler.cpp:39] profiler_start
+USDT:2026-10-19 19:48:21 19901:19901 SyncActivityProfilerHandler.cpp:46] profiler_stop
+USDT:2026-10-19 19:48:21 19901:19901 SyncActivityProfilerHandler.cpp:39] profiler_start
+USDT:2026-10-19 19:48:21 19901:19901 SyncActivityProfilerHandler.cpp:46] profiler_stop
+4 2 {'host': 121.29, 'fused': 73.87, 'joined': 52.81}
+USDT:2026-10-19 19:48:22 19901:19901 SyncActivityProfilerHandler.cpp:39] profiler_start
+USDT:2026-10-19 19:48:22 19901:19901 SyncActivityProfilerHandler.cpp:46] profiler_stop
+USDT:2026-10-19 19:48:22 19901:19901 SyncActivityProfilerHandler.cpp:39] profiler_start
+USDT:2026-10-19 19:48:22 19901:19901 SyncActivityProfilerHandler.cpp:46] profiler_stop
+USDT:2026-10-19 19:48:22 19901:19901 SyncActivityProfilerHandler.cpp:39] profiler_start
+USDT:2026-10-19 19:48:22 19901:19901 SyncActivityProfilerHandler.cpp:46] profiler_stop
+8 4 {'host': 125.32, 'fused': 78.41, 'joined': 52.65}
+USDT:2026-10-19 19:48:23 19901:19901 SyncActivityProfilerHandler.cpp:39] profiler_start
+USDT:2026-10-19 19:48:23 19901:19901 SyncActivityProfilerHandler.cpp:46] profiler_stop
+USDT:2026-10-19 19:48:23 19901:19901 SyncActivityProfilerHandler.cpp:39] profiler_start
+USDT:2026-10-19 19:48:23 19901:19901 SyncActivityProfilerHandler.cpp:46] profiler_stop
+USDT:2026-10-19 19:48:23 19901:19901 SyncActivityProfilerHandler.cpp:39] profiler_start
+USDT:2026-10-19 19:48:23 19901:19901 SyncActivityProfilerHandler.cpp:46] profiler_stop
+16 8 {'host': 121.3, 'fused': 85.96, 'joined': 53.61}
+USDT:2026-10-19 19:48:24 19901:19901 SyncActivityProfilerHandler.cpp:39] profiler_start
+USDT:2026-10-19 19:48:24 19901:19901 SyncActivityProfilerHandler.cpp:46] profiler_stop
+USDT:2026-10-19 19:48:24 19901:19901 SyncActivityProfilerHandler.cpp:39] profiler_start
+USDT:2026-10-19 19:48:24 19901:19901 SyncActivityProfilerHandler.cpp:46] profiler_stop
+USDT:2026-10-19 19:48:24 19901:19901 SyncActivityProfilerHandler.cpp:39] profiler_start
+USDT:2026-10-19 19:48:24 19901:19901 SyncActivityProfilerHandler.cpp:46] profiler_stop
+32 16 {'host': 135.28, 'fused': 104.65, 'joined': 69.88}

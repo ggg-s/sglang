@@ -700,7 +700,7 @@ def test_tp_consensus_and_graph_staging(tmp_path, backend, world_size):
             process.join(timeout=5)
 
 
-def _conditional_worker(rank, world_size, init_method, dispatch):
+def _conditional_worker(rank, world_size, init_method, dispatch, joined):
     """Real PyNccl collectives inside differently sized conditional leaves."""
     from hybrid_spec.integrations.sglang.compact_graph import (
         CompactCapture,
@@ -747,7 +747,7 @@ def _conditional_worker(rank, world_size, init_method, dispatch):
             run_prefix()
             run_prefix()
         torch.cuda.synchronize()
-        prefix, _ = _capture_graph(run_prefix, stream)
+        prefix, _ = _capture_graph(run_prefix, stream, keep_graph=joined)
         record = CompactCapture(
             prefix, output, SimpleNamespace(batch_size=bs), view, ()
         )
@@ -769,7 +769,7 @@ def _conditional_worker(rank, world_size, init_method, dispatch):
             tail()
             record.tails[size] = SimpleNamespace(forward=tail)
         dispatcher = record.conditional = ConditionalTailGraph(
-            record, stream, dispatch=dispatch
+            record, stream, dispatch=dispatch, joined=joined
         )
         counters = {"prefix_ct": 0, "request_ct": 0}
         expected_histogram = [0] * (bs + 1)
@@ -815,8 +815,12 @@ def _conditional_worker(rank, world_size, init_method, dispatch):
         dist.destroy_process_group()
 
 
-@pytest.mark.parametrize("dispatch", ["if", "switch"])
-def test_conditional_graph_tp2_consensus_and_collective_branches(tmp_path, dispatch):
+@pytest.mark.parametrize(
+    "dispatch,joined", [("if", False), ("switch", False), ("switch", True)]
+)
+def test_conditional_graph_tp2_consensus_and_collective_branches(
+    tmp_path, dispatch, joined
+):
     if not dist.is_nccl_available() or torch.cuda.device_count() < 2:
         pytest.skip("requires two NVIDIA GPUs and NCCL")
     from hybrid_spec.integrations.sglang.conditional_graph import (
@@ -826,7 +830,7 @@ def test_conditional_graph_tp2_consensus_and_collective_branches(tmp_path, dispa
     require_conditional_graph(dispatch)
     context = mp.spawn(
         _conditional_worker,
-        args=(2, (tmp_path / "conditional-rendezvous").as_uri(), dispatch),
+        args=(2, (tmp_path / "conditional-rendezvous").as_uri(), dispatch, joined),
         nprocs=2,
         join=False,
     )

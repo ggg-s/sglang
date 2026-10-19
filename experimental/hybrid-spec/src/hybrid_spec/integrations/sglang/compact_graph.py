@@ -93,7 +93,11 @@ def capture_compact(runner, batch, forward_fn, stream, post_warmup_hook, mode="s
             if post_warmup_hook is not None:
                 post_warmup_hook()
         torch.cuda.synchronize()
-        prefix, output = _capture_graph(forward_fn, stream)
+        prefix, output = _capture_graph(
+            forward_fn,
+            stream,
+            keep_graph=getattr(config, "conditional_draft_graph_joined", False),
+        )
     finally:
         del view.on_prefix_ready
     record = CompactCapture(
@@ -116,6 +120,7 @@ def capture_compact(runner, batch, forward_fn, stream, post_warmup_hook, mode="s
                 record,
                 stream,
                 dispatch=getattr(config, "conditional_draft_graph_dispatch", "if"),
+                joined=getattr(config, "conditional_draft_graph_joined", False),
             )
     return record
 
@@ -284,10 +289,12 @@ def _capture_tail(runner, record, size, stream, *, capture=True):
     )
 
 
-def _capture_graph(forward_fn, stream):
-    graph = torch.cuda.CUDAGraph()
+def _capture_graph(forward_fn, stream, *, keep_graph=False):
+    graph = torch.cuda.CUDAGraph(keep_graph=keep_graph)
     with torch.cuda.graph(graph, pool=torch.cuda.graph_pool_handle(), stream=stream):
         output = forward_fn()
+    if keep_graph:
+        graph.instantiate()
     return graph, output
 
 
@@ -324,6 +331,12 @@ def _plan_dsv4_metadata(
 def replay_compact(record, counters, raw_bs):
     if not 0 < raw_bs <= record.inputs.batch_size:
         raise ValueError("raw batch must fit the captured prefix")
+    if record.conditional is not None and getattr(record.conditional, "joined", False):
+        record.conditional.replay(raw_bs)
+        record.runtime_num_neural = None
+        counters["prefix_ct"] += 1
+        counters["request_ct"] += raw_bs
+        return record.output
     record.prefix.replay()
     if record.conditional is not None:
         if getattr(record.conditional, "dispatch", "if") == "switch":
