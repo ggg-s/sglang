@@ -23,6 +23,7 @@ def cost_config(config):
                 if not k.startswith("dynamic_verify")
                 # Preserve tables produced before this opt-in was introduced.
                 and (k != "conditional_draft_graph" or v)
+                and (k != "conditional_draft_graph_dispatch" or v != "if")
             }
         )
     )

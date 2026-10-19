@@ -700,7 +700,7 @@ def test_tp_consensus_and_graph_staging(tmp_path, backend, world_size):
             process.join(timeout=5)
 
 
-def _conditional_worker(rank, world_size, init_method):
+def _conditional_worker(rank, world_size, init_method, dispatch):
     """Real PyNccl collectives inside differently sized conditional leaves."""
     from hybrid_spec.integrations.sglang.compact_graph import (
         CompactCapture,
@@ -768,7 +768,9 @@ def _conditional_worker(rank, world_size, init_method):
             tail()
             tail()
             record.tails[size] = SimpleNamespace(forward=tail)
-        dispatcher = record.conditional = ConditionalTailGraph(record, stream)
+        dispatcher = record.conditional = ConditionalTailGraph(
+            record, stream, dispatch=dispatch
+        )
         counters = {"prefix_ct": 0, "request_ct": 0}
         expected_histogram = [0] * (bs + 1)
         expected_mixed = 0
@@ -813,17 +815,18 @@ def _conditional_worker(rank, world_size, init_method):
         dist.destroy_process_group()
 
 
-def test_conditional_graph_tp2_consensus_and_collective_branches(tmp_path):
+@pytest.mark.parametrize("dispatch", ["if", "switch"])
+def test_conditional_graph_tp2_consensus_and_collective_branches(tmp_path, dispatch):
     if not dist.is_nccl_available() or torch.cuda.device_count() < 2:
         pytest.skip("requires two NVIDIA GPUs and NCCL")
     from hybrid_spec.integrations.sglang.conditional_graph import (
         require_conditional_graph,
     )
 
-    require_conditional_graph()
+    require_conditional_graph(dispatch)
     context = mp.spawn(
         _conditional_worker,
-        args=(2, (tmp_path / "conditional-rendezvous").as_uri()),
+        args=(2, (tmp_path / "conditional-rendezvous").as_uri(), dispatch),
         nprocs=2,
         join=False,
     )

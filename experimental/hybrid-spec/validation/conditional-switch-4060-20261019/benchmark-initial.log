@@ -1,0 +1,57 @@
+/workspace/conditional-graph-20261019/venv/lib/python3.12/site-packages/torch/cuda/graphs.py:630: UserWarning: The CUDA Graph is empty. This usually means that the graph was attempted to be captured on wrong device or stream. (Triggered internally at /__w/pytorch/pytorch/aten/src/ATen/cuda/CUDAGraph.cpp:249.)
+  super().capture_end_pre()
+USDT:2026-10-19 17:26:52 18729:18729 SyncActivityProfilerHandler.cpp:39] profiler_start
+USDT:2026-10-19 17:26:52 18729:18729 SyncActivityProfilerHandler.cpp:46] profiler_stop
+USDT:2026-10-19 17:26:52 18729:18729 SyncActivityProfilerHandler.cpp:39] profiler_start
+USDT:2026-10-19 17:26:52 18729:18729 SyncActivityProfilerHandler.cpp:46] profiler_stop
+USDT:2026-10-19 17:26:52 18729:18729 SyncActivityProfilerHandler.cpp:39] profiler_start
+USDT:2026-10-19 17:26:52 18729:18729 SyncActivityProfilerHandler.cpp:46] profiler_stop
+USDT:2026-10-19 17:26:52 18729:18729 SyncActivityProfilerHandler.cpp:39] profiler_start
+USDT:2026-10-19 17:26:52 18729:18729 SyncActivityProfilerHandler.cpp:46] profiler_stop
+USDT:2026-10-19 17:26:52 18729:18729 SyncActivityProfilerHandler.cpp:39] profiler_start
+USDT:2026-10-19 17:26:52 18729:18729 SyncActivityProfilerHandler.cpp:46] profiler_stop
+USDT:2026-10-19 17:26:52 18729:18729 SyncActivityProfilerHandler.cpp:39] profiler_start
+USDT:2026-10-19 17:26:52 18729:18729 SyncActivityProfilerHandler.cpp:46] profiler_stop
+1 0 {'direct': 1.024, 'single_if': 8.192, 'tree': 8.192, 'direct_stats': 10.24, 'tree_stats': 17.408, 'production': 19.456, 'switch_no_stats': 7.168, 'switch_stats': 16.384, 'switch_production': 18.432}
+USDT:2026-10-19 17:26:54 18729:18729 SyncActivityProfilerHandler.cpp:39] profiler_start
+USDT:2026-10-19 17:26:54 18729:18729 SyncActivityProfilerHandler.cpp:46] profiler_stop
+USDT:2026-10-19 17:26:54 18729:18729 SyncActivityProfilerHandler.cpp:39] profiler_start
+USDT:2026-10-19 17:26:54 18729:18729 SyncActivityProfilerHandler.cpp:46] profiler_stop
+USDT:2026-10-19 17:26:54 18729:18729 SyncActivityProfilerHandler.cpp:39] profiler_start
+USDT:2026-10-19 17:26:54 18729:18729 SyncActivityProfilerHandler.cpp:46] profiler_stop
+USDT:2026-10-19 17:26:54 18729:18729 SyncActivityProfilerHandler.cpp:39] profiler_start
+USDT:2026-10-19 17:26:54 18729:18729 SyncActivityProfilerHandler.cpp:46] profiler_stop
+USDT:2026-10-19 17:26:54 18729:18729 SyncActivityProfilerHandler.cpp:39] profiler_start
+USDT:2026-10-19 17:26:54 18729:18729 SyncActivityProfilerHandler.cpp:46] profiler_stop
+USDT:2026-10-19 17:26:54 18729:18729 SyncActivityProfilerHandler.cpp:39] profiler_start
+USDT:2026-10-19 17:26:54 18729:18729 SyncActivityProfilerHandler.cpp:46] profiler_stop
+1 1 {'direct': 9.792, 'single_if': 19.104, 'tree': 19.136, 'direct_stats': 17.024, 'tree_stats': 27.872, 'production': 30.176, 'switch_no_stats': 17.696, 'switch_stats': 26.496, 'switch_production': 28.864}
+3 1 {'direct': 8.064, 'single_if': 15.52, 'tree': 34.08, 'direct_stats': 13.664, 'tree_stats': 41.12, 'production': 43.168, 'switch_no_stats': 14.432, 'switch_stats': 21.728, 'switch_production': 23.776}
+4 2 {'direct': 9.216, 'single_if': 16.576, 'tree': 35.328, 'direct_stats': 15.008, 'tree_stats': 42.88, 'production': 44.928, 'switch_no_stats': 15.776, 'switch_stats': 23.104, 'switch_production': 25.184}
+USDT:2026-10-19 17:26:57 18729:18729 SyncActivityProfilerHandler.cpp:39] profiler_start
+USDT:2026-10-19 17:26:57 18729:18729 SyncActivityProfilerHandler.cpp:46] profiler_stop
+USDT:2026-10-19 17:26:57 18729:18729 SyncActivityProfilerHandler.cpp:39] profiler_start
+USDT:2026-10-19 17:26:57 18729:18729 SyncActivityProfilerHandler.cpp:46] profiler_stop
+USDT:2026-10-19 17:26:57 18729:18729 SyncActivityProfilerHandler.cpp:39] profiler_start
+USDT:2026-10-19 17:26:57 18729:18729 SyncActivityProfilerHandler.cpp:46] profiler_stop
+USDT:2026-10-19 17:26:58 18729:18729 SyncActivityProfilerHandler.cpp:39] profiler_start
+USDT:2026-10-19 17:26:58 18729:18729 SyncActivityProfilerHandler.cpp:46] profiler_stop
+USDT:2026-10-19 17:26:58 18729:18729 SyncActivityProfilerHandler.cpp:39] profiler_start
+USDT:2026-10-19 17:26:58 18729:18729 SyncActivityProfilerHandler.cpp:46] profiler_stop
+USDT:2026-10-19 17:26:58 18729:18729 SyncActivityProfilerHandler.cpp:39] profiler_start
+USDT:2026-10-19 17:26:58 18729:18729 SyncActivityProfilerHandler.cpp:46] profiler_stop
+8 4 {'direct': 9.696, 'single_if': 17.088, 'tree': 45.12, 'direct_stats': 15.552, 'tree_stats': 53.088, 'production': 55.008, 'switch_no_stats': 16.384, 'switch_stats': 23.936, 'switch_production': 25.888}
+16 8 {'direct': 10.752, 'single_if': 18.304, 'tree': 56.064, 'direct_stats': 16.64, 'tree_stats': 63.872, 'production': 65.76, 'switch_no_stats': 17.792, 'switch_stats': 25.376, 'switch_production': 27.552}
+USDT:2026-10-19 17:27:00 18729:18729 SyncActivityProfilerHandler.cpp:39] profiler_start
+USDT:2026-10-19 17:27:00 18729:18729 SyncActivityProfilerHandler.cpp:46] profiler_stop
+USDT:2026-10-19 17:27:00 18729:18729 SyncActivityProfilerHandler.cpp:39] profiler_start
+USDT:2026-10-19 17:27:00 18729:18729 SyncActivityProfilerHandler.cpp:46] profiler_stop
+USDT:2026-10-19 17:27:00 18729:18729 SyncActivityProfilerHandler.cpp:39] profiler_start
+USDT:2026-10-19 17:27:00 18729:18729 SyncActivityProfilerHandler.cpp:46] profiler_stop
+USDT:2026-10-19 17:27:00 18729:18729 SyncActivityProfilerHandler.cpp:39] profiler_start
+USDT:2026-10-19 17:27:00 18729:18729 SyncActivityProfilerHandler.cpp:46] profiler_stop
+USDT:2026-10-19 17:27:00 18729:18729 SyncActivityProfilerHandler.cpp:39] profiler_start
+USDT:2026-10-19 17:27:00 18729:18729 SyncActivityProfilerHandler.cpp:46] profiler_stop
+USDT:2026-10-19 17:27:00 18729:18729 SyncActivityProfilerHandler.cpp:39] profiler_start
+USDT:2026-10-19 17:27:00 18729:18729 SyncActivityProfilerHandler.cpp:46] profiler_stop
+32 16 {'direct': 12.928, 'single_if': 20.384, 'tree': 69.248, 'direct_stats': 18.688, 'tree_stats': 76.928, 'production': 78.912, 'switch_no_stats': 20.576, 'switch_stats': 28.128, 'switch_production': 30.272}

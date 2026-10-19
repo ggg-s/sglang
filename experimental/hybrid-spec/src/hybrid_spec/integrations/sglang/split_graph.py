@@ -41,10 +41,13 @@ class SplitDraftGraphBackend:
         self.mode = mode
         config = getattr(runner.eagle_worker.draft_extension, "config", None)
         self.conditional = getattr(config, "conditional_draft_graph", False)
+        self.conditional_dispatch = getattr(
+            config, "conditional_draft_graph_dispatch", "if"
+        )
         if self.conditional:
             from .conditional_graph import require_conditional_graph
 
-            require_conditional_graph()
+            require_conditional_graph(self.conditional_dispatch)
         self.records = {}
         self.stream = None
         self.counters = {
@@ -124,6 +127,8 @@ class SplitDraftGraphBackend:
             self.counters["tail_batch_histogram"]
         )
         result["conditional_draft_graph"] = self.conditional
+        if self.conditional:
+            result["conditional_draft_graph_dispatch"] = self.conditional_dispatch
         for record in self.records.values():
             if record.conditional is None:
                 continue

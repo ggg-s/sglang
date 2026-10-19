@@ -1,39 +1,59 @@
 """Experimental device-side dispatch of fixed-shape compact draft tails.
 
-Use the same CUDAGraph IF bindings as PyTorch's torch.cond capture adapter.
-Capture model bodies directly: model metadata mutates Python objects and is
-not a functional torch.cond branch. No nested graph replay or new CUDA ABI.
+IF uses PyTorch's conditional bindings. SWITCH uses a capture-only CUDA adapter
+and PyTorch-owned fixed-shape child graphs. Model metadata mutates Python
+objects, so neither path requires functional torch.cond tracing.
 """
 
 from __future__ import annotations
 
+from functools import lru_cache
+from pathlib import Path
+
 import torch
 
 
-def require_conditional_graph():
+def require_conditional_graph(dispatch="if"):
+    if dispatch not in ("if", "switch"):
+        raise ValueError("conditional dispatch must be if or switch")
     version = torch.version.cuda
+    minimum = (12, 8) if dispatch == "switch" else (12, 4)
+    methods = (
+        ("raw_cuda_graph", "instantiate")
+        if dispatch == "switch"
+        else ("begin_capture_to_if_node", "end_capture_to_conditional_node")
+    )
     if (
         torch.version.hip is not None
         or version is None
-        or tuple(int(part) for part in version.split(".")[:2]) < (12, 4)
-        or not all(
-            hasattr(torch.cuda.CUDAGraph, name)
-            for name in (
-                "begin_capture_to_if_node",
-                "end_capture_to_conditional_node",
-            )
-        )
+        or tuple(int(part) for part in version.split(".")[:2]) < minimum
+        or not all(hasattr(torch.cuda.CUDAGraph, name) for name in methods)
     ):
         raise ValueError(
-            "conditional_draft_graph requires NVIDIA CUDA >=12.4 and PyTorch "
-            "CUDAGraph conditional-node bindings (PyTorch 2.14 API); "
+            f"conditional {dispatch} requires NVIDIA CUDA >={minimum[0]}.{minimum[1]} "
+            "and compatible PyTorch CUDAGraph conditional-node bindings/raw graph APIs; "
             "set conditional_draft_graph=false for ordinary split dispatch"
         )
 
 
+@lru_cache(maxsize=1)
+def _switch_adapter():
+    from torch.utils.cpp_extension import load
+
+    return load(
+        name="hybrid_spec_switch_graph",
+        sources=[str(Path(__file__).with_name("switch_graph.cu"))],
+        extra_cuda_cflags=["-O3"],
+    )
+
+
 class ConditionalTailGraph:
-    def __init__(self, record, stream):
-        require_conditional_graph()
+    def __init__(self, record, stream, *, dispatch="if"):
+        require_conditional_graph(dispatch)
+        # Compile before capture, on every TP rank. No rank-local fallback.
+        adapter = _switch_adapter() if dispatch == "switch" else None
+        self.dispatch = dispatch
+        self.leaf_graphs = []
         self.batch_size = record.inputs.batch_size
         count = record.num_neural
         self.live_bs = torch.full_like(count, self.batch_size)
@@ -76,10 +96,29 @@ class ConditionalTailGraph:
             self.stats.zero_()
         torch.cuda.synchronize()
         try:
+            if adapter is not None:
+                # Capture with PyTorch so allocator bookkeeping stays owned
+                # by its graph objects. Keep every leaf's pool alive until reset.
+                # These deterministic inference graphs are child graph nodes,
+                # not nested calls to CUDAGraph.replay().
+                for size in range(1, self.batch_size + 1):
+                    leaf = torch.cuda.CUDAGraph(keep_graph=True)
+                    self.leaf_graphs.append(leaf)
+                    with torch.cuda.graph(
+                        leaf, pool=torch.cuda.graph_pool_handle(), stream=stream
+                    ):
+                        record.tails[size].forward()
             with torch.cuda.graph(
                 self.graph, pool=torch.cuda.graph_pool_handle(), stream=stream
             ):
-                branch(count > 0, lambda: capture_range(1, self.batch_size))
+                if adapter is None:
+                    branch(count > 0, lambda: capture_range(1, self.batch_size))
+                else:
+                    adapter.capture_switch(
+                        count.data_ptr(),
+                        [leaf.raw_cuda_graph() for leaf in self.leaf_graphs],
+                        stream.cuda_stream,
+                    )
                 statistics()
         except Exception as exc:
             # Do not retry/fall back independently on a TP rank after partial
@@ -102,3 +141,6 @@ class ConditionalTailGraph:
 
     def reset(self):
         self.graph.reset()
+        for leaf in self.leaf_graphs:
+            leaf.reset()
+        self.leaf_graphs.clear()

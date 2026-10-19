@@ -1,0 +1,25 @@
+{
+  "source_base": "55444165099a4248e6ea534c0c51171ff06bcb85",
+  "source_sha256": {
+    "experimental/hybrid-spec/pyproject.toml": "fa2fdd43bdf7701187bb66c2450891e967af4b2c0d4f9906a978ac522b91747c",
+    "experimental/hybrid-spec/src/hybrid_spec/config.py": "d233045e6f6bed82205d33848625f9df01868f6cc3aeee46550065c3a92e4cbb",
+    "experimental/hybrid-spec/src/hybrid_spec/selection/verify_costs.py": "19fa1b90aa64062191274ee984323edaa48503aaa2f88e7b7e65b71f592116c6",
+    "experimental/hybrid-spec/src/hybrid_spec/integrations/sglang/compact_graph.py": "8de4da11753d5c180533b8ff76495f27e08f000d23a9b5af457216fb5a171619",
+    "experimental/hybrid-spec/src/hybrid_spec/integrations/sglang/conditional_graph.py": "0bccc9d8cfe5b9dddc8a2836cd20fb16706bea433497eb91e21256c6aaf6a8a8",
+    "experimental/hybrid-spec/src/hybrid_spec/integrations/sglang/split_graph.py": "cf4e90c7b0c554101882bac83f4a99c081e2681d758d99c5239b11da9ab80f4a",
+    "experimental/hybrid-spec/src/hybrid_spec/integrations/sglang/switch_graph.cu": "8467f53a5023a0468294becbb81e3d7b9dce6804562415791315fcdcacb9ed65",
+    "experimental/hybrid-spec/tests/test_core.py": "29e0d226b38e3d9aff56e8fd433621a49e3490c15b3ebe660271f211f154c526",
+    "experimental/hybrid-spec/tests/test_cuda.py": "43d5a05902468b191a8e3c31cdd3b8c31a0777a989c39012ab5def08023dfdb8",
+    "experimental/hybrid-spec/tests/test_compact_tail.py": "bbeab2b4cbf50b1ac500194312063ce74188c98ff788ec6f5a048ad3f640c1e7",
+    "experimental/hybrid-spec/tests/test_switch_graph.py": "8681b0b8545cb695a0366526af0c84da4104eda9ef4395aa69107f07901e9281",
+    "experimental/hybrid-spec/tests/test_tp.py": "9748bf5fdb2754b0704adb62eb1cd8b4bff8f7cc1f12358c08aeabffd9084dd3"
+  },
+  "server": "ai-workstation",
+  "scope": "TP1 synthetic recurrence/metadata and dispatch, no full model or TP2",
+  "timing": "same Case.measure from IF overhead experiment; 31 randomized GPU event samples with 2M-cycle delay, excludes common prefix/row compaction. Wall 7 randomized groups x 100 fenced rounds, 50 interleaved warmups. Initial and repeated measurement retained.",
+  "helpers": {
+    "ablate_dispatch.py": "3942f409075ee8b8a6b05bd1c79518e0af69f1f68e5ac7020bdb228ba45ea20d",
+    "dispatch_probe.py": "5e7aa5c05f35586edaa218ff78528b0b6630ba6a4b1ca49bb2430424b6b10005",
+    "compare_dispatch.py": "508cac76e9bd0d142d3639dad7aa4e86ae5e7f7db69233298e8dddd12358ac31"
+  }
+}

@@ -112,7 +112,11 @@ def capture_compact(runner, batch, forward_fn, stream, post_warmup_hook, mode="s
         if conditional:
             from .conditional_graph import ConditionalTailGraph
 
-            record.conditional = ConditionalTailGraph(record, stream)
+            record.conditional = ConditionalTailGraph(
+                record,
+                stream,
+                dispatch=getattr(config, "conditional_draft_graph_dispatch", "if"),
+            )
     return record
 
 

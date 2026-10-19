@@ -37,6 +37,7 @@ class HybridConfig:
     dynamic_verify_min_drafts: int = 1
     dynamic_verify_cost_table_path: str | None = None
     conditional_draft_graph: bool = False
+    conditional_draft_graph_dispatch: str = "if"
 
     def __post_init__(self):
         for name in (
@@ -67,6 +68,14 @@ class HybridConfig:
             self.conditional_draft_graph and self.draft_graph_mode != "split"
         ):
             raise ValueError("conditional_draft_graph requires draft_graph_mode=split")
+        if self.conditional_draft_graph_dispatch not in ("if", "switch") or (
+            self.conditional_draft_graph_dispatch != "if"
+            and not self.conditional_draft_graph
+        ):
+            raise ValueError(
+                "conditional_draft_graph_dispatch requires if or switch "
+                "and switch requires conditional_draft_graph=true"
+            )
         if self.verify_mode not in ("static", "padded", "compact"):
             raise ValueError("verify_mode must be static, padded or compact")
         neural = self.neural_drafts
