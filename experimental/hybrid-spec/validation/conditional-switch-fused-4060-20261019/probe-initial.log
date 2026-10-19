@@ -1,0 +1,14 @@
+/workspace/conditional-graph-20261019/venv/lib/python3.12/site-packages/torch/cuda/graphs.py:630: UserWarning: The CUDA Graph is empty. This usually means that the graph was attempted to be captured on wrong device or stream. (Triggered internally at /__w/pytorch/pytorch/aten/src/ATen/cuda/CUDAGraph.cpp:249.)
+  super().capture_end_pre()
+Traceback (most recent call last):
+  File "/workspace/conditional-switch-fused-20261019/compare_rounds.py", line 201, in <module>
+    checked = case.validate()
+              ^^^^^^^^^^^^^^^
+  File "/workspace/conditional-switch-fused-20261019/compare_rounds.py", line 115, in validate
+    self.run(mode, raw_bs)
+  File "/workspace/conditional-switch-fused-20261019/compare_rounds.py", line 85, in run
+    old_compact.replay_compact(self.host_record, self.counters, b)
+  File "/workspace/conditional-switch-20261019/repo/experimental/hybrid-spec/src/hybrid_spec/integrations/sglang/compact_graph.py", line 366, in replay_compact
+    record.tails[size].graph.replay()
+    ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+AttributeError: 'NoneType' object has no attribute 'replay'

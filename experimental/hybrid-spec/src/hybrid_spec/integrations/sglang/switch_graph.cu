@@ -19,15 +19,27 @@ void check(cudaError_t error) {
 }
 
 __global__ void set_switch_handle(cudaGraphConditionalHandle handle,
-                                  const int* count) {
-  cudaGraphSetConditional(handle, static_cast<unsigned int>(*count));
+                                  const int* count, unsigned long long* stats,
+                                  const int* live_bs, unsigned int capacity) {
+  unsigned int size = static_cast<unsigned int>(*count);
+  cudaGraphSetConditional(handle, size);
+  if (stats != nullptr && size <= capacity) {
+    atomicAdd(stats + size, 1ULL);
+    if (size > 0 && size < static_cast<unsigned int>(*live_bs)) {
+      atomicAdd(stats + capacity + 1, 1ULL);
+    }
+  }
 }
 
 // Called once inside the parent's torch.cuda.graph capture, never during replay.
 void capture_switch(uintptr_t count_ptr, const std::vector<uintptr_t>& leaves,
-                    uintptr_t stream_ptr) {
+                    uintptr_t stream_ptr, uintptr_t stats_ptr,
+                    uintptr_t live_bs_ptr) {
   if (leaves.empty() || count_ptr == 0) {
     throw std::invalid_argument("SWITCH needs a count and at least one tail");
+  }
+  if (stats_ptr != 0 && live_bs_ptr == 0) {
+    throw std::invalid_argument("SWITCH statistics require the actual batch");
   }
   auto stream = reinterpret_cast<cudaStream_t>(stream_ptr);
   cudaStreamCaptureStatus status;
@@ -48,7 +60,10 @@ void capture_switch(uintptr_t count_ptr, const std::vector<uintptr_t>& leaves,
   cudaGraphConditionalHandle handle;
   check(cudaGraphConditionalHandleCreate(&handle, graph, 0, 0));
   set_switch_handle<<<1, 1, 0, stream>>>(
-      handle, reinterpret_cast<const int*>(count_ptr));
+      handle, reinterpret_cast<const int*>(count_ptr),
+      reinterpret_cast<unsigned long long*>(stats_ptr),
+      reinterpret_cast<const int*>(live_bs_ptr),
+      static_cast<unsigned int>(leaves.size()));
   check(cudaGetLastError());
   // Refresh dependencies after the setter; no body may run before it.
 #if CUDART_VERSION >= 13000
@@ -90,5 +105,7 @@ void capture_switch(uintptr_t count_ptr, const std::vector<uintptr_t>& leaves,
 }  // namespace
 
 PYBIND11_MODULE(TORCH_EXTENSION_NAME, module) {
-  module.def("capture_switch", &capture_switch);
+  module.def("capture_switch", &capture_switch, pybind11::arg("count_ptr"),
+             pybind11::arg("leaves"), pybind11::arg("stream_ptr"),
+             pybind11::arg("stats_ptr") = 0, pybind11::arg("live_bs_ptr") = 0);
 }

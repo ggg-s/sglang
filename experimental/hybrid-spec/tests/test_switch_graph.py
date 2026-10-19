@@ -12,7 +12,10 @@ from hybrid_spec.integrations.sglang.conditional_graph import (
 
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="requires NVIDIA CUDA")
 @pytest.mark.parametrize("batch_size", [1, 3, 8, 32])
-def test_switch_replay_selects_exact_tail_and_preserves_private_allocations(batch_size):
+@pytest.mark.parametrize("batch_prepared", [False, True])
+def test_switch_replay_selects_exact_tail_and_preserves_private_allocations(
+    batch_size, batch_prepared
+):
     """Catch off-by-one case selection, stale handles and recycled leaf buffers."""
     require_conditional_graph("switch")
     count = torch.zeros((), dtype=torch.int32, device="cuda")
@@ -33,15 +36,30 @@ def test_switch_replay_selects_exact_tail_and_preserves_private_allocations(batc
             tail.forward()
     torch.cuda.synchronize()
     dispatcher = ConditionalTailGraph(record, stream, dispatch="switch")
+    from hybrid_spec.backends.gpu_sa.row_compaction import compact_neural_rows
+
+    rows = torch.empty(batch_size, dtype=torch.int64, device="cuda")
+    index = torch.arange(batch_size, device="cuda")
     expected_histogram = [0] * (batch_size + 1)
     mixed = 0
     for raw_bs in sorted({1, max(1, batch_size - 1), batch_size}):
         for size in [*range(raw_bs + 1), *range(raw_bs, -1, -1)]:
             count.fill_(size)
+            if batch_prepared:
+                # Poison the previous batch to detect a missing fused store.
+                dispatcher.live_bs.fill_(-99)
+                compact_neural_rows(
+                    index >= size,
+                    rows,
+                    count,
+                    raw_bs,
+                    False,
+                    live_bs=dispatcher.live_bs,
+                )
             output.fill_(-1)
             # Allocate/release outside the graph to exercise pool retention.
             poison = torch.full((4096,), 999, dtype=torch.int64, device="cuda")
-            dispatcher.replay(raw_bs)
+            dispatcher.replay(raw_bs, batch_prepared=batch_prepared)
             assert output.cpu().tolist() == [
                 (row + 17) * size if row < size else -1 for row in range(batch_size)
             ]
@@ -72,4 +90,8 @@ def test_switch_cost_profile_requires_matching_dispatch():
     with pytest.raises(ValueError, match="does not match hybrid config"):
         parse_cost_profile(profile, switch)
     costs, fixed = {(1, 512): {9: (0.2, 0.4)}}, {(1, 512): 0.2}
-    parse_cost_profile(cost_profile(switch, costs, fixed), switch)
+    fused = cost_profile(switch, costs, fixed)
+    parse_cost_profile(fused, switch)
+    fused["config"].pop("conditional_draft_graph_revision")
+    with pytest.raises(ValueError, match="does not match hybrid config"):
+        parse_cost_profile(fused, switch)

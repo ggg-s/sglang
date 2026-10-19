@@ -42,11 +42,11 @@ class CompactCapture:
     conditional: object | None = None
 
 
-def compact_neural_rows(mask, rows, count, raw_bs, no_skip):
+def compact_neural_rows(mask, rows, count, raw_bs, no_skip, *, live_bs=None):
     # Keep imports CPU-only until the CUDA runtime actually dispatches.
     from hybrid_spec.backends.gpu_sa.row_compaction import compact_neural_rows as run
 
-    run(mask, rows, count, raw_bs, no_skip)
+    run(mask, rows, count, raw_bs, no_skip, live_bs=live_bs)
 
 
 def capture_compact(runner, batch, forward_fn, stream, post_warmup_hook, mode="split"):
@@ -326,14 +326,25 @@ def replay_compact(record, counters, raw_bs):
         raise ValueError("raw batch must fit the captured prefix")
     record.prefix.replay()
     if record.conditional is not None:
-        compact_neural_rows(
-            record.override.use_retrieval,
-            record.rows,
-            record.num_neural,
-            raw_bs,
-            False,
-        )
-        record.conditional.replay(raw_bs)
+        if getattr(record.conditional, "dispatch", "if") == "switch":
+            compact_neural_rows(
+                record.override.use_retrieval,
+                record.rows,
+                record.num_neural,
+                raw_bs,
+                False,
+                live_bs=record.conditional.live_bs,
+            )
+            record.conditional.replay(raw_bs, batch_prepared=True)
+        else:
+            compact_neural_rows(
+                record.override.use_retrieval,
+                record.rows,
+                record.num_neural,
+                raw_bs,
+                False,
+            )
+            record.conditional.replay(raw_bs)
         # Verify may need its own host-visible token budget. Do not turn the
         # intermediate draft decision back into a blocking read for that reuse.
         record.runtime_num_neural = None

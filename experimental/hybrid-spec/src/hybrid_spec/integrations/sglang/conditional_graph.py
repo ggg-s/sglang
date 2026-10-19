@@ -41,7 +41,7 @@ def _switch_adapter():
     from torch.utils.cpp_extension import load
 
     return load(
-        name="hybrid_spec_switch_graph",
+        name="hybrid_spec_switch_graph_v2",
         sources=[str(Path(__file__).with_name("switch_graph.cu"))],
         extra_cuda_cflags=["-O3"],
     )
@@ -57,8 +57,8 @@ class ConditionalTailGraph:
         self.batch_size = record.inputs.batch_size
         count = record.num_neural
         self.live_bs = torch.full_like(count, self.batch_size)
-        # B+1 tail histogram bins followed by a mixed-batch counter. All
-        # updates are captured; only an explicit diagnostic call reads them.
+        # B+1 histogram bins and a mixed counter. SWITCH updates these in its
+        # setter kernel; IF uses captured tensor ops. Only diagnostics read back.
         self.stats = torch.zeros(
             self.batch_size + 2, dtype=torch.int64, device=count.device
         )
@@ -92,7 +92,8 @@ class ConditionalTailGraph:
         stream.wait_stream(torch.cuda.current_stream())
         with torch.cuda.stream(stream):
             count.zero_()
-            statistics()
+            if adapter is None:
+                statistics()
             self.stats.zero_()
         torch.cuda.synchronize()
         try:
@@ -113,13 +114,15 @@ class ConditionalTailGraph:
             ):
                 if adapter is None:
                     branch(count > 0, lambda: capture_range(1, self.batch_size))
+                    statistics()
                 else:
                     adapter.capture_switch(
                         count.data_ptr(),
                         [leaf.raw_cuda_graph() for leaf in self.leaf_graphs],
                         stream.cuda_stream,
+                        self.stats.data_ptr(),
+                        self.live_bs.data_ptr(),
                     )
-                statistics()
         except Exception as exc:
             # Do not retry/fall back independently on a TP rank after partial
             # collective capture. Restart all ranks with the option disabled.
@@ -130,8 +133,11 @@ class ConditionalTailGraph:
             ) from exc
         self.staging = (one,)
 
-    def replay(self, raw_bs):
-        self.live_bs.fill_(raw_bs)
+    def replay(self, raw_bs, *, batch_prepared=False):
+        # Production SWITCH compaction already wrote this on the same stream.
+        # Direct callers retain the explicit fill to avoid a stale raw batch.
+        if not batch_prepared:
+            self.live_bs.fill_(raw_bs)
         self.graph.replay()
 
     def snapshot(self):

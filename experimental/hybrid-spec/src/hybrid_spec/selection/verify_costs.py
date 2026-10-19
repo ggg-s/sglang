@@ -15,18 +15,19 @@ from pathlib import Path
 
 def cost_config(config):
     # Scheduling/learning knobs may change between calibration and serving.
-    return json.loads(
-        json.dumps(
-            {
-                k: v
-                for k, v in asdict(config).items()
-                if not k.startswith("dynamic_verify")
-                # Preserve tables produced before this opt-in was introduced.
-                and (k != "conditional_draft_graph" or v)
-                and (k != "conditional_draft_graph_dispatch" or v != "if")
-            }
-        )
-    )
+    values = {
+        k: v
+        for k, v in asdict(config).items()
+        if not k.startswith("dynamic_verify")
+        # Preserve tables produced before this opt-in was introduced.
+        and (k != "conditional_draft_graph" or v)
+        and (k != "conditional_draft_graph_dispatch" or v != "if")
+    }
+    if config.conditional_draft_graph_dispatch == "switch":
+        # The fused setter and compaction remove per-round kernels. A table
+        # collected with the original SWITCH must not seed these fixed costs.
+        values["conditional_draft_graph_revision"] = 2
+    return json.loads(json.dumps(values))
 
 
 def cost_profile(config, costs, draft_costs, runtime=None):

@@ -1,0 +1,25 @@
+Triage View
+Mode: single-trace
+Framework: SGLang
+Input traces: /Users/gq/Desktop/workspces/sglang/experimental/hybrid-spec/validation/conditional-switch-fused-4060-20261019/seed-911/b32-n16-fused.trace.json.gz
+
+Kernel Table
+| Kernel | Category | GPU time | Share | Launches | Python location (site share) | CPU op |
+| --- | --- | ---: | ---: | ---: | --- | --- |
+| void at::native::(anonymous namespace)::indexSelectSmallIndex<c10::Half, long, unsigned int, 2, 2, -2> | other | 0.03 ms | 37.6% | 5 | unresolved | - |
+| void cutlass::Kernel2<cutlass_80_wmma_tensorop_f16_s161616gemm_f16_32x32_32x1_nn_align8> | gemm | 0.02 ms | 21.0% | 5 | unresolved | - |
+| void at::native::index_elementwise_kernel<128, 4, at::native::index_copy_kernel_impl<at::native::OpaqueType<8> >(at::TensorIterator&, long, long, long)::{lambda(int)#1}> | memory | 0.01 ms | 9.6% | 5 | unresolved | - |
+| void at::native::elementwise_kernel<128, 4, at::native::gpu_kernel_impl<at::native::direct_copy_kernel_cuda(at::TensorIteratorBase&)::{lambda()#3}::operator()() const::{lambda()#4}::operator()() const::{lambda(long)#1}>(at::TensorIteratorBase&, at::native::direct_copy_kernel_cuda(at::TensorIteratorBase&)::{lambda()#3}::operator()() const::{lambda()#4}::operator()() const::{lambda(long)#1} const&)::{lambda(int)#1}> | memory | 0.01 ms | 9.6% | 5 | unresolved | - |
+| _compact_neural_rows | other | 0.01 ms | 8.3% | 5 | unresolved | cuLaunchKernelEx |
+| (anonymous namespace)::set_switch_handle(unsigned long long, int const*, unsigned long long*, int const*, unsigned int) | other | 0.01 ms | 8.1% | 5 | unresolved | cudaGraphLaunch |
+| void at::native::vectorized_elementwise_kernel<2, at::native::FillFunctor<long>, std::array<char*, 1ul>, false> | memory | 0.00 ms | 5.7% | 5 | unresolved | cudaGraphLaunch |
+
+Overlap Opportunity Table
+| Priority | Verdict | Kernel | Python scope | Formal signal | Dep risk | Recommendation |
+| --- | --- | --- | --- | --- | --- | --- |
+| - | - | No rows cleared the 1.0% reporting bar. Use mapping/formal mode for overlap attribution. | - | - | - | - |
+
+Fuse Opportunity Table
+| Pattern | Confidence | Related GPU time | Share | Evidence kernels | Current kernel Python location | Candidate fused Python path | Rationale |
+| --- | --- | ---: | ---: | --- | --- | --- | --- |
+| No medium-confidence source-backed fusion opportunity matched this trace. | - | - | - | - | - | - | - |

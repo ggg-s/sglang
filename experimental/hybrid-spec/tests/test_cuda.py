@@ -1077,16 +1077,22 @@ def test_compact_tail_graph_reorders_rows_without_computing_sa_requests(
 
 @pytest.mark.parametrize("size", [1, 8, 33, 257, 4097])
 @pytest.mark.parametrize("no_skip", [False, True])
-def test_gpu_dynamic_rows_stable_scan_excludes_padding(size, no_skip):
+@pytest.mark.parametrize("write_live_bs", [False, True])
+def test_gpu_dynamic_rows_stable_scan_excludes_padding(size, no_skip, write_live_bs):
     from hybrid_spec.backends.gpu_sa.row_compaction import compact_neural_rows
 
     rows = torch.empty(size, dtype=torch.int64, device="cuda")
     count = torch.empty((), dtype=torch.int32, device="cuda")
+    live_bs = torch.empty_like(count) if write_live_bs else None
     index = torch.arange(size, device="cuda")
     for raw_bs in (size, size // 2, 0, min(size, 1), size):
         for mask in (index % 3 == 0, index >= 0, index < 0):
             rows.fill_(-1)
-            compact_neural_rows(mask, rows, count, raw_bs, no_skip)
+            if live_bs is not None:
+                live_bs.fill_(-99)
+            compact_neural_rows(mask, rows, count, raw_bs, no_skip, live_bs=live_bs)
+            if live_bs is not None:
+                assert int(live_bs) == raw_bs
             expected = [i for i in range(raw_bs) if no_skip or not bool(mask[i])]
             assert int(count) == len(expected)
             assert rows[: len(expected)].tolist() == expected

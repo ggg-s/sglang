@@ -40,13 +40,17 @@ token 档位时原有的 host 读回仍可能存在，不能据此宣称整轮�
 以上是 IF 路径。SWITCH 将每个确定性 tail 单独捕获为
 `CUDAGraph(keep_graph=True)`，然后把它作为一个 SWITCH body 中的 child
 graph node；0 是空分支，1..B 对应精确行数。一个 CUDA kernel 直接读取
-int32 `num_neural` 并设置条件 handle，省去 IF 树的多次比较和 handle 设置。
+int32 `num_neural`、设置条件 handle，并累计 histogram/mixed 统计，省去
+IF 树的多次比较、handle 设置及独立统计 kernel。
 捕图期间通过 CUDA API 把 SWITCH 插入 PyTorch 的 parent graph，更新其
-依赖，使后续统计等待所选 tail 完成。热路径没有 Python 选分支或嵌套 replay。
+依赖，使所选 tail 等待 setter 完成。热路径没有 Python 选分支或嵌套 replay。
 全部 leaf Graph 对象及其 private pool 保留到 parent reset 后才释放；
 不能只留下 CUDA raw pointer，否则临时 tensor 的地址可能被重新分配。
 仅适用于已有的确定性 greedy 推理 tail，不支持含随机采样的 child graph。
-统计和 `live_bs.fill_` 与 IF 路径相同，prefix 仍未合图；不承诺减少启动数或显存。
+SWITCH 生产路径在行压缩 kernel 内写入 `live_bs`，不再单独 `fill_`；
+histogram/mixed 仍逐步准确累计。直接调用 dispatcher 而未经过行压缩时，
+`replay(raw_bs)` 保留 fill，防止缩批使用旧 batch。prefix 仍未合图；
+不承诺减少 Graph 启动数或显存。
 
 `num_neural=0` 时跳过所有 tail；其余大小按平衡 IF 树选一条分支，
 避免每轮对所有大小逐个执行条件判断。压缩行号仍稳定排序，只包含实际请求，
@@ -94,6 +98,8 @@ IF 节点、统计与启动的消融见 [4060 开销分析](validation/condition
 B=32 时当前 IF 树是主要新增成本，消除 `.item()` 仍可能回退。
 后续 [SWITCH 实测记录](validation/conditional-switch-4060-20261019/README.md)
 包含接入方式、659 项回归及 IF/SWITCH 开销对照。
+[统计/batch 融合记录](validation/conditional-switch-fused-4060-20261019/README.md)
+包含当前 SWITCH 的 673 项回归及与原 SWITCH、`.item()` 的整轮交错对照。
 TP2 条件 collective 和真实模型服务仍待验收；skip 不代表验证通过。
 在已可运行的原生模型命令上设置：
 
@@ -126,3 +132,4 @@ CPU 侧只即时维护 `prefix_ct` / `request_ct`，不要直接把进程内的
 开启 conditional 会改变共享固定成本，因此离线耗时表必须按新配置重跑；
 默认关闭时仍兼容此前没有该字段的旧表。
 IF 与 SWITCH 使用不同的耗时表指纹，切换 dispatch 后也需要重跑离线表。
+融合版 SWITCH 的指纹另含 revision=2，旧 SWITCH 的表也会被拒绝。

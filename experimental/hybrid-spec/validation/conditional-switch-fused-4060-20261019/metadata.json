@@ -1,0 +1,27 @@
+{
+  "source_base": "8f9d113455",
+  "source_sha256": {
+    "experimental/hybrid-spec/src/hybrid_spec/backends/gpu_sa/row_compaction.py": "87e669fbeea22e2d4db19e1f8edd2868bad0a9457d39f40e2321832e12a92a0e",
+    "experimental/hybrid-spec/src/hybrid_spec/integrations/sglang/compact_graph.py": "42a9c84c0176e56349b1ede8e500141886e7de2b8371af6c12fe0ea324b506fe",
+    "experimental/hybrid-spec/src/hybrid_spec/integrations/sglang/conditional_graph.py": "b061c449aeb3d0a4fb9659c38bcc334e961e6455e5d63e1f49a32d78e400ad37",
+    "experimental/hybrid-spec/src/hybrid_spec/integrations/sglang/switch_graph.cu": "79ca51238bc71f71eadf480b189e32bcbf637b4e1202e69398f63f9ad72da890",
+    "experimental/hybrid-spec/src/hybrid_spec/selection/verify_costs.py": "e35283892aaaeba110fe9962188f35ad3a59f955f5847b2b32fc6fb376786d96",
+    "experimental/hybrid-spec/tests/test_switch_graph.py": "35d938d30ddcdffb37ba0c9719808fabc23bf769c8848f304104cfc86dfd5cd2",
+    "experimental/hybrid-spec/tests/test_cuda.py": "9139923234248ea1fefdca6a56e4d8d242c27b7f290b775a89c5713cdd0b9f51"
+  },
+  "baseline_sha256": {
+    "backends/gpu_sa/row_compaction.py": "919ae9469643d26ca71822513cb1c80e1b24821efa52c661959755f849e6e7f1",
+    "integrations/sglang/compact_graph.py": "8de4da11753d5c180533b8ff76495f27e08f000d23a9b5af457216fb5a171619",
+    "integrations/sglang/conditional_graph.py": "0bccc9d8cfe5b9dddc8a2836cd20fb16706bea433497eb91e21256c6aaf6a8a8",
+    "integrations/sglang/switch_graph.cu": "8467f53a5023a0468294becbb81e3d7b9dce6804562415791315fcdcacb9ed65"
+  },
+  "baseline_import_relocation": "Only old compact_graph row_compaction import redirected to a separate module name; execution and GPU sources unchanged.",
+  "helpers": {
+    "compare_rounds.py": "f5beffe3409f9c99b959eb1c7c6b6a31c26025466c6a4a59183c7d9c28011937",
+    "ablate_dispatch.py": "3942f409075ee8b8a6b05bd1c79518e0af69f1f68e5ac7020bdb228ba45ea20d",
+    "dispatch_probe.py": "5e7aa5c05f35586edaa218ff78528b0b6630ba6a4b1ca49bb2430424b6b10005"
+  },
+  "server": "ai-workstation",
+  "timing": "Each seed uses 100 interleaved warmups, 15 blocks x 100 iterations; all three modes randomly ordered within each iteration; full round wall includes final CUDA synchronize. GPU dispatch:31 randomized event samples with 2M-cycle sleep before start event, excludes prefix/scan.",
+  "scope": "TP1 synthetic small GEMM draft round; no target verify, model weights or NCCL; baseline buffers/prefix/tails shared; all graphs/pools retained during comparison."
+}
