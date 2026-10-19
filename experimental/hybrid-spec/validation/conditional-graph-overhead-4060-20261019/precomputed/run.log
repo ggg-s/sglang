@@ -1,0 +1,13 @@
+USDT:2026-10-19 17:10:15 18392:18392 SyncActivityProfilerHandler.cpp:39] profiler_start
+USDT:2026-10-19 17:10:15 18392:18392 SyncActivityProfilerHandler.cpp:46] profiler_stop
+USDT:2026-10-19 17:10:15 18392:18392 SyncActivityProfilerHandler.cpp:39] profiler_start
+USDT:2026-10-19 17:10:15 18392:18392 SyncActivityProfilerHandler.cpp:46] profiler_stop
+USDT:2026-10-19 17:10:15 18392:18392 SyncActivityProfilerHandler.cpp:39] profiler_start
+USDT:2026-10-19 17:10:15 18392:18392 SyncActivityProfilerHandler.cpp:46] profiler_stop
+USDT:2026-10-19 17:10:15 18392:18392 SyncActivityProfilerHandler.cpp:39] profiler_start
+USDT:2026-10-19 17:10:15 18392:18392 SyncActivityProfilerHandler.cpp:46] profiler_stop
+USDT:2026-10-19 17:10:15 18392:18392 SyncActivityProfilerHandler.cpp:39] profiler_start
+USDT:2026-10-19 17:10:15 18392:18392 SyncActivityProfilerHandler.cpp:46] profiler_stop
+USDT:2026-10-19 17:10:15 18392:18392 SyncActivityProfilerHandler.cpp:39] profiler_start
+USDT:2026-10-19 17:10:15 18392:18392 SyncActivityProfilerHandler.cpp:46] profiler_stop
+{'direct': 13.312, 'single_if': 20.48, 'tree': 66.56, 'direct_stats': 19.456, 'tree_stats': 74.752, 'production': 76.8, 'single_if_precomputed': 19.456, 'tree_precomputed': 56.32}

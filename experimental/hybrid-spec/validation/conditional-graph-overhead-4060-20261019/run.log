@@ -1,0 +1,43 @@
+/workspace/conditional-graph-20261019/venv/lib/python3.12/site-packages/torch/cuda/graphs.py:630: UserWarning: The CUDA Graph is empty. This usually means that the graph was attempted to be captured on wrong device or stream. (Triggered internally at /__w/pytorch/pytorch/aten/src/ATen/cuda/CUDAGraph.cpp:249.)
+  super().capture_end_pre()
+USDT:2026-10-19 17:07:44 18338:18338 SyncActivityProfilerHandler.cpp:39] profiler_start
+USDT:2026-10-19 17:07:44 18338:18338 SyncActivityProfilerHandler.cpp:46] profiler_stop
+USDT:2026-10-19 17:07:44 18338:18338 SyncActivityProfilerHandler.cpp:39] profiler_start
+USDT:2026-10-19 17:07:44 18338:18338 SyncActivityProfilerHandler.cpp:46] profiler_stop
+USDT:2026-10-19 17:07:44 18338:18338 SyncActivityProfilerHandler.cpp:39] profiler_start
+USDT:2026-10-19 17:07:44 18338:18338 SyncActivityProfilerHandler.cpp:46] profiler_stop
+USDT:2026-10-19 17:07:44 18338:18338 SyncActivityProfilerHandler.cpp:39] profiler_start
+USDT:2026-10-19 17:07:44 18338:18338 SyncActivityProfilerHandler.cpp:46] profiler_stop
+USDT:2026-10-19 17:07:44 18338:18338 SyncActivityProfilerHandler.cpp:39] profiler_start
+USDT:2026-10-19 17:07:44 18338:18338 SyncActivityProfilerHandler.cpp:46] profiler_stop
+USDT:2026-10-19 17:07:44 18338:18338 SyncActivityProfilerHandler.cpp:39] profiler_start
+USDT:2026-10-19 17:07:44 18338:18338 SyncActivityProfilerHandler.cpp:46] profiler_stop
+1 0 {'host': 84.04, 'host_no_metrics': 67.47, 'direct': 33.71, 'single_if': 49.0, 'tree': 47.59, 'direct_stats': 47.25, 'tree_stats': 59.95, 'production': 79.01}
+USDT:2026-10-19 17:07:45 18338:18338 SyncActivityProfilerHandler.cpp:39] profiler_start
+USDT:2026-10-19 17:07:45 18338:18338 SyncActivityProfilerHandler.cpp:46] profiler_stop
+USDT:2026-10-19 17:07:45 18338:18338 SyncActivityProfilerHandler.cpp:39] profiler_start
+USDT:2026-10-19 17:07:45 18338:18338 SyncActivityProfilerHandler.cpp:46] profiler_stop
+USDT:2026-10-19 17:07:45 18338:18338 SyncActivityProfilerHandler.cpp:39] profiler_start
+USDT:2026-10-19 17:07:45 18338:18338 SyncActivityProfilerHandler.cpp:46] profiler_stop
+USDT:2026-10-19 17:07:45 18338:18338 SyncActivityProfilerHandler.cpp:39] profiler_start
+USDT:2026-10-19 17:07:45 18338:18338 SyncActivityProfilerHandler.cpp:46] profiler_stop
+USDT:2026-10-19 17:07:45 18338:18338 SyncActivityProfilerHandler.cpp:39] profiler_start
+USDT:2026-10-19 17:07:45 18338:18338 SyncActivityProfilerHandler.cpp:46] profiler_stop
+USDT:2026-10-19 17:07:45 18338:18338 SyncActivityProfilerHandler.cpp:39] profiler_start
+USDT:2026-10-19 17:07:45 18338:18338 SyncActivityProfilerHandler.cpp:46] profiler_stop
+1 1 {'host': 117.57, 'host_no_metrics': 129.11, 'direct': 52.01, 'single_if': 61.28, 'tree': 66.49, 'direct_stats': 60.9, 'tree_stats': 74.4, 'production': 87.44}
+4 2 {'host': 120.87, 'host_no_metrics': 106.13, 'direct': 51.97, 'single_if': 64.92, 'tree': 97.65, 'direct_stats': 68.41, 'tree_stats': 100.46, 'production': 117.39}
+16 8 {'host': 143.12, 'host_no_metrics': 116.22, 'direct': 113.64, 'single_if': 85.26, 'tree': 148.44, 'direct_stats': 64.1, 'tree_stats': 141.99, 'production': 164.09}
+USDT:2026-10-19 17:07:48 18338:18338 SyncActivityProfilerHandler.cpp:39] profiler_start
+USDT:2026-10-19 17:07:48 18338:18338 SyncActivityProfilerHandler.cpp:46] profiler_stop
+USDT:2026-10-19 17:07:48 18338:18338 SyncActivityProfilerHandler.cpp:39] profiler_start
+USDT:2026-10-19 17:07:48 18338:18338 SyncActivityProfilerHandler.cpp:46] profiler_stop
+USDT:2026-10-19 17:07:48 18338:18338 SyncActivityProfilerHandler.cpp:39] profiler_start
+USDT:2026-10-19 17:07:48 18338:18338 SyncActivityProfilerHandler.cpp:46] profiler_stop
+USDT:2026-10-19 17:07:48 18338:18338 SyncActivityProfilerHandler.cpp:39] profiler_start
+USDT:2026-10-19 17:07:48 18338:18338 SyncActivityProfilerHandler.cpp:46] profiler_stop
+USDT:2026-10-19 17:07:48 18338:18338 SyncActivityProfilerHandler.cpp:39] profiler_start
+USDT:2026-10-19 17:07:48 18338:18338 SyncActivityProfilerHandler.cpp:46] profiler_stop
+USDT:2026-10-19 17:07:48 18338:18338 SyncActivityProfilerHandler.cpp:39] profiler_start
+USDT:2026-10-19 17:07:48 18338:18338 SyncActivityProfilerHandler.cpp:46] profiler_stop
+32 16 {'host': 123.47, 'host_no_metrics': 107.73, 'direct': 62.37, 'single_if': 81.91, 'tree': 164.15, 'direct_stats': 70.45, 'tree_stats': 186.47, 'production': 198.3}

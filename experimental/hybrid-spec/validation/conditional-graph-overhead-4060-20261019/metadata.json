@@ -1,0 +1,14 @@
+{
+  "recorded_at": "2026-10-19T09:11:13.104038+00:00",
+  "server": "ai-workstation",
+  "scope": "Diagnostic synthetic dispatch, same FP16 GEMM; fixed-shape/precomputed controls are not general dynamic dispatch implementations. CPU/GPU profiler traces used for counts; timings taken without profiler.",
+  "wall_method": "7 randomized rounds x 100 fenced iterations, 50 interleaved warmups per variant",
+  "gpu_method": "31 randomized CUDA-event samples per variant, 2M-cycle sleep queued before start event to hide CPU enqueue gaps; excludes prefix and row compaction",
+  "source_sha256": {
+    "/workspace/conditional-graph-20261019/overhead/ablate_dispatch.py": "3942f409075ee8b8a6b05bd1c79518e0af69f1f68e5ac7020bdb228ba45ea20d",
+    "/workspace/conditional-graph-20261019/overhead/ablate_precomputed.py": "15380d8b4b9ad24ca0732c6958076547bedee5077de53c4ad606462beee234f7",
+    "/workspace/conditional-graph-20261019/dispatch_probe.py": "5e7aa5c05f35586edaa218ff78528b0b6630ba6a4b1ca49bb2430424b6b10005",
+    "/workspace/conditional-graph-20261019/repo/experimental/hybrid-spec/src/hybrid_spec/integrations/sglang/conditional_graph.py": "2f887179d81f04a1004b873baa459d4b6fdc744cbc54ebd437114868849f0595",
+    "/workspace/conditional-graph-20261019/repo/experimental/hybrid-spec/src/hybrid_spec/integrations/sglang/compact_graph.py": "7d5963c2850c2d2f255a0f75ce5c2b8e480655087936454b0e79381cbed2b497"
+  }
+}

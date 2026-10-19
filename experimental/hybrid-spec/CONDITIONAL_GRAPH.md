@@ -72,6 +72,8 @@ python -m pytest experimental/hybrid-spec/tests/test_tp.py \
 TP1 已在 RTX 4060 / Torch 2.14.1+cu130 验证，覆盖 20 项 conditional
 合成模型用例及 B=1/4/16/32 的 FP16 GEMM 调度探针；
 结果、首次失败和限制见 [4060 测试记录](validation/conditional-graph-4060-20261019/README.md)。
+IF 节点、统计与启动的消融见 [4060 开销分析](validation/conditional-graph-overhead-4060-20261019/README.md)：
+B=32 时当前 IF 树是主要新增成本，消除 `.item()` 仍可能回退。
 TP2 条件 collective 和真实模型服务仍待验收；skip 不代表验证通过。
 在已可运行的原生模型命令上设置：
 

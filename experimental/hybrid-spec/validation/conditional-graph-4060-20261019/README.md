@@ -53,6 +53,10 @@ B=1 的测量输入全部命中 SA，其余 B 的一半行进入 neural tail。
 不能把这些数值换算成真实模型吞吐，也不能外推 TP2。
 保持开关默认关闭，实际服务是否开启仍需模型负载 A/B。
 
+后续 [开销消融](../conditional-graph-overhead-4060-20261019/README.md) 用 GPU
+event 与预计算 predicate 对照确认 IF 树为主要新增成本。上表 B=1 的
+174.95 µs 未在交错重测中复现，不能视为该 batch 固有的大幅回退。
+
 ## 初次失败与处理
 
 - 首次 CUDA 大矩阵有 2 项普通 split 失败、278 项通过，20 项 conditional
