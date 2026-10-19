@@ -30,9 +30,12 @@ class HybridConfig:
     dynamic_verify: bool = False
     dynamic_verify_min_samples: int = 32
     dynamic_verify_explore_interval: int = 32
+    dynamic_verify_timing_interval: int = 16
+    dynamic_verify_profile: bool = False
     dynamic_verify_prior_strength: float = 4.0
     dynamic_verify_prior_rate: float = 0.8
     dynamic_verify_min_drafts: int = 1
+    dynamic_verify_cost_table_path: str | None = None
 
     def __post_init__(self):
         for name in (
@@ -78,9 +81,25 @@ class HybridConfig:
             raise ValueError("verify_token_buckets requires compact verify")
         if type(self.dynamic_verify) is not bool:
             raise ValueError("dynamic_verify must be a boolean")
+        if type(self.dynamic_verify_profile) is not bool or (
+            self.dynamic_verify_profile
+            and (not self.dynamic_verify or self.dynamic_verify_cost_table_path)
+        ):
+            raise ValueError(
+                "dynamic_verify_profile requires dynamic_verify and no seed table"
+            )
+        if self.dynamic_verify_cost_table_path is not None and (
+            not isinstance(self.dynamic_verify_cost_table_path, str)
+            or not self.dynamic_verify_cost_table_path.strip()
+            or not self.dynamic_verify
+        ):
+            raise ValueError(
+                "dynamic_verify_cost_table_path requires dynamic_verify and a path"
+            )
         for name in (
             "dynamic_verify_min_samples",
             "dynamic_verify_explore_interval",
+            "dynamic_verify_timing_interval",
             "dynamic_verify_min_drafts",
         ):
             if type(getattr(self, name)) is not int or getattr(self, name) < 1:

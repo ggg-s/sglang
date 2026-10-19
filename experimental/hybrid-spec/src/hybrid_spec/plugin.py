@@ -78,6 +78,12 @@ def register():
         HookType.AFTER,
     )
     HookRegistry.register(
+        "sglang.srt.managers.scheduler_components.internal_state."
+        "SchedulerInternalStateController._update_handlers",
+        _profile_update_handlers,
+        HookType.AFTER,
+    )
+    HookRegistry.register(
         "sglang.srt.managers.io_struct.GenerateReqInput.normalize_batch_and_arguments",
         _validate_inputs,
         HookType.BEFORE,
@@ -94,6 +100,11 @@ def _validate(server_args):
     from hybrid_spec.integrations.sglang.compatibility import validate_config
 
     config = _config()
+    if config.dynamic_verify_profile:
+        from sglang.srt.environ import envs
+
+        if envs.SGLANG_SIMULATE_ACC_LEN.get() != 1:
+            raise ValueError("hybrid cost profiling requires SGLANG_SIMULATE_ACC_LEN=1")
     validate_config(config, resolved_view(server_args))
     if config.verify_mode == "compact":
         os.environ["SGLANG_RAGGED_VERIFY_MODE"] = "compact"
@@ -201,6 +212,18 @@ def _attach(result, worker, *args, **kwargs):
         worker.target_worker.model_runner.model_config.vocab_size,
         tp_sync=tp_sync,
     )
+    if config.dynamic_verify:
+        import torch
+
+        target = worker.target_worker.model_runner
+        worker.draft_extension.cost_runtime = {
+            "target_model": target.model_config.model_path,
+            "draft_model": worker.draft_runner.model_config.model_path,
+            "gpu": torch.cuda.get_device_name(worker.gpu_id),
+            "tp_size": tp_group.world_size,
+            "dtype": str(target.dtype),
+            "kv_cache_dtype": str(target.kv_cache_dtype),
+        }
     if config.dynamic_verify and config.backend == "arctic":
         from hybrid_spec.backends.gpu_sa import GPUSuffixAutomaton
 
@@ -242,6 +265,8 @@ def _verify(result, worker, *args, **kwargs):
                 if result.can_run_cuda_graph:
                     graph = worker.target_worker.model_runner.decode_cuda_graph_runner
                     dynamic.graph_tokens = graph._ragged_graph_size
+                else:
+                    dynamic.discard_verify_timing()
                 dynamic.feedback(result.accept_lens)
         if on_device_verify := getattr(extension, "on_device_verify", None):
             on_device_verify(result, args[0] if args else kwargs["batch"])
@@ -286,6 +311,52 @@ def _diagnostics(result, controller, *args, **kwargs):
             )
 
 
+def _profile_update_handlers(result, controller):
+    """Expose calibration commands only on an explicitly dedicated profile server."""
+    worker = getattr(controller.scheduler, "draft_worker", None)
+    draft = getattr(worker, "draft_worker", None)
+    extension = getattr(draft, "draft_extension", None)
+    if extension is None or not extension.config.dynamic_verify_profile:
+        return result
+    from sglang.srt.managers.scheduler_components.internal_state import (
+        UpdateRejected,
+        _UpdateHandler,
+    )
+
+    def validate(key, value):
+        graph = worker.target_worker.model_runner.decode_cuda_graph_runner
+        if (
+            type(value) is not int
+            or value < 0
+            or graph is None
+            or not graph.capture_num_tokens
+        ):
+            raise UpdateRejected(
+                "hybrid profiling requires a nonnegative integer and CUDA graphs"
+            )
+        if (
+            key.endswith("graph_tokens")
+            and value
+            and value not in graph.capture_num_tokens
+        ):
+            raise UpdateRejected("hybrid profile graph tier was not captured")
+        if key.endswith("batch_size") and value > extension.config.max_requests:
+            raise UpdateRejected("hybrid profile batch exceeds max_requests")
+
+    def apply(key, value):
+        from hybrid_spec.integrations.sglang.compact_verify import get_dynamic_verify
+
+        device = getattr(extension, "device", None)
+        if device is None:
+            device = extension.backend.device
+        dynamic = get_dynamic_verify(extension, device)
+        dynamic.set_profile_cell(key.removeprefix("hybrid_spec_"), value)
+
+    for name in ("profile_batch_size", "profile_graph_tokens"):
+        result["hybrid_spec_" + name] = _UpdateHandler(validate, apply)
+    return result
+
+
 def _configure_verify(result, worker, batch, **kwargs):
     if worker.draft_extension is not None:
         from hybrid_spec.integrations.sglang.compact_verify import configure_verify
@@ -326,6 +397,21 @@ def _begin_draft(worker, batch, **kwargs):
             device = getattr(extension, "device", None)
             if device is None:
                 device = extension.backend.device
+            if (
+                hasattr(extension, "cost_runtime")
+                and "attention_backend" not in extension.cost_runtime
+            ):
+                target = worker.target_worker.model_runner
+                extension.cost_runtime["attention_backend"] = (
+                    type(target.attn_backend).__module__
+                    + "."
+                    + type(target.attn_backend).__name__
+                )
+                graph = target.decode_cuda_graph_runner
+                extension.cost_runtime["capture_max_bs"] = graph.max_bs if graph else 0
+                extension.cost_runtime["capture_token_grid"] = (
+                    list(graph.capture_num_tokens or []) if graph else []
+                )
             get_dynamic_verify(extension, device).begin(batch)
         elif getattr(extension, "dynamic_verify", None) is not None:
             extension.dynamic_verify.discard_timing()

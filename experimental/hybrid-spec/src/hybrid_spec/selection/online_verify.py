@@ -7,9 +7,12 @@ are collected asynchronously outside model CUDA graphs.
 
 from __future__ import annotations
 
+import math
 from collections import deque
 
 import torch
+
+from hybrid_spec.selection.verify_costs import cost_profile, load_cost_profile
 
 
 class OnlineAcceptance:
@@ -72,12 +75,20 @@ class OnlineAcceptance:
 
 
 class DynamicVerify:
-    def __init__(self, config, device, tp_sync=None):
+    def __init__(self, config, device, tp_sync=None, cost_runtime=None):
         self.config = config
         self.model = OnlineAcceptance(config, device)
         self.tp_sync = tp_sync
+        self.cost_runtime = cost_runtime or {}
         self.costs = {}
+        # Shared fixed term: drafting/selection plus post-verify work. The name
+        # is retained for the existing controller/diagnostic interface.
         self.draft_costs = {}
+        if config.dynamic_verify_cost_table_path:
+            self.costs, self.draft_costs = load_cost_profile(
+                config.dynamic_verify_cost_table_path, config, self.cost_runtime
+            )
+        self.seed_cost_entry_ct = sum(len(rows) for rows in self.costs.values())
         self.rounds = {}
         self.trials = {}
         self.timings = deque()
@@ -90,13 +101,32 @@ class DynamicVerify:
         self.explore_ct = 0
         self.cost_sample_ct = 0
         self.grids = {}
+        self.profile_batch_size = 0
+        self.profile_graph_tokens = 0
+        self.profile_records = (
+            deque(maxlen=10000) if config.dynamic_verify_profile else None
+        )
+
+    def set_profile_cell(self, name, value):
+        """Calibration-only worker commands; discard the previous cell's samples."""
+        if not self.config.dynamic_verify_profile:
+            raise ValueError("dynamic verify profiling is disabled")
+        setattr(self, name, value)
+        self.discard_timing()
+        self.timings.clear()
+        self.profile_records.clear()
 
     def minimum(self, values):
         return self.tp_sync.minimum(values) if self.tp_sync is not None else values
 
     def observe_cost(self, key, graph_tokens, draft_ms, verify_ms):
-        """EMA per batch/context/physical graph shape, never per logical length."""
-        if draft_ms < 0 or verify_ms <= 0:
+        """Shared fixed-cost EMA and verify-stage EMA per physical graph."""
+        if (
+            not math.isfinite(draft_ms)
+            or not math.isfinite(verify_ms)
+            or draft_ms < 0
+            or verify_ms <= 0
+        ):
             return
         costs = self.costs.setdefault(key, {})
         old = costs.get(graph_tokens)
@@ -112,13 +142,28 @@ class DynamicVerify:
 
     def poll_timings(self):
         while self.timings and self.timings[0][-1].query():
-            key, size, start, verify_start, end = self.timings.popleft()
+            key, size, start, verify_start, verify_end, seq, end = (
+                self.timings.popleft()
+            )
+            fixed_ms = start.elapsed_time(verify_start) + verify_end.elapsed_time(end)
+            verify_ms = verify_start.elapsed_time(verify_end)
             self.observe_cost(
                 key,
                 size,
-                start.elapsed_time(verify_start),
-                verify_start.elapsed_time(end),
+                fixed_ms,
+                verify_ms,
             )
+            if self.profile_records is not None:
+                self.profile_records.append(
+                    {
+                        "seq": seq,
+                        "bs": key[0],
+                        "context": key[1],
+                        "graph_tokens": size,
+                        "fixed_ms": fixed_ms,
+                        "verify_ms": verify_ms,
+                    }
+                )
 
     def begin(self, batch):
         self.poll_timings()
@@ -132,14 +177,25 @@ class DynamicVerify:
         )
         self.context_key = (len(batch.reqs), max(512, 1 << (context - 1).bit_length()))
         if self.model.device.type == "cuda":
-            self.start = torch.cuda.Event(enable_timing=True)
-            self.start.record(torch.cuda.current_stream(self.model.device))
+            next_round = self.rounds.get(self.context_key, 0) + 1
+            sample = (
+                self.config.dynamic_verify_profile
+                or (next_round - 1) % self.config.dynamic_verify_timing_interval == 0
+                or next_round % self.config.dynamic_verify_explore_interval == 0
+            ) and len(self.timings) < 8
+            boundary = None
+            if sample or self.completed is not None:
+                boundary = torch.cuda.Event(enable_timing=True)
+                boundary.record(torch.cuda.current_stream(self.model.device))
             if self.completed is not None:
                 # Close the previous decode cycle only after its feedback and
                 # native draft-extend have been enqueued. There is no wait.
                 if len(self.timings) < 8:
-                    self.timings.append((*self.completed, self.start))
+                    self.timings.append((*self.completed, boundary))
                 self.completed = None
+            # Unsampled rounds allocate no start/verify events. A boundary-only
+            # event closes a previous sampled cycle without timing this round.
+            self.start = boundary if sample else None
 
     def discard_timing(self):
         """Prefill/idle must not be charged to an unrelated decode shape."""
@@ -161,6 +217,14 @@ class DynamicVerify:
             self.trials[key] = trial + 1
             explore = full if trial % 2 == 0 else (trial // 2) % len(graph_tokens)
             self.explore_ct += 1
+        profiling = self.profile_graph_tokens > 0 and bs == self.profile_batch_size
+        if profiling:
+            if self.profile_graph_tokens not in graph_tokens:
+                raise ValueError(
+                    "profile graph tier does not fit the batch's verify window"
+                )
+            explore = graph_tokens.index(self.profile_graph_tokens)
+        min_samples = 0 if profiling else config.dynamic_verify_min_samples
         costs = self.costs.get(key, {})
         draft_ms = self.draft_costs.get(key, 0.0)
         price_values = [
@@ -179,7 +243,7 @@ class DynamicVerify:
                 caps.to(torch.int32),
                 self.grids[grid_key],
                 torch.tensor(price_values, device=caps.device, dtype=torch.float32),
-                config.dynamic_verify_min_samples,
+                min_samples,
                 config.dynamic_verify_min_drafts,
                 config.dynamic_verify_prior_strength,
                 config.dynamic_verify_prior_rate,
@@ -188,7 +252,7 @@ class DynamicVerify:
             )
             return self.finish_selection(buckets, lengths)
         survival = model.survival(buckets)
-        cold = model.check_ct[buckets, 0] < config.dynamic_verify_min_samples
+        cold = model.check_ct[buckets, 0] < min_samples
         minimum = torch.where(cold, caps, config.dynamic_verify_min_drafts)
         valid = model.depths[None, :] < caps[:, None]
         mandatory = model.depths[None, :] < minimum[:, None]
@@ -206,8 +270,8 @@ class DynamicVerify:
         utility = bs + prefix[(budgets - 1).clamp(min=0)]
         feasible = budgets >= minimum.sum()
 
-        # All alternatives share this round's drafting cost. Source mix changes
-        # that cost, so use its recent EMA as the fixed term.
+        # All alternatives share the drafting/post-verify cost. Use its recent
+        # EMA as the fixed term, including when the verify-stage prices are seeded.
         priced = torch.tensor(
             price_values,
             dtype=torch.float32,
@@ -256,16 +320,25 @@ class DynamicVerify:
             self.verify_start = torch.cuda.Event(enable_timing=True)
             self.verify_start.record(torch.cuda.current_stream(self.model.device))
 
+    def discard_verify_timing(self):
+        """Eager fallback must not train a captured graph's cost; keep labels."""
+        self.start = self.verify_start = None
+        self.completed = None
+
     def feedback(self, num_accept_tokens):
         pending, self.pending = self.pending, None
         if pending is None:
             return
         if self.verify_start is not None:
+            verify_end = torch.cuda.Event(enable_timing=True)
+            verify_end.record(torch.cuda.current_stream(self.model.device))
             self.completed = (
                 self.context_key,
                 self.graph_tokens,
                 self.start,
                 self.verify_start,
+                verify_end,
+                self.verify_ct,
             )
         self.start = self.verify_start = None
         buckets, lengths = pending
@@ -273,14 +346,25 @@ class DynamicVerify:
 
     def snapshot(self):
         self.poll_timings()
-        return {
+        result = {
             "verify_ct": self.verify_ct,
             "explore_ct": self.explore_ct,
             "cost_sample_ct": self.cost_sample_ct,
+            "seed_cost_entry_ct": self.seed_cost_entry_ct,
             "check_ct": self.model.check_ct.cpu().tolist(),
             "correct_ct": self.model.correct_ct.cpu().tolist(),
             "costs_ms": {
                 f"{key[0]}:{key[1]}": {str(n): list(v) for n, v in costs.items()}
                 for key, costs in self.costs.items()
             },
+            "cost_profile": cost_profile(
+                self.config, self.costs, self.draft_costs, self.cost_runtime
+            ),
         }
+        if self.profile_records is not None:
+            result["profile_records"] = list(self.profile_records)
+            result["profile_cell"] = [
+                self.profile_batch_size,
+                self.profile_graph_tokens,
+            ]
+        return result

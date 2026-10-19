@@ -65,7 +65,10 @@ def test_online_feedback_censors_tail_and_separates_sources():
 
 
 @pytest.mark.parametrize("aliased_capacity", [False, True])
-def test_dynamic_lengths_match_exhaustive_prefix_cost_oracle(aliased_capacity):
+@pytest.mark.parametrize("seeded", [False, True])
+def test_dynamic_lengths_match_exhaustive_prefix_cost_oracle(
+    aliased_capacity, seeded, tmp_path
+):
     """Global allocation must maximise utility over real physical graph costs."""
     import itertools
 
@@ -76,16 +79,28 @@ def test_dynamic_lengths_match_exhaustive_prefix_cost_oracle(aliased_capacity):
         use_retrieval=torch.tensor([True, False, True]),
         query_metadata=torch.tensor([[4, 0], [0, 0], [4, 1]]),
     )
-    chooser.model.check_ct.fill_(1000)
-    chooser.model.correct_ct.fill_(950)
-    chooser.model.correct_ct[0].fill_(200)
-    chooser.model.correct_ct[6].fill_(600)
     key = (3, 512)
     costs = (
         {6: 1.0, 9: 4.0, 12: 0.001} if aliased_capacity else {6: 1.0, 9: 1.1, 12: 4.0}
     )
     for n, cost in costs.items():
         chooser.observe_cost(key, n, 0.4, cost)
+    if seeded:
+        import json
+        from dataclasses import replace
+
+        path = tmp_path / "costs.json"
+        path.write_text(json.dumps(chooser.snapshot()["cost_profile"]))
+        chooser = DynamicVerify(
+            replace(dynamic_config(), dynamic_verify_cost_table_path=str(path)), "cpu"
+        )
+        assert chooser.cost_sample_ct == 0
+        assert chooser.seed_cost_entry_ct == len(costs)
+        assert not chooser.model.check_ct.any()
+    chooser.model.check_ct.fill_(1000)
+    chooser.model.correct_ct.fill_(950)
+    chooser.model.correct_ct[0].fill_(200)
+    chooser.model.correct_ct[6].fill_(600)
     caps = torch.tensor([3, 1, 2] if aliased_capacity else [3, 3, 3])
     lens = chooser.select(view, caps, list(costs), key) - 1
     scores = chooser.model.survival(chooser.model.buckets(view))
@@ -142,6 +157,459 @@ def test_dynamic_cold_start_exploration_and_abort_reset():
     assert torch.equal(before, chooser.model.check_ct)
 
 
+def test_seeded_costs_follow_online_ema_without_seeding_acceptance(tmp_path):
+    """Offline prices affect budgets, but live measurements can reverse them."""
+    import json
+    from dataclasses import replace
+
+    from hybrid_spec.selection.online_verify import DynamicVerify
+
+    config = dynamic_config(dynamic_verify_explore_interval=10000)
+    profile = DynamicVerify(config, "cpu")
+    for n, cost in [(2, 0.1), (4, 0.1), (9, 10)]:
+        profile.observe_cost((1, 512), n, 0.4, cost)
+    path = tmp_path / "profile.json"
+    path.write_text(json.dumps(profile.snapshot()["cost_profile"]))
+    chooser = DynamicVerify(
+        replace(config, dynamic_verify_cost_table_path=str(path)), "cpu"
+    )
+    view = NS(use_retrieval=torch.tensor([True]), query_metadata=torch.tensor([[4, 0]]))
+    caps = torch.tensor([8])
+    # Even with measured prices, new acceptance buckets keep their source caps.
+    assert chooser.select(view, caps, [2, 4, 9], (1, 512)).item() == 9
+    chooser.model.check_ct.fill_(1000)
+    chooser.model.correct_ct.fill_(800)
+    assert chooser.select(view, caps, [2, 4, 9], (1, 512)).item() == 4
+    for _ in range(100):
+        for n, cost in [(2, 10), (4, 10), (9, 0.1)]:
+            chooser.observe_cost((1, 512), n, 0.4, cost)
+    assert chooser.select(view, caps, [2, 4, 9], (1, 512)).item() == 9
+    assert chooser.cost_sample_ct == 300
+    before = chooser.snapshot()["cost_profile"]
+    chooser.observe_cost((1, 512), 9, float("nan"), 1)
+    chooser.observe_cost((1, 512), 9, 1, float("inf"))
+    assert chooser.snapshot()["cost_profile"] == before
+    # No interpolation/extrapolation across unmeasured batch/context keys.
+    assert chooser.select(view, caps, [2, 4, 9], (1, 1024)).item() == 9
+
+
+def test_cost_profile_rejects_incompatible_or_invalid_measurements(tmp_path):
+    import copy
+    import json
+    from dataclasses import replace
+
+    from hybrid_spec.selection.online_verify import DynamicVerify
+
+    config = dynamic_config()
+    collector = DynamicVerify(config, "cpu", cost_runtime={"tp_size": 1})
+    collector.observe_cost((1, 512), 4, 0.4, 1)
+    profile = collector.snapshot()["cost_profile"]
+    path = tmp_path / "profile.json"
+    loading = replace(config, dynamic_verify_cost_table_path=str(path))
+    for changed in ["version", "scope", "config", "runtime", "cost"]:
+        bad = copy.deepcopy(profile)
+        if changed == "version":
+            bad["version"] = 1
+        elif changed == "scope":
+            bad["scope"] = "eager"
+        elif changed == "config":
+            bad["config"]["num_neural_drafts"] = 2
+        elif changed == "runtime":
+            bad["runtime"]["tp_size"] = 8
+        else:
+            bad["verify_ms"]["1:512"]["4"] = float("nan")
+        path.write_text(json.dumps(bad))
+        with pytest.raises(ValueError, match="cost profile"):
+            DynamicVerify(loading, "cpu", cost_runtime={"tp_size": 1})
+
+
+def test_eager_fallback_keeps_labels_without_training_graph_costs():
+    """A failed graph admission cannot contaminate that graph's seed price."""
+    from hybrid_spec import plugin
+    from hybrid_spec.selection.online_verify import DynamicVerify
+
+    chooser = DynamicVerify(dynamic_config(), "cpu")
+    chooser.observe_cost((1, 512), 9, 0.4, 1)
+    before = chooser.snapshot()["cost_profile"]
+    chooser.pending = (torch.tensor([1]), torch.tensor([8]))
+    chooser.start = chooser.verify_start = object()
+    batch = NS(forward_mode=NS(is_idle=lambda: False))
+    extension = NS(dynamic_verify=chooser, on_verify_result=lambda result: None)
+    plugin._verify(
+        NS(can_run_cuda_graph=False, accept_lens=torch.tensor([3])),
+        NS(draft_worker=NS(draft_extension=extension)),
+        batch,
+    )
+    assert chooser.completed is None
+    assert chooser.model.correct_ct.sum().item() == 2
+    assert chooser.model.check_ct.sum().item() == 3
+    assert chooser.snapshot()["cost_profile"] == before
+
+
+def test_offline_profile_uses_steady_medians_worst_rank_and_round_trips(
+    monkeypatch, tmp_path
+):
+    import json
+    from dataclasses import replace
+
+    from hybrid_spec.selection.online_verify import DynamicVerify
+
+    profiler = load_module(
+        monkeypatch,
+        "hybrid_cost_profiler",
+        "experimental/hybrid-spec/benchmarks/profile_dynamic_verify.py",
+    )
+    config = dynamic_config()
+    ranks = []
+    for fixed_ms, verify_ms in [(0.5, 1.0), (0.3, 2.0)]:
+        rows = [
+            {
+                "seq": i,
+                "bs": 1,
+                "context": 512,
+                "graph_tokens": 4,
+                "fixed_ms": 100 if i < 8 else fixed_ms,
+                "verify_ms": 100 if i < 8 or i == 20 else verify_ms,
+            }
+            for i in range(48)
+        ]
+        ranks.append({"profile_records": rows})
+    info = {"internal_states": [{"hybrid_spec_dynamic_verify": r} for r in ranks]}
+    summary = profiler.summarize_cell(list(profiler.snapshots_in(info)), 1, 4, 8, 32)
+    assert summary[0]["num_steps"] == 40
+    assert summary[0]["verify_ms"] == 2.0
+    # A single outlier round cannot dominate the seed across repeated sweeps.
+    repeated = summary + [{**summary[0], "verify_ms": v} for v in [3, 999]]
+    merged = profiler.build_profile(repeated, config, {"tp_size": 2})
+    path = tmp_path / "costs.json"
+    path.write_text(json.dumps(merged))
+    chooser = DynamicVerify(
+        replace(config, dynamic_verify_cost_table_path=str(path)),
+        "cpu",
+        cost_runtime={"tp_size": 2},
+    )
+    assert chooser.draft_costs[(1, 512)] == 0.5
+    assert chooser.costs[(1, 512)][4][1] == 3.0
+    assert not chooser.model.check_ct.any()
+    with pytest.raises(ValueError, match="no steady Graph cost samples"):
+        profiler.build_profile([], config, {})
+    with pytest.raises(ValueError, match="never stabilized"):
+        profiler.summarize_cell(ranks, 1, 9, 8, 32)
+    ranks[1]["profile_records"] = ranks[1]["profile_records"][:20]
+    with pytest.raises(ValueError, match="never stabilized"):
+        profiler.summarize_cell(ranks, 1, 4, 8, 32)
+
+
+def test_profile_pins_bypass_cold_acceptance_and_reset_only_calibration_state():
+    from hybrid_spec.selection.online_verify import DynamicVerify
+
+    chooser = DynamicVerify(dynamic_config(dynamic_verify_profile=True), "cpu")
+    chooser.set_profile_cell("profile_batch_size", 2)
+    chooser.set_profile_cell("profile_graph_tokens", 8)
+    view = NS(
+        use_retrieval=torch.tensor([True, False]),
+        query_metadata=torch.tensor([[4, 0], [0, 0]]),
+    )
+    lengths = chooser.select(view, torch.tensor([8, 3]), [4, 8, 12, 18], (2, 512))
+    assert lengths.sum().item() == 8
+    chooser.feedback(torch.tensor([2, 2]))
+    before = chooser.model.check_ct.clone()
+    chooser.profile_records.append({"seq": 1})
+    chooser.timings.append(object())
+    chooser.set_profile_cell("profile_graph_tokens", 12)
+    assert not chooser.profile_records and not chooser.timings
+    assert torch.equal(chooser.model.check_ct, before)
+    with pytest.raises(ValueError, match="does not fit"):
+        chooser.select(view, torch.tensor([8, 3]), [4, 8, 18], (2, 512))
+    ordinary = DynamicVerify(dynamic_config(), "cpu")
+    assert "profile_records" not in ordinary.snapshot()
+    with pytest.raises(ValueError, match="profiling is disabled"):
+        ordinary.set_profile_cell("profile_graph_tokens", 4)
+
+
+def test_profile_commands_target_nested_draft_worker_and_are_opt_in(monkeypatch):
+    from hybrid_spec import plugin
+
+    module = ModuleType("sglang.srt.managers.scheduler_components.internal_state")
+    module.UpdateRejected = ValueError
+    module._UpdateHandler = lambda validate, apply: NS(validate=validate, apply=apply)
+    monkeypatch.setitem(sys.modules, module.__name__, module)
+    extension = NS(
+        config=dynamic_config(dynamic_verify_profile=True), backend=NS(device="cpu")
+    )
+    worker = NS(
+        draft_worker=NS(draft_extension=extension),
+        target_worker=NS(
+            model_runner=NS(decode_cuda_graph_runner=NS(capture_num_tokens=[4, 8, 18]))
+        ),
+    )
+    controller = NS(scheduler=NS(draft_worker=worker))
+    handlers = plugin._profile_update_handlers({}, controller)
+    for name, value in [("profile_batch_size", 2), ("profile_graph_tokens", 8)]:
+        key = "hybrid_spec_" + name
+        handlers[key].validate(key, value)
+        handlers[key].apply(key, value)
+    assert extension.dynamic_verify.profile_batch_size == 2
+    assert extension.dynamic_verify.profile_graph_tokens == 8
+    key = "hybrid_spec_profile_graph_tokens"
+    for invalid in [True, -1, 7, 8.0]:
+        with pytest.raises(ValueError):
+            handlers[key].validate(key, invalid)
+    extension.config = dynamic_config()
+    assert plugin._profile_update_handlers({}, controller) == {}
+
+
+def test_profile_http_handles_plain_text_flush_and_json_diagnostics(monkeypatch):
+    import io
+    from email.message import Message
+
+    profiler = load_module(
+        monkeypatch,
+        "hybrid_cost_http",
+        "experimental/hybrid-spec/benchmarks/profile_dynamic_verify.py",
+    )
+    for content_type, body, expected in [
+        ("text/plain", b"Cache flushed.", "Cache flushed."),
+        ("application/json", b'{"updated": true}', {"updated": True}),
+    ]:
+        response = io.BytesIO(body)
+        response.headers = Message()
+        response.headers["Content-Type"] = content_type
+        monkeypatch.setattr(
+            profiler.urllib.request, "urlopen", lambda req, timeout: response
+        )
+        assert (
+            profiler.request("http://localhost:30000", "/flush_cache", {}) == expected
+        )
+
+
+@pytest.mark.parametrize("ready", [False, True])
+def test_profile_round_waits_for_steady_time_and_drains_on_success_or_timeout(
+    monkeypatch, ready
+):
+    profiler = load_module(
+        monkeypatch,
+        "hybrid_cost_round",
+        "experimental/hybrid-spec/benchmarks/profile_dynamic_verify.py",
+    )
+    now, alive, calls = [0.0], [False], []
+
+    class Load:
+        def __init__(self, **kwargs):
+            pass
+
+        def start(self):
+            alive[0] = True
+
+        def is_alive(self):
+            return alive[0]
+
+        def join(self, timeout):
+            assert not alive[0]
+
+    rows = (
+        [
+            {
+                "seq": i,
+                "bs": 2,
+                "context": 512,
+                "graph_tokens": 8,
+                "fixed_ms": 1,
+                "verify_ms": 2,
+            }
+            for i in range(40)
+        ]
+        if ready
+        else []
+    )
+
+    def server(url, path, payload=None):
+        calls.append((path, payload))
+        if path.startswith("/flush_cache"):
+            return "Cache flushed."
+        if path == "/set_internal_state":
+            return {"updated": True}
+        if path == "/abort_request":
+            alive[0] = False
+            return "Aborted."
+        assert path == "/server_info"
+        return {
+            "internal_states": [
+                {"hybrid_spec_dynamic_verify": {"profile_records": rows}}
+            ]
+        }
+
+    monkeypatch.setattr(profiler, "request", server)
+    monkeypatch.setattr(profiler.threading, "Thread", Load)
+    monkeypatch.setattr(profiler.time, "monotonic", lambda: now[0])
+    monkeypatch.setattr(
+        profiler.time, "sleep", lambda seconds: now.__setitem__(0, now[0] + seconds)
+    )
+    args = NS(
+        url="http://localhost:30000",
+        max_tokens=4096,
+        round_timeout=4,
+        warmup_steps=8,
+        min_steady_steps=32,
+        min_steady_seconds=2,
+    )
+    if ready:
+        _, summaries = profiler.run_cell(args, ["hello"], 2, 8)
+        assert summaries[0]["num_steps"] == 32
+        assert now[0] == 3
+    else:
+        with pytest.raises(RuntimeError, match="timed out"):
+            profiler.run_cell(args, ["hello"], 2, 8)
+    assert calls[0][0].startswith("/flush_cache")
+    assert calls[1][1]["server_args"]["hybrid_spec_profile_graph_tokens"] == 8
+    assert calls[-1] == ("/abort_request", {"abort_all": True})
+    assert not alive[0]
+
+
+def test_profile_keeps_physical_graph_pinned_when_source_caps_leave_padding(
+    monkeypatch, compact_module
+):
+    import msgspec
+
+    from hybrid_spec.integrations.sglang.compact_verify import configure_verify
+    from hybrid_spec.selection.online_verify import DynamicVerify
+
+    class Layout(msgspec.Struct):
+        graph_num_tokens: int
+        total_verify_tokens: int = 0
+
+        @classmethod
+        def from_verify_lens_device(cls, *, verify_lens, graph_num_tokens):
+            return cls(graph_num_tokens)
+
+    module = ModuleType("sglang.srt.speculative.ragged_verify")
+    module.RaggedVerifyLayout = Layout
+    module.round_up_grid = lambda logical, grid: next(n for n in grid if n >= logical)
+    monkeypatch.setitem(sys.modules, module.__name__, module)
+    config = dynamic_config(dynamic_verify_profile=True)
+    chooser = DynamicVerify(config, "cpu")
+    chooser.context_key = (1, 512)
+    chooser.set_profile_cell("profile_batch_size", 1)
+    chooser.set_profile_cell("profile_graph_tokens", 8)
+    view = NS(
+        tokens=torch.zeros(1, 8, dtype=torch.long),
+        use_retrieval=torch.tensor([False]),
+        query_metadata=torch.tensor([[0, 0]]),
+    )
+    worker = NS(
+        draft_extension=NS(config=config, dynamic_verify=chooser, pending_view=view),
+        target_worker=NS(
+            model_runner=NS(
+                decode_cuda_graph_runner=NS(capture_num_tokens=[2, 4, 8, 9])
+            )
+        ),
+    )
+    batch = NS(seq_lens=torch.tensor([16]), forward_mode=NS(is_idle=lambda: False))
+    vi = NS(draft_token_num=9, retrieve_next_token=torch.arange(1, 10).view(1, 9))
+    configure_verify(vi, worker, batch)
+    assert vi.compact_verify_layout.graph_num_tokens == 8
+    assert vi.compact_verify_layout.total_verify_tokens == 4
+    assert chooser.graph_tokens == 8
+
+
+def test_cuda_fixed_profile_budget_matches_cpu_with_cold_acceptance(cuda_modules):
+    from hybrid_spec.selection.online_verify import DynamicVerify
+
+    config = dynamic_config(dynamic_verify_profile=True)
+    cpu, gpu = DynamicVerify(config, "cpu"), DynamicVerify(config, "cuda")
+    caps = torch.tensor([8, 3, 8], dtype=torch.int32)
+    mask = torch.tensor([True, False, True])
+    metadata = torch.tensor([[4, 0], [0, 0], [17, 1]])
+    for controller in (cpu, gpu):
+        controller.set_profile_cell("profile_batch_size", 3)
+        controller.set_profile_cell("profile_graph_tokens", 12)
+
+    def view(device):
+        return NS(use_retrieval=mask.to(device), query_metadata=metadata.to(device))
+
+    expected = cpu.select(view("cpu"), caps, [6, 9, 12, 18, 27], (3, 512))
+    actual = gpu.select(view("cuda"), caps.cuda(), [6, 9, 12, 18, 27], (3, 512))
+    assert actual.cpu().tolist() == expected.tolist()
+    assert actual.sum().item() == 12
+
+
+@pytest.mark.parametrize(
+    "explore_interval, samples", [(1000, [1]), (5, [1, 5, 10, 15])]
+)
+def test_sparse_timing_covers_exploration_and_accounts_for_entire_cycle(
+    monkeypatch, explore_interval, samples
+):
+    """A sampled verify ends before its tail; unsampled cycles allocate no events."""
+    from hybrid_spec.selection.online_verify import DynamicVerify
+
+    clock, events = [0], []
+
+    class Event:
+        def __init__(self, **kwargs):
+            events.append(self)
+
+        def record(self, stream):
+            self.time = clock[0]
+
+        def query(self):
+            return True
+
+        def elapsed_time(self, end):
+            return end.time - self.time
+
+    monkeypatch.setattr(torch.cuda, "Event", Event)
+    monkeypatch.setattr(torch.cuda, "current_stream", lambda device: None)
+    chooser = DynamicVerify(
+        dynamic_config(dynamic_verify_explore_interval=explore_interval), "cpu"
+    )
+    chooser.model.device = NS(type="cuda")
+    batch = NS(reqs=[NS(origin_input_ids=[1], output_ids=[])])
+    view = NS(use_retrieval=torch.tensor([True]), query_metadata=torch.tensor([[4, 0]]))
+    sampled = []
+    for round_number in range(1, 17):
+        clock[0] = 10 * round_number
+        chooser.begin(batch)
+        if chooser.start is not None:
+            sampled.append(round_number)
+        chooser.select(view, torch.tensor([8]), [2, 4, 9], chooser.context_key)
+        clock[0] += 2
+        chooser.mark_verify(9)
+        clock[0] += 3
+        chooser.feedback(torch.tensor([2]))
+    chooser.poll_timings()
+    assert sampled == samples
+    assert chooser.cost_sample_ct == len(samples)
+    # 2 ms before verify + 5 ms after verify; verify itself is exactly 3 ms.
+    assert chooser.costs[(1, 512)][9] == pytest.approx((7, 3))
+    assert chooser.draft_costs[(1, 512)] == pytest.approx(7)
+    assert len(events) == 4 * len(samples)
+    assert chooser.model.correct_ct.sum().item() == 16  # Labels remain per-round.
+
+
+@pytest.mark.parametrize("alignment", [1, 8])
+def test_dynamic_graph_grid_bounds_added_tiers_and_preserves_safe_rounding(alignment):
+    """Additional dynamic graphs scale with batch anchors, not every batch/mix."""
+    import math
+    from dataclasses import replace
+
+    config = replace(dynamic_config(), max_requests=512)
+    maximum = 512 * 9
+    full = {((bs * 9 + alignment - 1) // alignment) * alignment for bs in range(1, 513)}
+    grid = token_buckets(config, [maximum], 512, alignment)
+    # <=44 small-batch mixed tiers, <=6 tiers at each geometric batch anchor.
+    assert len(set(grid) - full) <= 44 + 6 * (math.ceil(math.log2(512)) + 2)
+    assert all(n % alignment == 0 for n in grid)
+    assert full <= set(grid)
+    for bs in [1, 3, 8, 17, 127, 511, 512]:
+        for logical in range(bs * 2, bs * 9 + 1):
+            physical = next(n for n in grid if n >= logical)
+            assert (
+                logical
+                <= physical
+                <= ((bs * 9 + alignment - 1) // alignment) * alignment
+            )
+
+
 def test_cuda_dynamic_plugin_labels_before_history_consumer_and_flushes(cuda_modules):
     from hybrid_spec import plugin
 
@@ -185,7 +653,8 @@ def test_cuda_dynamic_plugin_labels_before_history_consumer_and_flushes(cuda_mod
     assert not controller.timings
     plugin._begin_draft(worker, batch)
     torch.cuda.synchronize()
-    assert controller.snapshot()["cost_sample_ct"] == 1
+    # Eager fallback still labels acceptance but cannot price a captured graph.
+    assert controller.snapshot()["cost_sample_ct"] == 0
     controller.completed = (
         controller.context_key,
         13,
@@ -212,6 +681,8 @@ def test_cuda_dynamic_plugin_labels_before_history_consumer_and_flushes(cuda_mod
         {"dynamic_verify": 1},
         {"dynamic_verify_min_samples": 0},
         {"dynamic_verify_explore_interval": 0},
+        {"dynamic_verify_timing_interval": 0},
+        {"dynamic_verify_profile": 1},
         {"dynamic_verify_prior_strength": float("nan")},
         {"dynamic_verify_prior_strength": 1e300},
         {"dynamic_verify_prior_rate": 1},
@@ -227,7 +698,10 @@ def test_dynamic_invalid_config(kwargs):
 
 
 @pytest.mark.parametrize("bs", [1, 4, 16, 33])
-def test_cuda_fused_online_policy_and_feedback_match_cpu_reference(cuda_modules, bs):
+@pytest.mark.parametrize("seeded", [False, True])
+def test_cuda_fused_online_policy_and_feedback_match_cpu_reference(
+    cuda_modules, bs, seeded, tmp_path
+):
     """One-block policy and >256-position fallback must share the same labels."""
     from dataclasses import replace
 
@@ -243,6 +717,16 @@ def test_cuda_fused_online_policy_and_feedback_match_cpu_reference(cuda_modules,
     key = (bs, 512)
     grid = token_buckets(config, [bs * 9], bs)
     choices = [n for n in grid if bs * 2 <= n <= bs * 9]
+    if seeded:
+        import json
+
+        for n in choices:
+            cpu.observe_cost(key, n, 0.2, 1 + ((n * 7) % 23) / 10)
+        path = tmp_path / "costs.json"
+        path.write_text(json.dumps(cpu.snapshot()["cost_profile"]))
+        config = replace(config, dynamic_verify_cost_table_path=str(path))
+        cpu = DynamicVerify(config, "cpu")
+        gpu = DynamicVerify(config, "cuda")
     for iteration in range(8):
         check = torch.randint(0, 100, cpu.model.check_ct.shape, generator=rng)
         correct = (check * torch.rand(check.shape, generator=rng)).long()

@@ -6,7 +6,7 @@ import torch
 
 
 def token_buckets(config, base, max_bs, alignment=1):
-    """Exact small-batch tiers; larger batches use a bounded regular grid."""
+    """Exact small-batch mixes and sparse dynamic tiers at geometric anchors."""
     width = config.num_drafts + 1
     neural_width = config.neural_drafts + 1
     maximum = max_bs * width
@@ -25,7 +25,19 @@ def token_buckets(config, base, max_bs, alignment=1):
         for bs in range(1, min(max_bs, config.max_requests, 8) + 1):
             for num_sa in range(bs + 1):
                 buckets.add(bs * neural_width + num_sa * (width - neural_width))
-        for bs in range(1, min(max_bs, config.max_requests) + 1):
+        live_max = min(max_bs, config.max_requests)
+        if config.dynamic_verify:
+            # Add dynamic capacities around geometric batch anchors, rather
+            # than 25/50/75% for every possible live batch. Keep the full-width
+            # safety tiers above: rounding must fit each batch's KV window.
+            batch_anchors = {live_max}
+            bs = 1
+            while bs <= live_max:
+                batch_anchors.add(bs)
+                bs *= 2
+        else:
+            batch_anchors = range(1, live_max + 1)
+        for bs in batch_anchors:
             buckets.add(bs * neural_width)
             if config.dynamic_verify:
                 # A bounded capacity grid, independent of the number of possible
@@ -75,9 +87,16 @@ def configure_verify(result, worker, batch):
             for n in grid
             if len(batch.seq_lens) * (config.dynamic_verify_min_drafts + 1) <= n <= full
         ]
-        verify_lens = dynamic.select(
-            view, verify_lens - 1, choices, dynamic.context_key
-        )
+        if graph:
+            verify_lens = dynamic.select(
+                view, verify_lens - 1, choices, dynamic.context_key
+            )
+        else:
+            # Graph prices cannot predict eager execution. Preserve source caps
+            # while still collecting online acceptance feedback.
+            verify_lens = dynamic.finish_selection(
+                dynamic.minimum(dynamic.model.buckets(view)), verify_lens - 1
+            )
     cap_verify_chain(result, verify_lens)
     counters = getattr(worker.draft_extension, "compact_verify_counters", None)
     if counters is None:
@@ -106,6 +125,10 @@ def configure_verify(result, worker, batch):
         target_tokens = (
             round_up_grid(logical, graph.capture_num_tokens) if graph else logical
         )
+        if dynamic is not None and dynamic.profile_batch_size == len(batch.seq_lens):
+            # Keep the physical tier pinned even if source caps leave unused
+            # capacity. Profile the graph that actually executes, not a logical M.
+            target_tokens = max(target_tokens, dynamic.profile_graph_tokens)
         result.compact_verify_layout = replace(
             RaggedVerifyLayout.from_verify_lens_device(
                 verify_lens=verify_lens,
@@ -129,7 +152,10 @@ def get_dynamic_verify(extension, device):
         from hybrid_spec.selection.online_verify import DynamicVerify
 
         extension.dynamic_verify = DynamicVerify(
-            extension.config, device, getattr(extension, "tp_sync", None)
+            extension.config,
+            device,
+            getattr(extension, "tp_sync", None),
+            getattr(extension, "cost_runtime", None),
         )
     return extension.dynamic_verify
 

@@ -16,6 +16,7 @@
   "dynamic_verify": true,
   "dynamic_verify_min_samples": 32,
   "dynamic_verify_explore_interval": 32,
+  "dynamic_verify_timing_interval": 16,
   "dynamic_verify_prior_strength": 4.0,
   "dynamic_verify_prior_rate": 0.8,
   "dynamic_verify_min_drafts": 1
