@@ -1,0 +1,681 @@
+<?xml version="1.0" encoding="utf-8"?><testsuites name="pytest tests"><testsuite name="pytest" errors="0" failures="26" skipped="0" tests="352" time="16.203" timestamp="2026-10-19T16:51:37.039468+08:00" hostname="gq"><testcase classname="tests.test_core" name="test_automaton_matches_exhaustive_oracle_after_every_append" time="0.029" /><testcase classname="tests.test_core" name="test_history_replay_conflict_gap_and_generation" time="0.000" /><testcase classname="tests.test_core" name="test_runtime_reorder_rebuild_capacity_and_id_reuse" time="0.009" /><testcase classname="tests.test_core" name="test_whole_chain_fallback[healthy-False]" time="0.002" /><testcase classname="tests.test_core" name="test_whole_chain_fallback[versions-7]" time="0.001" /><testcase classname="tests.test_core" name="test_whole_chain_fallback[num_valid_drafts-1]" time="0.001" /><testcase classname="tests.test_core" name="test_whole_chain_fallback[match_lens-1]" time="0.001" /><testcase classname="tests.test_core" name="test_whole_chain_fallback[remaining-2]" time="0.000" /><testcase classname="tests.test_core" name="test_whole_chain_fallback[tokens-100]" time="0.001" /><testcase classname="tests.test_core" name="test_whole_chain_fallback[tokens--1]" time="0.000" /><testcase classname="tests.test_core" name="test_graph_storage_switches_sources_and_clears_padding" time="0.002" /><testcase classname="tests.test_core" name="test_bridge_anchor_reconcile_cleanup_and_failure_clear" time="0.003" /><testcase classname="tests.test_core" name="test_configuration_fails_closed" time="0.001" /><testcase classname="tests.test_core" name="test_real_lora_cli_default_none_is_disabled_for_all_spec_algorithms" time="0.029" /><testcase classname="tests.test_core" name="test_feedback_attributes_bonus_separately_from_correct_drafts" time="0.004" /><testcase classname="tests.test_core" name="test_device_bridge_keeps_feedback_on_device_and_ignores_cpu_decode_history" time="0.002" /><testcase classname="tests.test_core" name="test_shared_history_rejects_invalid_capacity_and_cpu_mode[overrides0]" time="0.000" /><testcase classname="tests.test_core" name="test_shared_history_rejects_invalid_capacity_and_cpu_mode[overrides1]" time="0.000" /><testcase classname="tests.test_core" name="test_shared_history_rejects_invalid_capacity_and_cpu_mode[overrides2]" time="0.000" /><testcase classname="tests.test_core" name="test_shared_history_rejects_invalid_capacity_and_cpu_mode[overrides3]" time="0.000" /><testcase classname="tests.test_core" name="test_shared_history_rejects_invalid_capacity_and_cpu_mode[overrides4]" time="0.000" /><testcase classname="tests.test_core" name="test_shared_history_rejects_invalid_capacity_and_cpu_mode[overrides5]" time="0.000" /><testcase classname="tests.test_core" name="test_shared_history_rejects_invalid_capacity_and_cpu_mode[overrides6]" time="0.000" /><testcase classname="tests.test_core" name="test_shared_history_finish_eviction_graph_mapping_and_flush" time="0.002" /><testcase classname="tests.test_core" name="test_tp_rejects_process_group_only_communication[DraftExtension]" time="0.000" /><testcase classname="tests.test_core" name="test_tp_rejects_process_group_only_communication[DeviceDraftExtension]" time="0.000" /><testcase classname="tests.test_core" name="test_device_graph_mapping_cache_preserves_padding_and_generation" time="0.001" /><testcase classname="tests.test_core" name="test_prefill_reclaims_finished_leases_before_capacity_check[False-False-1]" time="0.002" /><testcase classname="tests.test_core" name="test_prefill_reclaims_finished_leases_before_capacity_check[False-False-4]" time="0.002" /><testcase classname="tests.test_core" name="test_prefill_reclaims_finished_leases_before_capacity_check[False-True-1]" time="0.002" /><testcase classname="tests.test_core" name="test_prefill_reclaims_finished_leases_before_capacity_check[False-True-4]" time="0.002" /><testcase classname="tests.test_core" name="test_prefill_reclaims_finished_leases_before_capacity_check[True-False-1]" time="0.002" /><testcase classname="tests.test_core" name="test_prefill_reclaims_finished_leases_before_capacity_check[True-False-4]" time="0.002" /><testcase classname="tests.test_core" name="test_prefill_reclaims_finished_leases_before_capacity_check[True-True-1]" time="0.003" /><testcase classname="tests.test_core" name="test_prefill_reclaims_finished_leases_before_capacity_check[True-True-4]" time="0.002" /><testcase classname="tests.test_core" name="test_prefill_reclaims_dead_request_without_finish_callback[False]" time="0.001" /><testcase classname="tests.test_core" name="test_prefill_reclaims_dead_request_without_finish_callback[True]" time="0.001" /><testcase classname="tests.test_core" name="test_host_build_overlaps_prefill_and_imports_only_at_first_draft[False]" time="0.002" /><testcase classname="tests.test_core" name="test_host_build_overlaps_prefill_and_imports_only_at_first_draft[True]" time="0.001" /><testcase classname="tests.test_core" name="test_chunked_prefill_keeps_final_rows_and_discards_middle_bonus" time="0.001" /><testcase classname="tests.test_core" name="test_prefill_exception_cancels_reserved_host_build" time="0.001" /><testcase classname="tests.test_core" name="test_late_host_build_cannot_overwrite_reused_slot[close]" time="0.001" /><testcase classname="tests.test_core" name="test_late_host_build_cannot_overwrite_reused_slot[reset]" time="0.001" /><testcase classname="tests.test_core" name="test_late_host_build_cannot_overwrite_reused_slot[chunk]" time="0.001" /><testcase classname="tests.test_core" name="test_failed_host_build_releases_slot_before_propagating" time="0.001" /><testcase classname="tests.test_core" name="test_qwen_linear_attention_requires_text_only_mtp_pair[False]" time="0.000" /><testcase classname="tests.test_core" name="test_qwen_linear_attention_requires_text_only_mtp_pair[True]" time="0.000" /><testcase classname="tests.test_core" name="test_dsv4_native_mtp_sa_is_not_rejected_as_generic_hybrid_swa[True]" time="0.000" /><testcase classname="tests.test_core" name="test_dsv4_native_mtp_sa_is_not_rejected_as_generic_hybrid_swa[False]" time="0.000" /><testcase classname="tests.test_core" name="test_dsv4_sa_exception_requires_mtp_pair_and_text_only" time="0.000" /><testcase classname="tests.test_core" name="test_dsv4_split_rejects_qwen_triton_attention" time="0.001" /><testcase classname="tests.test_core" name="test_dsv4_compact_metadata_preserves_request_major_step_writes[3]" time="0.004" /><testcase classname="tests.test_core" name="test_dsv4_compact_metadata_preserves_request_major_step_writes[8]" time="0.003" /><testcase classname="tests.test_core" name="test_diagnostic_readback_preserves_native_state_and_counts" time="0.001" /><testcase classname="tests.test_core" name="test_unsupported_requests_rejected_before_scheduling" time="0.000" /><testcase classname="tests.test_core" name="test_media_and_embeddings_rejected_before_gpu_scheduling" time="0.000" /><testcase classname="tests.test_core" name="test_invalid_plugin_configuration[num_drafts-0]" time="0.000" /><testcase classname="tests.test_core" name="test_invalid_plugin_configuration[num_drafts-True]" time="0.000" /><testcase classname="tests.test_core" name="test_invalid_plugin_configuration[min_match_len--1]" time="0.000" /><testcase classname="tests.test_core" name="test_invalid_plugin_configuration[max_requests-0]" time="0.000" /><testcase classname="tests.test_core" name="test_invalid_plugin_configuration[max_history_tokens-2]" time="0.000" /><testcase classname="tests.test_core" name="test_invalid_plugin_configuration[backend-unknown]" time="0.000" /><testcase classname="tests.test_core" name="test_invalid_neural_gate_width[-1]" time="0.000" /><testcase classname="tests.test_core" name="test_invalid_neural_gate_width[3]" time="0.000" /><testcase classname="tests.test_core" name="test_invalid_neural_gate_width[True]" time="0.000" /><testcase classname="tests.test_core" name="test_invalid_neural_gate_width[1.5]" time="0.000" /><testcase classname="tests.test_core" name="test_split_graph_configuration_rejects_unsupported_state[change0]" time="0.000" /><testcase classname="tests.test_core" name="test_split_graph_configuration_rejects_unsupported_state[change1]" time="0.000" /><testcase classname="tests.test_core" name="test_split_graph_configuration_rejects_unsupported_state[change2]" time="0.000" /><testcase classname="tests.test_core" name="test_split_graph_configuration_rejects_unsupported_state[change3]" time="0.001" /><testcase classname="tests.test_core" name="test_split_graph_configuration_rejects_unsupported_state[change4]" time="0.000" /><testcase classname="tests.test_core" name="test_split_graph_runtime_configuration_fails_closed" time="0.000" /><testcase classname="tests.test_core" name="test_compact_dispatch_uses_raw_count_before_runner_restores_padding" time="0.000" /><testcase classname="tests.test_core" name="test_dynamic_compact_dispatch_keeps_live_rows_and_buffer_addresses[split-1]" time="0.004" /><testcase classname="tests.test_core" name="test_dynamic_compact_dispatch_keeps_live_rows_and_buffer_addresses[split-8]" time="0.001" /><testcase classname="tests.test_core" name="test_dynamic_compact_dispatch_keeps_live_rows_and_buffer_addresses[split-32]" time="0.002" /><testcase classname="tests.test_core" name="test_dynamic_compact_dispatch_keeps_live_rows_and_buffer_addresses[split_no_skip-1]" time="0.001" /><testcase classname="tests.test_core" name="test_dynamic_compact_dispatch_keeps_live_rows_and_buffer_addresses[split_no_skip-8]" time="0.001" /><testcase classname="tests.test_core" name="test_dynamic_compact_dispatch_keeps_live_rows_and_buffer_addresses[split_no_skip-32]" time="0.002" /><testcase classname="tests.test_core" name="test_neural_gate_falls_back_before_divergence_and_resets_next_batch" time="0.001" /><testcase classname="tests.test_core" name="test_neural_gate_propagates_through_history_and_capture_views" time="0.001" /><testcase classname="tests.test_core" name="test_split_gate_and_large_batch_configuration[1-0]" time="0.000" /><testcase classname="tests.test_core" name="test_split_gate_and_large_batch_configuration[1-1]" time="0.000" /><testcase classname="tests.test_core" name="test_split_gate_and_large_batch_configuration[2-0]" time="0.000" /><testcase classname="tests.test_core" name="test_split_gate_and_large_batch_configuration[2-1]" time="0.000" /><testcase classname="tests.test_core" name="test_split_gate_and_large_batch_configuration[2-2]" time="0.000" /><testcase classname="tests.test_core" name="test_split_gate_and_large_batch_configuration[8-3]" time="0.000" /><testcase classname="tests.test_core" name="test_split_gate_and_large_batch_configuration[8-8]" time="0.000" /><testcase classname="tests.test_core" name="test_split_rejects_gate_outside_draft_budget[3]" time="0.000" /><testcase classname="tests.test_core" name="test_split_rejects_gate_outside_draft_budget[-1]" time="0.000" /><testcase classname="tests.test_core" name="test_split_rejects_gate_outside_draft_budget[True]" time="0.000" /><testcase classname="tests.test_core" name="test_split_rejects_gate_outside_draft_budget[1.5]" time="0.000" /><testcase classname="tests.test_core" name="test_arctic_split_supports_overlap_and_chunked_cpu_suffix_queries" time="0.000" /><testcase classname="tests.test_core" name="test_arctic_parameters_reject_invalid_probabilities_and_bounds[arctic_max_tree_depth-0]" time="0.000" /><testcase classname="tests.test_core" name="test_arctic_parameters_reject_invalid_probabilities_and_bounds[arctic_max_tree_depth-True]" time="0.000" /><testcase classname="tests.test_core" name="test_arctic_parameters_reject_invalid_probabilities_and_bounds[arctic_max_spec_factor--1]" time="0.000" /><testcase classname="tests.test_core" name="test_arctic_parameters_reject_invalid_probabilities_and_bounds[arctic_max_spec_factor-nan]" time="0.000" /><testcase classname="tests.test_core" name="test_arctic_parameters_reject_invalid_probabilities_and_bounds[arctic_max_spec_offset-inf]" time="0.000" /><testcase classname="tests.test_core" name="test_arctic_parameters_reject_invalid_probabilities_and_bounds[arctic_max_spec_offset-True]" time="0.000" /><testcase classname="tests.test_core" name="test_arctic_parameters_reject_invalid_probabilities_and_bounds[arctic_min_token_prob--0.1]" time="0.000" /><testcase classname="tests.test_core" name="test_arctic_parameters_reject_invalid_probabilities_and_bounds[arctic_min_token_prob-1.1]" time="0.000" /><testcase classname="tests.test_compact_tail" name="test_conditional_cost_seed_cannot_cross_dispatch_modes" time="0.002" /><testcase classname="tests.test_compact_tail" name="test_conditional_graph_rejects_unsupported_runtime[None-None]" time="0.001" /><testcase classname="tests.test_compact_tail" name="test_conditional_graph_rejects_unsupported_runtime[12.3-None]" time="0.000" /><testcase classname="tests.test_compact_tail" name="test_conditional_graph_rejects_unsupported_runtime[13.0-7.0]" time="0.000" /><testcase classname="tests.test_compact_tail" name="test_conditional_graph_requires_both_capture_bindings" time="0.000" /><testcase classname="tests.test_compact_tail" name="test_conditional_dispatch_never_reads_count_for_metrics_or_verify" time="0.001" /><testcase classname="tests.test_compact_tail" name="test_dsv4_compact_tail_recurrence_refreshes_rows_kv_plan_and_step_metadata[2-0]" time="0.010" /><testcase classname="tests.test_compact_tail" name="test_dsv4_compact_tail_recurrence_refreshes_rows_kv_plan_and_step_metadata[2-1]" time="0.005" /><testcase classname="tests.test_compact_tail" name="test_dsv4_compact_tail_recurrence_refreshes_rows_kv_plan_and_step_metadata[3-2]" time="0.006" /><testcase classname="tests.test_compact_tail" name="test_dsv4_compact_tail_recurrence_refreshes_rows_kv_plan_and_step_metadata[8-0]" time="0.015" /><testcase classname="tests.test_compact_tail" name="test_dsv4_compact_tail_recurrence_refreshes_rows_kv_plan_and_step_metadata[8-1]" time="0.015" /><testcase classname="tests.test_compact_tail" name="test_dsv4_compact_tail_recurrence_refreshes_rows_kv_plan_and_step_metadata[8-2]" time="0.015" /><testcase classname="tests.test_compact_tail" name="test_dsv4_compact_tail_recurrence_refreshes_rows_kv_plan_and_step_metadata[8-3]" time="0.011" /><testcase classname="tests.test_compact_verify" name="test_online_feedback_censors_tail_and_separates_sources" time="0.009" /><testcase classname="tests.test_compact_verify" name="test_dynamic_lengths_match_exhaustive_prefix_cost_oracle[False-False]" time="0.010" /><testcase classname="tests.test_compact_verify" name="test_dynamic_lengths_match_exhaustive_prefix_cost_oracle[False-True]" time="0.002" /><testcase classname="tests.test_compact_verify" name="test_dynamic_lengths_match_exhaustive_prefix_cost_oracle[True-False]" time="0.002" /><testcase classname="tests.test_compact_verify" name="test_dynamic_lengths_match_exhaustive_prefix_cost_oracle[True-True]" time="0.002" /><testcase classname="tests.test_compact_verify" name="test_dynamic_cold_start_exploration_and_abort_reset" time="0.004" /><testcase classname="tests.test_compact_verify" name="test_seeded_costs_follow_online_ema_without_seeding_acceptance" time="0.003" /><testcase classname="tests.test_compact_verify" name="test_cost_profile_rejects_incompatible_or_invalid_measurements" time="0.003" /><testcase classname="tests.test_compact_verify" name="test_eager_fallback_keeps_labels_without_training_graph_costs" time="0.001" /><testcase classname="tests.test_compact_verify" name="test_offline_profile_uses_steady_medians_worst_rank_and_round_trips" time="0.007" /><testcase classname="tests.test_compact_verify" name="test_profile_pins_bypass_cold_acceptance_and_reset_only_calibration_state" time="0.001" /><testcase classname="tests.test_compact_verify" name="test_profile_commands_target_nested_draft_worker_and_are_opt_in" time="0.001" /><testcase classname="tests.test_compact_verify" name="test_profile_http_handles_plain_text_flush_and_json_diagnostics" time="0.001" /><testcase classname="tests.test_compact_verify" name="test_profile_round_waits_for_steady_time_and_drains_on_success_or_timeout[False]" time="0.001" /><testcase classname="tests.test_compact_verify" name="test_profile_round_waits_for_steady_time_and_drains_on_success_or_timeout[True]" time="0.001" /><testcase classname="tests.test_compact_verify" name="test_profile_keeps_physical_graph_pinned_when_source_caps_leave_padding" time="0.006" /><testcase classname="tests.test_compact_verify" name="test_cuda_fixed_profile_budget_matches_cpu_with_cold_acceptance" time="3.093"><failure message="RuntimeError: Ninja is required to load C++ extensions (pip install ninja to get it)">experimental/hybrid-spec/tests/test_compact_verify.py:519: in test_cuda_fixed_profile_budget_matches_cpu_with_cold_acceptance
+    cpu, gpu = DynamicVerify(config, "cpu"), DynamicVerify(config, "cuda")
+                                             ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+experimental/hybrid-spec/src/hybrid_spec/selection/online_verify.py:80: in __init__
+    self.model = OnlineAcceptance(config, device)
+                 ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+experimental/hybrid-spec/src/hybrid_spec/selection/online_verify.py:34: in __init__
+    self.gpu_ops = GPUSuffixAutomaton.load_module()
+                   ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+experimental/hybrid-spec/src/hybrid_spec/backends/gpu_sa/__init__.py:27: in load_module
+    return load(
+../venv/lib/python3.12/site-packages/torch/utils/cpp_extension.py:1937: in load
+    return _jit_compile(
+../venv/lib/python3.12/site-packages/torch/utils/cpp_extension.py:2398: in _jit_compile
+    _write_ninja_file_and_build_library(
+../venv/lib/python3.12/site-packages/torch/utils/cpp_extension.py:2508: in _write_ninja_file_and_build_library
+    verify_ninja_availability()
+../venv/lib/python3.12/site-packages/torch/utils/cpp_extension.py:2574: in verify_ninja_availability
+    raise RuntimeError("Ninja is required to load C++ extensions (pip install ninja to get it)")
+E   RuntimeError: Ninja is required to load C++ extensions (pip install ninja to get it)</failure></testcase><testcase classname="tests.test_compact_verify" name="test_sparse_timing_covers_exploration_and_accounts_for_entire_cycle[1000-samples0]" time="0.005" /><testcase classname="tests.test_compact_verify" name="test_sparse_timing_covers_exploration_and_accounts_for_entire_cycle[5-samples1]" time="0.004" /><testcase classname="tests.test_compact_verify" name="test_dynamic_graph_grid_bounds_added_tiers_and_preserves_safe_rounding[1]" time="0.020" /><testcase classname="tests.test_compact_verify" name="test_dynamic_graph_grid_bounds_added_tiers_and_preserves_safe_rounding[8]" time="0.019" /><testcase classname="tests.test_compact_verify" name="test_cuda_dynamic_plugin_labels_before_history_consumer_and_flushes" time="0.012"><failure message="ImportError: /root/.cache/torch_extensions/py312_cu130/hybrid_spec_gpu_sa_v4/hybrid_spec_gpu_sa_v4.so: cannot open shared object file: No such file or directory">experimental/hybrid-spec/tests/test_compact_verify.py:636: in test_cuda_dynamic_plugin_labels_before_history_consumer_and_flushes
+    plugin._begin_draft(worker, batch)
+experimental/hybrid-spec/src/hybrid_spec/plugin.py:418: in _begin_draft
+    get_dynamic_verify(extension, device).begin(batch)
+    ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+experimental/hybrid-spec/src/hybrid_spec/integrations/sglang/compact_verify.py:154: in get_dynamic_verify
+    extension.dynamic_verify = DynamicVerify(
+experimental/hybrid-spec/src/hybrid_spec/selection/online_verify.py:80: in __init__
+    self.model = OnlineAcceptance(config, device)
+                 ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+experimental/hybrid-spec/src/hybrid_spec/selection/online_verify.py:34: in __init__
+    self.gpu_ops = GPUSuffixAutomaton.load_module()
+                   ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+experimental/hybrid-spec/src/hybrid_spec/backends/gpu_sa/__init__.py:27: in load_module
+    return load(
+../venv/lib/python3.12/site-packages/torch/utils/cpp_extension.py:1937: in load
+    return _jit_compile(
+../venv/lib/python3.12/site-packages/torch/utils/cpp_extension.py:2420: in _jit_compile
+    return _import_module_from_library(name, build_directory, is_python_module)
+           ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+../venv/lib/python3.12/site-packages/torch/utils/cpp_extension.py:2944: in _import_module_from_library
+    module = importlib.util.module_from_spec(spec)
+             ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+&lt;frozen importlib._bootstrap&gt;:813: in module_from_spec
+    ???
+&lt;frozen importlib._bootstrap_external&gt;:1289: in create_module
+    ???
+&lt;frozen importlib._bootstrap&gt;:488: in _call_with_frames_removed
+    ???
+E   ImportError: /root/.cache/torch_extensions/py312_cu130/hybrid_spec_gpu_sa_v4/hybrid_spec_gpu_sa_v4.so: cannot open shared object file: No such file or directory</failure></testcase><testcase classname="tests.test_compact_verify" name="test_dynamic_invalid_config[kwargs0]" time="0.001" /><testcase classname="tests.test_compact_verify" name="test_dynamic_invalid_config[kwargs1]" time="0.001" /><testcase classname="tests.test_compact_verify" name="test_dynamic_invalid_config[kwargs2]" time="0.001" /><testcase classname="tests.test_compact_verify" name="test_dynamic_invalid_config[kwargs3]" time="0.001" /><testcase classname="tests.test_compact_verify" name="test_dynamic_invalid_config[kwargs4]" time="0.001" /><testcase classname="tests.test_compact_verify" name="test_dynamic_invalid_config[kwargs5]" time="0.001" /><testcase classname="tests.test_compact_verify" name="test_dynamic_invalid_config[kwargs6]" time="0.000" /><testcase classname="tests.test_compact_verify" name="test_dynamic_invalid_config[kwargs7]" time="0.001" /><testcase classname="tests.test_compact_verify" name="test_dynamic_invalid_config[kwargs8]" time="0.001" /><testcase classname="tests.test_compact_verify" name="test_dynamic_invalid_config[kwargs9]" time="0.000" /><testcase classname="tests.test_compact_verify" name="test_cuda_fused_online_policy_and_feedback_match_cpu_reference[False-1]" time="0.012"><failure message="ImportError: /root/.cache/torch_extensions/py312_cu130/hybrid_spec_gpu_sa_v4/hybrid_spec_gpu_sa_v4.so: cannot open shared object file: No such file or directory">experimental/hybrid-spec/tests/test_compact_verify.py:712: in test_cuda_fused_online_policy_and_feedback_match_cpu_reference
+    gpu = DynamicVerify(config, "cuda")
+          ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+experimental/hybrid-spec/src/hybrid_spec/selection/online_verify.py:80: in __init__
+    self.model = OnlineAcceptance(config, device)
+                 ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+experimental/hybrid-spec/src/hybrid_spec/selection/online_verify.py:34: in __init__
+    self.gpu_ops = GPUSuffixAutomaton.load_module()
+                   ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+experimental/hybrid-spec/src/hybrid_spec/backends/gpu_sa/__init__.py:27: in load_module
+    return load(
+../venv/lib/python3.12/site-packages/torch/utils/cpp_extension.py:1937: in load
+    return _jit_compile(
+../venv/lib/python3.12/site-packages/torch/utils/cpp_extension.py:2420: in _jit_compile
+    return _import_module_from_library(name, build_directory, is_python_module)
+           ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+../venv/lib/python3.12/site-packages/torch/utils/cpp_extension.py:2944: in _import_module_from_library
+    module = importlib.util.module_from_spec(spec)
+             ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+&lt;frozen importlib._bootstrap&gt;:813: in module_from_spec
+    ???
+&lt;frozen importlib._bootstrap_external&gt;:1289: in create_module
+    ???
+&lt;frozen importlib._bootstrap&gt;:488: in _call_with_frames_removed
+    ???
+E   ImportError: /root/.cache/torch_extensions/py312_cu130/hybrid_spec_gpu_sa_v4/hybrid_spec_gpu_sa_v4.so: cannot open shared object file: No such file or directory</failure></testcase><testcase classname="tests.test_compact_verify" name="test_cuda_fused_online_policy_and_feedback_match_cpu_reference[False-4]" time="0.011"><failure message="ImportError: /root/.cache/torch_extensions/py312_cu130/hybrid_spec_gpu_sa_v4/hybrid_spec_gpu_sa_v4.so: cannot open shared object file: No such file or directory">experimental/hybrid-spec/tests/test_compact_verify.py:712: in test_cuda_fused_online_policy_and_feedback_match_cpu_reference
+    gpu = DynamicVerify(config, "cuda")
+          ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+experimental/hybrid-spec/src/hybrid_spec/selection/online_verify.py:80: in __init__
+    self.model = OnlineAcceptance(config, device)
+                 ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+experimental/hybrid-spec/src/hybrid_spec/selection/online_verify.py:34: in __init__
+    self.gpu_ops = GPUSuffixAutomaton.load_module()
+                   ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+experimental/hybrid-spec/src/hybrid_spec/backends/gpu_sa/__init__.py:27: in load_module
+    return load(
+../venv/lib/python3.12/site-packages/torch/utils/cpp_extension.py:1937: in load
+    return _jit_compile(
+../venv/lib/python3.12/site-packages/torch/utils/cpp_extension.py:2420: in _jit_compile
+    return _import_module_from_library(name, build_directory, is_python_module)
+           ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+../venv/lib/python3.12/site-packages/torch/utils/cpp_extension.py:2944: in _import_module_from_library
+    module = importlib.util.module_from_spec(spec)
+             ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+&lt;frozen importlib._bootstrap&gt;:813: in module_from_spec
+    ???
+&lt;frozen importlib._bootstrap_external&gt;:1289: in create_module
+    ???
+&lt;frozen importlib._bootstrap&gt;:488: in _call_with_frames_removed
+    ???
+E   ImportError: /root/.cache/torch_extensions/py312_cu130/hybrid_spec_gpu_sa_v4/hybrid_spec_gpu_sa_v4.so: cannot open shared object file: No such file or directory</failure></testcase><testcase classname="tests.test_compact_verify" name="test_cuda_fused_online_policy_and_feedback_match_cpu_reference[False-16]" time="0.012"><failure message="ImportError: /root/.cache/torch_extensions/py312_cu130/hybrid_spec_gpu_sa_v4/hybrid_spec_gpu_sa_v4.so: cannot open shared object file: No such file or directory">experimental/hybrid-spec/tests/test_compact_verify.py:712: in test_cuda_fused_online_policy_and_feedback_match_cpu_reference
+    gpu = DynamicVerify(config, "cuda")
+          ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+experimental/hybrid-spec/src/hybrid_spec/selection/online_verify.py:80: in __init__
+    self.model = OnlineAcceptance(config, device)
+                 ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+experimental/hybrid-spec/src/hybrid_spec/selection/online_verify.py:34: in __init__
+    self.gpu_ops = GPUSuffixAutomaton.load_module()
+                   ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+experimental/hybrid-spec/src/hybrid_spec/backends/gpu_sa/__init__.py:27: in load_module
+    return load(
+../venv/lib/python3.12/site-packages/torch/utils/cpp_extension.py:1937: in load
+    return _jit_compile(
+../venv/lib/python3.12/site-packages/torch/utils/cpp_extension.py:2420: in _jit_compile
+    return _import_module_from_library(name, build_directory, is_python_module)
+           ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+../venv/lib/python3.12/site-packages/torch/utils/cpp_extension.py:2944: in _import_module_from_library
+    module = importlib.util.module_from_spec(spec)
+             ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+&lt;frozen importlib._bootstrap&gt;:813: in module_from_spec
+    ???
+&lt;frozen importlib._bootstrap_external&gt;:1289: in create_module
+    ???
+&lt;frozen importlib._bootstrap&gt;:488: in _call_with_frames_removed
+    ???
+E   ImportError: /root/.cache/torch_extensions/py312_cu130/hybrid_spec_gpu_sa_v4/hybrid_spec_gpu_sa_v4.so: cannot open shared object file: No such file or directory</failure></testcase><testcase classname="tests.test_compact_verify" name="test_cuda_fused_online_policy_and_feedback_match_cpu_reference[False-33]" time="0.011"><failure message="ImportError: /root/.cache/torch_extensions/py312_cu130/hybrid_spec_gpu_sa_v4/hybrid_spec_gpu_sa_v4.so: cannot open shared object file: No such file or directory">experimental/hybrid-spec/tests/test_compact_verify.py:712: in test_cuda_fused_online_policy_and_feedback_match_cpu_reference
+    gpu = DynamicVerify(config, "cuda")
+          ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+experimental/hybrid-spec/src/hybrid_spec/selection/online_verify.py:80: in __init__
+    self.model = OnlineAcceptance(config, device)
+                 ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+experimental/hybrid-spec/src/hybrid_spec/selection/online_verify.py:34: in __init__
+    self.gpu_ops = GPUSuffixAutomaton.load_module()
+                   ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+experimental/hybrid-spec/src/hybrid_spec/backends/gpu_sa/__init__.py:27: in load_module
+    return load(
+../venv/lib/python3.12/site-packages/torch/utils/cpp_extension.py:1937: in load
+    return _jit_compile(
+../venv/lib/python3.12/site-packages/torch/utils/cpp_extension.py:2420: in _jit_compile
+    return _import_module_from_library(name, build_directory, is_python_module)
+           ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+../venv/lib/python3.12/site-packages/torch/utils/cpp_extension.py:2944: in _import_module_from_library
+    module = importlib.util.module_from_spec(spec)
+             ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+&lt;frozen importlib._bootstrap&gt;:813: in module_from_spec
+    ???
+&lt;frozen importlib._bootstrap_external&gt;:1289: in create_module
+    ???
+&lt;frozen importlib._bootstrap&gt;:488: in _call_with_frames_removed
+    ???
+E   ImportError: /root/.cache/torch_extensions/py312_cu130/hybrid_spec_gpu_sa_v4/hybrid_spec_gpu_sa_v4.so: cannot open shared object file: No such file or directory</failure></testcase><testcase classname="tests.test_compact_verify" name="test_cuda_fused_online_policy_and_feedback_match_cpu_reference[True-1]" time="0.012"><failure message="ImportError: /root/.cache/torch_extensions/py312_cu130/hybrid_spec_gpu_sa_v4/hybrid_spec_gpu_sa_v4.so: cannot open shared object file: No such file or directory">experimental/hybrid-spec/tests/test_compact_verify.py:712: in test_cuda_fused_online_policy_and_feedback_match_cpu_reference
+    gpu = DynamicVerify(config, "cuda")
+          ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+experimental/hybrid-spec/src/hybrid_spec/selection/online_verify.py:80: in __init__
+    self.model = OnlineAcceptance(config, device)
+                 ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+experimental/hybrid-spec/src/hybrid_spec/selection/online_verify.py:34: in __init__
+    self.gpu_ops = GPUSuffixAutomaton.load_module()
+                   ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+experimental/hybrid-spec/src/hybrid_spec/backends/gpu_sa/__init__.py:27: in load_module
+    return load(
+../venv/lib/python3.12/site-packages/torch/utils/cpp_extension.py:1937: in load
+    return _jit_compile(
+../venv/lib/python3.12/site-packages/torch/utils/cpp_extension.py:2420: in _jit_compile
+    return _import_module_from_library(name, build_directory, is_python_module)
+           ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+../venv/lib/python3.12/site-packages/torch/utils/cpp_extension.py:2944: in _import_module_from_library
+    module = importlib.util.module_from_spec(spec)
+             ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+&lt;frozen importlib._bootstrap&gt;:813: in module_from_spec
+    ???
+&lt;frozen importlib._bootstrap_external&gt;:1289: in create_module
+    ???
+&lt;frozen importlib._bootstrap&gt;:488: in _call_with_frames_removed
+    ???
+E   ImportError: /root/.cache/torch_extensions/py312_cu130/hybrid_spec_gpu_sa_v4/hybrid_spec_gpu_sa_v4.so: cannot open shared object file: No such file or directory</failure></testcase><testcase classname="tests.test_compact_verify" name="test_cuda_fused_online_policy_and_feedback_match_cpu_reference[True-4]" time="0.012"><failure message="ImportError: /root/.cache/torch_extensions/py312_cu130/hybrid_spec_gpu_sa_v4/hybrid_spec_gpu_sa_v4.so: cannot open shared object file: No such file or directory">experimental/hybrid-spec/tests/test_compact_verify.py:712: in test_cuda_fused_online_policy_and_feedback_match_cpu_reference
+    gpu = DynamicVerify(config, "cuda")
+          ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+experimental/hybrid-spec/src/hybrid_spec/selection/online_verify.py:80: in __init__
+    self.model = OnlineAcceptance(config, device)
+                 ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+experimental/hybrid-spec/src/hybrid_spec/selection/online_verify.py:34: in __init__
+    self.gpu_ops = GPUSuffixAutomaton.load_module()
+                   ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+experimental/hybrid-spec/src/hybrid_spec/backends/gpu_sa/__init__.py:27: in load_module
+    return load(
+../venv/lib/python3.12/site-packages/torch/utils/cpp_extension.py:1937: in load
+    return _jit_compile(
+../venv/lib/python3.12/site-packages/torch/utils/cpp_extension.py:2420: in _jit_compile
+    return _import_module_from_library(name, build_directory, is_python_module)
+           ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+../venv/lib/python3.12/site-packages/torch/utils/cpp_extension.py:2944: in _import_module_from_library
+    module = importlib.util.module_from_spec(spec)
+             ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+&lt;frozen importlib._bootstrap&gt;:813: in module_from_spec
+    ???
+&lt;frozen importlib._bootstrap_external&gt;:1289: in create_module
+    ???
+&lt;frozen importlib._bootstrap&gt;:488: in _call_with_frames_removed
+    ???
+E   ImportError: /root/.cache/torch_extensions/py312_cu130/hybrid_spec_gpu_sa_v4/hybrid_spec_gpu_sa_v4.so: cannot open shared object file: No such file or directory</failure></testcase><testcase classname="tests.test_compact_verify" name="test_cuda_fused_online_policy_and_feedback_match_cpu_reference[True-16]" time="0.014"><failure message="ImportError: /root/.cache/torch_extensions/py312_cu130/hybrid_spec_gpu_sa_v4/hybrid_spec_gpu_sa_v4.so: cannot open shared object file: No such file or directory">experimental/hybrid-spec/tests/test_compact_verify.py:712: in test_cuda_fused_online_policy_and_feedback_match_cpu_reference
+    gpu = DynamicVerify(config, "cuda")
+          ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+experimental/hybrid-spec/src/hybrid_spec/selection/online_verify.py:80: in __init__
+    self.model = OnlineAcceptance(config, device)
+                 ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+experimental/hybrid-spec/src/hybrid_spec/selection/online_verify.py:34: in __init__
+    self.gpu_ops = GPUSuffixAutomaton.load_module()
+                   ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+experimental/hybrid-spec/src/hybrid_spec/backends/gpu_sa/__init__.py:27: in load_module
+    return load(
+../venv/lib/python3.12/site-packages/torch/utils/cpp_extension.py:1937: in load
+    return _jit_compile(
+../venv/lib/python3.12/site-packages/torch/utils/cpp_extension.py:2420: in _jit_compile
+    return _import_module_from_library(name, build_directory, is_python_module)
+           ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+../venv/lib/python3.12/site-packages/torch/utils/cpp_extension.py:2944: in _import_module_from_library
+    module = importlib.util.module_from_spec(spec)
+             ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+&lt;frozen importlib._bootstrap&gt;:813: in module_from_spec
+    ???
+&lt;frozen importlib._bootstrap_external&gt;:1289: in create_module
+    ???
+&lt;frozen importlib._bootstrap&gt;:488: in _call_with_frames_removed
+    ???
+E   ImportError: /root/.cache/torch_extensions/py312_cu130/hybrid_spec_gpu_sa_v4/hybrid_spec_gpu_sa_v4.so: cannot open shared object file: No such file or directory</failure></testcase><testcase classname="tests.test_compact_verify" name="test_cuda_fused_online_policy_and_feedback_match_cpu_reference[True-33]" time="0.012"><failure message="ImportError: /root/.cache/torch_extensions/py312_cu130/hybrid_spec_gpu_sa_v4/hybrid_spec_gpu_sa_v4.so: cannot open shared object file: No such file or directory">experimental/hybrid-spec/tests/test_compact_verify.py:712: in test_cuda_fused_online_policy_and_feedback_match_cpu_reference
+    gpu = DynamicVerify(config, "cuda")
+          ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+experimental/hybrid-spec/src/hybrid_spec/selection/online_verify.py:80: in __init__
+    self.model = OnlineAcceptance(config, device)
+                 ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+experimental/hybrid-spec/src/hybrid_spec/selection/online_verify.py:34: in __init__
+    self.gpu_ops = GPUSuffixAutomaton.load_module()
+                   ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+experimental/hybrid-spec/src/hybrid_spec/backends/gpu_sa/__init__.py:27: in load_module
+    return load(
+../venv/lib/python3.12/site-packages/torch/utils/cpp_extension.py:1937: in load
+    return _jit_compile(
+../venv/lib/python3.12/site-packages/torch/utils/cpp_extension.py:2420: in _jit_compile
+    return _import_module_from_library(name, build_directory, is_python_module)
+           ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+../venv/lib/python3.12/site-packages/torch/utils/cpp_extension.py:2944: in _import_module_from_library
+    module = importlib.util.module_from_spec(spec)
+             ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+&lt;frozen importlib._bootstrap&gt;:813: in module_from_spec
+    ???
+&lt;frozen importlib._bootstrap_external&gt;:1289: in create_module
+    ???
+&lt;frozen importlib._bootstrap&gt;:488: in _call_with_frames_removed
+    ???
+E   ImportError: /root/.cache/torch_extensions/py312_cu130/hybrid_spec_gpu_sa_v4/hybrid_spec_gpu_sa_v4.so: cannot open shared object file: No such file or directory</failure></testcase><testcase classname="tests.test_compact_verify" name="test_source_lengths_config_and_token_grid[1-0]" time="0.001" /><testcase classname="tests.test_compact_verify" name="test_source_lengths_config_and_token_grid[2-3]" time="0.001" /><testcase classname="tests.test_compact_verify" name="test_source_lengths_config_and_token_grid[3-1]" time="0.001" /><testcase classname="tests.test_compact_verify" name="test_source_lengths_config_and_token_grid[8-8]" time="0.001" /><testcase classname="tests.test_compact_verify" name="test_invalid_budgets_fail_before_cuda[kwargs0]" time="0.001" /><testcase classname="tests.test_compact_verify" name="test_invalid_budgets_fail_before_cuda[kwargs1]" time="0.001" /><testcase classname="tests.test_compact_verify" name="test_invalid_budgets_fail_before_cuda[kwargs2]" time="0.001" /><testcase classname="tests.test_compact_verify" name="test_invalid_budgets_fail_before_cuda[kwargs3]" time="0.001" /><testcase classname="tests.test_compact_verify" name="test_invalid_budgets_fail_before_cuda[kwargs4]" time="0.001" /><testcase classname="tests.test_compact_verify" name="test_invalid_budgets_fail_before_cuda[kwargs5]" time="0.001" /><testcase classname="tests.test_compact_verify" name="test_invalid_budgets_fail_before_cuda[kwargs6]" time="0.001" /><testcase classname="tests.test_compact_verify" name="test_cutoff_does_not_accept_zero_filled_tail" time="0.001" /><testcase classname="tests.test_compact_verify" name="test_capture_loop_uses_token_tiers_instead_of_multiplying_by_width" time="0.013" /><testcase classname="tests.test_compact_verify" name="test_cuda_mixed_verify_graph_tier_switches_and_native_commit[False-1-False-3-1]" time="2.515" /><testcase classname="tests.test_compact_verify" name="test_cuda_mixed_verify_graph_tier_switches_and_native_commit[False-1-False-2-3]" time="0.198" /><testcase classname="tests.test_compact_verify" name="test_cuda_mixed_verify_graph_tier_switches_and_native_commit[False-1-False-1-8]" time="0.277" /><testcase classname="tests.test_compact_verify" name="test_cuda_mixed_verify_graph_tier_switches_and_native_commit[False-1-False-8-8]" time="0.206" /><testcase classname="tests.test_compact_verify" name="test_cuda_mixed_verify_graph_tier_switches_and_native_commit[False-1-True-3-1]" time="0.192" /><testcase classname="tests.test_compact_verify" name="test_cuda_mixed_verify_graph_tier_switches_and_native_commit[False-1-True-2-3]" time="0.288" /><testcase classname="tests.test_compact_verify" name="test_cuda_mixed_verify_graph_tier_switches_and_native_commit[False-1-True-1-8]" time="0.188" /><testcase classname="tests.test_compact_verify" name="test_cuda_mixed_verify_graph_tier_switches_and_native_commit[False-1-True-8-8]" time="0.196" /><testcase classname="tests.test_compact_verify" name="test_cuda_mixed_verify_graph_tier_switches_and_native_commit[False-8-False-3-1]" time="0.424" /><testcase classname="tests.test_compact_verify" name="test_cuda_mixed_verify_graph_tier_switches_and_native_commit[False-8-False-2-3]" time="0.184" /><testcase classname="tests.test_compact_verify" name="test_cuda_mixed_verify_graph_tier_switches_and_native_commit[False-8-False-1-8]" time="0.170" /><testcase classname="tests.test_compact_verify" name="test_cuda_mixed_verify_graph_tier_switches_and_native_commit[False-8-False-8-8]" time="0.164" /><testcase classname="tests.test_compact_verify" name="test_cuda_mixed_verify_graph_tier_switches_and_native_commit[False-8-True-3-1]" time="0.194" /><testcase classname="tests.test_compact_verify" name="test_cuda_mixed_verify_graph_tier_switches_and_native_commit[False-8-True-2-3]" time="0.157" /><testcase classname="tests.test_compact_verify" name="test_cuda_mixed_verify_graph_tier_switches_and_native_commit[False-8-True-1-8]" time="0.166" /><testcase classname="tests.test_compact_verify" name="test_cuda_mixed_verify_graph_tier_switches_and_native_commit[False-8-True-8-8]" time="0.168" /><testcase classname="tests.test_compact_verify" name="test_cuda_mixed_verify_graph_tier_switches_and_native_commit[True-1-False-3-1]" time="0.020"><failure message="ImportError: /root/.cache/torch_extensions/py312_cu130/hybrid_spec_gpu_sa_v4/hybrid_spec_gpu_sa_v4.so: cannot open shared object file: No such file or directory">experimental/hybrid-spec/tests/test_compact_verify.py:1024: in test_cuda_mixed_verify_graph_tier_switches_and_native_commit
+    chooser = get_dynamic_verify(worker.draft_extension, "cuda")
+              ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+experimental/hybrid-spec/src/hybrid_spec/integrations/sglang/compact_verify.py:154: in get_dynamic_verify
+    extension.dynamic_verify = DynamicVerify(
+experimental/hybrid-spec/src/hybrid_spec/selection/online_verify.py:80: in __init__
+    self.model = OnlineAcceptance(config, device)
+                 ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+experimental/hybrid-spec/src/hybrid_spec/selection/online_verify.py:34: in __init__
+    self.gpu_ops = GPUSuffixAutomaton.load_module()
+                   ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+experimental/hybrid-spec/src/hybrid_spec/backends/gpu_sa/__init__.py:27: in load_module
+    return load(
+../venv/lib/python3.12/site-packages/torch/utils/cpp_extension.py:1937: in load
+    return _jit_compile(
+../venv/lib/python3.12/site-packages/torch/utils/cpp_extension.py:2420: in _jit_compile
+    return _import_module_from_library(name, build_directory, is_python_module)
+           ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+../venv/lib/python3.12/site-packages/torch/utils/cpp_extension.py:2944: in _import_module_from_library
+    module = importlib.util.module_from_spec(spec)
+             ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+&lt;frozen importlib._bootstrap&gt;:813: in module_from_spec
+    ???
+&lt;frozen importlib._bootstrap_external&gt;:1289: in create_module
+    ???
+&lt;frozen importlib._bootstrap&gt;:488: in _call_with_frames_removed
+    ???
+E   ImportError: /root/.cache/torch_extensions/py312_cu130/hybrid_spec_gpu_sa_v4/hybrid_spec_gpu_sa_v4.so: cannot open shared object file: No such file or directory</failure></testcase><testcase classname="tests.test_compact_verify" name="test_cuda_mixed_verify_graph_tier_switches_and_native_commit[True-1-False-2-3]" time="0.018"><failure message="ImportError: /root/.cache/torch_extensions/py312_cu130/hybrid_spec_gpu_sa_v4/hybrid_spec_gpu_sa_v4.so: cannot open shared object file: No such file or directory">experimental/hybrid-spec/tests/test_compact_verify.py:1024: in test_cuda_mixed_verify_graph_tier_switches_and_native_commit
+    chooser = get_dynamic_verify(worker.draft_extension, "cuda")
+              ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+experimental/hybrid-spec/src/hybrid_spec/integrations/sglang/compact_verify.py:154: in get_dynamic_verify
+    extension.dynamic_verify = DynamicVerify(
+experimental/hybrid-spec/src/hybrid_spec/selection/online_verify.py:80: in __init__
+    self.model = OnlineAcceptance(config, device)
+                 ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+experimental/hybrid-spec/src/hybrid_spec/selection/online_verify.py:34: in __init__
+    self.gpu_ops = GPUSuffixAutomaton.load_module()
+                   ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+experimental/hybrid-spec/src/hybrid_spec/backends/gpu_sa/__init__.py:27: in load_module
+    return load(
+../venv/lib/python3.12/site-packages/torch/utils/cpp_extension.py:1937: in load
+    return _jit_compile(
+../venv/lib/python3.12/site-packages/torch/utils/cpp_extension.py:2420: in _jit_compile
+    return _import_module_from_library(name, build_directory, is_python_module)
+           ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+../venv/lib/python3.12/site-packages/torch/utils/cpp_extension.py:2944: in _import_module_from_library
+    module = importlib.util.module_from_spec(spec)
+             ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+&lt;frozen importlib._bootstrap&gt;:813: in module_from_spec
+    ???
+&lt;frozen importlib._bootstrap_external&gt;:1289: in create_module
+    ???
+&lt;frozen importlib._bootstrap&gt;:488: in _call_with_frames_removed
+    ???
+E   ImportError: /root/.cache/torch_extensions/py312_cu130/hybrid_spec_gpu_sa_v4/hybrid_spec_gpu_sa_v4.so: cannot open shared object file: No such file or directory</failure></testcase><testcase classname="tests.test_compact_verify" name="test_cuda_mixed_verify_graph_tier_switches_and_native_commit[True-1-False-1-8]" time="0.018"><failure message="ImportError: /root/.cache/torch_extensions/py312_cu130/hybrid_spec_gpu_sa_v4/hybrid_spec_gpu_sa_v4.so: cannot open shared object file: No such file or directory">experimental/hybrid-spec/tests/test_compact_verify.py:1024: in test_cuda_mixed_verify_graph_tier_switches_and_native_commit
+    chooser = get_dynamic_verify(worker.draft_extension, "cuda")
+              ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+experimental/hybrid-spec/src/hybrid_spec/integrations/sglang/compact_verify.py:154: in get_dynamic_verify
+    extension.dynamic_verify = DynamicVerify(
+experimental/hybrid-spec/src/hybrid_spec/selection/online_verify.py:80: in __init__
+    self.model = OnlineAcceptance(config, device)
+                 ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+experimental/hybrid-spec/src/hybrid_spec/selection/online_verify.py:34: in __init__
+    self.gpu_ops = GPUSuffixAutomaton.load_module()
+                   ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+experimental/hybrid-spec/src/hybrid_spec/backends/gpu_sa/__init__.py:27: in load_module
+    return load(
+../venv/lib/python3.12/site-packages/torch/utils/cpp_extension.py:1937: in load
+    return _jit_compile(
+../venv/lib/python3.12/site-packages/torch/utils/cpp_extension.py:2420: in _jit_compile
+    return _import_module_from_library(name, build_directory, is_python_module)
+           ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+../venv/lib/python3.12/site-packages/torch/utils/cpp_extension.py:2944: in _import_module_from_library
+    module = importlib.util.module_from_spec(spec)
+             ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+&lt;frozen importlib._bootstrap&gt;:813: in module_from_spec
+    ???
+&lt;frozen importlib._bootstrap_external&gt;:1289: in create_module
+    ???
+&lt;frozen importlib._bootstrap&gt;:488: in _call_with_frames_removed
+    ???
+E   ImportError: /root/.cache/torch_extensions/py312_cu130/hybrid_spec_gpu_sa_v4/hybrid_spec_gpu_sa_v4.so: cannot open shared object file: No such file or directory</failure></testcase><testcase classname="tests.test_compact_verify" name="test_cuda_mixed_verify_graph_tier_switches_and_native_commit[True-1-False-8-8]" time="0.018"><failure message="ImportError: /root/.cache/torch_extensions/py312_cu130/hybrid_spec_gpu_sa_v4/hybrid_spec_gpu_sa_v4.so: cannot open shared object file: No such file or directory">experimental/hybrid-spec/tests/test_compact_verify.py:1024: in test_cuda_mixed_verify_graph_tier_switches_and_native_commit
+    chooser = get_dynamic_verify(worker.draft_extension, "cuda")
+              ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+experimental/hybrid-spec/src/hybrid_spec/integrations/sglang/compact_verify.py:154: in get_dynamic_verify
+    extension.dynamic_verify = DynamicVerify(
+experimental/hybrid-spec/src/hybrid_spec/selection/online_verify.py:80: in __init__
+    self.model = OnlineAcceptance(config, device)
+                 ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+experimental/hybrid-spec/src/hybrid_spec/selection/online_verify.py:34: in __init__
+    self.gpu_ops = GPUSuffixAutomaton.load_module()
+                   ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+experimental/hybrid-spec/src/hybrid_spec/backends/gpu_sa/__init__.py:27: in load_module
+    return load(
+../venv/lib/python3.12/site-packages/torch/utils/cpp_extension.py:1937: in load
+    return _jit_compile(
+../venv/lib/python3.12/site-packages/torch/utils/cpp_extension.py:2420: in _jit_compile
+    return _import_module_from_library(name, build_directory, is_python_module)
+           ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+../venv/lib/python3.12/site-packages/torch/utils/cpp_extension.py:2944: in _import_module_from_library
+    module = importlib.util.module_from_spec(spec)
+             ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+&lt;frozen importlib._bootstrap&gt;:813: in module_from_spec
+    ???
+&lt;frozen importlib._bootstrap_external&gt;:1289: in create_module
+    ???
+&lt;frozen importlib._bootstrap&gt;:488: in _call_with_frames_removed
+    ???
+E   ImportError: /root/.cache/torch_extensions/py312_cu130/hybrid_spec_gpu_sa_v4/hybrid_spec_gpu_sa_v4.so: cannot open shared object file: No such file or directory</failure></testcase><testcase classname="tests.test_compact_verify" name="test_cuda_mixed_verify_graph_tier_switches_and_native_commit[True-1-True-3-1]" time="0.018"><failure message="ImportError: /root/.cache/torch_extensions/py312_cu130/hybrid_spec_gpu_sa_v4/hybrid_spec_gpu_sa_v4.so: cannot open shared object file: No such file or directory">experimental/hybrid-spec/tests/test_compact_verify.py:1024: in test_cuda_mixed_verify_graph_tier_switches_and_native_commit
+    chooser = get_dynamic_verify(worker.draft_extension, "cuda")
+              ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+experimental/hybrid-spec/src/hybrid_spec/integrations/sglang/compact_verify.py:154: in get_dynamic_verify
+    extension.dynamic_verify = DynamicVerify(
+experimental/hybrid-spec/src/hybrid_spec/selection/online_verify.py:80: in __init__
+    self.model = OnlineAcceptance(config, device)
+                 ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+experimental/hybrid-spec/src/hybrid_spec/selection/online_verify.py:34: in __init__
+    self.gpu_ops = GPUSuffixAutomaton.load_module()
+                   ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+experimental/hybrid-spec/src/hybrid_spec/backends/gpu_sa/__init__.py:27: in load_module
+    return load(
+../venv/lib/python3.12/site-packages/torch/utils/cpp_extension.py:1937: in load
+    return _jit_compile(
+../venv/lib/python3.12/site-packages/torch/utils/cpp_extension.py:2420: in _jit_compile
+    return _import_module_from_library(name, build_directory, is_python_module)
+           ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+../venv/lib/python3.12/site-packages/torch/utils/cpp_extension.py:2944: in _import_module_from_library
+    module = importlib.util.module_from_spec(spec)
+             ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+&lt;frozen importlib._bootstrap&gt;:813: in module_from_spec
+    ???
+&lt;frozen importlib._bootstrap_external&gt;:1289: in create_module
+    ???
+&lt;frozen importlib._bootstrap&gt;:488: in _call_with_frames_removed
+    ???
+E   ImportError: /root/.cache/torch_extensions/py312_cu130/hybrid_spec_gpu_sa_v4/hybrid_spec_gpu_sa_v4.so: cannot open shared object file: No such file or directory</failure></testcase><testcase classname="tests.test_compact_verify" name="test_cuda_mixed_verify_graph_tier_switches_and_native_commit[True-1-True-2-3]" time="0.018"><failure message="ImportError: /root/.cache/torch_extensions/py312_cu130/hybrid_spec_gpu_sa_v4/hybrid_spec_gpu_sa_v4.so: cannot open shared object file: No such file or directory">experimental/hybrid-spec/tests/test_compact_verify.py:1024: in test_cuda_mixed_verify_graph_tier_switches_and_native_commit
+    chooser = get_dynamic_verify(worker.draft_extension, "cuda")
+              ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+experimental/hybrid-spec/src/hybrid_spec/integrations/sglang/compact_verify.py:154: in get_dynamic_verify
+    extension.dynamic_verify = DynamicVerify(
+experimental/hybrid-spec/src/hybrid_spec/selection/online_verify.py:80: in __init__
+    self.model = OnlineAcceptance(config, device)
+                 ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+experimental/hybrid-spec/src/hybrid_spec/selection/online_verify.py:34: in __init__
+    self.gpu_ops = GPUSuffixAutomaton.load_module()
+                   ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+experimental/hybrid-spec/src/hybrid_spec/backends/gpu_sa/__init__.py:27: in load_module
+    return load(
+../venv/lib/python3.12/site-packages/torch/utils/cpp_extension.py:1937: in load
+    return _jit_compile(
+../venv/lib/python3.12/site-packages/torch/utils/cpp_extension.py:2420: in _jit_compile
+    return _import_module_from_library(name, build_directory, is_python_module)
+           ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+../venv/lib/python3.12/site-packages/torch/utils/cpp_extension.py:2944: in _import_module_from_library
+    module = importlib.util.module_from_spec(spec)
+             ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+&lt;frozen importlib._bootstrap&gt;:813: in module_from_spec
+    ???
+&lt;frozen importlib._bootstrap_external&gt;:1289: in create_module
+    ???
+&lt;frozen importlib._bootstrap&gt;:488: in _call_with_frames_removed
+    ???
+E   ImportError: /root/.cache/torch_extensions/py312_cu130/hybrid_spec_gpu_sa_v4/hybrid_spec_gpu_sa_v4.so: cannot open shared object file: No such file or directory</failure></testcase><testcase classname="tests.test_compact_verify" name="test_cuda_mixed_verify_graph_tier_switches_and_native_commit[True-1-True-1-8]" time="0.018"><failure message="ImportError: /root/.cache/torch_extensions/py312_cu130/hybrid_spec_gpu_sa_v4/hybrid_spec_gpu_sa_v4.so: cannot open shared object file: No such file or directory">experimental/hybrid-spec/tests/test_compact_verify.py:1024: in test_cuda_mixed_verify_graph_tier_switches_and_native_commit
+    chooser = get_dynamic_verify(worker.draft_extension, "cuda")
+              ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+experimental/hybrid-spec/src/hybrid_spec/integrations/sglang/compact_verify.py:154: in get_dynamic_verify
+    extension.dynamic_verify = DynamicVerify(
+experimental/hybrid-spec/src/hybrid_spec/selection/online_verify.py:80: in __init__
+    self.model = OnlineAcceptance(config, device)
+                 ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+experimental/hybrid-spec/src/hybrid_spec/selection/online_verify.py:34: in __init__
+    self.gpu_ops = GPUSuffixAutomaton.load_module()
+                   ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+experimental/hybrid-spec/src/hybrid_spec/backends/gpu_sa/__init__.py:27: in load_module
+    return load(
+../venv/lib/python3.12/site-packages/torch/utils/cpp_extension.py:1937: in load
+    return _jit_compile(
+../venv/lib/python3.12/site-packages/torch/utils/cpp_extension.py:2420: in _jit_compile
+    return _import_module_from_library(name, build_directory, is_python_module)
+           ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+../venv/lib/python3.12/site-packages/torch/utils/cpp_extension.py:2944: in _import_module_from_library
+    module = importlib.util.module_from_spec(spec)
+             ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+&lt;frozen importlib._bootstrap&gt;:813: in module_from_spec
+    ???
+&lt;frozen importlib._bootstrap_external&gt;:1289: in create_module
+    ???
+&lt;frozen importlib._bootstrap&gt;:488: in _call_with_frames_removed
+    ???
+E   ImportError: /root/.cache/torch_extensions/py312_cu130/hybrid_spec_gpu_sa_v4/hybrid_spec_gpu_sa_v4.so: cannot open shared object file: No such file or directory</failure></testcase><testcase classname="tests.test_compact_verify" name="test_cuda_mixed_verify_graph_tier_switches_and_native_commit[True-1-True-8-8]" time="0.018"><failure message="ImportError: /root/.cache/torch_extensions/py312_cu130/hybrid_spec_gpu_sa_v4/hybrid_spec_gpu_sa_v4.so: cannot open shared object file: No such file or directory">experimental/hybrid-spec/tests/test_compact_verify.py:1024: in test_cuda_mixed_verify_graph_tier_switches_and_native_commit
+    chooser = get_dynamic_verify(worker.draft_extension, "cuda")
+              ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+experimental/hybrid-spec/src/hybrid_spec/integrations/sglang/compact_verify.py:154: in get_dynamic_verify
+    extension.dynamic_verify = DynamicVerify(
+experimental/hybrid-spec/src/hybrid_spec/selection/online_verify.py:80: in __init__
+    self.model = OnlineAcceptance(config, device)
+                 ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+experimental/hybrid-spec/src/hybrid_spec/selection/online_verify.py:34: in __init__
+    self.gpu_ops = GPUSuffixAutomaton.load_module()
+                   ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+experimental/hybrid-spec/src/hybrid_spec/backends/gpu_sa/__init__.py:27: in load_module
+    return load(
+../venv/lib/python3.12/site-packages/torch/utils/cpp_extension.py:1937: in load
+    return _jit_compile(
+../venv/lib/python3.12/site-packages/torch/utils/cpp_extension.py:2420: in _jit_compile
+    return _import_module_from_library(name, build_directory, is_python_module)
+           ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+../venv/lib/python3.12/site-packages/torch/utils/cpp_extension.py:2944: in _import_module_from_library
+    module = importlib.util.module_from_spec(spec)
+             ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+&lt;frozen importlib._bootstrap&gt;:813: in module_from_spec
+    ???
+&lt;frozen importlib._bootstrap_external&gt;:1289: in create_module
+    ???
+&lt;frozen importlib._bootstrap&gt;:488: in _call_with_frames_removed
+    ???
+E   ImportError: /root/.cache/torch_extensions/py312_cu130/hybrid_spec_gpu_sa_v4/hybrid_spec_gpu_sa_v4.so: cannot open shared object file: No such file or directory</failure></testcase><testcase classname="tests.test_compact_verify" name="test_cuda_mixed_verify_graph_tier_switches_and_native_commit[True-8-False-3-1]" time="0.019"><failure message="ImportError: /root/.cache/torch_extensions/py312_cu130/hybrid_spec_gpu_sa_v4/hybrid_spec_gpu_sa_v4.so: cannot open shared object file: No such file or directory">experimental/hybrid-spec/tests/test_compact_verify.py:1024: in test_cuda_mixed_verify_graph_tier_switches_and_native_commit
+    chooser = get_dynamic_verify(worker.draft_extension, "cuda")
+              ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+experimental/hybrid-spec/src/hybrid_spec/integrations/sglang/compact_verify.py:154: in get_dynamic_verify
+    extension.dynamic_verify = DynamicVerify(
+experimental/hybrid-spec/src/hybrid_spec/selection/online_verify.py:80: in __init__
+    self.model = OnlineAcceptance(config, device)
+                 ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+experimental/hybrid-spec/src/hybrid_spec/selection/online_verify.py:34: in __init__
+    self.gpu_ops = GPUSuffixAutomaton.load_module()
+                   ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+experimental/hybrid-spec/src/hybrid_spec/backends/gpu_sa/__init__.py:27: in load_module
+    return load(
+../venv/lib/python3.12/site-packages/torch/utils/cpp_extension.py:1937: in load
+    return _jit_compile(
+../venv/lib/python3.12/site-packages/torch/utils/cpp_extension.py:2420: in _jit_compile
+    return _import_module_from_library(name, build_directory, is_python_module)
+           ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+../venv/lib/python3.12/site-packages/torch/utils/cpp_extension.py:2944: in _import_module_from_library
+    module = importlib.util.module_from_spec(spec)
+             ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+&lt;frozen importlib._bootstrap&gt;:813: in module_from_spec
+    ???
+&lt;frozen importlib._bootstrap_external&gt;:1289: in create_module
+    ???
+&lt;frozen importlib._bootstrap&gt;:488: in _call_with_frames_removed
+    ???
+E   ImportError: /root/.cache/torch_extensions/py312_cu130/hybrid_spec_gpu_sa_v4/hybrid_spec_gpu_sa_v4.so: cannot open shared object file: No such file or directory</failure></testcase><testcase classname="tests.test_compact_verify" name="test_cuda_mixed_verify_graph_tier_switches_and_native_commit[True-8-False-2-3]" time="0.018"><failure message="ImportError: /root/.cache/torch_extensions/py312_cu130/hybrid_spec_gpu_sa_v4/hybrid_spec_gpu_sa_v4.so: cannot open shared object file: No such file or directory">experimental/hybrid-spec/tests/test_compact_verify.py:1024: in test_cuda_mixed_verify_graph_tier_switches_and_native_commit
+    chooser = get_dynamic_verify(worker.draft_extension, "cuda")
+              ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+experimental/hybrid-spec/src/hybrid_spec/integrations/sglang/compact_verify.py:154: in get_dynamic_verify
+    extension.dynamic_verify = DynamicVerify(
+experimental/hybrid-spec/src/hybrid_spec/selection/online_verify.py:80: in __init__
+    self.model = OnlineAcceptance(config, device)
+                 ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+experimental/hybrid-spec/src/hybrid_spec/selection/online_verify.py:34: in __init__
+    self.gpu_ops = GPUSuffixAutomaton.load_module()
+                   ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+experimental/hybrid-spec/src/hybrid_spec/backends/gpu_sa/__init__.py:27: in load_module
+    return load(
+../venv/lib/python3.12/site-packages/torch/utils/cpp_extension.py:1937: in load
+    return _jit_compile(
+../venv/lib/python3.12/site-packages/torch/utils/cpp_extension.py:2420: in _jit_compile
+    return _import_module_from_library(name, build_directory, is_python_module)
+           ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+../venv/lib/python3.12/site-packages/torch/utils/cpp_extension.py:2944: in _import_module_from_library
+    module = importlib.util.module_from_spec(spec)
+             ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+&lt;frozen importlib._bootstrap&gt;:813: in module_from_spec
+    ???
+&lt;frozen importlib._bootstrap_external&gt;:1289: in create_module
+    ???
+&lt;frozen importlib._bootstrap&gt;:488: in _call_with_frames_removed
+    ???
+E   ImportError: /root/.cache/torch_extensions/py312_cu130/hybrid_spec_gpu_sa_v4/hybrid_spec_gpu_sa_v4.so: cannot open shared object file: No such file or directory</failure></testcase><testcase classname="tests.test_compact_verify" name="test_cuda_mixed_verify_graph_tier_switches_and_native_commit[True-8-False-1-8]" time="0.020"><failure message="ImportError: /root/.cache/torch_extensions/py312_cu130/hybrid_spec_gpu_sa_v4/hybrid_spec_gpu_sa_v4.so: cannot open shared object file: No such file or directory">experimental/hybrid-spec/tests/test_compact_verify.py:1024: in test_cuda_mixed_verify_graph_tier_switches_and_native_commit
+    chooser = get_dynamic_verify(worker.draft_extension, "cuda")
+              ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+experimental/hybrid-spec/src/hybrid_spec/integrations/sglang/compact_verify.py:154: in get_dynamic_verify
+    extension.dynamic_verify = DynamicVerify(
+experimental/hybrid-spec/src/hybrid_spec/selection/online_verify.py:80: in __init__
+    self.model = OnlineAcceptance(config, device)
+                 ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+experimental/hybrid-spec/src/hybrid_spec/selection/online_verify.py:34: in __init__
+    self.gpu_ops = GPUSuffixAutomaton.load_module()
+                   ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+experimental/hybrid-spec/src/hybrid_spec/backends/gpu_sa/__init__.py:27: in load_module
+    return load(
+../venv/lib/python3.12/site-packages/torch/utils/cpp_extension.py:1937: in load
+    return _jit_compile(
+../venv/lib/python3.12/site-packages/torch/utils/cpp_extension.py:2420: in _jit_compile
+    return _import_module_from_library(name, build_directory, is_python_module)
+           ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+../venv/lib/python3.12/site-packages/torch/utils/cpp_extension.py:2944: in _import_module_from_library
+    module = importlib.util.module_from_spec(spec)
+             ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+&lt;frozen importlib._bootstrap&gt;:813: in module_from_spec
+    ???
+&lt;frozen importlib._bootstrap_external&gt;:1289: in create_module
+    ???
+&lt;frozen importlib._bootstrap&gt;:488: in _call_with_frames_removed
+    ???
+E   ImportError: /root/.cache/torch_extensions/py312_cu130/hybrid_spec_gpu_sa_v4/hybrid_spec_gpu_sa_v4.so: cannot open shared object file: No such file or directory</failure></testcase><testcase classname="tests.test_compact_verify" name="test_cuda_mixed_verify_graph_tier_switches_and_native_commit[True-8-False-8-8]" time="0.019"><failure message="ImportError: /root/.cache/torch_extensions/py312_cu130/hybrid_spec_gpu_sa_v4/hybrid_spec_gpu_sa_v4.so: cannot open shared object file: No such file or directory">experimental/hybrid-spec/tests/test_compact_verify.py:1024: in test_cuda_mixed_verify_graph_tier_switches_and_native_commit
+    chooser = get_dynamic_verify(worker.draft_extension, "cuda")
+              ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+experimental/hybrid-spec/src/hybrid_spec/integrations/sglang/compact_verify.py:154: in get_dynamic_verify
+    extension.dynamic_verify = DynamicVerify(
+experimental/hybrid-spec/src/hybrid_spec/selection/online_verify.py:80: in __init__
+    self.model = OnlineAcceptance(config, device)
+                 ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+experimental/hybrid-spec/src/hybrid_spec/selection/online_verify.py:34: in __init__
+    self.gpu_ops = GPUSuffixAutomaton.load_module()
+                   ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+experimental/hybrid-spec/src/hybrid_spec/backends/gpu_sa/__init__.py:27: in load_module
+    return load(
+../venv/lib/python3.12/site-packages/torch/utils/cpp_extension.py:1937: in load
+    return _jit_compile(
+../venv/lib/python3.12/site-packages/torch/utils/cpp_extension.py:2420: in _jit_compile
+    return _import_module_from_library(name, build_directory, is_python_module)
+           ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+../venv/lib/python3.12/site-packages/torch/utils/cpp_extension.py:2944: in _import_module_from_library
+    module = importlib.util.module_from_spec(spec)
+             ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+&lt;frozen importlib._bootstrap&gt;:813: in module_from_spec
+    ???
+&lt;frozen importlib._bootstrap_external&gt;:1289: in create_module
+    ???
+&lt;frozen importlib._bootstrap&gt;:488: in _call_with_frames_removed
+    ???
+E   ImportError: /root/.cache/torch_extensions/py312_cu130/hybrid_spec_gpu_sa_v4/hybrid_spec_gpu_sa_v4.so: cannot open shared object file: No such file or directory</failure></testcase><testcase classname="tests.test_compact_verify" name="test_cuda_mixed_verify_graph_tier_switches_and_native_commit[True-8-True-3-1]" time="0.018"><failure message="ImportError: /root/.cache/torch_extensions/py312_cu130/hybrid_spec_gpu_sa_v4/hybrid_spec_gpu_sa_v4.so: cannot open shared object file: No such file or directory">experimental/hybrid-spec/tests/test_compact_verify.py:1024: in test_cuda_mixed_verify_graph_tier_switches_and_native_commit
+    chooser = get_dynamic_verify(worker.draft_extension, "cuda")
+              ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+experimental/hybrid-spec/src/hybrid_spec/integrations/sglang/compact_verify.py:154: in get_dynamic_verify
+    extension.dynamic_verify = DynamicVerify(
+experimental/hybrid-spec/src/hybrid_spec/selection/online_verify.py:80: in __init__
+    self.model = OnlineAcceptance(config, device)
+                 ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+experimental/hybrid-spec/src/hybrid_spec/selection/online_verify.py:34: in __init__
+    self.gpu_ops = GPUSuffixAutomaton.load_module()
+                   ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+experimental/hybrid-spec/src/hybrid_spec/backends/gpu_sa/__init__.py:27: in load_module
+    return load(
+../venv/lib/python3.12/site-packages/torch/utils/cpp_extension.py:1937: in load
+    return _jit_compile(
+../venv/lib/python3.12/site-packages/torch/utils/cpp_extension.py:2420: in _jit_compile
+    return _import_module_from_library(name, build_directory, is_python_module)
+           ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+../venv/lib/python3.12/site-packages/torch/utils/cpp_extension.py:2944: in _import_module_from_library
+    module = importlib.util.module_from_spec(spec)
+             ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+&lt;frozen importlib._bootstrap&gt;:813: in module_from_spec
+    ???
+&lt;frozen importlib._bootstrap_external&gt;:1289: in create_module
+    ???
+&lt;frozen importlib._bootstrap&gt;:488: in _call_with_frames_removed
+    ???
+E   ImportError: /root/.cache/torch_extensions/py312_cu130/hybrid_spec_gpu_sa_v4/hybrid_spec_gpu_sa_v4.so: cannot open shared object file: No such file or directory</failure></testcase><testcase classname="tests.test_compact_verify" name="test_cuda_mixed_verify_graph_tier_switches_and_native_commit[True-8-True-2-3]" time="0.019"><failure message="ImportError: /root/.cache/torch_extensions/py312_cu130/hybrid_spec_gpu_sa_v4/hybrid_spec_gpu_sa_v4.so: cannot open shared object file: No such file or directory">experimental/hybrid-spec/tests/test_compact_verify.py:1024: in test_cuda_mixed_verify_graph_tier_switches_and_native_commit
+    chooser = get_dynamic_verify(worker.draft_extension, "cuda")
+              ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+experimental/hybrid-spec/src/hybrid_spec/integrations/sglang/compact_verify.py:154: in get_dynamic_verify
+    extension.dynamic_verify = DynamicVerify(
+experimental/hybrid-spec/src/hybrid_spec/selection/online_verify.py:80: in __init__
+    self.model = OnlineAcceptance(config, device)
+                 ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+experimental/hybrid-spec/src/hybrid_spec/selection/online_verify.py:34: in __init__
+    self.gpu_ops = GPUSuffixAutomaton.load_module()
+                   ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+experimental/hybrid-spec/src/hybrid_spec/backends/gpu_sa/__init__.py:27: in load_module
+    return load(
+../venv/lib/python3.12/site-packages/torch/utils/cpp_extension.py:1937: in load
+    return _jit_compile(
+../venv/lib/python3.12/site-packages/torch/utils/cpp_extension.py:2420: in _jit_compile
+    return _import_module_from_library(name, build_directory, is_python_module)
+           ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+../venv/lib/python3.12/site-packages/torch/utils/cpp_extension.py:2944: in _import_module_from_library
+    module = importlib.util.module_from_spec(spec)
+             ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+&lt;frozen importlib._bootstrap&gt;:813: in module_from_spec
+    ???
+&lt;frozen importlib._bootstrap_external&gt;:1289: in create_module
+    ???
+&lt;frozen importlib._bootstrap&gt;:488: in _call_with_frames_removed
+    ???
+E   ImportError: /root/.cache/torch_extensions/py312_cu130/hybrid_spec_gpu_sa_v4/hybrid_spec_gpu_sa_v4.so: cannot open shared object file: No such file or directory</failure></testcase><testcase classname="tests.test_compact_verify" name="test_cuda_mixed_verify_graph_tier_switches_and_native_commit[True-8-True-1-8]" time="0.019"><failure message="ImportError: /root/.cache/torch_extensions/py312_cu130/hybrid_spec_gpu_sa_v4/hybrid_spec_gpu_sa_v4.so: cannot open shared object file: No such file or directory">experimental/hybrid-spec/tests/test_compact_verify.py:1024: in test_cuda_mixed_verify_graph_tier_switches_and_native_commit
+    chooser = get_dynamic_verify(worker.draft_extension, "cuda")
+              ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+experimental/hybrid-spec/src/hybrid_spec/integrations/sglang/compact_verify.py:154: in get_dynamic_verify
+    extension.dynamic_verify = DynamicVerify(
+experimental/hybrid-spec/src/hybrid_spec/selection/online_verify.py:80: in __init__
+    self.model = OnlineAcceptance(config, device)
+                 ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+experimental/hybrid-spec/src/hybrid_spec/selection/online_verify.py:34: in __init__
+    self.gpu_ops = GPUSuffixAutomaton.load_module()
+                   ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+experimental/hybrid-spec/src/hybrid_spec/backends/gpu_sa/__init__.py:27: in load_module
+    return load(
+../venv/lib/python3.12/site-packages/torch/utils/cpp_extension.py:1937: in load
+    return _jit_compile(
+../venv/lib/python3.12/site-packages/torch/utils/cpp_extension.py:2420: in _jit_compile
+    return _import_module_from_library(name, build_directory, is_python_module)
+           ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+../venv/lib/python3.12/site-packages/torch/utils/cpp_extension.py:2944: in _import_module_from_library
+    module = importlib.util.module_from_spec(spec)
+             ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+&lt;frozen importlib._bootstrap&gt;:813: in module_from_spec
+    ???
+&lt;frozen importlib._bootstrap_external&gt;:1289: in create_module
+    ???
+&lt;frozen importlib._bootstrap&gt;:488: in _call_with_frames_removed
+    ???
+E   ImportError: /root/.cache/torch_extensions/py312_cu130/hybrid_spec_gpu_sa_v4/hybrid_spec_gpu_sa_v4.so: cannot open shared object file: No such file or directory</failure></testcase><testcase classname="tests.test_compact_verify" name="test_cuda_mixed_verify_graph_tier_switches_and_native_commit[True-8-True-8-8]" time="0.018"><failure message="ImportError: /root/.cache/torch_extensions/py312_cu130/hybrid_spec_gpu_sa_v4/hybrid_spec_gpu_sa_v4.so: cannot open shared object file: No such file or directory">experimental/hybrid-spec/tests/test_compact_verify.py:1024: in test_cuda_mixed_verify_graph_tier_switches_and_native_commit
+    chooser = get_dynamic_verify(worker.draft_extension, "cuda")
+              ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+experimental/hybrid-spec/src/hybrid_spec/integrations/sglang/compact_verify.py:154: in get_dynamic_verify
+    extension.dynamic_verify = DynamicVerify(
+experimental/hybrid-spec/src/hybrid_spec/selection/online_verify.py:80: in __init__
+    self.model = OnlineAcceptance(config, device)
+                 ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+experimental/hybrid-spec/src/hybrid_spec/selection/online_verify.py:34: in __init__
+    self.gpu_ops = GPUSuffixAutomaton.load_module()
+                   ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+experimental/hybrid-spec/src/hybrid_spec/backends/gpu_sa/__init__.py:27: in load_module
+    return load(
+../venv/lib/python3.12/site-packages/torch/utils/cpp_extension.py:1937: in load
+    return _jit_compile(
+../venv/lib/python3.12/site-packages/torch/utils/cpp_extension.py:2420: in _jit_compile
+    return _import_module_from_library(name, build_directory, is_python_module)
+           ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+../venv/lib/python3.12/site-packages/torch/utils/cpp_extension.py:2944: in _import_module_from_library
+    module = importlib.util.module_from_spec(spec)
+             ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+&lt;frozen importlib._bootstrap&gt;:813: in module_from_spec
+    ???
+&lt;frozen importlib._bootstrap_external&gt;:1289: in create_module
+    ???
+&lt;frozen importlib._bootstrap&gt;:488: in _call_with_frames_removed
+    ???
+E   ImportError: /root/.cache/torch_extensions/py312_cu130/hybrid_spec_gpu_sa_v4/hybrid_spec_gpu_sa_v4.so: cannot open shared object file: No such file or directory</failure></testcase><testcase classname="tests.test_compact_verify" name="test_cuda_prepare_packs_native_kv_window_without_changing_commit_layout[False-False]" time="0.051" /><testcase classname="tests.test_compact_verify" name="test_cuda_prepare_packs_native_kv_window_without_changing_commit_layout[False-True]" time="0.021" /><testcase classname="tests.test_compact_verify" name="test_cuda_prepare_packs_native_kv_window_without_changing_commit_layout[True-True]" time="0.020" /><testcase classname="tests.test_compact_verify" name="test_cuda_ragged_triton_attention_matches_independent_torch_reference" time="1.040" /><testcase classname="tests.test_compact_verify" name="test_final_counters_include_real_graph_padding[False]" time="0.001" /><testcase classname="tests.test_compact_verify" name="test_final_counters_include_real_graph_padding[True]" time="0.001" /><testcase classname="tests.test_compact_verify" name="test_cuda_source_budget_reuses_split_host_count" time="0.013" /><testcase classname="tests.test_compact_verify" name="test_cuda_zero_filled_tail_cannot_extend_acceptance" time="0.013" /><testcase classname="tests.test_compact_verify" name="test_capture_shape_preserves_nonmultiple_token_tiers" time="0.007" /><testcase classname="tests.test_compact_verify" name="test_inherited_capture_loop_without_target_initialization[False-0]" time="0.008" /><testcase classname="tests.test_compact_verify" name="test_inherited_capture_loop_without_target_initialization[False-1]" time="0.006" /><testcase classname="tests.test_compact_verify" name="test_inherited_capture_loop_without_target_initialization[True-0]" time="0.007" /><testcase classname="tests.test_compact_verify" name="test_inherited_capture_loop_without_target_initialization[True-1]" time="0.007" /><testcase classname="tests.test_compact_verify" name="test_compact_backend_validation_waits_for_attention_initialization[False]" time="0.001" /><testcase classname="tests.test_compact_verify" name="test_compact_backend_validation_waits_for_attention_initialization[True]" time="0.001" /><testcase classname="tests.test_compact_verify" name="test_token_tiers_obey_native_tp_sp_alignment[1]" time="0.001" /><testcase classname="tests.test_compact_verify" name="test_token_tiers_obey_native_tp_sp_alignment[2]" time="0.001" /><testcase classname="tests.test_compact_verify" name="test_token_tiers_obey_native_tp_sp_alignment[8]" time="0.001" /><testcase classname="tests.test_compact_verify" name="test_token_tiers_obey_native_tp_sp_alignment[16]" time="0.001" /><testcase classname="tests.test_draft_recurrence" name="test_selected_prefix_drives_model_and_verify_chain[False-None-0-False-False-1]" time="0.016" /><testcase classname="tests.test_draft_recurrence" name="test_selected_prefix_drives_model_and_verify_chain[False-None-0-False-False-2]" time="0.018" /><testcase classname="tests.test_draft_recurrence" name="test_selected_prefix_drives_model_and_verify_chain[False-None-0-False-False-4]" time="0.017" /><testcase classname="tests.test_draft_recurrence" name="test_selected_prefix_drives_model_and_verify_chain[False-None-0-True-False-1]" time="0.015" /><testcase classname="tests.test_draft_recurrence" name="test_selected_prefix_drives_model_and_verify_chain[False-None-0-True-False-2]" time="0.015" /><testcase classname="tests.test_draft_recurrence" name="test_selected_prefix_drives_model_and_verify_chain[False-None-0-True-False-4]" time="0.015" /><testcase classname="tests.test_draft_recurrence" name="test_selected_prefix_drives_model_and_verify_chain[False-None-0-False-True-1]" time="0.016" /><testcase classname="tests.test_draft_recurrence" name="test_selected_prefix_drives_model_and_verify_chain[False-None-0-False-True-2]" time="0.121" /><testcase classname="tests.test_draft_recurrence" name="test_selected_prefix_drives_model_and_verify_chain[False-None-0-False-True-4]" time="0.015" /><testcase classname="tests.test_draft_recurrence" name="test_selected_prefix_drives_model_and_verify_chain[False-mask1-0-False-False-1]" time="0.014" /><testcase classname="tests.test_draft_recurrence" name="test_selected_prefix_drives_model_and_verify_chain[False-mask1-0-False-False-2]" time="0.015" /><testcase classname="tests.test_draft_recurrence" name="test_selected_prefix_drives_model_and_verify_chain[False-mask1-0-False-False-4]" time="0.016" /><testcase classname="tests.test_draft_recurrence" name="test_selected_prefix_drives_model_and_verify_chain[False-mask1-0-True-False-1]" time="0.015" /><testcase classname="tests.test_draft_recurrence" name="test_selected_prefix_drives_model_and_verify_chain[False-mask1-0-True-False-2]" time="0.015" /><testcase classname="tests.test_draft_recurrence" name="test_selected_prefix_drives_model_and_verify_chain[False-mask1-0-True-False-4]" time="0.016" /><testcase classname="tests.test_draft_recurrence" name="test_selected_prefix_drives_model_and_verify_chain[False-mask1-0-False-True-1]" time="0.015" /><testcase classname="tests.test_draft_recurrence" name="test_selected_prefix_drives_model_and_verify_chain[False-mask1-0-False-True-2]" time="0.015" /><testcase classname="tests.test_draft_recurrence" name="test_selected_prefix_drives_model_and_verify_chain[False-mask1-0-False-True-4]" time="0.016" /><testcase classname="tests.test_draft_recurrence" name="test_selected_prefix_drives_model_and_verify_chain[False-mask2-0-False-False-1]" time="0.016" /><testcase classname="tests.test_draft_recurrence" name="test_selected_prefix_drives_model_and_verify_chain[False-mask2-0-False-False-2]" time="0.016" /><testcase classname="tests.test_draft_recurrence" name="test_selected_prefix_drives_model_and_verify_chain[False-mask2-0-False-False-4]" time="0.016" /><testcase classname="tests.test_draft_recurrence" name="test_selected_prefix_drives_model_and_verify_chain[False-mask2-0-True-False-1]" time="0.015" /><testcase classname="tests.test_draft_recurrence" name="test_selected_prefix_drives_model_and_verify_chain[False-mask2-0-True-False-2]" time="0.017" /><testcase classname="tests.test_draft_recurrence" name="test_selected_prefix_drives_model_and_verify_chain[False-mask2-0-True-False-4]" time="0.016" /><testcase classname="tests.test_draft_recurrence" name="test_selected_prefix_drives_model_and_verify_chain[False-mask2-0-False-True-1]" time="0.016" /><testcase classname="tests.test_draft_recurrence" name="test_selected_prefix_drives_model_and_verify_chain[False-mask2-0-False-True-2]" time="0.016" /><testcase classname="tests.test_draft_recurrence" name="test_selected_prefix_drives_model_and_verify_chain[False-mask2-0-False-True-4]" time="0.017" /><testcase classname="tests.test_draft_recurrence" name="test_selected_prefix_drives_model_and_verify_chain[False-mask3-0-False-False-1]" time="0.016" /><testcase classname="tests.test_draft_recurrence" name="test_selected_prefix_drives_model_and_verify_chain[False-mask3-0-False-False-2]" time="0.016" /><testcase classname="tests.test_draft_recurrence" name="test_selected_prefix_drives_model_and_verify_chain[False-mask3-0-False-False-4]" time="0.016" /><testcase classname="tests.test_draft_recurrence" name="test_selected_prefix_drives_model_and_verify_chain[False-mask3-0-True-False-1]" time="0.015" /><testcase classname="tests.test_draft_recurrence" name="test_selected_prefix_drives_model_and_verify_chain[False-mask3-0-True-False-2]" time="0.015" /><testcase classname="tests.test_draft_recurrence" name="test_selected_prefix_drives_model_and_verify_chain[False-mask3-0-True-False-4]" time="0.016" /><testcase classname="tests.test_draft_recurrence" name="test_selected_prefix_drives_model_and_verify_chain[False-mask3-0-False-True-1]" time="0.016" /><testcase classname="tests.test_draft_recurrence" name="test_selected_prefix_drives_model_and_verify_chain[False-mask3-0-False-True-2]" time="0.016" /><testcase classname="tests.test_draft_recurrence" name="test_selected_prefix_drives_model_and_verify_chain[False-mask3-0-False-True-4]" time="0.016" /><testcase classname="tests.test_draft_recurrence" name="test_selected_prefix_drives_model_and_verify_chain[False-mask4-2-False-False-1]" time="0.016" /><testcase classname="tests.test_draft_recurrence" name="test_selected_prefix_drives_model_and_verify_chain[False-mask4-2-False-False-2]" time="0.016" /><testcase classname="tests.test_draft_recurrence" name="test_selected_prefix_drives_model_and_verify_chain[False-mask4-2-False-False-4]" time="0.015" /><testcase classname="tests.test_draft_recurrence" name="test_selected_prefix_drives_model_and_verify_chain[False-mask4-2-True-False-1]" time="0.016" /><testcase classname="tests.test_draft_recurrence" name="test_selected_prefix_drives_model_and_verify_chain[False-mask4-2-True-False-2]" time="0.015" /><testcase classname="tests.test_draft_recurrence" name="test_selected_prefix_drives_model_and_verify_chain[False-mask4-2-True-False-4]" time="0.016" /><testcase classname="tests.test_draft_recurrence" name="test_selected_prefix_drives_model_and_verify_chain[False-mask4-2-False-True-1]" time="0.016" /><testcase classname="tests.test_draft_recurrence" name="test_selected_prefix_drives_model_and_verify_chain[False-mask4-2-False-True-2]" time="0.016" /><testcase classname="tests.test_draft_recurrence" name="test_selected_prefix_drives_model_and_verify_chain[False-mask4-2-False-True-4]" time="0.016" /><testcase classname="tests.test_draft_recurrence" name="test_selected_prefix_drives_model_and_verify_chain[True-None-0-False-False-1]" time="0.018" /><testcase classname="tests.test_draft_recurrence" name="test_selected_prefix_drives_model_and_verify_chain[True-None-0-False-False-2]" time="0.017" /><testcase classname="tests.test_draft_recurrence" name="test_selected_prefix_drives_model_and_verify_chain[True-None-0-False-False-4]" time="0.016" /><testcase classname="tests.test_draft_recurrence" name="test_selected_prefix_drives_model_and_verify_chain[True-None-0-True-False-1]" time="0.016" /><testcase classname="tests.test_draft_recurrence" name="test_selected_prefix_drives_model_and_verify_chain[True-None-0-True-False-2]" time="0.015" /><testcase classname="tests.test_draft_recurrence" name="test_selected_prefix_drives_model_and_verify_chain[True-None-0-True-False-4]" time="0.015" /><testcase classname="tests.test_draft_recurrence" name="test_selected_prefix_drives_model_and_verify_chain[True-None-0-False-True-1]" time="0.016" /><testcase classname="tests.test_draft_recurrence" name="test_selected_prefix_drives_model_and_verify_chain[True-None-0-False-True-2]" time="0.017" /><testcase classname="tests.test_draft_recurrence" name="test_selected_prefix_drives_model_and_verify_chain[True-None-0-False-True-4]" time="0.016" /><testcase classname="tests.test_draft_recurrence" name="test_selected_prefix_drives_model_and_verify_chain[True-mask1-0-False-False-1]" time="0.016" /><testcase classname="tests.test_draft_recurrence" name="test_selected_prefix_drives_model_and_verify_chain[True-mask1-0-False-False-2]" time="0.016" /><testcase classname="tests.test_draft_recurrence" name="test_selected_prefix_drives_model_and_verify_chain[True-mask1-0-False-False-4]" time="0.016" /><testcase classname="tests.test_draft_recurrence" name="test_selected_prefix_drives_model_and_verify_chain[True-mask1-0-True-False-1]" time="0.017" /><testcase classname="tests.test_draft_recurrence" name="test_selected_prefix_drives_model_and_verify_chain[True-mask1-0-True-False-2]" time="0.016" /><testcase classname="tests.test_draft_recurrence" name="test_selected_prefix_drives_model_and_verify_chain[True-mask1-0-True-False-4]" time="0.015" /><testcase classname="tests.test_draft_recurrence" name="test_selected_prefix_drives_model_and_verify_chain[True-mask1-0-False-True-1]" time="0.017" /><testcase classname="tests.test_draft_recurrence" name="test_selected_prefix_drives_model_and_verify_chain[True-mask1-0-False-True-2]" time="0.017" /><testcase classname="tests.test_draft_recurrence" name="test_selected_prefix_drives_model_and_verify_chain[True-mask1-0-False-True-4]" time="0.016" /><testcase classname="tests.test_draft_recurrence" name="test_selected_prefix_drives_model_and_verify_chain[True-mask2-0-False-False-1]" time="0.015" /><testcase classname="tests.test_draft_recurrence" name="test_selected_prefix_drives_model_and_verify_chain[True-mask2-0-False-False-2]" time="0.015" /><testcase classname="tests.test_draft_recurrence" name="test_selected_prefix_drives_model_and_verify_chain[True-mask2-0-False-False-4]" time="0.017" /><testcase classname="tests.test_draft_recurrence" name="test_selected_prefix_drives_model_and_verify_chain[True-mask2-0-True-False-1]" time="0.016" /><testcase classname="tests.test_draft_recurrence" name="test_selected_prefix_drives_model_and_verify_chain[True-mask2-0-True-False-2]" time="0.017" /><testcase classname="tests.test_draft_recurrence" name="test_selected_prefix_drives_model_and_verify_chain[True-mask2-0-True-False-4]" time="0.017" /><testcase classname="tests.test_draft_recurrence" name="test_selected_prefix_drives_model_and_verify_chain[True-mask2-0-False-True-1]" time="0.016" /><testcase classname="tests.test_draft_recurrence" name="test_selected_prefix_drives_model_and_verify_chain[True-mask2-0-False-True-2]" time="0.017" /><testcase classname="tests.test_draft_recurrence" name="test_selected_prefix_drives_model_and_verify_chain[True-mask2-0-False-True-4]" time="0.111" /><testcase classname="tests.test_draft_recurrence" name="test_selected_prefix_drives_model_and_verify_chain[True-mask3-0-False-False-1]" time="0.017" /><testcase classname="tests.test_draft_recurrence" name="test_selected_prefix_drives_model_and_verify_chain[True-mask3-0-False-False-2]" time="0.017" /><testcase classname="tests.test_draft_recurrence" name="test_selected_prefix_drives_model_and_verify_chain[True-mask3-0-False-False-4]" time="0.017" /><testcase classname="tests.test_draft_recurrence" name="test_selected_prefix_drives_model_and_verify_chain[True-mask3-0-True-False-1]" time="0.016" /><testcase classname="tests.test_draft_recurrence" name="test_selected_prefix_drives_model_and_verify_chain[True-mask3-0-True-False-2]" time="0.015" /><testcase classname="tests.test_draft_recurrence" name="test_selected_prefix_drives_model_and_verify_chain[True-mask3-0-True-False-4]" time="0.016" /><testcase classname="tests.test_draft_recurrence" name="test_selected_prefix_drives_model_and_verify_chain[True-mask3-0-False-True-1]" time="0.016" /><testcase classname="tests.test_draft_recurrence" name="test_selected_prefix_drives_model_and_verify_chain[True-mask3-0-False-True-2]" time="0.016" /><testcase classname="tests.test_draft_recurrence" name="test_selected_prefix_drives_model_and_verify_chain[True-mask3-0-False-True-4]" time="0.016" /><testcase classname="tests.test_draft_recurrence" name="test_selected_prefix_drives_model_and_verify_chain[True-mask4-2-False-False-1]" time="0.015" /><testcase classname="tests.test_draft_recurrence" name="test_selected_prefix_drives_model_and_verify_chain[True-mask4-2-False-False-2]" time="0.016" /><testcase classname="tests.test_draft_recurrence" name="test_selected_prefix_drives_model_and_verify_chain[True-mask4-2-False-False-4]" time="0.019" /><testcase classname="tests.test_draft_recurrence" name="test_selected_prefix_drives_model_and_verify_chain[True-mask4-2-True-False-1]" time="0.016" /><testcase classname="tests.test_draft_recurrence" name="test_selected_prefix_drives_model_and_verify_chain[True-mask4-2-True-False-2]" time="0.016" /><testcase classname="tests.test_draft_recurrence" name="test_selected_prefix_drives_model_and_verify_chain[True-mask4-2-True-False-4]" time="0.017" /><testcase classname="tests.test_draft_recurrence" name="test_selected_prefix_drives_model_and_verify_chain[True-mask4-2-False-True-1]" time="0.015" /><testcase classname="tests.test_draft_recurrence" name="test_selected_prefix_drives_model_and_verify_chain[True-mask4-2-False-True-2]" time="0.016" /><testcase classname="tests.test_draft_recurrence" name="test_selected_prefix_drives_model_and_verify_chain[True-mask4-2-False-True-4]" time="0.016" /><testcase classname="tests.test_draft_recurrence" name="test_deferred_gate_preserves_actual_worker_recurrence[mask0]" time="0.016" /><testcase classname="tests.test_draft_recurrence" name="test_deferred_gate_preserves_actual_worker_recurrence[mask1]" time="0.016" /><testcase classname="tests.test_draft_recurrence" name="test_deferred_gate_preserves_actual_worker_recurrence[mask2]" time="0.017" /><testcase classname="tests.test_draft_recurrence" name="test_skipped_tail_contains_candidates_from_completed_query" time="0.016" /><testcase classname="tests.test_draft_recurrence" name="test_configurable_split_gate_uses_actual_worker[mask0-1-0]" time="0.017" /><testcase classname="tests.test_draft_recurrence" name="test_configurable_split_gate_uses_actual_worker[mask0-1-1]" time="0.017" /><testcase classname="tests.test_draft_recurrence" name="test_configurable_split_gate_uses_actual_worker[mask0-2-0]" time="0.016" /><testcase classname="tests.test_draft_recurrence" name="test_configurable_split_gate_uses_actual_worker[mask0-2-1]" time="0.016" /><testcase classname="tests.test_draft_recurrence" name="test_configurable_split_gate_uses_actual_worker[mask0-2-2]" time="0.016" /><testcase classname="tests.test_draft_recurrence" name="test_configurable_split_gate_uses_actual_worker[mask0-8-0]" time="0.016" /><testcase classname="tests.test_draft_recurrence" name="test_configurable_split_gate_uses_actual_worker[mask0-8-1]" time="0.016" /><testcase classname="tests.test_draft_recurrence" name="test_configurable_split_gate_uses_actual_worker[mask0-8-3]" time="0.017" /><testcase classname="tests.test_draft_recurrence" name="test_configurable_split_gate_uses_actual_worker[mask0-8-8]" time="0.018" /><testcase classname="tests.test_draft_recurrence" name="test_configurable_split_gate_uses_actual_worker[mask1-1-0]" time="0.016" /><testcase classname="tests.test_draft_recurrence" name="test_configurable_split_gate_uses_actual_worker[mask1-1-1]" time="0.016" /><testcase classname="tests.test_draft_recurrence" name="test_configurable_split_gate_uses_actual_worker[mask1-2-0]" time="0.015" /><testcase classname="tests.test_draft_recurrence" name="test_configurable_split_gate_uses_actual_worker[mask1-2-1]" time="0.017" /><testcase classname="tests.test_draft_recurrence" name="test_configurable_split_gate_uses_actual_worker[mask1-2-2]" time="0.016" /><testcase classname="tests.test_draft_recurrence" name="test_configurable_split_gate_uses_actual_worker[mask1-8-0]" time="0.017" /><testcase classname="tests.test_draft_recurrence" name="test_configurable_split_gate_uses_actual_worker[mask1-8-1]" time="0.017" /><testcase classname="tests.test_draft_recurrence" name="test_configurable_split_gate_uses_actual_worker[mask1-8-3]" time="0.016" /><testcase classname="tests.test_draft_recurrence" name="test_configurable_split_gate_uses_actual_worker[mask1-8-8]" time="0.016" /><testcase classname="tests.test_draft_recurrence" name="test_configurable_split_gate_uses_actual_worker[mask2-1-0]" time="0.015" /><testcase classname="tests.test_draft_recurrence" name="test_configurable_split_gate_uses_actual_worker[mask2-1-1]" time="0.015" /><testcase classname="tests.test_draft_recurrence" name="test_configurable_split_gate_uses_actual_worker[mask2-2-0]" time="0.017" /><testcase classname="tests.test_draft_recurrence" name="test_configurable_split_gate_uses_actual_worker[mask2-2-1]" time="0.016" /><testcase classname="tests.test_draft_recurrence" name="test_configurable_split_gate_uses_actual_worker[mask2-2-2]" time="0.015" /><testcase classname="tests.test_draft_recurrence" name="test_configurable_split_gate_uses_actual_worker[mask2-8-0]" time="0.015" /><testcase classname="tests.test_draft_recurrence" name="test_configurable_split_gate_uses_actual_worker[mask2-8-1]" time="0.017" /><testcase classname="tests.test_draft_recurrence" name="test_configurable_split_gate_uses_actual_worker[mask2-8-3]" time="0.017" /><testcase classname="tests.test_draft_recurrence" name="test_configurable_split_gate_uses_actual_worker[mask2-8-8]" time="0.016" /><testcase classname="tests.test_draft_recurrence" name="test_configurable_skip_materializes_complete_chain[1-0]" time="0.017" /><testcase classname="tests.test_draft_recurrence" name="test_configurable_skip_materializes_complete_chain[1-1]" time="0.017" /><testcase classname="tests.test_draft_recurrence" name="test_configurable_skip_materializes_complete_chain[2-0]" time="0.017" /><testcase classname="tests.test_draft_recurrence" name="test_configurable_skip_materializes_complete_chain[2-1]" time="0.016" /><testcase classname="tests.test_draft_recurrence" name="test_configurable_skip_materializes_complete_chain[2-2]" time="0.018" /><testcase classname="tests.test_draft_recurrence" name="test_configurable_skip_materializes_complete_chain[8-0]" time="0.017" /><testcase classname="tests.test_draft_recurrence" name="test_configurable_skip_materializes_complete_chain[8-1]" time="0.016" /><testcase classname="tests.test_draft_recurrence" name="test_configurable_skip_materializes_complete_chain[8-3]" time="0.016" /><testcase classname="tests.test_draft_recurrence" name="test_configurable_skip_materializes_complete_chain[8-8]" time="0.016" /><testcase classname="tests.test_draft_recurrence" name="test_mapped_split_prefix_keeps_target_vocab_tokens[0]" time="0.016" /><testcase classname="tests.test_draft_recurrence" name="test_mapped_split_prefix_keeps_target_vocab_tokens[1]" time="0.015" /><testcase classname="tests.test_draft_recurrence" name="test_mapped_split_prefix_keeps_target_vocab_tokens[3]" time="0.016" /><testcase classname="tests.test_draft_recurrence" name="test_mapped_split_prefix_keeps_target_vocab_tokens[8]" time="0.016" /></testsuite></testsuites>

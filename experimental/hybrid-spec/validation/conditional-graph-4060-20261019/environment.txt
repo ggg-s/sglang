@@ -1,0 +1,5 @@
+3.12.3 (main, Mar  3 2026, 12:15:18) [GCC 13.3.0]
+torch 2.14.1+cu130 cuda 13.0 triton 3.8.0
+device NVIDIA GeForce RTX 4060 Laptop GPU
+conditional bindings True
+cuda computation [2.0, 2.0]

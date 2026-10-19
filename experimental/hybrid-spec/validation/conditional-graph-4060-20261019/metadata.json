@@ -1,0 +1,87 @@
+{
+  "recorded_at_utc": "2026-10-19T08:59:00.739033+00:00",
+  "server": "ai-workstation",
+  "remote_directory": "/workspace/conditional-graph-20261019",
+  "source_commit": "55444165099a4248e6ea534c0c51171ff06bcb85",
+  "archive_sha256": "df2d5ce5517a4484de36dacb47a479803ed05c55180b83e467621f04ee16f1f0",
+  "python": "3.12.3 (main, Mar  3 2026, 12:15:18) [GCC 13.3.0]",
+  "platform": "Linux-6.6.87.2-microsoft-standard-WSL2-x86_64-with-glibc2.39",
+  "torch": "2.14.1+cu130",
+  "cuda": "13.0",
+  "triton": "3.8.0",
+  "gpu": "NVIDIA GeForce RTX 4060 Laptop GPU",
+  "gpu_driver": "592.82",
+  "conditional_bindings": true,
+  "results": {
+    "legacy-torch28": {
+      "tests": 114,
+      "failures": 0,
+      "errors": 0,
+      "skipped": 0,
+      "passed": 114,
+      "seconds": 1.423
+    },
+    "focused": {
+      "tests": 4,
+      "failures": 0,
+      "errors": 0,
+      "skipped": 0,
+      "passed": 4,
+      "seconds": 11.722
+    },
+    "cuda-regression-v2": {
+      "tests": 280,
+      "failures": 0,
+      "errors": 0,
+      "skipped": 0,
+      "passed": 280,
+      "seconds": 103.023
+    },
+    "component-regression-v2": {
+      "tests": 352,
+      "failures": 0,
+      "errors": 0,
+      "skipped": 0,
+      "passed": 352,
+      "seconds": 88.432
+    }
+  },
+  "initial_attempts": {
+    "cuda-regression": {
+      "tests": 280,
+      "failures": 2,
+      "errors": 0,
+      "skipped": 0,
+      "passed": 278,
+      "seconds": 50.014
+    },
+    "component-regression": {
+      "tests": 352,
+      "failures": 26,
+      "errors": 0,
+      "skipped": 0,
+      "passed": 326,
+      "seconds": 16.203
+    }
+  },
+  "source_sha256": {
+    "experimental/hybrid-spec/CONDITIONAL_GRAPH.md": "fa6c11df06c0d18fc43114d1d976ecd328c0a966db8a7d2a0705d7fa063a30e0",
+    "experimental/hybrid-spec/README.md": "789a580dd4c4a17d725b0e90193d998fd03f8c366500cb8b1bb017b4399d2de4",
+    "experimental/hybrid-spec/configs/device-draft-split-conditional.json": "8b4edfe445ba6de069e5f6af03ec9c537a55025c7657c810dff83f4e1df875ee",
+    "experimental/hybrid-spec/src/hybrid_spec/config.py": "77f9927f22799071481c5bcf0a9e7c268db18935b994a774e93d1663c1e40d94",
+    "experimental/hybrid-spec/src/hybrid_spec/integrations/sglang/compact_graph.py": "7d5963c2850c2d2f255a0f75ce5c2b8e480655087936454b0e79381cbed2b497",
+    "experimental/hybrid-spec/src/hybrid_spec/integrations/sglang/conditional_graph.py": "2f887179d81f04a1004b873baa459d4b6fdc744cbc54ebd437114868849f0595",
+    "experimental/hybrid-spec/src/hybrid_spec/integrations/sglang/split_graph.py": "65288f7de58ad5576670524ba75709e2eebc03dad5927517c52dc0b3a0137d6d",
+    "experimental/hybrid-spec/src/hybrid_spec/plugin.py": "0c5ae1f5b47d95f9d0e5cfe3b0606812cc671283ad65acbe83bfc3bf4ee66568",
+    "experimental/hybrid-spec/src/hybrid_spec/selection/verify_costs.py": "7ad242a4d2fdc3dc40b7fba672b38779f749f9335d15c268e0e3ffe7a691064b",
+    "experimental/hybrid-spec/tests/test_compact_tail.py": "f4cf08976dbb0732aa320647e12be83848e5e37fcffea1650552d463317da054",
+    "experimental/hybrid-spec/tests/test_core.py": "8092b9bf405f84393d33f3499906d344853579cb320c98bd0a8686e3f152b380",
+    "experimental/hybrid-spec/tests/test_cuda.py": "ca0ed503240121d280494606961eb94303d1fb44ca2f2f52e0f3af6cc6c4fae9",
+    "experimental/hybrid-spec/tests/test_tp.py": "42a4cc72d3f3aa7cb2bf58697b9816f6945c77dda6ec8516c09277bf55e95d24"
+  },
+  "helper_sha256": "3323ed0e2561469672735868387cd9834507af9661a248238cf876245103639e",
+  "probe_sha256": "5e7aa5c05f35586edaa218ff78528b0b6630ba6a4b1ca49bb2430424b6b10005",
+  "gc_helper_sha256": "f8c1949faf7fd9e0fa8f0fdf1e9dad25c1f16cb5e000cd5d1ac3333c10a5433c",
+  "post_test_gpu": "NVIDIA GeForce RTX 4060 Laptop GPU, 0 MiB, 0 %",
+  "scope": "Real single-GPU conditional capture/replay; model and child attention are synthetic. Native topk/KV metadata/row compaction are retained. The separate dispatch probe uses real FP16 GEMM and gather/scatter. No TP2 NCCL, Arctic, full-weight serving, model accuracy or serving throughput validation."
+}

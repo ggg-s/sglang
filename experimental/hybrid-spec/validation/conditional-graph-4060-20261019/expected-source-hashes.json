@@ -1,0 +1,19 @@
+{
+  "commit": "55444165099a4248e6ea534c0c51171ff06bcb85",
+  "archive_sha256": "df2d5ce5517a4484de36dacb47a479803ed05c55180b83e467621f04ee16f1f0",
+  "sha256": {
+    "experimental/hybrid-spec/CONDITIONAL_GRAPH.md": "fa6c11df06c0d18fc43114d1d976ecd328c0a966db8a7d2a0705d7fa063a30e0",
+    "experimental/hybrid-spec/README.md": "789a580dd4c4a17d725b0e90193d998fd03f8c366500cb8b1bb017b4399d2de4",
+    "experimental/hybrid-spec/configs/device-draft-split-conditional.json": "8b4edfe445ba6de069e5f6af03ec9c537a55025c7657c810dff83f4e1df875ee",
+    "experimental/hybrid-spec/src/hybrid_spec/config.py": "77f9927f22799071481c5bcf0a9e7c268db18935b994a774e93d1663c1e40d94",
+    "experimental/hybrid-spec/src/hybrid_spec/integrations/sglang/compact_graph.py": "7d5963c2850c2d2f255a0f75ce5c2b8e480655087936454b0e79381cbed2b497",
+    "experimental/hybrid-spec/src/hybrid_spec/integrations/sglang/conditional_graph.py": "2f887179d81f04a1004b873baa459d4b6fdc744cbc54ebd437114868849f0595",
+    "experimental/hybrid-spec/src/hybrid_spec/integrations/sglang/split_graph.py": "65288f7de58ad5576670524ba75709e2eebc03dad5927517c52dc0b3a0137d6d",
+    "experimental/hybrid-spec/src/hybrid_spec/plugin.py": "0c5ae1f5b47d95f9d0e5cfe3b0606812cc671283ad65acbe83bfc3bf4ee66568",
+    "experimental/hybrid-spec/src/hybrid_spec/selection/verify_costs.py": "7ad242a4d2fdc3dc40b7fba672b38779f749f9335d15c268e0e3ffe7a691064b",
+    "experimental/hybrid-spec/tests/test_compact_tail.py": "f4cf08976dbb0732aa320647e12be83848e5e37fcffea1650552d463317da054",
+    "experimental/hybrid-spec/tests/test_core.py": "8092b9bf405f84393d33f3499906d344853579cb320c98bd0a8686e3f152b380",
+    "experimental/hybrid-spec/tests/test_cuda.py": "ca0ed503240121d280494606961eb94303d1fb44ca2f2f52e0f3af6cc6c4fae9",
+    "experimental/hybrid-spec/tests/test_tp.py": "42a4cc72d3f3aa7cb2bf58697b9816f6945c77dda6ec8516c09277bf55e95d24"
+  }
+}

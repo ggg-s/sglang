@@ -69,8 +69,11 @@ python -m pytest experimental/hybrid-spec/tests/test_tp.py \
   -k conditional -q
 ```
 
-以上 GPU 测试本机没有 CUDA，尚未执行，skip 不代表验证通过。
-通过后，在已可运行的原生模型命令上设置：
+TP1 已在 RTX 4060 / Torch 2.14.1+cu130 验证，覆盖 20 项 conditional
+合成模型用例及 B=1/4/16/32 的 FP16 GEMM 调度探针；
+结果、首次失败和限制见 [4060 测试记录](validation/conditional-graph-4060-20261019/README.md)。
+TP2 条件 collective 和真实模型服务仍待验收；skip 不代表验证通过。
+在已可运行的原生模型命令上设置：
 
 ```bash
 export SGLANG_PLUGINS=hybrid_spec
@@ -95,7 +98,7 @@ CPU 侧只即时维护 `prefix_ct` / `request_ct`，不要直接把进程内的
 用同一模型、负载、batch、gate 和 target Graph 配置，分别关闭/开启开关，
 重启服务后比较输出、接受长度、吞吐、TPOT、启动显存和 trace。
 应检查 `hybrid_prefix_decision` 对应的 `.item()` 空闲是否消失，以及条件判断
-本身的 GPU 开销。此版不保证减少 Graph 启动次数，也没有实测速度提升。
+本身的 GPU 开销。此版不保证减少 Graph 启动次数；4060 调度微测未显示稳定加速。
 
 可与 `dynamic_verify=true` 组合；接受率和预算策略不变。
 开启 conditional 会改变共享固定成本，因此离线耗时表必须按新配置重跑；

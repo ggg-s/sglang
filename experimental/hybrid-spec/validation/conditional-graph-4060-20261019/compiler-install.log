@@ -1,0 +1,12 @@
+Using Python 3.12.3 environment at: /workspace/conditional-graph-20261019/venv
+Resolved 5 packages in 871ms
+Downloading nvidia-cuda-nvcc (35.7MiB)
+Downloading nvidia-nvvm (58.7MiB)
+ Downloading nvidia-cuda-nvcc
+ Downloading nvidia-nvvm
+Prepared 3 packages in 29.19s
+Installed 4 packages in 11ms
+ + ninja==1.13.2
+ + nvidia-cuda-crt==13.0.88
+ + nvidia-cuda-nvcc==13.0.88
+ + nvidia-nvvm==13.0.88

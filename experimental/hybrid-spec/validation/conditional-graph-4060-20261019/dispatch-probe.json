@@ -1,0 +1,103 @@
+{
+  "torch": "2.14.1+cu130",
+  "cuda": "13.0",
+  "gpu": "NVIDIA GeForce RTX 4060 Laptop GPU",
+  "results": [
+    {
+      "batch_size": 1,
+      "conditional": false,
+      "checked_rounds": 4,
+      "item_ct_in_10_rounds": 10,
+      "dispatch_us_median": 82.83864997792989,
+      "dispatch_us_samples": [
+        92.42624015314505,
+        82.83864997792989,
+        76.84206997510046
+      ]
+    },
+    {
+      "batch_size": 1,
+      "conditional": true,
+      "checked_rounds": 4,
+      "item_ct_in_10_rounds": 0,
+      "dispatch_us_median": 174.9542000470683,
+      "dispatch_us_samples": [
+        174.9947399366647,
+        169.08738005440682,
+        174.9542000470683
+      ]
+    },
+    {
+      "batch_size": 4,
+      "conditional": false,
+      "checked_rounds": 22,
+      "item_ct_in_10_rounds": 10,
+      "dispatch_us_median": 108.18159993505105,
+      "dispatch_us_samples": [
+        144.28087015403435,
+        108.18159993505105,
+        106.90305003663525
+      ]
+    },
+    {
+      "batch_size": 4,
+      "conditional": true,
+      "checked_rounds": 22,
+      "item_ct_in_10_rounds": 0,
+      "dispatch_us_median": 101.67322994675487,
+      "dispatch_us_samples": [
+        106.2085700687021,
+        101.58369987038895,
+        101.67322994675487
+      ]
+    },
+    {
+      "batch_size": 16,
+      "conditional": false,
+      "checked_rounds": 70,
+      "item_ct_in_10_rounds": 10,
+      "dispatch_us_median": 122.07869993289933,
+      "dispatch_us_samples": [
+        112.9488498554565,
+        122.07869993289933,
+        136.57157018315047
+      ]
+    },
+    {
+      "batch_size": 16,
+      "conditional": true,
+      "checked_rounds": 70,
+      "item_ct_in_10_rounds": 0,
+      "dispatch_us_median": 133.91325977863744,
+      "dispatch_us_samples": [
+        125.87197998072952,
+        133.91325977863744,
+        136.0893200035207
+      ]
+    },
+    {
+      "batch_size": 32,
+      "conditional": false,
+      "checked_rounds": 134,
+      "item_ct_in_10_rounds": 10,
+      "dispatch_us_median": 118.47218993352726,
+      "dispatch_us_samples": [
+        122.25767015479505,
+        118.47218993352726,
+        107.03022999223322
+      ]
+    },
+    {
+      "batch_size": 32,
+      "conditional": true,
+      "checked_rounds": 134,
+      "item_ct_in_10_rounds": 0,
+      "dispatch_us_median": 140.05036995513365,
+      "dispatch_us_samples": [
+        140.05036995513365,
+        138.37309001246467,
+        146.91391988890246
+      ]
+    }
+  ]
+}
