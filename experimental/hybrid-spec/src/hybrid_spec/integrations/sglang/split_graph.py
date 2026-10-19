@@ -39,6 +39,12 @@ class SplitDraftGraphBackend:
         self.delegate = delegate
         self.runner = runner
         self.mode = mode
+        config = getattr(runner.eagle_worker.draft_extension, "config", None)
+        self.conditional = getattr(config, "conditional_draft_graph", False)
+        if self.conditional:
+            from .conditional_graph import require_conditional_graph
+
+            require_conditional_graph()
         self.records = {}
         self.stream = None
         self.counters = {
@@ -54,6 +60,8 @@ class SplitDraftGraphBackend:
         }
         # Expose actual branch counts without reading GPU counters in metrics.
         runner.eagle_worker.draft_extension.split_graph_counters = self.counters
+        if self.conditional:
+            runner.eagle_worker.draft_extension.split_graph_snapshot = self.snapshot
 
     def __getattr__(self, name):
         return getattr(self.delegate, name)
@@ -99,8 +107,33 @@ class SplitDraftGraphBackend:
 
     def cleanup(self):
         for record in self.records.values():
+            if record.conditional is not None:
+                record.conditional.reset()
             record.prefix.reset()
             for tail in record.tails.values():
-                tail.graph.reset()
+                if tail.graph is not None:
+                    tail.graph.reset()
+                tail.forward = None
         self.records.clear()
         self.delegate.cleanup()
+
+    def snapshot(self):
+        """Merge asynchronous GPU branch counters only when requested."""
+        result = dict(self.counters)
+        histogram = result["tail_batch_histogram"] = dict(
+            self.counters["tail_batch_histogram"]
+        )
+        result["conditional_draft_graph"] = self.conditional
+        for record in self.records.values():
+            if record.conditional is None:
+                continue
+            counts, mixed = record.conditional.snapshot()
+            result["skip_ct"] += counts[0]
+            result["tail_ct"] += sum(counts[1:])
+            result["mixed_ct"] += mixed
+            tail_requests = sum(size * count for size, count in enumerate(counts))
+            result["tail_request_ct"] += tail_requests
+            for size, count in enumerate(counts):
+                histogram[str(size)] += count
+        result["skip_request_ct"] = result["request_ct"] - result["tail_request_ct"]
+        return result

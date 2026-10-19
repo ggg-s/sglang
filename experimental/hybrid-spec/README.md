@@ -34,6 +34,10 @@ GPU 每轮稳定压缩出 neural 行号，排除 Graph padding；CPU 只读回�
 `--max-running-requests` 和 decode Graph 配置决定。每个捕获前缀仍为各个可能
 尾段大小保留独立 metadata、暂存和私有 Graph 池，扩大批次会增加捕获显存。
 
+实验性 `conditional_draft_graph=true` 可让 GPU 在条件图内选择紧凑尾段，
+移除中间行数的 `.item()`。默认关闭，服务器测试方法和限制见
+[conditional graph 接入](CONDITIONAL_GRAPH.md)。
+
 支持单机 TP≥1、greedy、topk=1；EAGLE/MTP、EAGLE3 和 STANDALONE
 共用 Triton draft attention 的紧凑路径，DeepSeek V4 原生 MTP 使用 dsv4 draft
 attention。模型仍需满足下文的纯文本、attention 和词表兼容约束。

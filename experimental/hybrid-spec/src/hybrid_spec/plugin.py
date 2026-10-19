@@ -302,8 +302,11 @@ def _diagnostics(result, controller, *args, **kwargs):
                 extension.compact_verify_counters
             )
         if hasattr(extension, "split_graph_counters"):
-            result.internal_state["hybrid_spec_split_graph"] = dict(
-                extension.split_graph_counters
+            snapshot = getattr(extension, "split_graph_snapshot", None)
+            result.internal_state["hybrid_spec_split_graph"] = (
+                snapshot()
+                if snapshot is not None
+                else dict(extension.split_graph_counters)
             )
         if getattr(extension, "dynamic_verify", None) is not None:
             result.internal_state["hybrid_spec_dynamic_verify"] = (

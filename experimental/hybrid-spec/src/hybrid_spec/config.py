@@ -36,6 +36,7 @@ class HybridConfig:
     dynamic_verify_prior_rate: float = 0.8
     dynamic_verify_min_drafts: int = 1
     dynamic_verify_cost_table_path: str | None = None
+    conditional_draft_graph: bool = False
 
     def __post_init__(self):
         for name in (
@@ -62,6 +63,10 @@ class HybridConfig:
             raise ValueError("num_neural_gate_tokens must be between 0 and num_drafts")
         if self.draft_graph_mode not in ("full", "split", "split_no_skip"):
             raise ValueError("draft_graph_mode must be full, split or split_no_skip")
+        if type(self.conditional_draft_graph) is not bool or (
+            self.conditional_draft_graph and self.draft_graph_mode != "split"
+        ):
+            raise ValueError("conditional_draft_graph requires draft_graph_mode=split")
         if self.verify_mode not in ("static", "padded", "compact"):
             raise ValueError("verify_mode must be static, padded or compact")
         neural = self.neural_drafts

@@ -698,3 +698,142 @@ def test_tp_consensus_and_graph_staging(tmp_path, backend, world_size):
             if process.is_alive():
                 process.terminate()
             process.join(timeout=5)
+
+
+def _conditional_worker(rank, world_size, init_method):
+    """Real PyNccl collectives inside differently sized conditional leaves."""
+    from hybrid_spec.integrations.sglang.compact_graph import (
+        CompactCapture,
+        _capture_graph,
+        compact_neural_rows,
+        prepare_compaction,
+        replay_compact,
+    )
+    from hybrid_spec.integrations.sglang.conditional_graph import ConditionalTailGraph
+    from hybrid_spec.integrations.sglang.gated_override import GatedOverride
+    from sglang.srt.distributed.device_communicators.pynccl import PyNcclCommunicator
+
+    torch.cuda.set_device(rank)
+    dist.init_process_group(
+        "gloo",
+        init_method=init_method,
+        rank=rank,
+        world_size=world_size,
+        timeout=timedelta(seconds=60),
+    )
+    dispatcher = None
+    prefix = None
+    try:
+        device = torch.device("cuda", rank)
+        comm = PyNcclCommunicator(dist.group.WORLD, device)
+        sync = TPSynchronizer(dist.group.WORLD, comm)
+        bs = 5  # non-power-of-two branch tree and graph padding
+        mask = torch.zeros(bs, dtype=torch.bool, device=device)
+        view = GatedOverride(
+            torch.ones((bs, 2), dtype=torch.int64, device=device),
+            torch.zeros_like(mask),
+            tp_sync=sync,
+        )
+        output = torch.zeros(bs, dtype=torch.float32, device=device)
+        stream = torch.cuda.Stream()
+
+        def run_prefix():
+            output.zero_()
+            view.use_retrieval.copy_(mask)
+            view._synchronize()
+
+        stream.wait_stream(torch.cuda.current_stream())
+        with torch.cuda.stream(stream):
+            run_prefix()
+            run_prefix()
+        torch.cuda.synchronize()
+        prefix, _ = _capture_graph(run_prefix, stream)
+        record = CompactCapture(
+            prefix, output, SimpleNamespace(batch_size=bs), view, ()
+        )
+        prepare_compaction(record, "split")
+        # Compile row compaction before capture/replay and warm up every leaf
+        # in identical order, irrespective of this rank's retrieval mask.
+        compact_neural_rows(mask, record.rows, record.num_neural, bs, False)
+        record.rows.copy_(torch.arange(bs, device=device))
+        for size in range(1, bs + 1):
+            buffer = torch.empty(size, dtype=torch.float32, device=device)
+
+            def tail(size=size, buffer=buffer):
+                buffer.fill_(rank + 1)
+                with comm.change_state(enable=True):
+                    comm.all_reduce(buffer)
+                output.index_copy_(0, record.rows[:size], buffer)
+
+            tail()
+            tail()
+            record.tails[size] = SimpleNamespace(forward=tail)
+        dispatcher = record.conditional = ConditionalTailGraph(record, stream)
+        counters = {"prefix_ct": 0, "request_ct": 0}
+        expected_histogram = [0] * (bs + 1)
+        expected_mixed = 0
+        cases = [
+            (5, []),
+            (5, list(range(5))),
+            (5, [0, 2]),
+            (3, [0, 1]),
+            (1, []),
+            (1, [0]),
+            (4, [1, 3]),
+            (5, [1, 2, 3, 4]),
+        ]
+        for raw_bs, hits in cases * 2:
+            local_hits = list(hits)
+            if rank == 0 and raw_bs > 1 and hits:
+                local_hits.remove(hits[0])  # forces unanimous neural fallback
+            mask.zero_()
+            mask[local_hits] = True
+            replay_compact(record, counters, raw_bs)
+            agreed_hits = set(hits)
+            if raw_bs > 1 and hits:
+                agreed_hits.remove(hits[0])
+            expected = [
+                world_size * (world_size + 1) / 2
+                if row < raw_bs and row not in agreed_hits
+                else 0
+                for row in range(bs)
+            ]
+            assert output.cpu().tolist() == expected
+            count = sum(value != 0 for value in expected)
+            expected_histogram[count] += 1
+            expected_mixed += int(0 < count < raw_bs)
+        assert dispatcher.snapshot() == (expected_histogram, expected_mixed)
+        assert not counters.get("decision_wait_ns", 0)
+    finally:
+        torch.cuda.synchronize()
+        if dispatcher is not None:
+            dispatcher.reset()
+        if prefix is not None:
+            prefix.reset()
+        dist.destroy_process_group()
+
+
+def test_conditional_graph_tp2_consensus_and_collective_branches(tmp_path):
+    if not dist.is_nccl_available() or torch.cuda.device_count() < 2:
+        pytest.skip("requires two NVIDIA GPUs and NCCL")
+    from hybrid_spec.integrations.sglang.conditional_graph import (
+        require_conditional_graph,
+    )
+
+    require_conditional_graph()
+    context = mp.spawn(
+        _conditional_worker,
+        args=(2, (tmp_path / "conditional-rendezvous").as_uri()),
+        nprocs=2,
+        join=False,
+    )
+    deadline = time.monotonic() + 120
+    try:
+        while not context.join(timeout=1):
+            if time.monotonic() > deadline:
+                raise TimeoutError("conditional TP workers did not finish")
+    finally:
+        for process in context.processes:
+            if process.is_alive():
+                process.terminate()
+            process.join(timeout=5)

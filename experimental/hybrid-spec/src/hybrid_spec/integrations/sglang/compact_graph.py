@@ -8,6 +8,7 @@ from __future__ import annotations
 
 import copy
 import time
+from collections.abc import Callable
 from dataclasses import dataclass, field
 
 import torch
@@ -22,6 +23,7 @@ class CompactTail:
     # Graphs retain addresses, not ownership of tensors allocated outside
     # capture. Keep every staging buffer alive after the run closure is gone.
     staging: tuple
+    forward: Callable | None = None
 
 
 @dataclass
@@ -37,6 +39,7 @@ class CompactCapture:
     num_neural: torch.Tensor | None = None
     no_skip: bool = False
     runtime_num_neural: int | None = None
+    conditional: object | None = None
 
 
 def compact_neural_rows(mask, rows, count, raw_bs, no_skip):
@@ -62,12 +65,11 @@ def capture_compact(runner, batch, forward_fn, stream, post_warmup_hook, mode="s
     state = None
     worker = runner.eagle_worker
     prefix_width = max(1, view.num_neural_gate_tokens)
-    neural_steps = getattr(getattr(worker, "draft_extension", None), "config", None)
+    config = getattr(getattr(worker, "draft_extension", None), "config", None)
     neural_steps = (
-        neural_steps.neural_drafts
-        if neural_steps is not None
-        else runner.speculative_num_steps
+        config.neural_drafts if config is not None else runner.speculative_num_steps
     )
+    conditional = getattr(config, "conditional_draft_graph", False)
 
     def prefix_ready(fb, tokens, hidden, cache, drafts):
         nonlocal state
@@ -104,7 +106,13 @@ def capture_compact(runner, batch, forward_fn, stream, post_warmup_hook, mode="s
     torch.cuda.synchronize()
     if prefix_width < neural_steps:
         for size in range(1, batch.batch_size + 1):
-            record.tails[size] = _capture_tail(runner, record, size, stream)
+            record.tails[size] = _capture_tail(
+                runner, record, size, stream, capture=not conditional
+            )
+        if conditional:
+            from .conditional_graph import ConditionalTailGraph
+
+            record.conditional = ConditionalTailGraph(record, stream)
     return record
 
 
@@ -117,7 +125,7 @@ def prepare_compaction(record, mode):
     record.no_skip = mode == "split_no_skip"
 
 
-def _capture_tail(runner, record, size, stream):
+def _capture_tail(runner, record, size, stream, *, capture=True):
     from sglang.kernels.ops.speculative.topk1 import draft_topk1_postprocess
     from sglang.srt.layers.attention.triton_backend import TritonMultiStepDraftBackend
     from sglang.srt.model_executor.forward_context import (
@@ -261,13 +269,14 @@ def _capture_tail(runner, record, size, stream):
                 # capture inputs so those GPU builders are recorded in graph.
                 attention.on_after_cuda_graph_warmup()
     torch.cuda.synchronize()
-    graph, _ = _capture_graph(run, stream)
+    graph = _capture_graph(run, stream)[0] if capture else None
     return CompactTail(
         graph,
         rows,
         fb,
         attention,
         (seed_hidden, seed_tokens, compact_drafts, compact_cache, flat_cache, mask, sa),
+        run if not capture else None,
     )
 
 
@@ -312,6 +321,21 @@ def replay_compact(record, counters, raw_bs):
     if not 0 < raw_bs <= record.inputs.batch_size:
         raise ValueError("raw batch must fit the captured prefix")
     record.prefix.replay()
+    if record.conditional is not None:
+        compact_neural_rows(
+            record.override.use_retrieval,
+            record.rows,
+            record.num_neural,
+            raw_bs,
+            False,
+        )
+        record.conditional.replay(raw_bs)
+        # Verify may need its own host-visible token budget. Do not turn the
+        # intermediate draft decision back into a blocking read for that reuse.
+        record.runtime_num_neural = None
+        counters["prefix_ct"] += 1
+        counters["request_ct"] += raw_bs
+        return record.output
     size = 0
     if record.tails:
         compact_neural_rows(

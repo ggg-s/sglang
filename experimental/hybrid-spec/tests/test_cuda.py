@@ -471,9 +471,9 @@ def native_triton_metadata_methods(monkeypatch):
     ],
 )
 @pytest.mark.parametrize(
-    "steps,gate,batch_size,neural,mode",
+    "steps,gate,batch_size,neural,mode,conditional",
     [
-        (k, g, b, None, mode)
+        (k, g, b, None, mode, False)
         for k, g in (
             (1, 0),
             (1, 1),
@@ -490,16 +490,20 @@ def native_triton_metadata_methods(monkeypatch):
         for b in (1, 8)
         for mode in ("split", "split_no_skip")
     ]
-    + [(8, 3, 16, None, mode) for mode in ("split", "split_no_skip")]
+    + [(8, 3, 16, None, mode, False) for mode in ("split", "split_no_skip")]
     + [
-        (8, 3, 8, 2, "split"),
-        (8, 1, 8, 3, "split"),
-        (8, 8, 8, 1, "split"),
-        (8, 3, 1, 2, "split"),
+        (8, 3, 8, 2, "split", False),
+        (8, 1, 8, 3, "split", False),
+        (8, 8, 8, 1, "split", False),
+        (8, 3, 1, 2, "split", False),
+        pytest.param(8, 0, 1, None, "split", True, id="conditional-b1"),
+        pytest.param(8, 1, 8, None, "split", True, id="conditional-b8"),
+        pytest.param(8, 2, 8, 3, "split", True, id="conditional-source-caps"),
+        pytest.param(8, 8, 8, None, "split", True, id="conditional-no-tail"),
     ],
 )
 def test_compact_tail_graph_reorders_rows_without_computing_sa_requests(
-    monkeypatch, mode, kind, steps, gate, batch_size, neural
+    monkeypatch, mode, kind, steps, gate, batch_size, neural, conditional
 ):
     """Run the actual worker body, topk, compaction and CUDA graph scheduling.
 
@@ -524,6 +528,13 @@ def test_compact_tail_graph_reorders_rows_without_computing_sa_requests(
         FullCudaGraphBackend,
     )
     from test_draft_recurrence import load_functions
+
+    if conditional:
+        from hybrid_spec.integrations.sglang.conditional_graph import (
+            require_conditional_graph,
+        )
+
+        require_conditional_graph()
 
     arctic = kind.startswith("arctic_")
     kind = kind.removeprefix("arctic_")
@@ -664,6 +675,7 @@ def test_compact_tail_graph_reorders_rows_without_computing_sa_requests(
         128,
         history_mode="device",
         draft_graph_mode=mode,
+        conditional_draft_graph=conditional,
         num_neural_gate_tokens=gate,
         num_neural_drafts=neural,
         verify_mode="padded" if neural is not None else "static",
@@ -892,6 +904,7 @@ def test_compact_tail_graph_reorders_rows_without_computing_sa_requests(
                 config=replace(
                     config,
                     draft_graph_mode="full",
+                    conditional_draft_graph=False,
                     num_neural_drafts=None,
                     verify_mode="static",
                 ),
@@ -1044,7 +1057,7 @@ def test_compact_tail_graph_reorders_rows_without_computing_sa_requests(
             finally:
                 fb.spec_info.draft_override = view
     assert poison
-    counters = backend.counters
+    counters = backend.snapshot()
     assert (
         counters["request_ct"]
         == counters["skip_request_ct"] + counters["tail_request_ct"]

@@ -16,6 +16,113 @@ from hybrid_spec.core.contracts import DraftOverrideView
 from hybrid_spec.integrations.sglang import compact_graph
 
 
+def test_conditional_cost_seed_cannot_cross_dispatch_modes():
+    from dataclasses import replace
+
+    from hybrid_spec.config import HybridConfig
+    from hybrid_spec.selection.verify_costs import cost_profile, parse_cost_profile
+
+    config = HybridConfig(8, 1, 4, 128, history_mode="device", draft_graph_mode="split")
+    profile = cost_profile(config, {(4, 512): {36: (1.0, 2.0)}}, {(4, 512): 1.0})
+    # A persisted pre-conditional table has no such configuration field.
+    profile["config"].pop("conditional_draft_graph", None)
+    assert parse_cost_profile(profile, config)[1] == {(4, 512): 1.0}
+    with pytest.raises(ValueError, match="hybrid config"):
+        parse_cost_profile(profile, replace(config, conditional_draft_graph=True))
+
+
+@pytest.mark.parametrize("cuda,hip", [(None, None), ("12.3", None), ("13.0", "7.0")])
+def test_conditional_graph_rejects_unsupported_runtime(monkeypatch, cuda, hip):
+    from hybrid_spec.integrations.sglang.conditional_graph import (
+        require_conditional_graph,
+    )
+
+    monkeypatch.setattr(torch.version, "cuda", cuda)
+    monkeypatch.setattr(torch.version, "hip", hip)
+    with pytest.raises(ValueError, match="NVIDIA CUDA >=12.4"):
+        require_conditional_graph()
+
+
+def test_conditional_graph_requires_both_capture_bindings(monkeypatch):
+    from hybrid_spec.integrations.sglang.conditional_graph import (
+        require_conditional_graph,
+    )
+
+    monkeypatch.setattr(torch.version, "cuda", "13.0")
+    monkeypatch.setattr(torch.version, "hip", None)
+    monkeypatch.setattr(torch.cuda, "CUDAGraph", NS(begin_capture_to_if_node=None))
+    with pytest.raises(ValueError, match="conditional-node bindings"):
+        require_conditional_graph()
+
+
+def test_conditional_dispatch_never_reads_count_for_metrics_or_verify(monkeypatch):
+    """Padded requests cannot enter the tail or force an intermediate readback.
+
+    CUDA dispatch is replaced here; the real GPU branch/capture test is in
+    test_cuda.py. The CPU contract is that later verify receives no stale count.
+    """
+    from hybrid_spec.integrations.sglang.split_graph import SplitDraftGraphBackend
+
+    output = torch.zeros(4, dtype=torch.int64)
+    mask = torch.tensor([True, False, True, False])
+    record = compact_graph.CompactCapture(
+        NS(replay=lambda: output.zero_()),
+        output,
+        NS(batch_size=4),
+        NS(use_retrieval=mask),
+        (),
+        runtime_num_neural=99,
+    )
+    compact_graph.prepare_compaction(record, "split")
+
+    def compact(mask, rows, count, raw_bs, no_skip):
+        chosen = (~mask[:raw_bs]).nonzero().flatten()
+        rows[: len(chosen)].copy_(chosen)
+        count.fill_(len(chosen))
+
+    monkeypatch.setattr(compact_graph, "compact_neural_rows", compact)
+    record.conditional = NS(
+        replay=lambda raw_bs: output.copy_((~mask & (torch.arange(4) < raw_bs)).long()),
+        snapshot=lambda: ([0, 2, 0, 0, 0], 1),
+    )
+    backend = object.__new__(SplitDraftGraphBackend)
+    backend.conditional = True
+    backend.records = {4: record}
+    backend.counters = dict.fromkeys(
+        (
+            "prefix_ct",
+            "skip_ct",
+            "tail_ct",
+            "decision_wait_ns",
+            "request_ct",
+            "skip_request_ct",
+            "tail_request_ct",
+            "mixed_ct",
+        ),
+        0,
+    )
+    backend.counters["tail_batch_histogram"] = {str(i): 0 for i in range(5)}
+    extension = NS(compact_num_neural=99)
+    backend.runner = NS(raw_bs=3, eagle_worker=NS(draft_extension=extension))
+    # Fails immediately if dispatch/metrics reintroduces a scalar readback.
+    with monkeypatch.context() as patch:
+        patch.setattr(torch.Tensor, "item", lambda self: pytest.fail("count readback"))
+        assert backend.replay(4, None) is output
+        backend.runner.raw_bs = 1
+        mask[0] = False
+        backend.replay(4, None)
+    assert output.tolist() == [1, 0, 0, 0]
+    assert extension.compact_num_neural is None
+    first = backend.snapshot()
+    assert first["request_ct"] == 4
+    assert first["tail_request_ct"] == first["skip_request_ct"] == 2
+    assert first["tail_ct"] == first["prefix_ct"] == 2
+    assert first["mixed_ct"] == 1
+    assert first["decision_wait_ns"] == 0
+    assert backend.snapshot() == first  # readback is not double-counted
+    assert sum(backend.counters["tail_batch_histogram"].values()) == 0
+
+
 @pytest.mark.parametrize(
     "k,gate", [(2, 0), (2, 1), (3, 2), (8, 0), (8, 1), (8, 2), (8, 3)]
 )
