@@ -144,7 +144,11 @@ class EAGLEDraftExtendCudaGraphRunner(DecodeCudaGraphRunner):
         self.deepep_adapter = DeepEPCudaGraphRunnerAdapter()
 
         self.capture_forward_mode = self.forward_mode
-        self.capture_hidden_mode = CaptureHiddenMode.LAST
+        self.capture_hidden_mode = (
+            CaptureHiddenMode.NULL
+            if model_runner.spec_algorithm.is_standalone()
+            else CaptureHiddenMode.LAST
+        )
 
         self.capture_bs, _ = get_batch_sizes_to_capture(model_runner)
 
@@ -445,7 +449,7 @@ class EAGLEDraftExtendCudaGraphRunner(DecodeCudaGraphRunner):
             global_dp_buffer_len=global_dp_buffer_len,
             spec_algorithm=self.model_runner.spec_algorithm,
             spec_info=spec_info,
-            capture_hidden_mode=CaptureHiddenMode.LAST,
+            capture_hidden_mode=self.capture_hidden_mode,
         )
         self.model_runner.kv_index_translator.bind_runner_slots(forward_batch)
 
@@ -682,6 +686,10 @@ class EAGLEDraftExtendCudaGraphRunner(DecodeCudaGraphRunner):
             next_token_logits=out.next_token_logits[:raw_bs],
             # CUDA graph replay reuses its captured output storage. These states
             # survive into the next draft step, so detach them from that buffer.
-            hidden_states=out.hidden_states[:raw_bs].clone(),
+            hidden_states=(
+                out.hidden_states[:raw_bs].clone()
+                if out.hidden_states is not None
+                else None
+            ),
         )
         return out

@@ -1754,6 +1754,185 @@ def test_compact_backend_validation_waits_for_attention_initialization(
             plugin._verify_token_buckets([9, 36], runner)
 
 
+@pytest.mark.parametrize("standalone", [False, True])
+@pytest.mark.parametrize("prefill_rows", [1, 3])
+def test_draft_extend_graph_state_survives_prefill_merge_and_filter(
+    standalone, prefill_rows
+):
+    """Reproduce the continuous-batch crash from mixed None/non-None state."""
+    from typing import Callable
+
+    path = (
+        ROOT / "python/sglang/srt/speculative/eagle_draft_extend_cuda_graph_runner.py"
+    )
+    definition = next(
+        n
+        for n in ast.parse(path.read_text()).body
+        if isinstance(n, ast.ClassDef) and n.name == "EAGLEDraftExtendCudaGraphRunner"
+    )
+    init = next(
+        n
+        for n in definition.body
+        if isinstance(n, ast.FunctionDef) and n.name == "__init__"
+    )
+    mode_assignment = next(
+        n
+        for n in init.body
+        if isinstance(n, ast.Assign)
+        and any(
+            isinstance(t, ast.Attribute) and t.attr == "capture_hidden_mode"
+            for t in n.targets
+        )
+    )
+    bs, width, hidden = 2, 9, 4
+    captured = []
+    forward_batches = []
+    buffers = NS(
+        **{
+            name: torch.zeros(bs * width, dtype=torch.long)
+            for name in ("input_ids", "out_cache_loc", "positions")
+        },
+        **{
+            name: torch.zeros(bs, dtype=torch.long)
+            for name in (
+                "req_pool_indices",
+                "seq_lens",
+                "seq_lens_cpu",
+                "extend_seq_lens",
+                "num_correct_drafts",
+                "num_accept_tokens",
+                "select_index",
+            )
+        },
+        mrope_positions=torch.zeros(3, bs * width, dtype=torch.long),
+        hidden_states=None if standalone else torch.zeros(bs * width, hidden),
+        next_token_logits_buffer=torch.zeros(bs, 8),
+        global_num_tokens_gpu=None,
+        global_num_tokens_for_logprob_gpu=None,
+        mamba_track_indices=None,
+        dsa_seed_topk_capture=None,
+    )
+    runner = NS(
+        buffers=buffers,
+        captured_req_width=width,
+        extend_seq_lens_cpu=[width] * bs,
+        require_mlp_tp_gather=False,
+        require_attn_tp_gather=False,
+        forward_mode=object(),
+        draft_extend_attn_backend=NS(
+            init_forward_metadata_in_graph=lambda *a, **k: None,
+            init_forward_metadata_out_graph=lambda *a, **k: None,
+        ),
+        deepep_adapter=NS(capture=lambda **k: None, replay=lambda: None),
+        backend=NS(capture_one=lambda key, fn, **kw: captured.append(fn())),
+        _make_graph_key=lambda size: size,
+    )
+    mode = NS(NULL=0, LAST=1)
+
+    def model_forward(ids, positions, fb):
+        forward_batches.append(fb)
+        return NS(
+            next_token_logits=torch.zeros(bs, 8),
+            hidden_states=None
+            if fb.capture_hidden_mode == mode.NULL
+            else torch.ones(bs, hidden),
+        )
+
+    model_runner = runner.model_runner = NS(
+        spec_algorithm=NS(is_standalone=lambda: standalone),
+        kv_index_translator=NS(bind_runner_slots=lambda *a: None),
+        canary_manager=None,
+        model=NS(forward=model_forward),
+        model_config=NS(model_is_mrope=False),
+        device="cpu",
+        device_timer=None,
+    )
+    ns = dict(
+        torch=torch,
+        Callable=Callable,
+        Optional=Optional,
+        self=runner,
+        model_runner=model_runner,
+        CaptureHiddenMode=mode,
+        contextlib=NS(nullcontext=nullcontext),
+        List=list,
+        track_indices=lambda *a: None,
+        EagleDraftExtendInput=NS,
+        ForwardBatch=NS,
+        DpPaddingMode=NS(
+            get_default_mode_in_cuda_graph=lambda: NS(is_max_len=lambda: False)
+        ),
+        set_dp_buffer_len=lambda *a: None,
+        set_is_extend_in_batch=lambda *a: None,
+        ForwardContext=NS,
+        forward_context=lambda *a: nullcontext(),
+        maybe_flashinfer_autotune_speculative_draft=lambda *a, **k: None,
+    )
+    exec(
+        compile(ast.Module(body=[mode_assignment], type_ignores=[]), str(path), "exec"),
+        ns,
+    )
+    load_functions(
+        str(path.relative_to(ROOT)), ["capture_one_shape"], ns, definition.name
+    )
+    ns["capture_one_shape"](runner, bs, None)
+
+    # Execute the real replay adapter too: STANDALONE must not slice None,
+    # while recurrent hidden states must detach from captured output storage.
+    runner.capture_bs = [1, 2, 4]
+    runner.seq_len_fill_value = 1
+    runner.require_gathered_buffer = False
+    runner._pad_to_bucket = lambda size, buckets: size
+    runner._replay_graph = lambda *args: captured[0]
+    runner.draft_extend_attn_backend.shared_read_ends = lambda *args: 0
+    fb = forward_batches[0]
+    fb.kv_loc_plan = fb.kv_loc_cols = fb.out_cache_loc_virtual = None
+    ns.update(
+        refresh_track_indices=lambda *a, **k: None,
+        _grouped_foreach_copy_=lambda dsts, srcs: [
+            d.copy_(s) for d, s in zip(dsts, srcs)
+        ],
+        device_timer_ctx=lambda *a: nullcontext(),
+        SharedReadEnds=NS(PRE_REPLAY=1, IN_REPLAY=2, POST_REPLAY=3),
+        LogitsProcessorOutput=NS,
+    )
+    load_functions(str(path.relative_to(ROOT)), ["execute"], ns, definition.name)
+    replayed = ns["execute"](runner, fb, buffers.select_index)
+    if not standalone:
+        assert replayed.hidden_states.data_ptr() != captured[0].hidden_states.data_ptr()
+
+    load_functions(
+        "python/sglang/srt/speculative/eagle_info.py",
+        ["merge_batch", "filter_batch"],
+        ns,
+        "EagleDraftInput",
+    )
+
+    def state(rows, value):
+        return NS(
+            future_indices=None,
+            topk_p=torch.ones(rows, 1),
+            topk_index=torch.zeros(rows, 1, dtype=torch.long),
+            draft_probs=None,
+            hidden_states=value,
+            bonus_tokens=torch.arange(rows),
+            dsa_topk_indices=None,
+            cuda_graph_compatible=True,
+        )
+
+    decoded = state(bs, replayed.hidden_states)
+    prefill = state(
+        prefill_rows, None if standalone else torch.ones(prefill_rows, hidden)
+    )
+    ns["merge_batch"](decoded, prefill)
+    ns["filter_batch"](decoded, torch.tensor([bs + prefill_rows - 1, 0]))
+    assert decoded.topk_index.shape == (2, 1)
+    if standalone:
+        assert decoded.hidden_states is None
+    else:
+        assert decoded.hidden_states.shape == (2, hidden)
+
+
 @pytest.mark.parametrize("alignment", [1, 2, 8, 16])
 def test_token_tiers_obey_native_tp_sp_alignment(alignment):
     config = HybridConfig(
