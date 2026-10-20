@@ -1,5 +1,9 @@
 # SGLang 混合投机扩展（实验）
 
+截至 2026-10-20 的实测数据见 [测试总报告](validation/TEST_RESULTS.md)，涵盖内网 DSV4 TP8、A100 / 6000D / 4090 性能、4060 功能回归及 compact 对照；[逐次数据](validation/TEST_RESULTS_RUNS.md) 和 [完整历史记录](validation/TEST_RESULTS_DETAILS.md) 保留统计口径、版本、证据链接与作废结果说明。
+
+内网 [DSV4-Flash / H100 TP8 实测报告（10-17～10-20）](validation/DSV4_PERFORMANCE_20261017_19.md)：edits c1～32、离线耗时表与 fixed/dynamic compact、SWE c8/c16/c80，以及 decode 与系统吞吐的不同口径。edits c1 padded SA8/neural3 达 430.74 tok/s；SWE SA8 相对同轮 MTP K3 再提高约 4%～6% RPS，c80 受 KV 压力影响端到端回退。
+
 新增显式开启的 [在线校准与动态验证](DYNAMIC_VERIFY.md)：SA/suffix 和 neural
 统一从 target 验证反馈估计接受率，结合实际 CUDA Graph 档位耗时选择每请求验证长度。
 保留 gate、split 和原草稿上限，默认不改变已有固定长度行为。
@@ -187,8 +191,9 @@ Qwen3.5/3.6 GDN MTP 暂不开放此新模式，原等长路径保留。DSV4 的�
 
 内网请固定同一来源策略比较：原 SA8/neural8、SA8/neural3 padded、SA8/neural3 compact，
 覆盖 c=1/4，gate=1/3，并用交替顺序多次重复。4060 组件验证范围和证据见
-[compact verify 验证记录](validation/compact-verify-4060/README.md)；DSV4 TP8 模型质量、
-压缩 KV 运行状态、真实 scheduler 以及吞吐仍须内网验收。
+[compact verify 验证记录](validation/compact-verify-4060/README.md)。DSV4 TP8 已有用户提供的
+[真实模型性能数据](validation/DSV4_PERFORMANCE_20261017_19.md)，含 padded/compact 和动态预算对照；
+该性能汇总不替代模型质量、压缩 KV 与调度边界的专项验收。
 
 ## 实现与边界
 

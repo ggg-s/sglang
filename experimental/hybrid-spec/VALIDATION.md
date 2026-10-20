@@ -3,6 +3,10 @@
 当前机制、优化阶段与跨实验结论的汇总入口见 [优化总览](OPTIMIZATIONS.md)。
 下文按阶段保留当时的协议、结果和验收限制。
 
+## DeepSeek-V4-Flash / H100 TP8 性能汇总（更新至 2026-10-20）
+
+用户提供的完整内网结果已整理到 [DSV4 实测报告](validation/DSV4_PERFORMANCE_20261017_19.md)：edits c1～32、离线耗时表与 fixed/dynamic compact、SWE c8/c16/c80，以及 decode 与系统吞吐的统计口径。c1 padded SA8/neural3 为 430.74 tok/s；SWE SA8 相对同轮 MTP K3 约 +4%～+6% RPS，c80 在 KV 压力下端到端回退。本次仅整理文档，未重跑 GPU 或新增质量验收。下文的“待验收”标题保留各实现阶段的历史状态，当前性能证据以该专题为准。
+
 ## DeepSeek V4 split 逐请求紧凑尾段（2026-10-17，待内网 GPU 验收）
 
 在上一阶段的 V4 接入上，将多请求分支改为 Qwen 已有的 gather/tail/scatter 调度。
