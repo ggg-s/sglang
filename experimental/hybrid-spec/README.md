@@ -18,6 +18,20 @@ verify 直接在设备上暂存 `predict/accept_index/accept_lens`，下一轮 d
 
 `num_neural_gate_tokens` 默认为 0，保留上述 sa-spec 参考策略；取 1…K 时，先检查 SA 与原生 neural 草稿前 N 个 token 是否一致。检查范围内沿用 neural token；全部一致后才允许 SA 替换后续位置，任一步不一致则本轮余下位置均使用 neural。检查和 mask 更新可被 draft CUDA Graph 捕获，不增加模型 forward、逐步 D2H 或额外 TP collective。TP 仍沿用原生 neural token 在各 rank 一致的约定；这一新策略尚需多 GPU 模型验收。verify 统计读取检查后的最终 mask。
 
+实验性 `sa_require_unique_continuation=true` 在上述 neural gate 之前增加
+续写歧义检查（默认关闭，仅 device GPU SA、`partial_drafts="fallback"`）。
+沿所匹配 SA 状态的 K 步续写检查分叉；全局池里同样长的有效匹配还需给出
+相同的 K 个 token，包括本地历史与 donor 的平局。发现冲突时整行回退 neural，
+不裁短 verify，不尝试以更短匹配绕过冲突。更短上下文不否决更长匹配；
+代际失效、不可用或没有完整候选的 donor 不参与比较。末尾不足 K 的历史
+出现位置不会被当作一个不同的 token，但它已经观察到的分歧仍会触发拒绝。
+检查合入现有查询 kernel，不增加模型 forward、CPU 回读或 collective；
+每个参与比较的来源增加至多 K 步状态遍历和 token 比较，仍有查询计算成本。
+它只排除已观察到的歧义：历史单次出现或所有历史都复制错同一段仍可能放行，
+不能当作正确概率。修复共享 eager 缓冲覆盖外层请求映射的问题后，4090/Qwen3
+小样本对照接受长度提升约 0.75%，吞吐无可辨收益，故继续默认关闭；
+详见 [混合 tail 修复与 gate 对照](validation/tail-fix-gate-ab-4090-20261020/README.md)。
+
 `configs/device-qwen35-mtp.json` 是 Qwen3.5 MTP 的实验配置：K=8、匹配阈值 4、前 4 个 token 一致性检查、短候选整链回退。它与参考配置是不同的选路策略，不能把匹配命中率当作性能收益；模型、量化及负载改变后应重新测量。选择依据与 A100 对照见 [接受长度分析](validation/acceptance-regression.md)。该配置仍运行完整 MTP；CUDA 状态布局保持 v3，安装代码后重启服务即可加载新逻辑，不需要重新编译 CUDA 插件。
 
 `draft_graph_mode="split"` 将 EAGLE/MTP、EAGLE3 和 STANDALONE 的 neural draft

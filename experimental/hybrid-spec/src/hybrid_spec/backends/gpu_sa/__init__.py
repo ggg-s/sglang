@@ -210,4 +210,5 @@ class GPUSuffixAutomaton:
             shared_lengths,
             self.config.shared_context_tokens,
             query_metadata,
+            self.config.sa_require_unique_continuation,
         )

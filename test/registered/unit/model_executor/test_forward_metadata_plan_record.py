@@ -8,15 +8,19 @@ Covers the contract behind ``skip_attn_backend_init`` deprecation:
   * the deprecated kwarg shim maps explicit values onto the marker
     (mapped, not ignored) and warns once per process
 
-Pure dataclass logic — CPU only.
+CPU only; the eager decode ownership regression uses an in-memory model and
+shared-buffer staging boundary.
 """
 
 import unittest
 import warnings
-
-import torch
+from contextlib import nullcontext
+from dataclasses import replace
+from types import SimpleNamespace
+from unittest.mock import patch
 
 import sglang.srt.model_executor.forward_batch_info as fbi
+import torch
 from sglang.srt.model_executor.forward_batch_info import ForwardBatch, ForwardMode
 from sglang.test.ci.ci_register import register_cpu_ci
 from sglang.test.test_utils import CustomTestCase
@@ -37,6 +41,75 @@ def _make_batch(bs: int = 2, num_tokens: int = 2) -> ForwardBatch:
 
 
 class TestForwardMetadataPlanRecord(CustomTestCase):
+    def test_preplanned_decode_preserves_outer_graph_request_mapping(self):
+        """Compact inner decode must not stage into its outer graph's buffers.
+
+        The eager registry coalesces inputs with the draft graph. Copying row
+        three into its first lane corrupts the next full-batch KV lookup, even
+        though the inner model received the correct row on this call.
+        """
+        from sglang.srt.model_executor.runner import eager_runner
+
+        for planning in ("ready", "fresh", "stale"):
+            with self.subTest(planning=planning):
+                outer_seq = torch.tensor([792, 655, 408, 295])
+                outer_reqs = torch.tensor([0, 1, 2, 3])
+                original_seq = outer_seq.clone()
+                original_reqs = outer_reqs.clone()
+                fb = _make_batch(bs=1, num_tokens=1)
+                fb.seq_lens = outer_seq[3:].clone()
+                fb.req_pool_indices = outer_reqs[3:].clone()
+                if planning != "fresh":
+                    fb.mark_forward_metadata_ready(replan_equivalent=True)
+                if planning == "stale":
+                    fb.forward_metadata_planned_bs = 2
+
+                def stage(
+                    batch, pp_proxy_tensors, outer_seq=outer_seq, outer_reqs=outer_reqs
+                ):
+                    outer_seq[:1].copy_(batch.seq_lens)
+                    outer_reqs[:1].copy_(batch.req_pool_indices)
+                    return replace(
+                        batch, seq_lens=outer_seq[:1], req_pool_indices=outer_reqs[:1]
+                    )
+
+                planned = []
+                backend = SimpleNamespace(
+                    init_forward_metadata=lambda batch, planned=planned: planned.append(
+                        batch.seq_lens.clone()
+                    )
+                )
+                runner = SimpleNamespace(
+                    enable_pdmux=False,
+                    load_batch=stage,
+                    _resolve_decode_pdmux=lambda backend=backend: (
+                        backend,
+                        nullcontext(),
+                    ),
+                    model_runner=SimpleNamespace(
+                        model=SimpleNamespace(
+                            forward=lambda ids, pos, batch, **kw: (
+                                batch.seq_lens + batch.req_pool_indices
+                            )
+                        ),
+                        device_timer=None,
+                        _pp_kwargs=lambda pp: {},
+                    ),
+                )
+                with patch.object(
+                    eager_runner, "device_timer_ctx", lambda *a: nullcontext()
+                ):
+                    output = eager_runner.EagerRunner._execute_decode(runner, fb)
+                self.assertEqual(output.tolist(), [298])
+                if planning == "ready":
+                    self.assertTrue(torch.equal(outer_seq, original_seq))
+                    self.assertTrue(torch.equal(outer_reqs, original_reqs))
+                    self.assertEqual(planned, [])
+                else:
+                    self.assertEqual(outer_seq.tolist(), [295, 655, 408, 295])
+                    self.assertEqual(outer_reqs.tolist(), [3, 1, 2, 3])
+                    self.assertEqual(len(planned), 1)
+
     def test_fresh_batch_needs_planning(self):
         fb = _make_batch()
         self.assertTrue(fb.needs_forward_metadata_init())

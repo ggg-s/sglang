@@ -214,7 +214,7 @@ __global__ void consume_query_kernel(
     const int64_t *limits, const int *pending, int64_t *pending_meta,
     const int64_t *slots, const int64_t *generations, const int64_t *seq_lens,
     int64_t *tokens, bool *mask, int n, int h, int k, int min_match,
-    bool zero_partial, int64_t *query_metadata) {
+    bool zero_partial, int64_t *query_metadata, bool require_unique) {
   int row = blockIdx.x;
   mask[row] = false;
   if (query_metadata) {
@@ -250,6 +250,8 @@ __global__ void consume_query_kernel(
   int start = a.s(suffix, 2) + 1;
   int count = min(k, a.meta[0] - start);
   if (count < k && !zero_partial)
+    return;
+  if (require_unique && !a.unique_continuation(suffix, k))
     return;
   for (int j = 0; j < count; ++j)
     tokens[row * k + j] = a.history[start + j];
@@ -300,6 +302,7 @@ __global__ void finalize_shared_kernel(
 
 struct SharedMatch {
   int length, continuation, index, start;
+  bool unique = true;
 
   __device__ bool beats(const SharedMatch &other) const {
     if (length != other.length)
@@ -311,6 +314,25 @@ struct SharedMatch {
   }
 };
 
+// Combine the strongest matches without hiding conflicting equally long
+// contexts behind publication-order/available-tail tie breaking. Shorter
+// contexts are less specific evidence and do not veto a longer match.
+__device__ SharedMatch merge_matches(SharedMatch left, SharedMatch right,
+                                    const int *history,
+                                    const int64_t *shared_slots, int h, int k,
+                                    bool require_unique) {
+  SharedMatch best = right.beats(left) ? right : left;
+  if (require_unique && left.index != INT_MAX && right.index != INT_MAX &&
+      left.length == right.length) {
+    bool equal = true;
+    for (int j = 0; j < k; ++j)
+      equal &= history[shared_slots[left.index] * h + left.start + j] ==
+               history[shared_slots[right.index] * h + right.start + j];
+    best.unique = left.unique && right.unique && equal;
+  }
+  return best;
+}
+
 constexpr int MAX_SHARED_QUERY_THREADS = 128;
 
 __global__ void shared_query_kernel(
@@ -319,7 +341,7 @@ __global__ void shared_query_kernel(
     const int64_t *seq_lens, const int64_t *shared_slots,
     const int64_t *shared_generations, int64_t *tokens, bool *mask,
     int n, int h, int k, int num_shared, int max_context, int min_match,
-    bool zero_partial, int64_t *query_metadata) {
+    bool zero_partial, int64_t *query_metadata, bool require_unique) {
   int row = blockIdx.x;
   int64_t slot = slots[row];
   if (slot < 0 || slot >= n || owners[slot] != generations[row])
@@ -349,7 +371,8 @@ __global__ void shared_query_kernel(
       continue;
     int length = 0;
     int state = a.match_suffix(history + slot * h + m[0] - context, context, length, true);
-    if (state <= 0 || length < min_match || length <= own_length)
+    if (state <= 0 || length < min_match || length < own_length ||
+        (!require_unique && length == own_length))
       continue;
     int start = a.s(state, 2) + 1;
     int count = min(k, a.meta[0] - start);
@@ -358,25 +381,46 @@ __global__ void shared_query_kernel(
     // Filter partial continuations before ranking. Own history wins equal
     // matches; eligible donors rank by match, uncapped tail, publication order.
     SharedMatch candidate{length, a.meta[0] - start, i, start};
-    if (candidate.beats(best))
-      best = candidate;
+    if (require_unique)
+      candidate.unique = a.unique_continuation(state, k);
+    best = merge_matches(best, candidate, history, shared_slots, h, k,
+                         require_unique);
   }
   __shared__ SharedMatch matches[MAX_SHARED_QUERY_THREADS];
   matches[threadIdx.x] = best;
   __syncthreads();
   for (int stride = blockDim.x / 2; stride; stride >>= 1) {
-    if (threadIdx.x < stride &&
-        matches[threadIdx.x + stride].beats(matches[threadIdx.x]))
-      matches[threadIdx.x] = matches[threadIdx.x + stride];
+    if (threadIdx.x < stride)
+      matches[threadIdx.x] = merge_matches(
+          matches[threadIdx.x], matches[threadIdx.x + stride], history,
+          shared_slots, h, k, require_unique);
     __syncthreads();
   }
-  if (threadIdx.x == 0 && matches[0].index != INT_MAX) {
+  if (threadIdx.x == 0) {
     best = matches[0];
+    if (mask[row] && (best.index == INT_MAX || own_length >= best.length)) {
+      if (require_unique) {
+        Automaton own{history + slot * h, s,
+                      edges + slot * (h + 1) * Automaton::EDGE_FIELDS, m, h};
+        bool unique = own.unique_continuation(suffix, k);
+        if (best.index != INT_MAX && own_length == best.length) {
+          unique &= best.unique;
+          int64_t donor = shared_slots[best.index];
+          for (int j = 0; j < k; ++j)
+            unique &= tokens[row * k + j] ==
+                      history[donor * h + best.start + j];
+        }
+        mask[row] = unique;
+      }
+      return;
+    }
+    if (best.index == INT_MAX)
+      return;
     int64_t donor = shared_slots[best.index];
     int count = min(k, best.continuation);
     for (int j = 0; j < k; ++j)
       tokens[row * k + j] = j < count ? history[donor * h + best.start + j] : 0;
-    mask[row] = true;
+    mask[row] = !require_unique || best.unique;
     if (query_metadata) {
       query_metadata[row * 2] = best.length;
       query_metadata[row * 2 + 1] = 1;
@@ -452,13 +496,15 @@ void consume_and_query(
     std::optional<torch::Tensor> shared_slots,
     std::optional<torch::Tensor> shared_generations,
     std::optional<torch::Tensor> shared_lengths, int64_t max_context,
-    std::optional<torch::Tensor> query_metadata) {
+    std::optional<torch::Tensor> query_metadata, bool require_unique) {
   check_storage(history, states, edges, meta);
   check_device_metadata(meta, owners, pending, pending_meta, slots, generations,
                         seq_lens);
   check_tensor(limits, torch::kInt64, meta.device());
   check_tensor(tokens, torch::kInt64, meta.device());
   check_tensor(mask, torch::kBool, meta.device());
+  TORCH_CHECK(!require_unique || !zero_partial,
+              "unique continuation requires full candidates");
   TORCH_CHECK(limits.sizes() == owners.sizes() && tokens.dim() == 2 &&
                   tokens.size(0) == slots.size(0) && tokens.size(1) > 0 &&
                   tokens.size(1) + 1 == pending.size(1) &&
@@ -505,7 +551,8 @@ void consume_and_query(
         slots.data_ptr<int64_t>(), generations.data_ptr<int64_t>(),
         seq_lens.data_ptr<int64_t>(), tokens.data_ptr<int64_t>(), mask.data_ptr<bool>(),
         history.size(0), history.size(1), tokens.size(1), min_match, zero_partial,
-        query_metadata ? query_metadata->data_ptr<int64_t>() : nullptr);
+        query_metadata ? query_metadata->data_ptr<int64_t>() : nullptr,
+        require_unique && !(shared_slots && shared_slots->numel()));
     C10_CUDA_KERNEL_LAUNCH_CHECK();
     if (shared_slots && shared_slots->numel()) {
       int threads = 32;
@@ -520,7 +567,8 @@ void consume_and_query(
           shared_generations->data_ptr<int64_t>(), tokens.data_ptr<int64_t>(),
           mask.data_ptr<bool>(), history.size(0), history.size(1), tokens.size(1),
           shared_slots->numel(), max_context, min_match, zero_partial,
-          query_metadata ? query_metadata->data_ptr<int64_t>() : nullptr);
+          query_metadata ? query_metadata->data_ptr<int64_t>() : nullptr,
+          require_unique);
       C10_CUDA_KERNEL_LAUNCH_CHECK();
     }
   }

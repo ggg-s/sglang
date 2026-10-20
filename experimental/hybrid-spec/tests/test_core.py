@@ -1198,6 +1198,23 @@ def test_invalid_neural_gate_width(value):
 @pytest.mark.parametrize(
     "change",
     [
+        {"sa_require_unique_continuation": 1},
+        {"history_mode": "cpu"},
+        {"backend": "reference"},
+        {"partial_drafts": "zero"},
+    ],
+)
+def test_unique_continuation_configuration_fails_closed(change):
+    # Otherwise this option could silently do nothing (CPU/reference), or treat
+    # zero-filled non-candidates as if their continuation had been observed.
+    values = {"history_mode": "device", "sa_require_unique_continuation": True}
+    with pytest.raises(ValueError, match="sa_require_unique_continuation"):
+        HybridConfig(3, 2, 2, 64, **(values | change))
+
+
+@pytest.mark.parametrize(
+    "change",
+    [
         {"draft_graph_mode": "unknown"},
         {"history_mode": "cpu"},
         {"conditional_draft_graph": 1},

@@ -77,6 +77,18 @@ struct Automaton {
   HYBRID_DEVICE static int target(const int *edge) {
     return *edge < 0 ? ~*edge : *edge;
   }
+  // All occurrences of a SAM state have the same right language. A single
+  // outgoing edge at each step proves that no *observed* K-token continuation
+  // disagrees. Occurrences ending at the text boundary provide no next token;
+  // they do not count as a competing token. This is not a correctness score.
+  HYBRID_DEVICE bool unique_continuation(int state, int count) {
+    for (int i = 0; i < count; ++i) {
+      if (s(state, 3) < 0 || s(state, 4) != -1)
+        return false;
+      state = s(state, 3);
+    }
+    return true;
+  }
   // Longest suffix of an external request's context present in this SA.
   // Each donor is a separate text, so a lookup can never cross requests.
   HYBRID_DEVICE int match_suffix(const int *context, int count, int &length,

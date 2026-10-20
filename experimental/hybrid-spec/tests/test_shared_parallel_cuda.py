@@ -1,6 +1,7 @@
 """Global search must preserve serial selection across lanes and strided scans."""
 
 import random
+from dataclasses import replace
 
 import pytest
 import torch
@@ -206,3 +207,106 @@ def test_shared_parallel_ties_across_lanes_and_strides():
         winner = positions.index(min(positions)) + 1
         assert mask.item()
         assert tokens.tolist() == [histories[winner][2:]]
+
+
+def test_unique_continuation_local_branch_and_graph_reuse():
+    """Matching the first next token cannot hide a branch at token two."""
+    backend = GPUSuffixAutomaton(
+        HybridConfig(3, 2, 1, 128, history_mode="device"), "cuda"
+    )
+    device = {"device": "cuda", "dtype": torch.int64}
+    slots, generations = torch.tensor([0], **device), torch.tensor([1], **device)
+    lengths = torch.zeros(1, **device)
+    tokens = torch.zeros((1, 3), **device)
+    mask = torch.zeros(1, device="cuda", dtype=torch.bool)
+    # Same matched suffix, same first candidate, differing second candidate.
+    ambiguous = [1, 2, 10, 11, 12, 90, 1, 2, 10, 21, 22, 91, 1, 2]
+    unique = [1, 2, 10, 11, 12, 90, 1, 2]
+    backend.config = replace(backend.config, sa_require_unique_continuation=True)
+    graph = torch.cuda.CUDAGraph()
+    with torch.cuda.graph(graph):
+        backend.consume_and_query(slots, generations, lengths, tokens, mask)
+    for history, expected in ((ambiguous, False), (unique, True), (ambiguous, False)):
+        backend.initialize_device_slot(0, 1, 128)
+        backend.append(0, HistoryDelta(RequestKey("local", 1), 0, tuple(history)))
+        lengths.fill_(len(history) - 1)
+        for _ in range(2):
+            graph.replay()
+            assert mask.item() == expected
+        backend.config = replace(backend.config, sa_require_unique_continuation=False)
+        backend.consume_and_query(slots, generations, lengths, tokens, mask)
+        assert mask.item() and tokens.tolist() == [[10, 11, 12]]
+        backend.config = replace(backend.config, sa_require_unique_continuation=True)
+
+
+@pytest.mark.parametrize("own_match", [False, True])
+def test_unique_continuation_pool_conflicts_and_specificity(own_match):
+    """Pool ties, strided scans and stale donors cannot bypass ambiguity veto."""
+    backend = GPUSuffixAutomaton(
+        HybridConfig(
+            3,
+            2,
+            1,
+            128,
+            history_mode="device",
+            enable_global_pool=True,
+            max_shared_requests=257,
+            sa_require_unique_continuation=True,
+        ),
+        "cuda",
+    )
+    device = {"device": "cuda", "dtype": torch.int64}
+    own = [1, 2, 10, 11, 12, 90, 1, 2] if own_match else [90, 1, 2]
+    histories = {
+        0: own,
+        1: [1, 2, 10, 11, 12],
+        2: [1, 2, 10, 21, 22],
+        3: [90, 1, 2, 30, 31, 32],  # Longer, more specific context wins.
+    }
+    for slot, history in histories.items():
+        backend.initialize_device_slot(slot, slot + 1, 128)
+        backend.append(
+            slot, HistoryDelta(RequestKey(str(slot), slot + 1), 0, tuple(history))
+        )
+    slots = torch.tensor([0, -1], **device)
+    generations = torch.tensor([1, -1], **device)
+    lengths = torch.tensor([len(own) - 1, 0], **device)
+    sources = torch.full((258,), -1, **device)
+    source_generations = torch.zeros_like(sources)
+    source_lengths = torch.full_like(sources, -1)
+    tokens = torch.zeros((2, 3), **device)
+    mask = torch.zeros(2, device="cuda", dtype=torch.bool)
+
+    def query():
+        backend.consume_and_query(
+            slots,
+            generations,
+            lengths,
+            tokens,
+            mask,
+            shared_slots=sources,
+            shared_generations=source_generations,
+            shared_lengths=source_lengths,
+        )
+
+    graph = torch.cuda.CUDAGraph()
+    with torch.cuda.graph(graph):
+        query()
+    for left, right in ((16, 128), (128, 16), (16, 256)):
+        sources.fill_(-1)
+        source_generations.zero_()
+        sources[left], source_generations[left] = 1, 2
+        sources[right], source_generations[right] = 2, 3
+        graph.replay()
+        assert mask.tolist() == [False, False]
+        # Invalidating the conflicting generation must remove its veto.
+        source_generations[right] = 99
+        graph.replay()
+        assert mask.tolist() == [True, False]
+        assert tokens[0].tolist() == [10, 11, 12]
+        # A more specific context must beat both ambiguous shorter donors.
+        source_generations[right] = 3
+        sources[64], source_generations[64] = 3, 4
+        graph.replay()
+        assert mask.tolist() == [True, False]
+        assert tokens[0].tolist() == [30, 31, 32]

@@ -16,6 +16,7 @@ class HybridConfig:
     history_mode: str = "cpu"
     partial_drafts: str = "fallback"
     num_neural_gate_tokens: int = 0
+    sa_require_unique_continuation: bool = False
     draft_graph_mode: str = "full"
     enable_global_pool: bool = False
     max_shared_requests: int = 0
@@ -66,6 +67,17 @@ class HybridConfig:
             raise ValueError("num_neural_gate_tokens must be between 0 and num_drafts")
         if self.draft_graph_mode not in ("full", "split", "split_no_skip"):
             raise ValueError("draft_graph_mode must be full, split or split_no_skip")
+        if type(self.sa_require_unique_continuation) is not bool or (
+            self.sa_require_unique_continuation
+            and (
+                self.backend != "gpu_sa"
+                or self.history_mode != "device"
+                or self.partial_drafts != "fallback"
+            )
+        ):
+            raise ValueError(
+                "sa_require_unique_continuation requires device gpu_sa and full candidates"
+            )
         if type(self.conditional_draft_graph) is not bool or (
             self.conditional_draft_graph and self.draft_graph_mode != "split"
         ):

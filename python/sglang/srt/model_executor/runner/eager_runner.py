@@ -245,7 +245,11 @@ class EagerRunner(BaseRunner):
         model_runner = self.model_runner
         enable_pdmux = self.enable_pdmux
         attn_backend, pdmux_ctx = self._resolve_decode_pdmux()
-        if not enable_pdmux:
+        if not enable_pdmux and forward_batch.needs_forward_metadata_init():
+            # Pre-planned inner draft forwards own their input/metadata
+            # addresses. The eager registry may share the outer graph's
+            # buffers: staging a compact row there would overwrite its full
+            # request mapping and corrupt subsequent tail replays.
             forward_batch = self.load_batch(forward_batch, pp_proxy_tensors)
         if forward_batch.needs_forward_metadata_init():
             if hasattr(model_runner.model, "prepare_forward_batch"):

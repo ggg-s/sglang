@@ -114,6 +114,12 @@ def measure(
             mask,
             4,
             True,
+            None,  # shared slots
+            None,  # shared generations
+            None,  # shared final lengths
+            128,
+            None,  # query metadata
+            False,  # unique-continuation gate
         )
 
     stream = torch.cuda.Stream()

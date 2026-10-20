@@ -71,6 +71,29 @@ static void check(const std::vector<int> &input) {
     assert(length == best_length);
     if (length)
       assert(states[Automaton::STATE_FIELDS * suffix + 2] == best_end);
+    // Independent substring oracle: every observed continuation (including a
+    // short one at EOF) must agree with one complete K-token continuation.
+    // This catches clones/inline secondary edges that hide a later branch.
+    if (length) {
+      for (int k = 1; k <= 4; ++k) {
+        std::vector<std::vector<int>> tails;
+        std::vector<int> complete;
+        for (int start = 0; start + length <= n; ++start) {
+          if (!std::equal(input.begin() + n - length, input.begin() + n,
+                          input.begin() + start))
+            continue;
+          int end = std::min(n, start + length + k);
+          tails.emplace_back(input.begin() + start + length, input.begin() + end);
+          if (tails.back().size() == static_cast<size_t>(k))
+            complete = tails.back();
+        }
+        bool unique = complete.size() == static_cast<size_t>(k);
+        if (unique)
+          for (const auto &tail : tails)
+            unique &= std::equal(tail.begin(), tail.end(), complete.begin());
+        assert(sa.unique_continuation(suffix, k) == unique);
+      }
+    }
     assert(meta[1] <= 2 * capacity + 1 && meta[2] <= n - 1);
     check_index(sa);
   }
