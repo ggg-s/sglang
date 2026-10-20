@@ -103,23 +103,42 @@ export HYBRID_SPEC_CONFIG="$PWD/experimental/hybrid-spec/configs/device-dspark-s
 export SGLANG_RAGGED_VERIFY_MODE=static
 ```
 
-prefill 复用 GPU SA 的异步建索引和请求租约；每轮消费上次接受结果并查询 SA，
-原生 DSPARK 生成完整 neural block 后执行前缀 gate 和一次 TP 候选/最终 mask 共识，
+prefill 复用 GPU SA 的异步建索引和请求租约；每轮消费上次接受结果并查询 SA。
+默认 `full` 模式在原生 DSPARK 生成完整 neural block 后执行前缀 gate 和一次 TP 候选/最终 mask 共识，
 命中行原地替换为 SA block，未命中行保留 neural。保留原生 anchor、target verify、
 hidden/KV 注入与提交，并按 DSPARK 的连续输出布局回写接受前缀和 bonus。
 原地写入保留 folded proposal 与 target epilogue 的共享草稿缓冲区别名。
 
-当前只接入 `gpu_sa + history_mode=device + draft_graph_mode=full + verify_mode=static`，
-SA/neural 等长、greedy、纯文本、单机 TP，支持配置 gate 和全局 SA 池。
+可显式选择 `draft_graph_mode="split"`，目前仅允许 `num_neural_gate_tokens=0`：
+在 proposal 前完成 SA 查询和 TP 候选/mask 共识，SA 行直接提供候选，只将 neural
+行压缩后传给原生 `DraftBlockProposer`。全 SA 时不执行 neural proposal；全 neural
+时保持原生 folded 缓冲区路径。原始 batch 的 static target verify 和 hidden/KV
+提交仍覆盖所有行，接收反馈保持原行顺序。
+
+模板为 `configs/device-dspark-sa-split.json`（K=5、gate=0，verify 窗口 6）。
+在已能运行的原生 DSPARK 命令上改用此 JSON，并保持
+`--speculative-dspark-block-size 5 --speculative-num-draft-tokens 6`；
+其他 checkpoint 的 gamma 需同步修改。原 full 模板和默认策略不变。
+
+当前要求 `gpu_sa + history_mode=device + verify_mode=static`，draft 模式为
+`full` 或上述 gate=0 `split`。SA/neural 等长、greedy、纯文本、单机 TP，支持全局 SA 池。
 支持 full-attention target 及原生 DSPARK 已适配的纯文本 DSV4；其余混合 SWA、
 Mamba/mRoPE target 暂拒绝。SA 替换后清除 neural confidence，关闭对应的
-FutureMap confidence 携带；DSPARK 自带的 confidence 裁剪、compact、split、
-条件图和动态预算暂不与此路径混用。
+FutureMap confidence 携带；DSPARK 自带的 confidence 裁剪、compact/padded verify、
+条件图、gate≥1 split 和动态预算暂不与此路径混用。
 
-这版仍运行完整 DSPARK neural block，收益只能来自候选接受长度改善，尚未证明
-端到端加速。短回归覆盖 gate/回退、共享缓冲区、原生 decode 到 verify/KV 提交
-的接线，以及 GPU SA 接受反馈；不等同于真实 DSPARK 模型或多卡验收。
-本轮组件验证与边界见 [2026-10-20 短回归记录](validation/conditional-dspark-20261020/README.md)。
+split 第一版使用 GPU nonzero 生成行号并回读，以筛选原生 CPU 长度元数据，
+存在同步和动态分配；不属于 conditional graph 的无中间读回路径。有 SA 行时，
+合并输出使用独立缓冲，不消费本轮 folded accept/commit 的结果，走原生非 folded 验收和提交；
+neural 子批仍可使用原生 draft CUDA Graph。压缩 KV 计划保留物理写入 id，重新构建
+所选行的读表，不修改 target 的原计划或共享请求/采样状态。
+`hybrid_spec_dspark_draft` 诊断累计 proposal、总行数、neural 行数、skip 行数、
+全 SA 与混合批次数；行数是逻辑请求数，不能当作含 Graph padding 的实际计算量。
+
+full 的收益仍只能来自候选接受长度；split 可以减少 neural proposal 行数，
+尚未证明端到端加速。组件验证不等同于真实 DSPARK 模型或多卡验收。
+原接线见 [短回归记录](validation/conditional-dspark-20261020/README.md)，
+gate=0 split 的实现与验证见 [新增短回归](validation/dspark-g0-split-20261020/README.md)。
 
 ## Arctic Suffix 可选后端
 

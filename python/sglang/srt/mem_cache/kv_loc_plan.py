@@ -40,6 +40,7 @@ batch over its own buffers (`write_slots`).
 from __future__ import annotations
 
 import enum
+from copy import copy
 from typing import TYPE_CHECKING, Callable, Dict, Hashable, Optional, Union
 
 import msgspec
@@ -170,6 +171,42 @@ class KVLocPlan:
         self._read_tables: Dict[Hashable, KVIndexTable] = {}
 
     # -- writes ----------------------------------------------------------------
+
+    def select_rows(
+        self, indices: torch.Tensor, indices_cpu: torch.Tensor
+    ) -> KVLocPlan:
+        """A request subset of the same window, retaining every translated id.
+
+        Writes have already been allocated/translated by the full-batch plan.
+        Read tables must be rebuilt for the selected request order instead of
+        sharing a cached full-batch table.
+        """
+        plan = copy(self)
+        plan.req_pool_indices = self.req_pool_indices.index_select(0, indices)
+        plan.seq_lens = self.seq_lens.index_select(0, indices)
+        plan.seq_lens_cpu = (
+            None
+            if self.seq_lens_cpu is None
+            else self.seq_lens_cpu.index_select(0, indices_cpu)
+        )
+        bs = self.req_pool_indices.numel()
+
+        def select(ids):
+            return (
+                None
+                if ids is None
+                else ids.reshape(bs, -1).index_select(0, indices).reshape(-1)
+            )
+
+        plan._write_ids = {key: select(ids) for key, ids in self._write_ids.items()}
+        plan.write_physical = plan._write_ids[self._full_key]
+        plan.write_virtual = (
+            plan.write_physical
+            if self.write_virtual is self.write_physical
+            else select(self.write_virtual)
+        )
+        plan._read_tables = {}
+        return plan
 
     def bind(self, batch, reader: KVIndexTranslator, *, cols: Optional[Cols] = None):
         """Give ``batch`` (a ForwardBatch or a stand-in) this plan, the part of

@@ -45,8 +45,8 @@ def register():
         HookRegistry.register(f"{dspark_worker}.{method}", hook, kind)
     HookRegistry.register(
         "sglang.srt.speculative.dspark_components.dspark_draft.DraftBlockProposer.propose",
-        dspark.splice_proposal,
-        HookType.AFTER,
+        dspark.propose,
+        HookType.AROUND,
     )
     HookRegistry.register(
         "sglang.srt.speculative.eagle_worker_v2.EagleDraftWorker.draft",
@@ -339,6 +339,10 @@ def _diagnostics(result, controller, *args, **kwargs):
     if extension is not None:
         # Explicit diagnostic readback only; never synchronize each decode step.
         result.internal_state["hybrid_spec"] = extension.metrics.snapshot()
+        if hasattr(extension, "dspark_draft_counters"):
+            result.internal_state["hybrid_spec_dspark_draft"] = dict(
+                extension.dspark_draft_counters
+            )
         if hasattr(extension, "compact_verify_counters"):
             counters = extension.compact_verify_counters
             result.internal_state["hybrid_spec_compact_verify"] = dict(

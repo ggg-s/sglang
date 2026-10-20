@@ -29,12 +29,15 @@ def validate_config(config, cfg):
     elif (
         config.backend != "gpu_sa"
         or config.history_mode != "device"
-        or config.draft_graph_mode != "full"
+        or config.draft_graph_mode not in ("full", "split")
         or config.verify_mode != "static"
         or config.dynamic_verify
+        or config.conditional_draft_graph
+        or (config.draft_graph_mode == "split" and config.num_neural_gate_tokens != 0)
     ):
         errors.append(
-            "DSPARK SA requires gpu_sa, device history, full draft and static verify"
+            "DSPARK SA requires gpu_sa, device history, static verify and "
+            "full draft or gate=0 split (without conditional graphs)"
         )
     for name, expected in required.items():
         if getattr(cfg, name, None) != expected:
