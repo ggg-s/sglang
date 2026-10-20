@@ -1,0 +1,11 @@
+{
+  "num_drafts": 7,
+  "min_match_len": 4,
+  "max_requests": 8,
+  "max_history_tokens": 4096,
+  "backend": "gpu_sa",
+  "history_mode": "device",
+  "num_neural_gate_tokens": 1,
+  "draft_graph_mode": "full",
+  "verify_mode": "static"
+}

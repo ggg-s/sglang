@@ -98,6 +98,33 @@ def configure_verify(result, worker, batch):
                 dynamic.minimum(dynamic.model.buckets(view)), verify_lens - 1
             )
     cap_verify_chain(result, verify_lens)
+    if config.conditional_verify_graph:
+        from .conditional_verify import ConditionalVerifyBackend, DeviceVerifyPlan
+
+        graph = worker.target_worker.model_runner.decode_cuda_graph_runner
+        if graph is None or not isinstance(graph.backend, ConditionalVerifyBackend):
+            raise ValueError("conditional verify requires its captured target backend")
+        dense = len(batch.seq_lens) * (config.num_drafts + 1)
+        full = round_up_grid(dense, graph.capture_num_tokens)
+        floor = (
+            dynamic.profile_graph_tokens
+            if dynamic is not None and dynamic.profile_batch_size == len(batch.seq_lens)
+            else 0
+        )
+        plan = DeviceVerifyPlan.create(
+            verify_lens, graph.backend.capacities, full, floor=floor
+        )
+        result.conditional_verify_plan = plan
+        # This CPU-known bound is for admission only. The GPU-selected leaf's
+        # G controls packing, attention metadata and actual target execution.
+        result.compact_verify_layout = RaggedVerifyLayout.from_verify_lens_device(
+            verify_lens=verify_lens, graph_num_tokens=full
+        )
+        worker.draft_extension.compact_verify_counters = graph.backend.counters
+        worker.draft_extension.pending_verify_tokens = None
+        if dynamic is not None:
+            dynamic.mark_verify(plan.graph_tokens)
+        return
     counters = getattr(worker.draft_extension, "compact_verify_counters", None)
     if counters is None:
         counters = worker.draft_extension.compact_verify_counters = {

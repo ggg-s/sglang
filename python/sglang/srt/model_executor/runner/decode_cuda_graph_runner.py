@@ -1279,6 +1279,9 @@ class DecodeCudaGraphRunner(BaseCudaGraphRunner):
         forward_batch, attn_backend, pp_proxy_tensors = self.capture_prepare(
             bs, stream_idx=stream_idx, num_tokens=num_tokens
         )
+        prepare_inputs = getattr(self.backend, "prepare_capture_inputs", None)
+        if prepare_inputs is not None:
+            prepare_inputs(forward_batch)
 
         # All setup hooks below read get_attn_backend() (TboForwardBatchPreparer,
         # DeepEP adapter, …) so they must run inside the same ForwardContext
@@ -1297,7 +1300,8 @@ class DecodeCudaGraphRunner(BaseCudaGraphRunner):
                 # run eagerly in `init_forward_metadata_out_graph` (replay-prep), so
                 # the captured graph reads already-physical locs. Base no-op for triton.
                 attn_backend.init_forward_metadata_in_graph(forward_batch)
-                self._record_in_graph_metadata_prep_done()
+                if not getattr(self.backend, "conditional_verify", False):
+                    self._record_in_graph_metadata_prep_done()
 
                 # No invalidate_loc_cache() here: the unified pool translates its
                 # locs in `init_forward_metadata_out_graph`, so no cache to invalidate.
@@ -1381,7 +1385,7 @@ class DecodeCudaGraphRunner(BaseCudaGraphRunner):
                 self.backend.capture_one(
                     shape_key,
                     run_once,
-                    capture_inputs=None,
+                    capture_inputs=forward_batch,
                     post_warmup_hook=post_warmup_hook,
                 )
 
@@ -1632,9 +1636,19 @@ class DecodeCudaGraphRunner(BaseCudaGraphRunner):
         shared_read_ends = self._resolve_shared_read_ends(
             self._replay_attn_backend(), forward_batch.forward_mode
         )
+        if getattr(forward_batch, "conditional_verify_plan", None) is not None:
+            # External event nodes cannot live in conditional bodies. A main
+            # stream event after the parent covers every selected leaf's reads.
+            shared_read_ends = SharedReadEnds.POST_REPLAY
         with timer_ctx, self.backend.replay_session():
-            self.load_batch(forward_batch, pp_proxy_tensors)
-            if envs.SGLANG_LOG_DECODE_GRAPH_KEY.get():
+            device_verify = getattr(forward_batch, "conditional_verify_plan", None)
+            if device_verify is not None:
+                # The extension's selected leaf owns packing and metadata prep;
+                # load_batch would require the selected tier back on the CPU.
+                self.raw_num_token = forward_batch.batch_size * self.captured_req_width
+            else:
+                self.load_batch(forward_batch, pp_proxy_tensors)
+            if device_verify is None and envs.SGLANG_LOG_DECODE_GRAPH_KEY.get():
                 logger.info(
                     "Decode graph replay: worker=%s key_size=%s (%s) mode=%s raw_bs=%d%s",
                     "draft" if self.model_runner.is_draft_worker else "target",
@@ -1651,7 +1665,11 @@ class DecodeCudaGraphRunner(BaseCudaGraphRunner):
             if shared_read_ends is SharedReadEnds.PRE_REPLAY:
                 self._publish_read_done(in_graph=False)
 
-            output = self.backend.replay(self._replay_graph_key, forward_batch)
+            output = (
+                self.backend.replay_dynamic(forward_batch)
+                if device_verify is not None
+                else self.backend.replay(self._replay_graph_key, forward_batch)
+            )
 
             if shared_read_ends is SharedReadEnds.IN_REPLAY:
                 self._publish_read_done(in_graph=True)

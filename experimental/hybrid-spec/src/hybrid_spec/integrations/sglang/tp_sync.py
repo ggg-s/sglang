@@ -30,10 +30,11 @@ class TPOverride(DraftOverrideView):
 
 
 class TPSynchronizer:
-    def __init__(self, group, communicator=None):
+    def __init__(self, group, communicator=None, *, group_coordinator=None):
         self.group = group
         self.world_size = dist.get_world_size(group)
         self.communicator = communicator
+        self.group_coordinator = group_coordinator
         if communicator is not None and not communicator.available:
             raise ValueError("hybrid-spec TP requires an available PyNccl communicator")
 
@@ -54,7 +55,7 @@ class TPSynchronizer:
             ),
             dim=1,
         )
-        comm = self.communicator
+        comm = self._active_communicator()
         # PyNccl normally disables itself outside capture. Explicitly enable it
         # for eager too, retaining the same communicator and collective ordering.
         with nullcontext() if comm is None else comm.change_state(enable=True):
@@ -72,10 +73,17 @@ class TPSynchronizer:
         if self.world_size == 1 or not values.numel():
             return values
         values = values.contiguous().clone()
-        comm = self.communicator
+        comm = self._active_communicator()
         with nullcontext() if comm is None else comm.change_state(enable=True):
             if comm is None:
                 dist.all_reduce(values, op=dist.ReduceOp.MIN, group=self.group)
             else:
                 comm.all_reduce(values, op=dist.ReduceOp.MIN)
         return values
+
+    def _active_communicator(self):
+        # Capture selects the dedicated communicator; eager selection/feedback
+        # uses the ordinary one after the coordinator restores its scope.
+        if self.group_coordinator is not None:
+            return self.group_coordinator.pynccl_comm
+        return self.communicator

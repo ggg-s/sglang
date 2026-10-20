@@ -1,7 +1,7 @@
 """Real process-group tests; CPU Gloo does not substitute for CUDA/NCCL."""
 
 import time
-from contextlib import contextmanager
+from contextlib import ExitStack, contextmanager
 from datetime import timedelta
 from types import SimpleNamespace
 
@@ -62,6 +62,35 @@ class GlooCommunicator:
     def all_reduce(self, tensor, op):
         assert not self.disabled
         dist.all_reduce(tensor, op=op, group=self.group)
+
+
+def test_tp_sync_follows_scoped_coordinator_without_eager_leak(monkeypatch):
+    monkeypatch.setattr(dist, "get_world_size", lambda group: 2)
+
+    class Boundary(GlooCommunicator):
+        def all_reduce(self, tensor, op):
+            assert not self.disabled
+            if tensor.ndim == 1:
+                tensor.add_(self.group)
+            elif self.group == 20:
+                tensor[:, -1].zero_()
+
+    ordinary, dedicated = Boundary(10), Boundary(20)
+    coordinator = SimpleNamespace(pynccl_comm=ordinary)
+    sync = TPSynchronizer(object(), ordinary, group_coordinator=coordinator)
+    values = torch.ones(2, dtype=torch.int32)
+    view = DraftOverrideView(
+        torch.ones((2, 3), dtype=torch.int64), torch.ones(2, dtype=torch.bool)
+    )
+    assert sync.minimum(values).tolist() == [11, 11]
+    assert sync.synchronize(view).use_retrieval.all()
+    coordinator.pynccl_comm = dedicated
+    assert sync.minimum(values).tolist() == [21, 21]
+    assert not sync.synchronize(view).use_retrieval.any()
+    coordinator.pynccl_comm = ordinary
+    assert sync.minimum(values).tolist() == [11, 11]
+    assert values.tolist() == [1, 1]
+    assert ordinary.disabled and dedicated.disabled
 
 
 def _check_device_bridge(sync, ranks, device):
@@ -711,7 +740,7 @@ def _conditional_worker(rank, world_size, init_method, dispatch, joined):
     )
     from hybrid_spec.integrations.sglang.conditional_graph import ConditionalTailGraph
     from hybrid_spec.integrations.sglang.gated_override import GatedOverride
-    from sglang.srt.distributed.device_communicators.pynccl import PyNcclCommunicator
+    from sglang.srt.distributed.parallel_state import GroupCoordinator
 
     torch.cuda.set_device(rank)
     dist.init_process_group(
@@ -723,10 +752,28 @@ def _conditional_worker(rank, world_size, init_method, dispatch, joined):
     )
     dispatcher = None
     prefix = None
+    coordinator = None
+    scope = ExitStack()
     try:
         device = torch.device("cuda", rank)
-        comm = PyNcclCommunicator(dist.group.WORLD, device)
-        sync = TPSynchronizer(dist.group.WORLD, comm)
+        coordinator = GroupCoordinator(
+            [list(range(world_size))],
+            rank,
+            "nccl",
+            use_pynccl=True,
+            use_mscclpp=False,
+            use_custom_allreduce=False,
+            use_torch_symm_mem_all_reduce=False,
+            use_hpu_communicator=False,
+            use_xpu_communicator=False,
+            use_npu_communicator=False,
+            group_name="conditional_test",
+        )
+        ordinary = coordinator.pynccl_comm
+        sync = TPSynchronizer(dist.group.WORLD, ordinary, group_coordinator=coordinator)
+        scope.enter_context(coordinator.conditional_graph_capture_scope())
+        comm = coordinator.pynccl_comm
+        assert comm is not ordinary and comm.graph_usage_mode == 1
         bs = 5  # non-power-of-two branch tree and graph padding
         mask = torch.zeros(bs, dtype=torch.bool, device=device)
         view = GatedOverride(
@@ -761,8 +808,7 @@ def _conditional_worker(rank, world_size, init_method, dispatch, joined):
 
             def tail(size=size, buffer=buffer):
                 buffer.fill_(rank + 1)
-                with comm.change_state(enable=True):
-                    comm.all_reduce(buffer)
+                coordinator._all_reduce_in_place(buffer)
                 output.index_copy_(0, record.rows[:size], buffer)
 
             tail()
@@ -771,6 +817,8 @@ def _conditional_worker(rank, world_size, init_method, dispatch, joined):
         dispatcher = record.conditional = ConditionalTailGraph(
             record, stream, dispatch=dispatch, joined=joined
         )
+        scope.close()
+        assert coordinator.pynccl_comm is ordinary
         counters = {"prefix_ct": 0, "request_ct": 0}
         expected_histogram = [0] * (bs + 1)
         expected_mixed = 0
@@ -790,6 +838,9 @@ def _conditional_worker(rank, world_size, init_method, dispatch, joined):
                 local_hits.remove(hits[0])  # forces unanimous neural fallback
             mask.zero_()
             mask[local_hits] = True
+            coordinator.check_conditional_graph_replay_stream(
+                torch.cuda.current_stream()
+            )
             replay_compact(record, counters, raw_bs)
             agreed_hits = set(hits)
             if raw_bs > 1 and hits:
@@ -807,11 +858,14 @@ def _conditional_worker(rank, world_size, init_method, dispatch, joined):
         assert dispatcher.snapshot() == (expected_histogram, expected_mixed)
         assert not counters.get("decision_wait_ns", 0)
     finally:
+        scope.close()
         torch.cuda.synchronize()
         if dispatcher is not None:
             dispatcher.reset()
         if prefix is not None:
             prefix.reset()
+        if coordinator is not None:
+            coordinator.destroy()
         dist.destroy_process_group()
 
 

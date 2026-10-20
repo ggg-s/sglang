@@ -3,6 +3,7 @@
 # Adapted from https://github.com/vllm-project/vllm/blob/v0.6.4.post1/vllm/distributed/device_communicators/pynccl.py
 
 import logging
+import os
 from contextlib import contextmanager
 from typing import Optional, Union
 
@@ -34,6 +35,7 @@ class PyNcclCommunicator:
         device: Union[int, str, torch.device],
         library_path: Optional[str] = None,
         is_symmetric_memory_enabled: bool = False,
+        graph_usage_mode: Optional[int] = None,
     ):
         """
         Args:
@@ -44,6 +46,8 @@ class PyNcclCommunicator:
             library_path: the path to the NCCL library. If None, it will
                 use the default library path.
             is_symmetric_memory_enabled: whether symmetric memory is enabled.
+            graph_usage_mode: explicit NCCL graph mode for a dedicated communicator.
+                None preserves the ordinary/symmetric-memory initialization paths.
         It is the caller's responsibility to make sure each communicator
         is bind to a unique device.
         """
@@ -60,6 +64,8 @@ class PyNcclCommunicator:
             self.world_size = group.world_size
 
         self.group = group
+        self.library_path = library_path
+        self.graph_usage_mode = graph_usage_mode
 
         # if world_size == 1, no need to create communicator
         if self.world_size == 1:
@@ -68,6 +74,7 @@ class PyNcclCommunicator:
             return
         try:
             self.nccl = NCCLLibrary(library_path)
+            self.library_path = self.nccl.lib._name
         except Exception:
             # disable because of missing NCCL library
             # e.g. in a non-GPU environment
@@ -79,6 +86,7 @@ class PyNcclCommunicator:
         self.disabled = False
 
         self.nccl_version = self.nccl.ncclGetRawVersion()
+        self.validate_graph_usage_mode(graph_usage_mode, self.nccl_version)
         if self.rank == 0:
             logger.info("sglang is using nccl==%s", self.nccl.ncclGetVersion())
 
@@ -110,11 +118,13 @@ class PyNcclCommunicator:
         # `torch.cuda.device` is a context manager that changes the
         # current cuda device to the specified one
         with torch.cuda.device(device):
-            if is_symmetric_memory_enabled:
-                # When symmetric memory is enabled, disable internal
-                # NCCL cuda event synchronizations to improve performance.
+            if is_symmetric_memory_enabled or graph_usage_mode is not None:
+                # Keep symmetric memory's existing mode; conditional graph
+                # communicators opt in explicitly without changing defaults.
                 config = ncclConfig_t.create()
-                config.graphUsageMode = 1
+                config.graphUsageMode = (
+                    1 if graph_usage_mode is None else graph_usage_mode
+                )
                 self.comm: ncclComm_t = self.nccl.ncclCommInitRankConfig(
                     self.world_size, self.unique_id, self.rank, config
                 )
@@ -134,6 +144,30 @@ class PyNcclCommunicator:
         # by default it is disabled, e.g. in profiling models and prefill phase.
         # to use it, use under `with obj.change_state(enable=True)`, usually
         # when we are using CUDA graph.
+        self.disabled = True
+
+    @staticmethod
+    def validate_graph_usage_mode(mode: Optional[int], nccl_version: int) -> None:
+        if mode is None:
+            return
+        if type(mode) is not int or mode not in (0, 1, 2):
+            raise ValueError("graph_usage_mode must be None, 0, 1 or 2")
+        # NCCL 2.28 ignores this field; it first appears in the 2.29 headers.
+        if nccl_version < 22900:
+            raise ValueError("explicit graph_usage_mode requires NCCL >= 2.29")
+        if mode == 1 and os.environ.get("NCCL_GRAPH_MIXING_SUPPORT", "-1") != "-1":
+            raise ValueError(
+                "unset NCCL_GRAPH_MIXING_SUPPORT when requesting graph_usage_mode=1; "
+                "it overrides the communicator configuration"
+            )
+
+    def destroy(self) -> None:
+        """Release an explicitly owned communicator after its graphs are retired."""
+        if self.available and getattr(self, "comm", None) is not None:
+            with torch.cuda.device(self.device):
+                self.nccl.ncclCommDestroy(self.comm)
+            self.comm = None
+        self.available = False
         self.disabled = True
 
     def _resolve_stream(self) -> torch.cuda.Stream:

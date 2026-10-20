@@ -101,6 +101,7 @@ class DynamicVerify:
         self.explore_ct = 0
         self.cost_sample_ct = 0
         self.grids = {}
+        self.price_cache = {}
         self.profile_batch_size = 0
         self.profile_graph_tokens = 0
         self.profile_records = (
@@ -139,12 +140,36 @@ class DynamicVerify:
         self.cost_sample_ct += 1
         old_draft = self.draft_costs.get(key, draft_ms)
         self.draft_costs[key] = 0.9 * old_draft + 0.1 * draft_ms
+        # All capacities share the fixed term, so invalidate the whole cell.
+        self.price_cache.pop(key, None)
+
+    def device_prices(self, key, graph_tokens):
+        """Upload a price vector only on first use or after its cell changes."""
+        grid = tuple(graph_tokens)
+        cell = self.price_cache.setdefault(key, {})
+        if grid not in cell:
+            costs = self.costs.get(key, {})
+            fixed = self.draft_costs.get(key, 0.0)
+            cell[grid] = torch.tensor(
+                [fixed + costs[n][1] if n in costs else torch.inf for n in grid],
+                device=self.model.check_ct.device,
+                dtype=torch.float32,
+            )
+        if grid not in self.grids:
+            self.grids[grid] = torch.tensor(
+                grid, device=self.model.check_ct.device, dtype=torch.long
+            )
+        return self.grids[grid], cell[grid]
 
     def poll_timings(self):
         while self.timings and self.timings[0][-1].query():
             key, size, start, verify_start, verify_end, seq, end = (
                 self.timings.popleft()
             )
+            # Device-selected tiers were copied to pinned host storage before
+            # the completion event. The query above guarantees this is ready.
+            if isinstance(size, torch.Tensor):
+                size = int(size.item())
             fixed_ms = start.elapsed_time(verify_start) + verify_end.elapsed_time(end)
             verify_ms = verify_start.elapsed_time(verify_end)
             self.observe_cost(
@@ -204,7 +229,7 @@ class DynamicVerify:
         self.pending = None
 
     def select(self, view, caps, graph_tokens, key):
-        """Scores and allocation stay on GPU; caller reads only the final sum."""
+        """Scores and allocation stay on GPU, including the selected budget."""
         config, model = self.config, self.model
         bs, width = len(caps), config.num_drafts
         buckets = self.minimum(model.buckets(view))
@@ -226,23 +251,15 @@ class DynamicVerify:
             explore = graph_tokens.index(self.profile_graph_tokens)
         min_samples = 0 if profiling else config.dynamic_verify_min_samples
         costs = self.costs.get(key, {})
-        draft_ms = self.draft_costs.get(key, 0.0)
-        price_values = [
-            draft_ms + costs[n][1] if n in costs else torch.inf for n in graph_tokens
-        ]
+        capacities, prices = self.device_prices(key, graph_tokens)
         if model.gpu_ops is not None and bs * width <= 256 and len(graph_tokens) <= 256:
-            grid_key = tuple(graph_tokens)
-            if grid_key not in self.grids:
-                self.grids[grid_key] = torch.tensor(
-                    graph_tokens, device=caps.device, dtype=torch.long
-                )
             lengths = model.gpu_ops.calibration_select(
                 model.check_ct,
                 model.correct_ct,
                 buckets,
                 caps.to(torch.int32),
-                self.grids[grid_key],
-                torch.tensor(price_values, device=caps.device, dtype=torch.float32),
+                capacities,
+                prices,
                 min_samples,
                 config.dynamic_verify_min_drafts,
                 config.dynamic_verify_prior_strength,
@@ -265,23 +282,17 @@ class DynamicVerify:
         rank = torch.empty_like(order)
         rank.scatter_(0, order, torch.arange(bs * width, device=caps.device))
         prefix = scores.flatten()[order].cumsum(0)
-        capacities = torch.tensor(graph_tokens, device=caps.device, dtype=torch.long)
         budgets = torch.minimum(capacities - bs, caps.sum())
         utility = bs + prefix[(budgets - 1).clamp(min=0)]
         feasible = budgets >= minimum.sum()
 
         # All alternatives share the drafting/post-verify cost. Use its recent
         # EMA as the fixed term, including when the verify-stage prices are seeded.
-        priced = torch.tensor(
-            price_values,
-            dtype=torch.float32,
-            device=caps.device,
-        )
         # Source caps can make several capacities represent the same logical
         # prefix. Price the graph that packing will actually select, including
         # when a larger captured graph happens to have a cheaper measurement.
         physical = torch.searchsorted(capacities, budgets + bs)
-        priced = priced[physical]
+        priced = prices[physical]
         # Until a shape has been measured, preserve the fixed source budgets.
         if not costs:
             priced[full] = 1
@@ -302,9 +313,8 @@ class DynamicVerify:
             chosen,
             chosen.new_tensor(full),
         )
-        lengths = (
-            ((rank.view(bs, width) < budgets[chosen]) & valid).sum(1).to(torch.int32)
-        )
+        budget = budgets.gather(0, chosen.reshape(1)).reshape(())
+        lengths = ((rank.view(bs, width) < budget) & valid).sum(1).to(torch.int32)
         return self.finish_selection(buckets, lengths)
 
     def finish_selection(self, buckets, lengths):
@@ -317,6 +327,12 @@ class DynamicVerify:
     def mark_verify(self, graph_tokens):
         self.graph_tokens = graph_tokens
         if self.start is not None:
+            if isinstance(graph_tokens, torch.Tensor):
+                # Retain a per-sample destination; never reuse a host scalar
+                # while an earlier asynchronous transfer is still in flight.
+                host = torch.empty((), dtype=graph_tokens.dtype, pin_memory=True)
+                host.copy_(graph_tokens, non_blocking=True)
+                self.graph_tokens = host
             self.verify_start = torch.cuda.Event(enable_timing=True)
             self.verify_start.record(torch.cuda.current_stream(self.model.device))
 

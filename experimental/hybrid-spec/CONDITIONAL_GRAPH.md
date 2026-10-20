@@ -16,6 +16,13 @@ C++ 编译器与 PyTorch `CUDAGraph(keep_graph=True)` / raw graph 接口；
 SWITCH 放进同一张主图；仅支持 SWITCH，默认关闭。
 模板为 [device-draft-split-joined.json](configs/device-draft-split-joined.json)。
 
+TP>1 的条件图使用按通信 group 缓存的专用 PyNccl communicator，显式设置
+`graphUsageMode=1`，在 KV 预算前预留通信资源，要求实际加载的 NCCL >=2.29，且未设置
+`NCCL_GRAPH_MIXING_SUPPORT` 覆盖该配置。prefix/tail 捕获和预热期间，模型
+collective 与 SA 共识统一路由到该实例；退出捕获作用域后恢复普通 communicator
+及其通信后端，普通图和 eager 路径的默认初始化保持不变。条件图在每个 group
+上仅允许同一执行流串行 replay；先释放 Graph，再销毁 group 及专用 communicator。
+
 ## 执行方式
 
 普通 split：
@@ -32,7 +39,7 @@ prefix replay → GPU 压缩行 → conditional tail graph replay
 ```
 
 默认分段模式保留 prefix 和行压缩的独立启动。
-移除的是中间选择 tail 的 `.item()`；最终 compact verify 确定 target Graph
+仅开启 draft 条件图时，移除的是中间选择 tail 的 `.item()`；最终 compact verify 确定 target Graph
 token 档位时原有的 host 读回仍可能存在，不能据此宣称整轮无同步。
 
 每个 tail 大小先准备自己的 metadata / 暂存并预热，再直接捕获到条件节点内，
@@ -152,3 +159,74 @@ CPU 侧只即时维护 `prefix_ct` / `request_ct`，不要直接把进程内的
 IF 与 SWITCH 使用不同的耗时表指纹，切换 dispatch 后也需要重跑离线表。
 融合版 SWITCH 的指纹另含 revision=2，旧 SWITCH 的表也会被拒绝。
 joined=true 也进入耗时表指纹，不能沿用分段 SWITCH 的表。
+
+## GPU 选择 compact target 档位（第二步）
+
+增加 `"conditional_verify_graph": true`，同时保留
+`"conditional_draft_graph": true` 和 `"verify_mode": "compact"`。
+target 分派使用 CUDA SWITCH，要求 CUDA toolkit >=12.8；draft 可以继续使用
+IF 或 SWITCH。开关默认关闭，旧配置与旧耗时表指纹保持兼容；开启后耗时表指纹
+包含这个字段，不能直接沿用旧表。
+
+TP 对最终长度达成共识后，GPU 归约 M 并对原有 target token 网格做 lower-bound。
+CPU 只保留按 live batch 全窗口计算的入场上界，不读取选中的 G。
+一个 target 分支负责自己的打包、KV 地址翻译、attention 元数据准备、G 行模型
+forward 及原生 compact-to-dense 散射。每个已有 token 档位只捕获一次模型，
+没有按 batch×档位增加模型 Graph，也没有用 dense 执行代替 compact。
+分支复用 target 临时内存池，散射结果保存在池外的共享输出缓冲中。
+
+target 与 draft 条件图共用第一步的专用 NCCL communicator 生命周期。
+target leaf 内不记录原有的 external read-done event；parent replay 后在主流
+记录完成事件，保守覆盖所有共享 KV 元数据读取，避免把 event 节点带进条件体。
+
+当前接入 Triton 和 DSV4，包括 online C128 MTP。条件 verify 的 C128 planner
+直接从 GPU 实际长度构造原生 CompressPlan，不需要 CPU 长度镜像。
+普通 prefill、decode 和等长 verify 继续使用原有元数据路径。
+继续沿用 compact 原有的 topk=1、无 Mamba /
+mRoPE / LoRA / DP / PP / PDMux / two-batch-overlap 限制。
+
+compact 计数器在 GPU 累计，诊断查询才读回，flush 不重置这个累计值。
+动态价格向量按 context / 网格缓存，只在首次使用或该 context 的 EMA 更新后上传。
+采样计时若需要 G 标签，会先异步复制到独立 pinned host 标量；仅在完成事件
+query 成功后读取 CPU 标量，不为标签在 decode 中等待 GPU。
+
+短回归入口：
+
+```bash
+PYTHONPATH=experimental/hybrid-spec/src python -m pytest -q \
+  experimental/hybrid-spec/tests/test_conditional_verify.py \
+  experimental/hybrid-spec/tests/test_compact_verify.py \
+  experimental/hybrid-spec/tests/test_switch_graph.py
+```
+
+组件测试覆盖实际 SWITCH、原生 ragged/scatter kernel 与简化 GPU 模型/KV 边界；
+不等于 DSV4 真模型或 TP=2 的端到端验证，不据此宣称吞吐收益。
+
+2026-10-20 短回归记录：
+
+- 本地 CPU：`test_core.py`、`test_conditional_verify.py`、`test_compact_verify.py`、
+  `test_compact_tail.py`、`test_switch_graph.py` 合计 188 passed / 63 CUDA skipped。
+- 远端 `hz01-ssh.gpuhome.cc:30120`：单卡 RTX 4090 48GB，
+  PyTorch 2.12.1+cu130 / CUDA 13.0。
+- `test_conditional_verify.py`：9 passed，21.11 秒（包含首次编译）。
+  检查实际 target 行数只等于选中 G、升降档、缩小 batch、KV 写入、散射输出、
+  GPU 计数及异步计时标签；模型与 KV translator 是确定性的 GPU 边界替身。
+- 原生 compact prepare（三种模式）、ragged Triton attention 独立参考对照、
+  已有 SWITCH（排除 joined）：13 passed，7.48 秒。
+- 未启动服务、未下载权重、未测吞吐；单卡机器未执行 TP=2，未验证 DSV4 真模型。
+
+DSV4 online C128 补充：
+
+- GPU planner 保持原生 16-byte CompressPlan ABI；实际 verify token 之外的计划
+  标为 invalid，padding 请求不写在线状态。
+- 按每条请求的真实长度和 packed offset 保存逐前缀状态，支持 9-token 窗口；
+  提交仍使用实际接受后的序列长度，跨 128-token 边界保持原有重置语义。
+- 条件 target 启动时重新设置 native commit 的 Python 标记，GPU 计划负责标记
+  pending；提交后清空 pending，兼容连续 replay 及神经尾段被跳过的下一轮提交。
+- 没有关闭 online compress，也没有为了适配 C128 恢复等长 target 执行。
+- 新增 `test/registered/kernels/ops/attention/test_online_c128_ragged.py`：远端
+  5 passed / 2 dtype subtests passed（3.53 秒）。覆盖真实 DSV4 元数据入口、
+  FP32/BF16 GPU 与 CPU 参考、128 边界、padding、9-token 状态银行和连续捕图 replay。
+  隔离 harness 替代包初始化、测试框架和未使用的 legacy TVM/JIT 导入边界；
+  实际 planner、Triton 内核、controller 和提取的 DSV4 元数据方法均执行生产代码。
+  完整 DSV4 模型、原生 compressor 数值链和 TP=2 仍未验证。

@@ -19,6 +19,9 @@ def cap_verify_chain(verify_input, verify_lens):
 
 
 def prepare_compact_verify(verify_input, batch, target_worker):
+    if getattr(verify_input, "conditional_verify_plan", None) is not None:
+        backend = target_worker.model_runner.decode_cuda_graph_runner.backend
+        return backend.prepare(verify_input, batch, target_worker)
     from sglang.kernels.ops.speculative.dspark.dspark_verify_window import (
         BuildRaggedVerifyWindow,
     )
@@ -76,6 +79,9 @@ def prepare_compact_verify(verify_input, batch, target_worker):
 
 
 def scatter_verify_output(verify_input, logits_output):
+    if getattr(verify_input, "conditional_verify_plan", None) is not None:
+        # The selected target leaf already scattered to the native accept ABI.
+        return
     from sglang.kernels.ops.speculative.dspark.dspark_verify_window import (
         ScatterCompactToStrided,
     )

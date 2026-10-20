@@ -6,7 +6,7 @@ subsequent graph overwrite the prefix's hidden state or its complete SA chain.
 
 from __future__ import annotations
 
-from contextlib import contextmanager
+from contextlib import contextmanager, nullcontext
 
 
 class SplitDraftGraphBackend:
@@ -52,6 +52,7 @@ class SplitDraftGraphBackend:
 
             require_conditional_graph(self.conditional_dispatch)
         self.records = {}
+        self._conditional_groups = ()
         self.stream = None
         self.counters = {
             "prefix_ct": 0,
@@ -76,7 +77,15 @@ class SplitDraftGraphBackend:
     def capture_session(self, stream):
         self.stream = stream
         try:
-            with self.delegate.capture_session(stream):
+            scope = nullcontext(())
+            if self.conditional:
+                from sglang.srt.distributed.parallel_state import (
+                    conditional_graph_capture_scope,
+                )
+
+                scope = conditional_graph_capture_scope()
+            with scope as groups, self.delegate.capture_session(stream):
+                self._conditional_groups = groups
                 yield
         finally:
             self.stream = None
@@ -105,6 +114,12 @@ class SplitDraftGraphBackend:
         from .compact_graph import replay_compact
 
         record = self.records[shape_key]
+        if self.conditional and self._conditional_groups:
+            import torch
+
+            stream = torch.cuda.current_stream()
+            for group in self._conditional_groups:
+                group.check_conditional_graph_replay_stream(stream)
         output = replay_compact(record, self.counters, self.runner.raw_bs)
         self.runner.eagle_worker.draft_extension.compact_num_neural = (
             record.runtime_num_neural
@@ -121,6 +136,7 @@ class SplitDraftGraphBackend:
                     tail.graph.reset()
                 tail.forward = None
         self.records.clear()
+        self._conditional_groups = ()
         self.delegate.cleanup()
 
     def snapshot(self):

@@ -64,6 +64,45 @@ EAGLE3 的 hot-token 映射在 prefix/tail 的 gate 比较和 token 选择前统
 
 device 模式以 generation 和 GPU 历史版本检查隔离旧反馈、槽位复用、重排和 Graph padding；prefill/retract 时重建索引。允许实验性开启 overlap 和 chunked prefill：中间块不构建 SA、不接入临时采样 token；最后一块启动前快照完整历史（含已缓存/先前分块的前缀），后台构建与最后一块 prefill 重叠，返回后只暂存真实 bonus。CPU 构建未完成时首次 draft 仍会等待。GPU 接受前缀可能包含 CPU EOS/停止截断前的尾部，不能将索引长度当作交付长度；原生停止处理保持不变。支持单机多 TP 实验，仍不开放 mixed prefill/decode、grammar 等其余未支持组合。chunked prefill 的真实 GPU/模型验收尚未完成。
 
+## DSPARK + GPU SA（实验接入）
+
+在已能运行的原生 DSPARK 命令上启用插件，使用
+`configs/device-dspark-sa.json`。该模板设置 `num_drafts=7`，相应保留
+`--speculative-algorithm DSPARK --speculative-dspark-block-size 7`
+和 `--speculative-num-draft-tokens 8`；实际 checkpoint 的 gamma 不同，需同步修改
+配置与启动参数。DSPARK 的 block size 不等于 EAGLE 的 recurrent steps，
+这里不要求 `--speculative-num-steps 7`。容量为 8，服务并发上限应与配置匹配。
+
+DeepSeek V4 官方 Flash/Pro DSpark checkpoint 的 `dspark_block_size=5`
+（[官方配置](https://huggingface.co/deepseek-ai/DeepSeek-V4-Pro-DSpark/blob/main/config.json)）。
+对齐该配置时，把本模板的 `num_drafts` 改为 5，启动设置
+`--speculative-dspark-block-size 5 --speculative-num-draft-tokens 6`。
+模板中的 7 是通用示例，不代表 V4 checkpoint 固定使用 7。
+
+```bash
+export SGLANG_PLUGINS=hybrid_spec
+export HYBRID_SPEC_CONFIG="$PWD/experimental/hybrid-spec/configs/device-dspark-sa.json"
+export SGLANG_RAGGED_VERIFY_MODE=static
+```
+
+prefill 复用 GPU SA 的异步建索引和请求租约；每轮消费上次接受结果并查询 SA，
+原生 DSPARK 生成完整 neural block 后执行前缀 gate 和一次 TP 候选/最终 mask 共识，
+命中行原地替换为 SA block，未命中行保留 neural。保留原生 anchor、target verify、
+hidden/KV 注入与提交，并按 DSPARK 的连续输出布局回写接受前缀和 bonus。
+原地写入保留 folded proposal 与 target epilogue 的共享草稿缓冲区别名。
+
+当前只接入 `gpu_sa + history_mode=device + draft_graph_mode=full + verify_mode=static`，
+SA/neural 等长、greedy、纯文本、单机 TP，支持配置 gate 和全局 SA 池。
+支持 full-attention target 及原生 DSPARK 已适配的纯文本 DSV4；其余混合 SWA、
+Mamba/mRoPE target 暂拒绝。SA 替换后清除 neural confidence，关闭对应的
+FutureMap confidence 携带；DSPARK 自带的 confidence 裁剪、compact、split、
+条件图和动态预算暂不与此路径混用。
+
+这版仍运行完整 DSPARK neural block，收益只能来自候选接受长度改善，尚未证明
+端到端加速。短回归覆盖 gate/回退、共享缓冲区、原生 decode 到 verify/KV 提交
+的接线，以及 GPU SA 接受反馈；不等同于真实 DSPARK 模型或多卡验收。
+本轮组件验证与边界见 [2026-10-20 短回归记录](validation/conditional-dspark-20261020/README.md)。
+
 ## Arctic Suffix 可选后端
 
 `backend="arctic"` 使用 ArcticInference 官方 CPU 后缀树，可替换 GPU SA，支持
@@ -141,7 +180,7 @@ Qwen3.5/3.6 GDN MTP 暂不开放此新模式，原等长路径保留。DSV4 的�
 
 DeepSeek V4 原生 MTP 现在有独立接入：只对 `DeepseekV4ForCausalLM` target +
 `DeepseekV4ForCausalLMNextN` draft 放行 `is_hybrid_swa`，其余未适配 SWA 模型、
-外部草稿和 DSpark 仍拒绝。纯文本 V4 可直接使用；有视觉能力的 checkpoint
+其他未适配的外部草稿仍拒绝；DSPARK 使用上面的独立 block 接口。纯文本 V4 可直接使用；有视觉能力的 checkpoint
 需要显式 text-only 配置，实际多模态输入仍会被请求检查拒绝。
 
 V4 的 `split` 与 Qwen 一样按请求裁剪：按配置宽度完成 gate 后，命中行保留

@@ -47,6 +47,9 @@ _TRITON_KERNELS = [
     ("dsv4_attn_metadata_kernels", "expand_prefill_causally"),
     ("dsv4_attn_metadata_kernels", "build_page_table_positions"),
     ("dsv4_attn_metadata_kernels", "build_causal_swa_page_indices"),
+    ("dsv4.online_c128_ragged", "plan_online_verify"),
+    ("dsv4.online_c128_ragged", "write_ragged_prefix_states"),
+    ("dsv4.online_c128_ragged", "commit_ragged_pending"),
 ]
 for _mod, _fn in _TRITON_KERNELS:
     register_kernel(

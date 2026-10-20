@@ -1273,6 +1273,7 @@ def test_compact_dispatch_uses_raw_count_before_runner_restores_padding(monkeypa
     from hybrid_spec.integrations.sglang.split_graph import SplitDraftGraphBackend
 
     backend = object.__new__(SplitDraftGraphBackend)
+    backend.conditional = False
     backend.records = {4: compact_graph.CompactCapture(None, None, None, None, ())}
     backend.mode = "split"
     backend.counters = {}

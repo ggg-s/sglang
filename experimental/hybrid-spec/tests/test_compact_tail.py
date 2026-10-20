@@ -16,6 +16,44 @@ from hybrid_spec.core.contracts import DraftOverrideView
 from hybrid_spec.integrations.sglang import compact_graph
 
 
+@pytest.mark.parametrize("conditional", [False, True])
+def test_capture_session_scopes_communication_and_restores_on_failure(
+    monkeypatch, conditional
+):
+    from hybrid_spec.integrations.sglang.split_graph import SplitDraftGraphBackend
+
+    state = NS(communicator="ordinary")
+    groups = (object(),)
+
+    @contextmanager
+    def scope():
+        previous = state.communicator
+        state.communicator = "conditional"
+        try:
+            yield groups
+        finally:
+            state.communicator = previous
+
+    module = ModuleType("sglang.srt.distributed.parallel_state")
+    module.conditional_graph_capture_scope = scope
+    monkeypatch.setitem(sys.modules, module.__name__, module)
+
+    @contextmanager
+    def delegate(stream):
+        assert state.communicator == ("conditional" if conditional else "ordinary")
+        yield
+
+    backend = object.__new__(SplitDraftGraphBackend)
+    backend.conditional = conditional
+    backend.delegate = NS(capture_session=delegate)
+    backend._conditional_groups = ()
+    with pytest.raises(RuntimeError, match="capture aborted"):
+        with backend.capture_session(object()):
+            assert backend._conditional_groups == (groups if conditional else ())
+            raise RuntimeError("capture aborted")
+    assert backend.stream is None and state.communicator == "ordinary"
+
+
 def test_conditional_cost_seed_cannot_cross_dispatch_modes():
     from dataclasses import replace
 
@@ -89,6 +127,7 @@ def test_conditional_dispatch_never_reads_count_for_metrics_or_verify(monkeypatc
     backend.conditional = True
     backend.conditional_dispatch = "if"
     backend.conditional_joined = False
+    backend._conditional_groups = ()
     backend.records = {4: record}
     backend.counters = dict.fromkeys(
         (

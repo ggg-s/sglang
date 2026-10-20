@@ -473,6 +473,7 @@ class GroupCoordinator:
             )
 
         self.pynccl_comm: Optional[PyNcclCommunicator] = None
+        self._conditional_graph_state = None
         if use_pynccl and self.world_size > 1:
             self.pynccl_comm = PyNcclCommunicator(
                 group=self.cpu_group,
@@ -626,6 +627,33 @@ class GroupCoordinator:
         rank_in_group = self.rank_in_group
         world_size = self.world_size
         return self.ranks[(rank_in_group - 1) % world_size]
+
+    def _conditional_graph_resources(self):
+        if self._conditional_graph_state is None:
+            from sglang.srt.distributed.conditional_graph import (
+                ConditionalGraphCommunicator,
+            )
+
+            self._conditional_graph_state = ConditionalGraphCommunicator(self)
+        return self._conditional_graph_state
+
+    def get_conditional_graph_communicator(self):
+        """All ranks call before capture; ordinary communicator is unchanged."""
+        if self.world_size == 1:
+            return None
+        return self._conditional_graph_resources().get()
+
+    @contextmanager
+    def conditional_graph_capture_scope(self):
+        if self.world_size == 1:
+            yield
+            return
+        with self._conditional_graph_resources().capture_scope():
+            yield
+
+    def check_conditional_graph_replay_stream(self, stream):
+        if self.world_size > 1:
+            self._conditional_graph_resources().check_replay_stream(stream)
 
     @contextmanager
     def graph_capture(
@@ -2101,6 +2129,10 @@ class GroupCoordinator:
         return tensor
 
     def destroy(self):
+        conditional = getattr(self, "_conditional_graph_state", None)
+        if conditional is not None:
+            conditional.destroy()
+            self._conditional_graph_state = None
         # Must precede destroy_process_group(): FlashInfer's workspace
         # teardown collectives on the group it was built with.
         if self.pcie_ipc_comm is not None:
@@ -2291,6 +2323,36 @@ def get_mooncake_transfer_engine():
     )
 
     return _get_engine()
+
+
+def prepare_conditional_graph_communicators():
+    """Collectively reserve graph-only NCCL resources before budgeting model KV."""
+    groups = []
+    seen = set()
+    for group in (
+        get_tp_group(),
+        get_pp_group(),
+        _DCP,
+        _ATTN_TP,
+        _SHARED_EXPERTS_TP,
+        _MOE_EP,
+        _MOE_TP,
+    ):
+        if group is not None and group.world_size > 1 and id(group) not in seen:
+            seen.add(id(group))
+            group.get_conditional_graph_communicator()
+            groups.append(group)
+    return tuple(groups)
+
+
+@contextmanager
+def conditional_graph_capture_scope():
+    """Use graph-only communicators for every group covered by graph_capture."""
+    groups = prepare_conditional_graph_communicators()
+    with contextlib.ExitStack() as stack:
+        for group in groups:
+            stack.enter_context(group.conditional_graph_capture_scope())
+        yield tuple(groups)
 
 
 @contextmanager

@@ -46,6 +46,7 @@ class _OnlineC128LayerRuntime:
 class _OnlineC128VerifyContext:
     req_pool_indices: torch.Tensor
     seq_lens: torch.Tensor
+    verify_lens: Optional[torch.Tensor] = None
 
 
 class OnlineC128MTPController:
@@ -53,6 +54,24 @@ class OnlineC128MTPController:
         self.backend = backend
         self._verify_ctx: Optional[_OnlineC128VerifyContext] = None
         self._layer_runtimes: Optional[List[_OnlineC128LayerRuntime]] = None
+        self._ragged_verify = False
+
+    def enable_ragged_verify(self) -> None:
+        self._ragged_verify = True
+        if self.enabled():
+            if not self._num_verify_tokens():
+                raise ValueError("online C128 state banks must cover the verify window")
+            self.backend.token_to_kv_pool.get_online_c128_mtp_pending_seq_lens().fill_(
+                -1
+            )
+
+    def arm_ragged_verify(self, req_pool_indices, seq_lens, verify_lens) -> None:
+        # Python is not executed by a conditional replay. Re-arm the native
+        # post-verify commit gate on every launch; the graph marks GPU pending
+        # lengths itself and commits from the selected leaf's ragged banks.
+        self._verify_ctx = _OnlineC128VerifyContext(
+            req_pool_indices, seq_lens, verify_lens
+        )
 
     def enabled(self) -> bool:
         return (
@@ -70,6 +89,7 @@ class OnlineC128MTPController:
         self,
         req_pool_indices: torch.Tensor,
         seq_lens: torch.Tensor,
+        verify_lens: Optional[torch.Tensor] = None,
     ) -> None:
         if not self.enabled():
             self.clear()
@@ -78,7 +98,22 @@ class OnlineC128MTPController:
         self._verify_ctx = _OnlineC128VerifyContext(
             req_pool_indices=req_pool_indices.detach(),
             seq_lens=seq_lens.detach(),
+            verify_lens=verify_lens,
         )
+        if verify_lens is not None:
+            pending = (
+                self.backend.token_to_kv_pool.get_online_c128_mtp_pending_seq_lens()
+            )
+            pending.fill_(-1)
+            valid = (verify_lens > 0) & (req_pool_indices >= 0)
+            pending.scatter_reduce_(
+                0,
+                req_pool_indices.clamp(min=0).long(),
+                torch.where(valid, seq_lens, -1).long(),
+                reduce="amax",
+                include_self=True,
+            )
+            return
         head_dim = self._head_dim()
         state_dtype = self._state_dtype()
         if head_dim is None or state_dtype is None or self._num_verify_tokens() == 0:
@@ -96,6 +131,10 @@ class OnlineC128MTPController:
 
     def clear(self) -> None:
         self._verify_ctx = None
+        if self._ragged_verify and self.enabled():
+            self.backend.token_to_kv_pool.get_online_c128_mtp_pending_seq_lens().fill_(
+                -1
+            )
 
     def prepare_forward(
         self,
@@ -104,6 +143,7 @@ class OnlineC128MTPController:
         seq_lens: torch.Tensor,
         *,
         verify_bs: Optional[int] = None,
+        verify_lens: Optional[torch.Tensor] = None,
     ) -> int:
         if not self.enabled():
             self.clear()
@@ -126,6 +166,7 @@ class OnlineC128MTPController:
         self.commit_pending(
             req_pool_indices=active_req_pool_indices,
             seq_lens=active_seq_lens,
+            force=verify_lens is not None,
         )
         if not logical_forward_mode.is_target_verify():
             return 0
@@ -133,6 +174,7 @@ class OnlineC128MTPController:
         self.begin_verify(
             req_pool_indices=active_req_pool_indices,
             seq_lens=active_seq_lens,
+            verify_lens=verify_lens,
         )
         return self.state_slot_offset()
 
@@ -162,6 +204,21 @@ class OnlineC128MTPController:
         head_dim = compressor.head_dim
         state_pool = token_to_kv_pool.get_attention_compress_states(layer_id)
         state = state_pool.kv_score_buffer.kv_score
+        if ctx.verify_lens is not None:
+            from sglang.kernels.ops.attention.dsv4.online_c128_ragged import (
+                write_ragged_prefix_states,
+            )
+
+            write_ragged_prefix_states(
+                kv_score_input,
+                ctx.seq_lens,
+                ctx.req_pool_indices,
+                ctx.verify_lens,
+                compressor.ape.reshape(128, head_dim),
+                state,
+                state_pool.online_mtp_state_slot_offset,
+            )
+            return
         total_bs = kv_score_input.numel() // (num_verify_tokens * head_dim * 2)
         layer_bs = min(ctx.seq_lens.shape[0], ctx.req_pool_indices.shape[0], total_bs)
         if layer_bs <= 0:
@@ -185,8 +242,9 @@ class OnlineC128MTPController:
         self,
         req_pool_indices: torch.Tensor,
         seq_lens: torch.Tensor,
+        force: bool = False,
     ) -> None:
-        if self._verify_ctx is None:
+        if self._verify_ctx is None and not force:
             return
         if not self.enabled():
             self.clear()
@@ -205,6 +263,20 @@ class OnlineC128MTPController:
         cur_bs = min(seq_lens.shape[0], req_pool_indices.shape[0])
 
         for runtime in self._iter_layer_runtimes():
+            if self._ragged_verify:
+                from sglang.kernels.ops.attention.dsv4.online_c128_ragged import (
+                    commit_ragged_pending,
+                )
+
+                commit_ragged_pending(
+                    seq_lens,
+                    req_pool_indices,
+                    pending_seq_lens,
+                    runtime.main_state,
+                    num_verify_tokens,
+                    runtime.state_slot_offset,
+                )
+                continue
             _jit_online_c128_mtp_module(
                 runtime.head_dim,
                 seq_lens.dtype,

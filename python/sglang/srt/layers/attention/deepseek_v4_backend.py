@@ -1275,7 +1275,10 @@ class DeepseekV4AttnBackend(
                 "DSV4 ragged verify does not support context parallel (CP); "
                 "set SGLANG_RAGGED_VERIFY_MODE off for CP runs."
             )
-        if self.online_c128_mtp.enabled():
+        if (
+            self.online_c128_mtp.enabled()
+            and getattr(forward_batch, "conditional_verify_lens", None) is None
+        ):
             raise NotImplementedError(
                 "DSV4 ragged verify does not support online c128 MTP; "
                 "set SGLANG_RAGGED_VERIFY_MODE off or disable online compress."
@@ -1304,9 +1307,26 @@ class DeepseekV4AttnBackend(
         extend_seq_lens: torch.Tensor,
         use_prefill_cuda_graph: bool,
         online_c128_state_slot_offset: int,
+        online_verify_lens: Optional[torch.Tensor] = None,
+        graph_num_tokens: Optional[int] = None,
     ) -> Optional[FusedCompressMetadata]:
         if not self.has_c128 or not self.online_c128_mtp.enabled():
             return None
+
+        if online_verify_lens is not None:
+            from sglang.kernels.ops.attention.dsv4.compress import CompressorPrefillPlan
+            from sglang.kernels.ops.attention.dsv4.online_c128_ragged import (
+                plan_online_verify,
+            )
+
+            plan_c, plan_w = plan_online_verify(
+                seq_lens,
+                online_verify_lens,
+                req_pool_indices,
+                graph_num_tokens,
+                online_c128_state_slot_offset,
+            )
+            return CompressorPrefillPlan(128, plan_c, plan_w)
 
         assert seq_lens_cpu is not None
         num_draft_tokens = self.speculative_num_draft_tokens
@@ -1951,10 +1971,11 @@ class DeepseekV4AttnBackend(
         use_prefill_cuda_graph: bool = False,
         online_c128_state_slot_offset: int = 0,
         ragged_layout: Optional[RaggedVerifyLayout] = None,
+        online_verify_lens: Optional[torch.Tensor] = None,
     ) -> Union[DSV4Metadata, DSV4RawVerifyMetadata]:
         assert out_cache_loc is not None
         bs = len(seq_lens)
-        if self.needs_cpu_seq_lens:
+        if self.needs_cpu_seq_lens and online_verify_lens is None:
             assert seq_lens_cpu is not None
             seq_lens_cpu_list = seq_lens_cpu.tolist()
         else:
@@ -1986,6 +2007,8 @@ class DeepseekV4AttnBackend(
                 extend_seq_lens,
                 use_prefill_cuda_graph,
                 online_c128_state_slot_offset,
+                online_verify_lens=online_verify_lens,
+                graph_num_tokens=total_verify_tokens,
             ),
             extend_start_loc=extend_start_loc,
             verify_lens=verify_lens,
@@ -2364,6 +2387,9 @@ class DeepseekV4AttnBackend(
         req_pool_indices = forward_batch.req_pool_indices
         seq_lens = forward_batch.seq_lens
         uses_cpu_seq_lens = self.needs_cpu_seq_lens or self.is_dspark_draft
+        online_verify_lens = getattr(forward_batch, "conditional_verify_lens", None)
+        if online_verify_lens is not None:
+            uses_cpu_seq_lens = False
 
         if in_capture:
             # Captured graph does no real cache writes, so synthesize a dummy
@@ -2493,9 +2519,14 @@ class DeepseekV4AttnBackend(
             )
             online_c128_state_slot_offset = self.online_c128_mtp.prepare_forward(
                 actual_forward_mode,
-                req_pool_indices,
+                (
+                    torch.where(online_verify_lens > 0, req_pool_indices, -1)
+                    if online_verify_lens is not None
+                    else req_pool_indices
+                ),
                 seq_lens,
                 verify_bs=verify_bs,
+                verify_lens=online_verify_lens,
             )
             temp_metadata = self.init_forward_metadata_target_verify(
                 max_seq_len=chosen_max_seq_len,
@@ -2506,6 +2537,7 @@ class DeepseekV4AttnBackend(
                 use_prefill_cuda_graph=True,
                 online_c128_state_slot_offset=online_c128_state_slot_offset,
                 ragged_layout=ragged_layout,
+                online_verify_lens=online_verify_lens,
             )
         elif bucket == _GraphBucket.DRAFT_EXTEND:
             self.online_c128_mtp.prepare_forward(

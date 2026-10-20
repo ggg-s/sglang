@@ -30,6 +30,24 @@ def register():
         "sglang.srt.speculative.standalone_worker_v2.StandaloneDraftWorker.__init__",
     ):
         HookRegistry.register(path, _attach, HookType.AFTER)
+    from hybrid_spec.integrations.sglang import dspark
+
+    dspark_worker = (
+        "sglang.srt.speculative.dspark_components.dspark_worker_v2.DSparkWorkerV2"
+    )
+    for method, hook, kind in (
+        ("__init__", dspark.attach, HookType.AFTER),
+        ("_forward_prefill", _prefill, HookType.AROUND),
+        ("_forward_decode", dspark.decode, HookType.AROUND),
+        ("note_request_finished", _finished, HookType.AFTER),
+        ("clear_cache_pool", _reset, HookType.AFTER),
+    ):
+        HookRegistry.register(f"{dspark_worker}.{method}", hook, kind)
+    HookRegistry.register(
+        "sglang.srt.speculative.dspark_components.dspark_draft.DraftBlockProposer.propose",
+        dspark.splice_proposal,
+        HookType.AFTER,
+    )
     HookRegistry.register(
         "sglang.srt.speculative.eagle_worker_v2.EagleDraftWorker.draft",
         _begin_draft,
@@ -44,6 +62,11 @@ def register():
         "sglang.srt.model_executor.runner.decode_cuda_graph_runner."
         "DecodeCudaGraphRunner._build_ragged_verify_token_buckets",
         _verify_token_buckets,
+        HookType.AFTER,
+    )
+    HookRegistry.register(
+        "sglang.srt.model_executor.runner_backend.utils.resolve_decode_backend",
+        _target_graph_backend,
         HookType.AFTER,
     )
     HookRegistry.register(
@@ -175,13 +198,25 @@ def _attach(result, worker, *args, **kwargs):
             "split draft graphs require the worker and Graph split API v5"
         )
     tp_group = get_tp_group()
+    if config.conditional_draft_graph:
+        from sglang.srt.distributed.parallel_state import (
+            prepare_conditional_graph_communicators,
+        )
+
+        # NCCL allocates device resources. Reserve them before the scheduler
+        # budgets KV, not during capture after KV has consumed the free memory.
+        prepare_conditional_graph_communicators()
     communicator = None
     if tp_group.world_size > 1:
         communicator = tp_group.pynccl_comm
         if communicator is None or not communicator.available:
             raise ValueError("hybrid-spec TP requires SGLang's PyNccl communicator")
     tp_sync = (
-        TPSynchronizer(tp_group.device_group, communicator)
+        TPSynchronizer(
+            tp_group.device_group,
+            communicator,
+            group_coordinator=tp_group if config.conditional_draft_graph else None,
+        )
         if tp_group.world_size > 1
         else None
     )
@@ -232,17 +267,24 @@ def _attach(result, worker, *args, **kwargs):
         GPUSuffixAutomaton.load_module()
 
 
+def _extension(worker):
+    direct = getattr(worker, "draft_extension", None)
+    if direct is not None:
+        return direct
+    return getattr(getattr(worker, "draft_worker", None), "draft_extension", None)
+
+
 def _finished(result, worker, *, rid, natural_stop):
-    draft = worker.draft_worker
-    if draft is not None and draft.draft_extension is not None:
-        draft.draft_extension.close_request(rid, retain=True)
+    extension = _extension(worker)
+    if extension is not None:
+        extension.close_request(rid, retain=True)
 
 
 def _reset(result, worker, *args, **kwargs):
-    draft = worker.draft_worker
-    if draft is not None and draft.draft_extension is not None:
-        draft.draft_extension.reset()
-        draft.draft_extension.dynamic_verify = None
+    extension = _extension(worker)
+    if extension is not None:
+        extension.reset()
+        extension.dynamic_verify = None
 
 
 def _verify(result, worker, *args, **kwargs):
@@ -264,7 +306,8 @@ def _verify(result, worker, *args, **kwargs):
             if not batch.forward_mode.is_idle():
                 if result.can_run_cuda_graph:
                     graph = worker.target_worker.model_runner.decode_cuda_graph_runner
-                    dynamic.graph_tokens = graph._ragged_graph_size
+                    if not extension.config.conditional_verify_graph:
+                        dynamic.graph_tokens = graph._ragged_graph_size
                 else:
                     dynamic.discard_verify_timing()
                 dynamic.feedback(result.accept_lens)
@@ -275,7 +318,7 @@ def _verify(result, worker, *args, **kwargs):
 
 
 def _prefill(original, worker, batch, *args, **kwargs):
-    extension = getattr(worker.draft_worker, "draft_extension", None)
+    extension = _extension(worker)
     if getattr(extension, "dynamic_verify", None) is not None:
         extension.dynamic_verify.discard_timing()
     if extension is None or not hasattr(extension, "begin_prefill"):
@@ -292,14 +335,14 @@ def _prefill(original, worker, batch, *args, **kwargs):
 
 def _diagnostics(result, controller, *args, **kwargs):
     worker = controller.scheduler.draft_worker
-    draft = getattr(worker, "draft_worker", None)
-    extension = getattr(draft, "draft_extension", None)
+    extension = _extension(worker)
     if extension is not None:
         # Explicit diagnostic readback only; never synchronize each decode step.
         result.internal_state["hybrid_spec"] = extension.metrics.snapshot()
         if hasattr(extension, "compact_verify_counters"):
+            counters = extension.compact_verify_counters
             result.internal_state["hybrid_spec_compact_verify"] = dict(
-                extension.compact_verify_counters
+                counters.snapshot() if hasattr(counters, "snapshot") else counters
             )
         if hasattr(extension, "split_graph_counters"):
             snapshot = getattr(extension, "split_graph_snapshot", None)
@@ -317,8 +360,7 @@ def _diagnostics(result, controller, *args, **kwargs):
 def _profile_update_handlers(result, controller):
     """Expose calibration commands only on an explicitly dedicated profile server."""
     worker = getattr(controller.scheduler, "draft_worker", None)
-    draft = getattr(worker, "draft_worker", None)
-    extension = getattr(draft, "draft_extension", None)
+    extension = _extension(worker)
     if extension is None or not extension.config.dynamic_verify_profile:
         return result
     from sglang.srt.managers.scheduler_components.internal_state import (
@@ -386,6 +428,19 @@ def _verify_token_buckets(result, runner):
             gathered_buffer_required=runner.require_gathered_buffer,
         )
         return token_buckets(config, result, runner.max_bs, alignment)
+
+
+def _target_graph_backend(result, cuda_graph_runner):
+    config = _config()
+    if (
+        config.conditional_verify_graph
+        and not cuda_graph_runner.model_runner.is_draft_worker
+    ):
+        from hybrid_spec.integrations.sglang.conditional_verify import (
+            ConditionalVerifyBackend,
+        )
+
+        return ConditionalVerifyBackend(result, cuda_graph_runner)
 
 
 def _begin_draft(worker, batch, **kwargs):

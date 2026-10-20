@@ -437,7 +437,13 @@ class DSparkWorkerV2(BaseSpecWorker):
 
     @property
     def carries_confidence(self) -> bool:
-        return self._hosts_draft and self._verify_planner.carries_confidence
+        # Extension proposals may replace tokens that the neural confidence
+        # head scored. Do not reserve/publish stale confidence through FutureMap.
+        return (
+            getattr(self, "draft_extension", None) is None
+            and self._hosts_draft
+            and self._verify_planner.carries_confidence
+        )
 
     @property
     def spec_v2_attn_backends(self) -> tuple:

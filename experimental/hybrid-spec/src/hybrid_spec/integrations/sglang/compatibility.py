@@ -16,7 +16,6 @@ def validate_config(config, cfg):
         "nnodes": 1,
         "enable_torch_compile": False,
         "speculative_eagle_topk": 1,
-        "speculative_num_steps": config.num_drafts,
         "speculative_num_draft_tokens": config.num_drafts + 1,
         "enable_mixed_chunk": False,
         "enable_multi_layer_eagle": False,
@@ -24,6 +23,19 @@ def validate_config(config, cfg):
         "disaggregation_mode": "null",
         "decoupled_spec_role": "null",
     }
+    dspark = cfg.speculative_algorithm == "DSPARK"
+    if not dspark:
+        required["speculative_num_steps"] = config.num_drafts
+    elif (
+        config.backend != "gpu_sa"
+        or config.history_mode != "device"
+        or config.draft_graph_mode != "full"
+        or config.verify_mode != "static"
+        or config.dynamic_verify
+    ):
+        errors.append(
+            "DSPARK SA requires gpu_sa, device history, full draft and static verify"
+        )
     for name, expected in required.items():
         if getattr(cfg, name, None) != expected:
             errors.append(f"{name}={expected!r} required")
@@ -69,12 +81,42 @@ def validate_config(config, cfg):
         and cfg.chunked_prefill_size not in (None, -1)
     ):
         errors.append("CPU history requires chunked_prefill_size=-1")
-    if cfg.speculative_algorithm not in ("EAGLE", "EAGLE3", "STANDALONE"):
-        errors.append("only ordinary EAGLE/MTP, EAGLE3 and STANDALONE are wired")
+    if cfg.speculative_algorithm not in ("EAGLE", "EAGLE3", "STANDALONE", "DSPARK"):
+        errors.append("only EAGLE/MTP, EAGLE3, STANDALONE and DSPARK are wired")
     if config.backend not in ("gpu_sa", "arctic"):
         errors.append("reference backend is test-only")
     if errors:
         raise ValueError("hybrid-spec unsupported configuration: " + "; ".join(errors))
+
+
+def validate_dspark_model(worker, config):
+    from sglang.srt.configs.hybrid_arch import mambaish_config
+
+    if worker.gamma != config.num_drafts:
+        raise ValueError("DSPARK gamma must equal hybrid-spec num_drafts")
+    if worker._verify_planner.mode_value != "static":
+        raise ValueError("DSPARK SA requires SGLANG_RAGGED_VERIFY_MODE=static")
+    for model in (
+        worker.target_worker.model_runner.model_config,
+        worker.draft_model_runner.model_config,
+    ):
+        architectures = getattr(model.hf_config, "architectures", [])
+        dsv4 = architectures in (
+            ["DeepseekV4ForCausalLM"],
+            ["DeepseekV4ForCausalLMDSpark"],
+        )
+        if (
+            model.model_is_mrope
+            or (
+                model.is_multimodal
+                and not getattr(model.hf_config, "language_only", False)
+            )
+            or mambaish_config(model) is not None
+            or (getattr(model, "is_hybrid_swa", False) and not dsv4)
+        ):
+            raise ValueError(
+                "DSPARK SA currently requires text-only full attention or DSV4"
+            )
 
 
 def validate_model(worker, config=None):

@@ -39,6 +39,7 @@ class HybridConfig:
     conditional_draft_graph: bool = False
     conditional_draft_graph_dispatch: str = "if"
     conditional_draft_graph_joined: bool = False
+    conditional_verify_graph: bool = False
 
     def __post_init__(self):
         for name in (
@@ -84,6 +85,13 @@ class HybridConfig:
             raise ValueError("conditional_draft_graph_joined requires SWITCH dispatch")
         if self.verify_mode not in ("static", "padded", "compact"):
             raise ValueError("verify_mode must be static, padded or compact")
+        if type(self.conditional_verify_graph) is not bool or (
+            self.conditional_verify_graph
+            and (self.verify_mode != "compact" or not self.conditional_draft_graph)
+        ):
+            raise ValueError(
+                "conditional_verify_graph requires compact verify and conditional_draft_graph"
+            )
         neural = self.neural_drafts
         if type(neural) is not int or not 1 <= neural <= self.num_drafts:
             raise ValueError("num_neural_drafts must be between 1 and num_drafts")
