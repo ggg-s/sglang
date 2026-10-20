@@ -13,6 +13,22 @@ import msgspec
 import torch
 
 
+class _SplitProposalBuffers:
+    """Worker-owned scratch; static verification consumes it before the next step."""
+
+    def __init__(self, max_bs, num_drafts, device, mask_token_id):
+        device = torch.device(device)
+        self.use_retrieval_cpu = torch.empty(
+            max_bs, dtype=torch.bool, pin_memory=device.type == "cuda"
+        )
+        self.tokens = torch.empty(
+            (max_bs, num_drafts), dtype=torch.int64, device=device
+        )
+        self.block_ids = torch.full_like(self.tokens, mask_token_id)
+        self.greedy_mask = torch.ones(max_bs, dtype=torch.bool, device=device)
+        self.temperatures = torch.ones(max_bs, device=device)
+
+
 def attach(result, worker, *args, **kwargs):
     from sglang.srt.distributed.parallel_state import get_tp_group
 
@@ -40,6 +56,12 @@ def attach(result, worker, *args, **kwargs):
     )
     worker._proposer._hybrid_spec_extension = worker.draft_extension
     if config.draft_graph_mode == "split":
+        worker.draft_extension.dspark_split_buffers = _SplitProposalBuffers(
+            config.max_requests,
+            config.num_drafts,
+            worker.draft_extension.backend.device,
+            worker._proposer._mask_token_id,
+        )
         worker.draft_extension.dspark_draft_counters = {
             "proposal_ct": 0,
             "request_ct": 0,
@@ -60,11 +82,15 @@ def propose(original, proposer, **kwargs):
     # All TP ranks agree on candidates before any rank skips a collective.
     view = extension.pending_view
     view._synchronize()
-    rows = (~view.use_retrieval).nonzero(as_tuple=True)[0]
-    # Native draft attention still consumes CPU per-request lengths. Keep one
-    # ordered row readback; do not mutate/filter the scheduler's shared batch.
-    rows_cpu = rows.cpu()
-    bs, num_neural = kwargs["bs"], rows.numel()
+    buffers = extension.dspark_split_buffers
+    bs = kwargs["bs"]
+    # CUDA nonzero first synchronizes to size its output, then rows.cpu() must
+    # synchronize again for nonempty rows. Read one fixed-size mask instead;
+    # host dispatch and native CPU length metadata still require this one wait.
+    use_retrieval_cpu = buffers.use_retrieval_cpu[:bs]
+    use_retrieval_cpu.copy_(view.use_retrieval)
+    neural_rows = [i for i, hit in enumerate(use_retrieval_cpu.tolist()) if not hit]
+    num_neural = len(neural_rows)
     counters = extension.dspark_draft_counters
     counters["proposal_ct"] += 1
     counters["request_ct"] += bs
@@ -81,20 +107,27 @@ def propose(original, proposer, **kwargs):
         DraftProposal,
     )
 
-    tokens = view.tokens.clone()
+    # All-SA output can borrow the query buffer: native static verification
+    # reads it without modification, and feedback finishes before the next query.
+    tokens = view.tokens
     if num_neural:
+        # Only a mixed batch needs indices or any proposal-row packing.
+        rows_cpu = torch.tensor(neural_rows, dtype=torch.int64)
+        rows = rows_cpu.to(tokens.device, non_blocking=True)
+        tokens = buffers.tokens[:bs]
+        tokens.copy_(view.tokens)
         compact = _select_proposal_rows(kwargs, rows, rows_cpu)
         neural = original(proposer, **compact)
         tokens.index_copy_(0, rows, neural.draft_block.draft_tokens)
-    block_ids = torch.full_like(tokens, proposer._mask_token_id)
+    block_ids = buffers.block_ids[:bs]
     block_ids[:, 0].copy_(kwargs["draft_input"].bonus_tokens.reshape(-1))
     return DraftProposal(
         draft_block_ids=block_ids,
         draft_block=DraftBlockResult(
             draft_tokens=tokens,
             corrected_logits=None,
-            greedy_mask=torch.ones(bs, dtype=torch.bool, device=tokens.device),
-            temperatures=torch.ones(bs, device=tokens.device),
+            greedy_mask=buffers.greedy_mask[:bs],
+            temperatures=buffers.temperatures[:bs],
             greedy_draft=True,
         ),
         # A compact folded sampler writes its first N rows, not the original

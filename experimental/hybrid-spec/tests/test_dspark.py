@@ -18,6 +18,7 @@ from hybrid_spec.integrations.sglang.compatibility import (
     validate_dspark_model,
 )
 from hybrid_spec.integrations.sglang.dspark import (
+    _SplitProposalBuffers,
     decode,
     propose,
     splice_proposal,
@@ -376,6 +377,7 @@ def test_split_runs_only_neural_rows_through_native_proposer(
         config=config(draft_graph_mode="split"),
         pending_view=view,
         dspark_draft_counters=counters,
+        dspark_split_buffers=_SplitProposalBuffers(bs, gamma, device, 0),
     )
     proposer = SimpleNamespace(
         _hybrid_spec_extension=extension,
@@ -467,6 +469,85 @@ def test_split_runs_only_neural_rows_through_native_proposer(
         skip_request_ct=12,
         all_sa_ct=1,
         mixed_ct=3,
+    )
+
+
+@pytest.mark.parametrize("device", ["cpu", "cuda"])
+def test_single_request_split_reuses_buffers_across_hit_miss_transitions(
+    monkeypatch, device
+):
+    """Row 0 is a real miss; scratch reuse must not retain stale SA/anchor data."""
+    if device == "cuda" and not torch.cuda.is_available():
+        pytest.skip("CUDA required")
+    module_name = "sglang.srt.speculative.dspark_components.dspark_draft"
+    dto_module = ModuleType(module_name)
+    dto_module.DraftBlockResult, dto_module.DraftProposal = Block, Proposal
+    monkeypatch.setitem(sys.modules, module_name, dto_module)
+    buffers = _SplitProposalBuffers(4, 3, device, 0)
+    view = GatedOverride(
+        torch.empty((1, 3), dtype=torch.int64, device=device),
+        torch.empty(1, dtype=torch.bool, device=device),
+    )
+    counters = dict.fromkeys(
+        (
+            "proposal_ct",
+            "request_ct",
+            "neural_request_ct",
+            "skip_request_ct",
+            "all_sa_ct",
+            "mixed_ct",
+        ),
+        0,
+    )
+    extension = SimpleNamespace(
+        config=config(draft_graph_mode="split"),
+        pending_view=view,
+        dspark_draft_counters=counters,
+        dspark_split_buffers=buffers,
+    )
+    proposer = SimpleNamespace(_hybrid_spec_extension=extension)
+    neural_calls = []
+
+    def original(proposer, **kwargs):
+        neural_calls.append(kwargs["bs"])
+        return make_proposal(torch.tensor([[1, 2, 3]], device=device))
+
+    for step, hit in enumerate([True, False, True, False, True]):
+        view.use_retrieval.fill_(hit)
+        view.tokens.fill_(step + 10)
+        before = view.tokens.clone()
+        result = propose(
+            original,
+            proposer,
+            bs=1,
+            draft_input=SimpleNamespace(
+                bonus_tokens=torch.tensor([step], device=device)
+            ),
+        )
+        expected = [[step + 10] * 3] if hit else [[1, 2, 3]]
+        assert result.draft_block.draft_tokens.tolist() == expected
+        assert result.folded == (not hit)
+        assert torch.equal(view.tokens, before)
+        if hit:
+            assert result.draft_block.draft_tokens.data_ptr() == view.tokens.data_ptr()
+            assert result.draft_block_ids.data_ptr() == buffers.block_ids.data_ptr()
+            assert (
+                result.draft_block.greedy_mask.data_ptr()
+                == buffers.greedy_mask.data_ptr()
+            )
+            assert (
+                result.draft_block.temperatures.data_ptr()
+                == buffers.temperatures.data_ptr()
+            )
+            assert result.draft_block_ids.tolist() == [[step, 0, 0]]
+    assert neural_calls == [1, 1]
+    assert counters == dict(
+        proposal_ct=5,
+        request_ct=5,
+        neural_request_ct=2,
+        skip_request_ct=3,
+        all_sa_ct=3,
+        mixed_ct=0,
     )
 
 
@@ -592,6 +673,7 @@ def test_native_decode_uses_sa_and_preserves_verify_commit_order(monkeypatch, mo
         dto_module.DraftBlockResult, dto_module.DraftProposal = Block, Proposal
         monkeypatch.setitem(sys.modules, module_name, dto_module)
         extension.config = config(draft_graph_mode="split")
+        extension.dspark_split_buffers = _SplitProposalBuffers(2, 3, "cpu", 0)
         extension.dspark_draft_counters = dict.fromkeys(
             (
                 "proposal_ct",

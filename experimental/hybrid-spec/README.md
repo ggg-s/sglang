@@ -127,9 +127,11 @@ Mamba/mRoPE target 暂拒绝。SA 替换后清除 neural confidence，关闭对�
 FutureMap confidence 携带；DSPARK 自带的 confidence 裁剪、compact/padded verify、
 条件图、gate≥1 split 和动态预算暂不与此路径混用。
 
-split 第一版使用 GPU nonzero 生成行号并回读，以筛选原生 CPU 长度元数据，
-存在同步和动态分配；不属于 conditional graph 的无中间读回路径。有 SA 行时，
-合并输出使用独立缓冲，不消费本轮 folded accept/commit 的结果，走原生非 folded 验收和提交；
+split 使用预分配的 pinned CPU mask 缓冲，一次固定长度回读后在 CPU 决定分支；
+仅混合批次生成并上传 neural 行号以筛选原生 CPU 长度元数据。仍有一次 host 等待，
+不属于 conditional graph 的无中间读回路径。全 SA 直接借用查询候选；混合批复用
+合并候选缓冲，两者均复用 anchor 和采样元数据缓冲。有 SA 行时，
+不消费本轮 folded accept/commit 的结果，走原生非 folded 验收和提交；
 neural 子批仍可使用原生 draft CUDA Graph。压缩 KV 计划保留物理写入 id，重新构建
 所选行的读表，不修改 target 的原计划或共享请求/采样状态。
 `hybrid_spec_dspark_draft` 诊断累计 proposal、总行数、neural 行数、skip 行数、
@@ -139,6 +141,7 @@ full 的收益仍只能来自候选接受长度；split 可以减少 neural prop
 尚未证明端到端加速。组件验证不等同于真实 DSPARK 模型或多卡验收。
 原接线见 [短回归记录](validation/conditional-dspark-20261020/README.md)，
 gate=0 split 的实现与验证见 [新增短回归](validation/dspark-g0-split-20261020/README.md)。
+减少分支同步和临时分配的变更见 [split 调度优化](validation/dspark-split-overhead-20261020/README.md)。
 
 ## Arctic Suffix 可选后端
 
