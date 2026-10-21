@@ -13,5 +13,7 @@
   "arctic_max_tree_depth": 64,
   "arctic_max_spec_factor": 2.0,
   "arctic_max_spec_offset": 0.0,
-  "arctic_min_token_prob": 0.1
+  "arctic_min_token_prob": 0.1,
+  "verify_mode": "compact",
+  "dynamic_verify": false
 }

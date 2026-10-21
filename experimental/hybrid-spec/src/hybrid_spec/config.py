@@ -27,7 +27,7 @@ class HybridConfig:
     arctic_max_spec_offset: float = 0.0
     arctic_min_token_prob: float = 0.1
     num_neural_drafts: int | None = None
-    verify_mode: str = "static"
+    verify_mode: str = "compact"
     verify_token_buckets: tuple[int, ...] = ()
     dynamic_verify: bool = False
     dynamic_verify_min_samples: int = 32

@@ -10,5 +10,7 @@
   "draft_graph_mode": "split",
   "enable_global_pool": true,
   "max_shared_requests": 16,
-  "shared_context_tokens": 128
+  "shared_context_tokens": 128,
+  "verify_mode": "compact",
+  "dynamic_verify": false
 }

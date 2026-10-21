@@ -41,11 +41,12 @@ def text_draft(history, context, k, policy):
     return result, length
 
 
-def test_default_configuration_and_model_templates_use_split_gate_one():
+def test_default_configuration_and_model_templates_use_fixed_compact_split_gate_one():
     config = HybridConfig(3, 2, 4, 128)
     assert (config.history_mode, config.draft_graph_mode) == ("device", "split")
     assert config.num_neural_gate_tokens == 1
     assert config.sa_continuation_policy == "frequency"
+    assert (config.verify_mode, config.dynamic_verify) == ("compact", False)
     directory = Path(__file__).resolve().parents[1] / "configs"
     for path in directory.glob("*.json"):
         config = HybridConfig.from_file(path)
@@ -56,6 +57,15 @@ def test_default_configuration_and_model_templates_use_split_gate_one():
         ):
             continue
         assert (config.draft_graph_mode, config.num_neural_gate_tokens) == ("split", 1)
+        if path.name.startswith("device-qwen35-"):
+            assert config.verify_mode == "static"
+        elif path.name == "device-dsv4-mtp-padded-verify.json":
+            assert config.verify_mode == "padded"
+        else:
+            assert config.verify_mode == "compact"
+        assert config.dynamic_verify == (
+            path.name == "device-dsv4-mtp-dynamic-verify.json"
+        )
     with pytest.raises(ValueError, match="sa_continuation_policy"):
         HybridConfig(3, 2, 4, 128, sa_continuation_policy="unknown")
 

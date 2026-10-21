@@ -826,8 +826,8 @@ def test_source_lengths_config_and_token_grid(neural, gate):
         {"num_neural_drafts": True},
         {"verify_mode": "unknown"},
         {"verify_token_buckets": [0]},
-        {"num_neural_drafts": 3},
-        {"verify_token_buckets": [4]},
+        {"num_neural_drafts": 3, "verify_mode": "static"},
+        {"verify_token_buckets": [4], "verify_mode": "static"},
     ],
 )
 def test_invalid_budgets_fail_before_cuda(kwargs):

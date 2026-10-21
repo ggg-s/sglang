@@ -7,5 +7,6 @@
   "history_mode": "device",
   "partial_drafts": "fallback",
   "num_neural_gate_tokens": 1,
-  "draft_graph_mode": "split"
+  "draft_graph_mode": "split",
+  "verify_mode": "static"
 }

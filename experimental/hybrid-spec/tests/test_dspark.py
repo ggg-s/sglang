@@ -70,6 +70,7 @@ def config(**kwargs):
                 "history_mode": "device",
                 "draft_graph_mode": "full",
                 "num_neural_gate_tokens": 0,
+                "verify_mode": "static",
             }
             | kwargs
         ),

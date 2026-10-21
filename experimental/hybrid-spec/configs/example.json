@@ -6,5 +6,7 @@
   "backend": "gpu_sa",
   "draft_graph_mode": "split",
   "num_neural_gate_tokens": 1,
-  "history_mode": "device"
+  "history_mode": "device",
+  "verify_mode": "compact",
+  "dynamic_verify": false
 }

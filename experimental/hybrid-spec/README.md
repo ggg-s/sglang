@@ -13,7 +13,7 @@
 统一从 target 验证反馈估计接受率，结合实际 CUDA Graph 档位耗时选择每请求验证长度。
 保留 gate、split 和原草稿上限，默认不改变已有固定长度行为。
 
-本目录实现 [DESIGN.md](DESIGN.md) 的固定长度、请求级来源选择。默认 `draft_graph_mode="split"`、gate=1，检查首个 neural 候选后，跳过 SA 命中请求的 neural 尾段，使用 GPU 动态行号压缩，不限定 batch≤4。显式 `full` 对照仍执行完整 neural 起草并使用请求级来源 mask。
+本目录实现 [DESIGN.md](DESIGN.md) 的固定长度、请求级来源选择。默认使用 fixed compact：`verify_mode="compact"`、`dynamic_verify=false`，配合 `draft_graph_mode="split"`、gate=1。候选长度固定；检查首个 neural 候选后，跳过 SA 命中请求的 neural 尾段，使用 GPU 动态行号压缩，不限定 batch≤4。显式 `full` 对照仍执行完整 neural 起草并使用请求级来源 mask。Qwen3.5/3.6 MTP 的 Mamba/mRoPE 路径及 DSPARK 暂不支持 compact，其专用模板显式保留 `verify_mode="static"`。
 
 当前优化、执行流程、配置区别、A100 性能结论和未实现项见 [OPTIMIZATIONS.md](OPTIMIZATIONS.md)。SA 独立按请求存储；device 模式可显式开启跨活跃请求和完成请求的全局检索池。CPU 语义测试与 CUDA/真实模型验收是不同层次；详细验证记录见 [VALIDATION.md](VALIDATION.md)。未测模型不得视为已支持。
 
@@ -171,10 +171,12 @@ verify 或原生 score 驱动混合策略。Arctic 不创建 GPU SA 池，需安
 并选 `verify_mode=padded` 或 `compact`。服务参数仍按最大窗口设置：
 SA=8 / neural=3 对应 `--speculative-num-steps 8 --speculative-num-draft-tokens 9`。
 
-- `static`：原来的等长路径，默认值。
+- `static`：原来的等长路径，可显式用于对照或不支持 compact 的模型。
 - `padded`：SA / neural 按各自长度截断接受链，target 仍计算完整窗口，作为归因对照。
-- `compact`：相同候选策略，将有效 token、位置和 KV 写入列打包后运行 target；
+- `compact`：默认值；相同候选策略，将有效 token、位置和 KV 写入列打包后运行 target；
   logits / hidden states 映射回原槽位，再交给原生接受、KV 提交和 draft-extend。
+
+默认 `dynamic_verify=false`，即 fixed compact；只有显式开启才动态选择验证长度。
 
 `num_neural_gate_tokens` 可独立设置为 0…SA 长度。gate=3、neural=2 时，
 先探测三个 neural token 来决定来源；若回退，只验证两个 draft 加 anchor，

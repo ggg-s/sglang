@@ -12,5 +12,6 @@
   "max_shared_requests": 16,
   "shared_context_tokens": 128,
   "num_neural_drafts": 3,
-  "verify_mode": "compact"
+  "verify_mode": "compact",
+  "dynamic_verify": false
 }
