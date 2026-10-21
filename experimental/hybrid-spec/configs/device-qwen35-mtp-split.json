@@ -8,5 +8,6 @@
   "partial_drafts": "fallback",
   "num_neural_gate_tokens": 1,
   "draft_graph_mode": "split",
-  "verify_mode": "static"
+  "verify_mode": "compact",
+  "dynamic_verify": false
 }

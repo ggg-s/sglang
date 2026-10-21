@@ -33,9 +33,14 @@ def prepare_compact_verify(verify_input, batch, target_worker):
 
     if verify_input.topk != 1 or verify_input.kv_loc_plan is None:
         raise ValueError("compact EAGLE verify requires a planned topk=1 chain")
-    if batch.mamba_track_indices is not None or batch.hisparse_coordinator is not None:
-        raise ValueError("compact EAGLE verify does not support Mamba or HiSparse")
+    if batch.hisparse_coordinator is not None:
+        raise ValueError("compact EAGLE verify does not support HiSparse")
     runner = target_worker.model_runner
+    if (
+        batch.mamba_track_indices is not None
+        and not runner.attn_backend.supports_ragged_verify_graph
+    ):
+        raise ValueError("compact Mamba verify requires a ragged-capable backend")
     dense = verify_input.draft_token.view(-1, verify_input.draft_token_num)
     layout = verify_input.compact_verify_layout
     window = BuildRaggedVerifyWindow.execute(
@@ -73,6 +78,17 @@ def prepare_compact_verify(verify_input, batch, target_worker):
     forward_batch, can_run_graph = packed.prepare_for_verify(
         packed_batch, target_worker
     )
+    # prepare_for_verify refreshes tracking on its private packed batch. Native
+    # acceptance commits against the original batch and needs the same plan.
+    for name in (
+        "mamba_track_indices",
+        "mamba_track_mask",
+        "mamba_track_seqlens",
+        "mamba_prefill_track_mask_cpu",
+        "mamba_track_seqlens_cpu",
+    ):
+        if hasattr(packed_batch, name):
+            setattr(batch, name, getattr(packed_batch, name))
     if can_run_graph:
         forward_batch.mark_forward_metadata_ready()
     return forward_batch, can_run_graph

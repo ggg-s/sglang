@@ -57,9 +57,7 @@ def test_default_configuration_and_model_templates_use_fixed_compact_split_gate_
         ):
             continue
         assert (config.draft_graph_mode, config.num_neural_gate_tokens) == ("split", 1)
-        if path.name.startswith("device-qwen35-"):
-            assert config.verify_mode == "static"
-        elif path.name == "device-dsv4-mtp-padded-verify.json":
+        if path.name == "device-dsv4-mtp-padded-verify.json":
             assert config.verify_mode == "padded"
         else:
             assert config.verify_mode == "compact"

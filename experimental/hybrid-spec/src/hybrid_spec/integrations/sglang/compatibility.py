@@ -127,13 +127,6 @@ def validate_model(worker, config=None):
     draft = worker.draft_runner.model_config
     target_arch = getattr(target.hf_config, "architectures", [])
     draft_arch = getattr(draft.hf_config, "architectures", [])
-    if config is not None and config.verify_mode == "compact":
-        from sglang.srt.configs.hybrid_arch import mambaish_config
-
-        if target.model_is_mrope or mambaish_config(target) is not None:
-            raise ValueError(
-                "compact verify currently requires non-Mamba, non-mRoPE targets"
-            )
     dsv4_mtp = target_arch == ["DeepseekV4ForCausalLM"] and draft_arch == [
         "DeepseekV4ForCausalLMNextN"
     ]
@@ -156,6 +149,17 @@ def validate_model(worker, config=None):
         and getattr(target.hf_config, "language_only", False)
         and getattr(draft.hf_config, "language_only", False)
     )
+
+    if config is not None and config.verify_mode == "compact":
+        from sglang.srt.configs.hybrid_arch import mambaish_config
+
+        if qwen_mtp:
+            if config.conditional_verify_graph:
+                raise ValueError("Qwen GDN compact verify requires host tier dispatch")
+        elif target.model_is_mrope or mambaish_config(target) is not None:
+            raise ValueError(
+                "compact verify requires full attention or text-only Qwen3.5/3.6 MTP"
+            )
 
     for model_config in (target, draft):
         if getattr(model_config, "is_hybrid_swa", False) and not dsv4_mtp:

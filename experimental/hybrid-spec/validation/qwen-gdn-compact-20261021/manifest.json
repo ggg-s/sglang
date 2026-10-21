@@ -1,0 +1,18 @@
+{
+  "platform": "Linux-5.15.0-56-generic-x86_64-with-glibc2.35",
+  "torch": "2.14.1+cu130",
+  "transformers": "5.19.0",
+  "triton": "3.8.0",
+  "gpu": "NVIDIA A100-PCIE-40GB",
+  "source_sha256": {
+    "python/sglang/srt/layers/attention/linear/gdn_backend.py": "0c33f05cd9437e74e94531314e6551878d45cefbcd4c7c07d22c54e36a1abe42",
+    "python/sglang/srt/model_executor/forward_batch_info.py": "2b40dbc8dd30cf474ce42721f56909a0dbc255d0b50b53d3c9dbeeb1ca103f08",
+    "python/sglang/srt/speculative/eagle_compact_verify.py": "d7de5168134488593f9e203a9456b20e56c68d0ad14b91d0fa687e46ddd0aaa8",
+    "python/sglang/srt/layers/attention/hybrid_linear_attn_backend.py": "be138ae62064638c6801f1a90646b30553862f7bc8fc3ff72be354cbc937be44",
+    "python/sglang/kernels/ops/attention/fla/fused_sigmoid_gating_recurrent.py": "bce8b1d8409befd86bb76185c85c0a1ffa81abb71d2285d3593a73960abd9f72",
+    "python/sglang/kernels/ops/mamba/causal_conv1d_triton.py": "e5bf5095b98f3407b200fdb7e74ac511a7caa7b1f15b798250ea365dcb41c2a9",
+    "python/sglang/kernels/ops/mamba/mamba_state_scatter_triton.py": "2428f4ca0e3bf809f75c9db07db77b1bec242326bb259149ab3e2e7c0d7f0d19",
+    "experimental/hybrid-spec/src/hybrid_spec/integrations/sglang/compatibility.py": "fb5ccbafe31dae276416a865ff650c52bb140c6bbbef46cf013b0c465dc073f9",
+    "experimental/hybrid-spec/tests/test_gdn_compact.py": "88af1e1d7260728f2712d050c3902e00dbfa6129dd5d5964b4d1afe4553f0b63"
+  }
+}

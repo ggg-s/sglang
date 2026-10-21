@@ -518,6 +518,7 @@ class GDNAttnBackend(MambaAttnBackendBase):
 
     needs_cpu_seq_lens: bool = False
     supports_mis: bool = True
+    supports_ragged_verify_graph: bool = True
     requires_contiguous_prefill_state: bool = True
 
     def __init__(self, model_runner: ModelRunner):
@@ -624,6 +625,12 @@ class GDNAttnBackend(MambaAttnBackendBase):
     def _init_target_verify_qkv_routing(self, forward_batch: ForwardBatch) -> None:
         # CUDA-graph metadata leaves mode and draft count at their defaults.
         if not forward_batch.forward_mode.is_target_verify():
+            self._use_strided_target_verify_qkv = False
+            return
+
+        if getattr(forward_batch.spec_info, "ragged_verify_layout", None) is not None:
+            # Ragged verify always uses the varlen Triton recurrence, including
+            # when the dense verify backend would choose a fused CuTe kernel.
             self._use_strided_target_verify_qkv = False
             return
 
@@ -946,6 +953,63 @@ class GDNAttnBackend(MambaAttnBackendBase):
     ) -> tuple[torch.Tensor, torch.Tensor]:
         return fused_gdn_gating(layer.A_log, a, b, layer.dt_bias)
 
+    def _convolve_target_verify(
+        self,
+        *,
+        layer,
+        mixed_qkv,
+        conv_states,
+        cache_indices,
+        intermediate_conv_window,
+        intermediate_state_indices,
+        query_start_loc,
+        draft_token_num,
+        ragged_verify,
+        retrieve_next_token,
+        retrieve_next_sibling,
+        retrieve_parent_token,
+    ):
+        """Keep per-step conv scratch dense while target tokens stay packed."""
+        seq_len, dim = mixed_qkv.shape
+        dense_indices = None
+        if ragged_verify:
+            batch_size = query_start_loc.numel() - 1
+            token_pos = torch.arange(
+                seq_len, device=mixed_qkv.device, dtype=torch.int32
+            )
+            rows = torch.searchsorted(query_start_loc[1:], token_pos, right=True)
+            # Tokens beyond the capped layout are graph padding. A sink row
+            # absorbs those writes and supplies finite zeros on the gather.
+            dense_indices = (
+                rows * draft_token_num
+                + (token_pos - query_start_loc[rows]).to(torch.int64)
+            ).clamp(max=batch_size * draft_token_num)
+            dense = mixed_qkv.new_zeros(batch_size * draft_token_num + 1, dim)
+            dense.index_copy_(0, dense_indices, mixed_qkv)
+            dense = dense[:-1].view(batch_size, draft_token_num, dim)
+        else:
+            batch_size = seq_len // draft_token_num
+            dense = mixed_qkv.view(batch_size, draft_token_num, dim)
+        processed = causal_conv1d_update(
+            dense.transpose(1, 2),
+            conv_states,
+            layer.conv_weights,
+            layer.bias,
+            layer.activation,
+            conv_state_indices=cache_indices[:batch_size],
+            intermediate_conv_window=intermediate_conv_window,
+            intermediate_state_indices=intermediate_state_indices[:batch_size],
+            retrieve_next_token=retrieve_next_token,
+            retrieve_next_sibling=retrieve_next_sibling,
+            retrieve_parent_token=retrieve_parent_token,
+        )
+        processed = processed.transpose(1, 2).reshape(batch_size * draft_token_num, dim)
+        if dense_indices is None:
+            return processed
+        padded = processed.new_zeros(batch_size * draft_token_num + 1, dim)
+        padded[:-1] = processed
+        return padded[dense_indices]
+
     def forward_extend(
         self,
         layer: RadixLinearAttention,
@@ -962,6 +1026,10 @@ class GDNAttnBackend(MambaAttnBackendBase):
             return mixed_qkv.new_zeros((1, 0, layer.num_v_heads, layer.head_v_dim))
 
         is_target_verify = forward_batch.forward_mode.is_target_verify()
+        ragged_verify = (
+            is_target_verify
+            and getattr(forward_batch.spec_info, "ragged_verify_layout", None) is not None
+        )
         forward_metadata = self.forward_metadata
 
         query_start_loc = forward_metadata.query_start_loc
@@ -1040,25 +1108,21 @@ class GDNAttnBackend(MambaAttnBackendBase):
             state_cache_indices = cache_indices
 
         if is_target_verify:
-            batch_size = seq_len // forward_batch.spec_info.draft_token_num
             draft_token_num = forward_batch.spec_info.draft_token_num
-            mixed_qkv_reshaped = mixed_qkv.view(
-                batch_size, draft_token_num, -1
-            ).transpose(1, 2)
-            mixed_qkv_processed = causal_conv1d_update(
-                mixed_qkv_reshaped,
-                conv_states,
-                layer.conv_weights,
-                layer.bias,
-                layer.activation,
-                conv_state_indices=cache_indices[:batch_size],
+            mixed_qkv = self._convolve_target_verify(
+                layer=layer,
+                mixed_qkv=mixed_qkv,
+                conv_states=conv_states,
+                cache_indices=cache_indices,
                 intermediate_conv_window=intermediate_conv_window_cache,
-                intermediate_state_indices=intermediate_state_indices[:batch_size],
+                intermediate_state_indices=intermediate_state_indices,
+                query_start_loc=query_start_loc,
+                draft_token_num=draft_token_num,
+                ragged_verify=ragged_verify,
                 retrieve_next_token=retrieve_next_token,
                 retrieve_next_sibling=retrieve_next_sibling,
                 retrieve_parent_token=retrieve_parent_token,
             )
-            mixed_qkv = mixed_qkv_processed.transpose(1, 2).view(seq_len, -1)
         else:
             if forward_metadata.has_mamba_track_mask:
                 mixed_qkv_to_track = mixed_qkv[
@@ -1119,6 +1183,7 @@ class GDNAttnBackend(MambaAttnBackendBase):
                     cache_indices=cache_indices,
                     query_start_loc=query_start_loc,
                     retrieve_parent_token=retrieve_parent_token,
+                    ragged_verify=ragged_verify,
                 )
             elif use_replayssm_spec:
                 core_attn_out = self._replayssm_target_verify(
@@ -1145,7 +1210,14 @@ class GDNAttnBackend(MambaAttnBackendBase):
                     "recurrent target_verify fallback requires intermediate_ssm, "
                     "which is not allocated under --enable-linear-replayssm-spec"
                 )
-                core_attn_out = self.kernel_dispatcher.target_verify(
+                # FlashInfer's MTP path requires a uniform width. The tree
+                # fallback is the same Triton kernel and accepts cu_seqlens.
+                verify_kernel = (
+                    self.kernel_dispatcher.tree_verify_kernel
+                    if ragged_verify
+                    else self.kernel_dispatcher
+                )
+                core_attn_out = verify_kernel.target_verify(
                     A_log=layer.A_log,
                     dt_bias=layer.dt_bias,
                     q=query,
@@ -1374,6 +1446,7 @@ class GDNAttnBackend(MambaAttnBackendBase):
         cache_indices: torch.Tensor,
         query_start_loc: torch.Tensor,
         retrieve_parent_token: Optional[torch.Tensor],
+        ragged_verify: bool = False,
     ) -> torch.Tensor:
         """Ring-writing verify; the commit fold replays the accepted prefix
         into ``temporal``. Uses the vendored CuTe DSL MTP kernel when the
@@ -1390,7 +1463,9 @@ class GDNAttnBackend(MambaAttnBackendBase):
         seq_len = query.shape[1]
         batch_size = query_start_loc.shape[0] - 1
         draft_token_num = seq_len // batch_size
-        if self._replayssm_fold_uses_cutedsl(ssm_states.dtype, draft_token_num):
+        if not ragged_verify and self._replayssm_fold_uses_cutedsl(
+            ssm_states.dtype, draft_token_num
+        ):
             from sglang.kernels.ops.attention.cutedsl_gdn_mtp_ring import (
                 gated_delta_rule_mtp,
             )

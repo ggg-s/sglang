@@ -13,7 +13,7 @@
 统一从 target 验证反馈估计接受率，结合实际 CUDA Graph 档位耗时选择每请求验证长度。
 保留 gate、split 和原草稿上限，默认不改变已有固定长度行为。
 
-本目录实现 [DESIGN.md](DESIGN.md) 的固定长度、请求级来源选择。默认使用 fixed compact：`verify_mode="compact"`、`dynamic_verify=false`，配合 `draft_graph_mode="split"`、gate=1。候选长度固定；检查首个 neural 候选后，跳过 SA 命中请求的 neural 尾段，使用 GPU 动态行号压缩，不限定 batch≤4。显式 `full` 对照仍执行完整 neural 起草并使用请求级来源 mask。Qwen3.5/3.6 MTP 的 Mamba/mRoPE 路径及 DSPARK 暂不支持 compact，其专用模板显式保留 `verify_mode="static"`。
+本目录实现 [DESIGN.md](DESIGN.md) 的固定长度、请求级来源选择。默认使用 fixed compact：`verify_mode="compact"`、`dynamic_verify=false`，配合 `draft_graph_mode="split"`、gate=1。候选长度固定；检查首个 neural 候选后，跳过 SA 命中请求的 neural 尾段，使用 GPU 动态行号压缩，不限定 batch≤4。显式 `full` 对照仍执行完整 neural 起草并使用请求级来源 mask。Qwen3.5/3.6 纯文本 MTP 已接入 GDN/mRoPE compact，详见下文；DSPARK 专用模板仍显式使用 `verify_mode="static"`。
 
 当前优化、执行流程、配置区别、A100 性能结论和未实现项见 [OPTIMIZATIONS.md](OPTIMIZATIONS.md)。SA 独立按请求存储；device 模式可显式开启跨活跃请求和完成请求的全局检索池。CPU 语义测试与 CUDA/真实模型验收是不同层次；详细验证记录见 [VALIDATION.md](VALIDATION.md)。未测模型不得视为已支持。
 
@@ -212,9 +212,19 @@ Graph 最大 batch 建议与本轮最大并发一致，避免为用不到的大�
 `logical_token_ct`、实际 target 图/forward 行数 `target_token_ct`、未压缩窗口
 `dense_token_ct`，以及 `graph_token_histogram`；实际交付 token 数仍看原生接受统计。
 
-compact 目前要求非 Mamba、非 mRoPE、支持 ragged verify 的 target attention，
+compact 要求支持 ragged verify 的 target attention；除下述 Qwen MTP 接入外，
+其余 Mamba/mRoPE 模型仍不开放。
 适用于已接线的 MTP / EAGLE3 / STANDALONE，及 GPU SA / Arctic 两种候选来源。
-Qwen3.5/3.6 GDN MTP 暂不开放此新模式，原等长路径保留。DSV4 的原生 ragged 路径
+Qwen3.5/3.6 GDN MTP 支持纯文本 fixed compact，使用原生 MTP 与 `--language-only`，
+并要求完整 attention 后端支持 ragged verify Graph（如 Triton）。
+`configs/device-qwen35-mtp-compact-verify.json` 给出 SA=8/neural=3/gate=1。
+卷积临时还原等宽槽位以保留逐步状态，GDN 递归按每请求真实长度计算；compact
+自动使用变长 Triton verify，不走要求统一长度的 FlashInfer/CuTe verify。
+原生接受及状态提交继续使用展开后的请求级索引，文本 mRoPE 按紧凑 token 的位置生成。
+普通 host token 档位 dispatch 可用；`conditional_verify_graph=true` 暂不开放，
+多模态输入及其他线性模型仍拒绝。验收记录见
+[Qwen GDN compact](validation/qwen-gdn-compact-20261021/README.md)。
+DSV4 的原生 ragged 路径
 不支持 CP 或实验性 online c128 MTP；不要开启 `SGLANG_EXPERIMENTAL_ONLINE_C128_MTP`。
 其余单机 TP、greedy、topk=1、无 LoRA/grammar/mixed chunk 限制继续生效。
 
@@ -325,6 +335,7 @@ python -m sglang.launch_server \
   --speculative-num-steps 3 \
   --speculative-eagle-topk 1 \
   --speculative-num-draft-tokens 4 \
+  --attention-backend triton \
   --speculative-draft-attention-backend triton \
   --max-running-requests 4 \
   --cuda-graph-max-bs-decode 4 \
@@ -348,7 +359,7 @@ python experimental/hybrid-spec/benchmarks/benchmark_device_overhead.py \
 
 微基准交替比较原 PyTorch 统计/融合统计，以及原映射拷贝/固定映射缓存，记录各轮 CUDA event 区间与 wall time。反馈两路都包含 pending-state reset；结果只代表 eager 组件开销，包含 host launch gap，不能代替模型 TPOT 或整体加速比。
 
-Qwen3.6-35B-A3B-FP8 使用 `Qwen3_5MoeForConditionalGeneration` 架构。将上述算法改为 `EAGLE`，移除外部 draft model 路径，并添加 `--language-only`，使用 checkpoint 内置的 MTP。当前分支的 `--language-model-only` 不支持这个架构。该接入保留原生位置编码和 GDN 状态提交，只替换起草 token；实际多模态请求仍拒绝。启动成功和包级测试不能替代逐 token 对照验收。
+Qwen3.6-35B-A3B-FP8 使用 `Qwen3_5MoeForConditionalGeneration` 架构。将上述算法改为 `EAGLE`，移除外部 draft model 路径，并添加 `--language-only`，使用 checkpoint 内置的 MTP；保留支持 compact 的 target attention 后端，如上例的 `--attention-backend triton`。当前分支的 `--language-model-only` 不支持这个架构。该接入保留原生位置编码和 GDN 状态提交，compact 使用变长验证路径；实际多模态请求仍拒绝。采用 SA8/neural3 模板时，同步改成 `--speculative-num-steps 8 --speculative-num-draft-tokens 9`。启动成功和包级测试不能替代逐 token 对照验收；本轮真实权重验证仅覆盖 Qwen3.5 GPTQ，未实测3.6 FP8。
 
 多卡时将 `--tp-size 1` 改为 `--tp-size 2` 或 `--tp-size 4`，模型本身也必须支持对应 TP 分片。所有 rank 使用相同插件与 JSON 配置；target/draft 共享原生 TP 拓扑。保持 DP/PP/EP/CP 为 1、单机；GPU SA 旧 CPU 历史模式关闭 overlap 和 chunked prefill，device 模式与 Arctic CPU 树允许开启。多 TP 代码已接通，当前本机只完成 CPU 多进程通信测试，真实 NCCL/模型验收仍待部署环境执行。
 

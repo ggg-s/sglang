@@ -916,7 +916,15 @@ def test_failed_host_build_releases_slot_before_propagating(host_prefill_case):
 
 
 @pytest.mark.parametrize("moe", [False, True])
-def test_qwen_linear_attention_requires_text_only_mtp_pair(moe):
+@pytest.mark.parametrize("verify_mode", ["static", "padded", "compact"])
+def test_qwen_linear_attention_requires_text_only_mtp_pair(
+    monkeypatch, moe, verify_mode
+):
+    monkeypatch.setitem(
+        sys.modules,
+        "sglang.srt.configs.hybrid_arch",
+        SimpleNamespace(mambaish_config=lambda config: object()),
+    )
     target = SimpleNamespace(
         hf_config=SimpleNamespace(
             architectures=[
@@ -946,7 +954,16 @@ def test_qwen_linear_attention_requires_text_only_mtp_pair(moe):
         ),
         draft_runner=SimpleNamespace(model_config=draft),
     )
-    validate_model(worker)
+    config = HybridConfig(8, 2, 4, 128, verify_mode=verify_mode)
+    validate_model(worker, config)
+    if verify_mode == "compact":
+        with pytest.raises(ValueError, match="host tier dispatch"):
+            validate_model(
+                worker,
+                replace(
+                    config, conditional_draft_graph=True, conditional_verify_graph=True
+                ),
+            )
     # Do not turn this exception into permission for arbitrary hybrid targets,
     # external draft models, multimodal serving, or sliding-window pools.
     for obj, field, value in (
@@ -960,7 +977,7 @@ def test_qwen_linear_attention_requires_text_only_mtp_pair(moe):
         original = getattr(obj, field)
         setattr(obj, field, value)
         with pytest.raises(ValueError):
-            validate_model(worker)
+            validate_model(worker, config)
         setattr(obj, field, original)
 
 

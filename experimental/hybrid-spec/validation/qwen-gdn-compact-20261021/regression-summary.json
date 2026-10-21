@@ -1,0 +1,17 @@
+{
+  "passed": 846,
+  "failed": 0,
+  "errors": 0,
+  "skipped": 254,
+  "source_sha256": {
+    "python/sglang/srt/layers/attention/linear/gdn_backend.py": "0c33f05cd9437e74e94531314e6551878d45cefbcd4c7c07d22c54e36a1abe42",
+    "python/sglang/srt/model_executor/forward_batch_info.py": "2b40dbc8dd30cf474ce42721f56909a0dbc255d0b50b53d3c9dbeeb1ca103f08",
+    "python/sglang/srt/speculative/eagle_compact_verify.py": "d7de5168134488593f9e203a9456b20e56c68d0ad14b91d0fa687e46ddd0aaa8",
+    "experimental/hybrid-spec/src/hybrid_spec/integrations/sglang/compatibility.py": "fb5ccbafe31dae276416a865ff650c52bb140c6bbbef46cf013b0c465dc073f9",
+    "experimental/hybrid-spec/tests/test_gdn_compact.py": "88af1e1d7260728f2712d050c3902e00dbfa6129dd5d5964b4d1afe4553f0b63",
+    "experimental/hybrid-spec/tests/test_core.py": "112d95c4de24216994ba2cec94b7997291fa1a82b93c1d2cfb54c2709fd0b6a6",
+    "experimental/hybrid-spec/tests/test_compact_verify.py": "fb64f4af280a26af1da14ee5e393aa656cdbe9247de1cd73db09488a62335058",
+    "experimental/hybrid-spec/tests/test_frequency.py": "f33399419c2de8d0294804b2eb8b25f358caf17afbd2d6a15f46684e90f89960",
+    "experimental/hybrid-spec/configs/device-qwen35-mtp-compact-verify.json": "1819994ad492ea92c3c8e81fdd3c6bc8fa114282a20da336eec2264ecc9d5b53"
+  }
+}

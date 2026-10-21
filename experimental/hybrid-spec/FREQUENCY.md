@@ -4,7 +4,8 @@
 `draft_graph_mode=split`、`num_neural_gate_tokens=1`，GPU SA 的
 `sa_continuation_policy` 默认是 `frequency`。验证默认采用 fixed compact：
 `verify_mode=compact`、`dynamic_verify=false`，保持固定候选长度。普通模型 JSON 模板同步更新。
-Qwen3.5/3.6 MTP 的 Mamba/mRoPE 路径及 DSPARK 暂不支持 compact，专用模板显式保留 static。
+Qwen3.5/3.6 纯文本 MTP 同样默认 fixed compact；GDN 及文本 mRoPE 的接入和验收见
+[Qwen GDN compact](validation/qwen-gdn-compact-20261021/README.md)。DSPARK 专用模板仍显式保留 static。
 DSPARK split 仍仅支持 gate=0，因此其两个显式模板保留原来的 full/gate=1、
 split/gate=0；`device-sa-spec.json` 显式保留 first/full/gate=0，作为历史参考策略。
 

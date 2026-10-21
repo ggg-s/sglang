@@ -1,0 +1,943 @@
+{
+  "runs": [
+    {
+      "file": "compact-first-requests.json",
+      "concurrency": 1,
+      "requests": 12,
+      "wall_s": 9.569842776283622,
+      "output_tokens": 1740,
+      "verify": {
+        "verify_ct": 501,
+        "logical_token_ct": 2209,
+        "target_token_ct": 2209,
+        "dense_token_ct": 4509
+      },
+      "source": {
+        "retrieval_requests": 41,
+        "neural_requests": 460,
+        "retrieval_correct_drafts": 249,
+        "neural_correct_drafts": 1016,
+        "retrieval_accept_tokens": 290,
+        "neural_accept_tokens": 1476
+      },
+      "target_position_reduction": 0.5100909292526059,
+      "accept_length": 3.539714867617108
+    },
+    {
+      "file": "compact-first-requests.json",
+      "concurrency": 4,
+      "requests": 12,
+      "wall_s": 4.8796632420271635,
+      "output_tokens": 1738,
+      "verify": {
+        "verify_ct": 146,
+        "logical_token_ct": 2224,
+        "target_token_ct": 2224,
+        "dense_token_ct": 4509
+      },
+      "source": {
+        "retrieval_requests": 44,
+        "neural_requests": 457,
+        "retrieval_correct_drafts": 255,
+        "neural_correct_drafts": 1002,
+        "retrieval_accept_tokens": 299,
+        "neural_accept_tokens": 1459
+      },
+      "target_position_reduction": 0.5067642492792193,
+      "accept_length": 3.5212981744421907
+    },
+    {
+      "file": "padded-first-requests.json",
+      "concurrency": 1,
+      "requests": 12,
+      "wall_s": 8.296035055071115,
+      "output_tokens": 1733,
+      "verify": {
+        "verify_ct": 498,
+        "logical_token_ct": 2197,
+        "target_token_ct": 4482,
+        "dense_token_ct": 4482
+      },
+      "source": {
+        "retrieval_requests": 41,
+        "neural_requests": 457,
+        "retrieval_correct_drafts": 249,
+        "neural_correct_drafts": 1011,
+        "retrieval_accept_tokens": 290,
+        "neural_accept_tokens": 1468
+      },
+      "target_position_reduction": 0.0,
+      "accept_length": 3.543032786885246
+    },
+    {
+      "file": "padded-first-requests.json",
+      "concurrency": 4,
+      "requests": 12,
+      "wall_s": 4.170209169387817,
+      "output_tokens": 1748,
+      "verify": {
+        "verify_ct": 148,
+        "logical_token_ct": 2262,
+        "target_token_ct": 4617,
+        "dense_token_ct": 4617
+      },
+      "source": {
+        "retrieval_requests": 42,
+        "neural_requests": 471,
+        "retrieval_correct_drafts": 251,
+        "neural_correct_drafts": 1011,
+        "retrieval_accept_tokens": 293,
+        "neural_accept_tokens": 1482
+      },
+      "target_position_reduction": 0.0,
+      "accept_length": 3.4711729622266403
+    },
+    {
+      "file": "padded-requests.json",
+      "concurrency": 1,
+      "requests": 12,
+      "wall_s": 8.336772743612528,
+      "output_tokens": 1748,
+      "verify": {
+        "verify_ct": 504,
+        "logical_token_ct": 2226,
+        "target_token_ct": 4536,
+        "dense_token_ct": 4536
+      },
+      "source": {
+        "retrieval_requests": 42,
+        "neural_requests": 462,
+        "retrieval_correct_drafts": 251,
+        "neural_correct_drafts": 1023,
+        "retrieval_accept_tokens": 293,
+        "neural_accept_tokens": 1485
+      },
+      "target_position_reduction": 0.0,
+      "accept_length": 3.5395537525354968
+    },
+    {
+      "file": "padded-requests.json",
+      "concurrency": 4,
+      "requests": 12,
+      "wall_s": 4.072507491335273,
+      "output_tokens": 1734,
+      "verify": {
+        "verify_ct": 142,
+        "logical_token_ct": 2197,
+        "target_token_ct": 4482,
+        "dense_token_ct": 4482
+      },
+      "source": {
+        "retrieval_requests": 41,
+        "neural_requests": 457,
+        "retrieval_correct_drafts": 250,
+        "neural_correct_drafts": 1007,
+        "retrieval_accept_tokens": 291,
+        "neural_accept_tokens": 1464
+      },
+      "target_position_reduction": 0.0,
+      "accept_length": 3.537832310838446
+    },
+    {
+      "file": "compact-requests.json",
+      "concurrency": 1,
+      "requests": 12,
+      "wall_s": 8.323509648442268,
+      "output_tokens": 1748,
+      "verify": {
+        "verify_ct": 504,
+        "logical_token_ct": 2226,
+        "target_token_ct": 2226,
+        "dense_token_ct": 4536
+      },
+      "source": {
+        "retrieval_requests": 42,
+        "neural_requests": 462,
+        "retrieval_correct_drafts": 251,
+        "neural_correct_drafts": 1019,
+        "retrieval_accept_tokens": 293,
+        "neural_accept_tokens": 1481
+      },
+      "target_position_reduction": 0.5092592592592593,
+      "accept_length": 3.533333333333333
+    },
+    {
+      "file": "compact-requests.json",
+      "concurrency": 4,
+      "requests": 12,
+      "wall_s": 3.863505447283387,
+      "output_tokens": 1730,
+      "verify": {
+        "verify_ct": 141,
+        "logical_token_ct": 2165,
+        "target_token_ct": 2165,
+        "dense_token_ct": 4410
+      },
+      "source": {
+        "retrieval_requests": 41,
+        "neural_requests": 449,
+        "retrieval_correct_drafts": 250,
+        "neural_correct_drafts": 1008,
+        "retrieval_accept_tokens": 291,
+        "neural_accept_tokens": 1457
+      },
+      "target_position_reduction": 0.5090702947845804,
+      "accept_length": 3.5838509316770186
+    }
+  ],
+  "comparisons": {
+    "pair_first": [
+      {
+        "concurrency": 1,
+        "exact": 9,
+        "requests": 12,
+        "rows": [
+          {
+            "index": 0,
+            "exact": true,
+            "first_difference": 192,
+            "tokens_a": 192,
+            "tokens_b": 192
+          },
+          {
+            "index": 1,
+            "exact": true,
+            "first_difference": 192,
+            "tokens_a": 192,
+            "tokens_b": 192
+          },
+          {
+            "index": 2,
+            "exact": true,
+            "first_difference": 192,
+            "tokens_a": 192,
+            "tokens_b": 192
+          },
+          {
+            "index": 3,
+            "exact": false,
+            "first_difference": 49,
+            "tokens_a": 185,
+            "tokens_b": 192
+          },
+          {
+            "index": 4,
+            "exact": true,
+            "first_difference": 192,
+            "tokens_a": 192,
+            "tokens_b": 192
+          },
+          {
+            "index": 5,
+            "exact": true,
+            "first_difference": 11,
+            "tokens_a": 11,
+            "tokens_b": 11
+          },
+          {
+            "index": 6,
+            "exact": false,
+            "first_difference": 0,
+            "tokens_a": 94,
+            "tokens_b": 80
+          },
+          {
+            "index": 7,
+            "exact": true,
+            "first_difference": 66,
+            "tokens_a": 66,
+            "tokens_b": 66
+          },
+          {
+            "index": 8,
+            "exact": true,
+            "first_difference": 160,
+            "tokens_a": 160,
+            "tokens_b": 160
+          },
+          {
+            "index": 9,
+            "exact": true,
+            "first_difference": 192,
+            "tokens_a": 192,
+            "tokens_b": 192
+          },
+          {
+            "index": 10,
+            "exact": true,
+            "first_difference": 192,
+            "tokens_a": 192,
+            "tokens_b": 192
+          },
+          {
+            "index": 11,
+            "exact": false,
+            "first_difference": 4,
+            "tokens_a": 72,
+            "tokens_b": 72
+          }
+        ]
+      },
+      {
+        "concurrency": 4,
+        "exact": 6,
+        "requests": 12,
+        "rows": [
+          {
+            "index": 0,
+            "exact": false,
+            "first_difference": 16,
+            "tokens_a": 192,
+            "tokens_b": 192
+          },
+          {
+            "index": 1,
+            "exact": false,
+            "first_difference": 0,
+            "tokens_a": 192,
+            "tokens_b": 192
+          },
+          {
+            "index": 2,
+            "exact": true,
+            "first_difference": 192,
+            "tokens_a": 192,
+            "tokens_b": 192
+          },
+          {
+            "index": 3,
+            "exact": false,
+            "first_difference": 49,
+            "tokens_a": 185,
+            "tokens_b": 192
+          },
+          {
+            "index": 4,
+            "exact": true,
+            "first_difference": 192,
+            "tokens_a": 192,
+            "tokens_b": 192
+          },
+          {
+            "index": 5,
+            "exact": true,
+            "first_difference": 11,
+            "tokens_a": 11,
+            "tokens_b": 11
+          },
+          {
+            "index": 6,
+            "exact": true,
+            "first_difference": 94,
+            "tokens_a": 94,
+            "tokens_b": 94
+          },
+          {
+            "index": 7,
+            "exact": true,
+            "first_difference": 66,
+            "tokens_a": 66,
+            "tokens_b": 66
+          },
+          {
+            "index": 8,
+            "exact": true,
+            "first_difference": 160,
+            "tokens_a": 160,
+            "tokens_b": 160
+          },
+          {
+            "index": 9,
+            "exact": false,
+            "first_difference": 50,
+            "tokens_a": 192,
+            "tokens_b": 192
+          },
+          {
+            "index": 10,
+            "exact": false,
+            "first_difference": 108,
+            "tokens_a": 192,
+            "tokens_b": 192
+          },
+          {
+            "index": 11,
+            "exact": false,
+            "first_difference": 33,
+            "tokens_a": 70,
+            "tokens_b": 73
+          }
+        ]
+      }
+    ],
+    "pair_repeat": [
+      {
+        "concurrency": 1,
+        "exact": 11,
+        "requests": 12,
+        "rows": [
+          {
+            "index": 0,
+            "exact": true,
+            "first_difference": 192,
+            "tokens_a": 192,
+            "tokens_b": 192
+          },
+          {
+            "index": 1,
+            "exact": true,
+            "first_difference": 192,
+            "tokens_a": 192,
+            "tokens_b": 192
+          },
+          {
+            "index": 2,
+            "exact": true,
+            "first_difference": 192,
+            "tokens_a": 192,
+            "tokens_b": 192
+          },
+          {
+            "index": 3,
+            "exact": true,
+            "first_difference": 192,
+            "tokens_a": 192,
+            "tokens_b": 192
+          },
+          {
+            "index": 4,
+            "exact": true,
+            "first_difference": 192,
+            "tokens_a": 192,
+            "tokens_b": 192
+          },
+          {
+            "index": 5,
+            "exact": true,
+            "first_difference": 11,
+            "tokens_a": 11,
+            "tokens_b": 11
+          },
+          {
+            "index": 6,
+            "exact": true,
+            "first_difference": 94,
+            "tokens_a": 94,
+            "tokens_b": 94
+          },
+          {
+            "index": 7,
+            "exact": true,
+            "first_difference": 66,
+            "tokens_a": 66,
+            "tokens_b": 66
+          },
+          {
+            "index": 8,
+            "exact": true,
+            "first_difference": 160,
+            "tokens_a": 160,
+            "tokens_b": 160
+          },
+          {
+            "index": 9,
+            "exact": true,
+            "first_difference": 192,
+            "tokens_a": 192,
+            "tokens_b": 192
+          },
+          {
+            "index": 10,
+            "exact": false,
+            "first_difference": 108,
+            "tokens_a": 192,
+            "tokens_b": 192
+          },
+          {
+            "index": 11,
+            "exact": true,
+            "first_difference": 73,
+            "tokens_a": 73,
+            "tokens_b": 73
+          }
+        ]
+      },
+      {
+        "concurrency": 4,
+        "exact": 8,
+        "requests": 12,
+        "rows": [
+          {
+            "index": 0,
+            "exact": true,
+            "first_difference": 192,
+            "tokens_a": 192,
+            "tokens_b": 192
+          },
+          {
+            "index": 1,
+            "exact": true,
+            "first_difference": 192,
+            "tokens_a": 192,
+            "tokens_b": 192
+          },
+          {
+            "index": 2,
+            "exact": true,
+            "first_difference": 192,
+            "tokens_a": 192,
+            "tokens_b": 192
+          },
+          {
+            "index": 3,
+            "exact": false,
+            "first_difference": 73,
+            "tokens_a": 192,
+            "tokens_b": 192
+          },
+          {
+            "index": 4,
+            "exact": true,
+            "first_difference": 192,
+            "tokens_a": 192,
+            "tokens_b": 192
+          },
+          {
+            "index": 5,
+            "exact": true,
+            "first_difference": 11,
+            "tokens_a": 11,
+            "tokens_b": 11
+          },
+          {
+            "index": 6,
+            "exact": true,
+            "first_difference": 80,
+            "tokens_a": 80,
+            "tokens_b": 80
+          },
+          {
+            "index": 7,
+            "exact": true,
+            "first_difference": 66,
+            "tokens_a": 66,
+            "tokens_b": 66
+          },
+          {
+            "index": 8,
+            "exact": true,
+            "first_difference": 160,
+            "tokens_a": 160,
+            "tokens_b": 160
+          },
+          {
+            "index": 9,
+            "exact": false,
+            "first_difference": 143,
+            "tokens_a": 192,
+            "tokens_b": 192
+          },
+          {
+            "index": 10,
+            "exact": false,
+            "first_difference": 74,
+            "tokens_a": 192,
+            "tokens_b": 192
+          },
+          {
+            "index": 11,
+            "exact": false,
+            "first_difference": 4,
+            "tokens_a": 69,
+            "tokens_b": 73
+          }
+        ]
+      }
+    ],
+    "padded_self": [
+      {
+        "concurrency": 1,
+        "exact": 7,
+        "requests": 12,
+        "rows": [
+          {
+            "index": 0,
+            "exact": false,
+            "first_difference": 16,
+            "tokens_a": 192,
+            "tokens_b": 192
+          },
+          {
+            "index": 1,
+            "exact": true,
+            "first_difference": 192,
+            "tokens_a": 192,
+            "tokens_b": 192
+          },
+          {
+            "index": 2,
+            "exact": true,
+            "first_difference": 192,
+            "tokens_a": 192,
+            "tokens_b": 192
+          },
+          {
+            "index": 3,
+            "exact": true,
+            "first_difference": 192,
+            "tokens_a": 192,
+            "tokens_b": 192
+          },
+          {
+            "index": 4,
+            "exact": true,
+            "first_difference": 192,
+            "tokens_a": 192,
+            "tokens_b": 192
+          },
+          {
+            "index": 5,
+            "exact": true,
+            "first_difference": 11,
+            "tokens_a": 11,
+            "tokens_b": 11
+          },
+          {
+            "index": 6,
+            "exact": false,
+            "first_difference": 0,
+            "tokens_a": 80,
+            "tokens_b": 94
+          },
+          {
+            "index": 7,
+            "exact": true,
+            "first_difference": 66,
+            "tokens_a": 66,
+            "tokens_b": 66
+          },
+          {
+            "index": 8,
+            "exact": true,
+            "first_difference": 160,
+            "tokens_a": 160,
+            "tokens_b": 160
+          },
+          {
+            "index": 9,
+            "exact": false,
+            "first_difference": 78,
+            "tokens_a": 192,
+            "tokens_b": 192
+          },
+          {
+            "index": 10,
+            "exact": false,
+            "first_difference": 108,
+            "tokens_a": 192,
+            "tokens_b": 192
+          },
+          {
+            "index": 11,
+            "exact": false,
+            "first_difference": 53,
+            "tokens_a": 72,
+            "tokens_b": 73
+          }
+        ]
+      },
+      {
+        "concurrency": 4,
+        "exact": 8,
+        "requests": 12,
+        "rows": [
+          {
+            "index": 0,
+            "exact": false,
+            "first_difference": 16,
+            "tokens_a": 192,
+            "tokens_b": 192
+          },
+          {
+            "index": 1,
+            "exact": false,
+            "first_difference": 0,
+            "tokens_a": 192,
+            "tokens_b": 192
+          },
+          {
+            "index": 2,
+            "exact": true,
+            "first_difference": 192,
+            "tokens_a": 192,
+            "tokens_b": 192
+          },
+          {
+            "index": 3,
+            "exact": true,
+            "first_difference": 192,
+            "tokens_a": 192,
+            "tokens_b": 192
+          },
+          {
+            "index": 4,
+            "exact": true,
+            "first_difference": 192,
+            "tokens_a": 192,
+            "tokens_b": 192
+          },
+          {
+            "index": 5,
+            "exact": true,
+            "first_difference": 11,
+            "tokens_a": 11,
+            "tokens_b": 11
+          },
+          {
+            "index": 6,
+            "exact": false,
+            "first_difference": 0,
+            "tokens_a": 94,
+            "tokens_b": 80
+          },
+          {
+            "index": 7,
+            "exact": true,
+            "first_difference": 66,
+            "tokens_a": 66,
+            "tokens_b": 66
+          },
+          {
+            "index": 8,
+            "exact": true,
+            "first_difference": 160,
+            "tokens_a": 160,
+            "tokens_b": 160
+          },
+          {
+            "index": 9,
+            "exact": true,
+            "first_difference": 192,
+            "tokens_a": 192,
+            "tokens_b": 192
+          },
+          {
+            "index": 10,
+            "exact": false,
+            "first_difference": 74,
+            "tokens_a": 192,
+            "tokens_b": 192
+          },
+          {
+            "index": 11,
+            "exact": true,
+            "first_difference": 73,
+            "tokens_a": 73,
+            "tokens_b": 73
+          }
+        ]
+      }
+    ],
+    "compact_self": [
+      {
+        "concurrency": 1,
+        "exact": 8,
+        "requests": 12,
+        "rows": [
+          {
+            "index": 0,
+            "exact": false,
+            "first_difference": 16,
+            "tokens_a": 192,
+            "tokens_b": 192
+          },
+          {
+            "index": 1,
+            "exact": true,
+            "first_difference": 192,
+            "tokens_a": 192,
+            "tokens_b": 192
+          },
+          {
+            "index": 2,
+            "exact": true,
+            "first_difference": 192,
+            "tokens_a": 192,
+            "tokens_b": 192
+          },
+          {
+            "index": 3,
+            "exact": false,
+            "first_difference": 49,
+            "tokens_a": 185,
+            "tokens_b": 192
+          },
+          {
+            "index": 4,
+            "exact": true,
+            "first_difference": 192,
+            "tokens_a": 192,
+            "tokens_b": 192
+          },
+          {
+            "index": 5,
+            "exact": true,
+            "first_difference": 11,
+            "tokens_a": 11,
+            "tokens_b": 11
+          },
+          {
+            "index": 6,
+            "exact": true,
+            "first_difference": 94,
+            "tokens_a": 94,
+            "tokens_b": 94
+          },
+          {
+            "index": 7,
+            "exact": true,
+            "first_difference": 66,
+            "tokens_a": 66,
+            "tokens_b": 66
+          },
+          {
+            "index": 8,
+            "exact": true,
+            "first_difference": 160,
+            "tokens_a": 160,
+            "tokens_b": 160
+          },
+          {
+            "index": 9,
+            "exact": false,
+            "first_difference": 78,
+            "tokens_a": 192,
+            "tokens_b": 192
+          },
+          {
+            "index": 10,
+            "exact": true,
+            "first_difference": 192,
+            "tokens_a": 192,
+            "tokens_b": 192
+          },
+          {
+            "index": 11,
+            "exact": false,
+            "first_difference": 4,
+            "tokens_a": 72,
+            "tokens_b": 73
+          }
+        ]
+      },
+      {
+        "concurrency": 4,
+        "exact": 6,
+        "requests": 12,
+        "rows": [
+          {
+            "index": 0,
+            "exact": true,
+            "first_difference": 192,
+            "tokens_a": 192,
+            "tokens_b": 192
+          },
+          {
+            "index": 1,
+            "exact": false,
+            "first_difference": 81,
+            "tokens_a": 192,
+            "tokens_b": 192
+          },
+          {
+            "index": 2,
+            "exact": true,
+            "first_difference": 192,
+            "tokens_a": 192,
+            "tokens_b": 192
+          },
+          {
+            "index": 3,
+            "exact": false,
+            "first_difference": 49,
+            "tokens_a": 185,
+            "tokens_b": 192
+          },
+          {
+            "index": 4,
+            "exact": true,
+            "first_difference": 192,
+            "tokens_a": 192,
+            "tokens_b": 192
+          },
+          {
+            "index": 5,
+            "exact": true,
+            "first_difference": 11,
+            "tokens_a": 11,
+            "tokens_b": 11
+          },
+          {
+            "index": 6,
+            "exact": false,
+            "first_difference": 0,
+            "tokens_a": 94,
+            "tokens_b": 80
+          },
+          {
+            "index": 7,
+            "exact": true,
+            "first_difference": 66,
+            "tokens_a": 66,
+            "tokens_b": 66
+          },
+          {
+            "index": 8,
+            "exact": true,
+            "first_difference": 160,
+            "tokens_a": 160,
+            "tokens_b": 160
+          },
+          {
+            "index": 9,
+            "exact": false,
+            "first_difference": 50,
+            "tokens_a": 192,
+            "tokens_b": 192
+          },
+          {
+            "index": 10,
+            "exact": false,
+            "first_difference": 108,
+            "tokens_a": 192,
+            "tokens_b": 192
+          },
+          {
+            "index": 11,
+            "exact": false,
+            "first_difference": 4,
+            "tokens_a": 70,
+            "tokens_b": 69
+          }
+        ]
+      }
+    ]
+  },
+  "prefill_only": {
+    "samples": 10,
+    "first_tokens": {
+      "red": 6,
+      "Here": 4
+    },
+    "spec_details_present": false
+  },
+  "cache_reuse": {
+    "exact": true,
+    "prompt_tokens": 4827,
+    "output_tokens": 160,
+    "second_cached_tokens": {
+      "device": 4800,
+      "host": 0
+    }
+  }
+}

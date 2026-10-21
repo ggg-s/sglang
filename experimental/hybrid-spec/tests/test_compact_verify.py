@@ -1188,8 +1188,9 @@ def test_cuda_mixed_verify_graph_tier_switches_and_native_commit(
 @pytest.mark.parametrize(
     "standalone,with_graph", [(False, False), (False, True), (True, True)]
 )
+@pytest.mark.parametrize("track", [False, True])
 def test_cuda_prepare_packs_native_kv_window_without_changing_commit_layout(
-    monkeypatch, cuda_modules, standalone, with_graph
+    monkeypatch, cuda_modules, standalone, with_graph, track
 ):
     from enum import Enum
 
@@ -1235,6 +1236,11 @@ def test_cuda_prepare_packs_native_kv_window_without_changing_commit_layout(
             prepared.append(fb)
             return fb
 
+    def refresh_track(batch):
+        if track:
+            batch.mamba_track_indices = torch.tensor([6, 7], device="cuda")
+            batch.mamba_track_mask = None
+
     dependencies = {
         "sglang.srt.mem_cache.kv_index_translator": dict(KVIndexTranslator=object),
         "sglang.srt.mem_cache.kv_loc_plan": dict(
@@ -1247,7 +1253,7 @@ def test_cuda_prepare_packs_native_kv_window_without_changing_commit_layout(
             SpecInput=Spec, SpecInputType=NS(DFLASH_VERIFY=0)
         ),
         "sglang.srt.speculative.spec_utils": dict(
-            prepare_mamba_track_for_verify=lambda batch: None
+            prepare_mamba_track_for_verify=refresh_track
         ),
         "sglang.srt.platforms": dict(current_platform=NS(is_out_of_tree=lambda: False)),
     }
@@ -1282,7 +1288,7 @@ def test_cuda_prepare_packs_native_kv_window_without_changing_commit_layout(
         seq_lens=prefix,
         seq_lens_cpu=None,
         seq_lens_sum=None,
-        mamba_track_indices=None,
+        mamba_track_indices=torch.tensor([0, 1], device="cuda") if track else None,
         hisparse_coordinator=None,
         forward_mode=Mode.TARGET_VERIFY,
         device="cuda",
@@ -1298,7 +1304,10 @@ def test_cuda_prepare_packs_native_kv_window_without_changing_commit_layout(
         req_to_token_pool=NS(req_to_token=table),
         spec_algorithm=NS(is_standalone=lambda: standalone),
         decode_cuda_graph_runner=graph,
-        attn_backend=NS(init_forward_metadata=lambda fb: seen.append(fb)),
+        attn_backend=NS(
+            supports_ragged_verify_graph=True,
+            init_forward_metadata=lambda fb: seen.append(fb),
+        ),
     )
     fb, can_graph = cuda_modules.prepare_compact_verify(
         vi, batch, NS(model_runner=runner)
@@ -1313,6 +1322,9 @@ def test_cuda_prepare_packs_native_kv_window_without_changing_commit_layout(
     assert batch.out_cache_loc is plan.write_virtual
     assert fb.kv_loc_plan is plan
     assert len(seen) == 1 and seen[0] is fb
+    if track:
+        assert batch.mamba_track_indices.tolist() == [6, 7]
+        assert batch.mamba_track_mask is None
 
 
 def test_cuda_ragged_triton_attention_matches_independent_torch_reference(

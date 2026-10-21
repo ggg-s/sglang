@@ -1462,7 +1462,6 @@ class ForwardBatch(ForwardBatchDeepSeekMHAMixin):
         # passes its own positions (uniform num_draft_tokens per request).
         if seq_positions is None:
             seq_positions = batch.spec_info.positions
-        seq_positions = seq_positions.view(batch_size, -1)
         # Split text-only and mixed batches here because SpecV2 text-only batches can avoid an extra D2H.
         if all(mm_input is None for mm_input in mm_inputs):
             self.mrope_positions = (
@@ -1470,6 +1469,7 @@ class ForwardBatch(ForwardBatchDeepSeekMHAMixin):
             )
             return
         else:
+            seq_positions = seq_positions.view(batch_size, -1)
             mrope_deltas = [
                 (
                     torch.zeros(1, dtype=torch.int64)
