@@ -133,7 +133,7 @@ export SGLANG_PLUGINS=hybrid_spec
 export HYBRID_SPEC_CONFIG="$PWD/experimental/hybrid-spec/configs/device-draft-split-conditional.json"
 ```
 
-模板保持 K=8、gate=2、容量 8；原生命令需匹配
+模板保持 K=8、gate=1、容量 8；原生命令需匹配
 `--speculative-num-steps 8 --speculative-num-draft-tokens 9`、topk=1、
 `--max-running-requests 8 --cuda-graph-max-bs-decode 8`，普通模型使用
 `--speculative-draft-attention-backend triton`。已有配置可直接只增加开关，

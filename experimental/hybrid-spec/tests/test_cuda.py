@@ -128,6 +128,7 @@ def test_shared_history_graph_final_feedback_boundaries_and_generation(partial):
         max_shared_requests=2,
         partial_drafts=partial,
         enable_global_pool=True,
+        sa_continuation_policy="first",
     )
     backend = GPUSuffixAutomaton(config, "cuda")
 
@@ -324,7 +325,7 @@ def test_cuda_sa_differential_capacity_reorder_and_slot_reuse():
             continue
         oracle = SuffixAutomaton()
         oracle.append(histories[slot])
-        tokens, match = oracle.query(3)
+        tokens, match = oracle.query(3, config.sa_continuation_policy)
         assert result.healthy[row].item()
         assert result.versions[row].item() == len(histories[slot])
         assert result.match_lens[row].item() == match
@@ -1233,6 +1234,7 @@ def test_finished_prefill_leases_recover_sa_through_graph_replay(
         history_mode="device",
         enable_global_pool=global_pool,
         max_shared_requests=2 if global_pool else 0,
+        draft_graph_mode="full",
     )
     backend = GPUSuffixAutomaton(config, "cuda")
     extension = DeviceDraftExtension(config, backend, 100)
@@ -1415,7 +1417,7 @@ def test_long_history_hash_import_and_captured_splits(alphabet):
         oracle.append(delta)
         seq_lens.fill_(len(history) - 1)
         graph.replay()
-        tokens, match = oracle.query(8)
+        tokens, match = oracle.query(8, config.sa_continuation_policy)
         eligible = match >= 4
         assert view.use_retrieval.item() == eligible
         assert view.tokens.tolist() == [
@@ -1426,7 +1428,9 @@ def test_long_history_hash_import_and_captured_splits(alphabet):
     # Compare every semantic state and edge with an independent CPU automaton.
     num_states = backend.meta[0, 1].item()
     assert num_states == len(oracle.links)
-    states = backend.states[0, :num_states].cpu().tolist()
+    from hybrid_spec.backends.sa_layout import unpack_states
+
+    states = unpack_states(backend.states[0, :num_states].cpu())[:, :5].tolist()
     edges = backend.edges[0, : backend.meta[0, 2].item(), :3].cpu().tolist()
     for p, (depth, link, pos, inline, head) in enumerate(states):
         assert (depth, link, pos) == (

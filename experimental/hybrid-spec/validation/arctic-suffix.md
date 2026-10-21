@@ -92,7 +92,7 @@ export HYBRID_SPEC_CONFIG="$PWD/experimental/hybrid-spec/configs/arctic-suffix-s
 仅把 `backend` 改成 arctic 而继续配置 `history_mode=device` 会报错，必须同步
 设置上述 CPU 历史/调度选项。默认 GPU SA 配置不变。
 
-模板选用 K=8/G=2，`arctic_max_spec_factor=2.0` 用于在匹配较短时容许更多候选；
+当前模板选用 K=8/G=1，`arctic_max_spec_factor=2.0` 用于在匹配较短时容许更多候选；
 这属于策略参数，需按负载校准。其他 Arctic 参数默认值：max depth 64、factor 1.0、
 offset 0.0、min token probability 0.1。更改 K 时同步修改 JSON 与服务 steps/token
 参数，并保持 G≤K。`enable_global_pool=false` 可单独评估请求内后缀树。

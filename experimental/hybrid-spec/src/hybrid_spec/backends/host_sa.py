@@ -7,6 +7,8 @@ from dataclasses import dataclass
 
 import torch
 
+from hybrid_spec.backends.sa_layout import COMPACT_MAX_HISTORY, state_layout
+
 
 @dataclass
 class HostAutomaton:
@@ -34,17 +36,23 @@ class NativeHostBuilder:
             ctypes.c_int,
         )
         self.build_native.restype = ctypes.c_int
+        self.build_compact_native = self.library.hybrid_sa_build_host_compact
+        self.build_compact_native.argtypes = self.build_native.argtypes
+        self.build_compact_native.restype = ctypes.c_int
         self.pin_memory = pin_memory
 
-    def prepare(self, history):
+    def prepare(self, history, *, compact=False):
         # Allocate/snapshot before GPU prefill, so background work does not
         # call the CUDA pinned allocator or access mutable request objects.
         capacity = max(1, len(history))
+        if compact and capacity > COMPACT_MAX_HISTORY:
+            raise ValueError("compact SA history capacity exceeded")
         kwargs = dict(dtype=torch.int32, device="cpu", pin_memory=self.pin_memory)
+        dtype, fields = state_layout(capacity) if compact else (torch.int32, 10)
         return HostAutomaton(
             torch.tensor(history, dtype=torch.int64, device="cpu"),
             torch.empty(capacity, **kwargs),
-            torch.empty((2 * capacity + 1, 5), **kwargs),
+            torch.empty((2 * capacity + 1, fields), **(kwargs | {"dtype": dtype})),
             torch.empty((capacity + 1, 6), **kwargs),
             torch.empty(7, **kwargs),
         )
@@ -52,7 +60,12 @@ class NativeHostBuilder:
     def build(self, host, vocab_size):
         if not 0 < vocab_size <= 2**31 - 1:
             raise ValueError("vocab_size must fit a positive int32")
-        code = self.build_native(
+        build = (
+            self.build_compact_native
+            if host.states.dtype == torch.uint16
+            else self.build_native
+        )
+        code = build(
             host.tokens.data_ptr(),
             host.tokens.numel(),
             vocab_size,

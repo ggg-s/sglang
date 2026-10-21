@@ -97,6 +97,8 @@ def main():
             )
             if b"STATE_FIELDS" in (include / "automaton.h").read_bytes():
                 flags.append("-DHYBRID_SA_COMPACT_LAYOUT")
+            if b"init_frequency" in (include / "automaton.h").read_bytes():
+                flags.append("-DHYBRID_SA_FREQUENCY_LAYOUT")
             subprocess.run(
                 command
                 + ["-std=c++17", "-O3"]

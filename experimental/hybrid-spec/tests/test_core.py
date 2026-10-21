@@ -221,6 +221,10 @@ def valid_config():
         speculative_num_steps=2,
         speculative_num_draft_tokens=3,
         disable_overlap_schedule=True,
+        disable_cuda_graph=False,
+        enable_memory_saver=False,
+        speculative_use_rejection_sampling=False,
+        max_running_requests=2,
         enable_mixed_chunk=False,
         enable_multi_layer_eagle=False,
         speculative_adaptive=False,
@@ -234,7 +238,7 @@ def valid_config():
 
 def test_configuration_fails_closed():
     cfg = valid_config()
-    config = HybridConfig(2, 2, 2, 32)
+    config = HybridConfig(2, 2, 2, 32, history_mode="cpu", draft_graph_mode="full")
     validate_config(config, cfg)
     device_config = HybridConfig(2, 2, 2, 32, history_mode="device")
     overlap_cfg = SimpleNamespace(**(vars(cfg) | {"disable_overlap_schedule": False}))
@@ -1520,4 +1524,6 @@ def test_arctic_split_supports_overlap_and_chunked_cpu_suffix_queries():
 )
 def test_arctic_parameters_reject_invalid_probabilities_and_bounds(field, value):
     with pytest.raises(ValueError, match="arctic_"):
-        HybridConfig(2, 1, 8, 128, backend="arctic", **{field: value})
+        HybridConfig(
+            2, 1, 8, 128, backend="arctic", history_mode="cpu", **{field: value}
+        )

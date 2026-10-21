@@ -101,7 +101,15 @@ def _check_device_bridge(sync, ranks, device):
     """
     rank = dist.get_rank()
     for k in (1, 3):
-        config = HybridConfig(k, 2, 4, 32, history_mode="device")
+        config = HybridConfig(
+            k,
+            2,
+            4,
+            32,
+            history_mode="device",
+            draft_graph_mode="full",
+            num_neural_gate_tokens=0,
+        )
 
         class LookupBackend:
             def __init__(self):
@@ -594,7 +602,14 @@ def _check_cpu_history_bridge(sync, ranks, device):
     """
     rank = dist.get_rank()
     config = HybridConfig(
-        2, 2, 2, 32, "reference" if device.type == "cpu" else "gpu_sa"
+        2,
+        2,
+        2,
+        32,
+        "reference" if device.type == "cpu" else "gpu_sa",
+        history_mode="cpu",
+        draft_graph_mode="full",
+        num_neural_gate_tokens=0,
     )
     if device.type == "cpu":
         backend = ReferenceBackend(config)

@@ -60,7 +60,20 @@ class Window(msgspec.Struct):
 
 
 def config(**kwargs):
-    return HybridConfig(3, 2, 4, 64, history_mode="device", **kwargs)
+    return HybridConfig(
+        3,
+        2,
+        4,
+        64,
+        **(
+            {
+                "history_mode": "device",
+                "draft_graph_mode": "full",
+                "num_neural_gate_tokens": 0,
+            }
+            | kwargs
+        ),
+    )
 
 
 def make_proposal(tokens, folded=True):

@@ -22,16 +22,16 @@ static void check_index(Automaton &sa) {
   for (int p = 0; p < sa.meta[1]; ++p) {
     if (sa.s(p, 3) != -1) {
       assert(sa.s(p, 2) + 1 < sa.meta[0]);
-      assert(sa.find(p, sa.history[sa.s(p, 2) + 1]) == &sa.s(p, 3));
+      assert(sa.find(p, sa.history[sa.s(p, 2) + 1]).same_field(sa.s(p, 3)));
     }
     if (sa.s(p, 4) < -1) {
       int second = ~sa.s(p, 4);
-      assert(sa.find(p, sa.history[sa.s(second, 2)]) == &sa.s(p, 4));
+      assert(sa.find(p, sa.history[sa.s(second, 2)]).same_field(sa.s(p, 4)));
     }
     for (int edge = sa.s(p, 4); edge >= 0; edge = sa.e(edge, 2)) {
       assert(sa.e(edge, 3) == p);
       assert(seen[edge] == (sa.e(sa.s(p, 4), 4) >= -1));
-      assert(sa.find(p, sa.e(edge, 0)) == &sa.e(edge, 1));
+      assert(sa.find(p, sa.e(edge, 0)).same_field(Automaton::Field(&sa.e(edge, 1))));
     }
     assert(sa.find(p, -1) == nullptr);
   }
@@ -48,6 +48,7 @@ static void check(const std::vector<int> &input) {
   states[2] = -1;
   states[3] = states[4] = -1;
   Automaton sa{history.data(), states.data(), edges.data(), meta, capacity};
+  sa.init_frequency(0);
   for (int n = 1; n <= capacity; ++n) {
     sa.append(input[n - 1]);
     assert(meta[4] == 1 && meta[0] == n);
@@ -176,7 +177,7 @@ static void check_external_suffixes() {
       std::vector<int64_t> input(width);
       for (int i = 0; i < width; ++i)
         input[i] = (bits >> i) & 1;
-      std::vector<int> history(width), states((2 * width + 1) * 5),
+      std::vector<int> history(width), states((2 * width + 1) * Automaton::STATE_FIELDS),
           edges((width + 1) * 6);
       int meta[7];
       assert(hybrid_sa_build_host(input.data(), width, 3, history.data(),

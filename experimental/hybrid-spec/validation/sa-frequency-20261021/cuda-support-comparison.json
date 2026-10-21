@@ -1,0 +1,23 @@
+{
+  "python/sglang/kernels/ops/attention/decode_attention.py": "match",
+  "python/sglang/kernels/ops/attention/extend_attention.py": "match",
+  "python/sglang/kernels/ops/attention/score_mod.py": "match",
+  "python/sglang/kernels/ops/speculative/cache_locs.py": "match",
+  "python/sglang/kernels/ops/speculative/topk1.py": "match",
+  "python/sglang/srt/arg_groups/arg_utils.py": "match",
+  "python/sglang/srt/arg_groups/fields/lora.py": "match",
+  "python/sglang/srt/layers/attention/triton_backend.py": "match",
+  "python/sglang/srt/mem_cache/kv_loc_plan.py": "match",
+  "python/sglang/srt/model_executor/forward_batch_info.py": "match",
+  "python/sglang/srt/model_executor/forward_context.py": "match",
+  "python/sglang/srt/model_executor/runner/decode_cuda_graph_runner.py": "different",
+  "python/sglang/srt/speculative/dflash_info.py": "match",
+  "python/sglang/srt/speculative/dspark_components/dspark_draft.py": "match",
+  "python/sglang/srt/speculative/dspark_components/dspark_worker_v2.py": "match",
+  "python/sglang/srt/speculative/eagle_compact_verify.py": "different",
+  "python/sglang/srt/speculative/eagle_draft_extend_cuda_graph_runner.py": "different",
+  "python/sglang/srt/speculative/eagle_info.py": "match",
+  "python/sglang/srt/speculative/eagle_utils.py": "match",
+  "python/sglang/srt/speculative/eagle_worker_v2.py": "match",
+  "python/sglang/srt/speculative/spec_utils.py": "match"
+}

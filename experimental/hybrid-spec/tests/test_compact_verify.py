@@ -206,7 +206,15 @@ def test_cost_profile_rejects_incompatible_or_invalid_measurements(tmp_path):
     profile = collector.snapshot()["cost_profile"]
     path = tmp_path / "profile.json"
     loading = replace(config, dynamic_verify_cost_table_path=str(path))
-    for changed in ["version", "scope", "config", "runtime", "cost"]:
+    for changed in [
+        "version",
+        "scope",
+        "config",
+        "runtime",
+        "cost",
+        "sa_storage_missing",
+        "sa_storage_old",
+    ]:
         bad = copy.deepcopy(profile)
         if changed == "version":
             bad["version"] = 1
@@ -216,6 +224,10 @@ def test_cost_profile_rejects_incompatible_or_invalid_measurements(tmp_path):
             bad["config"]["num_neural_drafts"] = 2
         elif changed == "runtime":
             bad["runtime"]["tp_size"] = 8
+        elif changed == "sa_storage_missing":
+            bad["config"].pop("gpu_sa_storage_revision")
+        elif changed == "sa_storage_old":
+            bad["config"]["gpu_sa_storage_revision"] = 5
         else:
             bad["verify_ms"]["1:512"]["4"] = float("nan")
         path.write_text(json.dumps(bad))

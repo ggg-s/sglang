@@ -1,5 +1,10 @@
 # SGLang 混合投机扩展（实验）
 
+**2026-10-21 默认更新**：GPU SA 增加在线续写频次，默认以频次选择单链候选；
+默认执行模式改为 `device + split + gate=1`，常规模板同步调整。
+计数算法、策略、72/108 字节/token 自适应索引预算、v6 重编译与 DSPARK 例外见
+[频次实现与升级说明](FREQUENCY.md)。下列既有性能数据属于此前版本，不能作为新策略的性能验收。
+
 截至 2026-10-20 的实测数据见 [测试总报告](validation/TEST_RESULTS.md)，涵盖内网 DSV4 TP8、A100 / 6000D / 4090 性能、4060 功能回归及 compact 对照；[逐次数据](validation/TEST_RESULTS_RUNS.md) 和 [完整历史记录](validation/TEST_RESULTS_DETAILS.md) 保留统计口径、版本、证据链接与作废结果说明。
 
 内网 [DSV4-Flash / H100 TP8 实测报告（10-17～10-20）](validation/DSV4_PERFORMANCE_20261017_19.md)：edits c1～32、离线耗时表与 fixed/dynamic compact、SWE c8/c16/c80，以及 decode 与系统吞吐的不同口径。edits c1 padded SA8/neural3 达 430.74 tok/s；SWE SA8 相对同轮 MTP K3 再提高约 4%～6% RPS，c80 受 KV 压力影响端到端回退。
@@ -8,19 +13,19 @@
 统一从 target 验证反馈估计接受率，结合实际 CUDA Graph 档位耗时选择每请求验证长度。
 保留 gate、split 和原草稿上限，默认不改变已有固定长度行为。
 
-本目录实现 [DESIGN.md](DESIGN.md) 的固定长度、请求级来源选择。默认 `draft_graph_mode="full"` 照常运行完整 neural draft，由设备端 mask 在每个位置选择 SA 或 neural token；选定 token 同时进入下一步模型输入和最终验证链。显式开启 `split` 后，可按配置 gate 跳过 SA 命中请求的 neural 尾段，使用 GPU 动态行号压缩，不再限定 batch≤4。
+本目录实现 [DESIGN.md](DESIGN.md) 的固定长度、请求级来源选择。默认 `draft_graph_mode="split"`、gate=1，检查首个 neural 候选后，跳过 SA 命中请求的 neural 尾段，使用 GPU 动态行号压缩，不限定 batch≤4。显式 `full` 对照仍执行完整 neural 起草并使用请求级来源 mask。
 
 当前优化、执行流程、配置区别、A100 性能结论和未实现项见 [OPTIMIZATIONS.md](OPTIMIZATIONS.md)。SA 独立按请求存储；device 模式可显式开启跨活跃请求和完成请求的全局检索池。CPU 语义测试与 CUDA/真实模型验收是不同层次；详细验证记录见 [VALIDATION.md](VALIDATION.md)。未测模型不得视为已支持。
 
-新增 opt-in `history_mode="device"` 路径，用于对齐 Baseten `sa_spec` 的 GPU 增量更新与调度方式。prefill 前快照 prompt 并准备 pinned CPU 缓冲，由后台线程使用与 CUDA 相同的 C++ 状态机构建初始 SA；本机 native 调用释放 GIL，与 target prefill/draft-extend 并行。prefill 返回时只暂存 GPU bonus，首次 draft 才消费构建结果，并在 forward stream 上异步拷贝已使用的状态前缀。不再在 GPU 上逐 token 构建 prompt SA，也不在每轮 decode 读取或重建 CPU 输出历史。
+默认 `history_mode="device"` 路径沿用 Baseten `sa_spec` 的 GPU 增量更新与调度方式。prefill 前快照 prompt 并准备 pinned CPU 缓冲，由后台线程使用与 CUDA 相同的 C++ 状态机构建初始 SA；本机 native 调用释放 GIL，与 target prefill/draft-extend 并行。prefill 返回时只暂存 GPU bonus，首次 draft 才消费构建结果，并在 forward stream 上异步拷贝已使用的状态前缀。不再在 GPU 上逐 token 构建 prompt SA，也不在每轮 decode 读取或重建 CPU 输出历史。
 
 verify 直接在设备上暂存 `predict/accept_index/accept_lens`，下一轮 draft 在 CUDA Graph 内消费增量、查询并选择来源。eager 使用相同设备算子。若 CPU 构建未完成，首次 draft 会等待该 future；不调用额外的 GPU 全局同步。异步 H2D 的 pinned 源缓冲保留到拷贝事件完成；异常、abort/flush、retract 和槽位复用会取消或丢弃旧任务结果，旧任务不能向新代际写入状态。
 
-该路径允许单机 TP≥1 的 overlap 配置。多 TP 在每次设备查询后达成候选与资格共识，eager 和 Graph 使用 SGLang 的 PyNccl 通信器，任一 rank 不合格或候选不同则统一回退 neural；TP=1 不增加通信。device 路径已有 Qwen3.5 MTP 的 A100 TP=1 实测，结果见上述优化总览；多 GPU 模型及真实 NCCL Graph 时间线仍待验收。旧模式默认 `history_mode="cpu"`，保留关闭 overlap 的限制。device 路径保留映射变化时的 H2D、verify 反馈 kernel 和 host 构建/导入，不能声称零开销或所有配置稳定加速。
+该路径允许单机 TP≥1 的 overlap 配置。多 TP 在每次设备查询后达成候选与资格共识，eager 和 Graph 使用 SGLang 的 PyNccl 通信器，任一 rank 不合格或候选不同则统一回退 neural；TP=1 不增加通信。device 路径已有 Qwen3.5 MTP 的 A100 TP=1 实测，结果见上述优化总览；多 GPU 模型及真实 NCCL Graph 时间线仍待验收。默认 `history_mode="device"`；显式选择旧 `cpu` 历史模式需同时设置 `draft_graph_mode="full"`，并关闭 overlap。device 路径保留映射变化时的 H2D、verify 反馈 kernel 和 host 构建/导入，不能声称零开销或所有配置稳定加速。
 
 `configs/device-sa-spec.json` 给出 K=8、阈值 4、`partial_drafts="zero"` 的参考策略配置。启动时相应设置 `--speculative-num-steps 8 --speculative-num-draft-tokens 9`；测试 overlap 时移除 `--disable-overlap-schedule`。`zero` 复现参考集成对不足 K 个续写的尾部补零；这些仍是草稿，必须经过原生 target verify，不代表输出补零。默认 `partial_drafts="fallback"` 继续整条回退，可用于单独比较该策略差异。阈值设为大于历史容量的数值可测量“维护 SA、全部选择 MTP”的成本。
 
-`num_neural_gate_tokens` 默认为 0，保留上述 sa-spec 参考策略；取 1…K 时，先检查 SA 与原生 neural 草稿前 N 个 token 是否一致。检查范围内沿用 neural token；全部一致后才允许 SA 替换后续位置，任一步不一致则本轮余下位置均使用 neural。检查和 mask 更新可被 draft CUDA Graph 捕获，不增加模型 forward、逐步 D2H 或额外 TP collective。TP 仍沿用原生 neural token 在各 rank 一致的约定；这一新策略尚需多 GPU 模型验收。verify 统计读取检查后的最终 mask。
+`num_neural_gate_tokens` 默认为 1；上述 sa-spec 参考模板显式使用 0；取 1…K 时，先检查 SA 与原生 neural 草稿前 N 个 token 是否一致。检查范围内沿用 neural token；全部一致后才允许 SA 替换后续位置，任一步不一致则本轮余下位置均使用 neural。检查和 mask 更新可被 draft CUDA Graph 捕获，不增加模型 forward、逐步 D2H 或额外 TP collective。TP 仍沿用原生 neural token 在各 rank 一致的约定；这一新策略尚需多 GPU 模型验收。verify 统计读取检查后的最终 mask。
 
 实验性 `sa_require_unique_continuation=true` 在上述 neural gate 之前增加
 续写歧义检查（默认关闭，仅 device GPU SA、`partial_drafts="fallback"`）。
@@ -36,7 +41,7 @@ verify 直接在设备上暂存 `predict/accept_index/accept_lens`，下一轮 d
 小样本对照接受长度提升约 0.75%，吞吐无可辨收益，故继续默认关闭；
 详见 [混合 tail 修复与 gate 对照](validation/tail-fix-gate-ab-4090-20261020/README.md)。
 
-`configs/device-qwen35-mtp.json` 是 Qwen3.5 MTP 的实验配置：K=8、匹配阈值 4、前 4 个 token 一致性检查、短候选整链回退。它与参考配置是不同的选路策略，不能把匹配命中率当作性能收益；模型、量化及负载改变后应重新测量。选择依据与 A100 对照见 [接受长度分析](validation/acceptance-regression.md)。该配置仍运行完整 MTP；CUDA 状态布局保持 v3，安装代码后重启服务即可加载新逻辑，不需要重新编译 CUDA 插件。
+`configs/device-qwen35-mtp.json` 是 Qwen3.5 MTP 的实验配置：K=8、匹配阈值 4、gate=1、split、短候选整链回退。历史 gate=4/full 的 A100 对照保留在 [接受长度分析](validation/acceptance-regression.md)，不代表当前默认。新版频次状态使用 v6 自适应布局，需要同步更新插件并重启，首次启动会重新编译。
 
 `draft_graph_mode="split"` 将 EAGLE/MTP、EAGLE3 和 STANDALONE 的 neural draft
 按 gate 宽度拆成共享前缀和紧凑尾段。
@@ -62,9 +67,9 @@ attention。模型仍需满足下文的纯文本、attention 和词表兼容约�
 SA 查询在独立 stream 执行，在 gate 边界汇合并做一次候选及最终 mask 的 TP 共识。
 G=0/1 没有可重叠的 neural inner forward；G≥2 可与前缀计算重叠。
 前缀/尾段使用独立私有池；`split_no_skip` 使用同一切分，但让所有实际请求行
-执行尚余尾段（G=K 时同样无尾段）。默认仍为 `full`，不支持 memory saver、
+执行尚余尾段（G=K 时同样无尾段）。默认是 `split`/gate=1，不支持 memory saver、
 KV canary 或 draft-extend DSA seed。worker、runner、插件需同时更新至 split API v5；
-SA 状态布局保持 v3。配置示例仍保留 G=2、B=1/4，不代表能力上限。
+SA 状态布局更新为 v6。常规模板使用 G=1，B=1/4/8 不代表能力上限。
 详见 [动态行号与可配置 gate 验收](validation/dynamic-rows-gate-20261017.md)。
 
 EAGLE3 的 hot-token 映射在 prefix/tail 的 gate 比较和 token 选择前统一转换为
@@ -118,7 +123,7 @@ hidden/KV 注入与提交，并按 DSPARK 的连续输出布局回写接受前�
 模板为 `configs/device-dspark-sa-split.json`（K=5、gate=0，verify 窗口 6）。
 在已能运行的原生 DSPARK 命令上改用此 JSON，并保持
 `--speculative-dspark-block-size 5 --speculative-num-draft-tokens 6`；
-其他 checkpoint 的 gamma 需同步修改。原 full 模板和默认策略不变。
+其他 checkpoint 的 gamma 需同步修改。原 DSPARK full 模板仍显式保留 full/gate=1。
 
 当前要求 `gpu_sa + history_mode=device + verify_mode=static`，draft 模式为
 `full` 或上述 gate=0 `split`。SA/neural 等长、greedy、纯文本、单机 TP，支持全局 SA 池。
@@ -262,15 +267,15 @@ split 支持 K≥1、gate=0…K。`max_history_tokens=16384` 包含完整 prompt
 
 默认 CPU 历史模式使用同步调度器已提交到 CPU 的输出，只上传确认增量，当前 anchor 已包含在历史中。device 模式使用 GPU verify 的接受前缀，可能包含最终 CPU EOS/停止截断前的尾部；不能将其计数或索引长度当作最终交付 token 统计。这两条 GPU SA 路径均不增加逐步 D2H 读取。Arctic 的 CPU 树则需要每批 GPU 接受路径 D2H 和消费等待，不能套用 GPU SA 的性能结论。
 
-默认 GPU SA 的最长重复后缀通过 suffix link 查询，续写采用该后缀的最早出现位置。候选不含 anchor。匹配长度与可用续写长度分别记录；默认续写不足、版本不符、无槽位、历史超容量、token 非法或预算不足时整条链回退 neural。`partial_drafts="zero"` 单独复现尾部补零；不会选择较短匹配来填满候选。
+默认 GPU SA 的最长重复后缀通过 suffix link 查询，续写按每步转移的出现频次贪心选择；同频选较小 token ID。显式 `sa_continuation_policy="first"` 可改用最早出现位置复制。候选不含 anchor。匹配长度与可用续写长度分别记录；默认续写不足、版本不符、无槽位、历史超容量、token 非法或预算不足时整条链回退 neural。`partial_drafts="zero"` 单独复现尾部补零；不会选择较短匹配来填满候选。
 
-GPU SA 使用每请求一个线程维护状态，当前 v3 已引入高分叉哈希、双转移内联、增量分桶和低多样性快路径，历史状态预算约 68 字节/token。CPU 微基准的长历史改善不能直接推算 GPU 查询或模型 TPOT。默认 CPU 历史模式的前缀检查随历史长度增长；device 模式只在 prefill/retract 快照一次历史，后台线程不触碰请求对象或 CUDA。
+GPU SA 使用每请求一个线程维护状态，当前 v6 保留高分叉哈希、双转移内联、增量分桶和低多样性快路径，并新增在线频次动态树，历史容量≤32767 时状态预算约 72 字节/token，长容量自动使用 108 字节/token。CPU 微基准的长历史改善不能直接推算 GPU 查询或模型 TPOT。旧 CPU 历史模式的前缀检查随历史长度增长；device 模式只在 prefill/retract 快照一次历史，后台线程不触碰请求对象或 CUDA。
 
 针对根目录性能分析的后续改动与独立归因边界，见 [VALIDATION.md](VALIDATION.md) 顶部。full 模式把 TP 共识放在 draft 的 `prepare()` 中；split 在前缀结束、gate 判定后执行候选和 mask 共识，Graph 可捕获一次精确 MIN 归约；eager 在相同逻辑位置执行。不能根据某个 rank 的本地命中 mask 跳过通信。
 
 device 模式将六项来源统计融合到已有 GPU verify 反馈 kernel，避免每轮单独执行六次 PyTorch 归约及相关逐元素算子；诊断字段和 bonus 口径保持不变。Graph 槽位/代际映射在请求顺序、代际及捕获形状均不变时复用，避免重复清零和拷贝；SA 查询和 TP 共识仍每轮执行。CPU 历史保留原统计实现。当前 A100 回归和服务运行已覆盖设备反馈路径，组件改动的独立性能归因仍应按固定配置对照。
 
-`configs/device-k3.json` 提供与性能报告相同 K=3、阈值 4、整链 fallback 的设备历史配置，容量为 4×8192，当前 v3 设备状态预算约 2.13 MiB/卡（不含 Graph pool 等额外开销），覆盖报告中并发 4、4096 输入 + 256 输出的负载。它同时改变历史模式和容量，仅作为运行配置，不是单变量归因证据；对照时应分别固定容量、固定历史模式。保留旧 `example.json` 以复现 CPU 路径。
+`configs/device-k3.json` 提供与性能报告相同 K=3、阈值 4、整链 fallback 的设备历史配置，容量为 4×8192，当前 v6 设备状态预算约 2.25 MiB/卡（不含 Graph pool 等额外开销），覆盖报告中并发 4、4096 输入 + 256 输出的负载。它同时改变历史模式和容量，仅作为运行配置，不是单变量归因证据；对照时应分别固定容量、固定历史模式。`example.json` 也默认使用 device/split/gate=1；旧 CPU 路径需显式配置。
 
 ## 安装
 
@@ -301,7 +306,7 @@ git pull --ff-only
 
 保留 stash，查看 `git stash show -p` 后再判断是否需要合并回来。新版本已经处理 LoRA 默认值为 None、device 历史的 overlap 和 Qwen3.5/3.6 text-only MTP；旧的临时放宽校验可能已被覆盖。不要直接 `stash pop` 把旧文件逻辑重新覆盖回来，也无需 `reset --hard`。如果还有其他文件冲突，Git 会继续停止更新，按实际差异处理。
 
-成功更新后，若先前不是 editable 安装，重新运行上面的插件安装命令，并重启服务以加载新代码。部署 sa_spec 风格的设备增量路径时，将 `HYBRID_SPEC_CONFIG` 指向 `configs/device-k3.json`（原生 K=3）或 `configs/device-sa-spec.json`（原生 K=8）；`example.json` 继续用于旧 CPU 历史基线。
+成功更新后，若先前不是 editable 安装，重新运行上面的插件安装命令，并重启服务以加载新代码。部署 sa_spec 风格的设备增量路径时，将 `HYBRID_SPEC_CONFIG` 指向 `configs/device-k3.json`（原生 K=3）或 `configs/device-sa-spec.json`（原生 K=8）；`example.json` 现在也采用 device/split/gate=1；旧 CPU 历史基线需显式配置。
 
 ## 启动
 
@@ -318,14 +323,17 @@ python -m sglang.launch_server \
   --speculative-num-steps 3 \
   --speculative-eagle-topk 1 \
   --speculative-num-draft-tokens 4 \
+  --speculative-draft-attention-backend triton \
+  --max-running-requests 4 \
+  --cuda-graph-max-bs-decode 4 \
   --chunked-prefill-size 2048 \
   --tp-size 1 \
   --port 30000
 ```
 
-EAGLE3 / 普通 MTP 使用相应原生模型配置，分别保留原生 `EAGLE3` / `EAGLE` 算法身份，其他首版限制相同。先用 `--disable-cuda-graph` 验证 eager，再去掉该参数验收 Graph。
+EAGLE3 / 普通 MTP 使用相应原生模型配置，分别保留原生 `EAGLE3` / `EAGLE` 算法身份，其他首版限制相同。默认 split 必须启用 CUDA Graph；验证 eager 时先显式将 JSON 的 `draft_graph_mode` 改为 `full`，再设置 `--disable-cuda-graph`。
 
-上例启用 device 历史、overlap 和 2048 token 的 chunked prefill；不要添加 `--enable-mixed-chunk`。也可以省略 `--chunked-prefill-size` 使用 SGLang 为该模型解析的默认值。复现旧 CPU 历史基线时改回 `configs/example.json`，并恢复 `--disable-overlap-schedule --chunked-prefill-size -1`。做性能归因时分别比较两项都关闭、仅开启 overlap、两项都开启；native 与 hybrid 使用相同调度参数，且输入长度必须超过 chunk size 才实际覆盖分块路径。
+上例启用 device 历史、overlap 和 2048 token 的 chunked prefill；不要添加 `--enable-mixed-chunk`。也可以省略 `--chunked-prefill-size` 使用 SGLang 为该模型解析的默认值。复现旧 CPU 历史策略时，复制配置并显式设置 `history_mode=cpu`、`draft_graph_mode=full`、`num_neural_gate_tokens=0`、`sa_continuation_policy=first`，并恢复 `--disable-overlap-schedule --chunked-prefill-size -1`；新版仍维护频次，不能用作旧版无计数成本基线。做性能归因时分别比较两项都关闭、仅开启 overlap、两项都开启；native 与 hybrid 使用相同调度参数，且输入长度必须超过 chunk size 才实际覆盖分块路径。
 
 更新 CUDA 扩展代码后重启服务，PyTorch 会按源码变更重新编译。先验证 CUDA 算子，再运行无模型的组件微基准：
 
@@ -366,14 +374,17 @@ LoRA 关闭时，无需也无法通过 `--enable-lora` 显式传入 False；本�
 | `min_match_len` | 启用检索所需的最短历史匹配长度，须显式配置 |
 | `max_requests` | 可同时持有 SA 的请求数；无槽位时 neural fallback |
 | `max_history_tokens` | 单请求 prompt + 已提交输出容量；超出时 neural fallback |
-| `backend` | 服务只能使用 `gpu_sa`；`reference` 用于测试 |
-| `history_mode` | `cpu`（默认，旧同步路径）或 `device`（GPU 反馈与 Graph 内增量处理，支持单机多 TP 实验） |
+| `backend` | 服务支持 `gpu_sa` / `arctic`；`reference` 用于测试 |
+| `history_mode` | 默认 `device`（GPU 反馈和增量更新）；旧 `cpu` 路径仅 full，Arctic 使用 CPU 树 |
+| `draft_graph_mode` | 默认 `split`；可显式 full 或 split_no_skip 对照 |
+| `num_neural_gate_tokens` | 默认 1，范围 0…K；DSPARK split 仍只允许 0 |
+| `sa_continuation_policy` | 默认 `frequency`；`first` 复制最早出现位置的续写，适用于 GPU SA / reference |
 | `partial_drafts` | `fallback`（默认，不足 K 则整条回退）或 `zero`（参考实现的尾部补零草稿） |
 | `enable_global_pool` | 默认 `false`；`device` 模式下跨已发布的活跃请求和保留请求查询 SA |
 | `max_shared_requests` | 完成请求保留上限，默认 0；需开启全局池；达到上限按完成顺序 FIFO 淘汰 |
 | `shared_context_tokens` | 跨请求查询最多使用当前历史最后多少个 token，默认 128；本请求查询保持原行为 |
 
-状态内存估计：`4 * (max_requests + max_shared_requests) * [H + 5*(2H+1) + 6*(H+1) + 7]` 字节，加上每槽位 `40 + 4*(K+1)` 字节的设备反馈元数据。`configs/example.json` 约 34 MiB，另有查询与 Graph buffer。状态在 draft worker 构造时分配，早于 target KV 预算/分配；不修改原生 KV 规划。
+状态内存估计：`(max_requests + max_shared_requests) * [4*(H + 6*(H+1) + 7) + S*(2H+1)]` 字节，其中 H≤32767 时 S=22，否则 S=40；加上每槽位 `40 + 4*(K+1)` 字节的设备反馈元数据。`configs/example.json` 约 36 MiB，另有查询与 Graph buffer。状态在 draft worker 构造时分配，早于 target KV 预算/分配；不修改原生 KV 规划。
 
 ### 可选的跨请求 SA 历史
 
@@ -395,15 +406,15 @@ neural 前缀检查、TP 候选共识、target verify 和 split 的现有约束�
 该来源失效回退。未导入的后台构建不进入池，槽位复用有 generation 校验。
 跨请求查询兼容 `split`，要求 device 历史、gate=0…K、单机 TP≥1、greedy 等
 现有 split 约束。增加保留槽位不会放宽活跃并发限制，也会增加显存和查询成本。
-组合示例为 `configs/device-qwen35-mtp-split-global-pool.json`：K=8、gate=2、
-4 个活跃槽位、16 个保留槽位、H=4096，与 6000D 对照中的 split 配置一致。
+组合示例为 `configs/device-qwen35-mtp-split-global-pool.json`：K=8、gate=1、
+4 个活跃槽位、16 个保留槽位、H=4096；此前 6000D 对照使用 gate=2 和旧候选策略。
 吞吐取决于历史重复程度，不能从查询加速直接推断整体收益。
-并行查询保持 v3 存储布局；更新后重启服务，扩展会按 CUDA 源码变化自动重新编译。
+并行查询在 v6 使用只读频次访问；更新后重启服务，扩展会重新编译。
 参考来源、实现差异和验证范围见 [全局池记录](validation/global-pool.md)。
 
 转移边参考 sa-spec 的内联设计：每个状态直接保存第一条转移；第二条转移用同一辅助字段的负值编码，第三条起才分配边记录，超过 4 条出边才维护哈希。单一重复历史直接延长链，二值历史完全不使用边池。转移标签由已有历史和 first-position 恢复，clone 与重定向保持这一不变量。额外边数有 `n−1` 上界，预留边池从 `3H+1` 缩为 `H+1`；哈希仍逐桶分裂、精确比较键，CPU 状态可以直接导入较大 GPU 槽位继续扩展。重置不扫描整池。
 
-状态预算约 **68 字节/历史 token**，低于上一版哈希的 108，也低于最初链表的 72。例如 32 × 262144 每 rank 约 **544 MiB**，另加反馈和 Graph buffer。布局版本为 `hybrid_spec_gpu_sa_v3`，拉取后须重启服务。
+当前按历史容量选择布局：**H≤32767 约 72 字节/历史 token，H≥32768 约 108 字节/token**，均含精确频次辅助树。例如 32 × 16384 每 rank 约 **36 MiB**；32 × 262144 自动使用长布局，约 **864 MiB**，另加反馈和 Graph buffer。布局版本为 `hybrid_spec_gpu_sa_v6`，更新后须重启服务。此前 v3 的 68 字节预算属于无频次历史实现。
 
 多 TP 的 SA 状态按 rank 复制，上述容量是每张卡的占用，不随 TP 分片缩小。每轮将 `[tokens, ~tokens, eligibility]` 打包做一次 MIN all-reduce；按位取反逆转 int64 的有符号顺序，因此归约后 `min(tokens) == ~min(~tokens)` 逐位置成立当且仅当所有 rank 的候选完全相同。资格也必须全部为真。任一 rank 不满足条件或候选不同，所有 rank 对该行统一回退 neural；不需要广播或指定源 rank。归约输入为 `8*B*(2K+1)` 字节（不代表实际链路流量），Graph 中 B 包括 padding。沿用 SGLang 的 TP batch 顺序/形状一致性约定，不能用于不同 rank 独立调度请求。
 

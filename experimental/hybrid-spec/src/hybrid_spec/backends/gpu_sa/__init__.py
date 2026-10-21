@@ -7,6 +7,7 @@ from pathlib import Path
 import torch
 
 from hybrid_spec.backends.host_sa import NativeHostBuilder
+from hybrid_spec.backends.sa_layout import SA_STORAGE_REVISION, state_layout
 from hybrid_spec.core.contracts import RetrievalCandidates
 
 
@@ -14,8 +15,11 @@ class GPUSuffixAutomaton:
     @staticmethod
     def estimate_memory(config):
         h, n = config.max_history_tokens, config.num_sa_slots
+        dtype, fields = state_layout(h)
+        state_bytes = torch.empty((), dtype=dtype).element_size() * fields
         return n * (
-            (h + (2 * h + 1) * 5 + (h + 1) * 6 + 7) * 4
+            (h + (h + 1) * 6 + 7) * 4
+            + (2 * h + 1) * state_bytes
             + 40
             + 4 * (config.num_drafts + 1)
         )
@@ -25,7 +29,7 @@ class GPUSuffixAutomaton:
         from torch.utils.cpp_extension import load
 
         return load(
-            name="hybrid_spec_gpu_sa_v4",
+            name=f"hybrid_spec_gpu_sa_v{SA_STORAGE_REVISION}",
             sources=[
                 str(Path(__file__).with_name("suffix_automaton.cu")),
                 str(Path(__file__).with_name("host_builder.cpp")),
@@ -45,9 +49,10 @@ class GPUSuffixAutomaton:
         self.host_builder = NativeHostBuilder(self.module.__file__)
         self.host_transfers = []
         n, h = config.num_sa_slots, config.max_history_tokens
+        dtype, fields = state_layout(h)
         self.history = torch.empty((n, h), dtype=torch.int32, device=self.device)
         self.states = torch.empty(
-            (n, 2 * h + 1, 5), dtype=torch.int32, device=self.device
+            (n, 2 * h + 1, fields), dtype=dtype, device=self.device
         )
         self.edges = torch.empty((n, h + 1, 6), dtype=torch.int32, device=self.device)
         self.meta = torch.zeros((n, 7), dtype=torch.int32, device=self.device)
@@ -91,7 +96,13 @@ class GPUSuffixAutomaton:
         self._check_stream()
         slots = torch.tensor(snapshot.slots, dtype=torch.int64, device=self.device)
         outputs = self.module.query(
-            self.history, self.states, self.edges, self.meta, slots, num_drafts
+            self.history,
+            self.states,
+            self.edges,
+            self.meta,
+            slots,
+            num_drafts,
+            self.config.sa_continuation_policy == "frequency",
         )
         return RetrievalCandidates(*outputs)
 
@@ -102,7 +113,10 @@ class GPUSuffixAutomaton:
         self.pending_meta[slot].zero_()
 
     def prepare_host(self, history):
-        return self.host_builder.prepare(history)
+        # Match the destination layout even for a short prompt in a long slot.
+        return self.host_builder.prepare(
+            history, compact=self.states.dtype == torch.uint16
+        )
 
     def build_host(self, host, vocab_size):
         return self.host_builder.build(host, vocab_size)
@@ -117,6 +131,8 @@ class GPUSuffixAutomaton:
             0 <= slot < self.config.num_sa_slots
             and 0 <= length < h
             and 1 <= num_states <= min(host.states.shape[0], 2 * h + 1)
+            and host.states.dtype == self.states.dtype
+            and host.states.shape[1:] == self.states.shape[2:]
             and 0 <= num_edges <= min(host.edges.shape[0], h + 1)
             and healthy == 1
             and hash_base > 0
@@ -211,4 +227,5 @@ class GPUSuffixAutomaton:
             self.config.shared_context_tokens,
             query_metadata,
             self.config.sa_require_unique_continuation,
+            self.config.sa_continuation_policy == "frequency",
         )

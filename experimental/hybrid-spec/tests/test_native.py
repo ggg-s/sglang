@@ -18,6 +18,7 @@ import torch
 from hybrid_spec.backends.gpu_sa import GPUSuffixAutomaton
 from hybrid_spec.backends.host_sa import NativeHostBuilder
 from hybrid_spec.backends.reference import SuffixAutomaton
+from hybrid_spec.backends.sa_layout import state_layout, unpack_states
 from hybrid_spec.config import HybridConfig
 
 
@@ -33,7 +34,7 @@ def native_toolchain(tmp_path):
     # include unrelated credentials from the developer's shell environment.
     env = {
         name: os.environ[name]
-        for name in ("SystemRoot", "WINDIR", "PATH", "TEMP", "TMP", "HOME")
+        for name in ("SystemRoot", "WINDIR", "PATH", "TEMP", "TMP", "TMPDIR", "HOME")
         if name in os.environ
     }
     env.update(
@@ -43,7 +44,8 @@ def native_toolchain(tmp_path):
     return command, env
 
 
-def test_native_automaton_against_exhaustive_oracle(tmp_path):
+@pytest.mark.parametrize("source", ["automaton_test.cpp", "frequency_test.cpp"])
+def test_native_automaton_against_exhaustive_oracle(tmp_path, source):
     command, env = native_toolchain(tmp_path)
     package = Path(__file__).resolve().parents[1]
     executable = tmp_path / ("automaton.exe" if os.name == "nt" else "automaton")
@@ -55,7 +57,7 @@ def test_native_automaton_against_exhaustive_oracle(tmp_path):
             "-UNDEBUG",
             "-I",
             str(package / "src/hybrid_spec/backends/gpu_sa"),
-            str(package / "tests/native/automaton_test.cpp"),
+            str(package / "tests/native" / source),
             str(package / "src/hybrid_spec/backends/gpu_sa/host_builder.cpp"),
             "-o",
             str(executable),
@@ -93,7 +95,10 @@ def host_builder(tmp_path_factory):
     return NativeHostBuilder(library, pin_memory=False)
 
 
-def test_host_native_layout_matches_reference_and_validates_tokens(host_builder):
+@pytest.mark.parametrize("compact", [False, True])
+def test_host_native_layout_matches_reference_and_validates_tokens(
+    host_builder, compact
+):
     """Transferred states must preserve suffix links, clone positions and edges."""
     histories = itertools.chain.from_iterable(
         itertools.product(range(alphabet), repeat=width)
@@ -101,16 +106,15 @@ def test_host_native_layout_matches_reference_and_validates_tokens(host_builder)
         for width in range(1, maximum + 1)
     )
     for tokens in histories:
-        host = host_builder.build(host_builder.prepare(tokens), 100)
+        host = host_builder.build(host_builder.prepare(tokens, compact=compact), 100)
         oracle = SuffixAutomaton()
         oracle.append(tokens)
         length, num_states, num_edges, last, healthy, _, _ = host.meta.tolist()
         assert length == len(tokens) and last == oracle.last and healthy == 1
         assert host.history[:length].tolist() == list(tokens)
         assert num_states == len(oracle.links)
-        for i, (depth, link, pos, inline, head) in enumerate(
-            host.states[:num_states].tolist()
-        ):
+        states = unpack_states(host.states[:num_states])
+        for i, (depth, link, pos, inline, head) in enumerate(states[:, :5].tolist()):
             assert (depth, link, pos) == (
                 oracle.lengths[i],
                 oracle.links[i],
@@ -119,7 +123,7 @@ def test_host_native_layout_matches_reference_and_validates_tokens(host_builder)
             edges = {} if inline == -1 else {host.history[pos + 1].item(): inline}
             if head < -1:
                 target = ~head
-                edges[host.history[host.states[target, 2]].item()] = target
+                edges[host.history[states[target, 2]].item()] = target
                 head = -1
             while head != -1:
                 assert 0 <= head < num_edges
@@ -129,7 +133,27 @@ def test_host_native_layout_matches_reference_and_validates_tokens(host_builder)
             assert edges == oracle.edges[i]
     for tokens in ((-1,), (100,), (2**32 + 3,)):
         with pytest.raises(ValueError, match="target-vocabulary"):
-            host_builder.build(host_builder.prepare(tokens), 100)
+            host_builder.build(host_builder.prepare(tokens, compact=compact), 100)
+
+
+@pytest.mark.parametrize("capacity", [16384, 32767, 32768, 65536])
+def test_state_layout_boundary_and_memory_estimate(capacity):
+    dtype, fields = state_layout(capacity)
+    compact = capacity <= 32767
+    assert (dtype, fields) == ((torch.uint16, 11) if compact else (torch.int32, 10))
+    config = HybridConfig(3, 2, 32, capacity)
+    expected = 32 * (
+        (capacity + (capacity + 1) * 6 + 7) * 4
+        + (2 * capacity + 1) * (22 if compact else 40)
+        + 40
+        + 4 * 4
+    )
+    assert GPUSuffixAutomaton.estimate_memory(config) == expected
+
+
+def test_host_compact_capacity_rejects_overflow(host_builder):
+    with pytest.raises(ValueError, match="compact SA history capacity"):
+        host_builder.prepare([1] * 32768, compact=True)
 
 
 def test_native_host_builder_releases_gil_during_prefill(host_builder):
@@ -158,7 +182,7 @@ def test_host_import_copies_used_prefixes_and_keeps_sources_until_event(
     backend.device = torch.device("cpu")
     backend._check_stream = lambda: None
     backend.history = torch.full((1, 32), -99, dtype=torch.int32)
-    backend.states = torch.full((1, 65, 5), -99, dtype=torch.int32)
+    backend.states = torch.full((1, 65, 10), -99, dtype=torch.int32)
     backend.edges = torch.full((1, 33, 6), -99, dtype=torch.int32)
     backend.meta = torch.zeros((1, 7), dtype=torch.int32)
     backend.pending_meta = torch.tensor([[9, 5, 1]])

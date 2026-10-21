@@ -1,0 +1,23 @@
+{
+  "local_package": {
+    "passed": 359,
+    "skipped": 703,
+    "note": "TP is exercised by the remote broad suite; CUDA skips are not passes"
+  },
+  "native_sanitizers": {
+    "address": true,
+    "undefined": true,
+    "exit_code": 0
+  },
+  "ruff": "E9,F and formatting passed on all 58 Python files",
+  "whitespace": "git diff --check passed",
+  "source_files_matched": 87,
+  "artifacts_sha256": {
+    "source-manifest.json": "cbcef225c10f71a413604766c2bd1e6bfbedfa896e3ab95a428c1218ee41ae46",
+    "layout-costs.json": "2f00df37703f25e7dba7abf20688cbae3586b1282627ae377448386857c67406",
+    "results.json": "6e25ee04509ebc3318c4d0c502821f301325124c64d8155295e6e3cf19edb072",
+    "layout-repeat-costs.json": "ead7f7a0b71ad7043d9b128f9073249179fa72c02a3c9197088d79cbc943c6ed",
+    "local-evidence.tar.gz": "09beba0c8ca99c5a5185104e70045f7b7ac3953025d5247d7135feb811215276",
+    "cuda-evidence.tar.gz": "9a05096404eb216315295cad1608654b238dfa463552e0096ca9b7120fc72048"
+  }
+}

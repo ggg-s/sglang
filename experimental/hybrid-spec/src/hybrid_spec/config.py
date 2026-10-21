@@ -13,11 +13,12 @@ class HybridConfig:
     max_requests: int
     max_history_tokens: int
     backend: str = "gpu_sa"
-    history_mode: str = "cpu"
+    history_mode: str = "device"
     partial_drafts: str = "fallback"
-    num_neural_gate_tokens: int = 0
+    num_neural_gate_tokens: int = 1
+    sa_continuation_policy: str = "frequency"
     sa_require_unique_continuation: bool = False
-    draft_graph_mode: str = "full"
+    draft_graph_mode: str = "split"
     enable_global_pool: bool = False
     max_shared_requests: int = 0
     shared_context_tokens: int = 128
@@ -67,6 +68,8 @@ class HybridConfig:
             raise ValueError("num_neural_gate_tokens must be between 0 and num_drafts")
         if self.draft_graph_mode not in ("full", "split", "split_no_skip"):
             raise ValueError("draft_graph_mode must be full, split or split_no_skip")
+        if self.sa_continuation_policy not in ("frequency", "first"):
+            raise ValueError("sa_continuation_policy must be frequency or first")
         if type(self.sa_require_unique_continuation) is not bool or (
             self.sa_require_unique_continuation
             and (

@@ -43,12 +43,29 @@ class SuffixAutomaton:
                     self.links[q] = self.links[current] = clone
             self.last = current
 
-    def query(self, num_drafts):
+    def query(self, num_drafts, continuation_policy="first"):
         # The suffix link of last is the longest repeated suffix. first_pos
         # chooses its earliest occurrence, giving the longest available tail.
         state = self.links[self.last]
         if state <= 0:
             return [], 0
+        if continuation_policy == "frequency":
+            # Deliberately independent, exhaustive oracle for the native
+            # state's online counters and transition ranking.
+            pattern = self.history[-self.lengths[state] :]
+            result = []
+            for _ in range(num_drafts):
+                counts = {}
+                for start in range(len(self.history) - len(pattern)):
+                    if self.history[start : start + len(pattern)] == pattern:
+                        token = self.history[start + len(pattern)]
+                        counts[token] = counts.get(token, 0) + 1
+                if not counts:
+                    break
+                token = min(counts, key=lambda token: (-counts[token], token))
+                result.append(token)
+                pattern = pattern + [token]
+            return result, self.lengths[state]
         start = self.first_pos[state] + 1
         return self.history[start : start + num_drafts], self.lengths[state]
 
@@ -79,7 +96,7 @@ class ReferenceBackend:
             if slot < 0:
                 continue
             sa = self.slots[slot]
-            result, match = sa.query(num_drafts)
+            result, match = sa.query(num_drafts, self.config.sa_continuation_policy)
             tokens[row, : len(result)] = torch.tensor(result, device=self.device)
             valid[row] = len(result)
             matches[row] = match

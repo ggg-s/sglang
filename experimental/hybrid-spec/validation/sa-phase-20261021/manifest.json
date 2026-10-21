@@ -1,0 +1,330 @@
+{
+  "events_exit": 0,
+  "profiler_exit": 0,
+  "event_replays": 31200,
+  "profiled_sa_kernels": 10400,
+  "telemetry": {
+    "main": {
+      "samples": 48,
+      "ranges": {
+        "sm_mhz": {
+          "min": 2250.0,
+          "max": 2490.0
+        },
+        "memory_mhz": {
+          "min": 8000.0,
+          "max": 8000.0
+        },
+        "power_watts": {
+          "min": 23.44,
+          "max": 35.06
+        },
+        "temperature_c": {
+          "min": 47.0,
+          "max": 53.0
+        },
+        "gpu_util_percent": {
+          "min": 6.0,
+          "max": 61.0
+        }
+      },
+      "pstates": [
+        "P0"
+      ]
+    },
+    "profile-final": {
+      "samples": 52,
+      "ranges": {
+        "sm_mhz": {
+          "min": 2250.0,
+          "max": 2505.0
+        },
+        "memory_mhz": {
+          "min": 8000.0,
+          "max": 8000.0
+        },
+        "power_watts": {
+          "min": 23.69,
+          "max": 27.71
+        },
+        "temperature_c": {
+          "min": 40.0,
+          "max": 45.0
+        },
+        "gpu_util_percent": {
+          "min": 0.0,
+          "max": 59.0
+        }
+      },
+      "pstates": [
+        "P0"
+      ]
+    }
+  },
+  "target_anomaly": {
+    "wide": {
+      "inner_median_us": 21.503999829292297,
+      "outer_median_us": 30.57599999010563,
+      "top_outer_samples": [
+        {
+          "wall_start_ns": 1792557177371641058,
+          "wall_end_ns": 1792557177372179394,
+          "inner_us": 21.503999829292297,
+          "outer_us": 450.6880044937134,
+          "host_replay_us": 38.742
+        },
+        {
+          "wall_start_ns": 1792557177400835666,
+          "wall_end_ns": 1792557177401119614,
+          "inner_us": 21.503999829292297,
+          "outer_us": 201.9840031862259,
+          "host_replay_us": 108.728
+        },
+        {
+          "wall_start_ns": 1792557177408770947,
+          "wall_end_ns": 1792557177408956350,
+          "inner_us": 20.255999639630318,
+          "outer_us": 105.47199845314026,
+          "host_replay_us": 12.091
+        },
+        {
+          "wall_start_ns": 1792557177406813804,
+          "wall_end_ns": 1792557177406997564,
+          "inner_us": 20.416000857949257,
+          "outer_us": 94.2080020904541,
+          "host_replay_us": 10.561
+        },
+        {
+          "wall_start_ns": 1792557177407891196,
+          "wall_end_ns": 1792557177408070511,
+          "inner_us": 20.416000857949257,
+          "outer_us": 94.2080020904541,
+          "host_replay_us": 12.086
+        }
+      ]
+    },
+    "compact": {
+      "inner_median_us": 20.368000492453575,
+      "outer_median_us": 29.69600073993206,
+      "top_outer_samples": [
+        {
+          "wall_start_ns": 1792557177402661529,
+          "wall_end_ns": 1792557177402833977,
+          "inner_us": 20.479999482631683,
+          "outer_us": 83.10399949550629,
+          "host_replay_us": 60.091
+        },
+        {
+          "wall_start_ns": 1792557177405970788,
+          "wall_end_ns": 1792557177406103651,
+          "inner_us": 21.503999829292297,
+          "outer_us": 75.77600330114365,
+          "host_replay_us": 14.54
+        },
+        {
+          "wall_start_ns": 1792557177403784023,
+          "wall_end_ns": 1792557177403952290,
+          "inner_us": 20.128000527620316,
+          "outer_us": 75.48800110816956,
+          "host_replay_us": 10.526
+        },
+        {
+          "wall_start_ns": 1792557177405231849,
+          "wall_end_ns": 1792557177405365163,
+          "inner_us": 18.432000651955605,
+          "outer_us": 74.81600344181061,
+          "host_replay_us": 11.847
+        },
+        {
+          "wall_start_ns": 1792557177408238053,
+          "wall_end_ns": 1792557177408366700,
+          "inner_us": 18.432000651955605,
+          "outer_us": 74.72000271081924,
+          "host_replay_us": 12.454
+        }
+      ]
+    }
+  },
+  "empty_event_control": {
+    "median_us": 3.0720001086592674,
+    "p10_us": 2.047999994829297,
+    "p90_us": 4.111999971792102,
+    "max_us": 50.175998359918594,
+    "min_us": 1.0239999974146485
+  },
+  "delay_controls": [
+    {
+      "layout": "wide",
+      "delay_seconds": 0,
+      "samples": [
+        {
+          "wall_start_ns": 1792557177427476896,
+          "wall_end_ns": 1792557177427546374,
+          "inner_us": 19.45599913597107,
+          "outer_us": 22.52800017595291,
+          "host_replay_us": 12.161
+        },
+        {
+          "wall_start_ns": 1792557177427609386,
+          "wall_end_ns": 1792557177427689083,
+          "inner_us": 19.45599913597107,
+          "outer_us": 23.552000522613525,
+          "host_replay_us": 10.391
+        },
+        {
+          "wall_start_ns": 1792557177427748197,
+          "wall_end_ns": 1792557177427829151,
+          "inner_us": 19.45599913597107,
+          "outer_us": 22.52800017595291,
+          "host_replay_us": 8.259
+        },
+        {
+          "wall_start_ns": 1792557177427887680,
+          "wall_end_ns": 1792557177427943510,
+          "inner_us": 21.503999829292297,
+          "outer_us": 34.81600061058998,
+          "host_replay_us": 13.529
+        },
+        {
+          "wall_start_ns": 1792557177428039564,
+          "wall_end_ns": 1792557177428104667,
+          "inner_us": 19.45599913597107,
+          "outer_us": 26.623999699950218,
+          "host_replay_us": 9.582
+        }
+      ]
+    },
+    {
+      "layout": "wide",
+      "delay_seconds": 0.001,
+      "samples": [
+        {
+          "wall_start_ns": 1792557177428173002,
+          "wall_end_ns": 1792557177429521724,
+          "inner_us": 37.728000432252884,
+          "outer_us": 1305.4720163345337,
+          "host_replay_us": 39.252
+        },
+        {
+          "wall_start_ns": 1792557177429682626,
+          "wall_end_ns": 1792557177431111804,
+          "inner_us": 32.416000962257385,
+          "outer_us": 1303.5520315170288,
+          "host_replay_us": 47.035
+        },
+        {
+          "wall_start_ns": 1792557177431264170,
+          "wall_end_ns": 1792557177432578375,
+          "inner_us": 20.479999482631683,
+          "outer_us": 1233.5679531097412,
+          "host_replay_us": 30.431
+        },
+        {
+          "wall_start_ns": 1792557177432743356,
+          "wall_end_ns": 1792557177434110501,
+          "inner_us": 28.672000393271446,
+          "outer_us": 1298.4319925308228,
+          "host_replay_us": 45.998
+        },
+        {
+          "wall_start_ns": 1792557177434258288,
+          "wall_end_ns": 1792557177435538076,
+          "inner_us": 31.615998595952988,
+          "outer_us": 1207.1679830551147,
+          "host_replay_us": 16.232
+        }
+      ]
+    },
+    {
+      "layout": "compact",
+      "delay_seconds": 0,
+      "samples": [
+        {
+          "wall_start_ns": 1792557177435685775,
+          "wall_end_ns": 1792557177435843983,
+          "inner_us": 19.45599913597107,
+          "outer_us": 68.44799965620041,
+          "host_replay_us": 10.957
+        },
+        {
+          "wall_start_ns": 1792557177435960214,
+          "wall_end_ns": 1792557177436097191,
+          "inner_us": 21.43999934196472,
+          "outer_us": 25.599999353289604,
+          "host_replay_us": 10.728
+        },
+        {
+          "wall_start_ns": 1792557177436215402,
+          "wall_end_ns": 1792557177436357502,
+          "inner_us": 55.424001067876816,
+          "outer_us": 71.68000191450119,
+          "host_replay_us": 55.776
+        },
+        {
+          "wall_start_ns": 1792557177436470648,
+          "wall_end_ns": 1792557177436581942,
+          "inner_us": 19.45599913597107,
+          "outer_us": 25.312000885605812,
+          "host_replay_us": 10.001
+        },
+        {
+          "wall_start_ns": 1792557177436694101,
+          "wall_end_ns": 1792557177436807851,
+          "inner_us": 18.432000651955605,
+          "outer_us": 22.52800017595291,
+          "host_replay_us": 10.086
+        }
+      ]
+    },
+    {
+      "layout": "compact",
+      "delay_seconds": 0.001,
+      "samples": [
+        {
+          "wall_start_ns": 1792557177436921065,
+          "wall_end_ns": 1792557177438283724,
+          "inner_us": 29.69600073993206,
+          "outer_us": 1297.50394821167,
+          "host_replay_us": 44.838
+        },
+        {
+          "wall_start_ns": 1792557177438429384,
+          "wall_end_ns": 1792557177439736371,
+          "inner_us": 20.479999482631683,
+          "outer_us": 1241.8240308761597,
+          "host_replay_us": 24.819
+        },
+        {
+          "wall_start_ns": 1792557177439913534,
+          "wall_end_ns": 1792557177441192843,
+          "inner_us": 27.39199995994568,
+          "outer_us": 1254.4000148773193,
+          "host_replay_us": 61.949
+        },
+        {
+          "wall_start_ns": 1792557177441315727,
+          "wall_end_ns": 1792557177442554031,
+          "inner_us": 28.672000393271446,
+          "outer_us": 1216.5119647979736,
+          "host_replay_us": 52.783
+        },
+        {
+          "wall_start_ns": 1792557177442695808,
+          "wall_end_ns": 1792557177444071079,
+          "inner_us": 36.86400130391121,
+          "outer_us": 1319.9360370635986,
+          "host_replay_us": 89.765
+        }
+      ]
+    }
+  ],
+  "benchmark_sha256": "e28dbcdaa05b2995422f7b75cdc3b4e87809d79ce9fed3abb94040ddac843de9",
+  "production_sha256": {
+    "automaton.h": "cdf13a54b25462807be548c1e6633799ae04214aba7c214c7e4ba5cb7034b502",
+    "host_builder.h": "bbea1fe483e470bd2222b837d57f21dabcd8304ee6994ac5373f9a05112f0ed8",
+    "host_builder.cpp": "719633c3eef922fd92f84bf9de30d303de32ecdd91ac3a259480edf238b87f78",
+    "suffix_automaton.cu": "f7a2bfa7bf33398ea23b352216a6aefb24038b19e12bd81895372347f02b5066",
+    "generated_probe": "86d22fbec8c8680795448e88479b09580563b9ba750895c96cf96ba207182b00"
+  },
+  "evidence_sha256": "134884b1b3ef3f1ce81d36d6d7bec1a8723046102a0839d49474db66f9079339"
+}

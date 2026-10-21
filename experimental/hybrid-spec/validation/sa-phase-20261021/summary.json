@@ -1,0 +1,1144 @@
+{
+  "metric": "CUPTI CUDA kernel duration, median of five round medians, 20 kernels/round/layout/phase",
+  "rows": [
+    {
+      "capacity": 1024,
+      "alphabet": 1,
+      "batch_size": 1,
+      "eligible_at_min4": [
+        true
+      ],
+      "phases": {
+        "update": {
+          "wide_us": 14.076,
+          "compact_us": 12.285,
+          "wide_round_medians_us": [
+            14.076,
+            14.091999999999999,
+            14.077,
+            14.076,
+            14.076
+          ],
+          "compact_round_medians_us": [
+            12.285,
+            12.285,
+            12.316,
+            12.285,
+            12.285
+          ],
+          "reduction_percent": 12.72378516624041
+        },
+        "query": {
+          "wide_us": 2.464,
+          "compact_us": 2.3674999999999997,
+          "wide_round_medians_us": [
+            2.4795,
+            2.4635,
+            2.464,
+            2.464,
+            2.463
+          ],
+          "compact_round_medians_us": [
+            2.3674999999999997,
+            2.368,
+            2.367,
+            2.3674999999999997,
+            2.3674999999999997
+          ],
+          "reduction_percent": 3.9163961038961137
+        },
+        "query_min1": {
+          "wide_us": 2.464,
+          "compact_us": 2.368,
+          "wide_round_medians_us": [
+            2.463,
+            2.464,
+            2.495,
+            2.464,
+            2.463
+          ],
+          "compact_round_medians_us": [
+            2.368,
+            2.399,
+            2.368,
+            2.368,
+            2.3834999999999997
+          ],
+          "reduction_percent": 3.8961038961038974
+        },
+        "combined": {
+          "wide_us": 14.908,
+          "compact_us": 13.852,
+          "wide_round_medians_us": [
+            14.908,
+            14.908,
+            14.908,
+            14.908,
+            14.908
+          ],
+          "compact_round_medians_us": [
+            13.8525,
+            13.852,
+            13.852,
+            13.852,
+            13.852
+          ],
+          "reduction_percent": 7.083445130131471
+        }
+      }
+    },
+    {
+      "capacity": 1024,
+      "alphabet": 1,
+      "batch_size": 4,
+      "eligible_at_min4": [
+        true,
+        true,
+        true,
+        true
+      ],
+      "phases": {
+        "update": {
+          "wide_us": 15.986,
+          "compact_us": 13.716,
+          "wide_round_medians_us": [
+            15.986,
+            15.986,
+            15.986,
+            15.986,
+            15.986
+          ],
+          "compact_round_medians_us": [
+            13.716,
+            13.716,
+            13.716,
+            13.716,
+            13.716
+          ],
+          "reduction_percent": 14.199924934317531
+        },
+        "query": {
+          "wide_us": 2.653,
+          "compact_us": 2.59,
+          "wide_round_medians_us": [
+            2.654,
+            2.653,
+            2.653,
+            2.653,
+            2.654
+          ],
+          "compact_round_medians_us": [
+            2.59,
+            2.59,
+            2.59,
+            2.5895,
+            2.59
+          ],
+          "reduction_percent": 2.374670184696581
+        },
+        "query_min1": {
+          "wide_us": 2.653,
+          "compact_us": 2.59,
+          "wide_round_medians_us": [
+            2.622,
+            2.653,
+            2.622,
+            2.653,
+            2.653
+          ],
+          "compact_round_medians_us": [
+            2.589,
+            2.59,
+            2.59,
+            2.59,
+            2.59
+          ],
+          "reduction_percent": 2.374670184696581
+        },
+        "combined": {
+          "wide_us": 16.881,
+          "compact_us": 15.826,
+          "wide_round_medians_us": [
+            16.881,
+            16.881,
+            16.881,
+            16.881,
+            16.881
+          ],
+          "compact_round_medians_us": [
+            15.826,
+            15.826,
+            15.826,
+            15.826,
+            15.826
+          ],
+          "reduction_percent": 6.24962976127007
+        }
+      }
+    },
+    {
+      "capacity": 1024,
+      "alphabet": 2,
+      "batch_size": 1,
+      "eligible_at_min4": [
+        true
+      ],
+      "phases": {
+        "update": {
+          "wide_us": 131.494,
+          "compact_us": 113.768,
+          "wide_round_medians_us": [
+            131.494,
+            131.494,
+            131.494,
+            131.494,
+            131.494
+          ],
+          "compact_round_medians_us": [
+            113.768,
+            113.768,
+            113.768,
+            113.768,
+            113.768
+          ],
+          "reduction_percent": 13.48046298690434
+        },
+        "query": {
+          "wide_us": 6.324,
+          "compact_us": 6.132,
+          "wide_round_medians_us": [
+            6.324,
+            6.324,
+            6.323,
+            6.324,
+            6.324
+          ],
+          "compact_round_medians_us": [
+            6.132,
+            6.132,
+            6.132,
+            6.1325,
+            6.132
+          ],
+          "reduction_percent": 3.0360531309297945
+        },
+        "query_min1": {
+          "wide_us": 6.324,
+          "compact_us": 6.133,
+          "wide_round_medians_us": [
+            6.324,
+            6.324,
+            6.324,
+            6.324,
+            6.324
+          ],
+          "compact_round_medians_us": [
+            6.1485,
+            6.133,
+            6.133,
+            6.132,
+            6.133
+          ],
+          "reduction_percent": 3.020240354206194
+        },
+        "combined": {
+          "wide_us": 135.933,
+          "compact_us": 117.537,
+          "wide_round_medians_us": [
+            135.933,
+            135.93349999999998,
+            135.933,
+            135.933,
+            135.934
+          ],
+          "compact_round_medians_us": [
+            117.537,
+            117.5365,
+            117.537,
+            117.536,
+            117.537
+          ],
+          "reduction_percent": 13.53313764869457
+        }
+      }
+    },
+    {
+      "capacity": 1024,
+      "alphabet": 2,
+      "batch_size": 4,
+      "eligible_at_min4": [
+        true,
+        true,
+        true,
+        true
+      ],
+      "phases": {
+        "update": {
+          "wide_us": 133.118,
+          "compact_us": 114.665,
+          "wide_round_medians_us": [
+            133.118,
+            133.118,
+            133.118,
+            133.118,
+            133.118
+          ],
+          "compact_round_medians_us": [
+            114.665,
+            114.664,
+            114.665,
+            114.665,
+            114.665
+          ],
+          "reduction_percent": 13.86213735182319
+        },
+        "query": {
+          "wide_us": 6.625,
+          "compact_us": 6.109,
+          "wide_round_medians_us": [
+            6.625,
+            6.593500000000001,
+            6.625,
+            6.625,
+            6.625
+          ],
+          "compact_round_medians_us": [
+            6.14,
+            6.108,
+            6.109,
+            6.108499999999999,
+            6.109
+          ],
+          "reduction_percent": 7.7886792452830145
+        },
+        "query_min1": {
+          "wide_us": 6.593,
+          "compact_us": 6.108499999999999,
+          "wide_round_medians_us": [
+            6.593,
+            6.593500000000001,
+            6.593,
+            6.625,
+            6.593
+          ],
+          "compact_round_medians_us": [
+            6.108499999999999,
+            6.14,
+            6.108,
+            6.108,
+            6.14
+          ],
+          "reduction_percent": 7.348703170028825
+        },
+        "combined": {
+          "wide_us": 138.6445,
+          "compact_us": 118.575,
+          "wide_round_medians_us": [
+            138.6445,
+            138.644,
+            138.6445,
+            138.645,
+            138.645
+          ],
+          "compact_round_medians_us": [
+            118.575,
+            118.575,
+            118.575,
+            118.575,
+            118.575
+          ],
+          "reduction_percent": 14.475511109348005
+        }
+      }
+    },
+    {
+      "capacity": 1024,
+      "alphabet": 64,
+      "batch_size": 1,
+      "eligible_at_min4": [
+        false
+      ],
+      "phases": {
+        "update": {
+          "wide_us": 58.33,
+          "compact_us": 51.156,
+          "wide_round_medians_us": [
+            58.33,
+            58.33,
+            58.33,
+            58.33,
+            58.33
+          ],
+          "compact_round_medians_us": [
+            51.156,
+            51.156,
+            51.156,
+            51.156499999999994,
+            51.156
+          ],
+          "reduction_percent": 12.29898851362935
+        },
+        "query": {
+          "wide_us": 2.165,
+          "compact_us": 2.133,
+          "wide_round_medians_us": [
+            2.165,
+            2.165,
+            2.149,
+            2.165,
+            2.133
+          ],
+          "compact_round_medians_us": [
+            2.133,
+            2.133,
+            2.133,
+            2.133,
+            2.133
+          ],
+          "reduction_percent": 1.4780600461893778
+        },
+        "query_min1": {
+          "wide_us": 6.398,
+          "compact_us": 6.172,
+          "wide_round_medians_us": [
+            6.398,
+            6.398,
+            6.398,
+            6.398,
+            6.398
+          ],
+          "compact_round_medians_us": [
+            6.173,
+            6.172,
+            6.172,
+            6.172,
+            6.173
+          ],
+          "reduction_percent": 3.5323538605814275
+        },
+        "combined": {
+          "wide_us": 58.912,
+          "compact_us": 51.2535,
+          "wide_round_medians_us": [
+            58.912,
+            58.911500000000004,
+            58.912,
+            58.911,
+            58.912
+          ],
+          "compact_round_medians_us": [
+            51.269,
+            51.2535,
+            51.269499999999994,
+            51.253,
+            51.253
+          ],
+          "reduction_percent": 12.999898153177615
+        }
+      }
+    },
+    {
+      "capacity": 1024,
+      "alphabet": 64,
+      "batch_size": 4,
+      "eligible_at_min4": [
+        false,
+        false,
+        false,
+        false
+      ],
+      "phases": {
+        "update": {
+          "wide_us": 58.288,
+          "compact_us": 51.898,
+          "wide_round_medians_us": [
+            58.288,
+            58.288,
+            58.288,
+            58.288,
+            58.288
+          ],
+          "compact_round_medians_us": [
+            51.898,
+            51.898,
+            51.898,
+            51.898,
+            51.898
+          ],
+          "reduction_percent": 10.962805380181162
+        },
+        "query": {
+          "wide_us": 2.033,
+          "compact_us": 2.066,
+          "wide_round_medians_us": [
+            2.033,
+            2.033,
+            2.033,
+            2.033,
+            2.033
+          ],
+          "compact_round_medians_us": [
+            2.0655,
+            2.066,
+            2.066,
+            2.066,
+            2.066
+          ],
+          "reduction_percent": -1.6232169208066916
+        },
+        "query_min1": {
+          "wide_us": 6.487,
+          "compact_us": 5.971,
+          "wide_round_medians_us": [
+            6.487,
+            6.487,
+            6.487,
+            6.487,
+            6.487
+          ],
+          "compact_round_medians_us": [
+            5.971,
+            5.971,
+            5.971,
+            6.003,
+            5.971
+          ],
+          "reduction_percent": 7.954370279019574
+        },
+        "combined": {
+          "wide_us": 58.773,
+          "compact_us": 51.866,
+          "wide_round_medians_us": [
+            58.773,
+            58.773,
+            58.773,
+            58.773,
+            58.773
+          ],
+          "compact_round_medians_us": [
+            51.866,
+            51.866,
+            51.866,
+            51.866,
+            51.866
+          ],
+          "reduction_percent": 11.751994963673805
+        }
+      }
+    },
+    {
+      "capacity": 16384,
+      "alphabet": 1,
+      "batch_size": 1,
+      "eligible_at_min4": [
+        true
+      ],
+      "phases": {
+        "update": {
+          "wide_us": 15.271,
+          "compact_us": 13.206,
+          "wide_round_medians_us": [
+            15.271,
+            15.271,
+            15.271,
+            15.271,
+            15.272
+          ],
+          "compact_round_medians_us": [
+            13.206,
+            13.206,
+            13.206,
+            13.206,
+            13.206
+          ],
+          "reduction_percent": 13.52236264815665
+        },
+        "query": {
+          "wide_us": 2.691,
+          "compact_us": 2.566,
+          "wide_round_medians_us": [
+            2.691,
+            2.691,
+            2.691,
+            2.691,
+            2.691
+          ],
+          "compact_round_medians_us": [
+            2.566,
+            2.566,
+            2.566,
+            2.566,
+            2.566
+          ],
+          "reduction_percent": 4.6451133407655165
+        },
+        "query_min1": {
+          "wide_us": 2.691,
+          "compact_us": 2.566,
+          "wide_round_medians_us": [
+            2.691,
+            2.691,
+            2.691,
+            2.691,
+            2.691
+          ],
+          "compact_round_medians_us": [
+            2.5665,
+            2.566,
+            2.566,
+            2.567,
+            2.566
+          ],
+          "reduction_percent": 4.6451133407655165
+        },
+        "combined": {
+          "wide_us": 16.148,
+          "compact_us": 14.833,
+          "wide_round_medians_us": [
+            16.148,
+            16.148,
+            16.148,
+            16.148,
+            16.148
+          ],
+          "compact_round_medians_us": [
+            14.833,
+            14.833,
+            14.833,
+            14.833,
+            14.833
+          ],
+          "reduction_percent": 8.143423334159028
+        }
+      }
+    },
+    {
+      "capacity": 16384,
+      "alphabet": 1,
+      "batch_size": 4,
+      "eligible_at_min4": [
+        true,
+        true,
+        true,
+        true
+      ],
+      "phases": {
+        "update": {
+          "wide_us": 15.599,
+          "compact_us": 13.504,
+          "wide_round_medians_us": [
+            15.599,
+            15.599,
+            15.599,
+            15.598500000000001,
+            15.599
+          ],
+          "compact_round_medians_us": [
+            13.504,
+            13.504,
+            13.504,
+            13.504,
+            13.504
+          ],
+          "reduction_percent": 13.430348099237133
+        },
+        "query": {
+          "wide_us": 2.563,
+          "compact_us": 2.532,
+          "wide_round_medians_us": [
+            2.563,
+            2.563,
+            2.5635000000000003,
+            2.563,
+            2.563
+          ],
+          "compact_round_medians_us": [
+            2.563,
+            2.532,
+            2.532,
+            2.532,
+            2.532
+          ],
+          "reduction_percent": 1.2095200936402706
+        },
+        "query_min1": {
+          "wide_us": 2.563,
+          "compact_us": 2.532,
+          "wide_round_medians_us": [
+            2.563,
+            2.563,
+            2.563,
+            2.563,
+            2.563
+          ],
+          "compact_round_medians_us": [
+            2.532,
+            2.532,
+            2.532,
+            2.532,
+            2.533
+          ],
+          "reduction_percent": 1.2095200936402706
+        },
+        "combined": {
+          "wide_us": 16.474,
+          "compact_us": 15.604,
+          "wide_round_medians_us": [
+            16.474,
+            16.474,
+            16.474,
+            16.463,
+            16.463
+          ],
+          "compact_round_medians_us": [
+            15.599,
+            15.629,
+            15.62,
+            15.604,
+            15.604
+          ],
+          "reduction_percent": 5.281048925579713
+        }
+      }
+    },
+    {
+      "capacity": 16384,
+      "alphabet": 2,
+      "batch_size": 1,
+      "eligible_at_min4": [
+        true
+      ],
+      "phases": {
+        "update": {
+          "wide_us": 157.39350000000002,
+          "compact_us": 133.583,
+          "wide_round_medians_us": [
+            157.394,
+            157.394,
+            157.39350000000002,
+            157.39350000000002,
+            157.393
+          ],
+          "compact_round_medians_us": [
+            133.583,
+            133.582,
+            133.583,
+            133.583,
+            133.583
+          ],
+          "reduction_percent": 15.128007192164873
+        },
+        "query": {
+          "wide_us": 6.656,
+          "compact_us": 6.031,
+          "wide_round_medians_us": [
+            6.656,
+            6.656,
+            6.656,
+            6.656,
+            6.656
+          ],
+          "compact_round_medians_us": [
+            6.031,
+            6.031,
+            6.031,
+            6.031,
+            6.031
+          ],
+          "reduction_percent": 9.390024038461542
+        },
+        "query_min1": {
+          "wide_us": 6.656,
+          "compact_us": 6.045999999999999,
+          "wide_round_medians_us": [
+            6.656,
+            6.656,
+            6.656,
+            6.656,
+            6.656
+          ],
+          "compact_round_medians_us": [
+            6.062,
+            6.031,
+            6.062,
+            6.045999999999999,
+            6.031
+          ],
+          "reduction_percent": 9.164663461538469
+        },
+        "combined": {
+          "wide_us": 162.268,
+          "compact_us": 135.208,
+          "wide_round_medians_us": [
+            162.26749999999998,
+            162.237,
+            162.268,
+            162.268,
+            162.268
+          ],
+          "compact_round_medians_us": [
+            135.208,
+            135.208,
+            135.208,
+            135.208,
+            135.208
+          ],
+          "reduction_percent": 16.676116054921486
+        }
+      }
+    },
+    {
+      "capacity": 16384,
+      "alphabet": 2,
+      "batch_size": 4,
+      "eligible_at_min4": [
+        true,
+        true,
+        true,
+        true
+      ],
+      "phases": {
+        "update": {
+          "wide_us": 157.238,
+          "compact_us": 133.535,
+          "wide_round_medians_us": [
+            157.26850000000002,
+            157.238,
+            157.238,
+            157.238,
+            157.238
+          ],
+          "compact_round_medians_us": [
+            133.535,
+            133.535,
+            133.535,
+            133.535,
+            133.535
+          ],
+          "reduction_percent": 15.074600287462324
+        },
+        "query": {
+          "wide_us": 6.5275,
+          "compact_us": 5.964,
+          "wide_round_medians_us": [
+            6.5425,
+            6.5275,
+            6.527,
+            6.558,
+            6.527
+          ],
+          "compact_round_medians_us": [
+            5.964,
+            5.934,
+            5.9645,
+            5.964,
+            5.934
+          ],
+          "reduction_percent": 8.63270777479892
+        },
+        "query_min1": {
+          "wide_us": 6.527,
+          "compact_us": 5.964,
+          "wide_round_medians_us": [
+            6.527,
+            6.527,
+            6.527,
+            6.527,
+            6.527
+          ],
+          "compact_round_medians_us": [
+            5.964,
+            5.934,
+            5.964,
+            5.934,
+            5.964
+          ],
+          "reduction_percent": 8.625708595066639
+        },
+        "combined": {
+          "wide_us": 162.047,
+          "compact_us": 135.284,
+          "wide_round_medians_us": [
+            162.047,
+            162.047,
+            162.047,
+            162.047,
+            162.047
+          ],
+          "compact_round_medians_us": [
+            135.284,
+            135.284,
+            135.284,
+            135.284,
+            135.284
+          ],
+          "reduction_percent": 16.5155788135541
+        }
+      }
+    },
+    {
+      "capacity": 16384,
+      "alphabet": 64,
+      "batch_size": 1,
+      "eligible_at_min4": [
+        false
+      ],
+      "phases": {
+        "update": {
+          "wide_us": 66.641,
+          "compact_us": 57.749,
+          "wide_round_medians_us": [
+            66.641,
+            66.641,
+            66.641,
+            66.641,
+            66.641
+          ],
+          "compact_round_medians_us": [
+            57.749,
+            57.749,
+            57.749,
+            57.749,
+            57.749
+          ],
+          "reduction_percent": 13.343137107786497
+        },
+        "query": {
+          "wide_us": 2.09,
+          "compact_us": 2.09,
+          "wide_round_medians_us": [
+            2.09,
+            2.09,
+            2.0905,
+            2.09,
+            2.09
+          ],
+          "compact_round_medians_us": [
+            2.09,
+            2.09,
+            2.0595,
+            2.09,
+            2.0595
+          ],
+          "reduction_percent": 0.0
+        },
+        "query_min1": {
+          "wide_us": 7.675,
+          "compact_us": 7.082,
+          "wide_round_medians_us": [
+            7.675,
+            7.675,
+            7.675,
+            7.706,
+            7.675
+          ],
+          "compact_round_medians_us": [
+            7.0825,
+            7.082,
+            7.082,
+            7.082,
+            7.082
+          ],
+          "reduction_percent": 7.726384364820849
+        },
+        "combined": {
+          "wide_us": 67.39,
+          "compact_us": 58.093,
+          "wide_round_medians_us": [
+            67.389,
+            67.39,
+            67.3895,
+            67.39,
+            67.39
+          ],
+          "compact_round_medians_us": [
+            58.0925,
+            58.093,
+            58.108000000000004,
+            58.093,
+            58.093
+          ],
+          "reduction_percent": 13.795815402878764
+        }
+      }
+    },
+    {
+      "capacity": 16384,
+      "alphabet": 64,
+      "batch_size": 4,
+      "eligible_at_min4": [
+        false,
+        false,
+        false,
+        false
+      ],
+      "phases": {
+        "update": {
+          "wide_us": 66.622,
+          "compact_us": 58.165,
+          "wide_round_medians_us": [
+            66.622,
+            66.622,
+            66.622,
+            66.622,
+            66.622
+          ],
+          "compact_round_medians_us": [
+            58.165,
+            58.165,
+            58.166,
+            58.165,
+            58.166
+          ],
+          "reduction_percent": 12.694004983338836
+        },
+        "query": {
+          "wide_us": 1.997,
+          "compact_us": 1.997,
+          "wide_round_medians_us": [
+            1.997,
+            1.997,
+            1.997,
+            1.997,
+            1.997
+          ],
+          "compact_round_medians_us": [
+            1.966,
+            1.997,
+            1.997,
+            1.9820000000000002,
+            1.997
+          ],
+          "reduction_percent": 0.0
+        },
+        "query_min1": {
+          "wide_us": 7.551,
+          "compact_us": 7.115,
+          "wide_round_medians_us": [
+            7.551,
+            7.551,
+            7.551,
+            7.536,
+            7.551
+          ],
+          "compact_round_medians_us": [
+            7.115,
+            7.115,
+            7.115,
+            7.115,
+            7.115
+          ],
+          "reduction_percent": 5.774069659647729
+        },
+        "combined": {
+          "wide_us": 67.309,
+          "compact_us": 58.509,
+          "wide_round_medians_us": [
+            67.339,
+            67.309,
+            67.309,
+            67.309,
+            67.339
+          ],
+          "compact_round_medians_us": [
+            58.509,
+            58.539500000000004,
+            58.509,
+            58.5095,
+            58.509
+          ],
+          "reduction_percent": 13.074031704526877
+        }
+      }
+    },
+    {
+      "capacity": 32768,
+      "alphabet": 2,
+      "batch_size": 4,
+      "eligible_at_min4": [
+        true,
+        true,
+        true,
+        true
+      ],
+      "phases": {
+        "update": {
+          "wide_us": 194.125,
+          "compact_us": 194.125,
+          "wide_round_medians_us": [
+            194.125,
+            194.125,
+            194.125,
+            194.125,
+            194.125
+          ],
+          "compact_round_medians_us": [
+            194.125,
+            194.125,
+            194.125,
+            194.125,
+            194.125
+          ],
+          "reduction_percent": 0.0
+        },
+        "query": {
+          "wide_us": 7.622,
+          "compact_us": 7.59,
+          "wide_round_medians_us": [
+            7.622,
+            7.622,
+            7.622,
+            7.622,
+            7.622
+          ],
+          "compact_round_medians_us": [
+            7.59,
+            7.59,
+            7.59,
+            7.59,
+            7.59
+          ],
+          "reduction_percent": 0.41983731304119365
+        },
+        "query_min1": {
+          "wide_us": 7.622,
+          "compact_us": 7.59,
+          "wide_round_medians_us": [
+            7.622,
+            7.622,
+            7.622,
+            7.622,
+            7.622
+          ],
+          "compact_round_medians_us": [
+            7.59,
+            7.59,
+            7.59,
+            7.59,
+            7.59
+          ],
+          "reduction_percent": 0.41983731304119365
+        },
+        "combined": {
+          "wide_us": 199.657,
+          "compact_us": 199.721,
+          "wide_round_medians_us": [
+            199.6565,
+            199.657,
+            199.657,
+            199.6405,
+            199.657
+          ],
+          "compact_round_medians_us": [
+            199.722,
+            199.721,
+            199.721,
+            199.721,
+            199.721
+          ],
+          "reduction_percent": -0.03205497428089288
+        }
+      }
+    }
+  ]
+}

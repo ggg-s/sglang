@@ -58,6 +58,9 @@ int main(int argc, char **argv) {
 #ifdef HYBRID_SA_COMPACT_LAYOUT
     states[4] = -1;
 #endif
+#ifdef HYBRID_SA_FREQUENCY_LAYOUT
+    sa.init_frequency(0);
+#endif
     auto start = Clock::now();
     for (int i = 0; i < length; ++i)
       sa.append(tokens[i]);

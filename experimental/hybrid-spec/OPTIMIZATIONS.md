@@ -1,3 +1,5 @@
+> 2026-10-21：本文保留此前优化与实测记录。当前默认已改为 split/gate=1，并增加 GPU SA 在线频次；新版策略、内存与升级要求见 [FREQUENCY.md](FREQUENCY.md)。以下旧默认和测量不能作为新版性能结论。
+
 # Hybrid Spec 优化总览
 
 > 记录日期：2026-10-16。源码依据：`codex/hybrid-suffix-speculation` 分支截至

@@ -5,5 +5,8 @@
   "max_history_tokens": 8192,
   "backend": "gpu_sa",
   "history_mode": "device",
-  "partial_drafts": "zero"
+  "partial_drafts": "zero",
+  "draft_graph_mode": "full",
+  "num_neural_gate_tokens": 0,
+  "sa_continuation_policy": "first"
 }

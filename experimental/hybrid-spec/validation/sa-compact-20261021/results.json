@@ -1,0 +1,65 @@
+{
+  "broad_regression": {
+    "passed": 814,
+    "skipped": 254,
+    "deselected": 3,
+    "exit_code": 0,
+    "seconds": 207.61
+  },
+  "latest_supplement": {
+    "passed": 46,
+    "failed": 0,
+    "skipped": 0,
+    "cuda_cases": 32,
+    "cpu_cases": 14,
+    "exit_code": 0
+  },
+  "per_module": {
+    "module_collection": {
+      "skipped": 1
+    },
+    "tests.test_compact_tail": {
+      "passed": 15
+    },
+    "tests.test_compact_verify": {
+      "passed": 106
+    },
+    "tests.test_conditional_verify": {
+      "passed": 8
+    },
+    "tests.test_core": {
+      "passed": 109
+    },
+    "tests.test_cuda": {
+      "passed": 351,
+      "skipped": 248
+    },
+    "tests.test_draft_recurrence": {
+      "passed": 134
+    },
+    "tests.test_dspark": {
+      "passed": 28
+    },
+    "tests.test_frequency": {
+      "passed": 17
+    },
+    "tests.test_native": {
+      "passed": 11
+    },
+    "tests.test_shared_parallel_cuda": {
+      "passed": 16
+    },
+    "tests.test_switch_graph": {
+      "passed": 14
+    },
+    "tests.test_tp": {
+      "passed": 5,
+      "skipped": 5
+    }
+  },
+  "notes": [
+    "Broad run preceded the final cost-fingerprint guard and extra >65535 count case; latest supplement reruns all SA frequency/native/shared cases plus the cost-compatibility test on final sources. Counts overlap and are not additive.",
+    "Three known old-production-dependency failures from the prior frequency run are explicitly deselected using pytest-root-relative tests/ IDs.",
+    "Synthetic compact-tail suite uses lean_cuda_plugin and capture_gc_plugin copied from the prior validation; no model weights/server."
+  ]
+}

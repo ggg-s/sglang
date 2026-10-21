@@ -8,6 +8,11 @@
 #define HYBRID_EXPORT __attribute__((visibility("default")))
 #endif
 
-extern "C" HYBRID_EXPORT int hybrid_sa_build_host(
-    const int64_t *tokens, int count, int vocab, int *history, int *states,
-    int *edges, int *meta, int capacity);
+extern "C" HYBRID_EXPORT int
+hybrid_sa_build_host(const int64_t *tokens, int count, int vocab, int *history,
+                     int *states, int *edges, int *meta, int capacity);
+
+extern "C" HYBRID_EXPORT int
+hybrid_sa_build_host_compact(const int64_t *tokens, int count, int vocab,
+                             int *history, uint16_t *states, int *edges,
+                             int *meta, int capacity);

@@ -12,6 +12,8 @@ import math
 from dataclasses import asdict
 from pathlib import Path
 
+from hybrid_spec.backends.sa_layout import SA_STORAGE_REVISION
+
 
 def cost_config(config):
     # Scheduling/learning knobs may change between calibration and serving.
@@ -29,6 +31,9 @@ def cost_config(config):
         # The fused setter and compaction remove per-round kernels. A table
         # collected with the original SWITCH must not seed these fixed costs.
         values["conditional_draft_graph_revision"] = 2
+    if config.backend == "gpu_sa":
+        # Layout changes affect the shared fixed SA/draft cost term.
+        values["gpu_sa_storage_revision"] = SA_STORAGE_REVISION
     return json.loads(json.dumps(values))
 
 

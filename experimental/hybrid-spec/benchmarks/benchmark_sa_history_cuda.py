@@ -41,19 +41,28 @@ def measure(
     vocab,
     batch_size,
     repeats,
+    *,
+    compact_states=False,
+    frequency=False,
 ):
     k, tail = 8, 9
     capacity = length + tail + k + 1
+    packed = compact_states and capacity <= 32767
+    state_dtype = torch.uint16 if packed else torch.int32
+    if packed:
+        state_fields = 11
     data = sequence(length + tail, vocab)
     prompt = torch.tensor(data[:length], dtype=torch.int64)
     host = [
         torch.empty(length, dtype=torch.int32),
-        torch.empty((2 * length + 1, state_fields), dtype=torch.int32),
+        torch.empty((2 * length + 1, state_fields), dtype=state_dtype),
         torch.empty((edge_factor * length + 1, edge_fields), dtype=torch.int32),
         torch.empty(meta_fields, dtype=torch.int32),
     ]
     library = ctypes.CDLL(module.__file__)
-    build = library.hybrid_sa_build_host
+    build = (
+        library.hybrid_sa_build_host_compact if packed else library.hybrid_sa_build_host
+    )
     build.argtypes = (
         [ctypes.c_void_p, ctypes.c_int, ctypes.c_int]
         + [ctypes.c_void_p] * 4
@@ -67,7 +76,7 @@ def measure(
     frozen.append(host[3].cuda())
     history = torch.empty((batch_size, capacity), dtype=torch.int32, device="cuda")
     states = torch.empty(
-        (batch_size, 2 * capacity + 1, state_fields), dtype=torch.int32, device="cuda"
+        (batch_size, 2 * capacity + 1, state_fields), dtype=state_dtype, device="cuda"
     )
     edges = torch.empty(
         (batch_size, edge_factor * capacity + 1, edge_fields),
@@ -120,6 +129,9 @@ def measure(
             128,
             None,  # query metadata
             False,  # unique-continuation gate
+            # The default compares first-occurrence candidates across revisions;
+            # v5/v6 maintain exact counts even with that policy selected.
+            *([frequency] if state_fields in (10, 11) else []),
         )
 
     stream = torch.cuda.Stream()
@@ -164,7 +176,18 @@ def measure(
         if not torch.equal(tensor, tensor[:1].expand_as(tensor)):
             raise RuntimeError("inconsistent CUDA batch rows")
     cpu_history = history[0, : length + tail].cpu().tolist()
-    cpu_states = states[0, :ns].cpu().tolist()
+    cpu_storage = states[0, :ns].cpu()
+    if packed:
+        values = cpu_storage.to(torch.int32)
+        cpu_storage = torch.cat(
+            (
+                values[:, :4] - 1,
+                (values[:, 4] | (values[:, 5] << 16))[:, None],
+                values[:, 6:] - 1,
+            ),
+            dim=1,
+        )
+    cpu_states = cpu_storage.tolist()
     cpu_edges = edges[0, :ne, :3].cpu().tolist()
     digest = hashlib.sha256()
     digest.update(
@@ -179,7 +202,7 @@ def measure(
     )
     for state in cpu_states:
         outgoing = []
-        if state_fields == 5:
+        if state_fields in (5, 10, 11):
             if state[3] != -1:
                 outgoing.append((cpu_history[state[2] + 1], state[3]))
             head = state[4]
@@ -197,6 +220,10 @@ def measure(
         "median_us": statistics.median(samples),
         "samples_us": samples,
         "semantic_checksum": digest.hexdigest(),
+        "state_layout": "uint16+int32" if packed else "int32",
+        "index_bytes": sum(
+            t.numel() * t.element_size() for t in (history, states, edges, meta)
+        ),
     }
 
 
@@ -236,6 +263,7 @@ def main():
             )
             (baseline / filename).write_bytes(content)
         modules = {}
+        packed_modules = set()
         for name, source in (("before", baseline), ("after", repo / relative)):
             content = (source / "automaton.h").read_text()
             fields = [
@@ -255,10 +283,13 @@ def main():
                 extra_cflags=["-O3"],
                 extra_cuda_cflags=["-O3"],
             )
-            compact = "STATE_FIELDS" in content
+            state_match = re.search(r"STATE_FIELDS = (\d+)", content)
+            compact = state_match is not None
+            if "using CompactAutomaton" in content:
+                packed_modules.add(name)
             modules[name] = (
                 module,
-                5 if compact else 4,
+                int(state_match[1]) if compact else 4,
                 1 if compact else 3,
                 edge_fields,
                 meta_fields,
@@ -273,7 +304,12 @@ def main():
                     }
                     for name, native in modules.items():
                         row[name] = measure(
-                            *native, length, vocab, batch_size, args.repeats
+                            *native,
+                            length,
+                            vocab,
+                            batch_size,
+                            args.repeats,
+                            compact_states=name in packed_modules,
                         )
                     if (
                         row["before"]["semantic_checksum"]

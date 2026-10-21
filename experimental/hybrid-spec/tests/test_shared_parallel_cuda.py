@@ -10,19 +10,23 @@ from hybrid_spec.backends.reference import SuffixAutomaton
 from hybrid_spec.config import HybridConfig
 from hybrid_spec.core.contracts import HistoryDelta, RequestKey
 
+from test_frequency import text_draft
+
 pytestmark = pytest.mark.skipif(
     not torch.cuda.is_available(), reason="requires NVIDIA CUDA"
 )
 
 
-def _serial_candidates(histories, sources, num_drafts, min_match, context, partial):
+def _serial_candidates(
+    histories, sources, num_drafts, min_match, context, partial, policy="first"
+):
     """Independent text search oracle, including eligibility before ranking."""
     outputs, masks, metadata = [], [], []
     for slot in range(4):
         own = histories[slot]
         sa = SuffixAutomaton()
         sa.append(own)
-        own_tokens, own_match = sa.query(num_drafts)
+        own_tokens, own_match = sa.query(num_drafts, policy)
         valid = own_match >= min_match and (
             len(own_tokens) == num_drafts or partial == "zero"
         )
@@ -50,7 +54,14 @@ def _serial_candidates(histories, sources, num_drafts, min_match, context, parti
                     break
             else:
                 continue
+            candidate = history[start : start + num_drafts]
             continuation = len(history) - start
+            if policy == "frequency":
+                candidate, frequency_match = text_draft(
+                    history, suffix, num_drafts, policy
+                )
+                assert frequency_match == length
+                continuation = len(candidate)
             if length < min_match or (continuation < num_drafts and partial != "zero"):
                 continue
             # Equal own matches win regardless of continuation or source order.
@@ -59,7 +70,7 @@ def _serial_candidates(histories, sources, num_drafts, min_match, context, parti
             rank = (length, continuation, -index)
             if rank > best:
                 best = rank
-                tokens = history[start : start + num_drafts]
+                tokens = candidate
                 valid = True
                 shared = True
         outputs.append((tokens + [0] * num_drafts)[:num_drafts])
@@ -70,7 +81,8 @@ def _serial_candidates(histories, sources, num_drafts, min_match, context, parti
 
 @pytest.mark.parametrize("num_sources", [20, 64, 257])
 @pytest.mark.parametrize("partial", ["fallback", "zero"])
-def test_shared_parallel_matches_text_oracle_in_graph(num_sources, partial):
+@pytest.mark.parametrize("policy", ["first", "frequency"])
+def test_shared_parallel_matches_text_oracle_in_graph(num_sources, partial, policy):
     """Covers multiple warps, >128 sources, stale donors and publication changes."""
     config = HybridConfig(
         4,
@@ -82,6 +94,7 @@ def test_shared_parallel_matches_text_oracle_in_graph(num_sources, partial):
         max_shared_requests=num_sources - 4,
         shared_context_tokens=13,
         partial_drafts=partial,
+        sa_continuation_policy=policy,
     )
     backend = GPUSuffixAutomaton(config, "cuda")
     device = {"device": "cuda", "dtype": torch.int64}
@@ -151,7 +164,7 @@ def test_shared_parallel_matches_text_oracle_in_graph(num_sources, partial):
             sources.copy_(torch.tensor(published, **device))
             source_generations.copy_(torch.tensor(source_gens, **device))
             expected_tokens, expected_mask, expected_metadata = _serial_candidates(
-                histories, expected_sources, 4, 2, 13, partial
+                histories, expected_sources, 4, 2, 13, partial, policy
             )
             for _ in range(2):
                 graph.replay()

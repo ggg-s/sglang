@@ -6,8 +6,8 @@
   "backend": "gpu_sa",
   "history_mode": "device",
   "partial_drafts": "fallback",
-  "num_neural_gate_tokens": 4,
-  "draft_graph_mode": "full",
+  "num_neural_gate_tokens": 1,
+  "draft_graph_mode": "split",
   "enable_global_pool": true,
   "max_shared_requests": 16,
   "shared_context_tokens": 128

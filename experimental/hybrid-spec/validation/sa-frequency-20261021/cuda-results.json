@@ -1,0 +1,67 @@
+{
+  "full_regression": {
+    "passed": 803,
+    "failed": 3,
+    "skipped": 254,
+    "exit_code": 1,
+    "seconds": 252.04
+  },
+  "focused_sa": {
+    "passed": 33,
+    "failed": 0,
+    "skipped": 0,
+    "cuda_cases": 26,
+    "cpu_cases": 7,
+    "exit_code": 0
+  },
+  "per_module": {
+    "module_collection": {
+      "skipped": 1
+    },
+    "tests.test_compact_tail": {
+      "passed": 15
+    },
+    "tests.test_compact_verify": {
+      "passed": 106,
+      "failed": 2
+    },
+    "tests.test_conditional_verify": {
+      "passed": 8,
+      "failed": 1
+    },
+    "tests.test_core": {
+      "passed": 109
+    },
+    "tests.test_cuda": {
+      "passed": 351,
+      "skipped": 248
+    },
+    "tests.test_draft_recurrence": {
+      "passed": 134
+    },
+    "tests.test_dspark": {
+      "passed": 28
+    },
+    "tests.test_frequency": {
+      "passed": 12
+    },
+    "tests.test_native": {
+      "passed": 5
+    },
+    "tests.test_shared_parallel_cuda": {
+      "passed": 16
+    },
+    "tests.test_switch_graph": {
+      "passed": 14
+    },
+    "tests.test_tp": {
+      "passed": 5,
+      "skipped": 5
+    }
+  },
+  "environment": "torch=2.14.1+cu130\ntorch_cuda=13.0\nNVIDIA GeForce RTX 4060 Laptop GPU\n",
+  "notes": [
+    "The three --deselect arguments in the broad runner used cwd-relative paths rather than pytest root-relative node IDs, so all three known old-dependency cases actually executed and failed. No cases were deselected.",
+    "lean_cuda_plugin isolates serving imports for synthetic compact-tail tests; capture_gc_plugin disables cyclic GC inside those test captures. No model weights or server were exercised."
+  ]
+}
