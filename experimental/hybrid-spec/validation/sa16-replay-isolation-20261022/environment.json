@@ -1,0 +1,6 @@
+{
+  "torch": "2.14.1",
+  "triton": "3.8.0",
+  "transformers": "5.19.0",
+  "sglang": "0.0.0.dev1+g722f338ba"
+}

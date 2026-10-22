@@ -1,0 +1,602 @@
+{
+  "complete": true,
+  "benchmark_count": 4,
+  "measured_requests": 200,
+  "inputs_identical": true,
+  "rows": [
+    {
+      "mode": "sa16-snapshot",
+      "concurrency": 1,
+      "round": 1,
+      "output_throughput": 79.18473959183629,
+      "mean_tpot_ms": 5.085219019887412,
+      "mean_ttft_ms": 499.4281019642949,
+      "duration": 45.64010715484619,
+      "total_output_tokens": 3614,
+      "diagnostics_scope": "50 measured requests only; manual warmup excluded",
+      "output_cap_hits": 0,
+      "complete_tool_markers": 50,
+      "diagnostics": {
+        "hybrid_spec": {
+          "retrieval_requests": 207,
+          "neural_requests": 368,
+          "retrieval_correct_drafts": 1757,
+          "neural_correct_drafts": 1645,
+          "retrieval_accept_tokens": 1964,
+          "neural_accept_tokens": 2013
+        },
+        "hybrid_spec_compact_verify": {
+          "verify_ct": 575,
+          "logical_token_ct": 6831,
+          "target_token_ct": 6831,
+          "dense_token_ct": 9775,
+          "graph_token_histogram": {
+            "9": 368,
+            "17": 207
+          }
+        },
+        "hybrid_spec_split_graph": {
+          "prefix_ct": 575,
+          "skip_ct": 207,
+          "tail_ct": 368,
+          "decision_wait_ns": 15902175907,
+          "request_ct": 575,
+          "skip_request_ct": 207,
+          "tail_request_ct": 368,
+          "mixed_ct": 0,
+          "tail_batch_histogram": {
+            "0": 207,
+            "1": 368
+          }
+        }
+      },
+      "sa_selection_rate": 0.36,
+      "overall_accept_length": 6.9165217391304346,
+      "sa_accept_length": 9.48792270531401,
+      "sa_accept_rate": 0.5304951690821256,
+      "neural_accept_length": 5.470108695652174,
+      "verify_rows_per_1k_accept": 144.5813427206437,
+      "target_positions_per_1k_accept": 1717.6263515212472,
+      "target_position_reduction": 0.30117647058823527,
+      "verify_rows_per_1k_output": 159.10348644161593,
+      "target_positions_per_1k_output": 1890.1494189263974,
+      "prefix_ct": 575,
+      "prefix_per_1k_accept": 144.5813427206437,
+      "tail_rows_per_1k_accept": 92.53205934121196,
+      "host_decision_wait_ms_per_prefix": 27.655958099130434,
+      "prefix_per_1k_output": 159.10348644161593,
+      "tail_rows_per_1k_output": 101.8262313226342
+    },
+    {
+      "mode": "sa16-snapshot",
+      "concurrency": 1,
+      "round": 2,
+      "output_throughput": 80.40671303867083,
+      "mean_tpot_ms": 5.005841021894578,
+      "mean_ttft_ms": 492.8484860807657,
+      "duration": 45.07086365111172,
+      "total_output_tokens": 3624,
+      "diagnostics_scope": "50 measured requests only; manual warmup excluded",
+      "output_cap_hits": 0,
+      "complete_tool_markers": 50,
+      "diagnostics": {
+        "hybrid_spec": {
+          "retrieval_requests": 205,
+          "neural_requests": 366,
+          "retrieval_correct_drafts": 1759,
+          "neural_correct_drafts": 1681,
+          "retrieval_accept_tokens": 1964,
+          "neural_accept_tokens": 2047
+        },
+        "hybrid_spec_compact_verify": {
+          "verify_ct": 571,
+          "logical_token_ct": 6779,
+          "target_token_ct": 6779,
+          "dense_token_ct": 9707,
+          "graph_token_histogram": {
+            "9": 366,
+            "17": 205
+          }
+        },
+        "hybrid_spec_split_graph": {
+          "prefix_ct": 571,
+          "skip_ct": 205,
+          "tail_ct": 366,
+          "decision_wait_ns": 16032006498,
+          "request_ct": 571,
+          "skip_request_ct": 205,
+          "tail_request_ct": 366,
+          "mixed_ct": 0,
+          "tail_batch_histogram": {
+            "0": 205,
+            "1": 366
+          }
+        }
+      },
+      "sa_selection_rate": 0.35901926444833626,
+      "overall_accept_length": 7.024518388791594,
+      "sa_accept_length": 9.580487804878048,
+      "sa_accept_rate": 0.536280487804878,
+      "neural_accept_length": 5.592896174863388,
+      "verify_rows_per_1k_accept": 142.35851408626277,
+      "target_positions_per_1k_accept": 1690.1022188980305,
+      "target_position_reduction": 0.301637993200783,
+      "verify_rows_per_1k_output": 157.560706401766,
+      "target_positions_per_1k_output": 1870.5849889624724,
+      "prefix_ct": 571,
+      "prefix_per_1k_accept": 142.35851408626277,
+      "tail_rows_per_1k_accept": 91.2490650710546,
+      "host_decision_wait_ms_per_prefix": 28.077069173380035,
+      "prefix_per_1k_output": 157.560706401766,
+      "tail_rows_per_1k_output": 100.99337748344371
+    },
+    {
+      "mode": "sa16-replay",
+      "concurrency": 1,
+      "round": 1,
+      "output_throughput": 75.43854944300902,
+      "mean_tpot_ms": 5.74609742996437,
+      "mean_ttft_ms": 503.717256821692,
+      "duration": 49.25863537192345,
+      "total_output_tokens": 3716,
+      "diagnostics_scope": "50 measured requests only; manual warmup excluded",
+      "output_cap_hits": 0,
+      "complete_tool_markers": 50,
+      "diagnostics": {
+        "hybrid_spec": {
+          "retrieval_requests": 208,
+          "neural_requests": 376,
+          "retrieval_correct_drafts": 1781,
+          "neural_correct_drafts": 1740,
+          "retrieval_accept_tokens": 1989,
+          "neural_accept_tokens": 2116
+        },
+        "hybrid_spec_compact_verify": {
+          "verify_ct": 584,
+          "logical_token_ct": 6920,
+          "target_token_ct": 6920,
+          "dense_token_ct": 9928,
+          "graph_token_histogram": {
+            "9": 376,
+            "17": 208
+          }
+        },
+        "hybrid_spec_split_graph": {
+          "prefix_ct": 584,
+          "skip_ct": 208,
+          "tail_ct": 376,
+          "decision_wait_ns": 19138928753,
+          "request_ct": 584,
+          "skip_request_ct": 208,
+          "tail_request_ct": 376,
+          "mixed_ct": 0,
+          "tail_batch_histogram": {
+            "0": 208,
+            "1": 376
+          }
+        }
+      },
+      "sa_selection_rate": 0.3561643835616438,
+      "overall_accept_length": 7.029109589041096,
+      "sa_accept_length": 9.5625,
+      "sa_accept_rate": 0.53515625,
+      "neural_accept_length": 5.627659574468085,
+      "verify_rows_per_1k_accept": 142.26552984165653,
+      "target_positions_per_1k_accept": 1685.7490864799026,
+      "target_position_reduction": 0.3029814665592264,
+      "verify_rows_per_1k_output": 157.15823466092573,
+      "target_positions_per_1k_output": 1862.2174381054897,
+      "prefix_ct": 584,
+      "prefix_per_1k_accept": 142.26552984165653,
+      "tail_rows_per_1k_accept": 91.59561510353228,
+      "host_decision_wait_ms_per_prefix": 32.77213827568493,
+      "prefix_per_1k_output": 157.15823466092573,
+      "tail_rows_per_1k_output": 101.18406889128094
+    },
+    {
+      "mode": "sa16-replay",
+      "concurrency": 1,
+      "round": 2,
+      "output_throughput": 75.41574397420548,
+      "mean_tpot_ms": 5.745989760569814,
+      "mean_ttft_ms": 492.5884198024869,
+      "duration": 48.000587267801166,
+      "total_output_tokens": 3620,
+      "diagnostics_scope": "50 measured requests only; manual warmup excluded",
+      "output_cap_hits": 0,
+      "complete_tool_markers": 50,
+      "diagnostics": {
+        "hybrid_spec": {
+          "retrieval_requests": 203,
+          "neural_requests": 368,
+          "retrieval_correct_drafts": 1751,
+          "neural_correct_drafts": 1689,
+          "retrieval_accept_tokens": 1954,
+          "neural_accept_tokens": 2057
+        },
+        "hybrid_spec_compact_verify": {
+          "verify_ct": 571,
+          "logical_token_ct": 6763,
+          "target_token_ct": 6763,
+          "dense_token_ct": 9707,
+          "graph_token_histogram": {
+            "9": 368,
+            "17": 203
+          }
+        },
+        "hybrid_spec_split_graph": {
+          "prefix_ct": 571,
+          "skip_ct": 203,
+          "tail_ct": 368,
+          "decision_wait_ns": 18967817710,
+          "request_ct": 571,
+          "skip_request_ct": 203,
+          "tail_request_ct": 368,
+          "mixed_ct": 0,
+          "tail_batch_histogram": {
+            "0": 203,
+            "1": 368
+          }
+        }
+      },
+      "sa_selection_rate": 0.3555166374781086,
+      "overall_accept_length": 7.024518388791594,
+      "sa_accept_length": 9.625615763546797,
+      "sa_accept_rate": 0.5391009852216748,
+      "neural_accept_length": 5.5896739130434785,
+      "verify_rows_per_1k_accept": 142.35851408626277,
+      "target_positions_per_1k_accept": 1686.1131887309898,
+      "target_position_reduction": 0.303286288245596,
+      "verify_rows_per_1k_output": 157.73480662983425,
+      "target_positions_per_1k_output": 1868.232044198895,
+      "prefix_ct": 571,
+      "prefix_per_1k_accept": 142.35851408626277,
+      "tail_rows_per_1k_accept": 91.74769384193468,
+      "host_decision_wait_ms_per_prefix": 33.21859493870403,
+      "prefix_per_1k_output": 157.73480662983425,
+      "tail_rows_per_1k_output": 101.65745856353591
+    }
+  ],
+  "aggregate": [
+    {
+      "mode": "sa16-snapshot",
+      "concurrency": 1,
+      "rounds": 2,
+      "output_throughput": {
+        "mean": 79.79572631525356,
+        "by_round": [
+          79.18473959183629,
+          80.40671303867083
+        ]
+      },
+      "mean_tpot_ms": {
+        "mean": 5.045530020890995,
+        "by_round": [
+          5.085219019887412,
+          5.005841021894578
+        ]
+      },
+      "mean_ttft_ms": {
+        "mean": 496.1382940225303,
+        "by_round": [
+          499.4281019642949,
+          492.8484860807657
+        ]
+      },
+      "duration": {
+        "mean": 45.35548540297896,
+        "by_round": [
+          45.64010715484619,
+          45.07086365111172
+        ]
+      },
+      "total_output_tokens": {
+        "mean": 3619,
+        "by_round": [
+          3614,
+          3624
+        ]
+      },
+      "output_cap_hits": {
+        "mean": 0,
+        "by_round": [
+          0,
+          0
+        ]
+      },
+      "complete_tool_markers": {
+        "mean": 50,
+        "by_round": [
+          50,
+          50
+        ]
+      },
+      "sa_selection_rate": {
+        "mean": 0.3595096322241681,
+        "by_round": [
+          0.36,
+          0.35901926444833626
+        ]
+      },
+      "overall_accept_length": {
+        "mean": 6.970520063961015,
+        "by_round": [
+          6.9165217391304346,
+          7.024518388791594
+        ]
+      },
+      "sa_accept_length": {
+        "mean": 9.53420525509603,
+        "by_round": [
+          9.48792270531401,
+          9.580487804878048
+        ]
+      },
+      "sa_accept_rate": {
+        "mean": 0.5333878284435019,
+        "by_round": [
+          0.5304951690821256,
+          0.536280487804878
+        ]
+      },
+      "neural_accept_length": {
+        "mean": 5.5315024352577815,
+        "by_round": [
+          5.470108695652174,
+          5.592896174863388
+        ]
+      },
+      "verify_rows_per_1k_accept": {
+        "mean": 143.46992840345325,
+        "by_round": [
+          144.5813427206437,
+          142.35851408626277
+        ]
+      },
+      "target_positions_per_1k_accept": {
+        "mean": 1703.8642852096389,
+        "by_round": [
+          1717.6263515212472,
+          1690.1022188980305
+        ]
+      },
+      "target_position_reduction": {
+        "mean": 0.30140723189450913,
+        "by_round": [
+          0.30117647058823527,
+          0.301637993200783
+        ]
+      },
+      "verify_rows_per_1k_output": {
+        "mean": 158.33209642169095,
+        "by_round": [
+          159.10348644161593,
+          157.560706401766
+        ]
+      },
+      "target_positions_per_1k_output": {
+        "mean": 1880.367203944435,
+        "by_round": [
+          1890.1494189263974,
+          1870.5849889624724
+        ]
+      },
+      "prefix_ct": {
+        "mean": 573,
+        "by_round": [
+          575,
+          571
+        ]
+      },
+      "prefix_per_1k_accept": {
+        "mean": 143.46992840345325,
+        "by_round": [
+          144.5813427206437,
+          142.35851408626277
+        ]
+      },
+      "tail_rows_per_1k_accept": {
+        "mean": 91.89056220613328,
+        "by_round": [
+          92.53205934121196,
+          91.2490650710546
+        ]
+      },
+      "host_decision_wait_ms_per_prefix": {
+        "mean": 27.866513636255235,
+        "by_round": [
+          27.655958099130434,
+          28.077069173380035
+        ]
+      },
+      "prefix_per_1k_output": {
+        "mean": 158.33209642169095,
+        "by_round": [
+          159.10348644161593,
+          157.560706401766
+        ]
+      },
+      "tail_rows_per_1k_output": {
+        "mean": 101.40980440303895,
+        "by_round": [
+          101.8262313226342,
+          100.99337748344371
+        ]
+      },
+      "vs_sa16-snapshot": {
+        "throughput_gain_pct": 0.0,
+        "tpot_reduction_pct": 0.0
+      }
+    },
+    {
+      "mode": "sa16-replay",
+      "concurrency": 1,
+      "rounds": 2,
+      "output_throughput": {
+        "mean": 75.42714670860725,
+        "by_round": [
+          75.43854944300902,
+          75.41574397420548
+        ]
+      },
+      "mean_tpot_ms": {
+        "mean": 5.746043595267092,
+        "by_round": [
+          5.74609742996437,
+          5.745989760569814
+        ]
+      },
+      "mean_ttft_ms": {
+        "mean": 498.15283831208944,
+        "by_round": [
+          503.717256821692,
+          492.5884198024869
+        ]
+      },
+      "duration": {
+        "mean": 48.629611319862306,
+        "by_round": [
+          49.25863537192345,
+          48.000587267801166
+        ]
+      },
+      "total_output_tokens": {
+        "mean": 3668,
+        "by_round": [
+          3716,
+          3620
+        ]
+      },
+      "output_cap_hits": {
+        "mean": 0,
+        "by_round": [
+          0,
+          0
+        ]
+      },
+      "complete_tool_markers": {
+        "mean": 50,
+        "by_round": [
+          50,
+          50
+        ]
+      },
+      "sa_selection_rate": {
+        "mean": 0.3558405105198762,
+        "by_round": [
+          0.3561643835616438,
+          0.3555166374781086
+        ]
+      },
+      "overall_accept_length": {
+        "mean": 7.026813988916345,
+        "by_round": [
+          7.029109589041096,
+          7.024518388791594
+        ]
+      },
+      "sa_accept_length": {
+        "mean": 9.594057881773399,
+        "by_round": [
+          9.5625,
+          9.625615763546797
+        ]
+      },
+      "sa_accept_rate": {
+        "mean": 0.5371286176108374,
+        "by_round": [
+          0.53515625,
+          0.5391009852216748
+        ]
+      },
+      "neural_accept_length": {
+        "mean": 5.608666743755782,
+        "by_round": [
+          5.627659574468085,
+          5.5896739130434785
+        ]
+      },
+      "verify_rows_per_1k_accept": {
+        "mean": 142.31202196395964,
+        "by_round": [
+          142.26552984165653,
+          142.35851408626277
+        ]
+      },
+      "target_positions_per_1k_accept": {
+        "mean": 1685.931137605446,
+        "by_round": [
+          1685.7490864799026,
+          1686.1131887309898
+        ]
+      },
+      "target_position_reduction": {
+        "mean": 0.3031338774024112,
+        "by_round": [
+          0.3029814665592264,
+          0.303286288245596
+        ]
+      },
+      "verify_rows_per_1k_output": {
+        "mean": 157.44652064538,
+        "by_round": [
+          157.15823466092573,
+          157.73480662983425
+        ]
+      },
+      "target_positions_per_1k_output": {
+        "mean": 1865.2247411521923,
+        "by_round": [
+          1862.2174381054897,
+          1868.232044198895
+        ]
+      },
+      "prefix_ct": {
+        "mean": 577.5,
+        "by_round": [
+          584,
+          571
+        ]
+      },
+      "prefix_per_1k_accept": {
+        "mean": 142.31202196395964,
+        "by_round": [
+          142.26552984165653,
+          142.35851408626277
+        ]
+      },
+      "tail_rows_per_1k_accept": {
+        "mean": 91.67165447273348,
+        "by_round": [
+          91.59561510353228,
+          91.74769384193468
+        ]
+      },
+      "host_decision_wait_ms_per_prefix": {
+        "mean": 32.995366607194484,
+        "by_round": [
+          32.77213827568493,
+          33.21859493870403
+        ]
+      },
+      "prefix_per_1k_output": {
+        "mean": 157.44652064538,
+        "by_round": [
+          157.15823466092573,
+          157.73480662983425
+        ]
+      },
+      "tail_rows_per_1k_output": {
+        "mean": 101.42076372740843,
+        "by_round": [
+          101.18406889128094,
+          101.65745856353591
+        ]
+      },
+      "vs_sa16-snapshot": {
+        "throughput_gain_pct": -5.469052165698907,
+        "tpot_reduction_pct": -13.890883927564213
+      }
+    }
+  ]
+}

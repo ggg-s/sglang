@@ -5,6 +5,8 @@
 
 **FP32 状态下，SA16/MTP8 已能在 A100 40GB 保持完整 KV 容量并跑完 8 并发长输入。吞吐没有超过原生 MTP8：单并发低约 1.1%，8 并发低约 6.6%。**
 
+后续已完成 [固定容量 1 / Graph 1 的 SA16 快照与 Replay 对照](../sa16-replay-isolation-20261022/README.md)：快照 79.80、Replay 75.43 tok/s，Replay 吞吐低 5.47%，接受率没有下降。该实验单独固定服务容量，不能将本报告与历史 82.41 的全部差距都归因给 Replay 或 Graph 容量。
+
 ## 测试口径
 
 - NVIDIA A100-PCIE-40GB，PyTorch 2.14.1+cu130、CUDA 13.0、Triton 3.8.0。

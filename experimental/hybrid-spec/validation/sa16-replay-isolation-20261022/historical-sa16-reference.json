@@ -1,0 +1,136 @@
+{
+  "source_report": "../qwen-agent-mtp-profile-20261021/README.md",
+  "scope": "historical reference only; not a paired baseline in this isolation experiment",
+  "source_commit": "3d3291704191fa15ac7e7e8173ae0b9324c31750",
+  "workload_sha256": "14fa95c7d417ae66a0e59dfeb7e9aeea4013334ba474d2a19ea4109f69f004c5",
+  "rows": [
+    {
+      "mode": "sa16-n8",
+      "concurrency": 1,
+      "round": 1,
+      "output_throughput": 82.46527999372958,
+      "mean_tpot_ms": 4.900608022905404,
+      "mean_ttft_ms": 480.0659282505512,
+      "duration": 43.43646199069917,
+      "total_output_tokens": 3582,
+      "accept_length": 7.117307692307692,
+      "diagnostics_scope": "50 measured requests only; manual warmup excluded",
+      "output_cap_hits": 0,
+      "complete_tool_markers": 50,
+      "diagnostics": {
+        "hybrid_spec": {
+          "retrieval_requests": 203,
+          "neural_requests": 350,
+          "retrieval_correct_drafts": 1766,
+          "neural_correct_drafts": 1651,
+          "retrieval_accept_tokens": 1969,
+          "neural_accept_tokens": 2001
+        },
+        "hybrid_spec_compact_verify": {
+          "verify_ct": 553,
+          "logical_token_ct": 6601,
+          "target_token_ct": 6601,
+          "dense_token_ct": 9401,
+          "graph_token_histogram": {
+            "9": 350,
+            "17": 203
+          }
+        },
+        "hybrid_spec_split_graph": {
+          "prefix_ct": 553,
+          "skip_ct": 203,
+          "tail_ct": 350,
+          "decision_wait_ns": 16107608546,
+          "request_ct": 553,
+          "skip_request_ct": 203,
+          "tail_request_ct": 350,
+          "mixed_ct": 0,
+          "tail_batch_histogram": {
+            "0": 203,
+            "1": 350
+          }
+        }
+      },
+      "sa_selection_rate": 0.3670886075949367,
+      "overall_accept_length": 7.1790235081374325,
+      "sa_accept_length": 9.699507389162562,
+      "sa_accept_rate": 0.5437192118226601,
+      "neural_accept_length": 5.717142857142857,
+      "verify_rows_per_1k_accept": 139.29471032745593,
+      "target_positions_per_1k_accept": 1662.72040302267,
+      "target_position_reduction": 0.2978406552494416,
+      "verify_rows_per_1k_output": 154.38302624232273,
+      "target_positions_per_1k_output": 1842.8252372975992,
+      "prefix_ct": 553,
+      "prefix_per_1k_accept": 139.29471032745593,
+      "tail_rows_per_1k_accept": 88.16120906801008,
+      "host_decision_wait_ms_per_prefix": 29.127682723327304,
+      "prefix_per_1k_output": 154.38302624232273,
+      "tail_rows_per_1k_output": 97.7107761027359
+    },
+    {
+      "mode": "sa16-n8",
+      "concurrency": 1,
+      "round": 2,
+      "output_throughput": 82.3601923374019,
+      "mean_tpot_ms": 4.992226716625537,
+      "mean_ttft_ms": 480.3460480645299,
+      "duration": 43.92898920364678,
+      "total_output_tokens": 3618,
+      "accept_length": 7.051785714285714,
+      "diagnostics_scope": "50 measured requests only; manual warmup excluded",
+      "output_cap_hits": 0,
+      "complete_tool_markers": 50,
+      "diagnostics": {
+        "hybrid_spec": {
+          "retrieval_requests": 206,
+          "neural_requests": 359,
+          "retrieval_correct_drafts": 1758,
+          "neural_correct_drafts": 1665,
+          "retrieval_accept_tokens": 1964,
+          "neural_accept_tokens": 2024
+        },
+        "hybrid_spec_compact_verify": {
+          "verify_ct": 565,
+          "logical_token_ct": 6733,
+          "target_token_ct": 6733,
+          "dense_token_ct": 9605,
+          "graph_token_histogram": {
+            "9": 359,
+            "17": 206
+          }
+        },
+        "hybrid_spec_split_graph": {
+          "prefix_ct": 565,
+          "skip_ct": 206,
+          "tail_ct": 359,
+          "decision_wait_ns": 16578635110,
+          "request_ct": 565,
+          "skip_request_ct": 206,
+          "tail_request_ct": 359,
+          "mixed_ct": 0,
+          "tail_batch_histogram": {
+            "0": 206,
+            "1": 359
+          }
+        }
+      },
+      "sa_selection_rate": 0.36460176991150445,
+      "overall_accept_length": 7.058407079646018,
+      "sa_accept_length": 9.533980582524272,
+      "sa_accept_rate": 0.533373786407767,
+      "neural_accept_length": 5.637883008356546,
+      "verify_rows_per_1k_accept": 141.67502507522568,
+      "target_positions_per_1k_accept": 1688.3149448345034,
+      "target_position_reduction": 0.29901093180635085,
+      "verify_rows_per_1k_output": 156.16362631288004,
+      "target_positions_per_1k_output": 1860.9729132117193,
+      "prefix_ct": 565,
+      "prefix_per_1k_accept": 141.67502507522568,
+      "tail_rows_per_1k_accept": 90.02006018054162,
+      "host_decision_wait_ms_per_prefix": 29.342717008849558,
+      "prefix_per_1k_output": 156.16362631288004,
+      "tail_rows_per_1k_output": 99.2260917634052
+    }
+  ]
+}

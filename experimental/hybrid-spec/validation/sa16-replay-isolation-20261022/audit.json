@@ -1,0 +1,157 @@
+{
+  "source": {
+    "verified_files": 5659,
+    "commit": "50084814319d2e61eee6499500e9fe1904a2bc8b"
+  },
+  "workload_sha256": "14fa95c7d417ae66a0e59dfeb7e9aeea4013334ba474d2a19ea4109f69f004c5",
+  "gpu_after": "NVIDIA A100-PCIE-40GB, 0 MiB, 0 %",
+  "port_closed": true,
+  "cases": [
+    {
+      "mode": "sa16-snapshot",
+      "round": 1,
+      "memory_usage": {
+        "weight": 21.225,
+        "kvcache": 2.5,
+        "startup_available": 8.787,
+        "token_capacity": 131072,
+        "token_capacity_swa": null,
+        "graph": {
+          "prefill": 0.0,
+          "decode": 0.0,
+          "target_verify": 0.109,
+          "draft_prefill": 0.0,
+          "draft_decode": 0.029,
+          "draft_extend": 0.0
+        }
+      },
+      "observed_peak_gpu_mib": 32102,
+      "telemetry_samples": 63,
+      "pool_log_lines": [
+        "[2026-10-22 02:49:38] Mamba Cache is allocated. max_mamba_cache_size: 40, conv_state size: 0.06GB, ssm_state size: 2.40GB intermediate_ssm_state_cache size: 1.99GB intermediate_conv_window_cache size: 0.02GB "
+      ],
+      "sanity": {
+        "gsm8k": {
+          "error_rate": 0.0,
+          "score": 0.95,
+          "stop_rate": 1.0,
+          "truncated_rate": 0.0
+        },
+        "cache_restore": true
+      },
+      "cache_recovery_cached_tokens": 11648,
+      "cache_recovery_text_equal": true
+    },
+    {
+      "mode": "sa16-snapshot",
+      "round": 2,
+      "memory_usage": {
+        "weight": 21.225,
+        "kvcache": 2.5,
+        "startup_available": 8.787,
+        "token_capacity": 131072,
+        "token_capacity_swa": null,
+        "graph": {
+          "prefill": 0.0,
+          "decode": 0.0,
+          "target_verify": 0.109,
+          "draft_prefill": 0.0,
+          "draft_decode": 0.029,
+          "draft_extend": 0.0
+        }
+      },
+      "observed_peak_gpu_mib": 32102,
+      "telemetry_samples": 61,
+      "pool_log_lines": [
+        "[2026-10-22 03:00:40] Mamba Cache is allocated. max_mamba_cache_size: 40, conv_state size: 0.06GB, ssm_state size: 2.40GB intermediate_ssm_state_cache size: 1.99GB intermediate_conv_window_cache size: 0.02GB "
+      ],
+      "sanity": {
+        "gsm8k": {
+          "error_rate": 0.0,
+          "score": 0.95,
+          "stop_rate": 1.0,
+          "truncated_rate": 0.0
+        },
+        "cache_restore": true
+      },
+      "cache_recovery_cached_tokens": 11648,
+      "cache_recovery_text_equal": true
+    },
+    {
+      "mode": "sa16-replay",
+      "round": 1,
+      "memory_usage": {
+        "weight": 21.225,
+        "kvcache": 2.5,
+        "startup_available": 9.812,
+        "token_capacity": 131072,
+        "token_capacity_swa": null,
+        "graph": {
+          "prefill": 0.0,
+          "decode": 0.0,
+          "target_verify": 1.018,
+          "draft_prefill": 0.0,
+          "draft_decode": 0.029,
+          "draft_extend": 0.0
+        }
+      },
+      "observed_peak_gpu_mib": 31052,
+      "telemetry_samples": 67,
+      "pool_log_lines": [
+        "[2026-10-22 02:53:10] Mamba Cache is allocated. max_mamba_cache_size: 40, conv_state size: 0.06GB, ssm_state size: 2.40GB intermediate_ssm_state_cache size: 0.00GB intermediate_conv_window_cache size: 0.02GB ",
+        "[2026-10-22 02:53:10] GDN ReplaySSM ring buffers allocated (record_len=64, fold=False): d=0.029GB, k=0.015GB, g=0.000GB rawv=0.029GB, rawk=0.015GB, "
+      ],
+      "sanity": {
+        "gsm8k": {
+          "error_rate": 0.0,
+          "score": 0.95,
+          "stop_rate": 1.0,
+          "truncated_rate": 0.0
+        },
+        "cache_restore": true
+      },
+      "cache_recovery_cached_tokens": 11648,
+      "cache_recovery_text_equal": true
+    },
+    {
+      "mode": "sa16-replay",
+      "round": 2,
+      "memory_usage": {
+        "weight": 21.225,
+        "kvcache": 2.5,
+        "startup_available": 9.812,
+        "token_capacity": 131072,
+        "token_capacity_swa": null,
+        "graph": {
+          "prefill": 0.0,
+          "decode": 0.0,
+          "target_verify": 1.018,
+          "draft_prefill": 0.0,
+          "draft_decode": 0.029,
+          "draft_extend": 0.0
+        }
+      },
+      "observed_peak_gpu_mib": 31052,
+      "telemetry_samples": 64,
+      "pool_log_lines": [
+        "[2026-10-22 02:56:55] Mamba Cache is allocated. max_mamba_cache_size: 40, conv_state size: 0.06GB, ssm_state size: 2.40GB intermediate_ssm_state_cache size: 0.00GB intermediate_conv_window_cache size: 0.02GB ",
+        "[2026-10-22 02:56:55] GDN ReplaySSM ring buffers allocated (record_len=64, fold=False): d=0.029GB, k=0.015GB, g=0.000GB rawv=0.029GB, rawk=0.015GB, "
+      ],
+      "sanity": {
+        "gsm8k": {
+          "error_rate": 0.0,
+          "score": 0.95,
+          "stop_rate": 1.0,
+          "truncated_rate": 0.0
+        },
+        "cache_restore": true
+      },
+      "cache_recovery_cached_tokens": 11648,
+      "cache_recovery_text_equal": true
+    }
+  ],
+  "exact_repeat_text_matches_out_of_50": {
+    "sa16-snapshot": 44,
+    "sa16-replay": 45
+  }
+}

@@ -1,0 +1,23 @@
+{
+  "objective": "isolate ReplaySSM from service/Graph capacity changes in SA16/MTP8 C1",
+  "source_commit": "50084814319d2e61eee6499500e9fe1904a2bc8b",
+  "modes": ["sa16-snapshot", "sa16-replay"],
+  "boot_order": ["snapshot-r1", "replay-r1", "replay-r2", "snapshot-r2"],
+  "separate_boot_per_case": true,
+  "concurrency": 1,
+  "max_running_requests": 1,
+  "cuda_graph_max_bs_decode": 1,
+  "mamba_ssm_dtype": "float32",
+  "max_mamba_cache_size": 40,
+  "max_total_tokens": 131072,
+  "mem_fraction_static": 0.94,
+  "replay_ring_length": 64,
+  "workload_sha256": "14fa95c7d417ae66a0e59dfeb7e9aeea4013334ba474d2a19ea4109f69f004c5",
+  "measured_requests_per_case": 50,
+  "total_measured_requests": 200,
+  "temperature": 0,
+  "max_output_tokens": 2048,
+  "natural_eos": true,
+  "gates_per_boot": ["actual running capacity 1", "actual KV 131072", "FP32 SSM", "20-example matched GSM8K smoke > 80%", "long-prefix cache recovery"],
+  "precision_and_hybrid_settings": "launch.sh and sa16-n8.json; identical except ReplaySSM enable flag and its cache length"
+}
