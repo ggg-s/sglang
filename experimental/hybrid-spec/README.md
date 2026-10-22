@@ -231,7 +231,7 @@ GDN compact 可显式启用 `--enable-linear-replayssm-spec`，配合
 并至少为最大验证宽度（含 bonus）的两倍。SA16/neural8 的宽度为 17，使用
 `--linear-replayssm-cache-len 64`。该路径保留卷积回滚缓存，用请求级更新记录
 替代完整 GDN 中间快照；默认的 split/gate=1/fixed compact 不变。
-4060 组件验证和完整模型验收进度见
+4060 组件验证和 A100 完整模型显存、正确性 smoke、并发 1/8 性能结果见
 [ReplaySSM + GDN compact 验证记录](validation/qwen-gdn-replayssm-compact-20261022/README.md)。
 
 DSV4 的原生 ragged 路径

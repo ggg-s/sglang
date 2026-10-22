@@ -1,0 +1,18 @@
+{
+  "tests": {
+    "a100-registered": {
+      "tests": 32,
+      "errors": 0,
+      "failures": 0,
+      "skipped": 0
+    },
+    "a100-integration": {
+      "tests": 29,
+      "errors": 0,
+      "failures": 0,
+      "skipped": 0
+    }
+  },
+  "port_closed": true,
+  "gpu_after": "NVIDIA A100-PCIE-40GB, 0 MiB, 0 %"
+}

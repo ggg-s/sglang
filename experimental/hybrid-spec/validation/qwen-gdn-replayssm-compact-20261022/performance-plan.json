@@ -1,0 +1,43 @@
+{
+  "arms": [
+    "native-k8",
+    "native-k8-replay",
+    "sa16-n8-replay"
+  ],
+  "concurrency": [
+    1,
+    8
+  ],
+  "repeats": 2,
+  "measured_requests_per_case": 50,
+  "workload": "same frozen SWE-rebench OpenHands complete Agent prefixes as prior run",
+  "precision": {
+    "target": "float16",
+    "quantization": "gptq_marlin Int4",
+    "ssm": "float32",
+    "conv": "float16"
+  },
+  "pool_settings": {
+    "max_running_requests": 8,
+    "max_mamba_cache_size": 40,
+    "max_total_tokens": 131072,
+    "mem_fraction_static": 0.94
+  },
+  "sa_settings": {
+    "num_drafts": 16,
+    "num_neural_drafts": 8,
+    "num_neural_gate_tokens": 1,
+    "draft_graph_mode": "split",
+    "verify_mode": "compact",
+    "dynamic_verify": false,
+    "sa_continuation_policy": "frequency"
+  },
+  "replay_ring_length": 64,
+  "gates": [
+    "GPU regression passes for exact sources",
+    "full-model correctness / prefix-cache smoke",
+    "quick GSM8K same step-by-step prompt >80%",
+    "all arms preserve FP32 and actual KV capacity >=131072"
+  ],
+  "status": "complete on authorized A100 port 30154; 600 measured requests; see A100_RESULTS.md (archive retains the original pre-run plan)"
+}

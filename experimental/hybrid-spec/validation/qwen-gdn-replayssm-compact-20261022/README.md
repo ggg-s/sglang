@@ -1,6 +1,6 @@
 # ReplaySSM + GDN compact：4060 组件验证
 
-2026-10-22：接线及组件验证完成；**完整模型正确性、整机显存和并发 1/8 性能仍未验收**。
+2026-10-22：接线及组件验证完成。随后已在新 A100 端口 30154 完成完整模型 smoke、整机显存和并发 1/8 性能测试，详见 [A100 完整报告](A100_RESULTS.md)。下文保留 4060 组件阶段的证据与边界。
 原 A100 `fj02-ssh.gpuhome.cc:30224` 多次返回 connection refused；后续验证已获授权改用同主机的 30154 端口。
 用户随后授权先在工作站 RTX 4060 验证 CUDA 用例；未替换成小模型报告性能。
 
@@ -49,18 +49,18 @@
 这不包含模型权重、KV、Graph 或服务临时工作区，**不能据此确认 A100 上最终 KV 容量或 8 并发已可用**。
 原 8.96 GiB 快照未在 8 GiB 工作站上强行分配。
 
-## 完整模型待办
+## 完整模型验证后续
 
 冻结了前次相同的 50 条 SWE-rebench/OpenHands Agent 输入及内容 SHA；未重新采样。
-`launch.sh`、`run_matrix.py`、`performance-plan.json` 已准备，尚未执行：
+`launch.sh`、`run_matrix.py`、`performance-plan.json` 已在新 A100 执行：
 
 1. 原生 MTP8，保留原快照路径作为基线。
 2. 原生 MTP8 + ReplaySSM，分离 Replay 本身的影响。
 3. SA16/MTP8 + ReplaySSM，frequency / split / gate=1 / fixed compact。
 
 统一 FP32 状态，max-running=8、Mamba cache=40、KV 目标=131072、mem-fraction=0.94。
-先做完整模型正确性、缓存恢复与同提示 GSM8K smoke；实际容量达标后，再跑并发 1/8、各两轮。
-**没有新模型性能数据，也未复用旧数据冒充此次结果。**
+完整模型 smoke、缓存恢复与同提示 GSM8K 检查通过；三组实际 KV 均为 131072 token，已跑完并发 1/8、各两轮，共 600 个正式请求。A100 完整依赖环境也补验了注册 CUDA 测试及工作站未运行的生命周期用例。
+SA16/MTP8 + Replay 单并发吞吐约比原生 MTP8 低 1.1%，8 并发低 6.6%；省显存并成功跑通 8 并发，没有整体吞吐提升。详细口径、原始数据和限制见 [A100 完整报告](A100_RESULTS.md)。
 
 社区参考：[GDN ReplaySSM #28695](https://github.com/sgl-project/sglang/pull/28695)、[紧凑历史及生命周期 #35544](https://github.com/sgl-project/sglang/pull/35544)。核心已在当前分支；本次补接线和发现的历史重建问题，没有整段移植其他框架。审计记录见 `history/model-pr-history-notes.md`。
 
@@ -74,4 +74,4 @@
 - `cuda-evidence.tar.gz`：日志、最终覆盖包和证据清单；本地验证了压缩包及每个成员的 SHA256。
 - `local-verification.json`：本地验收记录。归档 SHA256：`38b2649ccf39c3047d6f73abed83c8f69e4e60f4a574a3df1bd66ff3c1d895ba`。
 
-4060 组件阶段的自有测试进程已结束，GPU 最终为 **0 MiB / 0%**。完整模型验证结果将另行补充。
+4060 组件阶段的自有测试进程已结束，GPU 最终为 **0 MiB / 0%**。`cuda-summary.json` 的 pending 字段是这一组件阶段的历史快照，后续验收状态以 `A100_RESULTS.md` 为准。
