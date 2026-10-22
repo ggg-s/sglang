@@ -233,6 +233,10 @@ GDN compact 可显式启用 `--enable-linear-replayssm-spec`，配合
 替代完整 GDN 中间快照；默认的 split/gate=1/fixed compact 不变。
 4060 组件验证和 A100 完整模型显存、正确性 smoke、并发 1/8 性能结果见
 [ReplaySSM + GDN compact 验证记录](validation/qwen-gdn-replayssm-compact-20261022/README.md)。
+SM80 的 FP32 checkpoint / FP16 激活实测形状已调整 Replay verify 的 warp/stage，
+并根据 packed token 容量减少补齐计算；保留原 TF32 点积和高低位补偿。
+[kernel profile 与优化复测](validation/gdn-replay-kernel-opt-20261022/README.md)
+记录同容量下 C1/C8 的收益、FP32 数值回归和实际显存。
 
 DSV4 的原生 ragged 路径
 不支持 CP 或实验性 online c128 MTP；不要开启 `SGLANG_EXPERIMENTAL_ONLINE_C128_MTP`。

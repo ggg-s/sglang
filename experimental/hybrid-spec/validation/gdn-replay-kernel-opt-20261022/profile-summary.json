@@ -1,0 +1,2074 @@
+{
+  "rows": [
+    {
+      "trace": "/Users/gq/Desktop/workspces/sglang/experimental/hybrid-spec/validation/gdn-replay-kernel-opt-20261022/traces/sa16-replay/DECODE-c1/DECODE-c1-TP-0.trace.json.gz",
+      "kernel_ct": 21253,
+      "decode_cycles": 10,
+      "cycle_scope": "first target-verify GPU start to last target-verify GPU start",
+      "window_ms": 477.1115729980469,
+      "cycle_ms": 47.71115729980469,
+      "gpu_busy_ms": 468.6622360839844,
+      "gpu_idle_ms": 8.4493369140625,
+      "gpu_busy_rate": 0.9822906477389156,
+      "phases": {
+        "verify": {
+          "kernel_ct": 15350,
+          "kernel_sum_us": 375458.9072265625,
+          "kernel_union_us": 353182.1162109375,
+          "kernel_ms_per_cycle": 37.54589072265625
+        },
+        "compact_scatter": {
+          "kernel_ct": 100,
+          "kernel_sum_us": 335.714111328125,
+          "kernel_union_us": 335.714111328125,
+          "kernel_ms_per_cycle": 0.0335714111328125
+        },
+        "outside_scopes": {
+          "kernel_ct": 90,
+          "kernel_sum_us": 361.661376953125,
+          "kernel_union_us": 361.661376953125,
+          "kernel_ms_per_cycle": 0.0361661376953125
+        },
+        "draft_extend": {
+          "kernel_ct": 490,
+          "kernel_sum_us": 29359.12109375,
+          "kernel_union_us": 29125.87158203125,
+          "kernel_ms_per_cycle": 2.935912109375
+        },
+        "draft": {
+          "kernel_ct": 80,
+          "kernel_sum_us": 880.130126953125,
+          "kernel_union_us": 880.130126953125,
+          "kernel_ms_per_cycle": 0.0880130126953125
+        },
+        "sa_prefix": {
+          "kernel_ct": 90,
+          "kernel_sum_us": 860.57958984375,
+          "kernel_union_us": 860.57958984375,
+          "kernel_ms_per_cycle": 0.086057958984375
+        },
+        "split_replay": {
+          "kernel_ct": 10,
+          "kernel_sum_us": 22.720703125,
+          "kernel_union_us": 22.720703125,
+          "kernel_ms_per_cycle": 0.0022720703125
+        },
+        "neural_tail": {
+          "kernel_ct": 2530,
+          "kernel_sum_us": 83004.37939453125,
+          "kernel_union_us": 82092.56689453125,
+          "kernel_ms_per_cycle": 8.300437939453124
+        },
+        "verify_plan": {
+          "kernel_ct": 100,
+          "kernel_sum_us": 225.698486328125,
+          "kernel_union_us": 225.698486328125,
+          "kernel_ms_per_cycle": 0.0225698486328125
+        },
+        "compact_pack": {
+          "kernel_ct": 480,
+          "kernel_sum_us": 1219.593505859375,
+          "kernel_union_us": 1219.593505859375,
+          "kernel_ms_per_cycle": 0.1219593505859375
+        }
+      },
+      "prefix_decision": {
+        "complete_span_ct": 10,
+        "host_ms_mean": 32.780597500000006,
+        "no_gpu_activity_ms_mean": 0.20997950683593883,
+        "note": "No-GPU portion is observed idle, not a proven removable dependency-free speedup."
+      },
+      "sa_consume_and_feedback_kernel_sum_us": 781.347900390625,
+      "split_copy_named_kernel_sum_us": 58.0478515625,
+      "top_kernels": [
+        {
+          "name": "_fwd_kernel",
+          "ct": 110,
+          "sum_us": 206806.4619140625
+        },
+        {
+          "name": "ampere_fp16_s16816gemm_fp16_64x64_sliced1x2_ldg8_f2f_stages_64x5_tn",
+          "ct": 510,
+          "sum_us": 79904.4970703125
+        },
+        {
+          "name": "gdn_replayssm_spec_circular_kernel",
+          "ct": 300,
+          "sum_us": 72455.55981445312
+        },
+        {
+          "name": "void sglang::device::marlin_moe::Marlin<__half, 1125899907892224l, 1125899906910725l, 128, 1, 8, 4, true, 4, 8, false, false, false>(int4 const*, int4 const*, int4*, int4*, int4 const*, int4 const*, unsigned short const*, int4 const*, int const*, int const*, int const*, int const*, float const*, int, bool, bool, int, int, int, int, int*, bool, bool, bool, int)",
+          "ct": 800,
+          "sum_us": 24605.720458984375
+        },
+        {
+          "name": "_fwd_grouped_kernel_stage1",
+          "ct": 70,
+          "sum_us": 19125.189208984375
+        },
+        {
+          "name": "sm80_xmma_gemm_f16f16_f16f32_f32_tn_n_tilesize32x32x64_stage6_warpsize2x2x1_tensor16x8x16_execute_kernel__5x_cublas",
+          "ct": 1200,
+          "sum_us": 11843.171875
+        },
+        {
+          "name": "ampere_s16816gemm_fp16_64x64_ldg8_stages_64x5_tn",
+          "ct": 300,
+          "sum_us": 11263.823974609375
+        },
+        {
+          "name": "void cutlass::Kernel2<cutlass_80_tensorop_s16816gemm_f16_64x64_64x6_tn_align8>(cutlass_80_tensorop_s16816gemm_f16_64x64_64x6_tn_align8::Params)",
+          "ct": 400,
+          "sum_us": 7186.15478515625
+        },
+        {
+          "name": "_causal_conv1d_update_kernel",
+          "ct": 300,
+          "sum_us": 5936.646728515625
+        },
+        {
+          "name": "fused_moe_kernel",
+          "ct": 160,
+          "sum_us": 4423.326904296875
+        },
+        {
+          "name": "std::enable_if<!(false), void>::type internal::gemvx::kernel<int, int, __half, __half, __half, float, false, true, true, false, 7, false, cublasGemvParamsEx<int, cublasGemvTensorStridedBatched<__half const>, cublasGemvTensorStridedBatched<__half const>, cublasGemvTensorStridedBatched<__half>, float> >(cublasGemvParamsEx<int, cublasGemvTensorStridedBatched<__half const>, cublasGemvTensorStridedBatched<__half const>, cublasGemvTensorStridedBatched<__half>, float>)",
+          "ct": 350,
+          "sum_us": 3949.214599609375
+        },
+        {
+          "name": "kernel_cutlass_kernel_flashinfernormkernelsfused_add_rmsnormFusedAddRMSNormKernel_object_at__tensorptrf16gmemalign128oi64204820481_tensorptrf16gmemalign128oi64204820481_tensorptrf16gmemal_0",
+          "ct": 960,
+          "sum_us": 3568.60107421875
+        },
+        {
+          "name": "_router_triton_kernel",
+          "ct": 480,
+          "sum_us": 2610.8056640625
+        },
+        {
+          "name": "void sglang::act_and_mul_kernel<__half, (sglang::ActivationKind)0, false, false, false, false, false, false>(sglang::ActivationParams)",
+          "ct": 960,
+          "sum_us": 2436.892578125
+        },
+        {
+          "name": "ampere_fp16_s16816gemm_fp16_128x64_ldg8_f2f_stages_64x4_tn",
+          "ct": 70,
+          "sum_us": 2379.59814453125
+        },
+        {
+          "name": "void moe_align_block_size_kernel<int>(int const*, int*, int*, int*, int, int, unsigned long, int*, bool, bool, int, int)",
+          "ct": 410,
+          "sum_us": 2166.880859375
+        },
+        {
+          "name": "void cublasLt::splitKreduce_kernel<32, 16, int, float, __half, float, __half, false, __half, __half, __half, true, false, false, false>(cublasLt::cublasSplitKParams<float>, float const*, __half const*, __half*, __half*, float const*, float const*, __half const*, float const*, __half*, void*, long, float*, int*, float*, float*, float const*, float const*, float const*, float const*, float const*)",
+          "ct": 740,
+          "sum_us": 2076.008544921875
+        },
+        {
+          "name": "void at::native::vectorized_elementwise_kernel<4, at::native::FillFunctor<c10::Half>, std::array<char*, 1ul>, false>(int, at::native::FillFunctor<c10::Half>, std::array<char*, 1ul>)",
+          "ct": 1300,
+          "sum_us": 2050.094482421875
+        },
+        {
+          "name": "memcpy32_post",
+          "ct": 880,
+          "sum_us": 1570.0791015625
+        },
+        {
+          "name": "_fused_gate_sigmoid_mul_add_kernel",
+          "ct": 480,
+          "sum_us": 1333.47216796875
+        }
+      ],
+      "graphs": [
+        {
+          "role": "sa_prefix",
+          "correlation": 271371,
+          "start_us": 1781943691137.95,
+          "end_us": 1781943691173.374,
+          "kernel_sum_us": 34.848000000000006,
+          "kernels": 9,
+          "raw_batch": null
+        },
+        {
+          "role": "neural_tail",
+          "correlation": 271390,
+          "start_us": 1781943691769.026,
+          "end_us": 1781943699985.6592,
+          "kernel_sum_us": 8298.681000000002,
+          "kernels": 253,
+          "raw_batch": null
+        },
+        {
+          "role": "verify",
+          "correlation": 272594,
+          "start_us": 1781943700292.253,
+          "end_us": 1781943735741.0762,
+          "kernel_sum_us": 37584.19699999991,
+          "kernels": 1514,
+          "raw_batch": 1
+        },
+        {
+          "role": "draft_extend",
+          "correlation": 273378,
+          "start_us": 1781943735962.485,
+          "end_us": 1781943738790.441,
+          "kernel_sum_us": 2849.2999999999997,
+          "kernels": 35,
+          "raw_batch": null
+        },
+        {
+          "role": "sa_prefix",
+          "correlation": 273884,
+          "start_us": 1781943738920.49,
+          "end_us": 1781943738956.8738,
+          "kernel_sum_us": 35.36000000000001,
+          "kernels": 9,
+          "raw_batch": null
+        },
+        {
+          "role": "neural_tail",
+          "correlation": 273903,
+          "start_us": 1781943739519.982,
+          "end_us": 1781943747745.895,
+          "kernel_sum_us": 8301.432999999999,
+          "kernels": 253,
+          "raw_batch": null
+        },
+        {
+          "role": "verify",
+          "correlation": 275107,
+          "start_us": 1781943748051.689,
+          "end_us": 1781943783497.6638,
+          "kernel_sum_us": 37590.313999999955,
+          "kernels": 1514,
+          "raw_batch": 1
+        },
+        {
+          "role": "draft_extend",
+          "correlation": 275891,
+          "start_us": 1781943783715.713,
+          "end_us": 1781943786564.6611,
+          "kernel_sum_us": 2874.452,
+          "kernels": 35,
+          "raw_batch": null
+        },
+        {
+          "role": "sa_prefix",
+          "correlation": 276397,
+          "start_us": 1781943786691.126,
+          "end_us": 1781943786725.9421,
+          "kernel_sum_us": 33.792,
+          "kernels": 9,
+          "raw_batch": null
+        },
+        {
+          "role": "neural_tail",
+          "correlation": 276416,
+          "start_us": 1781943787280.058,
+          "end_us": 1781943795502.323,
+          "kernel_sum_us": 8299.962000000005,
+          "kernels": 253,
+          "raw_batch": null
+        },
+        {
+          "role": "verify",
+          "correlation": 277620,
+          "start_us": 1781943795809.429,
+          "end_us": 1781943831027.434,
+          "kernel_sum_us": 37363.42499999991,
+          "kernels": 1514,
+          "raw_batch": 1
+        },
+        {
+          "role": "draft_extend",
+          "correlation": 278404,
+          "start_us": 1781943831728.207,
+          "end_us": 1781943834592.0352,
+          "kernel_sum_us": 2885.524,
+          "kernels": 35,
+          "raw_batch": null
+        },
+        {
+          "role": "sa_prefix",
+          "correlation": 278910,
+          "start_us": 1781943834718.436,
+          "end_us": 1781943834820.997,
+          "kernel_sum_us": 101.53699999999998,
+          "kernels": 9,
+          "raw_batch": null
+        },
+        {
+          "role": "neural_tail",
+          "correlation": 278929,
+          "start_us": 1781943835390.697,
+          "end_us": 1781943843610.306,
+          "kernel_sum_us": 8300.696,
+          "kernels": 253,
+          "raw_batch": null
+        },
+        {
+          "role": "verify",
+          "correlation": 280133,
+          "start_us": 1781943843916.452,
+          "end_us": 1781943878932.343,
+          "kernel_sum_us": 37157.153999999966,
+          "kernels": 1514,
+          "raw_batch": 1
+        },
+        {
+          "role": "draft_extend",
+          "correlation": 280917,
+          "start_us": 1781943879152.441,
+          "end_us": 1781943882005.26,
+          "kernel_sum_us": 2873.907,
+          "kernels": 35,
+          "raw_batch": null
+        },
+        {
+          "role": "sa_prefix",
+          "correlation": 281423,
+          "start_us": 1781943882132.909,
+          "end_us": 1781943882246.062,
+          "kernel_sum_us": 112.09699999999998,
+          "kernels": 9,
+          "raw_batch": null
+        },
+        {
+          "role": "neural_tail",
+          "correlation": 281442,
+          "start_us": 1781943882825.234,
+          "end_us": 1781943891042.7632,
+          "kernel_sum_us": 8297.110999999997,
+          "kernels": 253,
+          "raw_batch": null
+        },
+        {
+          "role": "verify",
+          "correlation": 282646,
+          "start_us": 1781943891349.357,
+          "end_us": 1781943926342.785,
+          "kernel_sum_us": 37139.74799999996,
+          "kernels": 1514,
+          "raw_batch": 1
+        },
+        {
+          "role": "draft_extend",
+          "correlation": 283430,
+          "start_us": 1781943926566.658,
+          "end_us": 1781943929420.6301,
+          "kernel_sum_us": 2873.204,
+          "kernels": 35,
+          "raw_batch": null
+        },
+        {
+          "role": "sa_prefix",
+          "correlation": 283936,
+          "start_us": 1781943929547.543,
+          "end_us": 1781943929660.76,
+          "kernel_sum_us": 112.097,
+          "kernels": 9,
+          "raw_batch": null
+        },
+        {
+          "role": "neural_tail",
+          "correlation": 283955,
+          "start_us": 1781943930258.236,
+          "end_us": 1781943938477.1409,
+          "kernel_sum_us": 8299.065999999999,
+          "kernels": 253,
+          "raw_batch": null
+        },
+        {
+          "role": "verify",
+          "correlation": 285159,
+          "start_us": 1781943938783.415,
+          "end_us": 1781943973737.93,
+          "kernel_sum_us": 37100.190999999955,
+          "kernels": 1514,
+          "raw_batch": 1
+        },
+        {
+          "role": "draft_extend",
+          "correlation": 285943,
+          "start_us": 1781943973960.652,
+          "end_us": 1781943976813.184,
+          "kernel_sum_us": 2873.589,
+          "kernels": 35,
+          "raw_batch": null
+        },
+        {
+          "role": "sa_prefix",
+          "correlation": 286449,
+          "start_us": 1781943976942.849,
+          "end_us": 1781943977054.497,
+          "kernel_sum_us": 110.62399999999998,
+          "kernels": 9,
+          "raw_batch": null
+        },
+        {
+          "role": "neural_tail",
+          "correlation": 286468,
+          "start_us": 1781943977629.893,
+          "end_us": 1781943985845.9822,
+          "kernel_sum_us": 8299.707,
+          "kernels": 253,
+          "raw_batch": null
+        },
+        {
+          "role": "verify",
+          "correlation": 287672,
+          "start_us": 1781943986151.456,
+          "end_us": 1781944021144.212,
+          "kernel_sum_us": 37134.82199999995,
+          "kernels": 1514,
+          "raw_batch": 1
+        },
+        {
+          "role": "draft_extend",
+          "correlation": 288456,
+          "start_us": 1781944021843.289,
+          "end_us": 1781944024701.837,
+          "kernel_sum_us": 2880.212,
+          "kernels": 35,
+          "raw_batch": null
+        },
+        {
+          "role": "sa_prefix",
+          "correlation": 288962,
+          "start_us": 1781944024830.093,
+          "end_us": 1781944024942.3499,
+          "kernel_sum_us": 111.26499999999999,
+          "kernels": 9,
+          "raw_batch": null
+        },
+        {
+          "role": "neural_tail",
+          "correlation": 288981,
+          "start_us": 1781944025536.722,
+          "end_us": 1781944033757.5798,
+          "kernel_sum_us": 8305.627999999997,
+          "kernels": 253,
+          "raw_batch": null
+        },
+        {
+          "role": "verify",
+          "correlation": 290185,
+          "start_us": 1781944034063.854,
+          "end_us": 1781944068895.072,
+          "kernel_sum_us": 36969.08899999989,
+          "kernels": 1514,
+          "raw_batch": 1
+        },
+        {
+          "role": "draft_extend",
+          "correlation": 290969,
+          "start_us": 1781944069116.385,
+          "end_us": 1781944071976.2131,
+          "kernel_sum_us": 2880.693,
+          "kernels": 35,
+          "raw_batch": null
+        },
+        {
+          "role": "sa_prefix",
+          "correlation": 291475,
+          "start_us": 1781944072104.054,
+          "end_us": 1781944072217.815,
+          "kernel_sum_us": 112.76899999999999,
+          "kernels": 9,
+          "raw_batch": null
+        },
+        {
+          "role": "neural_tail",
+          "correlation": 291494,
+          "start_us": 1781944072776.251,
+          "end_us": 1781944080992.052,
+          "kernel_sum_us": 8299.032000000003,
+          "kernels": 253,
+          "raw_batch": null
+        },
+        {
+          "role": "verify",
+          "correlation": 292698,
+          "start_us": 1781944081298.582,
+          "end_us": 1781944116891.917,
+          "kernel_sum_us": 37738.085000000014,
+          "kernels": 1514,
+          "raw_batch": 1
+        },
+        {
+          "role": "draft_extend",
+          "correlation": 293482,
+          "start_us": 1781944117112.527,
+          "end_us": 1781944120004.9631,
+          "kernel_sum_us": 2913.3,
+          "kernels": 35,
+          "raw_batch": null
+        },
+        {
+          "role": "sa_prefix",
+          "correlation": 293988,
+          "start_us": 1781944120134.02,
+          "end_us": 1781944120224.74,
+          "kernel_sum_us": 89.56799999999998,
+          "kernels": 9,
+          "raw_batch": null
+        },
+        {
+          "role": "neural_tail",
+          "correlation": 294007,
+          "start_us": 1781944120796.52,
+          "end_us": 1781944129014.21,
+          "kernel_sum_us": 8295.801,
+          "kernels": 253,
+          "raw_batch": null
+        },
+        {
+          "role": "verify",
+          "correlation": 295211,
+          "start_us": 1781944129321.124,
+          "end_us": 1781944165012.38,
+          "kernel_sum_us": 37836.4239999999,
+          "kernels": 1514,
+          "raw_batch": 1
+        },
+        {
+          "role": "draft_extend",
+          "correlation": 295995,
+          "start_us": 1781944165231.517,
+          "end_us": 1781944168113.297,
+          "kernel_sum_us": 2903.028,
+          "kernels": 35,
+          "raw_batch": null
+        },
+        {
+          "role": "sa_prefix",
+          "correlation": 296501,
+          "start_us": 1781944168242.642,
+          "end_us": 1781944168284.659,
+          "kernel_sum_us": 41.473,
+          "kernels": 9,
+          "raw_batch": null
+        },
+        {
+          "role": "neural_tail",
+          "correlation": 296520,
+          "start_us": 1781944168872.471,
+          "end_us": 1781944177094.96,
+          "kernel_sum_us": 8305.945000000003,
+          "kernels": 253,
+          "raw_batch": null
+        },
+        {
+          "role": "verify",
+          "correlation": 297724,
+          "start_us": 1781944177403.826,
+          "end_us": 1781944213018.314,
+          "kernel_sum_us": 37761.28799999998,
+          "kernels": 1514,
+          "raw_batch": 1
+        },
+        {
+          "role": "draft_extend",
+          "correlation": 298508,
+          "start_us": 1781944213238.027,
+          "end_us": 1781944216118.015,
+          "kernel_sum_us": 2901.46,
+          "kernels": 35,
+          "raw_batch": null
+        }
+      ],
+      "scope": "Diagnostic profiling only; steady decode holds batch with ignore_eos and forced continuation, not the formal natural-EOS throughput workload."
+    },
+    {
+      "trace": "/Users/gq/Desktop/workspces/sglang/experimental/hybrid-spec/validation/gdn-replay-kernel-opt-20261022/traces/sa16-replay/PREFILL-c1/PREFILL-c1-TP-0.trace.json.gz",
+      "kernel_ct": 4453,
+      "decode_cycles": null,
+      "cycle_scope": "full GPU trace",
+      "window_ms": 894.1801708984375,
+      "cycle_ms": null,
+      "gpu_busy_ms": 857.4448283691406,
+      "gpu_idle_ms": 36.73534252929687,
+      "gpu_busy_rate": 0.9589172923702987,
+      "phases": {
+        "outside_scopes": {
+          "kernel_ct": 42,
+          "kernel_sum_us": 182.94482421875,
+          "kernel_union_us": 182.94482421875
+        },
+        "prefill": {
+          "kernel_ct": 4411,
+          "kernel_sum_us": 856226.1433105469,
+          "kernel_union_us": 856226.1433105469
+        }
+      },
+      "prefix_decision": {
+        "complete_span_ct": 0,
+        "host_ms_mean": null,
+        "no_gpu_activity_ms_mean": null,
+        "note": "No-GPU portion is observed idle, not a proven removable dependency-free speedup."
+      },
+      "sa_consume_and_feedback_kernel_sum_us": 5.152099609375,
+      "split_copy_named_kernel_sum_us": 0,
+      "top_kernels": [
+        {
+          "name": "_fwd_kernel",
+          "ct": 33,
+          "sum_us": 283314.8271484375
+        },
+        {
+          "name": "void sglang::device::marlin_moe::Marlin<__half, 1125899907892224l, 1125899906910725l, 128, 4, 8, 4, false, 4, 8, false, false, false>(int4 const*, int4 const*, int4*, int4*, int4 const*, int4 const*, unsigned short const*, int4 const*, int const*, int const*, int const*, int const*, float const*, int, bool, bool, int, int, int, int, int*, bool, bool, bool, int)",
+          "ct": 240,
+          "sum_us": 234679.51000976562
+        },
+        {
+          "name": "ampere_fp16_s16816gemm_fp16_128x256_ldg8_f2f_stages_64x3_tn",
+          "ct": 123,
+          "sum_us": 114910.17236328125
+        },
+        {
+          "name": "ampere_fp16_s16816gemm_fp16_128x128_ldg8_f2f_stages_32x5_tn",
+          "ct": 289,
+          "sum_us": 40010.3017578125
+        },
+        {
+          "name": "chunk_gated_delta_rule_fwd_kernel_h_blockdim64",
+          "ct": 90,
+          "sum_us": 18992.76806640625
+        },
+        {
+          "name": "chunk_fwd_kernel_o",
+          "ct": 90,
+          "sum_us": 14461.183837890625
+        },
+        {
+          "name": "void moe_sum_reduce_kernel_warp_token_topk<c10::Half, 8, 4>(c10::Half const*, c10::Half*, long, long, long, long, long, at::OpMathType<c10::Half>::type)",
+          "ct": 123,
+          "sum_us": 13632.67822265625
+        },
+        {
+          "name": "void at::native::vectorized_elementwise_kernel<4, at::native::FillFunctor<c10::Half>, std::array<char*, 1ul>, false>(int, at::native::FillFunctor<c10::Half>, std::array<char*, 1ul>)",
+          "ct": 301,
+          "sum_us": 12801.14306640625
+        },
+        {
+          "name": "_causal_conv1d_fwd_kernel",
+          "ct": 90,
+          "sum_us": 11091.11572265625
+        },
+        {
+          "name": "sm80_xmma_gemm_f16f16_f16f32_f32_tn_n_tilesize192x128x32_stage4_warpsize4x2x1_tensor16x8x16_execute_kernel__5x_cublas",
+          "ct": 42,
+          "sum_us": 10831.275146484375
+        },
+        {
+          "name": "recompute_w_u_fwd_kernel",
+          "ct": 90,
+          "sum_us": 9792.644775390625
+        },
+        {
+          "name": "kernel_cutlass_kernel_flashinfernormkernelsfused_add_rmsnormFusedAddRMSNormKernel_object_at__tensorptrf16gmemalign128oi64204820481_tensorptrf16gmemalign128oi64204820481_tensorptrf16gmemal_0",
+          "ct": 246,
+          "sum_us": 9700.614013671875
+        },
+        {
+          "name": "chunk_gated_delta_rule_fwd_kkt_solve_kernel",
+          "ct": 90,
+          "sum_us": 9289.68798828125
+        },
+        {
+          "name": "void sglang::act_and_mul_kernel<__half, (sglang::ActivationKind)0, false, false, false, false, false, false>(sglang::ActivationParams)",
+          "ct": 246,
+          "sum_us": 8846.783935546875
+        },
+        {
+          "name": "fused_qkv_split_gdn_prefill_kernel",
+          "ct": 90,
+          "sum_us": 8001.938720703125
+        },
+        {
+          "name": "sm80_xmma_gemm_f16f16_f16f32_f32_tn_n_tilesize96x128x32_stage4_warpsize2x2x1_tensor16x8x16_execute_kernel__5x_cublas",
+          "ct": 164,
+          "sum_us": 7395.957275390625
+        },
+        {
+          "name": "_layer_norm_fwd_1pass_kernel",
+          "ct": 90,
+          "sum_us": 6367.781982421875
+        },
+        {
+          "name": "ampere_fp16_s16816gemm_fp16_64x64_sliced1x2_ldg8_f2f_stages_64x5_tn",
+          "ct": 96,
+          "sum_us": 6284.043212890625
+        },
+        {
+          "name": "fused_moe_kernel",
+          "ct": 6,
+          "sum_us": 6261.513916015625
+        },
+        {
+          "name": "_fused_gate_sigmoid_mul_add_kernel",
+          "ct": 123,
+          "sum_us": 5206.36865234375
+        }
+      ],
+      "graphs": [],
+      "scope": "Diagnostic profiling only; steady decode holds batch with ignore_eos and forced continuation, not the formal natural-EOS throughput workload."
+    },
+    {
+      "trace": "/Users/gq/Desktop/workspces/sglang/experimental/hybrid-spec/validation/gdn-replay-kernel-opt-20261022/traces/sa16-replay-opt/DECODE-c1/DECODE-c1-TP-0.trace.json.gz",
+      "kernel_ct": 19696,
+      "decode_cycles": 10,
+      "cycle_scope": "first target-verify GPU start to last target-verify GPU start",
+      "window_ms": 442.5483979492187,
+      "cycle_ms": 44.25483979492188,
+      "gpu_busy_ms": 369.71998315429687,
+      "gpu_idle_ms": 72.82841479492187,
+      "gpu_busy_rate": 0.8354340109863447,
+      "phases": {
+        "verify": {
+          "kernel_ct": 15990,
+          "kernel_sum_us": 339947.88525390625,
+          "kernel_union_us": 317763.4658203125,
+          "kernel_ms_per_cycle": 33.994788525390625
+        },
+        "compact_scatter": {
+          "kernel_ct": 100,
+          "kernel_sum_us": 389.44287109375,
+          "kernel_union_us": 389.44287109375,
+          "kernel_ms_per_cycle": 0.038944287109374996
+        },
+        "outside_scopes": {
+          "kernel_ct": 90,
+          "kernel_sum_us": 360.1630859375,
+          "kernel_union_us": 360.1630859375,
+          "kernel_ms_per_cycle": 0.03601630859375
+        },
+        "draft_extend": {
+          "kernel_ct": 490,
+          "kernel_sum_us": 30436.24169921875,
+          "kernel_union_us": 30195.7919921875,
+          "kernel_ms_per_cycle": 3.043624169921875
+        },
+        "draft": {
+          "kernel_ct": 80,
+          "kernel_sum_us": 872.005859375,
+          "kernel_union_us": 872.005859375,
+          "kernel_ms_per_cycle": 0.08720058593749999
+        },
+        "sa_prefix": {
+          "kernel_ct": 90,
+          "kernel_sum_us": 1963.1142578125,
+          "kernel_union_us": 1963.1142578125,
+          "kernel_ms_per_cycle": 0.19631142578125
+        },
+        "split_replay": {
+          "kernel_ct": 10,
+          "kernel_sum_us": 22.751708984375,
+          "kernel_union_us": 22.751708984375,
+          "kernel_ms_per_cycle": 0.0022751708984375
+        },
+        "verify_plan": {
+          "kernel_ct": 100,
+          "kernel_sum_us": 224.06494140625,
+          "kernel_union_us": 224.06494140625,
+          "kernel_ms_per_cycle": 0.022406494140625
+        },
+        "compact_pack": {
+          "kernel_ct": 480,
+          "kernel_sum_us": 1151.20654296875,
+          "kernel_union_us": 1151.20654296875,
+          "kernel_ms_per_cycle": 0.115120654296875
+        },
+        "neural_tail": {
+          "kernel_ct": 506,
+          "kernel_sum_us": 16634.466064453125,
+          "kernel_union_us": 16434.3662109375,
+          "kernel_ms_per_cycle": 1.6634466064453124
+        }
+      },
+      "prefix_decision": {
+        "complete_span_ct": 10,
+        "host_ms_mean": 28.0982683,
+        "no_gpu_activity_ms_mean": 0.22967772382812474,
+        "note": "No-GPU portion is observed idle, not a proven removable dependency-free speedup."
+      },
+      "sa_consume_and_feedback_kernel_sum_us": 1900.556884765625,
+      "split_copy_named_kernel_sum_us": 56.6416015625,
+      "top_kernels": [
+        {
+          "name": "_fwd_kernel",
+          "ct": 110,
+          "sum_us": 207962.97241210938
+        },
+        {
+          "name": "ampere_fp16_s16816gemm_fp16_64x64_sliced1x2_ldg8_f2f_stages_64x5_tn",
+          "ct": 766,
+          "sum_us": 37506.78515625
+        },
+        {
+          "name": "void sglang::device::marlin_moe::Marlin<__half, 1125899907892224l, 1125899906910725l, 128, 1, 8, 4, true, 4, 8, false, false, false>(int4 const*, int4 const*, int4*, int4*, int4 const*, int4 const*, unsigned short const*, int4 const*, int const*, int const*, int const*, int const*, float const*, int, bool, bool, int, int, int, int, int*, bool, bool, bool, int)",
+          "ct": 800,
+          "sum_us": 36612.79736328125
+        },
+        {
+          "name": "gdn_replayssm_spec_circular_kernel",
+          "ct": 300,
+          "sum_us": 21433.741943359375
+        },
+        {
+          "name": "void cutlass::Kernel2<cutlass_80_wmma_tensorop_f16_s161616gemm_f16_16x16_128x2_tn_align8>(cutlass_80_wmma_tensorop_f16_s161616gemm_f16_16x16_128x2_tn_align8::Params)",
+          "ct": 240,
+          "sum_us": 8635.14697265625
+        },
+        {
+          "name": "ampere_s16816gemm_fp16_128x64_ldg8_stages_64x4_tn",
+          "ct": 340,
+          "sum_us": 6209.143310546875
+        },
+        {
+          "name": "_causal_conv1d_update_kernel",
+          "ct": 300,
+          "sum_us": 5990.537841796875
+        },
+        {
+          "name": "ampere_fp16_s16816gemm_fp16_128x64_ldg8_f2f_stages_64x3_tn",
+          "ct": 8,
+          "sum_us": 5905.0380859375
+        },
+        {
+          "name": "_fwd_grouped_kernel_stage1",
+          "ct": 14,
+          "sum_us": 3842.46044921875
+        },
+        {
+          "name": "void cublasLt::splitKreduce_kernel<32, 16, int, float, __half, float, __half, false, __half, __half, __half, true, false, false, false>(cublasLt::cublasSplitKParams<float>, float const*, __half const*, __half*, __half*, float const*, float const*, __half const*, float const*, __half*, void*, long, float*, int*, float*, float*, float const*, float const*, float const*, float const*, float const*)",
+          "ct": 1140,
+          "sum_us": 3709.06982421875
+        },
+        {
+          "name": "ampere_s16816gemm_fp16_128x64_ldg8_stages_32x6_tn",
+          "ct": 330,
+          "sum_us": 3450.46826171875
+        },
+        {
+          "name": "kernel_cutlass_kernel_flashinfernormkernelsfused_add_rmsnormFusedAddRMSNormKernel_object_at__tensorptrf16gmemalign128oi64204820481_tensorptrf16gmemalign128oi64204820481_tensorptrf16gmemal_0",
+          "ct": 848,
+          "sum_us": 3257.21142578125
+        },
+        {
+          "name": "fused_moe_kernel",
+          "ct": 48,
+          "sum_us": 2764.691650390625
+        },
+        {
+          "name": "void cutlass::Kernel2<cutlass_80_wmma_tensorop_s161616gemm_f16_32x32_128x2_tn_align8>(cutlass_80_wmma_tensorop_s161616gemm_f16_32x32_128x2_tn_align8::Params)",
+          "ct": 330,
+          "sum_us": 2365.3720703125
+        },
+        {
+          "name": "ampere_s16816gemm_fp16_64x64_ldg8_stages_64x5_tn",
+          "ct": 60,
+          "sum_us": 2245.19677734375
+        },
+        {
+          "name": "sm80_xmma_gemm_f16f16_f16f32_f32_tn_n_tilesize32x32x64_stage6_warpsize2x2x1_tensor16x8x16_execute_kernel__5x_cublas",
+          "ct": 240,
+          "sum_us": 2240.686279296875
+        },
+        {
+          "name": "void moe_align_block_size_kernel<int>(int const*, int*, int*, int*, int, int, unsigned long, int*, bool, bool, int, int)",
+          "ct": 410,
+          "sum_us": 2133.010009765625
+        },
+        {
+          "name": "gdn_replayssm_compact_commit_kernel",
+          "ct": 10,
+          "sum_us": 2128.91259765625
+        },
+        {
+          "name": "void sglang::act_and_mul_kernel<__half, (sglang::ActivationKind)0, false, false, false, false, false, false>(sglang::ActivationParams)",
+          "ct": 848,
+          "sum_us": 2080.003662109375
+        },
+        {
+          "name": "void at::native::vectorized_elementwise_kernel<4, at::native::FillFunctor<c10::Half>, std::array<char*, 1ul>, false>(int, at::native::FillFunctor<c10::Half>, std::array<char*, 1ul>)",
+          "ct": 1300,
+          "sum_us": 2070.802978515625
+        }
+      ],
+      "graphs": [
+        {
+          "role": "sa_prefix",
+          "correlation": 240734,
+          "start_us": 1783243083990.908,
+          "end_us": 1783243084243.134,
+          "kernel_sum_us": 251.52200000000002,
+          "kernels": 9,
+          "raw_batch": null
+        },
+        {
+          "role": "verify",
+          "correlation": 241952,
+          "start_us": 1783243092675.006,
+          "end_us": 1783243125376.506,
+          "kernel_sum_us": 34856.74699999996,
+          "kernels": 1594,
+          "raw_batch": 1
+        },
+        {
+          "role": "draft_extend",
+          "correlation": 242736,
+          "start_us": 1783243126077.791,
+          "end_us": 1783243129074.071,
+          "kernel_sum_us": 3017.5600000000004,
+          "kernels": 35,
+          "raw_batch": null
+        },
+        {
+          "role": "sa_prefix",
+          "correlation": 243242,
+          "start_us": 1783243129203.288,
+          "end_us": 1783243129473.689,
+          "kernel_sum_us": 269.34499999999997,
+          "kernels": 9,
+          "raw_batch": null
+        },
+        {
+          "role": "verify",
+          "correlation": 244460,
+          "start_us": 1783243138052.444,
+          "end_us": 1783243169474.125,
+          "kernel_sum_us": 33579.04699999997,
+          "kernels": 1594,
+          "raw_batch": 1
+        },
+        {
+          "role": "draft_extend",
+          "correlation": 245244,
+          "start_us": 1783243169709.263,
+          "end_us": 1783243172607.109,
+          "kernel_sum_us": 2926.3909999999996,
+          "kernels": 35,
+          "raw_batch": null
+        },
+        {
+          "role": "sa_prefix",
+          "correlation": 245750,
+          "start_us": 1783243172737.319,
+          "end_us": 1783243172971.1118,
+          "kernel_sum_us": 232.80100000000004,
+          "kernels": 9,
+          "raw_batch": null
+        },
+        {
+          "role": "neural_tail",
+          "correlation": 245769,
+          "start_us": 1783243173726.766,
+          "end_us": 1783243181942.8928,
+          "kernel_sum_us": 8301.822999999999,
+          "kernels": 253,
+          "raw_batch": null
+        },
+        {
+          "role": "verify",
+          "correlation": 246973,
+          "start_us": 1783243182257.328,
+          "end_us": 1783243211145.774,
+          "kernel_sum_us": 30995.30799999996,
+          "kernels": 1514,
+          "raw_batch": 1
+        },
+        {
+          "role": "draft_extend",
+          "correlation": 247757,
+          "start_us": 1783243211367.92,
+          "end_us": 1783243214267.0461,
+          "kernel_sum_us": 2920.0219999999995,
+          "kernels": 35,
+          "raw_batch": null
+        },
+        {
+          "role": "sa_prefix",
+          "correlation": 248263,
+          "start_us": 1783243214396.647,
+          "end_us": 1783243214449.479,
+          "kernel_sum_us": 51.84000000000001,
+          "kernels": 9,
+          "raw_batch": null
+        },
+        {
+          "role": "verify",
+          "correlation": 249481,
+          "start_us": 1783243223016.457,
+          "end_us": 1783243254983.423,
+          "kernel_sum_us": 34116.00899999998,
+          "kernels": 1594,
+          "raw_batch": 1
+        },
+        {
+          "role": "draft_extend",
+          "correlation": 250265,
+          "start_us": 1783243255212.641,
+          "end_us": 1783243258177.464,
+          "kernel_sum_us": 2985.3670000000006,
+          "kernels": 35,
+          "raw_batch": null
+        },
+        {
+          "role": "sa_prefix",
+          "correlation": 250771,
+          "start_us": 1783243258307.993,
+          "end_us": 1783243258393.529,
+          "kernel_sum_us": 84.47999999999999,
+          "kernels": 9,
+          "raw_batch": null
+        },
+        {
+          "role": "verify",
+          "correlation": 251989,
+          "start_us": 1783243266854.906,
+          "end_us": 1783243299132.499,
+          "kernel_sum_us": 34441.868999999955,
+          "kernels": 1594,
+          "raw_batch": 1
+        },
+        {
+          "role": "draft_extend",
+          "correlation": 252773,
+          "start_us": 1783243299838.873,
+          "end_us": 1783243302908.208,
+          "kernel_sum_us": 3094.711,
+          "kernels": 35,
+          "raw_batch": null
+        },
+        {
+          "role": "sa_prefix",
+          "correlation": 253279,
+          "start_us": 1783243303037.905,
+          "end_us": 1783243303289.907,
+          "kernel_sum_us": 251.01000000000002,
+          "kernels": 9,
+          "raw_batch": null
+        },
+        {
+          "role": "verify",
+          "correlation": 254497,
+          "start_us": 1783243311771.317,
+          "end_us": 1783243344552.176,
+          "kernel_sum_us": 34930.98799999998,
+          "kernels": 1594,
+          "raw_batch": 1
+        },
+        {
+          "role": "draft_extend",
+          "correlation": 255281,
+          "start_us": 1783243344788.787,
+          "end_us": 1783243347803.05,
+          "kernel_sum_us": 3035.287,
+          "kernels": 35,
+          "raw_batch": null
+        },
+        {
+          "role": "sa_prefix",
+          "correlation": 255787,
+          "start_us": 1783243347933.675,
+          "end_us": 1783243348188.429,
+          "kernel_sum_us": 253.698,
+          "kernels": 9,
+          "raw_batch": null
+        },
+        {
+          "role": "verify",
+          "correlation": 257005,
+          "start_us": 1783243356688.75,
+          "end_us": 1783243389340.2651,
+          "kernel_sum_us": 34800.71699999995,
+          "kernels": 1594,
+          "raw_batch": 1
+        },
+        {
+          "role": "draft_extend",
+          "correlation": 257789,
+          "start_us": 1783243390042.03,
+          "end_us": 1783243393069.798,
+          "kernel_sum_us": 3048.9519999999998,
+          "kernels": 35,
+          "raw_batch": null
+        },
+        {
+          "role": "sa_prefix",
+          "correlation": 258295,
+          "start_us": 1783243393199.175,
+          "end_us": 1783243393461.641,
+          "kernel_sum_us": 261.474,
+          "kernels": 9,
+          "raw_batch": null
+        },
+        {
+          "role": "verify",
+          "correlation": 259513,
+          "start_us": 1783243401900.586,
+          "end_us": 1783243434066.561,
+          "kernel_sum_us": 34324.709999999985,
+          "kernels": 1594,
+          "raw_batch": 1
+        },
+        {
+          "role": "draft_extend",
+          "correlation": 260297,
+          "start_us": 1783243434302.979,
+          "end_us": 1783243437282.778,
+          "kernel_sum_us": 3000.6309999999994,
+          "kernels": 35,
+          "raw_batch": null
+        },
+        {
+          "role": "sa_prefix",
+          "correlation": 260803,
+          "start_us": 1783243437412.859,
+          "end_us": 1783243437674.525,
+          "kernel_sum_us": 260.674,
+          "kernels": 9,
+          "raw_batch": null
+        },
+        {
+          "role": "neural_tail",
+          "correlation": 260822,
+          "start_us": 1783243438740.037,
+          "end_us": 1783243446978.981,
+          "kernel_sum_us": 8332.643,
+          "kernels": 253,
+          "raw_batch": null
+        },
+        {
+          "role": "verify",
+          "correlation": 262026,
+          "start_us": 1783243447596.041,
+          "end_us": 1783243476718.313,
+          "kernel_sum_us": 31230.098999999995,
+          "kernels": 1514,
+          "raw_batch": 1
+        },
+        {
+          "role": "draft_extend",
+          "correlation": 262810,
+          "start_us": 1783243476941.675,
+          "end_us": 1783243479848.385,
+          "kernel_sum_us": 2927.4790000000003,
+          "kernels": 35,
+          "raw_batch": null
+        },
+        {
+          "role": "sa_prefix",
+          "correlation": 263316,
+          "start_us": 1783243479978.147,
+          "end_us": 1783243480041.5708,
+          "kernel_sum_us": 62.4,
+          "kernels": 9,
+          "raw_batch": null
+        },
+        {
+          "role": "verify",
+          "correlation": 264534,
+          "start_us": 1783243491022.552,
+          "end_us": 1783243522530.602,
+          "kernel_sum_us": 33674.600999999944,
+          "kernels": 1594,
+          "raw_batch": 1
+        },
+        {
+          "role": "draft_extend",
+          "correlation": 265318,
+          "start_us": 1783243523448.849,
+          "end_us": 1783243526365.096,
+          "kernel_sum_us": 2937.911,
+          "kernels": 35,
+          "raw_batch": null
+        },
+        {
+          "role": "sa_prefix",
+          "correlation": 265824,
+          "start_us": 1783243526496.041,
+          "end_us": 1783243526732.427,
+          "kernel_sum_us": 235.39400000000003,
+          "kernels": 9,
+          "raw_batch": null
+        },
+        {
+          "role": "verify",
+          "correlation": 267042,
+          "start_us": 1783243535223.404,
+          "end_us": 1783243566989.4722,
+          "kernel_sum_us": 33924.931000000026,
+          "kernels": 1594,
+          "raw_batch": 1
+        },
+        {
+          "role": "draft_extend",
+          "correlation": 267826,
+          "start_us": 1783243567223.778,
+          "end_us": 1783243570211.481,
+          "kernel_sum_us": 3008.439,
+          "kernels": 35,
+          "raw_batch": null
+        }
+      ],
+      "scope": "Diagnostic profiling only; steady decode holds batch with ignore_eos and forced continuation, not the formal natural-EOS throughput workload."
+    },
+    {
+      "trace": "/Users/gq/Desktop/workspces/sglang/experimental/hybrid-spec/validation/gdn-replay-kernel-opt-20261022/traces/sa16-replay-opt/PREFILL-c1/PREFILL-c1-TP-0.trace.json.gz",
+      "kernel_ct": 4453,
+      "decode_cycles": null,
+      "cycle_scope": "full GPU trace",
+      "window_ms": 965.6292690429688,
+      "cycle_ms": null,
+      "gpu_busy_ms": 925.8512326660157,
+      "gpu_idle_ms": 39.778036376953125,
+      "gpu_busy_rate": 0.9588060991395,
+      "phases": {
+        "outside_scopes": {
+          "kernel_ct": 42,
+          "kernel_sum_us": 205.698486328125,
+          "kernel_union_us": 205.698486328125
+        },
+        "prefill": {
+          "kernel_ct": 4411,
+          "kernel_sum_us": 924470.0078125,
+          "kernel_union_us": 924470.0078125
+        }
+      },
+      "prefix_decision": {
+        "complete_span_ct": 0,
+        "host_ms_mean": null,
+        "no_gpu_activity_ms_mean": null,
+        "note": "No-GPU portion is observed idle, not a proven removable dependency-free speedup."
+      },
+      "sa_consume_and_feedback_kernel_sum_us": 4.8330078125,
+      "split_copy_named_kernel_sum_us": 0,
+      "top_kernels": [
+        {
+          "name": "_fwd_kernel",
+          "ct": 33,
+          "sum_us": 292158.05126953125
+        },
+        {
+          "name": "void sglang::device::marlin_moe::Marlin<__half, 1125899907892224l, 1125899906910725l, 128, 4, 8, 4, false, 4, 8, false, false, false>(int4 const*, int4 const*, int4*, int4*, int4 const*, int4 const*, unsigned short const*, int4 const*, int const*, int const*, int const*, int const*, float const*, int, bool, bool, int, int, int, int, int*, bool, bool, bool, int)",
+          "ct": 240,
+          "sum_us": 262638.7263183594
+        },
+        {
+          "name": "ampere_fp16_s16816gemm_fp16_128x256_ldg8_f2f_stages_64x3_tn",
+          "ct": 123,
+          "sum_us": 128974.05834960938
+        },
+        {
+          "name": "ampere_fp16_s16816gemm_fp16_128x128_ldg8_f2f_stages_32x5_tn",
+          "ct": 289,
+          "sum_us": 46176.122314453125
+        },
+        {
+          "name": "chunk_gated_delta_rule_fwd_kernel_h_blockdim64",
+          "ct": 90,
+          "sum_us": 21193.858642578125
+        },
+        {
+          "name": "chunk_fwd_kernel_o",
+          "ct": 90,
+          "sum_us": 15726.234375
+        },
+        {
+          "name": "void at::native::vectorized_elementwise_kernel<4, at::native::FillFunctor<c10::Half>, std::array<char*, 1ul>, false>(int, at::native::FillFunctor<c10::Half>, std::array<char*, 1ul>)",
+          "ct": 301,
+          "sum_us": 13864.332275390625
+        },
+        {
+          "name": "void moe_sum_reduce_kernel_warp_token_topk<c10::Half, 8, 4>(c10::Half const*, c10::Half*, long, long, long, long, long, at::OpMathType<c10::Half>::type)",
+          "ct": 123,
+          "sum_us": 13862.153076171875
+        },
+        {
+          "name": "_causal_conv1d_fwd_kernel",
+          "ct": 90,
+          "sum_us": 12093.053955078125
+        },
+        {
+          "name": "sm80_xmma_gemm_f16f16_f16f32_f32_tn_n_tilesize192x128x32_stage4_warpsize4x2x1_tensor16x8x16_execute_kernel__5x_cublas",
+          "ct": 42,
+          "sum_us": 10830.8994140625
+        },
+        {
+          "name": "recompute_w_u_fwd_kernel",
+          "ct": 90,
+          "sum_us": 10426.64013671875
+        },
+        {
+          "name": "chunk_gated_delta_rule_fwd_kkt_solve_kernel",
+          "ct": 90,
+          "sum_us": 10285.968994140625
+        },
+        {
+          "name": "kernel_cutlass_kernel_flashinfernormkernelsfused_add_rmsnormFusedAddRMSNormKernel_object_at__tensorptrf16gmemalign128oi64204820481_tensorptrf16gmemalign128oi64204820481_tensorptrf16gmemal_0",
+          "ct": 246,
+          "sum_us": 10072.5517578125
+        },
+        {
+          "name": "void sglang::act_and_mul_kernel<__half, (sglang::ActivationKind)0, false, false, false, false, false, false>(sglang::ActivationParams)",
+          "ct": 246,
+          "sum_us": 9057.228515625
+        },
+        {
+          "name": "fused_qkv_split_gdn_prefill_kernel",
+          "ct": 90,
+          "sum_us": 8149.12451171875
+        },
+        {
+          "name": "sm80_xmma_gemm_f16f16_f16f32_f32_tn_n_tilesize96x128x32_stage4_warpsize2x2x1_tensor16x8x16_execute_kernel__5x_cublas",
+          "ct": 164,
+          "sum_us": 7754.62548828125
+        },
+        {
+          "name": "_layer_norm_fwd_1pass_kernel",
+          "ct": 90,
+          "sum_us": 6491.542236328125
+        },
+        {
+          "name": "ampere_fp16_s16816gemm_fp16_64x64_sliced1x2_ldg8_f2f_stages_64x5_tn",
+          "ct": 96,
+          "sum_us": 6374.287109375
+        },
+        {
+          "name": "fused_moe_kernel",
+          "ct": 6,
+          "sum_us": 6251.535888671875
+        },
+        {
+          "name": "_fused_qk_rmsnorm_rope_gate_kernel",
+          "ct": 33,
+          "sum_us": 5425.225830078125
+        }
+      ],
+      "graphs": [],
+      "scope": "Diagnostic profiling only; steady decode holds batch with ignore_eos and forced continuation, not the formal natural-EOS throughput workload."
+    },
+    {
+      "trace": "/Users/gq/Desktop/workspces/sglang/experimental/hybrid-spec/validation/gdn-replay-kernel-opt-20261022/traces/sa16-snapshot/DECODE-c1/DECODE-c1-TP-0.trace.json.gz",
+      "kernel_ct": 20956,
+      "decode_cycles": 10,
+      "cycle_scope": "first target-verify GPU start to last target-verify GPU start",
+      "window_ms": 418.2204948730469,
+      "cycle_ms": 41.82204948730468,
+      "gpu_busy_ms": 408.95628540039064,
+      "gpu_idle_ms": 9.26420947265625,
+      "gpu_busy_rate": 0.9778485043506334,
+      "phases": {
+        "verify": {
+          "kernel_ct": 15080,
+          "kernel_sum_us": 316073.59716796875,
+          "kernel_union_us": 293622.85009765625,
+          "kernel_ms_per_cycle": 31.607359716796875
+        },
+        "compact_scatter": {
+          "kernel_ct": 100,
+          "kernel_sum_us": 347.93798828125,
+          "kernel_union_us": 347.93798828125,
+          "kernel_ms_per_cycle": 0.034793798828125
+        },
+        "outside_scopes": {
+          "kernel_ct": 90,
+          "kernel_sum_us": 358.04833984375,
+          "kernel_union_us": 358.04833984375,
+          "kernel_ms_per_cycle": 0.035804833984375
+        },
+        "draft_extend": {
+          "kernel_ct": 490,
+          "kernel_sum_us": 29426.701171875,
+          "kernel_union_us": 29195.402587890625,
+          "kernel_ms_per_cycle": 2.9426701171875003
+        },
+        "draft": {
+          "kernel_ct": 80,
+          "kernel_sum_us": 878.433837890625,
+          "kernel_union_us": 878.433837890625,
+          "kernel_ms_per_cycle": 0.0878433837890625
+        },
+        "sa_prefix": {
+          "kernel_ct": 90,
+          "kernel_sum_us": 828.708740234375,
+          "kernel_union_us": 828.708740234375,
+          "kernel_ms_per_cycle": 0.0828708740234375
+        },
+        "split_replay": {
+          "kernel_ct": 10,
+          "kernel_sum_us": 22.52783203125,
+          "kernel_union_us": 22.52783203125,
+          "kernel_ms_per_cycle": 0.002252783203125
+        },
+        "neural_tail": {
+          "kernel_ct": 2530,
+          "kernel_sum_us": 82874.93212890625,
+          "kernel_union_us": 81894.41552734375,
+          "kernel_ms_per_cycle": 8.287493212890626
+        },
+        "verify_plan": {
+          "kernel_ct": 100,
+          "kernel_sum_us": 232.449462890625,
+          "kernel_union_us": 232.449462890625,
+          "kernel_ms_per_cycle": 0.023244946289062502
+        },
+        "compact_pack": {
+          "kernel_ct": 480,
+          "kernel_sum_us": 1227.919921875,
+          "kernel_union_us": 1227.919921875,
+          "kernel_ms_per_cycle": 0.1227919921875
+        }
+      },
+      "prefix_decision": {
+        "complete_span_ct": 10,
+        "host_ms_mean": 26.4418436,
+        "no_gpu_activity_ms_mean": 0.2222424037109373,
+        "note": "No-GPU portion is observed idle, not a proven removable dependency-free speedup."
+      },
+      "sa_consume_and_feedback_kernel_sum_us": 756.483642578125,
+      "split_copy_named_kernel_sum_us": 58.398681640625,
+      "top_kernels": [
+        {
+          "name": "_fwd_kernel",
+          "ct": 110,
+          "sum_us": 207152.54272460938
+        },
+        {
+          "name": "ampere_fp16_s16816gemm_fp16_64x64_sliced1x2_ldg8_f2f_stages_64x5_tn",
+          "ct": 510,
+          "sum_us": 79845.17211914062
+        },
+        {
+          "name": "void sglang::device::marlin_moe::Marlin<__half, 1125899907892224l, 1125899906910725l, 128, 1, 8, 4, true, 4, 8, false, false, false>(int4 const*, int4 const*, int4*, int4*, int4 const*, int4 const*, unsigned short const*, int4 const*, int const*, int const*, int const*, int const*, float const*, int, bool, bool, int, int, int, int, int*, bool, bool, bool, int)",
+          "ct": 800,
+          "sum_us": 24877.345703125
+        },
+        {
+          "name": "_fwd_grouped_kernel_stage1",
+          "ct": 70,
+          "sum_us": 19054.149169921875
+        },
+        {
+          "name": "sm80_xmma_gemm_f16f16_f16f32_f32_tn_n_tilesize32x32x64_stage6_warpsize2x2x1_tensor16x8x16_execute_kernel__5x_cublas",
+          "ct": 1200,
+          "sum_us": 12032.2587890625
+        },
+        {
+          "name": "fused_sigmoid_gating_delta_rule_update_kernel",
+          "ct": 300,
+          "sum_us": 11570.773681640625
+        },
+        {
+          "name": "ampere_s16816gemm_fp16_64x64_ldg8_stages_64x5_tn",
+          "ct": 300,
+          "sum_us": 11306.741455078125
+        },
+        {
+          "name": "void cutlass::Kernel2<cutlass_80_tensorop_s16816gemm_f16_64x64_64x6_tn_align8>(cutlass_80_tensorop_s16816gemm_f16_64x64_64x6_tn_align8::Params)",
+          "ct": 400,
+          "sum_us": 8055.171142578125
+        },
+        {
+          "name": "_causal_conv1d_update_kernel",
+          "ct": 300,
+          "sum_us": 5937.019775390625
+        },
+        {
+          "name": "fused_moe_kernel",
+          "ct": 160,
+          "sum_us": 4480.799072265625
+        },
+        {
+          "name": "std::enable_if<!(false), void>::type internal::gemvx::kernel<int, int, __half, __half, __half, float, false, true, true, false, 7, false, cublasGemvParamsEx<int, cublasGemvTensorStridedBatched<__half const>, cublasGemvTensorStridedBatched<__half const>, cublasGemvTensorStridedBatched<__half>, float> >(cublasGemvParamsEx<int, cublasGemvTensorStridedBatched<__half const>, cublasGemvTensorStridedBatched<__half const>, cublasGemvTensorStridedBatched<__half>, float>)",
+          "ct": 350,
+          "sum_us": 3949.43115234375
+        },
+        {
+          "name": "kernel_cutlass_kernel_flashinfernormkernelsfused_add_rmsnormFusedAddRMSNormKernel_object_at__tensorptrf16gmemalign128oi64204820481_tensorptrf16gmemalign128oi64204820481_tensorptrf16gmemal_0",
+          "ct": 960,
+          "sum_us": 3606.091796875
+        },
+        {
+          "name": "_router_triton_kernel",
+          "ct": 480,
+          "sum_us": 2626.25390625
+        },
+        {
+          "name": "void sglang::act_and_mul_kernel<__half, (sglang::ActivationKind)0, false, false, false, false, false, false>(sglang::ActivationParams)",
+          "ct": 960,
+          "sum_us": 2425.01806640625
+        },
+        {
+          "name": "ampere_fp16_s16816gemm_fp16_128x64_ldg8_f2f_stages_64x4_tn",
+          "ct": 70,
+          "sum_us": 2377.847900390625
+        },
+        {
+          "name": "void moe_align_block_size_kernel<int>(int const*, int*, int*, int*, int, int, unsigned long, int*, bool, bool, int, int)",
+          "ct": 410,
+          "sum_us": 2154.0859375
+        },
+        {
+          "name": "void cublasLt::splitKreduce_kernel<32, 16, int, float, __half, float, __half, false, __half, __half, __half, true, false, false, false>(cublasLt::cublasSplitKParams<float>, float const*, __half const*, __half*, __half*, float const*, float const*, __half const*, float const*, __half*, void*, long, float*, int*, float*, float*, float const*, float const*, float const*, float const*, float const*)",
+          "ct": 740,
+          "sum_us": 2099.200927734375
+        },
+        {
+          "name": "void at::native::vectorized_elementwise_kernel<4, at::native::FillFunctor<c10::Half>, std::array<char*, 1ul>, false>(int, at::native::FillFunctor<c10::Half>, std::array<char*, 1ul>)",
+          "ct": 1000,
+          "sum_us": 1642.6240234375
+        },
+        {
+          "name": "memcpy32_post",
+          "ct": 880,
+          "sum_us": 1551.52099609375
+        },
+        {
+          "name": "_fused_gate_sigmoid_mul_add_kernel",
+          "ct": 480,
+          "sum_us": 1326.21826171875
+        }
+      ],
+      "graphs": [
+        {
+          "role": "sa_prefix",
+          "correlation": 275242,
+          "start_us": 1781780936746.688,
+          "end_us": 1781780936848.0652,
+          "kernel_sum_us": 101.05600000000001,
+          "kernels": 9,
+          "raw_batch": null
+        },
+        {
+          "role": "neural_tail",
+          "correlation": 275261,
+          "start_us": 1781780937475.173,
+          "end_us": 1781780945680.222,
+          "kernel_sum_us": 8298.968000000006,
+          "kernels": 253,
+          "raw_batch": null
+        },
+        {
+          "role": "verify",
+          "correlation": 276465,
+          "start_us": 1781780945995.072,
+          "end_us": 1781780975028.3608,
+          "kernel_sum_us": 31192.790000000008,
+          "kernels": 1484,
+          "raw_batch": 1
+        },
+        {
+          "role": "draft_extend",
+          "correlation": 277305,
+          "start_us": 1781780975363.82,
+          "end_us": 1781780978211.391,
+          "kernel_sum_us": 2868.851,
+          "kernels": 35,
+          "raw_batch": null
+        },
+        {
+          "role": "sa_prefix",
+          "correlation": 277811,
+          "start_us": 1781780978339.968,
+          "end_us": 1781780978452.737,
+          "kernel_sum_us": 111.90499999999999,
+          "kernels": 9,
+          "raw_batch": null
+        },
+        {
+          "role": "neural_tail",
+          "correlation": 277830,
+          "start_us": 1781780979036.293,
+          "end_us": 1781780987236.542,
+          "kernel_sum_us": 8288.184999999998,
+          "kernels": 253,
+          "raw_batch": null
+        },
+        {
+          "role": "verify",
+          "correlation": 279034,
+          "start_us": 1781780987552.768,
+          "end_us": 1781781016507.208,
+          "kernel_sum_us": 31116.024999999994,
+          "kernels": 1484,
+          "raw_batch": 1
+        },
+        {
+          "role": "draft_extend",
+          "correlation": 279874,
+          "start_us": 1781781016844.81,
+          "end_us": 1781781019690.718,
+          "kernel_sum_us": 2867.06,
+          "kernels": 35,
+          "raw_batch": null
+        },
+        {
+          "role": "sa_prefix",
+          "correlation": 280380,
+          "start_us": 1781781019818.527,
+          "end_us": 1781781019929.8562,
+          "kernel_sum_us": 110.62500000000001,
+          "kernels": 9,
+          "raw_batch": null
+        },
+        {
+          "role": "neural_tail",
+          "correlation": 280399,
+          "start_us": 1781781020511.812,
+          "end_us": 1781781028708.9238,
+          "kernel_sum_us": 8284.123000000003,
+          "kernels": 253,
+          "raw_batch": null
+        },
+        {
+          "role": "verify",
+          "correlation": 281603,
+          "start_us": 1781781029024.094,
+          "end_us": 1781781058009.799,
+          "kernel_sum_us": 31145.787000000022,
+          "kernels": 1484,
+          "raw_batch": 1
+        },
+        {
+          "role": "draft_extend",
+          "correlation": 282443,
+          "start_us": 1781781058347.21,
+          "end_us": 1781781061198.941,
+          "kernel_sum_us": 2873.7799999999997,
+          "kernels": 35,
+          "raw_batch": null
+        },
+        {
+          "role": "sa_prefix",
+          "correlation": 282949,
+          "start_us": 1781781061326.398,
+          "end_us": 1781781061437.343,
+          "kernel_sum_us": 110.209,
+          "kernels": 9,
+          "raw_batch": null
+        },
+        {
+          "role": "neural_tail",
+          "correlation": 282968,
+          "start_us": 1781781062018.147,
+          "end_us": 1781781070222.2998,
+          "kernel_sum_us": 8288.601000000002,
+          "kernels": 253,
+          "raw_batch": null
+        },
+        {
+          "role": "verify",
+          "correlation": 284172,
+          "start_us": 1781781070540.254,
+          "end_us": 1781781099466.79,
+          "kernel_sum_us": 31081.783000000014,
+          "kernels": 1484,
+          "raw_batch": 1
+        },
+        {
+          "role": "draft_extend",
+          "correlation": 285012,
+          "start_us": 1781781099804.105,
+          "end_us": 1781781102656.764,
+          "kernel_sum_us": 2872.916,
+          "kernels": 35,
+          "raw_batch": null
+        },
+        {
+          "role": "sa_prefix",
+          "correlation": 285518,
+          "start_us": 1781781102785.853,
+          "end_us": 1781781102897.9502,
+          "kernel_sum_us": 111.36099999999999,
+          "kernels": 9,
+          "raw_batch": null
+        },
+        {
+          "role": "neural_tail",
+          "correlation": 285537,
+          "start_us": 1781781103499.106,
+          "end_us": 1781781111695.291,
+          "kernel_sum_us": 8280.665999999997,
+          "kernels": 253,
+          "raw_batch": null
+        },
+        {
+          "role": "verify",
+          "correlation": 286741,
+          "start_us": 1781781112019.933,
+          "end_us": 1781781140882.469,
+          "kernel_sum_us": 31020.502000000033,
+          "kernels": 1484,
+          "raw_batch": 1
+        },
+        {
+          "role": "draft_extend",
+          "correlation": 287581,
+          "start_us": 1781781141220.967,
+          "end_us": 1781781144073.147,
+          "kernel_sum_us": 2873.5879999999997,
+          "kernels": 35,
+          "raw_batch": null
+        },
+        {
+          "role": "sa_prefix",
+          "correlation": 288087,
+          "start_us": 1781781144205.724,
+          "end_us": 1781781144318.4932,
+          "kernel_sum_us": 111.87299999999999,
+          "kernels": 9,
+          "raw_batch": null
+        },
+        {
+          "role": "neural_tail",
+          "correlation": 288106,
+          "start_us": 1781781144904.384,
+          "end_us": 1781781153103.961,
+          "kernel_sum_us": 8288.152,
+          "kernels": 253,
+          "raw_batch": null
+        },
+        {
+          "role": "verify",
+          "correlation": 289310,
+          "start_us": 1781781153420.7,
+          "end_us": 1781781183196.202,
+          "kernel_sum_us": 31946.204000000027,
+          "kernels": 1484,
+          "raw_batch": 1
+        },
+        {
+          "role": "draft_extend",
+          "correlation": 290150,
+          "start_us": 1781781183528.364,
+          "end_us": 1781781186399.2642,
+          "kernel_sum_us": 2892.372,
+          "kernels": 35,
+          "raw_batch": null
+        },
+        {
+          "role": "sa_prefix",
+          "correlation": 290656,
+          "start_us": 1781781186529.889,
+          "end_us": 1781781186585.121,
+          "kernel_sum_us": 54.496,
+          "kernels": 9,
+          "raw_batch": null
+        },
+        {
+          "role": "neural_tail",
+          "correlation": 290675,
+          "start_us": 1781781187179.205,
+          "end_us": 1781781195370.5579,
+          "kernel_sum_us": 8274.551,
+          "kernels": 253,
+          "raw_batch": null
+        },
+        {
+          "role": "verify",
+          "correlation": 291879,
+          "start_us": 1781781195685.792,
+          "end_us": 1781781225498.223,
+          "kernel_sum_us": 31985.337000000018,
+          "kernels": 1484,
+          "raw_batch": 1
+        },
+        {
+          "role": "draft_extend",
+          "correlation": 292719,
+          "start_us": 1781781225832.913,
+          "end_us": 1781781228733.2532,
+          "kernel_sum_us": 2921.7799999999997,
+          "kernels": 35,
+          "raw_batch": null
+        },
+        {
+          "role": "sa_prefix",
+          "correlation": 293225,
+          "start_us": 1781781228861.638,
+          "end_us": 1781781228938.215,
+          "kernel_sum_us": 76.321,
+          "kernels": 9,
+          "raw_batch": null
+        },
+        {
+          "role": "neural_tail",
+          "correlation": 293244,
+          "start_us": 1781781229547.531,
+          "end_us": 1781781237751.971,
+          "kernel_sum_us": 8294.488000000005,
+          "kernels": 253,
+          "raw_batch": null
+        },
+        {
+          "role": "verify",
+          "correlation": 294448,
+          "start_us": 1781781238067.013,
+          "end_us": 1781781267569.234,
+          "kernel_sum_us": 31670.783000000018,
+          "kernels": 1484,
+          "raw_batch": 1
+        },
+        {
+          "role": "draft_extend",
+          "correlation": 295288,
+          "start_us": 1781781267902.772,
+          "end_us": 1781781270793.096,
+          "kernel_sum_us": 2911.668,
+          "kernels": 35,
+          "raw_batch": null
+        },
+        {
+          "role": "sa_prefix",
+          "correlation": 295794,
+          "start_us": 1781781270920.937,
+          "end_us": 1781781270958.9211,
+          "kernel_sum_us": 37.66400000000001,
+          "kernels": 9,
+          "raw_batch": null
+        },
+        {
+          "role": "neural_tail",
+          "correlation": 295813,
+          "start_us": 1781781271537.229,
+          "end_us": 1781781279742.534,
+          "kernel_sum_us": 8300.761000000002,
+          "kernels": 253,
+          "raw_batch": null
+        },
+        {
+          "role": "verify",
+          "correlation": 297017,
+          "start_us": 1781781280598.924,
+          "end_us": 1781781310048.9841,
+          "kernel_sum_us": 31619.842000000008,
+          "kernels": 1484,
+          "raw_batch": 1
+        },
+        {
+          "role": "draft_extend",
+          "correlation": 297857,
+          "start_us": 1781781310382.298,
+          "end_us": 1781781313268.718,
+          "kernel_sum_us": 2908.372,
+          "kernels": 35,
+          "raw_batch": null
+        },
+        {
+          "role": "sa_prefix",
+          "correlation": 298363,
+          "start_us": 1781781313398.415,
+          "end_us": 1781781313464.7512,
+          "kernel_sum_us": 65.56800000000001,
+          "kernels": 9,
+          "raw_batch": null
+        },
+        {
+          "role": "neural_tail",
+          "correlation": 298382,
+          "start_us": 1781781314035.379,
+          "end_us": 1781781322238.316,
+          "kernel_sum_us": 8292.186999999998,
+          "kernels": 253,
+          "raw_batch": null
+        },
+        {
+          "role": "verify",
+          "correlation": 299586,
+          "start_us": 1781781322553.87,
+          "end_us": 1781781351752.248,
+          "kernel_sum_us": 31362.14700000005,
+          "kernels": 1484,
+          "raw_batch": 1
+        },
+        {
+          "role": "draft_extend",
+          "correlation": 300426,
+          "start_us": 1781781352083.483,
+          "end_us": 1781781354957.167,
+          "kernel_sum_us": 2895.283999999999,
+          "kernels": 35,
+          "raw_batch": null
+        },
+        {
+          "role": "sa_prefix",
+          "correlation": 300932,
+          "start_us": 1781781355087.024,
+          "end_us": 1781781355126.416,
+          "kernel_sum_us": 38.68800000000001,
+          "kernels": 9,
+          "raw_batch": null
+        },
+        {
+          "role": "neural_tail",
+          "correlation": 300951,
+          "start_us": 1781781355705.076,
+          "end_us": 1781781363898.316,
+          "kernel_sum_us": 8283.224000000002,
+          "kernels": 253,
+          "raw_batch": null
+        },
+        {
+          "role": "verify",
+          "correlation": 302155,
+          "start_us": 1781781364215.567,
+          "end_us": 1781781393519.353,
+          "kernel_sum_us": 31464.404000000024,
+          "kernels": 1484,
+          "raw_batch": 1
+        },
+        {
+          "role": "draft_extend",
+          "correlation": 302995,
+          "start_us": 1781781393852.764,
+          "end_us": 1781781396747.5042,
+          "kernel_sum_us": 2914.7399999999993,
+          "kernels": 35,
+          "raw_batch": null
+        }
+      ],
+      "scope": "Diagnostic profiling only; steady decode holds batch with ignore_eos and forced continuation, not the formal natural-EOS throughput workload."
+    },
+    {
+      "trace": "/Users/gq/Desktop/workspces/sglang/experimental/hybrid-spec/validation/gdn-replay-kernel-opt-20261022/traces/sa16-snapshot/PREFILL-c1/PREFILL-c1-TP-0.trace.json.gz",
+      "kernel_ct": 4450,
+      "decode_cycles": null,
+      "cycle_scope": "full GPU trace",
+      "window_ms": 897.0655283203125,
+      "cycle_ms": null,
+      "gpu_busy_ms": 858.7322666015625,
+      "gpu_idle_ms": 38.33326171875,
+      "gpu_busy_rate": 0.957268158781526,
+      "phases": {
+        "outside_scopes": {
+          "kernel_ct": 39,
+          "kernel_sum_us": 169.664306640625,
+          "kernel_union_us": 169.664306640625
+        },
+        "prefill": {
+          "kernel_ct": 4411,
+          "kernel_sum_us": 857513.6027832031,
+          "kernel_union_us": 857513.6027832031
+        }
+      },
+      "prefix_decision": {
+        "complete_span_ct": 0,
+        "host_ms_mean": null,
+        "no_gpu_activity_ms_mean": null,
+        "note": "No-GPU portion is observed idle, not a proven removable dependency-free speedup."
+      },
+      "sa_consume_and_feedback_kernel_sum_us": 5.248046875,
+      "split_copy_named_kernel_sum_us": 0,
+      "top_kernels": [
+        {
+          "name": "_fwd_kernel",
+          "ct": 33,
+          "sum_us": 281160.0261230469
+        },
+        {
+          "name": "void sglang::device::marlin_moe::Marlin<__half, 1125899907892224l, 1125899906910725l, 128, 4, 8, 4, false, 4, 8, false, false, false>(int4 const*, int4 const*, int4*, int4*, int4 const*, int4 const*, unsigned short const*, int4 const*, int const*, int const*, int const*, int const*, float const*, int, bool, bool, int, int, int, int, int*, bool, bool, bool, int)",
+          "ct": 240,
+          "sum_us": 235735.939453125
+        },
+        {
+          "name": "ampere_fp16_s16816gemm_fp16_128x256_ldg8_f2f_stages_64x3_tn",
+          "ct": 123,
+          "sum_us": 115992.69677734375
+        },
+        {
+          "name": "ampere_fp16_s16816gemm_fp16_128x128_ldg8_f2f_stages_32x5_tn",
+          "ct": 289,
+          "sum_us": 40318.17431640625
+        },
+        {
+          "name": "chunk_gated_delta_rule_fwd_kernel_h_blockdim64",
+          "ct": 90,
+          "sum_us": 19072.38232421875
+        },
+        {
+          "name": "chunk_fwd_kernel_o",
+          "ct": 90,
+          "sum_us": 14531.945068359375
+        },
+        {
+          "name": "void moe_sum_reduce_kernel_warp_token_topk<c10::Half, 8, 4>(c10::Half const*, c10::Half*, long, long, long, long, long, at::OpMathType<c10::Half>::type)",
+          "ct": 123,
+          "sum_us": 13622.689208984375
+        },
+        {
+          "name": "void at::native::vectorized_elementwise_kernel<4, at::native::FillFunctor<c10::Half>, std::array<char*, 1ul>, false>(int, at::native::FillFunctor<c10::Half>, std::array<char*, 1ul>)",
+          "ct": 301,
+          "sum_us": 12792.600830078125
+        },
+        {
+          "name": "_causal_conv1d_fwd_kernel",
+          "ct": 90,
+          "sum_us": 11173.76953125
+        },
+        {
+          "name": "sm80_xmma_gemm_f16f16_f16f32_f32_tn_n_tilesize192x128x32_stage4_warpsize4x2x1_tensor16x8x16_execute_kernel__5x_cublas",
+          "ct": 42,
+          "sum_us": 10869.44482421875
+        },
+        {
+          "name": "kernel_cutlass_kernel_flashinfernormkernelsfused_add_rmsnormFusedAddRMSNormKernel_object_at__tensorptrf16gmemalign128oi64204820481_tensorptrf16gmemalign128oi64204820481_tensorptrf16gmemal_0",
+          "ct": 246,
+          "sum_us": 10006.600830078125
+        },
+        {
+          "name": "recompute_w_u_fwd_kernel",
+          "ct": 90,
+          "sum_us": 9764.44873046875
+        },
+        {
+          "name": "chunk_gated_delta_rule_fwd_kkt_solve_kernel",
+          "ct": 90,
+          "sum_us": 9318.68798828125
+        },
+        {
+          "name": "void sglang::act_and_mul_kernel<__half, (sglang::ActivationKind)0, false, false, false, false, false, false>(sglang::ActivationParams)",
+          "ct": 246,
+          "sum_us": 8840.798095703125
+        },
+        {
+          "name": "fused_qkv_split_gdn_prefill_kernel",
+          "ct": 90,
+          "sum_us": 8094.298095703125
+        },
+        {
+          "name": "sm80_xmma_gemm_f16f16_f16f32_f32_tn_n_tilesize96x128x32_stage4_warpsize2x2x1_tensor16x8x16_execute_kernel__5x_cublas",
+          "ct": 164,
+          "sum_us": 7440.555419921875
+        },
+        {
+          "name": "_layer_norm_fwd_1pass_kernel",
+          "ct": 90,
+          "sum_us": 6391.951904296875
+        },
+        {
+          "name": "ampere_fp16_s16816gemm_fp16_64x64_sliced1x2_ldg8_f2f_stages_64x5_tn",
+          "ct": 96,
+          "sum_us": 6287.595458984375
+        },
+        {
+          "name": "fused_moe_kernel",
+          "ct": 6,
+          "sum_us": 6239.594970703125
+        },
+        {
+          "name": "_fused_gate_sigmoid_mul_add_kernel",
+          "ct": 123,
+          "sum_us": 5221.888671875
+        }
+      ],
+      "graphs": [],
+      "scope": "Diagnostic profiling only; steady decode holds batch with ignore_eos and forced continuation, not the formal natural-EOS throughput workload."
+    }
+  ]
+}

@@ -1,0 +1,7 @@
+{
+  "torch": "2.14.1",
+  "triton": "3.8.0",
+  "transformers": "5.19.0",
+  "torch_build": "2.14.1+cu130",
+  "cuda": "13.0"
+}

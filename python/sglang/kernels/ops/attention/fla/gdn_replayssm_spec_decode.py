@@ -44,7 +44,7 @@ import triton
 import triton.language as tl
 
 from sglang.kernels.ops.attention.fla.utils import is_tf32_supported
-from sglang.srt.utils import is_gfx95_supported
+from sglang.srt.utils import get_device_sm, is_gfx95_supported
 
 _IS_GFX95 = is_gfx95_supported()
 
@@ -1120,7 +1120,12 @@ def _launch_gdn_spec(
     if BKT < 16:
         raise ValueError(f"BKT={BKT} must be >=16 for tl.dot.")
     BV = block_v if block_v is not None else min(triton.next_power_of_2(V), 64)
-    BS = max(bs_min, triton.next_power_of_2(max_spec_len))
+    # A packed graph's total token capacity also bounds every request window.
+    # For example, a 9-token neural-only tier need not run the 32-row tile of
+    # the maximum 17-token SA window. This uses a capture-time shape, not a
+    # device cursor read; the ring's global early-flush margin stays unchanged.
+    window_bound = min(max_spec_len, max(1, q.shape[0]))
+    BS = max(bs_min, triton.next_power_of_2(window_bound))
     BC = max(16, triton.next_power_of_2(max_cache_len))
     store_exact_raw = (
         rawv_cache is not None and rawk_cache is not None and beta_cache is not None
@@ -1286,8 +1291,8 @@ def gdn_replayssm_spec_decode(
     use_qk_l2norm_in_kernel: bool = True,
     null_block_id: int = 0,
     block_v: int = 64,
-    num_warps: int = 1,
-    num_stages: int = 2,
+    num_warps: int | None = None,
+    num_stages: int | None = None,
     nk: int = 2,
     bs_min: int = 4,
     block_v_flush: int = 64,
@@ -1310,10 +1315,31 @@ def gdn_replayssm_spec_decode(
          checkpoint (statically empty history).
     The circular history and cursors are request-keyed by ``replay_indices``;
     the checkpoint remains keyed by physical ``ssm_state_indices``.
+    ``None`` launch settings select the measured SM80 compact-history shape;
+    other shapes retain one warp / two stages. Explicit settings are honored.
     """
     if scale is None:
         scale = checkpoint_state.shape[-1] ** -0.5
     batch_size = query_start_loc.shape[0] - 1
+    sm80_compact = (
+        checkpoint_state.dtype == torch.float32
+        and q.dtype == torch.float16
+        and q.shape[1:] == (16, 128)
+        and v.shape[1:] == (32, 128)
+        and max_cache_len == 64
+        and max_spec_len in (9, 17)
+        and batch_size <= 8
+        and block_v == 64
+        and nk == 2
+        and rawv_cache is not None
+        and rawk_cache is not None
+        and beta_cache is None
+        and get_device_sm() == 80
+    )
+    if num_warps is None:
+        num_warps = 4 if sm80_compact else 1
+    if num_stages is None:
+        num_stages = 1 if sm80_compact else 2
     # At the Qwen3.5 MTP shape, one wide V tile avoids duplicating q/k and gate
     # work across two programs on gfx950.
     if (

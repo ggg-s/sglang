@@ -9,6 +9,7 @@ import unittest
 from types import SimpleNamespace
 
 import torch
+
 from sglang.kernels.ops.attention.fla.fused_sigmoid_gating_recurrent import (
     fused_sigmoid_gating_delta_rule_update,
 )
@@ -20,14 +21,16 @@ from sglang.srt.layers.attention.linear.gdn_backend import GDNAttnBackend
 from sglang.test.ci.ci_register import register_cuda_ci
 from sglang.test.test_utils import CustomTestCase
 
-register_cuda_ci(est_time=60, stage="base-b-kernel-unit", runner_config="1-gpu-large")
+register_cuda_ci(est_time=180, stage="base-b-kernel-unit", runner_config="1-gpu-large")
 
 
 class TestGdnReplayssmCompact(CustomTestCase):
-    def _run_windows(self, dtype, use_graph):
+    def _run_windows(
+        self, dtype, use_graph, h=2, hv=4, capacity=64, windows=(17, 9, 1)
+    ):
         torch.manual_seed(20261022)
-        width, capacity, ring_len = 17, 64, 64
-        h, hv, dim, slots, replay_slots = 2, 4, 128, 12, 9
+        width, ring_len = 17, 64
+        dim, slots, replay_slots = 128, 12, 9
         device = "cuda"
         state = torch.randn(slots, hv, dim, dim, device=device) * 0.05
         baseline = state.clone()
@@ -73,9 +76,17 @@ class TestGdnReplayssmCompact(CustomTestCase):
         v = torch.zeros(capacity, hv, dim, device=device, dtype=dtype)
         a = torch.zeros(capacity, hv, device=device, dtype=dtype)
         b = torch.zeros_like(a)
-        qsl = torch.tensor([0, 17, 26, 27, 27], device=device, dtype=torch.int32)
-        state_indices = torch.tensor([1, 4, 6, -1], device=device, dtype=torch.int32)
-        replay_indices = torch.tensor([5, 2, 7, -1], device=device, dtype=torch.int32)
+        owners = len(windows)
+        physical_slots = [1, 4, 6][:owners]
+        active_slots = [5, 2, 7][:owners]
+        initial_ends = [0] + list(torch.tensor(list(windows) + [0]).cumsum(0))
+        qsl = torch.tensor(initial_ends, device=device, dtype=torch.int32)
+        state_indices = torch.tensor(
+            physical_slots + [-1], device=device, dtype=torch.int32
+        )
+        replay_indices = torch.tensor(
+            active_slots + [-1], device=device, dtype=torch.int32
+        )
         backend = object.__new__(GDNAttnBackend)
 
         def verify():
@@ -124,10 +135,10 @@ class TestGdnReplayssmCompact(CustomTestCase):
         fold_ct = 0
         for step in range(64):
             # The same request keeps its replay/state slot as its batch row moves.
-            order = [(step + i) % 3 for i in range(3)]
-            lens = [[17, 9, 1][(owner + step // 3) % 3] for owner in order] + [0]
-            mapping = [[1, 4, 6][owner] for owner in order] + [-1]
-            replay_mapping = [[5, 2, 7][owner] for owner in order] + [-1]
+            order = [(step + i) % owners for i in range(owners)]
+            lens = [windows[(owner + step // owners) % owners] for owner in order] + [0]
+            mapping = [physical_slots[owner] for owner in order] + [-1]
+            replay_mapping = [active_slots[owner] for owner in order] + [-1]
             state_indices.copy_(torch.tensor(mapping, device=device))
             replay_indices.copy_(torch.tensor(replay_mapping, device=device))
             qsl.copy_(
@@ -178,7 +189,7 @@ class TestGdnReplayssmCompact(CustomTestCase):
             counts = [1 + step % n if n else 0 for n in lens]
             accept_lens = torch.tensor(counts, device=device, dtype=torch.int32)
             track_indices = torch.tensor(
-                [8, 9, 10, -1], device=device, dtype=torch.int32
+                list(range(8, 8 + owners)) + [-1], device=device, dtype=torch.int32
             )
             track_steps = torch.tensor(
                 [n // 2 if n else -1 for n in counts], device=device, dtype=torch.int32
@@ -233,6 +244,19 @@ class TestGdnReplayssmCompact(CustomTestCase):
             for graph in (False, True):
                 with self.subTest(dtype=dtype, graph=graph):
                     self._run_windows(dtype, graph)
+
+    def test_model_shape_fp32_checkpoint_graph(self):
+        # Exercise the SM80 compact launch shape against recurrent snapshots,
+        # including folds, tracked states and changing request/state ownership.
+        self._run_windows(torch.float16, True, h=16, hv=32)
+
+    def test_narrow_packed_graph_with_wider_draft_maximum(self):
+        # A 9-token graph tier still advertises a 17-token draft maximum.
+        # Bounding its tile by packed capacity must preserve delayed history
+        # folds and cache-tracked FP32 states across repeated Graph replays.
+        for dtype in (torch.float16, torch.bfloat16):
+            with self.subTest(dtype=dtype):
+                self._run_windows(dtype, True, h=16, hv=32, capacity=9, windows=(9,))
 
 
 if __name__ == "__main__":

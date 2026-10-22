@@ -1,0 +1,16 @@
+{
+  "num_drafts": 16,
+  "min_match_len": 4,
+  "max_requests": 8,
+  "max_history_tokens": 16384,
+  "backend": "gpu_sa",
+  "history_mode": "device",
+  "partial_drafts": "fallback",
+  "draft_graph_mode": "split",
+  "num_neural_gate_tokens": 1,
+  "num_neural_drafts": 8,
+  "verify_mode": "compact",
+  "dynamic_verify": false,
+  "sa_continuation_policy": "frequency",
+  "enable_global_pool": false
+}

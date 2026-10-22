@@ -1,0 +1,9 @@
+{
+  "status": "complete",
+  "gpu_after": "NVIDIA A100-PCIE-40GB, 0 MiB, 0 %",
+  "ports_closed": [
+    39923,
+    39924
+  ],
+  "production_hashes_match": true
+}

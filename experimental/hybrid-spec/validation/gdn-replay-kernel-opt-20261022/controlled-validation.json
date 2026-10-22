@@ -1,0 +1,6 @@
+{
+  "status": "complete",
+  "gpu_after": "NVIDIA A100-PCIE-40GB, 0 MiB, 0 %",
+  "kernel_calls_per_case": 300,
+  "same_input_comparison": true
+}

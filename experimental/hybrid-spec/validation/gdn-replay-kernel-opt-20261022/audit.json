@@ -1,0 +1,245 @@
+{
+  "cases": [
+    {
+      "mode": "baseline-replay",
+      "round": 1,
+      "concurrency": 1,
+      "observed_peak_gpu_mib": 34520,
+      "telemetry_samples": 65,
+      "output_tokens": 3620
+    },
+    {
+      "mode": "baseline-replay",
+      "round": 1,
+      "concurrency": 8,
+      "observed_peak_gpu_mib": 34898,
+      "telemetry_samples": 46,
+      "output_tokens": 3622
+    },
+    {
+      "mode": "baseline-replay",
+      "round": 2,
+      "concurrency": 1,
+      "observed_peak_gpu_mib": 34520,
+      "telemetry_samples": 64,
+      "output_tokens": 3616
+    },
+    {
+      "mode": "baseline-replay",
+      "round": 2,
+      "concurrency": 8,
+      "observed_peak_gpu_mib": 34896,
+      "telemetry_samples": 46,
+      "output_tokens": 3630
+    },
+    {
+      "mode": "optimized-replay",
+      "round": 1,
+      "concurrency": 1,
+      "observed_peak_gpu_mib": 33656,
+      "telemetry_samples": 62,
+      "output_tokens": 3627
+    },
+    {
+      "mode": "optimized-replay",
+      "round": 1,
+      "concurrency": 8,
+      "observed_peak_gpu_mib": 34032,
+      "telemetry_samples": 44,
+      "output_tokens": 3618
+    },
+    {
+      "mode": "optimized-replay",
+      "round": 2,
+      "concurrency": 1,
+      "observed_peak_gpu_mib": 33654,
+      "telemetry_samples": 62,
+      "output_tokens": 3641
+    },
+    {
+      "mode": "optimized-replay",
+      "round": 2,
+      "concurrency": 8,
+      "observed_peak_gpu_mib": 34028,
+      "telemetry_samples": 45,
+      "output_tokens": 3603
+    }
+  ],
+  "boots": [
+    {
+      "mode": "baseline-replay",
+      "round": 1,
+      "memory_usage": {
+        "weight": 21.225,
+        "kvcache": 2.5,
+        "startup_available": 6.429,
+        "token_capacity": 131072,
+        "token_capacity_swa": null,
+        "graph": {
+          "prefill": 0.0,
+          "decode": 0.0,
+          "target_verify": 1.779,
+          "draft_prefill": 0.0,
+          "draft_decode": 2.207,
+          "draft_extend": 0.041
+        }
+      },
+      "sanity": {
+        "gsm8k": {
+          "error_rate": 0.0,
+          "score": 0.95,
+          "stop_rate": 1.0,
+          "truncated_rate": 0.0
+        },
+        "cache_restore": true
+      },
+      "cache_recovery_cached_tokens": 11648,
+      "cache_recovery_text_equal": true,
+      "pool_log_lines": [
+        "[2026-10-22 03:40:40] Mamba Cache is allocated. max_mamba_cache_size: 40, conv_state size: 0.06GB, ssm_state size: 2.40GB intermediate_ssm_state_cache size: 0.00GB intermediate_conv_window_cache size: 0.08GB ",
+        "[2026-10-22 03:40:40] GDN ReplaySSM ring buffers allocated (record_len=64, fold=False): d=0.132GB, k=0.066GB, g=0.002GB rawv=0.132GB, rawk=0.066GB, "
+      ]
+    },
+    {
+      "mode": "baseline-replay",
+      "round": 2,
+      "memory_usage": {
+        "weight": 21.225,
+        "kvcache": 2.5,
+        "startup_available": 6.429,
+        "token_capacity": 131072,
+        "token_capacity_swa": null,
+        "graph": {
+          "prefill": 0.0,
+          "decode": 0.0,
+          "target_verify": 1.779,
+          "draft_prefill": 0.0,
+          "draft_decode": 2.207,
+          "draft_extend": 0.041
+        }
+      },
+      "sanity": {
+        "gsm8k": {
+          "error_rate": 0.0,
+          "score": 0.95,
+          "stop_rate": 1.0,
+          "truncated_rate": 0.0
+        },
+        "cache_restore": true
+      },
+      "cache_recovery_cached_tokens": 11648,
+      "cache_recovery_text_equal": true,
+      "pool_log_lines": [
+        "[2026-10-22 03:54:49] Mamba Cache is allocated. max_mamba_cache_size: 40, conv_state size: 0.06GB, ssm_state size: 2.40GB intermediate_ssm_state_cache size: 0.00GB intermediate_conv_window_cache size: 0.08GB ",
+        "[2026-10-22 03:54:49] GDN ReplaySSM ring buffers allocated (record_len=64, fold=False): d=0.132GB, k=0.066GB, g=0.002GB rawv=0.132GB, rawk=0.066GB, "
+      ]
+    },
+    {
+      "mode": "optimized-replay",
+      "round": 1,
+      "memory_usage": {
+        "weight": 21.225,
+        "kvcache": 2.5,
+        "startup_available": 7.336,
+        "token_capacity": 131072,
+        "token_capacity_swa": null,
+        "graph": {
+          "prefill": 0.0,
+          "decode": 0.0,
+          "target_verify": 0.873,
+          "draft_prefill": 0.0,
+          "draft_decode": 2.207,
+          "draft_extend": 0.041
+        }
+      },
+      "sanity": {
+        "gsm8k": {
+          "error_rate": 0.0,
+          "score": 1.0,
+          "stop_rate": 1.0,
+          "truncated_rate": 0.0
+        },
+        "cache_restore": true
+      },
+      "cache_recovery_cached_tokens": 11648,
+      "cache_recovery_text_equal": true,
+      "pool_log_lines": [
+        "[2026-10-22 03:46:13] Mamba Cache is allocated. max_mamba_cache_size: 40, conv_state size: 0.06GB, ssm_state size: 2.40GB intermediate_ssm_state_cache size: 0.00GB intermediate_conv_window_cache size: 0.08GB ",
+        "[2026-10-22 03:46:13] GDN ReplaySSM ring buffers allocated (record_len=64, fold=False): d=0.132GB, k=0.066GB, g=0.002GB rawv=0.132GB, rawk=0.066GB, "
+      ]
+    },
+    {
+      "mode": "optimized-replay",
+      "round": 2,
+      "memory_usage": {
+        "weight": 21.225,
+        "kvcache": 2.5,
+        "startup_available": 7.336,
+        "token_capacity": 131072,
+        "token_capacity_swa": null,
+        "graph": {
+          "prefill": 0.0,
+          "decode": 0.0,
+          "target_verify": 0.873,
+          "draft_prefill": 0.0,
+          "draft_decode": 2.207,
+          "draft_extend": 0.041
+        }
+      },
+      "sanity": {
+        "gsm8k": {
+          "error_rate": 0.0,
+          "score": 0.95,
+          "stop_rate": 1.0,
+          "truncated_rate": 0.0
+        },
+        "cache_restore": true
+      },
+      "cache_recovery_cached_tokens": 11648,
+      "cache_recovery_text_equal": true,
+      "pool_log_lines": [
+        "[2026-10-22 03:50:40] Mamba Cache is allocated. max_mamba_cache_size: 40, conv_state size: 0.06GB, ssm_state size: 2.40GB intermediate_ssm_state_cache size: 0.00GB intermediate_conv_window_cache size: 0.08GB ",
+        "[2026-10-22 03:50:40] GDN ReplaySSM ring buffers allocated (record_len=64, fold=False): d=0.132GB, k=0.066GB, g=0.002GB rawv=0.132GB, rawk=0.066GB, "
+      ]
+    }
+  ],
+  "final_validation": {
+    "status": "complete",
+    "gpu_after": "NVIDIA A100-PCIE-40GB, 0 MiB, 0 %",
+    "ports_closed": [
+      39923,
+      39924
+    ],
+    "production_hashes_match": true
+  },
+  "matched_server_parameters": {
+    "mamba_ssm_dtype": "float32",
+    "dtype": "float16",
+    "max_running_requests": 8,
+    "max_mamba_cache_size": 40,
+    "max_total_tokens": 131072,
+    "context_length": 16384,
+    "cuda_graph_max_bs_decode": 8,
+    "speculative_num_steps": 16,
+    "speculative_num_draft_tokens": 17,
+    "enable_linear_replayssm_spec": true,
+    "linear_replayssm_cache_len": 64,
+    "attention_backend": "triton",
+    "linear_attn_backend": "triton",
+    "linear_attn_verify_backend": "triton",
+    "random_seed": 42,
+    "disable_overlap_schedule": false,
+    "mem_fraction_static": 0.94
+  },
+  "workload_sha256": "14fa95c7d417ae66a0e59dfeb7e9aeea4013334ba474d2a19ea4109f69f004c5",
+  "exact_repeat_text_matches_out_of_50": {
+    "baseline-replay": {
+      "1": 46,
+      "8": 44
+    },
+    "optimized-replay": {
+      "1": 47,
+      "8": 42
+    }
+  }
+}

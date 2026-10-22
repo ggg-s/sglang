@@ -1,0 +1,54 @@
+[
+  {
+    "version": "baseline",
+    "width": 9,
+    "batch": 1,
+    "history": 16,
+    "max_spec_len": 17,
+    "launches": 300,
+    "kernel_mean_us": 168.15525333333335,
+    "trace": "controlled/baseline-width9.trace.json.gz",
+    "state_dtype": "float32",
+    "history_dtype": "float16",
+    "same_qkv_checkpoint_inputs": true
+  },
+  {
+    "version": "optimized",
+    "width": 9,
+    "batch": 1,
+    "history": 16,
+    "max_spec_len": 17,
+    "launches": 300,
+    "kernel_mean_us": 20.309986666666667,
+    "trace": "controlled/optimized-width9.trace.json.gz",
+    "state_dtype": "float32",
+    "history_dtype": "float16",
+    "same_qkv_checkpoint_inputs": true
+  },
+  {
+    "version": "baseline",
+    "width": 17,
+    "batch": 1,
+    "history": 16,
+    "max_spec_len": 17,
+    "launches": 300,
+    "kernel_mean_us": 161.87519,
+    "trace": "controlled/baseline-width17.trace.json.gz",
+    "state_dtype": "float32",
+    "history_dtype": "float16",
+    "same_qkv_checkpoint_inputs": true
+  },
+  {
+    "version": "optimized",
+    "width": 17,
+    "batch": 1,
+    "history": 16,
+    "max_spec_len": 17,
+    "launches": 300,
+    "kernel_mean_us": 58.16939333333333,
+    "trace": "controlled/optimized-width17.trace.json.gz",
+    "state_dtype": "float32",
+    "history_dtype": "float16",
+    "same_qkv_checkpoint_inputs": true
+  }
+]

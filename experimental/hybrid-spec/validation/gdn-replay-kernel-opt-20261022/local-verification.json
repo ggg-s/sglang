@@ -1,0 +1,13 @@
+{
+  "production_sha_matches_A100": true,
+  "final_test_source_matches_A100": true,
+  "archive_raw_files_checked": 285,
+  "ruff_selected": "passed",
+  "ruff_format": "passed",
+  "isort": "passed",
+  "registered_ci_metadata": "passed",
+  "diff_whitespace": "passed",
+  "test_results": "test-summary.json",
+  "formal_matrix": "matrix8/summary.json",
+  "controlled_profile": "controlled-summary.json"
+}

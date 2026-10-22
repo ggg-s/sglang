@@ -1,0 +1,70 @@
+{
+  "baseline-resources": [
+    {
+      "grid": [
+        2,
+        1,
+        32
+      ],
+      "warps": 1,
+      "stages": 2,
+      "BS": 32,
+      "BV": 64,
+      "BKT": 64,
+      "registers_per_thread": 168,
+      "spills": 1356,
+      "shared_memory_bytes": 57344,
+      "width": 9
+    },
+    {
+      "grid": [
+        2,
+        1,
+        32
+      ],
+      "warps": 1,
+      "stages": 2,
+      "BS": 32,
+      "BV": 64,
+      "BKT": 64,
+      "registers_per_thread": 168,
+      "spills": 1356,
+      "shared_memory_bytes": 57344,
+      "width": 17
+    }
+  ],
+  "optimized-resources": [
+    {
+      "grid": [
+        2,
+        1,
+        32
+      ],
+      "warps": 4,
+      "stages": 1,
+      "BS": 16,
+      "BV": 64,
+      "BKT": 64,
+      "registers_per_thread": 255,
+      "spills": 12,
+      "shared_memory_bytes": 24576,
+      "width": 9
+    },
+    {
+      "grid": [
+        2,
+        1,
+        32
+      ],
+      "warps": 4,
+      "stages": 1,
+      "BS": 32,
+      "BV": 64,
+      "BKT": 64,
+      "registers_per_thread": 255,
+      "spills": 178,
+      "shared_memory_bytes": 32768,
+      "width": 17
+    }
+  ]
+}

@@ -1,0 +1,4 @@
+user: |-
+  {problem}
+
+  Please reason step by step, then put the final numerical answer in \boxed{{answer}}.

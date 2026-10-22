@@ -1,0 +1,116 @@
+{
+  "gpu": "NVIDIA A100-PCIE-40GB",
+  "state_dtype": "float32",
+  "cases": 216,
+  "numerical_errors": 0,
+  "matched": [
+    {
+      "batch": 1,
+      "width": 9,
+      "history": 0,
+      "baseline_us": 163.6387558613927,
+      "tuned_same_bound_us": 65.67656454001579,
+      "tuned_narrow_bound_us": 28.019325850439852,
+      "narrow_bound_valid_for_integration": true
+    },
+    {
+      "batch": 1,
+      "width": 9,
+      "history": 16,
+      "baseline_us": 156.50020195597907,
+      "tuned_same_bound_us": 57.83577531134124,
+      "tuned_narrow_bound_us": 20.22412072758708,
+      "narrow_bound_valid_for_integration": true
+    },
+    {
+      "batch": 1,
+      "width": 9,
+      "history": 30,
+      "baseline_us": 166.76926018814447,
+      "tuned_same_bound_us": 58.04028903906398,
+      "tuned_narrow_bound_us": 20.293549207692106,
+      "narrow_bound_valid_for_integration": true
+    },
+    {
+      "batch": 1,
+      "width": 17,
+      "history": 0,
+      "baseline_us": 160.1434583787794,
+      "tuned_same_bound_us": 57.97326458580849,
+      "tuned_narrow_bound_us": 57.97326458580849,
+      "narrow_bound_valid_for_integration": true
+    },
+    {
+      "batch": 1,
+      "width": 17,
+      "history": 16,
+      "baseline_us": 165.58675417472358,
+      "tuned_same_bound_us": 58.239023374138284,
+      "tuned_narrow_bound_us": 58.239023374138284,
+      "narrow_bound_valid_for_integration": true
+    },
+    {
+      "batch": 1,
+      "width": 17,
+      "history": 30,
+      "baseline_us": 164.21059858078922,
+      "tuned_same_bound_us": 58.360978230856965,
+      "tuned_narrow_bound_us": 58.360978230856965,
+      "narrow_bound_valid_for_integration": true
+    },
+    {
+      "batch": 8,
+      "width": 9,
+      "history": 0,
+      "baseline_us": 794.8221883466167,
+      "tuned_same_bound_us": 234.55288851702656,
+      "tuned_narrow_bound_us": 62.53891110981652,
+      "narrow_bound_valid_for_integration": false
+    },
+    {
+      "batch": 8,
+      "width": 9,
+      "history": 16,
+      "baseline_us": 803.5732699978736,
+      "tuned_same_bound_us": 248.17926566589054,
+      "tuned_narrow_bound_us": 69.37722632158503,
+      "narrow_bound_valid_for_integration": false
+    },
+    {
+      "batch": 8,
+      "width": 9,
+      "history": 30,
+      "baseline_us": 803.3965387651998,
+      "tuned_same_bound_us": 249.60064210202034,
+      "tuned_narrow_bound_us": 72.82664684671226,
+      "narrow_bound_valid_for_integration": false
+    },
+    {
+      "batch": 8,
+      "width": 17,
+      "history": 0,
+      "baseline_us": 813.0818126647454,
+      "tuned_same_bound_us": 248.4276564022148,
+      "tuned_narrow_bound_us": 248.4276564022148,
+      "narrow_bound_valid_for_integration": true
+    },
+    {
+      "batch": 8,
+      "width": 17,
+      "history": 16,
+      "baseline_us": 803.5219828287761,
+      "tuned_same_bound_us": 255.5555721224867,
+      "tuned_narrow_bound_us": 255.5555721224867,
+      "narrow_bound_valid_for_integration": true
+    },
+    {
+      "batch": 8,
+      "width": 17,
+      "history": 30,
+      "baseline_us": 826.5668233235676,
+      "tuned_same_bound_us": 258.99881789494293,
+      "tuned_narrow_bound_us": 258.99881789494293,
+      "narrow_bound_valid_for_integration": true
+    }
+  ]
+}

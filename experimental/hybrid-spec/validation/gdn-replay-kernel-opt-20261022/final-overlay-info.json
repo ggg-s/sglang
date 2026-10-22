@@ -1,0 +1,5 @@
+{
+  "overlay_sha256": "60222dcada1a9eb6167f8adc079e2c79eb0423b9f7502d3b6c3878aaf04ae542",
+  "reason": "Resolve the hardware selector at call time; preserve explicit settings. Extend narrow-graph FP32-state regression to BF16 activations.",
+  "jit_kernel_ast_unchanged_since_initial_optimization": true
+}
