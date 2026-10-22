@@ -11,7 +11,6 @@ both the allocation and this expectation together.
 
 import pytest
 import torch
-
 from sglang.srt.configs.mamba_utils import (
     KimiLinearCacheParams,
     KimiLinearStateShape,
@@ -20,6 +19,7 @@ from sglang.srt.configs.mamba_utils import (
     Mamba2StateShape,
 )
 from sglang.srt.mem_cache.kv_cache_configurator import _pp_local_per_request_bytes
+from sglang.srt.mem_cache.memory_pool import MambaPool
 from sglang.test.ci.ci_register import register_cpu_ci
 from sglang.test.test_utils import CustomTestCase
 
@@ -62,6 +62,30 @@ def _gdn_params(temporal_dtype=torch.float32):
 
 
 class TestReplaySSMRingAccounting(CustomTestCase):
+    def test_gdn_ring_rejects_windows_that_cannot_fit_before_allocation(self):
+        # A 17-token compact verify exceeds the old default L=16. Before the
+        # guard was shared with GDN, this silently lost ring entries; L=32 is
+        # also too short for the two-window early-flush invariant.
+        for ring_len, error in (
+            (0, "power of two"),
+            (48, "power of two"),
+            (16, "too small"),
+            (32, "too small"),
+        ):
+            with self.subTest(ring_len=ring_len):
+                with self.assertRaisesRegex(ValueError, error):
+                    MambaPool(
+                        size=2,
+                        spec_state_size=2,
+                        cache_params=_gdn_params(),
+                        mamba_layer_ids=LAYERS,
+                        device="cpu",
+                        speculative_num_draft_tokens=17,
+                        speculative_eagle_topk=1,
+                        enable_linear_replayssm_spec=True,
+                        linear_replayssm_cache_len=ring_len,
+                    )
+
     def test_gdn_fold(self):
         # d 512 + normalized k 512 + scalar g 128 + d/k low parts 1024 = 2176
         self.assertEqual(

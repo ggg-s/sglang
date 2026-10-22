@@ -210,6 +210,18 @@ def gdn_replayssm_spec_circular_kernel(
         b_d_all = tl.load(
             p_d_main, mask=mask_v[:, None] & cache_valid[None, :], other=0.0
         ).to(tl.float32)
+        if STATE_FP32 and STORE_D_RESIDUAL:
+            # Compact history is stored as high/low activation-dtype parts.
+            # A fp32 checkpoint does not make the high part lossless: restore
+            # the low part before projecting history, just as commit does.
+            b_d_all += tl.load(
+                rawv_cache
+                + replay_idx * stride_rawv_slot
+                + (i_hv * MAX_CACHE_LEN + phys_c[None, :]) * V
+                + o_v[:, None],
+                mask=mask_v[:, None] & cache_valid[None, :],
+                other=0.0,
+            ).to(tl.float32)
         b_d_scaled_fp32 = b_d_all * b_replay_decay[None, :]
         if STATE_FP32:
             # Preserve the pre-existing fp32-checkpoint path: these dots use
@@ -341,6 +353,15 @@ def gdn_replayssm_spec_circular_kernel(
             )
             if STATE_FP32:
                 khist_tile = khist_tile.to(tl.float32)
+                if STORE_K_RESIDUAL:
+                    khist_tile += tl.load(
+                        rawk_cache
+                        + replay_idx * stride_rawk_slot
+                        + (i_h * MAX_CACHE_LEN + phys_c[:, None]) * K
+                        + o_kt[None, :],
+                        mask=cache_valid[:, None] & mask_kt[None, :],
+                        other=0.0,
+                    ).to(tl.float32)
             else:
                 khist_tile = khist_tile.to(k_cache.dtype.element_ty)
             scores_q += tl.dot(khist_tile, qT, input_precision=DOT_PRECISION)

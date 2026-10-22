@@ -443,9 +443,9 @@ def handle_linear_attn_backend(server_args: Any):
     # uses a strictly-lower causal mask, so it is valid ONLY for a linear
     # draft chain (speculative_eagle_topk in {None, 1}, i.e. NEXTN / MTP);
     # EAGLE tree verify (topk > 1) must fall back to the recurrent verify.
-    # GDN sizes the window to the draft maximum; KDA (kda_backend) keeps a
-    # --linear-replayssm-cache-len window and folds via its own fused
-    # verify ring-write + commit_kda_replayssm_after_verify.
+    # Both rings use --linear-replayssm-cache-len and must accommodate the
+    # maximum verify width plus the early-flush margin (checked by MambaPool).
+    # KDA folds via its own ring-writing verify + commit_kda_replayssm_after_verify.
     if cfg.enable_linear_replayssm_spec:
         if cfg.speculative_eagle_topk not in (None, 1):
             raise ValueError(
@@ -468,24 +468,29 @@ def handle_linear_attn_backend(server_args: Any):
 
         ragged_mode = read_ragged_verify_mode()
         if ragged_mode is not RaggedVerifyMode.STATIC:
-            # Ragged ring-writes need the KDA fold-every-commit family
-            # (DSPARK/DFLASH) + the triton verify kernel (nv_cutedsl falls
-            # back to it for ragged layouts). The GDN ring-write kernels do
-            # not take the ragged layout and the flashinfer verify kernel
-            # never writes the ring -> a stale ring would be folded; keep
-            # refusing those combinations.
+            from sglang.srt.configs.hybrid_arch import hybrid_gdn_config
+
+            # GDN circular replay reads packed query_start_loc, including the
+            # capped layout used by compact CUDA graphs. Keep KDA on its
+            # ring-writing fold-every-commit path; FlashInfer KDA verify does
+            # not write that ring.
             _algo = (cfg.speculative_algorithm or "").upper()
             verify = cfg.linear_attn_verify_backend
-            if _algo not in ("DSPARK", "DFLASH") or verify not in (
+            gdn_circular = (
+                decode == "triton"
+                and verify in (None, "triton")
+                and hybrid_gdn_config(model_config_of(server_args)) is not None
+            )
+            kda_fold = _algo in ("DSPARK", "DFLASH") and verify in (
                 "triton",
                 "nv_cutedsl",
-            ):
+            )
+            if not (gdn_circular or kda_fold):
                 raise ValueError(
                     "--enable-linear-replayssm-spec with "
-                    f"SGLANG_RAGGED_VERIFY_MODE={ragged_mode.value} requires the "
-                    "KDA fold-every-commit family (DSPARK/DFLASH) and a "
-                    "ring-writing verify kernel (--linear-attn-verify-backend "
-                    "triton or nv_cutedsl); got "
+                    f"SGLANG_RAGGED_VERIFY_MODE={ragged_mode.value} requires "
+                    "GDN with Triton decode/verify, or the KDA fold-every-commit "
+                    "family (DSPARK/DFLASH) with triton or nv_cutedsl verify; got "
                     f"algorithm={cfg.speculative_algorithm!r}, "
                     f"verify={verify!r}. Use SGLANG_RAGGED_VERIFY_MODE=static."
                 )

@@ -1199,6 +1199,7 @@ class GDNAttnBackend(MambaAttnBackendBase):
                     replay_indices=forward_batch.req_pool_indices,
                     query_start_loc=query_start_loc,
                     draft_token_num=forward_batch.spec_info.draft_token_num,
+                    ragged_verify=ragged_verify,
                 )
             else:
                 # The recurrent fallback needs the per-draft snapshots, which
@@ -1529,6 +1530,7 @@ class GDNAttnBackend(MambaAttnBackendBase):
         replay_indices: torch.Tensor,
         query_start_loc: torch.Tensor,
         draft_token_num: int,
+        ragged_verify: bool = False,
     ) -> torch.Tensor:
         """ReplaySSM GDN spec-verify (Part B of #28511).
 
@@ -1560,7 +1562,15 @@ class GDNAttnBackend(MambaAttnBackendBase):
         b = b.reshape(seq_len, HV)
         d_cache = layer_cache.replayssm_d  # [slots, HV, L, V]
         max_cache_len = d_cache.shape[-2]  # ring length L
-        out = q.new_empty(seq_len, HV, V)
+        # A capped compact graph can leave token-tier slack outside every
+        # query_start_loc interval. The replay kernel never visits that slack;
+        # downstream projections still process it, so initialize it to finite
+        # zeros instead of exposing allocator contents (possibly NaNs).
+        out = (
+            q.new_zeros(seq_len, HV, V)
+            if ragged_verify
+            else q.new_empty(seq_len, HV, V)
+        )
         gdn_replayssm_spec_decode(
             q=q,
             k=k,

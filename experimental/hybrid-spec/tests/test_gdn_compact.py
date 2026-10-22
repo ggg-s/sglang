@@ -4,7 +4,10 @@ Only serving imports and the model/pool objects are isolated. These component
 checks do not substitute for a Qwen checkpoint/server acceptance run.
 """
 
+import logging
 import sys
+import unittest
+from enum import Enum
 from pathlib import Path
 from types import MethodType, ModuleType
 from types import SimpleNamespace as NS
@@ -16,6 +19,159 @@ from test_compact_verify import load_module
 from test_draft_recurrence import load_functions
 
 GDN = "python/sglang/srt/layers/attention/linear/gdn_backend.py"
+
+
+@pytest.mark.parametrize("ring_len", [0, 16, 32, 48])
+def test_replay_ring_rejects_invalid_sa16_capacity_before_allocation(ring_len):
+    ns = {"Optional": Optional, "List": list, "BaseLinearStateParams": object}
+    load_functions(
+        "python/sglang/srt/mem_cache/memory_pool.py", ["__init__"], ns, "MambaPool"
+    )
+    # No cache/model/device object is needed: rejection must precede allocation.
+    with pytest.raises(ValueError, match="power of two|ring too small"):
+        ns["__init__"](
+            NS(),
+            size=8,
+            spec_state_size=8,
+            cache_params=None,
+            mamba_layer_ids=[],
+            device="cpu",
+            speculative_num_draft_tokens=17,
+            enable_linear_replayssm_spec=True,
+            linear_replayssm_cache_len=ring_len,
+        )
+
+
+@pytest.mark.parametrize("mode", ["compact", "cap-accept"])
+@pytest.mark.parametrize(
+    "gdn,algorithm,verify,topk,allowed",
+    [
+        (True, "EAGLE", "triton", 1, True),
+        (True, "EAGLE", None, 1, True),
+        (True, "EAGLE", "flashinfer", 1, False),
+        (True, "EAGLE", "triton", 2, False),
+        (False, "EAGLE", "triton", 1, False),
+        (False, "DSPARK", "triton", 1, True),
+        (False, "DSPARK", "flashinfer", 1, False),
+    ],
+)
+def test_replay_ragged_validation(
+    monkeypatch, mode, gdn, algorithm, verify, topk, allowed
+):
+    # Model/config discovery is the external boundary; execute the complete
+    # production validation body, including the existing negative guards.
+    class Mode(str, Enum):
+        STATIC = "static"
+        COMPACT = "compact"
+        CAP_ACCEPT = "cap-accept"
+
+    for name, values in {
+        "sglang.srt.speculative.ragged_verify": {
+            "RaggedVerifyMode": Mode,
+            "read_ragged_verify_mode": lambda: Mode(mode),
+        },
+        "sglang.srt.configs.hybrid_arch": {
+            "hybrid_gdn_config": lambda _: object() if gdn else None
+        },
+    }.items():
+        module = ModuleType(name)
+        module.__dict__.update(values)
+        monkeypatch.setitem(sys.modules, name, module)
+    ns = {
+        "Any": object,
+        "resolving_view": lambda args: args,
+        "get_platform": lambda: NS(is_sm100=False, is_cuda=False),
+        "pp_spec_stable_rows_enabled": lambda: False,
+        "model_config_of": lambda args: args,
+        "uses_kda_attention": lambda _: not gdn,
+        "logger": logging.getLogger(__name__),
+    }
+    load_functions(
+        "python/sglang/srt/arg_groups/attention_hook.py",
+        ["handle_linear_attn_backend"],
+        ns,
+    )
+    cfg = NS(
+        linear_attn_backend="triton",
+        linear_attn_decode_backend=None,
+        linear_attn_verify_backend=verify,
+        linear_attn_prefill_backend=None,
+        mamba_ssm_dtype="float32",
+        enable_linear_replayssm=False,
+        enable_linear_replayssm_spec=True,
+        speculative_eagle_topk=topk,
+        speculative_algorithm=algorithm,
+        disaggregation_mode="null",
+    )
+    if allowed:
+        ns["handle_linear_attn_backend"](cfg)
+        assert cfg.mamba_ssm_dtype == "float32"
+    else:
+        with pytest.raises(ValueError, match="linear draft chain|requires GDN"):
+            ns["handle_linear_attn_backend"](cfg)
+
+
+def test_replay_initializes_compact_graph_slack(monkeypatch):
+    name = "sglang.kernels.ops.attention.fla.gdn_replayssm_spec_decode"
+    module = ModuleType(name)
+
+    def kernel(**kwargs):
+        # GPU replay only visits intervals covered by query_start_loc. Poison
+        # the allocator separately so an unwritten graph tail fails reliably.
+        kwargs["out"][: kwargs["query_start_loc"][-1]].fill_(1)
+
+    module.gdn_replayssm_spec_decode = kernel
+    monkeypatch.setitem(sys.modules, name, module)
+    ns = {
+        "torch": torch,
+        "RadixLinearAttention": object,
+        "MambaPool": NS(SpeculativeState=object),
+    }
+    load_functions(GDN, ["_replayssm_target_verify"], ns, "GDNAttnBackend")
+    monkeypatch.setattr(
+        torch.Tensor,
+        "new_empty",
+        lambda tensor, *shape, **kwargs: torch.full(
+            shape, float("nan"), dtype=tensor.dtype
+        ),
+    )
+    result = ns["_replayssm_target_verify"](
+        NS(),
+        layer=NS(
+            num_k_heads=1,
+            head_k_dim=2,
+            num_v_heads=1,
+            head_v_dim=2,
+            A_log=None,
+            dt_bias=None,
+        ),
+        query=torch.zeros(8, 1, 2),
+        key=torch.zeros(8, 1, 2),
+        value=torch.zeros(8, 1, 2),
+        a=torch.zeros(8, 1),
+        b=torch.zeros(8, 1),
+        mamba_pool=NS(
+            replayssm_spec_write_pos=None,
+            replayssm_cache_base=None,
+            replayssm_is_flush=None,
+        ),
+        layer_cache=NS(
+            temporal=None,
+            replayssm_d=torch.zeros(2, 1, 64, 2),
+            replayssm_k=None,
+            replayssm_g=None,
+            replayssm_rawv=None,
+            replayssm_rawk=None,
+            replayssm_beta=None,
+        ),
+        cache_indices=None,
+        replay_indices=None,
+        query_start_loc=torch.tensor([0, 3, 4]),
+        draft_token_num=17,
+        ragged_verify=True,
+    )
+    assert torch.equal(result[:4], torch.ones_like(result[:4]))
+    assert torch.equal(result[4:], torch.zeros_like(result[4:]))
 
 
 @pytest.mark.parametrize("num_tokens", [0, 13, 16, 18])
@@ -79,12 +235,18 @@ def gdn_cuda_modules(monkeypatch):
     }.items():
         setattr(utils, name, lambda *args, value=value: value)
     monkeypatch.setitem(sys.modules, utils.__name__, utils)
+    common = ModuleType("sglang.srt.utils.common")
+    common.torch_release = tuple(
+        int(part) for part in torch.__version__.split("+")[0].split(".")[:2]
+    )
+    monkeypatch.setitem(sys.modules, common.__name__, common)
     jit = ModuleType("sglang.kernels.jit.utils")
     jit.is_arch_support_pdl = lambda: sm[0] >= 9
     monkeypatch.setitem(sys.modules, jit.__name__, jit)
     for name in (
         "attention.fla.fused_sigmoid_gating_recurrent",
         "attention.fla.gdn_replayssm_spec_fold",
+        "attention.fla.gdn_replayssm_spec_decode",
         "attention.triton_gdn_fused_proj",
         "memory.ptr_table",
         "mamba.causal_conv1d_triton",
@@ -92,6 +254,45 @@ def gdn_cuda_modules(monkeypatch):
     ):
         full = "sglang.kernels.ops." + name
         load_module(monkeypatch, full, "python/" + full.replace(".", "/") + ".py")
+
+
+@CUDA
+@pytest.mark.parametrize("graph", [False, True])
+@pytest.mark.parametrize("dtype", [torch.float16, torch.bfloat16])
+def test_cuda_gdn_replay_variable_windows(gdn_cuda_modules, graph, dtype):
+    """Run the registered kernel test with the lean serving-import fixture.
+
+    Both the registered test body and backend method are unchanged; only the
+    full serving imports are isolated on component-only CUDA installations.
+    """
+    from sglang.kernels.ops.attention.fla.fused_sigmoid_gating_recurrent import (
+        fused_sigmoid_gating_delta_rule_update,
+    )
+    from sglang.kernels.ops.attention.fla.gdn_replayssm_spec_decode import (
+        commit_gdn_replayssm_circular,
+        commit_gdn_replayssm_spec,
+    )
+
+    ns = {
+        "torch": torch,
+        "RadixLinearAttention": object,
+        "MambaPool": NS(SpeculativeState=object),
+        "SimpleNamespace": NS,
+        "fused_sigmoid_gating_delta_rule_update": fused_sigmoid_gating_delta_rule_update,
+        "commit_gdn_replayssm_circular": commit_gdn_replayssm_circular,
+        "commit_gdn_replayssm_spec": commit_gdn_replayssm_spec,
+    }
+    load_functions(GDN, ["_replayssm_target_verify"], ns, "GDNAttnBackend")
+    ns["GDNAttnBackend"] = type(
+        "Backend", (), {"_replayssm_target_verify": ns["_replayssm_target_verify"]}
+    )
+    load_functions(
+        "test/registered/kernels/ops/attention/test_gdn_replayssm_compact.py",
+        ["_run_windows"],
+        ns,
+        "TestGdnReplayssmCompact",
+    )
+    ns["_run_windows"](unittest.TestCase(), dtype, graph)
 
 
 @CUDA

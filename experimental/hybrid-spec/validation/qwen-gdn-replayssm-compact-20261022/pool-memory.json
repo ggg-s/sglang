@@ -1,0 +1,28 @@
+{
+  "scope": "production state-pool allocation only; not whole-server memory",
+  "config_source": "https://huggingface.co/Qwen/Qwen3.5-35B-A3B-GPTQ-Int4/blob/main/config.json",
+  "gpu": "NVIDIA GeForce RTX 4060 Laptop GPU",
+  "torch": "2.14.1+cu130",
+  "ssm_dtype": "torch.float32",
+  "conv_dtype": "torch.float16",
+  "pool_size": 40,
+  "active_requests": 8,
+  "verify_width": 17,
+  "ring_length": 64,
+  "tensor_bytes": {
+    "temporal": 2579496960,
+    "conv": 60456960,
+    "replayssm_d": 141557760,
+    "replayssm_k": 70778880,
+    "replayssm_g": 2211840,
+    "replayssm_rawv": 141557760,
+    "replayssm_rawk": 70778880,
+    "conv_intermediate_physical": 84049920
+  },
+  "tensor_total_bytes": 3150888960,
+  "cuda_allocated_delta_bytes": 3154396672,
+  "replay_ring_bytes": 426885120,
+  "old_snapshot_bytes_formula": 9625927680,
+  "snapshot_minus_ring_bytes": 9199042560,
+  "source_sha256": "d100ae5f0d9bbcb5868f6ac94f29eb56797cab73f5cf717076070f3ef8ea42c2"
+}

@@ -1,0 +1,59 @@
+{
+  "gdn_replay": {
+    "tests": 44,
+    "failures": 0,
+    "errors": 0,
+    "skipped": 0,
+    "seconds": 59.422
+  },
+  "compact_regression": {
+    "tests": 168,
+    "failures": 0,
+    "errors": 0,
+    "skipped": 0,
+    "seconds": 82.666
+  },
+  "deselected": [
+    "test_draft_extend_graph_state_survives_prefill_merge_and_filter[1-True]",
+    "test_draft_extend_graph_state_survives_prefill_merge_and_filter[3-True]"
+  ],
+  "deselection_reason": "full serving graph-delegate dependencies are unavailable in the component-only workstation environment",
+  "source_verified_files": 5659,
+  "source_manifest_sha256": "a6e1d3a8092a5c6cb5ca913cfa5543d53d69d39dea6eac6ebf6fcde2575fa9ed",
+  "environment": {
+    "torch": "2.14.1+cu130",
+    "cuda": "13.0",
+    "triton": "3.8.0",
+    "gpu": "NVIDIA GeForce RTX 4060 Laptop GPU"
+  },
+  "pool_memory": {
+    "scope": "production state-pool allocation only; not whole-server memory",
+    "config_source": "https://huggingface.co/Qwen/Qwen3.5-35B-A3B-GPTQ-Int4/blob/main/config.json",
+    "gpu": "NVIDIA GeForce RTX 4060 Laptop GPU",
+    "torch": "2.14.1+cu130",
+    "ssm_dtype": "torch.float32",
+    "conv_dtype": "torch.float16",
+    "pool_size": 40,
+    "active_requests": 8,
+    "verify_width": 17,
+    "ring_length": 64,
+    "tensor_bytes": {
+      "temporal": 2579496960,
+      "conv": 60456960,
+      "replayssm_d": 141557760,
+      "replayssm_k": 70778880,
+      "replayssm_g": 2211840,
+      "replayssm_rawv": 141557760,
+      "replayssm_rawk": 70778880,
+      "conv_intermediate_physical": 84049920
+    },
+    "tensor_total_bytes": 3150888960,
+    "cuda_allocated_delta_bytes": 3154396672,
+    "replay_ring_bytes": 426885120,
+    "old_snapshot_bytes_formula": 9625927680,
+    "snapshot_minus_ring_bytes": 9199042560,
+    "source_sha256": "d100ae5f0d9bbcb5868f6ac94f29eb56797cab73f5cf717076070f3ef8ea42c2"
+  },
+  "full_model_validation": "pending A100 SSH recovery",
+  "gpu_after": "NVIDIA GeForce RTX 4060 Laptop GPU, 0 MiB, 0 %"
+}

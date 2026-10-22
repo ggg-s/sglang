@@ -22,6 +22,7 @@ from sglang.srt.arg_groups import (
 from sglang.srt.arg_groups.attention_hook import (
     handle_attention_backend_compatibility,
     handle_deterministic_inference,
+    handle_linear_attn_backend,
 )
 from sglang.srt.arg_groups.cuda_graph_hook import (
     apply_cuda_graph_compatibility,
@@ -4452,6 +4453,60 @@ class TestLazyReexports(CustomTestCase):
     def test_an_unknown_attribute_still_raises(self):
         with self.assertRaises(AttributeError):
             server_args_module.NotAThing
+
+
+class TestGdnReplayssmCompactArgs(CustomTestCase):
+    def test_ragged_replay_preserves_family_and_backend_guards(self):
+        from sglang.srt.configs import Qwen3_5Config
+
+        # A linear GDN chain is safe with packed Triton replay. KDA still
+        # needs its ring-writing verify family; tree verification stays unsafe.
+        for mode in ("compact", "cap-accept"):
+            for family, algo, verify, topk, allowed in (
+                ("gdn", "EAGLE", "triton", 1, True),
+                ("gdn", "EAGLE", None, 1, True),
+                ("gdn", "EAGLE", "flashinfer", 1, False),
+                ("gdn", "EAGLE", "triton", 2, False),
+                ("kda", "EAGLE", "triton", 1, False),
+                ("kda", "DSPARK", "triton", 1, True),
+                ("kda", "DFLASH", "nv_cutedsl", 1, True),
+                ("kda", "DSPARK", "flashinfer", 1, False),
+            ):
+                with self.subTest(
+                    mode=mode, family=family, algo=algo, verify=verify, topk=topk
+                ):
+                    args = ServerArgs(
+                        model_path="dummy",
+                        linear_attn_backend="triton",
+                        linear_attn_verify_backend=verify,
+                        enable_linear_replayssm_spec=True,
+                        speculative_algorithm=algo,
+                        speculative_eagle_topk=topk,
+                        mamba_ssm_dtype="float32",
+                    )
+                    hf_config = (
+                        Qwen3_5Config()
+                        if family == "gdn"
+                        else SimpleNamespace(
+                            linear_attn_config={"kda_layers": [0]},
+                            get_text_config=lambda: SimpleNamespace(),
+                        )
+                    )
+                    args._model_config = SimpleNamespace(hf_config=hf_config)
+                    with (
+                        override_platform(is_cuda=False, is_sm100=False),
+                        envs.SGLANG_RAGGED_VERIFY_MODE.override(mode),
+                    ):
+                        if allowed:
+                            handle_linear_attn_backend(args)
+                            self.assertEqual(
+                                resolution_result(args, "mamba_ssm_dtype"), "float32"
+                            )
+                        else:
+                            with self.assertRaisesRegex(
+                                ValueError, "linear draft chain|requires GDN"
+                            ):
+                                handle_linear_attn_backend(args)
 
 
 if __name__ == "__main__":

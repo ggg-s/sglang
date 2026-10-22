@@ -649,6 +649,25 @@ class MambaPool:
         envelope_layout: bool = False,
         enable_linear_replayssm_spec: bool = False,
     ):
+        if enable_linear_replayssm_spec:
+            # Circular addressing uses a bit mask, and a verify window must
+            # fit alongside the committed history before the next capacity
+            # fold. Validate GDN too: the old check only covered KDA, allowing
+            # e.g. a 17-token GDN verify window into the default 16-entry ring.
+            ring_len = linear_replayssm_cache_len
+            if ring_len < 1 or ring_len & (ring_len - 1):
+                raise ValueError(
+                    f"spec-verify ring length must be a power of two, got {ring_len}"
+                )
+            if (
+                speculative_num_draft_tokens is not None
+                and ring_len < 2 * speculative_num_draft_tokens
+            ):
+                raise ValueError(
+                    f"spec-verify ring too small: {ring_len} < "
+                    f"2 * {speculative_num_draft_tokens} (early-flush margin); "
+                    "increase --linear-replayssm-cache-len"
+                )
         conv_state_shape = cache_params.shape.conv
         temporal_state_shape = cache_params.shape.temporal
         conv_dtype = cache_params.dtype.conv
@@ -814,21 +833,6 @@ class MambaPool:
                 # KDA still uses raw-input fold-every-commit. GDN materializes
                 # its compact d/k/g history directly and needs no duplicate ring.
                 if enable_linear_replayssm_spec and cache_params.is_kda:
-                    if cache_params.is_kda or not self.replayssm_spec_fold:
-                        # Backstop for the KDA ring invariants; this pool is
-                        # sized with the final adaptive-aware draft maximum.
-                        if L & (L - 1) != 0:
-                            raise ValueError(
-                                f"spec-verify ring length must be a power of two, got {L}"
-                            )
-                        if (
-                            speculative_num_draft_tokens is not None
-                            and L < 2 * speculative_num_draft_tokens
-                        ):
-                            raise ValueError(
-                                f"spec-verify ring too small: {L} < "
-                                f"2 * {speculative_num_draft_tokens} (early-flush margin)"
-                            )
                     replayssm_rawv = torch.zeros(
                         size=(num_mamba_layers, num_slots, hv, record_len, v_dim),
                         dtype=conv_dtype,

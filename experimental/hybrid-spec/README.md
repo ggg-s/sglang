@@ -224,6 +224,16 @@ Qwen3.5/3.6 GDN MTP 支持纯文本 fixed compact，使用原生 MTP 与 `--lang
 普通 host token 档位 dispatch 可用；`conditional_verify_graph=true` 暂不开放，
 多模态输入及其他线性模型仍拒绝。验收记录见
 [Qwen GDN compact](validation/qwen-gdn-compact-20261021/README.md)。
+
+GDN compact 可显式启用 `--enable-linear-replayssm-spec`，配合
+`--linear-attn-backend triton --linear-attn-verify-backend triton`。
+保持 FP32 状态时使用 `--mamba-ssm-dtype float32`；Replay 缓存长度需为 2 的幂，
+并至少为最大验证宽度（含 bonus）的两倍。SA16/neural8 的宽度为 17，使用
+`--linear-replayssm-cache-len 64`。该路径保留卷积回滚缓存，用请求级更新记录
+替代完整 GDN 中间快照；默认的 split/gate=1/fixed compact 不变。
+4060 组件验证和完整模型验收进度见
+[ReplaySSM + GDN compact 验证记录](validation/qwen-gdn-replayssm-compact-20261022/README.md)。
+
 DSV4 的原生 ragged 路径
 不支持 CP 或实验性 online c128 MTP；不要开启 `SGLANG_EXPERIMENTAL_ONLINE_C128_MTP`。
 其余单机 TP、greedy、topk=1、无 LoRA/grammar/mixed chunk 限制继续生效。
