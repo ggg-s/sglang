@@ -1,11 +1,12 @@
 import unittest
 from array import array
+from dataclasses import replace
 from types import SimpleNamespace
 from unittest.mock import MagicMock, patch
 
 import torch
 
-from sglang.srt.managers.schedule_batch import Req, ScheduleBatch
+from sglang.srt.managers.schedule_batch import FINISH_LENGTH, Req, ScheduleBatch
 from sglang.srt.managers.scheduler import Scheduler
 from sglang.srt.managers.scheduler_components.batch_result_processor import (
     SchedulerBatchResultProcessor,
@@ -14,6 +15,7 @@ from sglang.srt.managers.utils import GenerationBatchResult
 from sglang.srt.runtime_context import get_context
 from sglang.srt.sampling.sampling_params import SamplingParams
 from sglang.test.ci.ci_register import register_cpu_ci
+from sglang.test.test_utils import CustomTestCase
 
 register_cpu_ci(est_time=12, suite="base-a-test-cpu")
 
@@ -177,6 +179,25 @@ class TestMambaBoundaryMaskReuse(unittest.TestCase):
                     cache_update.assert_not_called()
                 else:
                     self.assertTrue(cache_update.call_args.kwargs["known_boundary"])
+
+
+class TestPDMuxDecodeCompletion(CustomTestCase):
+    def test_finished_request_ignores_the_already_submitted_decode(self):
+        """Finishing N must not append N+1 or release its KV twice in PDMux."""
+        req, batch = _make_batch()
+        req.finished_reason = FINISH_LENGTH(1)
+        processor = replace(
+            _make_processor(),
+            enable_overlap=False,
+            tree_cache=SimpleNamespace(
+                page_size=TRACK_INTERVAL, supports_mamba=lambda: False
+            ),
+        )
+        with get_context().override_server_args(
+            enable_pdmux=True, disable_overlap_schedule=True
+        ):
+            processor.process_batch_result_decode(batch, _make_result())
+        self.assertEqual(list(req.output_ids), [3])
 
 
 if __name__ == "__main__":
