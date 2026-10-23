@@ -3,11 +3,17 @@
 **2026-10-21 默认更新**：GPU SA 增加在线续写频次，默认以频次选择单链候选；
 默认执行模式改为 `device + split + gate=1`，常规模板同步调整。
 计数算法、策略、72/108 字节/token 自适应索引预算、v6 重编译与 DSPARK 例外见
-[频次实现与升级说明](FREQUENCY.md)。下列既有性能数据属于此前版本，不能作为新策略的性能验收。
+[频次实现与升级说明](FREQUENCY.md)。10-20 及以前的性能数据属于此前版本，不能作为新策略的性能验收；新版结果按各批次注明的配置与版本解释。
 
-截至 2026-10-20 的实测数据见 [测试总报告](validation/TEST_RESULTS.md)，涵盖内网 DSV4 TP8、A100 / 6000D / 4090 性能、4060 功能回归及 compact 对照；[逐次数据](validation/TEST_RESULTS_RUNS.md) 和 [完整历史记录](validation/TEST_RESULTS_DETAILS.md) 保留统计口径、版本、证据链接与作废结果说明。
+实测数据见 [测试总报告](validation/TEST_RESULTS.md)，涵盖内网 DSV4 TP8、A100 / 6000D / 4090 性能、4060 功能回归及 compact 对照；DSV4 汇总已补充至 2026-10-23。[逐次数据](validation/TEST_RESULTS_RUNS.md) 和 [完整历史记录](validation/TEST_RESULTS_DETAILS.md) 保留统计口径、版本、证据链接与作废结果说明。
 
 内网 [DSV4-Flash / H100 TP8 实测报告（10-17～10-20）](validation/DSV4_PERFORMANCE_20261017_19.md)：edits c1～32、离线耗时表与 fixed/dynamic compact、SWE c8/c16/c80，以及 decode 与系统吞吐的不同口径。edits c1 padded SA8/neural3 达 430.74 tok/s；SWE SA8 相对同轮 MTP K3 再提高约 4%～6% RPS，c80 受 KV 压力影响端到端回退。
+
+**2026-10-22 新增用户实测**：[DSV4 SWE c1 三臂对照](validation/DSV4_PERFORMANCE_20261017_19.md#swe-c1-8807cbaead)，版本 `8807cbaead`、4219 prompts、900s/臂。SA8 split+compact/gate1/neural3 为 **235.3 tok/s**，相对同轮 MTP K8 系统吞吐 **+31.0%**、纯 decode **+68.3%**、TPOT **−36.5%**、E2EL **−19.8%**；环境重编和定向测试用户报告为 **270 passed**。
+
+同构建的 [edits c1/2/4/8/16 接受长度扫描](validation/DSV4_PERFORMANCE_20261017_19.md#edits-mixed-8807cbaead) 已补充：每点 500 条、2048 输出上限，SA8/neural3/gate1/split/fixed compact/global pool。overall accept **4.245～4.464**，SA 行 **7.394～7.715**；c1/c16 吞吐 **402.3 / 2291.0 tok/s**。mixed 步占比升高时，两类行的接受长度未呈单调增长；组成分解及历史 native 比较口径见专题。
+
+**2026-10-23 补齐 edits 无投机基线**：[c8/16/32 target-only 对照](validation/DSV4_PERFORMANCE_20261017_19.md#edits-target-only-backfill-20261023) 为 **890.13 / 1316.34 / 1977.82 tok/s**。同 harness、500 条 edits、2048 输出上限下，历史 fixed compact 相对新基线吞吐 **+83.3% / +76.0% / +66.3%**，相对历史 MTP K8 **+61.6% / +55.6% / +48.6%**。本次新跑基线与历史对照分开记录，不表示三臂同期重测。
 
 新增显式开启的 [在线校准与动态验证](DYNAMIC_VERIFY.md)：SA/suffix 和 neural
 统一从 target 验证反馈估计接受率，结合实际 CUDA Graph 档位耗时选择每请求验证长度。

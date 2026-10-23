@@ -1,6 +1,6 @@
 # 混合投机解码测试数据总报告
 
-> 整理日期：2026-10-19；DSV4 数据更新至 2026-10-20。范围：本工作区现有验证报告、机器可读结果，以及用户在本会话提供的内网 DSV4 结果。此次仅整理数据，没有重新执行 GPU 测试。
+> 整理日期：2026-10-19；DSV4 数据更新至 2026-10-23，新增 edits c8/16/32 target-only 基线；保留 `8807cbaead` 版本 SWE c1 及 edits c1/2/4/8/16。范围：本工作区现有验证报告、机器可读结果，以及用户在本会话提供的内网 DSV4 结果。此次仅整理数据，没有重新执行 GPU 测试。
 >
 > 初版整理时分支：`codex/hybrid-suffix-speculation`，HEAD：`c39a01d74dcf953c5e9ff7f2fc0b4ed379ea7399`；此 SHA 是历史快照，不代表当前 HEAD。各实验版本另行注明。初版 STANDALONE 性能测试统一应用了当时未提交的 hidden-state 修复；后续修复提交见 `1a1dd4e567`，历史测试结果不因此成为该提交的新验收。
 
@@ -23,6 +23,12 @@
 <a id="1-如何阅读这些数字"></a>
 
 ## 1. 如何阅读这些数字
+
+**2026-10-23 补充 edits 无投机基线：c8/c16/c32 为 890.13 / 1316.34 / 1977.82 tok/s。** 用户确认与既有 MTP/混合使用相同 harness、500 条 edits、2048 输出上限。历史 fixed compact 相对新基线的吞吐提升为 **83.3% / 76.0% / 66.3%**，MTP K8 为 **13.4% / 13.1% / 12.0%**；相对 MTP 的混合增益仍为 **61.6% / 55.6% / 48.6%**。新增基线与历史对照分别保留，不称为同期重测；完整表及 c1 跨轮说明见 [DSV4 专题 §3.9](DSV4_PERFORMANCE_20261017_19.md#edits-target-only-backfill-20261023)。
+
+**2026-10-22 新增 edits 接受长度扫描：`8807cbaead`，每点 500 条、2048 输出上限，SA8/neural3/gate1/split/fixed compact/global pool，c1/2/4/8/16 每点重启服务。overall accept 为 4.245～4.464，SA 行 7.394～7.715、neural 行 2.667～2.707；吞吐 402.3 / 681.3 / 1082.8 / 1627.8 / 2291.0 tok/s。** mixed 步占比从 0% 升至 98.6%，未观察到单行接受长度随之单调增加。组成分解、历史 native 参考和证据目录见 [DSV4 专题 §3.8](DSV4_PERFORMANCE_20261017_19.md#edits-mixed-8807cbaead)。
+
+**2026-10-22 新增 SWE c1 用户实测：`8807cbaead`，4219 prompts、900s/臂，baseline / MTP K8 / SA8 split+compact/gate1/neural3 的 Completion 吞吐为 131.8 / 179.7 / 235.3 tok/s。SA 相对同轮 MTP K8 系统吞吐 +31.0%、纯 decode +68.3%、TPOT −36.5%、E2EL −19.8%；accept 为 2.661 → 4.136（+55.4%）。** 环境重编和定向测试用户报告为 270 passed。完整三臂指标、版本及舍入说明见 [DSV4 专题 §4.5](DSV4_PERFORMANCE_20261017_19.md#swe-c1-8807cbaead)。这组结果与此前 c8/c16 分开，不作跨批次配对。
 
 **2026-10-20 内网数据更新：DSV4 TP8 edits c1 最快为 padded SA8/neural3/gate1，430.74 tok/s（相对当轮 native K8 +59.4%）；c8～32 已测 fixed compact 相对 native K8 +48.6%～+61.6%。加载离线耗时表的 c1/c16/c32 dynamic 仍比 fixed 慢 3.0%～5.2%。SWE c8/c16，SA8 相对同轮 baseline RPS 约 +37% / +28%，相对更强的 MTP K3 再 +4%～+6%；c80 的 decode 改善未转化为系统收益。** 完整表格、批次和内网产物路径见 [DSV4 专题](DSV4_PERFORMANCE_20261017_19.md)。新增汇总未在本次整理中从内网原始文件复算。
 
@@ -61,6 +67,9 @@
 | D4 | 同上 | 用户新增 c8/c16 汇总，各臂 500 edits，单次顺序 | native / fixed compact / dynamic compact |
 | D5 | 同上 | 500 edits，c1/c16/c32，ecd8ef51a3，单次顺序 | 离线耗时表与 fixed/dynamic compact |
 | D6 | 同上 | SWE 4219 请求 / 459 用户组，c8/c16/c80，各点 900s | 系统吞吐、MTP K3/K8、KV 压力 |
+| D7 | 内网 DSV4；本轮未重述硬件，`8807cbaead` | SWE 4219 prompts，c1，900s/臂，三臂各一组汇总 | baseline / MTP K8 / SA8 split+compact/gate1/neural3；完成 535 / 751 / 933 |
+| D8 | 内网 DSV4，`8807cbaead` | edits 每点 500 条、输出上限 2048，c1/2/4/8/16，每点重启服务 | SA/neural 来源行接受长度、mixed 步占比和组成分解；与历史 native 分开记录 |
+| D9 | 内网 DSV4；新基线版本待补 | 新跑 target-only c8/16/32；同 harness、500 条 edits、2048 输出上限 | 补齐无投机吞吐基线，与历史 MTP K8 / 混合分别比较 |
 | A1 | A100 PCIe 40GB，Qwen3.5-35B-A3B-GPTQ-Int4，MTP TP1 | 100 edits、50 edits；另有 GSM8K | 接受率诊断、gate 与 C1 split |
 | A2 | 同上 | 50 edits，c4，每臂 2 次 | 混合批尾段压缩 |
 | S1 | RTX 6000D，Qwen3.6-35B-A3B-FP8，MTP TP1 | 3 场景 × c1/4 × 4 配置 × 3 次，72 点 | 全局池独立收益 |
@@ -72,11 +81,26 @@
 | F1 | RTX 4060 Laptop 8GB / WSL2 | 多轮逐步扩展的组件回归 | 生命周期、三算法、Arctic、gate、Graph、compact、动态反馈 |
 | P1 | A100 / 6000D / 4090 | 独立 profile 与微基准窗口 | 解释成本结构，不替代正式吞吐 |
 
-D1～D6 来自用户粘贴的内网结果；其余来自本工作区保存的报告和 JSON。不同轮次含重复使用的历史对照，**不把这些行相加成独立实验样本总数**。
+D1～D9 来自用户粘贴的内网结果；其余来自本工作区保存的报告和 JSON。不同轮次含重复使用的历史对照，**不把这些行相加成独立实验样本总数**。
 
 <a id="3-内网-dsv4-flash--h100-tp8"></a>
 
 ## 3. 内网 DSV4-Flash / H100 TP8
+
+**2026-10-23 补充 edits 无投机基线：c8/c16/c32 为 890.13 / 1316.34 / 1977.82 tok/s。** 用户确认与既有 MTP/混合使用相同 harness、500 条 edits、2048 输出上限。历史 fixed compact 相对新基线的吞吐提升为 **83.3% / 76.0% / 66.3%**，MTP K8 为 **13.4% / 13.1% / 12.0%**；相对 MTP 的混合增益仍为 **61.6% / 55.6% / 48.6%**。新增基线与历史对照分别保留，不称为同期重测；完整表及 c1 跨轮说明见 [DSV4 专题 §3.9](DSV4_PERFORMANCE_20261017_19.md#edits-target-only-backfill-20261023)。
+
+| 并发 | 无投机基线 tok/s | MTP K8 tok/s | 混合投机 tok/s | MTP 比基线 | 混合比基线 | 混合比 MTP |
+|---:|---:|---:|---:|---:|---:|---:|
+| 1¹ | 166.16 | 270.16 | **430.74** | +62.6% | **+159.2%** | **+59.4%** |
+| 8 | 890.13 | 1,009.40 | **1,631.27** | +13.4% | **+83.3%** | **+61.6%** |
+| 16 | 1,316.34 | 1,489.15 | **2,316.97** | +13.1% | **+76.0%** | **+55.6%** |
+| 32 | 1,977.82 | 2,214.46 | **3,289.69** | +12.0% | **+66.3%** | **+48.6%** |
+
+¹ c1 为历史跨轮 padded；c8/c16/c32 为新 target-only 基线配历史 fixed compact，不是三臂同期重跑。新增基线 TPOT 未提供。
+
+最新 edits 接受长度扫描见 [专题 §3.8](DSV4_PERFORMANCE_20261017_19.md#edits-mixed-8807cbaead)：c1～16 overall 为 4.245～4.464，c16 吞吐 2291.0 tok/s。SA 行占比及两类行接受长度共同决定 overall，mixed 步占比是另一统计口径。
+
+最新版本的 SWE 单并发三臂结果见 [专题 §4.5](DSV4_PERFORMANCE_20261017_19.md#swe-c1-8807cbaead)：SA8 Completion 235.3 tok/s，相对同期 MTP K8 +31.0%；本轮用户报告重编与 270 项定向测试通过。下文 §3.0～3.1 保留历史批次，使用各自基线。
 
 ### 3.0 最新补充：edits、离线成本表与 SWE
 
