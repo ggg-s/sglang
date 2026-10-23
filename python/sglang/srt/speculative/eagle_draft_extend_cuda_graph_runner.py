@@ -102,6 +102,7 @@ class EAGLEDraftExtendCudaGraphRunner(DecodeCudaGraphRunner):
         *,
         draft_extend_attn_backend=None,
         speculative_num_steps: Optional[int] = None,
+        capture_stream=None,
     ):
         # Parse args
         self.eagle_worker = eagle_worker
@@ -134,6 +135,7 @@ class EAGLEDraftExtendCudaGraphRunner(DecodeCudaGraphRunner):
         # Disable parent paths that don't apply.
         self.compile_bs = []
         self.enable_pdmux = False
+        self.capture_stream = capture_stream
         self.record_nolora_graph = False
         self.attention_graph_variants = None
         self.is_dllm = False
@@ -282,11 +284,10 @@ class EAGLEDraftExtendCudaGraphRunner(DecodeCudaGraphRunner):
             global_num_tokens_for_logprob_gpu=global_num_tokens_for_logprob_gpu,
             dsa_seed_topk_capture=dsa_seed_topk_capture,
         )
-        # The values depend on captured_req_width, while adaptive speculative
-        # decoding owns multiple runners whose select_index buffers all have
-        # shape [max_bs]. Sharing by field name and shape would alias those
-        # width-specific indices and can make a narrower graph gather OOB.
-        self.buffers.share_buffers(exclude={"select_index"})
+        # Keep adaptive-width select indices private. PDMux graphs also need
+        # private inputs while the prefill lane uses the shared input pool.
+        if capture_stream is None:
+            self.buffers.share_buffers(exclude={"select_index"})
 
         self.backend = resolve_decode_backend(self)
 

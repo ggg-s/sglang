@@ -116,10 +116,10 @@ class SchedulerMultiplexMixin:
     def _update_decode_attn_backends(self: Scheduler, stream_idx: int) -> None:
         """Point the decode-side attention backends at this stream group.
 
-        The target runner has always been switched here. The standard lane also
-        switches the draft runners: a graph replay indexes the group directly,
-        but the eager TARGET_VERIFY fallback and DSpark's draft block resolve
-        `decode_attn_backend`, which would otherwise stay pinned to group 0.
+        The target runner has always been switched here. Both PDMux prefill
+        modes also switch draft runners: eager MTP draft steps, TARGET_VERIFY
+        fallback, and DSpark's draft block resolve `decode_attn_backend`, which
+        would otherwise stay pinned to group 0.
         Reached only with no prefill in flight and after both streams have been
         drained, so no forward can be reading these fields.
         """
@@ -131,7 +131,7 @@ class SchedulerMultiplexMixin:
             return
 
         self.tp_worker.model_runner.update_decode_attn_backend(stream_idx)
-        if not self.pdmux_standard or self.draft_worker is None:
+        if self.draft_worker is None:
             return
         for runner in self.draft_worker._draft_model_runners():
             if runner.decode_attn_backend_group:
@@ -542,6 +542,21 @@ class SchedulerMultiplexMixin:
         logger.debug("Starting event loop for pd multiplexing...")
 
         while True:
+            # Speculation, grammar and penalties need the previous result
+            # before the next forward prepares its CPU-dependent state.
+            if pending_decode_result is not None and (
+                not self.spec_algorithm.is_none()
+                or self.running_batch.has_grammar
+                or (
+                    self.running_batch.sampling_info is not None
+                    and self.running_batch.sampling_info.penalizer_orchestrator.is_required
+                )
+            ):
+                with torch.cuda.stream(decode_stream):
+                    set_pdmux_status(False)
+                    self.process_batch_result(*pending_decode_result)
+                pending_decode_result = None
+
             with torch.cuda.stream(decode_stream):
                 set_pdmux_status(False)
                 if carried_batch_pending and not self.running_batch.is_empty():
@@ -626,7 +641,14 @@ class SchedulerMultiplexMixin:
                 # standard overlap scheduler's one-step lookahead.  Mark the
                 # batch accordingly so Mamba snapshots the next boundary before
                 # the shared Req counters advance in the following iteration.
-                running_batch.enable_overlap = True
+                running_batch.enable_overlap = (
+                    self.spec_algorithm.is_none()
+                    and not running_batch.has_grammar
+                    and not (
+                        running_batch.sampling_info is not None
+                        and running_batch.sampling_info.penalizer_orchestrator.is_required
+                    )
+                )
                 running_batch = self.update_running_batch(running_batch)
                 self.running_batch = running_batch
                 adjust_stream_group = adjust_stream_group or (
@@ -739,21 +761,7 @@ class SchedulerMultiplexMixin:
                 if pending_decode_result is not None:
                     self.process_batch_result(*pending_decode_result)
 
-                finishing_prefill = (
-                    prefill_done
-                    and self.split_prefill_batch is not None
-                    and self.split_prefill_batch.split_prefill_finished
-                )
-                if finishing_prefill and current_decode_result is not None:
-                    # Finalization can enqueue allocator and Mamba state work
-                    # that must observe this decode result.  Drain the current
-                    # item at this uncommon merge boundary and publish one event
-                    # covering both result processing and the forward.
-                    self.process_batch_result(*current_decode_result)
-                    pending_decode_result = None
-                else:
-                    pending_decode_result = current_decode_result
-                decode_result_done = decode_stream.record_event()
+                pending_decode_result = current_decode_result
 
             with torch.cuda.stream(prefill_stream):
                 set_pdmux_status(True)
@@ -768,6 +776,15 @@ class SchedulerMultiplexMixin:
 
                     self.tp_cpu_group.allreduce(flags, dist.ReduceOp.SUM).wait()
                     if flags.item() == self.ps.tp_size:
+                        # Drain the current decode only once every rank is
+                        # ready to merge, not on each local completion poll.
+                        with torch.cuda.stream(decode_stream):
+                            set_pdmux_status(False)
+                            if pending_decode_result is not None:
+                                self.process_batch_result(*pending_decode_result)
+                                pending_decode_result = None
+                            decode_result_done = decode_stream.record_event()
+                        set_pdmux_status(True)
                         running_batch = self._merge_finished_prefill_batch(
                             prefill_result,
                             prefill_stream,

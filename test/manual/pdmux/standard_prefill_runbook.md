@@ -151,8 +151,8 @@ Every baseline runs the same checkpoint as the cell it is compared with.
   real acceptance. `test/manual/dsv4/test_dsv4_flash_mtp_tp8.py` sets
   `SGLANG_SIMULATE_ACC_LEN=3` for a latency case; do not carry that variable
   into either the baseline or the PDMux cell, or the accept lengths compare
-  a simulation. Do not use layer_split as the MTP baseline: its split path
-  bypasses the draft extend.
+  a simulation. Layer-split MTP now performs draft extend after its final
+  target segment; keep the ordinary scheduler as the independent baseline.
 - DSpark: the standard scheduler with `DSPARK` and the confirmed draft
   checkpoint.
 
@@ -222,10 +222,69 @@ that moment, which the debug log reports on every switch
 
 ## 5. Known limits of this lane
 
-- EAGLE draft CUDA graphs are skipped (eager draft steps / draft extend).
-  DSpark's per-group draft and verify graphs stay on, as do the target's
-  decode and verify graphs.
+- EAGLE draft decode and draft extend CUDA graphs are captured per stream
+  group on CUDA, with private input buffers and a pool separate from prefill.
+  Eager fallback still applies to batches outside graph eligibility. DSpark's
+  per-group graphs and the target's decode / verify graphs remain enabled.
 - DSV4 and the DSpark draft run their single-stream paths (no model-internal
   helper streams).
 - Rejected at launch: a non-disabled prefill CUDA graph, multi-layer EAGLE,
   TBO, unified memory, DP attention, EP, CP, DCP.
+
+## 2026-10-23: opt-to-latest-main port
+
+Base: `origin/codex/dsv4-pdmux-latest-main` at `ede1ba7bd2`.
+Source: `origin/feat/dsv4-pdmux-opt` at `02ea743986`.
+
+The port keeps the newer baseline APIs and incorporates these PDMux changes:
+
+- Layer-split MTP completion, draft backend switching, Verify/IDLE metadata
+  isolation, and split input retention through the final draft extend
+  (`654969fca9`, `716ae9899c`, `c2aa1b7908`, `cdf5261083`, `99cc317765`).
+- Per-stream-group draft CUDA graphs with private input buffers and a draft
+  graph pool separate from concurrent prefill; fixed-width EAGLE/MTP joins
+  the DP replay vote (`d2885e1788`, `02ea743986`). The new baseline uses
+  `can_run_decode_cuda_graph`, resolved config bags, attention graph variants,
+  and width-private `select_index` buffers; these contracts are preserved.
+- Whole-model split-prefill BCG replay on its captured prefill-only lane
+  (`edfa234e9d`), preserving the baseline's DP capture flags and prefix buckets.
+- CPU-dependent decode completion before the next iteration, and delayed
+  result drain until the rank-wide prefill merge vote succeeds
+  (`7d4770a18b`, `08fdc48c8f`, `17b03a45b2`, adapted to the existing pipeline).
+- Split-prefill running timeouts reuse `ingest_requests` and its existing
+  rank-consistent abort broadcast (`3a869635ce`, adapted).
+- The PDMux decode post-warmup backend hook from `b6257385d7`; its older DCP
+  model implementation is not copied over the newer baseline.
+
+DP/DSpark, bounded indexer logits, and split-state synchronization already have
+corresponding ports in this base (`57d936cae7`, `8725462505`, `4e6c22dc01`).
+The canceled cross-step BCG experiment (`4d6063246f` / `ea1bd74faf`), standalone
+experimental DCP stack (`c74c1aec6f` / `1be65ac90a`), and unrelated metrics fix
+(`a5aea8bdec`) are excluded.
+
+Validation completed for this port:
+
+- 13 CPU test files, each in its own process: **132 passed, 73 subtests passed**.
+  This includes standard/layer-split scheduling, Gloo agreement, MTP, graph
+  eligibility, metadata isolation, input retention, timeouts, and HiCache.
+- Two adapted scheduler regressions were checked against the unmodified base:
+  both fail by assertion before the port and pass after it.
+- RTX 4060 Laptop 8 GB under Ubuntu/WSL, PyTorch `2.14.1+cu130`:
+  **4 CUDA smoke cases passed**. They run real 8/16-SM Green Context streams,
+  per-group draft graph capture/replay alongside a separate prefill graph,
+  exact tensor-output checks across 32 group switches, and split inputs through
+  a final CUDA draft extend. Whole-prefill lane-0 capture also restores stream
+  and DP flags after success and an injected capture failure.
+  Tiny tensor operators replace model/backends;
+  this is not full-model accuracy, TP8, or performance validation.
+- Python parsing, isort, Ruff format/name checks, registered-test validation,
+  and diff whitespace checks passed.
+
+Run the CUDA smoke checks from the repo root with PyTorch GreenContext support:
+
+```bash
+python -m pytest -q test/manual/pdmux/test_pdmux_port_cuda.py
+```
+
+The 4060 evidence directory is `/workspace/pdmux-opt-port-20261023/`.
+DeepSeek model accuracy, real NCCL TP/DP execution and throughput remain unvalidated.

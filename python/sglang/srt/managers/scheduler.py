@@ -3314,6 +3314,8 @@ class Scheduler(
             # Standard PDMux prefills live outside the decode batches until
             # completion, but their running-timeout clock has already started.
             inflight_batches += self._extra_inflight_batches()
+            if self.enable_pdmux and self.split_prefill_batch is not None:
+                inflight_batches.append(self.split_prefill_batch)
             seen_rids = set()
             for batch in inflight_batches:
                 if batch is None:
@@ -4518,7 +4520,13 @@ class Scheduler(
                     self._relay_forward_payload(
                         batch, batch.req_pool_indices, batch_result
                     )
-                batch.input_ids = None
+                # The final MTP draft extend rebuilds its ForwardBatch from
+                # these original, unpadded inputs after the target finishes.
+                if (
+                    batch.split_index + batch.split_forward_count
+                    >= self.model_config.num_hidden_layers
+                ):
+                    batch.input_ids = None
                 self._copy_auxiliary_output_to_cpu(batch, batch_result)
             elif not batch.spec_algorithm.is_none():
                 # Non-overlap: drive the V2 worker synchronously (no

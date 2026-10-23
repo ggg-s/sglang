@@ -59,6 +59,8 @@ def _scheduler(waiting_queue, running_reqs=(), last_batch_reqs=()):
     s.beam_coordinator = MagicMock()
     s.ps = SimpleNamespace(pp_size=1)
     s.pdmux_standard = False
+    s.enable_pdmux = False
+    s.split_prefill_batch = None
     s.running_batch = _batch(list(running_reqs))
     s.last_batch = _batch(list(last_batch_reqs)) if last_batch_reqs else None
     return s
@@ -135,6 +137,18 @@ class TestRunningTimeout(CustomTestCase):
         self.assertIsNone(stale.to_finish)
         self.assertIsNone(fresh.to_finish)
         self.assertIsNone(done.to_finish, "a finished req must not be aborted")
+
+    def test_split_prefill_timeout_uses_the_common_abort_broadcast(self):
+        stale = _req("split", forward_entry=time.perf_counter() - 10)
+        fresh = _req("fresh", forward_entry=time.perf_counter())
+        s = _scheduler([])
+        s.enable_pdmux = True
+        s.split_prefill_batch = _batch([stale, fresh])
+        with envs.SGLANG_REQ_RUNNING_TIMEOUT.override(1.0):
+            aborts = s._poll_timeout_aborts()
+        self.assertEqual([abort.rid for abort in aborts], ["split"])
+        self.assertIsNone(stale.to_finish)
+        self.assertEqual(s.split_prefill_batch.reqs, [stale, fresh])
 
     def test_req_in_both_running_and_last_batch_is_emitted_once(self):
         stale = _req("stale", forward_entry=time.perf_counter() - 10)

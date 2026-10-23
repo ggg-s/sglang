@@ -254,7 +254,7 @@ class EagerRunner(BaseRunner):
         runs under. PDmux selects a per-stream backend and publishes it via an
         active ForwardContext; non-pdmux uses attn_backend + the ambient ctx.
 
-        The standard lane makes one exception: a backend the caller already
+        Both prefill modes make one exception: a backend the caller already
         published wins. Overriding it would hand the model a per-stream backend
         that never planned this forward's metadata (the init is skipped because
         the caller marked it ready), and would drop the per-step
@@ -263,10 +263,9 @@ class EagerRunner(BaseRunner):
         model_runner = self.model_runner
         if not self.enable_pdmux:
             return model_runner.attn_backend, contextlib.nullcontext()
-        if self.pdmux_standard:
-            chosen = self._caller_published_attn_backend()
-            if chosen is not None:
-                return chosen, contextlib.nullcontext()
+        chosen = self._caller_published_attn_backend()
+        if chosen is not None:
+            return chosen, contextlib.nullcontext()
         return model_runner.decode_attn_backend, forward_context(
             ForwardContext(attn_backend=model_runner.decode_attn_backend)
         )
@@ -277,15 +276,21 @@ class EagerRunner(BaseRunner):
         """Resolve the backend an eager EXTEND-family forward runs under.
 
         TARGET_VERIFY is classified as an extend mode but belongs to the decode
-        lane: it runs between draft steps on the decode stream. On the standard
-        lane it must therefore use the decode lane's per-stream backend, not the
-        prefill instance -- both write `forward_metadata` and the same scratch
-        buffers in place, and a prefill can be in flight on the other stream. A
-        real prefill keeps the prefill backend and the ambient context, and so
-        does every forward under layer_split, which keeps its original routing.
+        lane: it runs between draft steps on the decode stream. Both PDMux modes
+        must keep its metadata and scratch buffers separate from an in-flight
+        prefill, including between split segments. Preserve explicit draft-step
+        contexts even when DP padding has converted their mode to EXTEND.
         """
-        if self.pdmux_standard and forward_batch.forward_mode.is_target_verify():
-            return self._resolve_decode_pdmux()
+        if self.enable_pdmux:
+            chosen = self._caller_published_attn_backend()
+            if chosen is not None:
+                return chosen, contextlib.nullcontext()
+            logical_mode = (
+                getattr(forward_batch, "_original_forward_mode", None)
+                or forward_batch.forward_mode
+            )
+            if logical_mode.is_target_verify():
+                return self._resolve_decode_pdmux()
         return self.model_runner.attn_backend, contextlib.nullcontext()
 
     def _execute_decode(
@@ -497,17 +502,28 @@ class EagerRunner(BaseRunner):
         self, forward_batch: ForwardBatch, pp_proxy_tensors=None
     ) -> Union[LogitsProcessorOutput, PPProxyTensors]:
         model_runner = self.model_runner
+        # IDLE on the decode lane must not clear the metadata retained by a
+        # split prefill. A peer-prefill idle uses the prefill backend; an
+        # explicit multi-step draft context takes precedence in either case.
+        attn_backend = model_runner.attn_backend
+        pdmux_ctx = contextlib.nullcontext()
+        if self.enable_pdmux:
+            chosen = self._caller_published_attn_backend()
+            if chosen is not None:
+                attn_backend = chosen
+            elif not forward_batch.is_extend_in_batch:
+                attn_backend, pdmux_ctx = self._resolve_decode_pdmux()
         # Padded idle (DP-attn MLP sync) needs metadata reinit; unpadded must
         # drop stale forward_metadata to avoid an SWA use-after-free on req_pool.
         if forward_batch.batch_size > 0:
             if not self.enable_pdmux:
                 forward_batch = self.load_batch(forward_batch, pp_proxy_tensors)
-            model_runner.attn_backend.init_forward_metadata(forward_batch)
+            attn_backend.init_forward_metadata(forward_batch)
         else:
-            model_runner.attn_backend.forward_metadata = None
+            attn_backend.forward_metadata = None
 
         kwargs = model_runner._pp_kwargs(pp_proxy_tensors)
-        with device_timer_ctx(model_runner.device_timer, "idle"):
+        with device_timer_ctx(model_runner.device_timer, "idle"), pdmux_ctx:
             return model_runner.model.forward(
                 forward_batch.input_ids,
                 forward_batch.positions,
