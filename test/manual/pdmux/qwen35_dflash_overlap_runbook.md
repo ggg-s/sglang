@@ -121,3 +121,36 @@ earlier experiments.
 
 See [`qwen35_awq_swe_results.md`](qwen35_awq_swe_results.md) for the measured
 three-group P88 comparison, acceptance counters and remaining numerical gaps.
+
+## ReplaySSM memory control
+
+For DFlash's GDN verify path, use speculative ReplaySSM:
+
+```bash
+REPLAYSSM_SPEC=1 REPLAYSSM_CACHE_LEN=32 HICACHE_SIZE=16 MAX_TOTAL_TOKENS=65536 \
+  PDMUX_CONFIG=test/manual/pdmux/qwen35_dflash_overlap_replayssm_a100.yaml \
+  bash test/manual/pdmux/launch_qwen35_awq_dflash_overlap.sh
+```
+
+This selects `--enable-linear-replayssm-spec`, keeps the `extra_buffer` radix
+strategy and replaces per-draft full SSM snapshots with compact request-keyed
+records. The separate `--enable-linear-replayssm` flag is the ordinary decode
+control and requires `no_buffer`; it is not the DFlash memory control.
+`MAX_TOTAL_TOKENS` changes the aggregate GPU KV pool limit. Both prefill budgets
+remain 32768, and the per-request context limit remains 16384.
+
+DFlash commits accepted GDN replay records using the actual request indices and
+the physical state indices selected by the decode backend. Tracked prefix states
+materialize at the accepted interval crossing, including under PDMux state
+translation. Recurrent and replay verify use the same activation-dtype beta
+rounding. The focused GPU regression covers circular wrap, a capacity fold,
+deferred active state, translated track destinations and convolution rollback.
+This does not establish complete generated-token equivalence to independent AR.
+
+ReplaySSM remains opt-in. Compare its throughput and TPOT before selecting it:
+freeing Mamba memory does not itself guarantee a latency improvement.
+The ReplaySSM companion YAML keeps P88 and full-device decode, and uses a 32768
+token-layer split budget with a 16-layer limit. This changes how many layers run
+between decode submissions; the two 32768 prefill token limits are independent.
+See the [ReplaySSM follow-up results](qwen35_awq_replayssm_swe_results.md) for
+the measured 64K comparison and the remaining TTFT and numerical limitations.

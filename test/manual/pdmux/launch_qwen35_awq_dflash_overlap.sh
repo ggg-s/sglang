@@ -27,7 +27,7 @@ args=(
   --linear-attn-prefill-backend triton --linear-attn-decode-backend triton
   --mamba-radix-cache-strategy extra_buffer
   --context-length 16384 --chunked-prefill-size 32768 --max-prefill-tokens 32768
-  --max-total-tokens 32768 --max-mamba-cache-size "${MAMBA_CACHE:-24}"
+  --max-total-tokens "${MAX_TOTAL_TOKENS:-32768}" --max-mamba-cache-size "${MAMBA_CACHE:-24}"
   --max-running-requests "${MAX_RUNNING_REQUESTS:-4}"
   --cuda-graph-max-bs-decode "${MAX_RUNNING_REQUESTS:-4}"
   --cuda-graph-backend-decode "${DECODE_GRAPH:-full}" --cuda-graph-backend-prefill disabled
@@ -47,8 +47,12 @@ if [[ ${PDMUX:-${DFLASH:-1}} == 1 ]]; then
     --pdmux-config-path "${PDMUX_CONFIG:-$script_dir/qwen35_dflash_overlap_a100.yaml}")
 fi
 if [[ ${HICACHE:-1} == 1 ]]; then
-  args+=(--enable-hierarchical-cache --hicache-size 4 --hicache-write-policy write_through
+  args+=(--enable-hierarchical-cache --hicache-size "${HICACHE_SIZE:-4}" --hicache-write-policy write_through
     --hicache-io-backend "$hicache_io" --hicache-mem-layout "$hicache_layout")
+fi
+if [[ ${REPLAYSSM_SPEC:-0} == 1 ]]; then
+  args+=(--enable-linear-replayssm-spec
+    --linear-replayssm-cache-len "${REPLAYSSM_CACHE_LEN:-32}")
 fi
 if [[ ${DETERMINISTIC:-0} == 1 ]]; then
   args+=(--enable-deterministic-inference)

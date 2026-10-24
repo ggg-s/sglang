@@ -1,0 +1,7 @@
+sm_group_num: 3
+split_forward_token_budget: 32768
+split_forward_max_layers: 16
+
+overlap_decode_full_sm: true
+manual_divisions:
+  - [88, 0, 1]

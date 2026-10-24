@@ -181,7 +181,9 @@ def gdn_replayssm_spec_circular_kernel(
     # Explicit sigmoid expression (NOT tl.sigmoid): bitwise clone of
     # fused_sigmoid_gating_delta_rule_update_kernel's beta so the fp32 value
     # stored to beta_cache is exactly what the recurrent baseline would compute.
-    beta_s = tl.where(mask_s, 1.0 / (1.0 + tl.exp(-b_s)), 0.0)
+    # Match the activation-dtype rounding in recurrent verify and prefill.
+    beta_s = (1.0 / (1.0 + tl.exp(-b_s))).to(b.dtype.element_ty).to(tl.float32)
+    beta_s = tl.where(mask_s, beta_s, 0.0)
     G_s = tl.cumsum(g_s, axis=0)
     expG_s = tl.exp(G_s)
 
@@ -1523,6 +1525,75 @@ def commit_gdn_replayssm_circular(
         BLOCK=block,
         NULL_BLOCK_ID=null_block_id,
     )
+
+
+def commit_gdn_replayssm_after_verify(
+    *,
+    spec_state,
+    write_pos: torch.Tensor,
+    cache_base: torch.Tensor,
+    is_flush: torch.Tensor,
+    state_batch_indices: torch.Tensor,
+    replay_indices: torch.Tensor,
+    accept_lens: torch.Tensor,
+    last_correct_step_indices: torch.Tensor,
+    max_spec_len: int,
+    mamba_track_indices: torch.Tensor | None = None,
+    mamba_steps_to_track: torch.Tensor | None = None,
+) -> None:
+    """Commit a linear verify window using request-keyed circular history.
+
+    State and track indices address physical Mamba slots; replay indices address
+    request slots. Keep these distinct when PDMux translates its state views.
+    """
+    from sglang.kernels.ops.mamba.mamba_state_scatter_triton import (
+        fused_conv_window_scatter_with_mask,
+    )
+
+    commit_gdn_replayssm_spec(
+        write_pos=write_pos,
+        cache_base=cache_base,
+        is_flush=is_flush,
+        num_accepted=accept_lens,
+        replay_indices=replay_indices,
+        max_cache_len=spec_state.replayssm_d.shape[-2],
+        max_spec_len=max_spec_len,
+        fold_every_commit=spec_state.temporal.dtype != torch.float32,
+        null_block_id=-1,
+    )
+    commit_gdn_replayssm_circular(
+        checkpoint_state=spec_state.temporal,
+        d_cache=spec_state.replayssm_d,
+        k_cache=spec_state.replayssm_k,
+        g_cache=spec_state.replayssm_g,
+        d_residual_cache=spec_state.replayssm_rawv,
+        k_residual_cache=spec_state.replayssm_rawk,
+        state_batch_indices=state_batch_indices,
+        replay_indices=replay_indices,
+        write_pos=write_pos,
+        cache_base=cache_base,
+        is_flush=is_flush,
+        accept_lens=accept_lens,
+        mamba_track_indices=mamba_track_indices,
+        mamba_steps_to_track=mamba_steps_to_track,
+        null_block_id=-1,
+    )
+    for conv_states, intermediate_conv in zip(
+        spec_state.conv, spec_state.intermediate_conv_window
+    ):
+        fused_conv_window_scatter_with_mask(
+            conv_states,
+            intermediate_conv,
+            state_batch_indices,
+            last_correct_step_indices,
+        )
+        if mamba_track_indices is not None and mamba_steps_to_track is not None:
+            fused_conv_window_scatter_with_mask(
+                conv_states,
+                intermediate_conv,
+                mamba_track_indices,
+                mamba_steps_to_track,
+            )
 
 
 def reset_gdn_replayssm_spec_cursors(

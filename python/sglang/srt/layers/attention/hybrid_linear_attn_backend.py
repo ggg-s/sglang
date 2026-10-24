@@ -1347,11 +1347,9 @@ class HybridLinearAttnBackend(AttentionBackend):
     ):
         """Update mamba states after MTP verify via a fused gather-scatter kernel.
 
-        ``req_pool_indices`` serves implementations that must re-derive the state
-        slot ids instead of reusing this step's ``forward_metadata``; the scatter
-        below reads the metadata it just planned.
+        State slots come from this step's ``forward_metadata``. ReplaySSM also
+        needs ``req_pool_indices`` to address its request-keyed circular rings.
         """
-        del req_pool_indices
         request_number = last_correct_step_indices.shape[0]
 
         # `mamba_track_indices` is VIRTUAL; the scatter writes physical views.
@@ -1369,14 +1367,36 @@ class HybridLinearAttnBackend(AttentionBackend):
         req_pool = self.linear_attn_backend.req_to_token_pool
         mamba_caches = req_pool.get_speculative_mamba2_params_all_layers()
 
-        # ReplaySSM-KDA: the accepted drafts live in the per-slot ring (written
-        # during verify); no intermediate_ssm is allocated. Replay the accepted
-        # prefix into `temporal` instead of scattering an intermediate state.
-        # dspark/dflash call this method directly; the generic spec_utils commit
-        # handles replayssm before reaching here (returns early), so this branch is
-        # only hit by the direct callers. Chain layout only (topk <= 1), so
+        # DFlash calls this method directly instead of the shared spec_utils
+        # commit. Its GDN replay ring uses request slots even when PDMux moves
+        # persistent states to different physical slots. Linear chains only:
         # accept_lens == last_correct_step_indices + 1.
         mamba_pool = req_pool.mamba_pool
+        if getattr(
+            mamba_pool, "replayssm_cache_base", None
+        ) is not None and not getattr(mamba_pool, "replayssm_is_kda", False):
+            from sglang.kernels.ops.attention.fla.gdn_replayssm_spec_decode import (
+                commit_gdn_replayssm_after_verify,
+            )
+
+            assert req_pool_indices is not None, "GDN ReplaySSM needs request slots"
+            commit_gdn_replayssm_after_verify(
+                spec_state=mamba_caches,
+                write_pos=mamba_pool.replayssm_spec_write_pos,
+                cache_base=mamba_pool.replayssm_cache_base,
+                is_flush=mamba_pool.replayssm_is_flush,
+                state_batch_indices=state_indices_tensor,
+                replay_indices=req_pool_indices[:request_number],
+                accept_lens=last_correct_step_indices + 1,
+                last_correct_step_indices=last_correct_step_indices,
+                max_spec_len=mamba_caches.intermediate_conv_window[0].shape[2],
+                mamba_track_indices=mamba_track_indices,
+                mamba_steps_to_track=mamba_steps_to_track,
+            )
+            return
+
+        # KDA's direct callers replay the accepted prefix into temporal instead
+        # of scattering the omitted intermediate_ssm snapshots.
         if getattr(mamba_pool, "replayssm_is_kda", False):
             from sglang.kernels.ops.attention.fla.kda_replayssm_spec_decode import (
                 commit_kda_replayssm_after_verify,
