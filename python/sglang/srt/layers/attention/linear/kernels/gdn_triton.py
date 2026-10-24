@@ -42,6 +42,7 @@ class TritonGDNKernel(LinearAttnKernelBase):
     """Triton-based kernel for GDN (Gated Delta Network) linear attention."""
 
     supports_packed_decode: bool = not is_cpu() and not is_npu()
+    supports_track_state_snapshot: bool = not (is_cpu() or is_npu() or is_xpu())
 
     def packed_decode(
         self,
@@ -183,6 +184,13 @@ class TritonGDNKernel(LinearAttnKernelBase):
         recurrent_state = ssm_states
         recurrent_state_indices_args = {"initial_state_indices": cache_indices}
         inplace_update_args = {"inplace_update": inplace_update}
+        track_kwargs = {}
+        if kwargs.get("track_state") is not None:
+            assert self.supports_track_state_snapshot
+            track_kwargs = dict(
+                track_state=kwargs["track_state"],
+                track_chunk_idx=kwargs["track_chunk_idx"],
+            )
         if is_cpu():
             if not inplace_update:
                 raise NotImplementedError(
@@ -212,6 +220,7 @@ class TritonGDNKernel(LinearAttnKernelBase):
             use_qk_l2norm_in_kernel=True,
             **recurrent_state_indices_args,
             **inplace_update_args,
+            **track_kwargs,
         )
 
     def target_verify(

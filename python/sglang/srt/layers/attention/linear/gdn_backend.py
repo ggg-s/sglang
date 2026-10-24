@@ -1018,6 +1018,20 @@ class GDNAttnBackend(MambaAttnBackendBase):
                 )
         else:
             g, beta = fused_gdn_gating(layer.A_log, a, b, layer.dt_bias)
+            h_track_buf = None
+            if (
+                forward_metadata.has_mamba_track_mask
+                and forward_metadata.track_ssm_h_src.numel() > 0
+                and self.kernel_dispatcher.extend_kernel.supports_track_state_snapshot
+            ):
+                # The per-chunk h used by attention has the activation dtype.
+                # Cache the FP32 accumulator directly so prefix reuse does not
+                # round an FP32 recurrent state through FP16/BF16.
+                h_track_buf = torch.empty(
+                    (forward_metadata.track_chunk_idx.shape[0], *ssm_states.shape[1:]),
+                    dtype=torch.float32,
+                    device=ssm_states.device,
+                )
             core_attn_out, last_recurrent_state, h = self.kernel_dispatcher.extend(
                 q=query,
                 k=key,
@@ -1035,6 +1049,12 @@ class GDNAttnBackend(MambaAttnBackendBase):
                     forward_metadata.state_checkpoint_every_n_tokens
                 ),
                 output=kwargs.get("linear_attn_output"),
+                track_state=h_track_buf,
+                track_chunk_idx=(
+                    forward_metadata.track_chunk_idx
+                    if h_track_buf is not None
+                    else None
+                ),
             )
 
             if is_npu() and last_recurrent_state is not None:
@@ -1051,7 +1071,11 @@ class GDNAttnBackend(MambaAttnBackendBase):
 
             if forward_metadata.has_mamba_track_mask:
                 self._track_mamba_state_extend(
-                    forward_batch, h, ssm_states, forward_metadata
+                    forward_batch,
+                    h,
+                    ssm_states,
+                    forward_metadata,
+                    h_track_buf=h_track_buf,
                 )
 
         return core_attn_out

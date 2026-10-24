@@ -11,9 +11,7 @@ from sglang.kernels.ops.attention.fla.chunk_delta_h import chunk_gated_delta_rul
 from sglang.kernels.ops.attention.fla.chunk_fwd import chunk_gated_delta_rule_fwd_intra
 from sglang.kernels.ops.attention.fla.chunk_o import chunk_fwd_o
 from sglang.kernels.ops.attention.fla.cumsum import chunk_local_cumsum
-from sglang.kernels.ops.attention.fla.index import (
-    prepare_chunk_indices,
-)
+from sglang.kernels.ops.attention.fla.index import prepare_chunk_indices
 from sglang.kernels.ops.attention.fla.l2norm import l2norm_fwd
 from sglang.kernels.ops.attention.fla.utils import (
     SUPPRESS_LEVEL,
@@ -45,6 +43,8 @@ def chunk_gated_delta_rule_fwd(
     cu_seqlens: Optional[torch.LongTensor] = None,
     chunk_indices: torch.LongTensor | None = None,
     inplace_update: bool = True,
+    track_state: Optional[torch.Tensor] = None,
+    track_chunk_idx: Optional[torch.Tensor] = None,
 ):
     g = chunk_local_cumsum(
         g, chunk_size=CHUNK_SIZE, cu_seqlens=cu_seqlens, chunk_indices=chunk_indices
@@ -60,6 +60,11 @@ def chunk_gated_delta_rule_fwd(
         chunk_indices=chunk_indices,
     )
 
+    track_kwargs = (
+        dict(track_state=track_state, track_chunk_idx=track_chunk_idx)
+        if track_state is not None
+        else {}
+    )
     h, v_new = chunk_gated_delta_rule_fwd_h(
         k=k,
         w=w,
@@ -70,6 +75,7 @@ def chunk_gated_delta_rule_fwd(
         cu_seqlens=cu_seqlens,
         chunk_indices=chunk_indices,
         inplace_update=inplace_update,
+        **track_kwargs,
     )
     o = chunk_fwd_o(
         q=q,
@@ -103,6 +109,8 @@ class ChunkGatedDeltaRuleFunction(torch.autograd.Function):
         cu_seqlens: Optional[torch.LongTensor] = None,
         use_qk_l2norm_in_kernel: bool = False,
         inplace_update: bool = True,
+        track_state: Optional[torch.Tensor] = None,
+        track_chunk_idx: Optional[torch.Tensor] = None,
     ):
         q_orig = q
         k_orig = k
@@ -128,6 +136,8 @@ class ChunkGatedDeltaRuleFunction(torch.autograd.Function):
             cu_seqlens=cu_seqlens,
             chunk_indices=chunk_indices,
             inplace_update=inplace_update,
+            track_state=track_state,
+            track_chunk_idx=track_chunk_idx,
         )
         return o.to(q.dtype), h
 
@@ -146,6 +156,8 @@ def chunk_gated_delta_rule(
     head_first: bool = False,
     use_qk_l2norm_in_kernel: bool = False,
     inplace_update: bool = True,
+    track_state: Optional[torch.Tensor] = None,
+    track_chunk_idx: Optional[torch.Tensor] = None,
 ):
     r"""
     Args:
@@ -176,6 +188,10 @@ def chunk_gated_delta_rule(
             Default: `False`.
         inplace_update (Optional[bool]):
             Whether to write final states back to `initial_state`. Default: `True`.
+        track_state (Optional[torch.Tensor]):
+            FP32 chunk-boundary snapshots, shaped `[N, H, V, K]`.
+        track_chunk_idx (Optional[torch.Tensor]):
+            Per-sequence chunk boundary to snapshot; -1 leaves that row untouched.
 
     Returns:
         o (torch.Tensor):
@@ -213,6 +229,7 @@ def chunk_gated_delta_rule(
         )
     """
     assert q.dtype == k.dtype == v.dtype
+    assert (track_state is None) == (track_chunk_idx is None)
     assert q.dtype != torch.float32, (
         "ChunkGatedDeltaRuleFunction does not support float32. Please use bfloat16."
     )
@@ -263,6 +280,8 @@ def chunk_gated_delta_rule(
         cu_seqlens,
         use_qk_l2norm_in_kernel,
         inplace_update,
+        track_state,
+        track_chunk_idx,
     )
     if head_first:
         o = rearrange(o, "b t h ... -> b h t ...")

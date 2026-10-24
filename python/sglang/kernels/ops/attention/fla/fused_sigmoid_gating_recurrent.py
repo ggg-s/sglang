@@ -217,6 +217,10 @@ def fused_sigmoid_gating_delta_rule_update_kernel(
 
         # Compute beta = sigmoid(b)
         b_beta = 1.0 / (1.0 + tl.exp(-b_b))
+        if not IS_KDA:
+            # GDN prefill and packed decode materialize beta in the activation
+            # dtype. Verify must apply the same rounding before updating state.
+            b_beta = b_beta.to(b.dtype.element_ty).to(tl.float32)
 
         # fused ring-write: stash this step's raw inputs + in-kernel gate/beta
         # into the per-slot ring for the commit fold to replay. Must sit here --
