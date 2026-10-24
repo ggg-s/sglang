@@ -68,6 +68,7 @@ def moe_wna16_marlin_gemm(
     use_fp32_reduce: bool = False,
     is_zp_float: bool = False,
     sm_count: int = -1,
+    use_full_k: bool = False,
 ) -> torch.Tensor:
     device = a.device
 
@@ -117,7 +118,7 @@ def moe_wna16_marlin_gemm(
         a_tmp = torch.empty(0, dtype=a.dtype, device=device)
 
     # Allocate c_tmp for fp32 reduce
-    if use_fp32_reduce and not use_atomic_add:
+    if use_fp32_reduce and not use_atomic_add and not use_full_k:
         sms = torch.cuda.get_device_properties(device).multi_processor_count
         # max num of threadblocks is sms * 4
         max_c_tmp_size = min(
@@ -173,6 +174,7 @@ def moe_wna16_marlin_gemm(
         use_fp32_reduce,
         is_zp_float,
         sm_count,
+        use_full_k,
     )
 
     return c

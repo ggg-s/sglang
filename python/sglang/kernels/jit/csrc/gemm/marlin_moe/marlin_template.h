@@ -328,7 +328,8 @@ __global__ void Marlin(
     bool has_bias,
     bool use_atomic_add,   // whether to use atomic add to reduce
     bool use_fp32_reduce,  // whether to use fp32 global reduce
-    int max_shared_mem) {
+    int max_shared_mem,
+    bool use_full_k) {
   // Each threadblock processes one "stripe" of the B matrix with (roughly) the
   // same size, which might involve multiple column "slices" (of width 16 *
   // `thread_n_blocks`). Stripes are defined as shown in the 3x3 matrix 5 SM
@@ -404,6 +405,11 @@ __global__ void Marlin(
       iters = (group_blocks / thread_k_blocks) * div_ceil(iters, (group_blocks / thread_k_blocks));
     }
   }
+
+  // Invariant mode gives each output tile a complete K reduction. Rounding
+  // stripes to whole tiles prevents the batch shape and green-context SM
+  // count from moving this row's floating-point accumulation boundaries.
+  if (use_full_k) iters = k_tiles * div_ceil(n_tiles * parallel, gridDim.x);
 
   int slice_row = (iters * blockIdx.x) % k_tiles;
   int slice_col_par = (iters * blockIdx.x) / k_tiles;
@@ -1135,9 +1141,11 @@ __global__ void Marlin(
         }
 
       } else if constexpr (group_blocks >= thread_k_blocks) {
-        if (k % b_sh_wr_iters == 0) {
-          int4* sh_zp_stage =
-              sh_zp + zp_sh_stage * ((group_blocks / thread_k_blocks) * (pipe / (group_blocks / thread_k_blocks)));
+        constexpr int g = group_blocks / thread_k_blocks;
+        // Keep zero points in registers for the entire quantization group,
+        // just like scales. Its shared stage may already be reused by cp.async.
+        if (pipe % g == 0 && k % b_sh_wr_iters == 0) {
+          int4* sh_zp_stage = sh_zp + zp_sh_stage * (g * (pipe / g));
 #pragma unroll
           for (int i = 0; i < num_ints_per_thread; i++) {
             frag_qzp[k % 2][i] = (reinterpret_cast<int*>(sh_zp_stage))[zp_sh_rd + i];
@@ -1177,9 +1185,9 @@ __global__ void Marlin(
 
       if constexpr (group_blocks != -1) {
         if constexpr (group_blocks >= thread_k_blocks) {
-          if (k % b_sh_wr_iters == 0) {
-            int4* sh_zp_stage =
-                sh_zp + zp_sh_stage * ((group_blocks / thread_k_blocks) * (pipe / (group_blocks / thread_k_blocks)));
+          constexpr int g = group_blocks / thread_k_blocks;
+          if (pipe % g == 0 && k % b_sh_wr_iters == 0) {
+            int4* sh_zp_stage = sh_zp + zp_sh_stage * (g * (pipe / g));
             reinterpret_cast<int4*>(&frag_zpf[k % 2])[0] = sh_zp_stage[zp_sh_rd];
           }
         } else {

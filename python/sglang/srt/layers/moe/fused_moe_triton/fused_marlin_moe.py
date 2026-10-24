@@ -5,8 +5,9 @@ import torch.nn.functional as F
 import triton
 import triton.language as tl
 
-from sglang.srt.layers import zero_copy_context
+from sglang.srt.batch_invariant_ops import is_batch_invariant_mode_enabled
 from sglang.srt.distributed.parallel_state import is_pdmux_prefill_enabled
+from sglang.srt.layers import zero_copy_context
 from sglang.srt.multiplex.pdmux_context import get_current_stream_idx, get_sm_counts
 from sglang.srt.utils import is_cuda
 from sglang.srt.utils.custom_op import register_custom_op
@@ -239,9 +240,12 @@ def fused_marlin_moe(
 
     # M block size selection logic
     # TODO: tune this further for specific models
-    for block_size_m in [8, 16, 32, 48, 64]:
-        if M * topk / E / block_size_m < 0.9:
-            break
+    deterministic = is_batch_invariant_mode_enabled()
+    block_size_m = 8
+    if not deterministic:
+        for block_size_m in [8, 16, 32, 48, 64]:
+            if M * topk / E / block_size_m < 0.9:
+                break
 
     if global_num_experts == -1:
         global_num_experts = E
@@ -300,9 +304,13 @@ def fused_marlin_moe(
     intermediate_cache3 = intermediate_cache3.view(-1, K)
 
     use_atomic_add = (
-        hidden_states.dtype == torch.half
-        or torch.cuda.get_device_capability(hidden_states.device)[0] >= 9
-    ) and (not is_mxfp4_marlin)
+        (
+            hidden_states.dtype == torch.half
+            or torch.cuda.get_device_capability(hidden_states.device)[0] >= 9
+        )
+        and (not is_mxfp4_marlin)
+        and (not deterministic)
+    )
 
     sm_count = -1
     if is_pdmux_prefill_enabled():
@@ -336,6 +344,7 @@ def fused_marlin_moe(
         use_fp32_reduce=True,
         is_zp_float=False,
         sm_count=sm_count,
+        use_full_k=deterministic,
     )
 
     if activation == "silu" and is_gated and gemm1_alpha is not None:
@@ -400,6 +409,7 @@ def fused_marlin_moe(
         use_fp32_reduce=True,
         is_zp_float=False,
         sm_count=sm_count,
+        use_full_k=deterministic,
     ).view(-1, topk, K)
 
     output = zero_copy_context.get_moe_output(hidden_states)

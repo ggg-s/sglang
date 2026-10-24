@@ -1,6 +1,8 @@
 import itertools
 import sys
+from contextlib import ExitStack
 from types import SimpleNamespace
+from unittest.mock import patch
 
 import pytest
 import torch
@@ -37,12 +39,199 @@ def stack_and_dev(tensors: list[torch.Tensor]):
     return torch.stack(tensors, dim=0).to(dev)
 
 
+def test_deterministic_marlin_cuda_graph_replay():
+    """Captured complete-K GEMMs must consume changed routing IDs on replay."""
+    import importlib
+
+    module = importlib.import_module(
+        "sglang.srt.layers.moe.fused_moe_triton.fused_marlin_moe"
+    )
+    torch.manual_seed(42)
+    m, n, k, experts, topk = 17, 256, 512, 8, 2
+    dtype = torch.float16
+    _, w1, s1, z1, _, _ = _setup_moe_weights(
+        experts, 2 * n, k, scalar_types.uint4, 128, False, dtype
+    )
+    _, w2, s2, z2, _, _ = _setup_moe_weights(
+        experts, k, n, scalar_types.uint4, 128, False, dtype
+    )
+    hidden = torch.randn(m, k, device="cuda", dtype=dtype) / 10
+    routes = torch.zeros(m, topk, device="cuda", dtype=torch.int32)
+    weights = torch.full((m, topk), 0.5, device="cuda")
+    gates = torch.zeros(m, experts, device="cuda", dtype=dtype)
+
+    def run():
+        return fused_marlin_moe(
+            hidden,
+            w1,
+            w2,
+            s1,
+            s2,
+            gates,
+            weights,
+            routes,
+            w1_zeros=z1,
+            w2_zeros=z2,
+            num_bits=4,
+        )
+
+    with (
+        patch.object(module, "is_batch_invariant_mode_enabled", return_value=True),
+        patch.object(module, "is_pdmux_prefill_enabled", return_value=False),
+    ):
+        stream = torch.cuda.Stream()
+        stream.wait_stream(torch.cuda.current_stream())
+        with torch.cuda.stream(stream):
+            for _ in range(3):
+                run()
+        torch.cuda.current_stream().wait_stream(stream)
+        graph = torch.cuda.CUDAGraph()
+        with torch.cuda.graph(graph, stream=stream):
+            captured = run()
+        for shift in (0, 3, 7):
+            routes.copy_(
+                (torch.arange(m * topk, device="cuda").reshape(m, topk) + shift)
+                % experts
+            )
+            graph.replay()
+            torch.testing.assert_close(captured, run(), rtol=0, atol=0)
+
+
 def _get_scalar_type(num_bits: int, has_zp: bool):
     if has_zp:
         assert num_bits == 4
         return scalar_types.uint4
     else:
         return scalar_types.uint4b8 if num_bits == 4 else scalar_types.uint8b128
+
+
+@pytest.mark.parametrize("dtype", [torch.float16, torch.bfloat16])
+@pytest.mark.parametrize("quant_type", [scalar_types.uint4b8, scalar_types.uint4])
+def test_deterministic_marlin_rows_across_batch_shapes_and_sm_counts(dtype, quant_type):
+    """A shared token's dot products must survive prefix reuse and P/D SM changes."""
+    import importlib
+
+    module = importlib.import_module(
+        "sglang.srt.layers.moe.fused_moe_triton.fused_marlin_moe"
+    )
+    torch.manual_seed(42)
+    m, n, k, experts, topk = 257, 512, 2048, 8, 2
+    _, w1, s1, z1, g1, p1 = _setup_moe_weights(
+        experts, 2 * n, k, quant_type, 128, False, dtype
+    )
+    _, w2, s2, z2, g2, p2 = _setup_moe_weights(
+        experts, k, n, quant_type, 128, False, dtype
+    )
+    hidden = torch.randn((m, k), device="cuda", dtype=dtype) / 10
+    gates = torch.randn((m, experts), device="cuda", dtype=dtype)
+    weights, ids = gates.float().softmax(-1).topk(topk)
+    ids = ids.to(torch.int32)
+
+    def run(rows, sm):
+        with ExitStack() as stack:
+            # Mock the execution configuration, while running the real aligner,
+            # activation, quantized GEMMs and expert reduction on CUDA.
+            stack.enter_context(
+                patch.object(
+                    module, "is_batch_invariant_mode_enabled", return_value=True
+                )
+            )
+            stack.enter_context(
+                patch.object(module, "is_pdmux_prefill_enabled", return_value=True)
+            )
+            stack.enter_context(
+                patch.object(module, "get_sm_counts", return_value=[[sm, 0, 1]])
+            )
+            stack.enter_context(
+                patch.object(module, "get_current_stream_idx", return_value=0)
+            )
+            return fused_marlin_moe(
+                hidden_states=hidden[-rows:],
+                w1=w1,
+                w2=w2,
+                w1_scale=s1,
+                w2_scale=s2,
+                gating_output=gates[-rows:],
+                topk_weights=weights[-rows:],
+                topk_ids=ids[-rows:],
+                g_idx1=g1,
+                g_idx2=g2,
+                sort_indices1=p1,
+                sort_indices2=p2,
+                w1_zeros=z1,
+                w2_zeros=z2,
+                num_bits=4,
+                is_k_full=True,
+            ).clone()
+
+    sms = torch.cuda.get_device_properties("cuda").multi_processor_count
+    reference = run(m, sms)
+    for sm in sorted({1, min(32, sms), min(64, sms), sms}):
+        for rows in (1, 7, 32, m):
+            torch.testing.assert_close(run(rows, sm), reference[-rows:], rtol=0, atol=0)
+
+
+@pytest.mark.parametrize("dtype", [torch.float16, torch.bfloat16])
+@pytest.mark.parametrize("full_k", [False, True])
+def test_awq_marlin_group_zero_points_repeated_launches(dtype, full_k):
+    """Grouped zero points must survive pipeline-stage reuse in the down GEMM."""
+    from functools import partial
+
+    torch.manual_seed(42)
+    m, n, k, experts, topk = 257, 2048, 512, 8, 2
+    reference_weights, q, scales, zeros, g_idx, perm = _setup_moe_weights(
+        experts, n, k, scalar_types.uint4, 128, False, dtype
+    )
+    hidden = torch.randn((m * topk, k), device="cuda", dtype=dtype) / 10
+    weights, ids = torch.softmax(torch.randn(m, experts, device="cuda"), -1).topk(topk)
+    sorted_ids, owners, total = moe_align_block_size(ids.int(), 8, experts)
+    sms = torch.cuda.get_device_properties("cuda").multi_processor_count
+    workspace = torch.zeros(sms * 4, device="cuda", dtype=torch.int32)
+    expected = torch.empty((m * topk, n), device="cuda", dtype=dtype)
+    for expert in range(experts):
+        tokens, routes = torch.where(ids == expert)
+        rows = tokens * topk + routes
+        expected[rows] = (hidden[rows] @ reference_weights[expert].T) * weights[
+            tokens, routes, None
+        ].to(dtype)
+
+    baseline = None
+    for sm in sorted({1, min(32, sms), min(64, sms), sms}):
+        for _ in range(3):
+            actual = _run_single_gemm(
+                partial(moe_wna16_marlin_gemm, sm_count=sm, use_full_k=full_k),
+                hidden,
+                torch.empty_like(expected),
+                q,
+                scales,
+                zeros,
+                g_idx,
+                perm,
+                workspace,
+                sorted_ids,
+                owners,
+                total,
+                weights,
+                scalar_types.uint4,
+                8,
+                1,
+                m * topk,
+                n,
+                k,
+                True,
+                True,
+                not full_k,
+            )
+            torch.testing.assert_close(
+                actual,
+                expected,
+                atol=0.002 if dtype == torch.float16 else 0.008,
+                rtol=0.02,
+            )
+            if baseline is None:
+                baseline = actual.clone()
+            elif full_k:
+                torch.testing.assert_close(actual, baseline, atol=0, rtol=0)
 
 
 def _setup_moe_weights(e, n, k, quant_type, group_size, act_order, dtype):
@@ -707,9 +896,25 @@ def test_moe_wna16_marlin_sm_count_override(m):
             partial(moe_wna16_marlin_gemm, sm_count=hint),
             a,
             torch.empty((m * topk, n), device="cuda", dtype=dtype),
-            qw, scales, zeros, g_idx, perm, workspace,
-            sorted_ids, experts, num, weights, quant_type,
-            block, topk, m, n, k, False, True, True,
+            qw,
+            scales,
+            zeros,
+            g_idx,
+            perm,
+            workspace,
+            sorted_ids,
+            experts,
+            num,
+            weights,
+            quant_type,
+            block,
+            topk,
+            m,
+            n,
+            k,
+            False,
+            True,
+            True,
         )
 
     reference = run(-1)
