@@ -4512,10 +4512,16 @@ class Scheduler(
                 if batch_result.next_draft_input is not None:
                     batch.spec_info = batch_result.next_draft_input
                     if batch_result.new_seq_lens is not None:
-                        batch.seq_lens = batch_result.new_seq_lens
-                        if batch.seq_lens_cpu is not None:
-                            batch.seq_lens_cpu = batch_result.new_seq_lens.to("cpu")
-                            batch.seq_lens_sum = int(batch.seq_lens_cpu.sum())
+                        # Speculative prefill seeds draft state without advancing
+                        # prompt lengths. Keep the existing CPU mirror and sum;
+                        # a D2H here would block submission of the next decode.
+                        assert (
+                            batch_result.new_seq_lens is batch.seq_lens
+                            or batch.forward_mode.is_idle()
+                        ), (
+                            "PDMux split prefill expects unchanged prompt lengths "
+                            "and the batch's own seq_lens tensor."
+                        )
                 elif batch_result.has_sampled_token_ids:
                     self._relay_forward_payload(
                         batch, batch.req_pool_indices, batch_result

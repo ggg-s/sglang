@@ -588,7 +588,11 @@ class DSparkWorkerV2(BaseSpecWorker):
         batch_output: GenerationBatchResult,
         on_publish,
     ) -> GenerationBatchResult:
-        """Inject captured target hidden states into the DSpark draft KV."""
+        """Inject captured target hidden states into the DSpark draft KV.
+
+        Prefill preserves the values and identity of batch.seq_lens, including
+        during draft KV injection, so PDMux can reuse its CPU length mirror.
+        """
         # BCG replay skips model-side Python, so re-evaluate the same pure predicate.
         target_hidden_is_projected = (
             self._target_hidden_projection_enabled

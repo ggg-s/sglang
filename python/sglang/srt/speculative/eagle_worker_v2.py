@@ -1321,7 +1321,11 @@ class EAGLEWorkerV2(BaseSpecWorker):
     def forward_batch_split_prefill(
         self, batch: ScheduleBatch
     ) -> GenerationBatchResult:
-        """Finish MTP draft state after the target's last split segment."""
+        """Finish MTP draft state after the target's last split segment.
+
+        Prefill preserves the values and identity of batch.seq_lens, including
+        during draft extend, so the scheduler can reuse its CPU length mirror.
+        """
         batch_output = self.target_worker.forward_batch_split_prefill(
             batch, capture_hidden_mode=CaptureHiddenMode.FULL
         )
