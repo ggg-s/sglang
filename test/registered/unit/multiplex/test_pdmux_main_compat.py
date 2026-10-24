@@ -128,6 +128,8 @@ class TestPdmuxMainCompat(unittest.TestCase):
         pending, inflight = req("pending"), req("inflight")
         scheduler = SimpleNamespace(
             ps=SimpleNamespace(pp_size=1),
+            enable_pdmux=True,
+            split_prefill_batch=None,
             running_batch=SimpleNamespace(reqs=[req("decode")]),
             last_batch=None,
             _extra_inflight_batches=lambda: [

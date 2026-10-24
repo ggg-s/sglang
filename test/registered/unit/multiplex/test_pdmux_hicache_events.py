@@ -23,6 +23,7 @@ from unittest.mock import Mock, patch
 
 from sglang.srt.multiplex.multiplexing_mixin import SchedulerMultiplexMixin
 from sglang.test.ci.ci_register import register_cpu_ci
+from sglang.test.test_utils import CustomTestCase
 
 register_cpu_ci(est_time=5, suite="base-a-test-cpu")
 
@@ -107,6 +108,8 @@ class _FakeScheduler(SchedulerMultiplexMixin):
 
     def __init__(self, *, max_iterations, query_results, pump_interval=1):
         self.max_iterations = max_iterations
+        self.enable_overlap = False
+        self.operations = []
         self.iteration = -1
         self.pumps = []
         self.split_forward_consumer_indices = []
@@ -172,12 +175,13 @@ class _FakeScheduler(SchedulerMultiplexMixin):
         return 0, self.stream_groups[0]
 
     def run_batch(self, batch):
+        self.operations.append(("submit", batch, self.iteration))
         if batch is self.split_prefill_batch:
             self.split_forward_consumer_indices.append(batch.hicache_consumer_index)
         return object()
 
     def process_batch_result(self, batch, result):
-        pass
+        self.operations.append(("commit", batch, self.iteration))
 
     def check_hicache_events_if_enabled(self):
         self.pumps.append(self.iteration)
@@ -216,7 +220,39 @@ def _run_loop(*, max_iterations, query_results, pump_interval=1):
     return scheduler
 
 
-class TestPDMuxHiCacheEvents(unittest.TestCase):
+class TestPDMuxHiCacheEvents(CustomTestCase):
+    def test_spec_overlap_submits_next_decode_before_committing_previous(self):
+        """DFlash must not drain N-1 before issuing N while a split is active.
+
+        Grammar still needs its previous CPU result before preparing N. The
+        non-overlap speculative path retains that same synchronous boundary.
+        """
+        for overlap, grammar in ((True, False), (False, False), (True, True)):
+            with self.subTest(overlap=overlap, grammar=grammar):
+                scheduler = _FakeScheduler(max_iterations=2, query_results=[])
+                scheduler.enable_overlap = overlap
+                scheduler.running_batch.has_grammar = grammar
+                scheduler.spec_algorithm = SimpleNamespace(is_none=lambda: False)
+                with _stubbed_cuda(), self.assertRaises(_LoopFinished):
+                    scheduler.event_loop_pdmux()
+                ops = scheduler.operations
+                next_submit = next(
+                    i
+                    for i, (op, batch, step) in enumerate(ops)
+                    if op == "submit" and batch is scheduler.running_batch and step == 1
+                )
+                first_commit = next(
+                    i for i, row in enumerate(ops) if row[0] == "commit"
+                )
+                if overlap and not grammar:
+                    self.assertLess(next_submit, first_commit)
+                    self.assertIs(
+                        scheduler.forward_stream, scheduler.stream_groups[0][1]
+                    )
+                else:
+                    self.assertLess(first_commit, next_submit)
+                self.assertEqual(scheduler.pumps, [0, 1])
+
     def test_every_iteration_pumps_hicache_events_exactly_once(self):
         """At interval 1, one pump per iteration across all formation states.
 

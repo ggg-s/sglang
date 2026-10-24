@@ -94,6 +94,7 @@ class TestPdmuxSxfPort(unittest.TestCase):
 
                 scheduler = SimpleNamespace(
                     split_prefill_batch=batch,
+                    enable_overlap=False,
                     chunked_req=None,
                     process_batch_result=consume,
                 )

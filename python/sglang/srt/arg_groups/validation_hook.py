@@ -150,9 +150,15 @@ def check_server_args(server_args: Any):
         assert cfg.disaggregation_mode == "null", (
             "PD-Multiplexing is not compatible with disaggregation mode."
         )
-        assert cfg.disable_overlap_schedule, (
-            "PD-Multiplexing is not compatible with overlap schedule."
-        )
+        if not cfg.disable_overlap_schedule:
+            assert (
+                cfg.pdmux_prefill_mode == "layer_split"
+                and cfg.speculative_algorithm == "DFLASH"
+                and cfg.tp_size == 1
+            ), (
+                "PD-Multiplexing overlap schedule currently requires "
+                "layer_split prefill, DFLASH, and tp_size=1."
+            )
 
         if cfg.enable_hierarchical_cache and cfg.hicache_write_policy == "write_back":
             logger.warning(

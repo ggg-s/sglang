@@ -8,12 +8,14 @@ from unittest.mock import Mock, patch
 
 import torch
 
+from sglang.srt.managers.overlap_utils import FutureMap
 from sglang.srt.managers.scheduler import Scheduler
 from sglang.srt.model_executor.forward_batch_info import ForwardMode
 from sglang.srt.multiplex.multiplexing_mixin import SchedulerMultiplexMixin
 from sglang.srt.runtime_context import get_context
 from sglang.srt.speculative.dflash_worker_v2 import DFlashWorkerV2
 from sglang.srt.speculative.eagle_worker_v2 import EAGLEWorkerV2
+from sglang.srt.speculative.spec_info import SpeculativeAlgorithm
 from sglang.srt.speculative.spec_tp_sync import SpecTpSync, SpecTpSyncSite
 from sglang.test.ci.ci_register import register_cpu_ci
 from sglang.test.test_utils import CustomTestCase
@@ -22,7 +24,77 @@ register_cpu_ci(est_time=5, suite="base-a-test-cpu")
 
 
 class TestPDMuxMTPSplitPrefill(CustomTestCase):
-    def _run_final_split(self, *, rebind_lengths=False, cpu_mirror=True, idle=False):
+    def test_overlap_merge_seeds_real_relay_before_finished_rows_are_filtered(self):
+        """Prefill and decode publish on different lanes into one relay.
+
+        The prefill rows must become visible only at merge, before filtering
+        mutates their pool indices. Existing decode rows must survive the seed.
+        """
+        pool = SimpleNamespace(req_to_token=torch.zeros((5, 64), dtype=torch.int32))
+        with patch("sglang.srt.managers.overlap_utils._is_cuda", False):
+            relay = FutureMap("cpu", SpeculativeAlgorithm.DFLASH, pool)
+        relay.publish_ready = Mock()
+        relay.new_seq_lens_buf.fill_(-1)
+        relay.output_tokens_buf.fill_(-1)
+        relay.new_seq_lens_buf[2] = 41
+        relay.output_tokens_buf[2] = 99
+        indices = torch.tensor([1, 3])
+        lengths = torch.tensor([13, 29])
+        draft = DFlashWorkerV2._make_next_draft_input_prefill(
+            None, bonus_tokens=torch.tensor([21, 34]), seq_lens=lengths
+        )
+        result = SimpleNamespace(next_draft_input=draft)
+        batch = SimpleNamespace(
+            req_pool_indices=indices,
+            seq_lens=lengths,
+            spec_info=draft,
+            split_prefill_finished=True,
+            beam_tail=None,
+            chunked_req=None,
+            batch_size=lambda: 2,
+            is_empty=lambda: True,
+        )
+        observed = []
+
+        def process(_batch, _result):
+            observed.append(relay.new_seq_lens_buf.clone())
+            torch.testing.assert_close(draft.future_indices, indices)
+
+        def filter_batch(**_kwargs):
+            batch.req_pool_indices = torch.empty(0, dtype=torch.int64)
+
+        batch.filter_batch = filter_batch
+        scheduler = SimpleNamespace(
+            enable_overlap=True,
+            spec_algorithm=SpeculativeAlgorithm.DFLASH,
+            future_map=relay,
+            beam_coordinator=SimpleNamespace(
+                maybe_select_and_relay=lambda *_a, **_k: None
+            ),
+            chunked_req=None,
+            process_batch_result=process,
+        )
+        scheduler._relay_forward_payload = lambda *args: (
+            Scheduler._relay_forward_payload(scheduler, *args)
+        )
+        running = SimpleNamespace(is_empty=lambda: True, batch_is_full=False)
+        with get_context().override_server_args(speculative_algorithm="DFLASH"):
+            returned = SchedulerMultiplexMixin._merge_completed_prefill_batch(
+                scheduler,
+                batch=batch,
+                prefill_result=result,
+                running_batch=running,
+                all_segments_run=True,
+            )
+        self.assertIs(returned, running)
+        torch.testing.assert_close(observed[0], torch.tensor([-1, 13, 41, 29, -1]))
+        torch.testing.assert_close(
+            relay.output_tokens_buf, torch.tensor([-1, 21, 99, 34, -1])
+        )
+
+    def _run_final_split(
+        self, *, rebind_lengths=False, cpu_mirror=True, idle=False, overlap=False
+    ):
         def forbid_readback(*_args, **_kwargs):
             raise AssertionError("prefill lengths must not be read back to the host")
 
@@ -54,7 +126,7 @@ class TestPDMuxMTPSplitPrefill(CustomTestCase):
             forward_sleep_time=None,
             disaggregation_mode=None,
             is_generation=True,
-            enable_overlap=False,
+            enable_overlap=overlap,
             pdmux_standard=False,
             enable_pdmux=True,
             split_prefill_batch=batch,
@@ -63,10 +135,28 @@ class TestPDMuxMTPSplitPrefill(CustomTestCase):
             ),
             model_config=SimpleNamespace(num_hidden_layers=40),
             _copy_auxiliary_output_to_cpu=Mock(),
+            _launch_result_copy=Mock(),
+            device_module=SimpleNamespace(Event=object),
+            pdmux_prefill_stream=object(),
+            pdmux_prefill_copy_stream=object(),
+            pdmux_prefill_copy_stream_ctx=contextlib.nullcontext(),
             _maybe_report_active_ranks=Mock(),
         )
         returned = inspect.unwrap(Scheduler.run_batch)(scheduler, batch)
         return batch, returned, result, lengths, mirror
+
+    def test_overlap_keeps_split_worker_and_prompt_lengths(self):
+        """Global overlap must not route a split through the ordinary forward.
+
+        Its final token is copied asynchronously; prompt lengths stay intact
+        until merge seeds FutureMap for the first decode.
+        """
+        batch, returned, result, lengths, mirror = self._run_final_split(overlap=True)
+        self.assertIs(returned, result)
+        self.assertIs(batch.seq_lens, lengths)
+        self.assertIs(batch.seq_lens_cpu, mirror)
+        self.assertIsNotNone(result.copy_done)
+        self.assertIs(batch.spec_info, result.next_draft_input)
 
     def test_final_split_preserves_lengths_without_host_readback(self):
         """Seeding draft state must not stall decode submission on prompt lengths.

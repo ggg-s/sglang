@@ -6,6 +6,7 @@ from __future__ import annotations
 
 import logging
 import time
+from collections import deque
 from typing import TYPE_CHECKING, Any, List, Optional
 
 import msgspec
@@ -454,6 +455,15 @@ class SchedulerMultiplexMixin:
         that state still set, which prevents a second finalize -- it is not a
         retry mechanism, and nothing re-enters this for the same batch.
         """
+        if all_segments_run and self.enable_overlap:
+            # Decode has drained before this merge. Seed only now: publishing
+            # from the final split submission would overwrite FutureMap's
+            # decode-ready event with a wait on the entire prefill lane.
+            future_indices = batch.req_pool_indices
+            self.future_map.publish(future_indices, batch.seq_lens)
+            self._relay_forward_payload(batch, future_indices, prefill_result)
+            batch.spec_info.future_indices = future_indices
+
         self.process_batch_result(batch, prefill_result)
 
         if all_segments_run:
@@ -532,20 +542,28 @@ class SchedulerMultiplexMixin:
         adjust_stream_group = False
         carried_batch_pending = False
         self._check_pdmux_dp_graph_capability()
+        # Grammar batches are drained before submission below. Keep the
+        # worker's normal grammar barrier valid (with no pending queue rows).
+        self.result_queue = deque()
         self._hicache_pump_tick = 0
         stream_idx = get_current_stream_idx()
         stream_group = self.stream_groups[stream_idx]
         prefill_stream = stream_group[0]
         decode_stream = stream_group[1]
+        if self.enable_overlap:
+            self.forward_stream = decode_stream
+            self.forward_stream_ctx = torch.cuda.stream(decode_stream)
+        self.pdmux_prefill_stream = prefill_stream
         torch.cuda.empty_cache()
 
         logger.debug("Starting event loop for pd multiplexing...")
 
         while True:
-            # Speculation, grammar and penalties need the previous result
-            # before the next forward prepares its CPU-dependent state.
+            # Synchronous speculation and CPU-dependent sampling need the
+            # previous result before preparing the next forward. Overlap
+            # DFlash instead carries lengths and bonus tokens through FutureMap.
             if pending_decode_result is not None and (
-                not self.spec_algorithm.is_none()
+                (not self.spec_algorithm.is_none() and not self.enable_overlap)
                 or self.running_batch.has_grammar
                 or (
                     self.running_batch.sampling_info is not None
@@ -642,7 +660,7 @@ class SchedulerMultiplexMixin:
                 # batch accordingly so Mamba snapshots the next boundary before
                 # the shared Req counters advance in the following iteration.
                 running_batch.enable_overlap = (
-                    self.spec_algorithm.is_none()
+                    (self.enable_overlap or self.spec_algorithm.is_none())
                     and not running_batch.has_grammar
                     and not (
                         running_batch.sampling_info is not None
@@ -691,6 +709,10 @@ class SchedulerMultiplexMixin:
                     )
                 prefill_stream = stream_group[0]
                 decode_stream = stream_group[1]
+                if self.enable_overlap:
+                    self.forward_stream = decode_stream
+                    self.forward_stream_ctx = torch.cuda.stream(decode_stream)
+                self.pdmux_prefill_stream = prefill_stream
                 adjust_stream_group = False
                 logger.debug(
                     f"Adjusting stream groups: {stream_idx}, prefill sm: {self.sm_counts[stream_idx][0]}, decode sm: {self.sm_counts[stream_idx][1]}"

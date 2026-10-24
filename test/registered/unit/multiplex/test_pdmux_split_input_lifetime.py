@@ -36,10 +36,9 @@ def load_scheduler_split_branch(resolve):
         n
         for n in ast.walk(run_batch)
         if isinstance(n, ast.If)
-        and any(
-            isinstance(part, ast.Attribute) and part.attr == "split_prefill_batch"
-            for part in ast.walk(n.test)
-        )
+        and isinstance(n.test, ast.BoolOp)
+        and isinstance(n.test.values[0], ast.Attribute)
+        and n.test.values[0].attr == "enable_pdmux"
     )
     wrapper = ast.parse("def run(self, batch):\n    pass\n").body[0]
     wrapper.body = branch.body + [
@@ -143,6 +142,7 @@ class TestSplitInputLifetime(CustomTestCase):
                         worker, batch
                     )
                     scheduler = SimpleNamespace(
+                        enable_overlap=False,
                         model_worker=worker,
                         tp_worker=worker,
                         future_map=None,

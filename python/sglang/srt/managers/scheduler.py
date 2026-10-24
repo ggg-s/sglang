@@ -4414,7 +4414,9 @@ class Scheduler(
 
         # Run forward
         if self.is_generation:
-            if self.enable_overlap:
+            if self.enable_overlap and not (
+                self.enable_pdmux and batch is self.split_prefill_batch
+            ):
                 # Self-gates on batch.spec_info.future_indices; non-spec_v2
                 # no-ops (ForwardBatch.init_new lazily computes the sum).
                 self.future_map.resolve_seq_lens_cpu(batch)
@@ -4533,7 +4535,18 @@ class Scheduler(
                     >= self.model_config.num_hidden_layers
                 ):
                     batch.input_ids = None
-                self._copy_auxiliary_output_to_cpu(batch, batch_result)
+                    if self.enable_overlap:
+                        batch_result.copy_done = self.device_module.Event()
+                        self._launch_result_copy(
+                            batch_result,
+                            return_logprob=batch.return_logprob,
+                            return_hidden_states=batch.return_hidden_states,
+                            forward_stream=self.pdmux_prefill_stream,
+                            copy_stream=self.pdmux_prefill_copy_stream,
+                            copy_stream_ctx=self.pdmux_prefill_copy_stream_ctx,
+                        )
+                if not self.enable_overlap:
+                    self._copy_auxiliary_output_to_cpu(batch, batch_result)
             elif not batch.spec_algorithm.is_none():
                 # Non-overlap: drive the V2 worker synchronously (no
                 # future_map relay / on_publish).

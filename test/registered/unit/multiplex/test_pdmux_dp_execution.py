@@ -15,7 +15,7 @@ import runpy
 import sys
 import tempfile
 import unittest
-from collections import namedtuple
+from collections import deque, namedtuple
 from datetime import timedelta
 from pathlib import Path
 from types import SimpleNamespace as NS
@@ -574,6 +574,7 @@ class TestActualLoop(CustomTestCase):
                 int32=torch.int32,
             ),
             dist=dist,
+            deque=deque,
             get_current_stream_idx=lambda: current["idx"],
             set_current_stream_idx=lambda i: current.update(idx=i),
             set_pdmux_status=lambda v: None,
@@ -598,6 +599,7 @@ class TestActualLoop(CustomTestCase):
             methods("multiplex/multiplexing_mixin.py", names, namespace),
         )
         s = scheduler_config(cls())
+        s.enable_overlap = False
         s.spec_algorithm = NS(is_none=lambda: True)
         s.ps = NS(attn_dp_size=2, tp_size=2)
         s.model_config = NS(num_hidden_layers=2 if delayed_merge else 3)

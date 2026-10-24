@@ -64,6 +64,8 @@ def _init_call_order(class_name, targets):
 class _Scheduler(SimpleNamespace, SchedulerMultiplexMixin):
     """Keep production helper dispatch available on lightweight fixtures."""
 
+    enable_overlap = False
+
 
 class _Batch:
     def __init__(self, empty):
