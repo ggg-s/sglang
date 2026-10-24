@@ -11,6 +11,7 @@ from sglang.srt.model_executor.cuda_graph_buffer_registry import (
     build_prefill_registry,
 )
 from sglang.srt.model_executor.forward_batch_info import PPProxyTensors
+from sglang.srt.model_executor.model_runner import ModelRunner
 from sglang.srt.model_executor.runner.prefill_cuda_graph_runner import (
     PrefillCudaGraphRunner,
     _build_layer_model_forward_kwargs,
@@ -22,6 +23,44 @@ from sglang.test.ci.ci_register import register_cpu_ci
 from sglang.test.test_utils import CustomTestCase
 
 register_cpu_ci(est_time=10, suite="base-a-test-cpu")
+
+
+class TestExtendForwardKwargs(CustomTestCase):
+    def test_supplied_embeddings_use_runner_precision_with_replacements(self):
+        """DFlash's FP16 draft must not receive BF16 from the shared extend path.
+
+        Exercise the runner entry point through an actual precision-sensitive
+        linear layer, with both supplied embeddings and token replacements.
+        """
+        for dtype in (torch.float16, torch.bfloat16):
+            with self.subTest(dtype=dtype):
+                layer = torch.nn.Linear(2, 2, bias=False, dtype=dtype)
+                with torch.no_grad():
+                    layer.weight.copy_(torch.eye(2))
+                source = torch.tensor([[1, 2], [3, 4]], dtype=torch.float32)
+                batch = SimpleNamespace(
+                    input_ids=torch.tensor([0, 1]),
+                    input_embeds=source,
+                    replace_embeds=torch.tensor([[5, 6]], dtype=torch.float32),
+                    replace_positions=torch.tensor([1]),
+                )
+                proxy = object()
+                runner = SimpleNamespace(
+                    dtype=dtype,
+                    is_generation=False,
+                    model=object(),
+                    _pp_kwargs=lambda value: {"pp_proxy_tensors": value},
+                )
+                kwargs = ModelRunner._extend_forward_kwargs(runner, batch, proxy)
+                actual = layer(kwargs["input_embeds"])
+                torch.testing.assert_close(
+                    actual, torch.tensor([[1, 2], [5, 6]], dtype=dtype)
+                )
+                self.assertIs(kwargs["pp_proxy_tensors"], proxy)
+                self.assertTrue(kwargs["get_embedding"])
+                torch.testing.assert_close(
+                    source, torch.tensor([[1, 2], [3, 4]], dtype=torch.float32)
+                )
 
 
 class _LayerModel:

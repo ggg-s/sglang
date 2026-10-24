@@ -169,6 +169,9 @@ from sglang.srt.model_executor.runner import (
     EagerRunner,
     get_batch_sizes_to_capture,
 )
+from sglang.srt.model_executor.runner_utils.forward_kwargs import (
+    build_extend_forward_kwargs,
+)
 from sglang.srt.model_executor.runner_utils.pdmux import (
     _can_replay_whole_split_prefill,
 )
@@ -1588,23 +1591,13 @@ class ModelRunner:
         """Build the extend/prefill model.forward kwargs (pp_proxy_tensors +
         input_embeds / replace_embeds overrides + get_embedding), shared by the
         prefill cuda-graph path and the EagerRunner's eager extend path."""
-        kwargs = self._pp_kwargs(pp_proxy_tensors)
-        if forward_batch.input_embeds is not None:
-            kwargs["input_embeds"] = forward_batch.input_embeds.bfloat16()
-        if (
-            forward_batch.replace_embeds is not None
-            and forward_batch.replace_positions is not None
-        ):
-            # Token embedding overrides: get base embeddings, scatter replacements
-            if "input_embeds" not in kwargs:
-                embed_layer = self.model.get_input_embeddings()
-                kwargs["input_embeds"] = embed_layer(forward_batch.input_ids)
-            kwargs["input_embeds"][forward_batch.replace_positions] = (
-                forward_batch.replace_embeds.to(kwargs["input_embeds"].dtype)
-            )
-        if not self.is_generation:
-            kwargs["get_embedding"] = True
-        return kwargs
+        return build_extend_forward_kwargs(
+            forward_batch,
+            pp_kwargs=self._pp_kwargs(pp_proxy_tensors),
+            model=self.model,
+            model_dtype=self.dtype,
+            is_generation=self.is_generation,
+        )
 
     def forward_split_prefill(
         self,
