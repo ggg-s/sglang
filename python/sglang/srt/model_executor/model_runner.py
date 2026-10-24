@@ -169,6 +169,9 @@ from sglang.srt.model_executor.runner import (
     EagerRunner,
     get_batch_sizes_to_capture,
 )
+from sglang.srt.model_executor.runner_utils.pdmux import (
+    _can_replay_whole_split_prefill,
+)
 from sglang.srt.platforms import current_platform
 from sglang.srt.runtime_context import (
     assert_published,
@@ -1837,14 +1840,38 @@ class ModelRunner:
                 split_forward_count is not None
                 or forward_batch.forward_mode.is_split_prefill()
             ):
-                # Layer-split mode; stays on ModelRunner, not the eager runner.
-                ret = self.forward_split_prefill(
-                    forward_batch,
-                    reinit_attn_backend=reinit_attn_backend,
-                    forward_count=(
-                        split_forward_count if split_forward_count is not None else 1
-                    ),
+                forward_count = (
+                    split_forward_count if split_forward_count is not None else 1
                 )
+                prefill_graph = self.prefill_cuda_graph_runner
+                if _can_replay_whole_split_prefill(
+                    forward_batch,
+                    forward_count,
+                    self.model_config.num_hidden_layers,
+                    prefill_graph,
+                    allows_context_parallel=(
+                        prefill_graph is not None
+                        and _prefill_cuda_graph_allows_context_parallel(
+                            prefill_graph, forward_batch
+                        )
+                    ),
+                ):
+                    # With no layer boundary to yield at, the ordinary BCG
+                    # body is equivalent to one complete split prefill. Replay
+                    # only on the prefill-only lane captured by this runner.
+                    kwargs = self._extend_forward_kwargs(
+                        forward_batch, pp_proxy_tensors
+                    )
+                    with device_timer_ctx(self.device_timer, "split_prefill"):
+                        ret = prefill_graph.execute(forward_batch, **kwargs)
+                    forward_batch.split_index = self.model_config.num_hidden_layers
+                    can_run_graph = True
+                else:
+                    ret = self.forward_split_prefill(
+                        forward_batch,
+                        reinit_attn_backend=reinit_attn_backend,
+                        forward_count=forward_count,
+                    )
             elif (
                 forward_batch.forward_mode.is_extend(include_draft_extend_v2=True)
                 and not isinstance(self.prefill_cuda_graph_runner, EagerRunner)

@@ -987,10 +987,14 @@ class SchedulerBatchResultProcessor:
                 )
                 continue
 
-            if (self.enable_overlap or self.enable_overlap_mlx) and (
-                req.finished() or req.is_retracted
-            ):
-                # NOTE: This (req.finished() or req.is_retracted) should only happen when overlap scheduling is enabled.
+            if (
+                self.enable_overlap
+                or self.enable_overlap_mlx
+                or get_disagg().enable_pdmux
+            ) and (req.finished() or req.is_retracted):
+                # PDMux also pipelines a plain decode result even though the
+                # ordinary overlap scheduler is disabled. Its overshoot must
+                # not append another token or release a finished request twice.
                 # And all the over-allocated tokens will be freed in `release_kv_cache`.
                 continue
 

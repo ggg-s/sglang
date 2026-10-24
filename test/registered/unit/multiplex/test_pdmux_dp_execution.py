@@ -24,6 +24,9 @@ from unittest.mock import Mock, patch
 import torch
 import torch.distributed as dist
 
+from sglang.srt.runtime_context import get_context, get_spec
+from sglang.test.test_utils import CustomTestCase
+
 ROOT = Path(__file__).resolve().parents[4]
 SRT = ROOT / "python/sglang/srt"
 register_cpu_ci = runpy.run_path(str(ROOT / "python/sglang/test/ci/ci_register.py"))[
@@ -74,6 +77,8 @@ class Batch:
         self.split_index = 0
         self.enable_overlap = False
         self.decode_mem_ok = True
+        self.has_grammar = False
+        self.sampling_info = None
 
     def batch_size(self):
         return self.rows
@@ -153,7 +158,11 @@ class TestStreamAgreement(unittest.TestCase):
 
 
 def graph_runner():
-    namespace = dict(torch=torch, get_current_stream_idx=lambda: 1)
+    namespace = dict(
+        torch=torch,
+        get_current_stream_idx=lambda: 1,
+        get_spec=get_spec,
+    )
     names = [
         "can_replay_batch_locally",
         "can_run_pdmux_decode_batch",
@@ -167,9 +176,15 @@ def graph_runner():
     )
     runner = cls()
     runner.model_runner = NS(
-        spec_algorithm=NS(is_none=lambda: True, is_ngram=lambda: False),
-        lora_manager=None,
+        spec_algorithm=NS(
+            is_none=lambda: True,
+            is_ngram=lambda: False,
+            is_eagle=lambda: False,
+            is_frozen_kv_mtp=lambda: False,
+        ),
+        server_args=NS(enable_lora=False, speculative_adaptive=False),
     )
+    runner.model_runner.lora_manager = None
     runner.attention_graph_variants = None
     runner.is_encoder_decoder = False
     runner.enable_two_batch_overlap = False
@@ -199,11 +214,77 @@ def graph_runner():
     return runner
 
 
-class TestGraphAgreement(unittest.TestCase):
+class TestGraphAgreement(CustomTestCase):
+    def setUp(self):
+        super().setUp()
+        override = get_context().override_server_args(
+            speculative_adaptive=False, speculative_num_draft_tokens=4
+        )
+        override.install()
+        self.addCleanup(override.restore)
+
+    def test_fixed_eagle_vote_allows_target_and_both_draft_phases(self):
+        runner = graph_runner()
+        runner.model_runner.spec_algorithm.is_none = lambda: False
+        runner.model_runner.spec_algorithm.is_eagle = lambda: True
+        runner.captured_req_width = 4
+        batches = [Batch(1), Batch(3)] + [Batch(0, Mode.IDLE) for _ in range(6)]
+        # Scheduler input has draft width 1; target verify will have width 4.
+        for batch in batches:
+            batch.spec_info = NS(num_tokens_per_req=1)
+        for veto in (False, True):
+            with self.subTest(veto=veto):
+                batches[0].replace_embeds = object() if veto else None
+                vote = all(runner.can_run_pdmux_decode_batch(b) for b in batches)
+                self.assertEqual(vote, not veto)
+                for batch in batches:
+                    forward = NS(
+                        replace_embeds=batch.replace_embeds,
+                        spec_info=NS(num_tokens_per_req=4),
+                        batch_size=batch.rows,
+                        input_ids=torch.zeros(batch.rows * 4),
+                        encoder_lens=None,
+                        can_run_tbo=False,
+                        can_run_decode_cuda_graph=vote,
+                        original_global_num_tokens_cpu=[b.rows for b in batches],
+                    )
+                    self.assertEqual(runner.can_run_graph(forward), not veto)
+                    for filename, width in (
+                        ("eagle_draft_cuda_graph_runner.py", 1),
+                        ("eagle_draft_extend_cuda_graph_runner.py", 4),
+                    ):
+                        can_run = methods(
+                            "speculative/" + filename, ["can_run_graph"], {}
+                        )["can_run_graph"]
+                        draft = NS(**vars(runner))
+                        draft.captured_req_width = width
+                        forward.spec_info.num_tokens_per_req = width
+                        self.assertEqual(can_run(draft, forward), not veto)
+
+    def test_eagle_unnegotiated_variants_and_width_mismatch_veto_idle_too(self):
+        for variant in ("adaptive", "ragged", "width", "other", "frozen"):
+            with self.subTest(variant=variant):
+                runner = graph_runner()
+                runner.model_runner.spec_algorithm.is_none = lambda: False
+                runner.model_runner.spec_algorithm.is_eagle = lambda: variant != "other"
+                runner.model_runner.spec_algorithm.is_frozen_kv_mtp = lambda: (
+                    variant == "frozen"
+                )
+                get_context().override(
+                    "pdmux graph regression", speculative_adaptive=variant == "adaptive"
+                )
+                runner.ragged_verify_mode = variant == "ragged"
+                runner.captured_req_width = 3 if variant == "width" else 4
+                for batch in (Batch(), Batch(0, Mode.IDLE), None):
+                    self.assertFalse(runner.can_run_pdmux_decode_batch(batch))
+
     def test_embedding_override_veto_is_shared_with_actual_replay(self):
         runner = graph_runner()
         batch = Batch()
         self.assertTrue(runner.can_run_pdmux_decode_batch(batch))
+        batch.input_ids = None
+        self.assertTrue(runner.can_run_pdmux_decode_batch(batch))
+        batch.input_ids = torch.arange(batch.rows)
         batch.replace_embeds = torch.ones(1)
         self.assertFalse(runner.can_run_pdmux_decode_batch(batch))
         self.assertFalse(runner.can_run_graph(batch))
@@ -254,6 +335,9 @@ class TestSplitContinuation(unittest.TestCase):
             ModelRunnerOutput=lambda **kw: NS(**kw),
             is_dsa_enable_prefill_cp=lambda: False,
             is_mla_cp_enabled=lambda: False,
+            _can_replay_whole_split_prefill=runpy.run_path(
+                str(SRT / "model_executor/runner_utils/pdmux.py")
+            )["_can_replay_whole_split_prefill"],
         )
         cls = type(
             "Runner",
@@ -270,6 +354,7 @@ class TestSplitContinuation(unittest.TestCase):
         )
         runner = cls()
         runner.device = "cuda"
+        runner.prefill_cuda_graph_runner = None
         runner.device_timer = None
         runner.model_config = NS(num_hidden_layers=3)
         runner.pp_group = NS(is_last_rank=True)
@@ -451,8 +536,10 @@ class StopLoop(Exception):
     pass
 
 
-class TestActualLoop(unittest.TestCase):
-    def run_rank(self, rank, memory_pressure=False):
+class TestActualLoop(CustomTestCase):
+    def run_rank(
+        self, rank, memory_pressure=False, dependent=False, delayed_merge=False
+    ):
         trace, current = [], {"idx": 0, "lane": None}
 
         class Stream:
@@ -511,12 +598,14 @@ class TestActualLoop(unittest.TestCase):
             methods("multiplex/multiplexing_mixin.py", names, namespace),
         )
         s = scheduler_config(cls())
+        s.spec_algorithm = NS(is_none=lambda: True)
         s.ps = NS(attn_dp_size=2, tp_size=2)
-        s.model_config = NS(num_hidden_layers=3)
+        s.model_config = NS(num_hidden_layers=2 if delayed_merge else 3)
         s.pdmux_config.split_forward_token_budget = 2048
         s.split_prefill_batch = None
         s.HICACHE_PUMP_INTERVAL = 16
         s.running_batch = Batch(1 if rank == 1 else 0)
+        s.running_batch.has_grammar = dependent
         s.stream_groups = [
             (Stream("p" + str(i)), Stream("d" + str(i))) for i in range(3)
         ]
@@ -530,7 +619,7 @@ class TestActualLoop(unittest.TestCase):
 
         def ingest():
             tick["n"] += 1
-            if tick["n"] == 2:
+            if tick["n"] == (3 if delayed_merge else 2):
                 raise StopLoop
             if tick["n"] == 1 and memory_pressure:
                 s.running_batch.decode_mem_ok = False
@@ -546,13 +635,14 @@ class TestActualLoop(unittest.TestCase):
                 batch.global_num_tokens = [2048, 0]
                 batch.extend_num_tokens = 2048 if rank == 0 else 0
                 return batch
-            if tick["n"] > 0:
+            if tick["n"] > 0 and not delayed_merge:
                 return None
             batch = batch or Batch(0, Mode.IDLE)
             batch.global_num_tokens = [0, 1]
             return batch
 
         s.dp_attn_adapter = NS(maybe_prepare_mlp_sync_batch=sync_batch)
+
         def update_running_batch(batch):
             trace.append(("update_running",))
             return batch
@@ -574,7 +664,8 @@ class TestActualLoop(unittest.TestCase):
 
         def process(batch, result):
             trace.append(("process_decode",))
-            s.running_batch.rows = 0
+            if not delayed_merge:
+                s.running_batch.rows = 0
 
         s.process_batch_result = process
 
@@ -587,7 +678,9 @@ class TestActualLoop(unittest.TestCase):
         def reduce(flags, op):
             self.assertEqual(op, dist.ReduceOp.SUM)
             trace.append(("completion_vote",))
-            return NS(wait=lambda: flags.fill_(2))
+            votes = sum(item[0] == "completion_vote" for item in trace)
+            ready = not delayed_merge or votes > 1
+            return NS(wait=lambda: flags.fill_(2 if ready else 0))
 
         s.tp_cpu_group = NS(allreduce=reduce)
         with self.assertRaises(StopLoop):
@@ -615,6 +708,21 @@ class TestActualLoop(unittest.TestCase):
             first_wait = next(x for x in trace if x[0] == "wait")
             self.assertEqual(first_wait[1], "p0")
             self.assertEqual(first_wait[2][0], "d0")
+
+    def test_cpu_dependent_decode_is_consumed_before_the_next_iteration(self):
+        trace = self.run_rank(1, dependent=True)
+        self.assertLess(trace.index(("process_decode",)), trace.index(("ingest", 1)))
+
+    def test_current_decode_stays_pending_until_all_ranks_can_merge(self):
+        trace = self.run_rank(1, delayed_merge=True)
+        votes = [i for i, item in enumerate(trace) if item[0] == "completion_vote"]
+        self.assertEqual(len(votes), 2)
+        self.assertEqual(
+            sum(item[0] == "process_decode" for item in trace[: votes[0]]), 1
+        )
+        merge = trace.index(("merge",))
+        self.assertGreater(merge, votes[1])
+        self.assertEqual(sum(item[0] == "process_decode" for item in trace[:merge]), 3)
 
     def test_memory_pressure_commits_pending_result_before_retraction_path(self):
         trace = self.run_rank(1, memory_pressure=True)

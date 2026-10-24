@@ -64,6 +64,7 @@ class _DecodeBatch:
     sampling_info = None
     spec_info = None
     enable_overlap = False
+    has_grammar = False
 
     def is_empty(self):
         return False
@@ -120,6 +121,7 @@ class _FakeScheduler(SchedulerMultiplexMixin):
         self.tree_cache = Mock()
         self.pdmux_standard = False
         self.draft_worker = None
+        self.spec_algorithm = SimpleNamespace(is_none=lambda: True)
         self.chunked_req = None
         self.split_prefill_batch = None
         self.running_batch = _DecodeBatch()

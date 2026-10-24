@@ -664,25 +664,43 @@ class DecodeCudaGraphRunner(BaseCudaGraphRunner):
         return True
 
     def can_run_pdmux_decode_batch(self, batch) -> bool:
-        # These variants depend on fields the ordinary DP token-count exchange
-        # does not negotiate. Uniform eager is safer than a per-rank fallback.
+        algorithm = self.model_runner.spec_algorithm
+        # Fixed-width EAGLE/MTP constructs verify and draft-extend inputs from
+        # the configured tree width on every rank, including idle participants.
+        # Adaptive/ragged and other speculative paths need extra negotiation.
+        fixed_eagle = (
+            algorithm.is_eagle()
+            and not algorithm.is_frozen_kv_mtp()
+            and not get_spec().speculative_adaptive
+            and not self.ragged_verify_mode
+        )
         if (
-            not self.model_runner.spec_algorithm.is_none()
+            (not algorithm.is_none() and not fixed_eagle)
             or self.model_runner.lora_manager is not None
             or self.attention_graph_variants is not None
             or self.is_encoder_decoder
             or self.enable_two_batch_overlap
         ):
             return False
+        # ScheduleBatch still carries draft-phase spec_info here. Its width is
+        # not the width of the TARGET_VERIFY input that the worker will build.
+        verify_width = get_spec().speculative_num_draft_tokens if fixed_eagle else None
+        if fixed_eagle and verify_width != self.captured_req_width:
+            return False
         if batch is None or batch.forward_mode.is_idle():
             return True
         if not batch.forward_mode.is_decode():
             return False
+        num_input_tokens = (
+            batch.input_ids.numel()
+            if batch.input_ids is not None
+            else batch.batch_size()
+        )
         return self.can_replay_batch_locally(
             replace_embeds=batch.replace_embeds,
-            spec_num_tokens_per_req=None,
+            spec_num_tokens_per_req=verify_width,
             batch_size=batch.batch_size(),
-            num_input_tokens=batch.input_ids.numel(),
+            num_input_tokens=num_input_tokens,
             encoder_lens=batch.encoder_lens,
             can_run_tbo=False,
         )
@@ -1098,7 +1116,10 @@ class DecodeCudaGraphRunner(BaseCudaGraphRunner):
             if not self.enable_pdmux:
                 with (
                     graph_capture(
-                        stream=get_or_create_global_graph_capture_stream()
+                        stream=(
+                            getattr(self, "capture_stream", None)
+                            or get_or_create_global_graph_capture_stream()
+                        )
                     ) as graph_capture_context,
                     profile_context as prof,
                 ):

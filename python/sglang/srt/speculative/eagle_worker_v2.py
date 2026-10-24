@@ -50,6 +50,7 @@ from sglang.srt.model_executor.cuda_graph_config import (
 from sglang.srt.model_executor.forward_batch_info import (
     CaptureHiddenMode,
     ForwardBatch,
+    ForwardMode,
     PPProxyTensors,
 )
 from sglang.srt.model_executor.forward_context import ForwardContext, forward_context
@@ -57,13 +58,11 @@ from sglang.srt.model_executor.runner import (
     DecodeCudaGraphRunner,
     get_batch_sizes_to_capture,
 )
-from sglang.srt.multiplex.pdmux_context import (
-    decode_lane_attn_backend,
-    is_pdmux_standard_prefill,
-)
+from sglang.srt.multiplex.pdmux_context import decode_lane_attn_backend
 from sglang.srt.runtime_context import (
     get_context,
     get_device,
+    get_disagg,
     get_exec,
     get_model,
     get_parallel,
@@ -389,14 +388,14 @@ class EagleDraftWorker(EagleDraftWorkerBase):
         if self.draft_extend_attn_backend is not None:
             self.draft_runner.attn_backend = self.draft_extend_attn_backend
 
-        # PDMux standard: the prefill lane runs its own draft extend (a plain
-        # EXTEND on the draft runner) while the decode lane may be running
+        # PDMux prefill runs its own draft extend (a plain EXTEND on the draft
+        # runner) while the decode lane may be running
         # DRAFT_EXTEND_V2 on the other stream. Both resolve
         # `draft_runner.attn_backend` and write its metadata and scratch buffers
         # in place, so give the prefill lane a second instance from the same
         # factory, bound only for the duration of that call.
         needs_prefill_lane_backend = (
-            is_pdmux_standard_prefill() and self.draft_extend_attn_backend is not None
+            get_disagg().enable_pdmux and self.draft_extend_attn_backend is not None
         )
         self.prefill_lane_draft_extend_attn_backend = (
             draft_backend_factory.create_draft_extend_backend()
@@ -481,18 +480,22 @@ class EagleDraftWorker(EagleDraftWorkerBase):
         if _is_cpu or check_cuda_graph_backend(Phase.DECODE, Backend.DISABLED):
             return
 
-        if is_pdmux_standard_prefill():
-            # These two runners hard-disable the pdmux capture path, so they
-            # would capture a single graph set on a plain stream and replay it
-            # on whichever green-context stream is current -- the graph's nodes
-            # keep the resource context they were captured with. Run the draft
-            # steps and the draft extend eagerly instead; the target's decode
-            # and verify graphs are captured per stream group and stay on.
-            logger.info(
-                "PD-Multiplexing standard prefill: skipping draft CUDA graph "
-                "capture (draft decode and draft extend run eagerly)."
+        if get_disagg().enable_pdmux and not _is_cuda:
+            logger.warning(
+                "PDMux draft CUDA graphs currently require CUDA; using eager"
             )
             return
+
+        def make_runner(runner_cls, *, draft_extend=False):
+            if get_disagg().enable_pdmux:
+                from sglang.srt.speculative.pdmux_draft_cuda_graph_runner import (
+                    PDMuxDraftCudaGraphRunner,
+                )
+
+                return PDMuxDraftCudaGraphRunner(
+                    self, runner_cls, draft_extend=draft_extend
+                )
+            return runner_cls(self)
 
         if get_model().model_impl == "mindspore":
             return
@@ -515,9 +518,9 @@ class EagleDraftWorker(EagleDraftWorkerBase):
                 f"num_tokens_per_req={self.topk}, bs={capture_bs}, "
                 f"avail mem={before_mem:.2f} GB",
             )
-            self.cuda_graph_runner = Device2DraftCudaGraphRunner[
-                self.target_worker.device
-            ](self)
+            self.cuda_graph_runner = make_runner(
+                Device2DraftCudaGraphRunner[self.target_worker.device]
+            )
             after_mem = get_available_gpu_memory(self.device, self.gpu_id)
             capture_time = time.perf_counter() - tic
             self._specialized_graph_memory_usage["draft_decode"] = (
@@ -619,9 +622,10 @@ class EagleDraftWorker(EagleDraftWorkerBase):
                 f"num_tokens_per_req={self.speculative_num_draft_tokens}, "
                 f"bs={capture_bs}, avail mem={before_mem:.2f} GB",
             )
-            self.cuda_graph_runner_for_draft_extend = Device2ExtendCudaGraphRunner[
-                self.target_worker.device
-            ](self)
+            self.cuda_graph_runner_for_draft_extend = make_runner(
+                Device2ExtendCudaGraphRunner[self.target_worker.device],
+                draft_extend=True,
+            )
             # draft_extend is the step's last shared-buffer-reading phase; its
             # read-done event is what the scheduler's WAR barrier waits on.
             after_mem = get_available_gpu_memory(self.device, self.gpu_id)
@@ -1011,6 +1015,10 @@ class EagleDraftWorker(EagleDraftWorkerBase):
         )
         with canary_ctx:
             logits_output = self.draft_runner.forward(forward_batch).logits_output
+        if batch.forward_mode.is_idle():
+            # DP attention may place real prefill work on peer ranks. This
+            # empty forward still joins the draft MoE collectives on this rank.
+            return None
         maybe_detect_nan(logits_output.next_token_logits, "draft_extend_for_prefill")
         maybe_detect_inf(logits_output.next_token_logits, "draft_extend_for_prefill")
 
@@ -1310,6 +1318,54 @@ class EAGLEWorkerV2(BaseSpecWorker):
                     ),
                 )
 
+    def forward_batch_split_prefill(
+        self, batch: ScheduleBatch
+    ) -> GenerationBatchResult:
+        """Finish MTP draft state after the target's last split segment."""
+        batch_output = self.target_worker.forward_batch_split_prefill(
+            batch, capture_hidden_mode=CaptureHiddenMode.FULL
+        )
+        is_idle = batch.forward_mode.is_idle()
+        if is_idle:
+            is_final_segment = (
+                batch.split_index + batch.split_forward_count
+                >= self.target_worker.model_config.num_hidden_layers
+            )
+            if not is_final_segment:
+                return batch_output
+        elif batch_output.logits_output is None:
+            return batch_output
+
+        if not is_idle:
+            batch_output.new_seq_lens = batch.seq_lens
+        # The target keeps SPLIT_PREFILL while processing its segments. The
+        # draft now runs one ordinary extend; leaving that mode on the draft
+        # ForwardBatch would make its attention treat this as another segment.
+        original_mode = batch.forward_mode
+        if not is_idle:
+            batch.forward_mode = ForwardMode.EXTEND
+        try:
+            with (
+                self.draft_worker.draft_tp_context(
+                    self.draft_worker.draft_runner.tp_group
+                ),
+                speculative_moe_backend_context(),
+                speculative_moe_a2a_backend_context(),
+                spec_stage_span("draft_extend"),
+                self.draft_worker.prefill_lane_draft_extend_backend(),
+            ):
+                draft_input = self.draft_worker._draft_extend_for_prefill(
+                    batch,
+                    None if is_idle else batch_output.logits_output.hidden_states,
+                    None if is_idle else batch_output.next_token_ids,
+                    None if is_idle else batch_output.logits_output.mm_input_embeds,
+                )
+                if not is_idle:
+                    batch_output.next_draft_input = draft_input
+        finally:
+            batch.forward_mode = original_mode
+        return batch_output
+
     def forward_batch_generation(
         self,
         batch: ScheduleBatch,
@@ -1442,7 +1498,7 @@ class EAGLEWorkerV2(BaseSpecWorker):
 
         # Verify runs on the decode lane; `verify_mask.buffer` is filled in
         # place, so take the backend the eager runner will resolve for it (the
-        # per-stream decode backend on the PDMux standard lane, the runner
+        # per-stream decode backend in either PDMux mode, the runner
         # default everywhere else).
         attn_backend = decode_lane_attn_backend(self._target_worker.model_runner)
         verify_mask = attn_backend.verify_mask
