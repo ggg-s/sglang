@@ -39,7 +39,6 @@ class PDMuxDraftCudaGraphRunner:
         if not groups:
             raise RuntimeError("PDMux draft graph capture requires stream groups")
         factory = DraftBackendFactory(
-            worker.server_args,
             worker.draft_runner,
             worker.topk,
             worker.speculative_num_steps,

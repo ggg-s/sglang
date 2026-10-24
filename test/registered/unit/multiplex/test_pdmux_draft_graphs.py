@@ -3,10 +3,11 @@
 import contextlib
 import unittest
 from types import SimpleNamespace as NS
-from unittest.mock import Mock
+from unittest.mock import Mock, create_autospec
 
 from test_pdmux_sxf_port import load_methods, register_cpu_ci
 
+from sglang.srt.speculative.draft_utils import DraftBackendFactory
 from sglang.test.test_utils import CustomTestCase
 
 register_cpu_ci(est_time=2, suite="base-a-test-cpu")
@@ -40,7 +41,9 @@ class TestPDMuxDraftGraphs(CustomTestCase):
             set_pdmux_status=lambda v: setattr(self.state, "prefill", v),
             get_global_graph_memory_pool=lambda: self.state.pool,
             set_global_graph_memory_pool=lambda v: setattr(self.state, "pool", v),
-            DraftBackendFactory=lambda *a, **k: self.factory,
+            DraftBackendFactory=create_autospec(
+                DraftBackendFactory, return_value=self.factory
+            ),
         )
         self.runner_type = type(
             "PDMuxDraftCudaGraphRunner",
