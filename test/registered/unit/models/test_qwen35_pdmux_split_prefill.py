@@ -1,36 +1,113 @@
 """CPU regressions for segmented Qwen3.5 MoE text prefill state and guards."""
 
-import ast, types, contextlib, unittest, pathlib, torch
+import ast
+import contextlib
+import pathlib
+import types
+import unittest
+from typing import Optional, Tuple
+
+import torch
+
+from sglang.test.ci.ci_register import register_cpu_ci
+from sglang.test.test_utils import CustomTestCase
+
 ROOT = pathlib.Path(__file__).resolve().parents[4]
-import runpy
-register_cpu_ci = runpy.run_path(str(ROOT / 'python/sglang/test/ci/ci_register.py'))['register_cpu_ci']
-register_cpu_ci(est_time=2, suite='base-a-test-cpu')
-p = ROOT / 'python/sglang/srt/models/qwen3_5.py'
+register_cpu_ci(est_time=2, suite="base-a-test-cpu")
+p = ROOT / "python/sglang/srt/models/qwen3_5.py"
 root = ast.parse(p.read_text())
-cls = next((n for n in root.body if isinstance(n, ast.ClassDef) and n.name == 'Qwen3_5MoeForConditionalGeneration'))
-fun = next((n for n in cls.body if isinstance(n, ast.FunctionDef) and n.name == 'forward_split_prefill'))
+cls = next(
+    (
+        n
+        for n in root.body
+        if isinstance(n, ast.ClassDef)
+        and n.name == "Qwen3_5MoeForConditionalGeneration"
+    )
+)
+fun = next(
+    (
+        n
+        for n in cls.body
+        if isinstance(n, ast.FunctionDef) and n.name == "forward_split_prefill"
+    )
+)
 fun.decorator_list = []
-from typing import Tuple, Optional
-ns = {'torch': torch, 'Tuple': Tuple, 'Optional': Optional, 'ForwardBatch': object, 'envs': types.SimpleNamespace(SGLANG_QWEN35_NATIVE_FINAL_NORM=types.SimpleNamespace(get=lambda : False)), 'get_global_expert_distribution_recorder': lambda : types.SimpleNamespace(with_current_layer=lambda i: contextlib.nullcontext())}
-exec(compile(ast.fix_missing_locations(ast.Module(body=[fun], type_ignores=[])), str(p), 'exec'), ns)
-run = ns['forward_split_prefill']
 
-class SplitTests(unittest.TestCase):
+ns = {
+    "torch": torch,
+    "Tuple": Tuple,
+    "Optional": Optional,
+    "ForwardBatch": object,
+    "envs": types.SimpleNamespace(
+        SGLANG_QWEN35_NATIVE_FINAL_NORM=types.SimpleNamespace(get=lambda: False)
+    ),
+    "get_global_expert_distribution_recorder": lambda: types.SimpleNamespace(
+        with_current_layer=lambda i: contextlib.nullcontext()
+    ),
+}
+exec(
+    compile(
+        ast.fix_missing_locations(ast.Module(body=[fun], type_ignores=[])),
+        str(p),
+        "exec",
+    ),
+    ns,
+)
+run = ns["forward_split_prefill"]
 
+
+class SplitTests(CustomTestCase):
     def fixture(self):
         calls = []
 
         def layer(i):
 
-            def go(positions, hidden_states, residual, forward_batch):
+            def go(
+                positions,
+                hidden_states,
+                residual,
+                forward_batch,
+                captured_last_layer_outputs=None,
+            ):
                 calls.append((i, positions.clone()))
+                if captured_last_layer_outputs is not None:
+                    captured_last_layer_outputs.append(
+                        hidden_states.clone()
+                        if residual is None
+                        else hidden_states + residual
+                    )
                 r = hidden_states if residual is None else residual + hidden_states
-                return (torch.tanh(hidden_states * (i + 1) + positions[:, None] * 0.01), r)
+                return (
+                    torch.tanh(hidden_states * (i + 1) + positions[:, None] * 0.01),
+                    r,
+                )
+
             return go
+
         norm = lambda h, r: (h + r * 0.1, r)
-        model = types.SimpleNamespace(end_layer=4, embed_tokens=lambda x: torch.stack([x.float(), x.float() + 1], 1), layers=[layer(i) for i in range(4)], norm=norm, flashinfer_mnnvl_cutedsl_fusion=None)
-        obj = types.SimpleNamespace(model=model, pp_group=types.SimpleNamespace(is_first_rank=True, is_last_rank=True), capture_aux_hidden_states=False, is_mrope_enabled=False, lm_head=None, logits_processor=lambda ids, h, head, b: h.clone())
-        batch = types.SimpleNamespace(mm_inputs=None, spec_info=None, residual=torch.ones(3, 2), mrope_positions=torch.arange(3.0) + 5)
+        model = types.SimpleNamespace(
+            end_layer=4,
+            embed_tokens=lambda x: torch.stack([x.float(), x.float() + 1], 1),
+            layers=[layer(i) for i in range(4)],
+            norm=norm,
+            flashinfer_mnnvl_cutedsl_fusion=None,
+        )
+        obj = types.SimpleNamespace(
+            model=model,
+            pp_group=types.SimpleNamespace(is_first_rank=True, is_last_rank=True),
+            capture_aux_hidden_states=False,
+            is_mrope_enabled=False,
+            lm_head=None,
+            logits_processor=lambda ids, h, head, b, aux=None: (
+                (h.clone(), aux) if aux is not None else h.clone()
+            ),
+        )
+        batch = types.SimpleNamespace(
+            mm_inputs=None,
+            spec_info=None,
+            residual=torch.ones(3, 2),
+            mrope_positions=torch.arange(3.0) + 5,
+        )
         return (obj, batch, calls)
 
     def test_segments_match_full_forward(self):
@@ -54,32 +131,67 @@ class SplitTests(unittest.TestCase):
     def test_mrope_positions_are_preserved(self):
         (o, b, calls) = self.fixture()
         o.is_mrope_enabled = True
-        b.mm_inputs = [types.SimpleNamespace(contains_mm_input=lambda : False)]
+        b.mm_inputs = [types.SimpleNamespace(contains_mm_input=lambda: False)]
         for a in range(4):
             run(o, torch.arange(3), torch.zeros(3), b, (a, a + 1))
-        for (_, pos) in calls:
+        for _, pos in calls:
             torch.testing.assert_close(pos, b.mrope_positions)
 
     def test_input_embeddings(self):
         (o, b, _) = self.fixture()
         x = torch.randn(3, 2)
-        o.model.embed_tokens = lambda _: self.fail('embedding lookup should be bypassed')
+        o.model.embed_tokens = lambda _: self.fail(
+            "embedding lookup should be bypassed"
+        )
         self.assertIsNone(run(o, torch.arange(3), torch.zeros(3), b, (0, 1), x))
 
+    def test_aux_capture_survives_interleaved_splits_and_resets(self):
+        # DFlash consumes several pre-layer residual sums. A decode or a second
+        # prefill must not overwrite the first prefill's partially captured list.
+        ids = torch.arange(3)
+        positions = torch.arange(3.0)
+        o, first, _ = self.fixture()
+        o.capture_aux_hidden_states = True
+        for index in (1, 3):
+            o.model.layers[index]._is_layer_to_capture = True
+        h, residual = o.model.embed_tokens(ids), None
+        expected = []
+        for layer in o.model.layers:
+            h, residual = layer(
+                positions,
+                h,
+                residual,
+                first,
+                captured_last_layer_outputs=expected
+                if getattr(layer, "_is_layer_to_capture", False)
+                else None,
+            )
+        run(o, ids, positions, first, (0, 2))
+        _, second, _ = self.fixture()
+        run(o, ids + 10, positions, second, (0, 4))
+        result, features = run(o, ids, positions, first, (2, 4))
+        torch.testing.assert_close(result, o.model.norm(h, residual)[0])
+        self.assertEqual(len(features), 2)
+        for actual, reference in zip(features, expected):
+            torch.testing.assert_close(actual, reference)
+        self.assertNotIn("aux_hidden_states", first.model_specific_states)
+        _, again = run(o, ids, positions, first, (0, 4))
+        self.assertEqual(len(again), 2)
+
     def test_rejects_unsupported_paths(self):
-        for variant in ['mm', 'spec', 'aux', 'pp', 'deferred']:
+        for variant in ["mm", "spec", "pp", "deferred"]:
             (o, b, _) = self.fixture()
-            if variant == 'mm':
-                b.mm_inputs = [types.SimpleNamespace(contains_mm_input=lambda : True)]
-            if variant == 'spec':
+            if variant == "mm":
+                b.mm_inputs = [types.SimpleNamespace(contains_mm_input=lambda: True)]
+            if variant == "spec":
                 b.spec_info = object()
-            if variant == 'aux':
-                o.capture_aux_hidden_states = True
-            if variant == 'pp':
+            if variant == "pp":
                 o.pp_group.is_last_rank = False
-            if variant == 'deferred':
+            if variant == "deferred":
                 o.model.flashinfer_mnnvl_cutedsl_fusion = object()
             with self.assertRaises(ValueError):
                 run(o, torch.arange(3), torch.zeros(3), b, (0, 1))
-if __name__ == '__main__':
+
+
+if __name__ == "__main__":
     unittest.main()

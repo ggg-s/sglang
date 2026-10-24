@@ -2334,6 +2334,8 @@ class Qwen3_5ForConditionalGeneration(Qwen3VLForConditionalGeneration):
 class Qwen3_5MoeForConditionalGeneration(Qwen3VLForConditionalGeneration):
     """Qwen3.5 MoE Vision-Language Model."""
 
+    supports_pdmux_dflash_prefill = True
+
     packed_modules_mapping = Qwen3_5ForCausalLM.packed_modules_mapping
     hf_to_sglang_mapper = None
 
@@ -2384,19 +2386,22 @@ class Qwen3_5MoeForConditionalGeneration(Qwen3VLForConditionalGeneration):
                 for item in forward_batch.mm_inputs
             ):
                 raise ValueError("Qwen3.5 split prefill currently supports text only")
-            if self.capture_aux_hidden_states or forward_batch.spec_info is not None:
-                raise ValueError("Qwen3.5 split prefill does not support speculation")
+            if forward_batch.spec_info is not None:
+                raise ValueError("Qwen3.5 split prefill does not support verify inputs")
             if model.flashinfer_mnnvl_cutedsl_fusion is not None:
                 raise ValueError("Qwen3.5 split prefill does not support deferred MoE")
             forward_batch.hidden_states = (
                 model.embed_tokens(input_ids) if input_embeds is None else input_embeds
             )
             forward_batch.residual = None
+            forward_batch.model_specific_states = {"aux_hidden_states": []}
 
         if self.is_mrope_enabled:
             positions = forward_batch.mrope_positions
         for layer_idx in range(start, end):
-            with get_global_expert_distribution_recorder().with_current_layer(layer_idx):
+            with get_global_expert_distribution_recorder().with_current_layer(
+                layer_idx
+            ):
                 forward_batch.hidden_states, forward_batch.residual = model.layers[
                     layer_idx
                 ](
@@ -2404,6 +2409,13 @@ class Qwen3_5MoeForConditionalGeneration(Qwen3VLForConditionalGeneration):
                     hidden_states=forward_batch.hidden_states,
                     residual=forward_batch.residual,
                     forward_batch=forward_batch,
+                    captured_last_layer_outputs=(
+                        forward_batch.model_specific_states["aux_hidden_states"]
+                        if getattr(
+                            model.layers[layer_idx], "_is_layer_to_capture", False
+                        )
+                        else None
+                    ),
                 )
 
         if end != model.end_layer:
@@ -2420,7 +2432,14 @@ class Qwen3_5MoeForConditionalGeneration(Qwen3VLForConditionalGeneration):
             else:
                 hidden_states, _ = norm(hidden_states, forward_batch.residual)
         forward_batch.hidden_states = hidden_states
-        return self.logits_processor(input_ids, hidden_states, self.lm_head, forward_batch)
+        aux_hidden_states = forward_batch.model_specific_states.pop("aux_hidden_states")
+        return self.logits_processor(
+            input_ids,
+            hidden_states,
+            self.lm_head,
+            forward_batch,
+            aux_hidden_states if self.capture_aux_hidden_states else None,
+        )
 
     def get_hidden_dim(self, module_name: str, layer_idx: int):
         return self.model.get_hidden_dim(module_name, layer_idx)

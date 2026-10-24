@@ -11,7 +11,10 @@ import torch
 from sglang.srt.managers.scheduler import Scheduler
 from sglang.srt.model_executor.forward_batch_info import ForwardMode
 from sglang.srt.multiplex.multiplexing_mixin import SchedulerMultiplexMixin
+from sglang.srt.runtime_context import get_context
+from sglang.srt.speculative.dflash_worker_v2 import DFlashWorkerV2
 from sglang.srt.speculative.eagle_worker_v2 import EAGLEWorkerV2
+from sglang.srt.speculative.spec_tp_sync import SpecTpSync, SpecTpSyncSite
 from sglang.test.ci.ci_register import register_cpu_ci
 from sglang.test.test_utils import CustomTestCase
 
@@ -223,6 +226,140 @@ class TestPDMuxMTPSplitPrefill(CustomTestCase):
         draft._draft_extend_for_prefill.assert_called_once_with(batch, None, None, None)
         self.assertIsNone(idle_result.next_draft_input)
         self.assertEqual(batch.forward_mode, ForwardMode.IDLE)
+
+
+class TestPDMuxDFlashSplitPrefill(CustomTestCase):
+    def test_rejects_target_without_split_aux_capture_before_loading_draft(self):
+        target = SimpleNamespace(model_runner=SimpleNamespace(model=object()))
+        with (
+            get_context().override_server_args(
+                enable_pdmux=True, pdmux_prefill_mode="layer_split"
+            ),
+            self.assertRaisesRegex(NotImplementedError, "auxiliary hidden states"),
+        ):
+            DFlashWorkerV2(
+                server_args=object(),
+                gpu_id=0,
+                ps=object(),
+                nccl_port=0,
+                target_worker=target,
+            )
+
+    def test_verify_commits_states_from_decode_metadata(self):
+        """The prefill batch can have one slot while verify has two requests."""
+        for pdmux in (False, True):
+            with self.subTest(pdmux=pdmux):
+                temporal = torch.full((10,), -1)
+                intermediate = torch.tensor([[10, 11, 12], [20, 21, 22]])
+
+                def backend(slots):
+                    def commit(*, last_correct_step_indices, **kwargs):
+                        if len(slots) != len(last_correct_step_indices):
+                            raise ValueError(
+                                "state indices and verify steps have different lengths"
+                            )
+                        temporal[slots] = intermediate[
+                            torch.arange(len(slots)), last_correct_step_indices
+                        ]
+
+                    return SimpleNamespace(update_mamba_state_after_mtp_verify=commit)
+
+                decode = backend([3, 7])
+                runner = SimpleNamespace(
+                    attn_backend=backend([0]) if pdmux else decode,
+                    decode_attn_backend=decode,
+                    model=object(),
+                )
+                worker = object.__new__(DFlashWorkerV2)
+                worker._need_mamba_verify_commit = True
+                worker._target_worker = SimpleNamespace(model_runner=runner)
+                batch = SimpleNamespace(
+                    mamba_track_indices=None, req_pool_indices=torch.tensor([5, 8])
+                )
+                with get_context().override_server_args(enable_pdmux=pdmux):
+                    worker._update_target_mamba_state_after_verify(
+                        batch=batch,
+                        seq_lens_pre_verify=torch.tensor([9, 13]),
+                        seq_lens_post_verify=torch.tensor([11, 16]),
+                        commit_lens=torch.tensor([2, 3]),
+                    )
+                expected = torch.full_like(temporal, -1)
+                expected[3], expected[7] = 11, 22
+                torch.testing.assert_close(temporal, expected)
+
+    def test_chunk_with_prefix_seeds_draft_pages_only_after_last_split(self):
+        """A split result must seed precisely the uncached prompt suffix.
+
+        Missing or premature injection leaves stale draft pages cacheable by
+        HiCache; using decode's communicator can reorder P/D collectives.
+        """
+        lengths = torch.tensor([7, 10])
+        features = torch.arange(10, dtype=torch.float32).view(5, 2)
+        locations = torch.tensor([2, 5, 7, 11, 14])
+        pages = torch.full((16, 2), -1.0)
+        writes, broadcasts = [], []
+
+        def inject(*, target_hidden, cache_loc, positions):
+            pages[cache_loc] = target_hidden
+            writes.append(positions.clone())
+
+        decode_group = SimpleNamespace(
+            world_size=2,
+            rank_in_group=0,
+            broadcast=lambda *a, **k: self.fail("prefill used decode communicator"),
+        )
+        prefill_group = SimpleNamespace(
+            broadcast=lambda values, src: broadcasts.append(values.clone())
+        )
+        partial = SimpleNamespace(logits_output=None, next_draft_input=None)
+        final = SimpleNamespace(
+            logits_output=SimpleNamespace(hidden_states=features),
+            next_token_ids=torch.tensor([21, 34]),
+        )
+        worker = object.__new__(DFlashWorkerV2)
+        worker._target_worker = SimpleNamespace(
+            forward_batch_split_prefill=Mock(side_effect=[partial, final])
+        )
+        worker.model_runner = SimpleNamespace(
+            prefill_attention_backend_str="torch_native"
+        )
+        worker._tp_sync = SpecTpSync(decode_group)
+        worker._tp_sync._sites = frozenset({SpecTpSyncSite.DFLASH_TARGET})
+        worker._append_target_hidden_to_draft_kv_by_loc = inject
+        batch = SimpleNamespace(
+            forward_mode=ForwardMode.SPLIT_PREFILL,
+            sampling_info=SimpleNamespace(is_all_greedy=True),
+            seq_lens=lengths,
+            seq_lens_cpu=lengths.clone(),
+            seq_lens_sum=17,
+            prefix_lens=[5, 7],
+            extend_lens=[2, 3],
+            out_cache_loc=locations,
+        )
+        with (
+            get_context().override_server_args(enable_dp_attention=False),
+            patch(
+                "sglang.srt.speculative.dflash_worker_v2.get_tp_group",
+                return_value=prefill_group,
+            ),
+        ):
+            self.assertIs(worker.forward_batch_split_prefill(batch), partial)
+            self.assertEqual(writes, [])
+            self.assertEqual(broadcasts, [])
+            result = worker.forward_batch_split_prefill(batch)
+        expected = torch.full_like(pages, -1)
+        expected[locations] = features
+        torch.testing.assert_close(pages, expected)
+        torch.testing.assert_close(writes[0], torch.tensor([5, 6, 7, 8, 9]))
+        torch.testing.assert_close(broadcasts[0], final.next_token_ids)
+        torch.testing.assert_close(
+            result.next_draft_input.bonus_tokens, final.next_token_ids
+        )
+        torch.testing.assert_close(result.next_draft_input.new_seq_lens, lengths)
+        self.assertIs(result.new_seq_lens, lengths)
+        self.assertIsNone(result.logits_output.hidden_states)
+        self.assertEqual(batch.seq_lens_sum, 17)
+        torch.testing.assert_close(batch.seq_lens_cpu, lengths)
 
 
 if __name__ == "__main__":

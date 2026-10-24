@@ -42,6 +42,7 @@ from sglang.srt.model_executor.runner_utils.pool import (
     graph_pool_borrow_enabled,
 )
 from sglang.srt.runtime_context import (
+    get_disagg,
     get_exec,
     get_parallel,
     get_schedule,
@@ -375,6 +376,19 @@ class DFlashWorkerV2(BaseSpecWorker):
         self.nccl_port = nccl_port
         self._target_worker = target_worker
         self.model_runner = target_worker.model_runner
+        disagg = get_disagg()
+        if (
+            disagg.enable_pdmux
+            and disagg.pdmux_prefill_mode == "layer_split"
+            and not getattr(
+                self.model_runner.model, "supports_pdmux_dflash_prefill", False
+            )
+        ):
+            raise NotImplementedError(
+                "PDMux layer-split + DFLASH requires a target model that preserves "
+                "auxiliary hidden states across split prefill. Qwen3.5 MoE text "
+                "prefill is currently supported."
+            )
         self._need_mamba_verify_commit = False
         self.page_size = get_schedule().page_size
         # Normalized in arg_groups.speculative_hook.handle_speculative_decoding.
@@ -1967,7 +1981,14 @@ class DFlashWorkerV2(BaseSpecWorker):
         """
         if not self._need_mamba_verify_commit:
             return
-        attn_backend = self.target_worker.model_runner.attn_backend
+        model_runner = self.target_worker.model_runner
+        # TARGET_VERIFY runs with decode metadata under PDMux. The prefill
+        # backend may still hold a different in-flight batch's state slots.
+        attn_backend = (
+            model_runner.decode_attn_backend
+            if get_disagg().enable_pdmux
+            else model_runner.attn_backend
+        )
 
         last_correct_step_indices = commit_lens.to(torch.int64) - 1
         mamba_steps_to_track = None
@@ -1991,7 +2012,6 @@ class DFlashWorkerV2(BaseSpecWorker):
                 torch.full_like(to_track_ith, -1, dtype=torch.int64),
             )
 
-        model_runner = self.target_worker.model_runner
         if hasattr(attn_backend, "update_mamba_state_after_mtp_verify"):
             attn_backend.update_mamba_state_after_mtp_verify(
                 last_correct_step_indices=last_correct_step_indices,
@@ -2181,6 +2201,101 @@ class DFlashWorkerV2(BaseSpecWorker):
     ) -> DFlashDraftInputV2:
         return make_draft_input_v2(bonus_tokens=bonus_tokens, new_seq_lens=new_seq_lens)
 
+    def forward_batch_split_prefill(
+        self, batch: ScheduleBatch
+    ) -> GenerationBatchResult:
+        """Capture target features across splits and seed draft KV once complete."""
+        self._validate_phase1_sampling_support(batch)
+        batch_output = self.target_worker.forward_batch_split_prefill(
+            batch, capture_hidden_mode=CaptureHiddenMode.FULL
+        )
+        if batch_output.logits_output is None:
+            return batch_output
+        return self._finalize_prefill(batch, batch_output, on_publish=None)
+
+    def _finalize_prefill(
+        self,
+        batch: ScheduleBatch,
+        batch_output: GenerationBatchResult,
+        on_publish,
+    ) -> GenerationBatchResult:
+        """Seed draft KV before publishing cacheable target pages.
+
+        Both ordinary and split prefill preserve batch.seq_lens and its CPU
+        mirror. HiCache transfers the corresponding draft KV as a sidecar.
+        """
+        logits_output, next_token_ids = (
+            batch_output.logits_output,
+            batch_output.next_token_ids,
+        )
+        # PDMux's prefill lane has its own communicator: using the decode
+        # communicator here can reorder collectives against concurrent verify.
+        self._tp_sync.sync(
+            SpecTpSyncSite.DFLASH_TARGET,
+            next_token_ids,
+            group=(
+                get_parallel().attn_tp_group
+                if get_parallel().enable_dp_attention
+                else get_tp_group()
+            ),
+        )
+        new_seq_lens = batch.seq_lens
+        batch_output.new_seq_lens = new_seq_lens
+        if on_publish is not None:
+            on_publish(batch_output.new_seq_lens)
+
+        # An idle DP rank runs the empty target prefill above to stay in
+        # the DP collective, but must skip the draft KV materialization,
+        # which needs per-request extend info.
+        if batch.forward_mode.is_idle():
+            batch_output.next_draft_input = DFlashDraftInputV2.create_idle_input(
+                device=self.device
+            )
+            return batch_output
+
+        if logits_output.hidden_states is None:
+            raise RuntimeError(
+                "DFLASH requires target aux hidden capture for prefill, but got None. "
+                "Make sure the target model has DFlash layers-to-capture configured."
+            )
+
+        if batch.extend_lens is None or batch.prefix_lens is None:
+            raise RuntimeError(
+                "DFLASH expected extend_lens / prefix_lens to be populated in extend mode, "
+                "but got None."
+            )
+
+        # Materialize prompt tokens into the draft KV cache immediately. This is required
+        # for radix cache safety (the scheduler may update radix after prefill returns).
+        device = next_token_ids.device
+        ctx_lens = torch.tensor(batch.extend_lens, dtype=torch.int32, device=device)
+        draft_seq_lens = torch.tensor(
+            batch.prefix_lens, dtype=torch.int32, device=device
+        )
+
+        if batch.out_cache_loc is None:
+            raise RuntimeError("DFLASH prefill expected out_cache_loc, but got None.")
+        positions, _ = compute_position(
+            self.model_runner.prefill_attention_backend_str,
+            draft_seq_lens,
+            ctx_lens,
+            int(sum(batch.extend_lens)),
+        )
+        self._append_target_hidden_to_draft_kv_by_loc(
+            target_hidden=logits_output.hidden_states,
+            cache_loc=batch.out_cache_loc,
+            positions=positions,
+        )
+
+        # Avoid copying large hidden-state buffers to CPU in overlap scheduling.
+        logits_output.hidden_states = None
+
+        batch_output.next_draft_input = self._make_next_draft_input_prefill(
+            bonus_tokens=next_token_ids,
+            seq_lens=new_seq_lens,
+        )
+        return batch_output
+
     def forward_batch_generation(
         self,
         batch: ScheduleBatch,
@@ -2198,69 +2313,7 @@ class DFlashWorkerV2(BaseSpecWorker):
                 capture_hidden_mode=CaptureHiddenMode.FULL,
             )
 
-            logits_output, next_token_ids = (
-                batch_output.logits_output,
-                batch_output.next_token_ids,
-            )
-            self._tp_sync.sync(SpecTpSyncSite.DFLASH_TARGET, next_token_ids)
-            new_seq_lens = batch.seq_lens
-            batch_output.new_seq_lens = new_seq_lens
-            if on_publish is not None:
-                on_publish(batch_output.new_seq_lens)
-
-            # An idle DP rank runs the empty target prefill above to stay in
-            # the DP collective, but must skip the draft KV materialization,
-            # which needs per-request extend info.
-            if batch.forward_mode.is_idle():
-                batch_output.next_draft_input = DFlashDraftInputV2.create_idle_input(
-                    device=self.device
-                )
-                return batch_output
-
-            if logits_output.hidden_states is None:
-                raise RuntimeError(
-                    "DFLASH requires target aux hidden capture for prefill, but got None. "
-                    "Make sure the target model has DFlash layers-to-capture configured."
-                )
-
-            if batch.extend_lens is None or batch.prefix_lens is None:
-                raise RuntimeError(
-                    "DFLASH expected extend_lens / prefix_lens to be populated in extend mode, "
-                    "but got None."
-                )
-
-            # Materialize prompt tokens into the draft KV cache immediately. This is required
-            # for radix cache safety (the scheduler may update radix after prefill returns).
-            device = next_token_ids.device
-            ctx_lens = torch.tensor(batch.extend_lens, dtype=torch.int32, device=device)
-            draft_seq_lens = torch.tensor(
-                batch.prefix_lens, dtype=torch.int32, device=device
-            )
-
-            if batch.out_cache_loc is None:
-                raise RuntimeError(
-                    "DFLASH prefill expected out_cache_loc, but got None."
-                )
-            positions, _ = compute_position(
-                self.model_runner.prefill_attention_backend_str,
-                draft_seq_lens,
-                ctx_lens,
-                int(sum(batch.extend_lens)),
-            )
-            self._append_target_hidden_to_draft_kv_by_loc(
-                target_hidden=logits_output.hidden_states,
-                cache_loc=batch.out_cache_loc,
-                positions=positions,
-            )
-
-            # Avoid copying large hidden-state buffers to CPU in overlap scheduling.
-            logits_output.hidden_states = None
-
-            batch_output.next_draft_input = self._make_next_draft_input_prefill(
-                bonus_tokens=next_token_ids,
-                seq_lens=new_seq_lens,
-            )
-            return batch_output
+            return self._finalize_prefill(batch, batch_output, on_publish)
 
         # Decode / target-verify stage.
         if batch.spec_info is None:

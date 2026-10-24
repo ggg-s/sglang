@@ -113,9 +113,11 @@ class SpecTpSync:
     def enabled(self, site: SpecTpSyncSite) -> bool:
         return site in self._sites
 
-    def sync(self, site: SpecTpSyncSite, values: torch.Tensor) -> torch.Tensor:
+    def sync(
+        self, site: SpecTpSyncSite, values: torch.Tensor, *, group=None
+    ) -> torch.Tensor:
         if site in self._sites:
-            self._tp_group.broadcast(values, src=0)
+            (self._tp_group if group is None else group).broadcast(values, src=0)
         return values
 
     def available_memory_gb(self, site: SpecTpSyncSite, device, gpu_id, *, group):
