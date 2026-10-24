@@ -154,3 +154,6 @@ token-layer split budget with a 16-layer limit. This changes how many layers run
 between decode submissions; the two 32768 prefill token limits are independent.
 See the [ReplaySSM follow-up results](qwen35_awq_replayssm_swe_results.md) for
 the measured 64K comparison and the remaining TTFT and numerical limitations.
+The [scheduler TTFT investigation](qwen35_awq_scheduler_ttft_results.md) records
+the CPU-length mirror wait, P88/P104 controls and rejected scheduling changes.
+Its clean rerun retained the same runtime and configuration.
