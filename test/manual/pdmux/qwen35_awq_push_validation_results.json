@@ -1,0 +1,85 @@
+{
+  "stage": "completed",
+  "date": "2026-10-25",
+  "purpose": "Pre-push CI packaging validation",
+  "cpu_tests": [
+    {
+      "path": "test/registered/unit/multiplex/test_pdmux_main_compat.py",
+      "exit_code": 0,
+      "tests": 8
+    },
+    {
+      "path": "test/registered/unit/multiplex/test_pdmux_decode_ready.py",
+      "exit_code": 0,
+      "tests": 20
+    },
+    {
+      "path": "test/registered/unit/multiplex/test_pdmux_temporal.py",
+      "exit_code": 0,
+      "tests": 7
+    },
+    {
+      "path": "test/registered/unit/multiplex/test_throughput_policy.py",
+      "exit_code": 0,
+      "tests": 16
+    },
+    {
+      "path": "test/registered/unit/spec/test_mixed_validation.py",
+      "exit_code": 0,
+      "tests": 14
+    },
+    {
+      "path": "test/registered/unit/spec/test_mixed_selection.py",
+      "exit_code": 0,
+      "tests": 5
+    }
+  ],
+  "cuda_tests": [
+    {
+      "path": "test/registered/kernel/speculative/test_eager_seq_lens_cpu.py",
+      "exit_code": 0,
+      "tests": 6
+    },
+    {
+      "path": "test/registered/kernel/speculative/test_mixed_marlin.py",
+      "exit_code": 0,
+      "tests": 7
+    },
+    {
+      "path": "test/registered/kernel/speculative/test_mixed_selection_graph.py",
+      "exit_code": 0,
+      "tests": 3
+    }
+  ],
+  "cpu_passed": 70,
+  "cuda_passed": 16,
+  "cuda_source_worktree_sha256": {
+    "test/registered/kernel/speculative/test_eager_seq_lens_cpu.py": "71f53b2d7292df0ab6342ef994b148aa15cfe5ce9db5fefc70e2a1b97356bc7d",
+    "test/registered/kernel/speculative/test_mixed_marlin.py": "130013b96837db44e93c0adaae762b85cd20caf0ea7d7c3a815f7fc4baa96b3c",
+    "test/registered/kernel/speculative/test_mixed_selection_graph.py": "10faea920d333e7a4de2f85614cf244683a466b43b2073ed74159ef632264d7c",
+    "python/sglang/srt/environ.py": "d3354eb4f8ed051bcb115235dca90c14251bbc4dbb38129132bbbe6cfb427696",
+    "python/sglang/srt/managers/overlap_utils.py": "510c36b29ecce68d84bb44dd9dc120119c1c4dd658481625c73248a62ca33b7f",
+    "python/sglang/srt/managers/scheduler.py": "d4b9060122fb2dbc5a9ec4f32e9c3936629ab7e3490d6736f720a23350fcdd6f",
+    "python/sglang/srt/model_executor/model_runner_components/attention_backend_setup.py": "64e3151d988a9234eb0d274d81a49f51d1b60f7c898dd409e455de3afd35f5e5",
+    "python/sglang/srt/multiplex/multiplexing_mixin.py": "34ed08b9858701e57b850e6af024731df64eb52edb98a39a92e7b7bb3b6763ba",
+    "python/sglang/srt/multiplex/pdmux_context.py": "96daad992e5f77b31d4a1c826c86f251e230dbdfb592b13f2454b2e80e281955",
+    "python/sglang/srt/multiplex/throughput_policy.py": "846eafca8137b3010a15e2d68693285ea999de57a412db3647174ed19616e719",
+    "python/sglang/srt/speculative/mixed_marlin.py": "9fde9dea4816d13bad50de6a2d25f91d8cfde08433dfb8fb000c00c6386cd135",
+    "python/sglang/srt/speculative/mixed_selection.py": "f32dab6de1a54ff0cd9cdaa5c752e825d4fed8220f2b0cf0409f0c82b827426e",
+    "python/sglang/srt/speculative/mixed_selection_graph.py": "17f3ffb2f3795b978afde52091e1a2c32f9c69d6901a881495993bc0a580f3ce",
+    "python/sglang/srt/layers/moe/fused_moe_triton/fused_marlin_moe.py": "63b6dbd725245bdf3c766eda391638ffcd2289f1edc007692a5c1cf16eec8e1e"
+  },
+  "import_only_cleanup": [
+    "test\\registered\\unit\\multiplex\\test_pdmux_temporal.py",
+    "test\\manual\\pdmux\\bench_mixed_reduction_tuning.py",
+    "test\\manual\\pdmux\\bench_mixed_selection.py",
+    "test\\manual\\pdmux\\mixed_eager_harness.py"
+  ],
+  "notes": [
+    "GPU tests moved from unit/spec to kernel/speculative and registered with the kernel suite; numerical code unchanged.",
+    "CPU selector test registers CPU CI without importing the serving runtime.",
+    "The two large generated result JSON files are losslessly compacted to satisfy the 1500 KiB file-size limit.",
+    "Historical report source paths/digests describe their retained snapshots. Fresh A100 model validation is still required.",
+    "No serving-default, model, tolerance or numerical-kernel change was introduced while preparing the push."
+  ]
+}

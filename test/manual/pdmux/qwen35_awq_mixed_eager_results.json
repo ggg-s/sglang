@@ -1,0 +1,3879 @@
+{
+  "date": "2026-10-25 Asia/Shanghai",
+  "objective": "Offline actual-model mixed prefill + full DFlash target verification correctness",
+  "status": "mixed_eager_implemented_numerical_state_gate_failed",
+  "mixed_graph_implemented": false,
+  "formal_serving_changed": false,
+  "C_implemented": false,
+  "config": {
+    "MAX_RUNNING_REQUESTS": "4",
+    "MEM_FRACTION": "0.9",
+    "MAMBA_CACHE": "24",
+    "BLOCK_SIZE": "8",
+    "CPU_OVERLAP": "1",
+    "DETERMINISTIC": "0",
+    "DFLASH": "1",
+    "HICACHE": "1",
+    "HICACHE_SIZE": "16",
+    "PDMUX": "0",
+    "REPLAYSSM_SPEC": "1",
+    "REPLAYSSM_CACHE_LEN": "32",
+    "MAX_TOTAL_TOKENS": "65536",
+    "PDMUX_CONFIG": "/root/rivermind-data/validation/pdmux-awq-qwen-20261024/sched-p88.yaml",
+    "SGLANG_PDMUX_TEMPORAL_LAYERS": "0",
+    "SGLANG_PDMUX_TEMPORAL_ADAPTIVE": "0",
+    "SGLANG_PDMUX_DECODE_READY": "off",
+    "TEMPORAL_AUDIT_PATH": "",
+    "BOUNDARY_DIAG_PATH": "",
+    "MIXED_OFFLINE_ROOT": "/root/rivermind-data/validation/mixed-eager-20261025"
+  },
+  "gpu": "NVIDIA A100-PCIE-40GB",
+  "source_base": "986d789766 plus frozen prior throughput experiment source",
+  "suite_manifest": {
+    "chunks": [
+      23,
+      32,
+      40,
+      64,
+      65,
+      128,
+      257,
+      430,
+      512
+    ],
+    "capacities": [
+      32,
+      32,
+      64,
+      64,
+      128,
+      128,
+      512,
+      512,
+      512
+    ],
+    "jobs": [
+      {
+        "nonce": "native-reductions-natural",
+        "rejection_fixture": false
+      },
+      {
+        "nonce": "native-reductions-rejection",
+        "rejection_fixture": true
+      },
+      {
+        "nonce": "frozen-input-state-reference",
+        "rejection_fixture": true,
+        "freeze_token_local_diagnostic": true
+      }
+    ],
+    "source_sha256": {
+      "python/sglang/srt/speculative/mixed_eager.py": "5aac2d9f586db7a58eff589d808ee742c2f7659691b40b462cdae2c2c7033796",
+      "test/registered/unit/spec/test_mixed_eager.py": "20e903e641c5a7391cf1010339406ace4f52bc3d0daa59078b393e61db82e5ba",
+      "test/manual/pdmux/mixed_eager_harness.py": "72bccd1f71471280dcc31908a1d70307584f31782f9fceb2c2f3c724aacd8501"
+    },
+    "started": 1792860172.102921
+  },
+  "tolerances": {
+    "rtol": 0.02,
+    "atol": 0.002,
+    "integers": "exact"
+  },
+  "method": [
+    "One prefill request plus three complete block8 verify requests; one anchor and seven speculative positions each.",
+    "Native draft graph produces proposals. Native verify graph, separate eager and mixed eager receive identical candidates per case.",
+    "Each comparison restores the same pre-verify target/draft KV, Conv/SSM, ReplaySSM and request mappings; acceptance is computed by native _accept_block.",
+    "Floating state reference is separate eager; native graph comparison checks acceptance/bonus rather than an independent full-state equality assertion.",
+    "Natural lane preserves proposals; rejection fixture changes two candidate IDs, never forces accepted lengths.",
+    "Across cases the unmodified native path advances D and the next P chunk once. Mixed state is not chained as an independent 9-round trajectory.",
+    "Snapshots check all Conv/SSM and ReplaySSM tensors; target/draft KV coverage includes all locations allocated to these requests plus sentinel zero, not every unallocated GPU page.",
+    "Frozen-intermediate lane substitutes separate-eager token-local projection/MoE outputs into mixed execution solely to isolate state routing; it cannot qualify graph correctness."
+  ],
+  "performance": {
+    "measured": false,
+    "reason": "Snapshot copies, synchronization, hooks and diagnostics invalidate serving throughput/latency measurements."
+  },
+  "lanes": {
+    "native-reductions-natural": {
+      "stage": "completed",
+      "gate_passed": false,
+      "diagnostic_only": false,
+      "cases": [
+        {
+          "turn": 0,
+          "p_prefix": 0,
+          "p_tokens": 23,
+          "p_capacity": 32,
+          "request_rows": [
+            1,
+            2,
+            3,
+            4
+          ],
+          "ring_before": {
+            "base": [
+              0,
+              0,
+              0,
+              0,
+              0
+            ],
+            "write": [
+              0,
+              0,
+              0,
+              0,
+              0
+            ]
+          },
+          "ring_read_wrap": false,
+          "ring_write_wrap": false,
+          "native_verify_graph": true,
+          "native_decisions": {
+            "accept": [
+              7,
+              7,
+              7
+            ],
+            "commits": [
+              8,
+              8,
+              8
+            ],
+            "bonus": [
+              413,
+              869,
+              835
+            ]
+          },
+          "acceptance_equal": true,
+          "native_acceptance_equal": true,
+          "safety_passed": true,
+          "state_mismatch_fields": [
+            "mamba.conv.0",
+            "mamba.temporal.0",
+            "mamba.replayssm_d.0",
+            "mamba.replayssm_k.0",
+            "mamba.replayssm_g.0",
+            "mamba.replayssm_rawv.0",
+            "mamba.conv_window_physical.0",
+            "target.key.3",
+            "target.key.7",
+            "target.value.7",
+            "target.key.11",
+            "target.value.11",
+            "target.key.15",
+            "target.value.15",
+            "target.key.19",
+            "target.value.19",
+            "target.key.23",
+            "target.value.23",
+            "target.key.27",
+            "target.value.27",
+            "target.key.31",
+            "target.value.31",
+            "target.key.35",
+            "target.value.35",
+            "target.key.39",
+            "target.value.39",
+            "draft.key.0",
+            "draft.value.0",
+            "draft.key.1",
+            "draft.value.1",
+            "draft.key.2",
+            "draft.value.2",
+            "draft.key.3",
+            "draft.value.3",
+            "draft.key.4",
+            "draft.value.4",
+            "draft.key.5",
+            "draft.value.5"
+          ],
+          "max_state_abs_difference": 5.4145965576171875,
+          "selected_regions": {
+            "mamba.conv.0.P": {
+              "max_abs": 0.6015625,
+              "rel_l2": 0.020061273127794266
+            },
+            "mamba.conv.0.V": {
+              "max_abs": 3.8671875,
+              "rel_l2": 0.031455401331186295
+            },
+            "mamba.temporal.0.P": {
+              "max_abs": 0.10343979299068451,
+              "rel_l2": 0.006257559638470411
+            },
+            "mamba.temporal.0.V": {
+              "max_abs": 0.0,
+              "rel_l2": 0.0
+            },
+            "target.value.39.P": {
+              "max_abs": 0.5546875,
+              "rel_l2": 0.007810554932802916
+            },
+            "target.value.39.V": {
+              "max_abs": 0.3095703125,
+              "rel_l2": 0.021049056202173233
+            },
+            "draft.value.5.P": {
+              "max_abs": 1.25390625,
+              "rel_l2": 0.02378949709236622
+            },
+            "draft.value.5.V": {
+              "max_abs": 3.4296875,
+              "rel_l2": 0.07444269210100174
+            }
+          },
+          "exact_boundary_checks_per_branch": [
+            45,
+            45
+          ]
+        },
+        {
+          "turn": 1,
+          "p_prefix": 23,
+          "p_tokens": 32,
+          "p_capacity": 32,
+          "request_rows": [
+            1,
+            2,
+            3,
+            4
+          ],
+          "ring_before": {
+            "base": [
+              0,
+              0,
+              0,
+              0,
+              0
+            ],
+            "write": [
+              0,
+              0,
+              8,
+              8,
+              8
+            ]
+          },
+          "ring_read_wrap": false,
+          "ring_write_wrap": false,
+          "native_verify_graph": true,
+          "native_decisions": {
+            "accept": [
+              7,
+              7,
+              7
+            ],
+            "commits": [
+              8,
+              8,
+              8
+            ],
+            "bonus": [
+              1067,
+              1989,
+              3553
+            ]
+          },
+          "acceptance_equal": true,
+          "native_acceptance_equal": true,
+          "safety_passed": true,
+          "state_mismatch_fields": [
+            "mamba.conv.0",
+            "mamba.temporal.0",
+            "mamba.replayssm_d.0",
+            "mamba.replayssm_k.0",
+            "mamba.replayssm_g.0",
+            "mamba.replayssm_rawv.0",
+            "mamba.conv_window_physical.0",
+            "target.key.3",
+            "target.value.3",
+            "target.key.7",
+            "target.value.7",
+            "target.key.11",
+            "target.value.11",
+            "target.key.15",
+            "target.value.15",
+            "target.key.19",
+            "target.value.19",
+            "target.key.23",
+            "target.value.23",
+            "target.key.27",
+            "target.value.27",
+            "target.key.31",
+            "target.value.31",
+            "target.key.35",
+            "target.value.35",
+            "target.key.39",
+            "target.value.39",
+            "draft.key.0",
+            "draft.value.0",
+            "draft.key.1",
+            "draft.value.1",
+            "draft.key.2",
+            "draft.value.2",
+            "draft.key.3",
+            "draft.value.3",
+            "draft.key.4",
+            "draft.value.4",
+            "draft.key.5",
+            "draft.value.5"
+          ],
+          "max_state_abs_difference": 15.1455078125,
+          "selected_regions": {
+            "mamba.conv.0.P": {
+              "max_abs": 2.0498046875,
+              "rel_l2": 0.040281862020492554
+            },
+            "mamba.conv.0.V": {
+              "max_abs": 11.619140625,
+              "rel_l2": 0.07168512046337128
+            },
+            "mamba.temporal.0.P": {
+              "max_abs": 0.10856328904628754,
+              "rel_l2": 0.010436139069497585
+            },
+            "mamba.temporal.0.V": {
+              "max_abs": 0.0,
+              "rel_l2": 0.0
+            },
+            "target.value.39.P": {
+              "max_abs": 0.3721923828125,
+              "rel_l2": 0.014980529434978962
+            },
+            "target.value.39.V": {
+              "max_abs": 0.5625,
+              "rel_l2": 0.0314665287733078
+            },
+            "draft.value.5.P": {
+              "max_abs": 2.05322265625,
+              "rel_l2": 0.05779418721795082
+            },
+            "draft.value.5.V": {
+              "max_abs": 15.1455078125,
+              "rel_l2": 0.19615331292152405
+            }
+          },
+          "exact_boundary_checks_per_branch": [
+            45,
+            45
+          ]
+        },
+        {
+          "turn": 2,
+          "p_prefix": 55,
+          "p_tokens": 40,
+          "p_capacity": 64,
+          "request_rows": [
+            1,
+            2,
+            3,
+            4
+          ],
+          "ring_before": {
+            "base": [
+              0,
+              0,
+              29,
+              29,
+              29
+            ],
+            "write": [
+              0,
+              0,
+              16,
+              16,
+              16
+            ]
+          },
+          "ring_read_wrap": true,
+          "ring_write_wrap": false,
+          "native_verify_graph": true,
+          "native_decisions": {
+            "accept": [
+              7,
+              7,
+              7
+            ],
+            "commits": [
+              8,
+              8,
+              8
+            ],
+            "bonus": [
+              262,
+              460,
+              1067
+            ]
+          },
+          "acceptance_equal": true,
+          "native_acceptance_equal": true,
+          "safety_passed": true,
+          "state_mismatch_fields": [
+            "mamba.conv.0",
+            "mamba.temporal.0",
+            "mamba.replayssm_d.0",
+            "mamba.replayssm_k.0",
+            "mamba.replayssm_g.0",
+            "mamba.replayssm_rawv.0",
+            "mamba.conv_window_physical.0",
+            "target.key.3",
+            "target.value.3",
+            "target.key.7",
+            "target.value.7",
+            "target.key.11",
+            "target.value.11",
+            "target.key.15",
+            "target.value.15",
+            "target.key.19",
+            "target.value.19",
+            "target.key.23",
+            "target.value.23",
+            "target.key.27",
+            "target.value.27",
+            "target.key.31",
+            "target.value.31",
+            "target.key.35",
+            "target.value.35",
+            "target.key.39",
+            "target.value.39",
+            "draft.key.0",
+            "draft.value.0",
+            "draft.key.1",
+            "draft.value.1",
+            "draft.key.2",
+            "draft.value.2",
+            "draft.key.3",
+            "draft.value.3",
+            "draft.key.4",
+            "draft.value.4",
+            "draft.key.5",
+            "draft.value.5"
+          ],
+          "max_state_abs_difference": 14.187995910644531,
+          "selected_regions": {
+            "mamba.conv.0.P": {
+              "max_abs": 1.5390625,
+              "rel_l2": 0.05266707390546799
+            },
+            "mamba.conv.0.V": {
+              "max_abs": 9.310546875,
+              "rel_l2": 0.06638305634260178
+            },
+            "mamba.temporal.0.P": {
+              "max_abs": 0.23238074779510498,
+              "rel_l2": 0.010801812633872032
+            },
+            "mamba.temporal.0.V": {
+              "max_abs": 0.2710981070995331,
+              "rel_l2": 0.008393767289817333
+            },
+            "target.value.39.P": {
+              "max_abs": 0.611328125,
+              "rel_l2": 0.019661100581288338
+            },
+            "target.value.39.V": {
+              "max_abs": 0.833984375,
+              "rel_l2": 0.03835634887218475
+            },
+            "draft.value.5.P": {
+              "max_abs": 3.546875,
+              "rel_l2": 0.07501378655433655
+            },
+            "draft.value.5.V": {
+              "max_abs": 7.859375,
+              "rel_l2": 0.13520295917987823
+            }
+          },
+          "exact_boundary_checks_per_branch": [
+            45,
+            45
+          ]
+        },
+        {
+          "turn": 3,
+          "p_prefix": 95,
+          "p_tokens": 64,
+          "p_capacity": 64,
+          "request_rows": [
+            1,
+            2,
+            3,
+            4
+          ],
+          "ring_before": {
+            "base": [
+              0,
+              0,
+              21,
+              21,
+              21
+            ],
+            "write": [
+              0,
+              0,
+              0,
+              0,
+              0
+            ]
+          },
+          "ring_read_wrap": false,
+          "ring_write_wrap": false,
+          "native_verify_graph": true,
+          "native_decisions": {
+            "accept": [
+              7,
+              7,
+              7
+            ],
+            "commits": [
+              8,
+              8,
+              8
+            ],
+            "bonus": [
+              1590,
+              198,
+              262
+            ]
+          },
+          "acceptance_equal": true,
+          "native_acceptance_equal": true,
+          "safety_passed": true,
+          "state_mismatch_fields": [
+            "mamba.conv.0",
+            "mamba.temporal.0",
+            "mamba.replayssm_d.0",
+            "mamba.replayssm_k.0",
+            "mamba.replayssm_g.0",
+            "mamba.replayssm_rawv.0",
+            "mamba.conv_window_physical.0",
+            "target.key.3",
+            "target.value.3",
+            "target.key.7",
+            "target.value.7",
+            "target.key.11",
+            "target.value.11",
+            "target.key.15",
+            "target.value.15",
+            "target.key.19",
+            "target.value.19",
+            "target.key.23",
+            "target.value.23",
+            "target.key.27",
+            "target.value.27",
+            "target.key.31",
+            "target.value.31",
+            "target.key.35",
+            "target.value.35",
+            "target.key.39",
+            "target.value.39",
+            "draft.key.0",
+            "draft.value.0",
+            "draft.key.1",
+            "draft.value.1",
+            "draft.key.2",
+            "draft.value.2",
+            "draft.key.3",
+            "draft.value.3",
+            "draft.key.4",
+            "draft.value.4",
+            "draft.key.5",
+            "draft.value.5"
+          ],
+          "max_state_abs_difference": 17.4765625,
+          "selected_regions": {
+            "mamba.conv.0.P": {
+              "max_abs": 1.234375,
+              "rel_l2": 0.031761474907398224
+            },
+            "mamba.conv.0.V": {
+              "max_abs": 1.65625,
+              "rel_l2": 0.031065214425325394
+            },
+            "mamba.temporal.0.P": {
+              "max_abs": 0.24595314264297485,
+              "rel_l2": 0.013744253665208817
+            },
+            "mamba.temporal.0.V": {
+              "max_abs": 0.0,
+              "rel_l2": 0.0
+            },
+            "target.value.39.P": {
+              "max_abs": 8.015625,
+              "rel_l2": 0.056886594742536545
+            },
+            "target.value.39.V": {
+              "max_abs": 0.4027099609375,
+              "rel_l2": 0.019966715946793556
+            },
+            "draft.value.5.P": {
+              "max_abs": 13.775390625,
+              "rel_l2": 0.18932336568832397
+            },
+            "draft.value.5.V": {
+              "max_abs": 2.6484375,
+              "rel_l2": 0.059114933013916016
+            }
+          },
+          "exact_boundary_checks_per_branch": [
+            45,
+            45
+          ]
+        },
+        {
+          "turn": 4,
+          "p_prefix": 159,
+          "p_tokens": 65,
+          "p_capacity": 128,
+          "request_rows": [
+            1,
+            2,
+            3,
+            4
+          ],
+          "ring_before": {
+            "base": [
+              0,
+              0,
+              21,
+              21,
+              21
+            ],
+            "write": [
+              0,
+              0,
+              8,
+              8,
+              8
+            ]
+          },
+          "ring_read_wrap": false,
+          "ring_write_wrap": true,
+          "native_verify_graph": true,
+          "native_decisions": {
+            "accept": [
+              7,
+              7,
+              7
+            ],
+            "commits": [
+              8,
+              8,
+              8
+            ],
+            "bonus": [
+              364,
+              869,
+              303
+            ]
+          },
+          "acceptance_equal": true,
+          "native_acceptance_equal": true,
+          "safety_passed": true,
+          "state_mismatch_fields": [
+            "mamba.conv.0",
+            "mamba.temporal.0",
+            "mamba.replayssm_d.0",
+            "mamba.replayssm_k.0",
+            "mamba.replayssm_g.0",
+            "mamba.replayssm_rawv.0",
+            "mamba.conv_window_physical.0",
+            "target.key.3",
+            "target.value.3",
+            "target.key.7",
+            "target.value.7",
+            "target.key.11",
+            "target.value.11",
+            "target.key.15",
+            "target.value.15",
+            "target.key.19",
+            "target.value.19",
+            "target.key.23",
+            "target.value.23",
+            "target.key.27",
+            "target.value.27",
+            "target.key.31",
+            "target.value.31",
+            "target.key.35",
+            "target.value.35",
+            "target.key.39",
+            "target.value.39",
+            "draft.key.0",
+            "draft.value.0",
+            "draft.key.1",
+            "draft.value.1",
+            "draft.key.2",
+            "draft.value.2",
+            "draft.key.3",
+            "draft.value.3",
+            "draft.key.4",
+            "draft.value.4",
+            "draft.key.5",
+            "draft.value.5"
+          ],
+          "max_state_abs_difference": 22.673507690429688,
+          "selected_regions": {
+            "mamba.conv.0.P": {
+              "max_abs": 1.67578125,
+              "rel_l2": 0.05207125097513199
+            },
+            "mamba.conv.0.V": {
+              "max_abs": 6.19140625,
+              "rel_l2": 0.08527938276529312
+            },
+            "mamba.temporal.0.P": {
+              "max_abs": 0.16437935829162598,
+              "rel_l2": 0.008533058688044548
+            },
+            "mamba.temporal.0.V": {
+              "max_abs": 0.0,
+              "rel_l2": 0.0
+            },
+            "target.value.39.P": {
+              "max_abs": 1.2109375,
+              "rel_l2": 0.032619185745716095
+            },
+            "target.value.39.V": {
+              "max_abs": 1.1680908203125,
+              "rel_l2": 0.044206660240888596
+            },
+            "draft.value.5.P": {
+              "max_abs": 7.87890625,
+              "rel_l2": 0.11598511785268784
+            },
+            "draft.value.5.V": {
+              "max_abs": 7.192626953125,
+              "rel_l2": 0.1482282280921936
+            }
+          },
+          "exact_boundary_checks_per_branch": [
+            45,
+            45
+          ]
+        },
+        {
+          "turn": 5,
+          "p_prefix": 224,
+          "p_tokens": 128,
+          "p_capacity": 128,
+          "request_rows": [
+            1,
+            2,
+            3,
+            4
+          ],
+          "ring_before": {
+            "base": [
+              0,
+              0,
+              21,
+              21,
+              21
+            ],
+            "write": [
+              0,
+              0,
+              16,
+              16,
+              16
+            ]
+          },
+          "ring_read_wrap": true,
+          "ring_write_wrap": false,
+          "native_verify_graph": true,
+          "native_decisions": {
+            "accept": [
+              7,
+              7,
+              7
+            ],
+            "commits": [
+              8,
+              8,
+              8
+            ],
+            "bonus": [
+              869,
+              835,
+              220
+            ]
+          },
+          "acceptance_equal": true,
+          "native_acceptance_equal": true,
+          "safety_passed": true,
+          "state_mismatch_fields": [
+            "mamba.conv.0",
+            "mamba.temporal.0",
+            "mamba.replayssm_d.0",
+            "mamba.replayssm_k.0",
+            "mamba.replayssm_g.0",
+            "mamba.replayssm_rawv.0",
+            "mamba.conv_window_physical.0",
+            "target.key.3",
+            "target.value.3",
+            "target.key.7",
+            "target.value.7",
+            "target.key.11",
+            "target.value.11",
+            "target.key.15",
+            "target.value.15",
+            "target.key.19",
+            "target.value.19",
+            "target.key.23",
+            "target.value.23",
+            "target.key.27",
+            "target.value.27",
+            "target.key.31",
+            "target.value.31",
+            "target.key.35",
+            "target.value.35",
+            "target.key.39",
+            "target.value.39",
+            "draft.key.0",
+            "draft.value.0",
+            "draft.key.1",
+            "draft.value.1",
+            "draft.key.2",
+            "draft.value.2",
+            "draft.key.3",
+            "draft.value.3",
+            "draft.key.4",
+            "draft.value.4",
+            "draft.key.5",
+            "draft.value.5"
+          ],
+          "max_state_abs_difference": 41.868896484375,
+          "selected_regions": {
+            "mamba.conv.0.P": {
+              "max_abs": 1.3056640625,
+              "rel_l2": 0.04247531667351723
+            },
+            "mamba.conv.0.V": {
+              "max_abs": 3.38671875,
+              "rel_l2": 0.08018861711025238
+            },
+            "mamba.temporal.0.P": {
+              "max_abs": 0.27959775924682617,
+              "rel_l2": 0.014406663365662098
+            },
+            "mamba.temporal.0.V": {
+              "max_abs": 0.6485152244567871,
+              "rel_l2": 0.011913499794900417
+            },
+            "target.value.39.P": {
+              "max_abs": 13.828125,
+              "rel_l2": 0.06263327598571777
+            },
+            "target.value.39.V": {
+              "max_abs": 1.049560546875,
+              "rel_l2": 0.03364080563187599
+            },
+            "draft.value.5.P": {
+              "max_abs": 27.5078125,
+              "rel_l2": 0.2330474555492401
+            },
+            "draft.value.5.V": {
+              "max_abs": 5.80859375,
+              "rel_l2": 0.10435009747743607
+            }
+          },
+          "exact_boundary_checks_per_branch": [
+            45,
+            45
+          ]
+        },
+        {
+          "turn": 6,
+          "p_prefix": 352,
+          "p_tokens": 257,
+          "p_capacity": 512,
+          "request_rows": [
+            1,
+            2,
+            3,
+            4
+          ],
+          "ring_before": {
+            "base": [
+              0,
+              0,
+              10,
+              10,
+              10
+            ],
+            "write": [
+              0,
+              0,
+              0,
+              0,
+              0
+            ]
+          },
+          "ring_read_wrap": false,
+          "ring_write_wrap": false,
+          "native_verify_graph": true,
+          "native_decisions": {
+            "accept": [
+              7,
+              7,
+              7
+            ],
+            "commits": [
+              8,
+              8,
+              8
+            ],
+            "bonus": [
+              1989,
+              3553,
+              348
+            ]
+          },
+          "acceptance_equal": true,
+          "native_acceptance_equal": true,
+          "safety_passed": true,
+          "state_mismatch_fields": [
+            "mamba.conv.0",
+            "mamba.temporal.0",
+            "mamba.replayssm_d.0",
+            "mamba.replayssm_k.0",
+            "mamba.replayssm_g.0",
+            "mamba.replayssm_rawv.0",
+            "mamba.conv_window_physical.0",
+            "target.key.3",
+            "target.value.3",
+            "target.key.7",
+            "target.value.7",
+            "target.key.11",
+            "target.value.11",
+            "target.key.15",
+            "target.value.15",
+            "target.key.19",
+            "target.value.19",
+            "target.key.23",
+            "target.value.23",
+            "target.key.27",
+            "target.value.27",
+            "target.key.31",
+            "target.value.31",
+            "target.key.35",
+            "target.value.35",
+            "target.key.39",
+            "target.value.39",
+            "draft.key.0",
+            "draft.value.0",
+            "draft.key.1",
+            "draft.value.1",
+            "draft.key.2",
+            "draft.value.2",
+            "draft.key.3",
+            "draft.value.3",
+            "draft.key.4",
+            "draft.value.4",
+            "draft.key.5",
+            "draft.value.5"
+          ],
+          "max_state_abs_difference": 24.796875,
+          "selected_regions": {
+            "mamba.conv.0.P": {
+              "max_abs": 13.994140625,
+              "rel_l2": 0.2514604926109314
+            },
+            "mamba.conv.0.V": {
+              "max_abs": 2.1015625,
+              "rel_l2": 0.04029938578605652
+            },
+            "mamba.temporal.0.P": {
+              "max_abs": 1.3631584644317627,
+              "rel_l2": 0.036333225667476654
+            },
+            "mamba.temporal.0.V": {
+              "max_abs": 0.0,
+              "rel_l2": 0.0
+            },
+            "target.value.39.P": {
+              "max_abs": 4.52886962890625,
+              "rel_l2": 0.04752787947654724
+            },
+            "target.value.39.V": {
+              "max_abs": 2.981689453125,
+              "rel_l2": 0.07126043736934662
+            },
+            "draft.value.5.P": {
+              "max_abs": 23.373046875,
+              "rel_l2": 0.21103429794311523
+            },
+            "draft.value.5.V": {
+              "max_abs": 16.8359375,
+              "rel_l2": 0.23730681836605072
+            }
+          },
+          "exact_boundary_checks_per_branch": [
+            45,
+            45
+          ]
+        },
+        {
+          "turn": 7,
+          "p_prefix": 609,
+          "p_tokens": 430,
+          "p_capacity": 512,
+          "request_rows": [
+            1,
+            2,
+            3,
+            4
+          ],
+          "ring_before": {
+            "base": [
+              0,
+              0,
+              10,
+              10,
+              10
+            ],
+            "write": [
+              0,
+              0,
+              8,
+              8,
+              8
+            ]
+          },
+          "ring_read_wrap": false,
+          "ring_write_wrap": false,
+          "native_verify_graph": true,
+          "native_decisions": {
+            "accept": [
+              7,
+              7,
+              7
+            ],
+            "commits": [
+              8,
+              8,
+              8
+            ],
+            "bonus": [
+              460,
+              1067,
+              271
+            ]
+          },
+          "acceptance_equal": true,
+          "native_acceptance_equal": true,
+          "safety_passed": true,
+          "state_mismatch_fields": [
+            "mamba.conv.0",
+            "mamba.temporal.0",
+            "mamba.replayssm_d.0",
+            "mamba.replayssm_k.0",
+            "mamba.replayssm_g.0",
+            "mamba.replayssm_rawv.0",
+            "mamba.conv_window_physical.0",
+            "target.key.3",
+            "target.value.3",
+            "target.key.7",
+            "target.value.7",
+            "target.key.11",
+            "target.value.11",
+            "target.key.15",
+            "target.value.15",
+            "target.key.19",
+            "target.value.19",
+            "target.key.23",
+            "target.value.23",
+            "target.key.27",
+            "target.value.27",
+            "target.key.31",
+            "target.value.31",
+            "target.key.35",
+            "target.value.35",
+            "target.key.39",
+            "target.value.39",
+            "draft.key.0",
+            "draft.value.0",
+            "draft.key.1",
+            "draft.value.1",
+            "draft.key.2",
+            "draft.value.2",
+            "draft.key.3",
+            "draft.value.3",
+            "draft.key.4",
+            "draft.value.4",
+            "draft.key.5",
+            "draft.value.5"
+          ],
+          "max_state_abs_difference": 23.0078125,
+          "selected_regions": {
+            "mamba.conv.0.P": {
+              "max_abs": 7.310546875,
+              "rel_l2": 0.2191610336303711
+            },
+            "mamba.conv.0.V": {
+              "max_abs": 0.94921875,
+              "rel_l2": 0.0319555401802063
+            },
+            "mamba.temporal.0.P": {
+              "max_abs": 0.8426552414894104,
+              "rel_l2": 0.03287355974316597
+            },
+            "mamba.temporal.0.V": {
+              "max_abs": 0.0,
+              "rel_l2": 0.0
+            },
+            "target.value.39.P": {
+              "max_abs": 2.8447265625,
+              "rel_l2": 0.04832455888390541
+            },
+            "target.value.39.V": {
+              "max_abs": 0.75146484375,
+              "rel_l2": 0.025925004854798317
+            },
+            "draft.value.5.P": {
+              "max_abs": 19.376953125,
+              "rel_l2": 0.20443566143512726
+            },
+            "draft.value.5.V": {
+              "max_abs": 4.205322265625,
+              "rel_l2": 0.08722303807735443
+            }
+          },
+          "exact_boundary_checks_per_branch": [
+            45,
+            45
+          ]
+        },
+        {
+          "turn": 8,
+          "p_prefix": 1039,
+          "p_tokens": 512,
+          "p_capacity": 512,
+          "request_rows": [
+            1,
+            2,
+            3,
+            4
+          ],
+          "ring_before": {
+            "base": [
+              0,
+              0,
+              10,
+              10,
+              10
+            ],
+            "write": [
+              0,
+              0,
+              16,
+              16,
+              16
+            ]
+          },
+          "ring_read_wrap": false,
+          "ring_write_wrap": true,
+          "native_verify_graph": true,
+          "native_decisions": {
+            "accept": [
+              7,
+              7,
+              7
+            ],
+            "commits": [
+              8,
+              8,
+              8
+            ],
+            "bonus": [
+              198,
+              262,
+              1067
+            ]
+          },
+          "acceptance_equal": true,
+          "native_acceptance_equal": true,
+          "safety_passed": true,
+          "state_mismatch_fields": [
+            "mamba.conv.0",
+            "mamba.temporal.0",
+            "mamba.replayssm_d.0",
+            "mamba.replayssm_k.0",
+            "mamba.replayssm_g.0",
+            "mamba.replayssm_rawv.0",
+            "mamba.conv_window_physical.0",
+            "target.key.3",
+            "target.value.3",
+            "target.key.7",
+            "target.value.7",
+            "target.key.11",
+            "target.value.11",
+            "target.key.15",
+            "target.value.15",
+            "target.key.19",
+            "target.value.19",
+            "target.key.23",
+            "target.value.23",
+            "target.key.27",
+            "target.value.27",
+            "target.key.31",
+            "target.value.31",
+            "target.key.35",
+            "target.value.35",
+            "target.key.39",
+            "target.value.39",
+            "draft.key.0",
+            "draft.value.0",
+            "draft.key.1",
+            "draft.value.1",
+            "draft.key.2",
+            "draft.value.2",
+            "draft.key.3",
+            "draft.value.3",
+            "draft.key.4",
+            "draft.value.4",
+            "draft.key.5",
+            "draft.value.5"
+          ],
+          "max_state_abs_difference": 25.25,
+          "selected_regions": {
+            "mamba.conv.0.P": {
+              "max_abs": 0.828125,
+              "rel_l2": 0.02644641511142254
+            },
+            "mamba.conv.0.V": {
+              "max_abs": 1.7001953125,
+              "rel_l2": 0.036244671791791916
+            },
+            "mamba.temporal.0.P": {
+              "max_abs": 0.1777639389038086,
+              "rel_l2": 0.011547408066689968
+            },
+            "mamba.temporal.0.V": {
+              "max_abs": 0.23056647181510925,
+              "rel_l2": 0.005663024727255106
+            },
+            "target.value.39.P": {
+              "max_abs": 3.3525390625,
+              "rel_l2": 0.04640868678689003
+            },
+            "target.value.39.V": {
+              "max_abs": 0.33984375,
+              "rel_l2": 0.019329585134983063
+            },
+            "draft.value.5.P": {
+              "max_abs": 19.2890625,
+              "rel_l2": 0.2002420574426651
+            },
+            "draft.value.5.V": {
+              "max_abs": 2.482421875,
+              "rel_l2": 0.05755102261900902
+            }
+          },
+          "exact_boundary_checks_per_branch": [
+            45,
+            45
+          ]
+        }
+      ],
+      "count": 9,
+      "acceptance_equal": 9,
+      "native_acceptance_equal": 9,
+      "safety_passed": 9,
+      "numerical_state_passed": 0,
+      "native_verify_graph_hits": 9,
+      "draft_graph_calls": 9,
+      "draft_graph_hits": 9,
+      "read_wrap_cases": 2,
+      "write_wrap_cases": 2
+    },
+    "native-reductions-rejection": {
+      "stage": "completed",
+      "gate_passed": false,
+      "diagnostic_only": false,
+      "cases": [
+        {
+          "turn": 0,
+          "p_prefix": 0,
+          "p_tokens": 23,
+          "p_capacity": 32,
+          "request_rows": [
+            1,
+            2,
+            3,
+            4
+          ],
+          "ring_before": {
+            "base": [
+              0,
+              0,
+              0,
+              0,
+              0
+            ],
+            "write": [
+              0,
+              0,
+              0,
+              0,
+              0
+            ]
+          },
+          "ring_read_wrap": false,
+          "ring_write_wrap": false,
+          "native_verify_graph": true,
+          "native_decisions": {
+            "accept": [
+              0,
+              3,
+              7
+            ],
+            "commits": [
+              1,
+              4,
+              8
+            ],
+            "bonus": [
+              364,
+              25,
+              835
+            ]
+          },
+          "acceptance_equal": true,
+          "native_acceptance_equal": true,
+          "safety_passed": true,
+          "state_mismatch_fields": [
+            "mamba.conv.0",
+            "mamba.temporal.0",
+            "mamba.replayssm_d.0",
+            "mamba.replayssm_k.0",
+            "mamba.replayssm_g.0",
+            "mamba.replayssm_rawv.0",
+            "mamba.conv_window_physical.0",
+            "target.key.3",
+            "target.key.7",
+            "target.value.7",
+            "target.key.11",
+            "target.value.11",
+            "target.key.15",
+            "target.value.15",
+            "target.key.19",
+            "target.value.19",
+            "target.key.23",
+            "target.value.23",
+            "target.key.27",
+            "target.value.27",
+            "target.key.31",
+            "target.value.31",
+            "target.key.35",
+            "target.value.35",
+            "target.key.39",
+            "target.value.39",
+            "draft.key.0",
+            "draft.value.0",
+            "draft.key.1",
+            "draft.value.1",
+            "draft.key.2",
+            "draft.value.2",
+            "draft.key.3",
+            "draft.value.3",
+            "draft.key.4",
+            "draft.value.4",
+            "draft.key.5",
+            "draft.value.5"
+          ],
+          "max_state_abs_difference": 6.003562927246094,
+          "selected_regions": {
+            "mamba.conv.0.P": {
+              "max_abs": 0.66015625,
+              "rel_l2": 0.022866034880280495
+            },
+            "mamba.conv.0.V": {
+              "max_abs": 2.0,
+              "rel_l2": 0.044723913073539734
+            },
+            "mamba.temporal.0.P": {
+              "max_abs": 0.1374734342098236,
+              "rel_l2": 0.006506955251097679
+            },
+            "mamba.temporal.0.V": {
+              "max_abs": 0.0,
+              "rel_l2": 0.0
+            },
+            "target.value.39.P": {
+              "max_abs": 0.0946044921875,
+              "rel_l2": 0.005758495535701513
+            },
+            "target.value.39.V": {
+              "max_abs": 0.716796875,
+              "rel_l2": 0.023083774372935295
+            },
+            "draft.value.5.P": {
+              "max_abs": 1.09375,
+              "rel_l2": 0.020908119156956673
+            },
+            "draft.value.5.V": {
+              "max_abs": 3.56884765625,
+              "rel_l2": 0.053639862686395645
+            }
+          },
+          "exact_boundary_checks_per_branch": [
+            45,
+            45
+          ]
+        },
+        {
+          "turn": 1,
+          "p_prefix": 23,
+          "p_tokens": 32,
+          "p_capacity": 32,
+          "request_rows": [
+            1,
+            2,
+            3,
+            4
+          ],
+          "ring_before": {
+            "base": [
+              0,
+              0,
+              0,
+              0,
+              0
+            ],
+            "write": [
+              0,
+              0,
+              1,
+              4,
+              8
+            ]
+          },
+          "ring_read_wrap": false,
+          "ring_write_wrap": false,
+          "native_verify_graph": true,
+          "native_decisions": {
+            "accept": [
+              0,
+              3,
+              7
+            ],
+            "commits": [
+              1,
+              4,
+              8
+            ],
+            "bonus": [
+              869,
+              869,
+              3553
+            ]
+          },
+          "acceptance_equal": true,
+          "native_acceptance_equal": true,
+          "safety_passed": true,
+          "state_mismatch_fields": [
+            "mamba.conv.0",
+            "mamba.temporal.0",
+            "mamba.replayssm_d.0",
+            "mamba.replayssm_k.0",
+            "mamba.replayssm_g.0",
+            "mamba.replayssm_rawv.0",
+            "mamba.conv_window_physical.0",
+            "target.key.3",
+            "target.value.3",
+            "target.key.7",
+            "target.value.7",
+            "target.key.11",
+            "target.value.11",
+            "target.key.15",
+            "target.value.15",
+            "target.key.19",
+            "target.value.19",
+            "target.key.23",
+            "target.value.23",
+            "target.key.27",
+            "target.value.27",
+            "target.key.31",
+            "target.value.31",
+            "target.key.35",
+            "target.value.35",
+            "target.key.39",
+            "target.value.39",
+            "draft.key.0",
+            "draft.value.0",
+            "draft.key.1",
+            "draft.value.1",
+            "draft.key.2",
+            "draft.value.2",
+            "draft.key.3",
+            "draft.value.3",
+            "draft.key.4",
+            "draft.value.4",
+            "draft.key.5",
+            "draft.value.5"
+          ],
+          "max_state_abs_difference": 23.283203125,
+          "selected_regions": {
+            "mamba.conv.0.P": {
+              "max_abs": 1.16015625,
+              "rel_l2": 0.03956688195466995
+            },
+            "mamba.conv.0.V": {
+              "max_abs": 13.4945068359375,
+              "rel_l2": 0.14006896317005157
+            },
+            "mamba.temporal.0.P": {
+              "max_abs": 0.14393573999404907,
+              "rel_l2": 0.010658289305865765
+            },
+            "mamba.temporal.0.V": {
+              "max_abs": 0.0,
+              "rel_l2": 0.0
+            },
+            "target.value.39.P": {
+              "max_abs": 0.4931640625,
+              "rel_l2": 0.015089215710759163
+            },
+            "target.value.39.V": {
+              "max_abs": 1.9091796875,
+              "rel_l2": 0.04375135526061058
+            },
+            "draft.value.5.P": {
+              "max_abs": 2.8125,
+              "rel_l2": 0.0600835420191288
+            },
+            "draft.value.5.V": {
+              "max_abs": 22.28515625,
+              "rel_l2": 0.20095038414001465
+            }
+          },
+          "exact_boundary_checks_per_branch": [
+            45,
+            45
+          ]
+        },
+        {
+          "turn": 2,
+          "p_prefix": 55,
+          "p_tokens": 40,
+          "p_capacity": 64,
+          "request_rows": [
+            1,
+            2,
+            3,
+            4
+          ],
+          "ring_before": {
+            "base": [
+              0,
+              0,
+              29,
+              29,
+              29
+            ],
+            "write": [
+              0,
+              0,
+              2,
+              8,
+              16
+            ]
+          },
+          "ring_read_wrap": true,
+          "ring_write_wrap": true,
+          "native_verify_graph": true,
+          "native_decisions": {
+            "accept": [
+              0,
+              3,
+              7
+            ],
+            "commits": [
+              1,
+              4,
+              8
+            ],
+            "bonus": [
+              303,
+              25,
+              1067
+            ]
+          },
+          "acceptance_equal": true,
+          "native_acceptance_equal": true,
+          "safety_passed": true,
+          "state_mismatch_fields": [
+            "mamba.conv.0",
+            "mamba.temporal.0",
+            "mamba.replayssm_d.0",
+            "mamba.replayssm_k.0",
+            "mamba.replayssm_g.0",
+            "mamba.replayssm_rawv.0",
+            "mamba.conv_window_physical.0",
+            "target.key.3",
+            "target.value.3",
+            "target.key.7",
+            "target.value.7",
+            "target.key.11",
+            "target.value.11",
+            "target.key.15",
+            "target.value.15",
+            "target.key.19",
+            "target.value.19",
+            "target.key.23",
+            "target.value.23",
+            "target.key.27",
+            "target.value.27",
+            "target.key.31",
+            "target.value.31",
+            "target.key.35",
+            "target.value.35",
+            "target.key.39",
+            "target.value.39",
+            "draft.key.0",
+            "draft.value.0",
+            "draft.key.1",
+            "draft.value.1",
+            "draft.key.2",
+            "draft.value.2",
+            "draft.key.3",
+            "draft.value.3",
+            "draft.key.4",
+            "draft.value.4",
+            "draft.key.5",
+            "draft.value.5"
+          ],
+          "max_state_abs_difference": 11.214797973632812,
+          "selected_regions": {
+            "mamba.conv.0.P": {
+              "max_abs": 2.33203125,
+              "rel_l2": 0.047596607357263565
+            },
+            "mamba.conv.0.V": {
+              "max_abs": 2.59375,
+              "rel_l2": 0.04456859827041626
+            },
+            "mamba.temporal.0.P": {
+              "max_abs": 0.5565605163574219,
+              "rel_l2": 0.01204783283174038
+            },
+            "mamba.temporal.0.V": {
+              "max_abs": 0.13648168742656708,
+              "rel_l2": 0.0022049604449421167
+            },
+            "target.value.39.P": {
+              "max_abs": 0.716796875,
+              "rel_l2": 0.02303249016404152
+            },
+            "target.value.39.V": {
+              "max_abs": 0.442779541015625,
+              "rel_l2": 0.022590572014451027
+            },
+            "draft.value.5.P": {
+              "max_abs": 3.50390625,
+              "rel_l2": 0.0817885771393776
+            },
+            "draft.value.5.V": {
+              "max_abs": 5.34130859375,
+              "rel_l2": 0.06912803649902344
+            }
+          },
+          "exact_boundary_checks_per_branch": [
+            45,
+            45
+          ]
+        },
+        {
+          "turn": 3,
+          "p_prefix": 95,
+          "p_tokens": 64,
+          "p_capacity": 64,
+          "request_rows": [
+            1,
+            2,
+            3,
+            4
+          ],
+          "ring_before": {
+            "base": [
+              0,
+              0,
+              29,
+              29,
+              21
+            ],
+            "write": [
+              0,
+              0,
+              3,
+              12,
+              0
+            ]
+          },
+          "ring_read_wrap": true,
+          "ring_write_wrap": false,
+          "native_verify_graph": true,
+          "native_decisions": {
+            "accept": [
+              0,
+              3,
+              7
+            ],
+            "commits": [
+              1,
+              4,
+              8
+            ],
+            "bonus": [
+              2663,
+              1989,
+              262
+            ]
+          },
+          "acceptance_equal": true,
+          "native_acceptance_equal": true,
+          "safety_passed": true,
+          "state_mismatch_fields": [
+            "mamba.conv.0",
+            "mamba.temporal.0",
+            "mamba.replayssm_d.0",
+            "mamba.replayssm_k.0",
+            "mamba.replayssm_g.0",
+            "mamba.replayssm_rawv.0",
+            "mamba.conv_window_physical.0",
+            "target.key.3",
+            "target.value.3",
+            "target.key.7",
+            "target.value.7",
+            "target.key.11",
+            "target.value.11",
+            "target.key.15",
+            "target.value.15",
+            "target.key.19",
+            "target.value.19",
+            "target.key.23",
+            "target.value.23",
+            "target.key.27",
+            "target.value.27",
+            "target.key.31",
+            "target.value.31",
+            "target.key.35",
+            "target.value.35",
+            "target.key.39",
+            "target.value.39",
+            "draft.key.0",
+            "draft.value.0",
+            "draft.key.1",
+            "draft.value.1",
+            "draft.key.2",
+            "draft.value.2",
+            "draft.key.3",
+            "draft.value.3",
+            "draft.key.4",
+            "draft.value.4",
+            "draft.key.5",
+            "draft.value.5"
+          ],
+          "max_state_abs_difference": 19.6484375,
+          "selected_regions": {
+            "mamba.conv.0.P": {
+              "max_abs": 0.8984375,
+              "rel_l2": 0.03234763815999031
+            },
+            "mamba.conv.0.V": {
+              "max_abs": 5.259765625,
+              "rel_l2": 0.039165835827589035
+            },
+            "mamba.temporal.0.P": {
+              "max_abs": 0.25454509258270264,
+              "rel_l2": 0.013012546114623547
+            },
+            "mamba.temporal.0.V": {
+              "max_abs": 0.0,
+              "rel_l2": 0.0
+            },
+            "target.value.39.P": {
+              "max_abs": 10.33642578125,
+              "rel_l2": 0.05418514832854271
+            },
+            "target.value.39.V": {
+              "max_abs": 0.35791015625,
+              "rel_l2": 0.019140446558594704
+            },
+            "draft.value.5.P": {
+              "max_abs": 19.6484375,
+              "rel_l2": 0.18379826843738556
+            },
+            "draft.value.5.V": {
+              "max_abs": 3.390625,
+              "rel_l2": 0.03761838749051094
+            }
+          },
+          "exact_boundary_checks_per_branch": [
+            45,
+            45
+          ]
+        },
+        {
+          "turn": 4,
+          "p_prefix": 159,
+          "p_tokens": 65,
+          "p_capacity": 128,
+          "request_rows": [
+            1,
+            2,
+            3,
+            4
+          ],
+          "ring_before": {
+            "base": [
+              0,
+              0,
+              29,
+              29,
+              21
+            ],
+            "write": [
+              0,
+              0,
+              4,
+              16,
+              8
+            ]
+          },
+          "ring_read_wrap": true,
+          "ring_write_wrap": true,
+          "native_verify_graph": true,
+          "native_decisions": {
+            "accept": [
+              0,
+              3,
+              7
+            ],
+            "commits": [
+              1,
+              4,
+              8
+            ],
+            "bonus": [
+              25,
+              17,
+              303
+            ]
+          },
+          "acceptance_equal": true,
+          "native_acceptance_equal": true,
+          "safety_passed": true,
+          "state_mismatch_fields": [
+            "mamba.conv.0",
+            "mamba.temporal.0",
+            "mamba.replayssm_d.0",
+            "mamba.replayssm_k.0",
+            "mamba.replayssm_g.0",
+            "mamba.replayssm_rawv.0",
+            "mamba.conv_window_physical.0",
+            "target.key.3",
+            "target.value.3",
+            "target.key.7",
+            "target.value.7",
+            "target.key.11",
+            "target.value.11",
+            "target.key.15",
+            "target.value.15",
+            "target.key.19",
+            "target.value.19",
+            "target.key.23",
+            "target.value.23",
+            "target.key.27",
+            "target.value.27",
+            "target.key.31",
+            "target.value.31",
+            "target.key.35",
+            "target.value.35",
+            "target.key.39",
+            "target.value.39",
+            "draft.key.0",
+            "draft.value.0",
+            "draft.key.1",
+            "draft.value.1",
+            "draft.key.2",
+            "draft.value.2",
+            "draft.key.3",
+            "draft.value.3",
+            "draft.key.4",
+            "draft.value.4",
+            "draft.key.5",
+            "draft.value.5"
+          ],
+          "max_state_abs_difference": 15.255859375,
+          "selected_regions": {
+            "mamba.conv.0.P": {
+              "max_abs": 1.77734375,
+              "rel_l2": 0.0530959777534008
+            },
+            "mamba.conv.0.V": {
+              "max_abs": 3.68359375,
+              "rel_l2": 0.06087811291217804
+            },
+            "mamba.temporal.0.P": {
+              "max_abs": 0.3333103358745575,
+              "rel_l2": 0.013496603816747665
+            },
+            "mamba.temporal.0.V": {
+              "max_abs": 0.23724037408828735,
+              "rel_l2": 0.005277811549603939
+            },
+            "target.value.39.P": {
+              "max_abs": 1.71826171875,
+              "rel_l2": 0.04597698897123337
+            },
+            "target.value.39.V": {
+              "max_abs": 0.65087890625,
+              "rel_l2": 0.03379667177796364
+            },
+            "draft.value.5.P": {
+              "max_abs": 14.881591796875,
+              "rel_l2": 0.17201367020606995
+            },
+            "draft.value.5.V": {
+              "max_abs": 6.24609375,
+              "rel_l2": 0.0887548178434372
+            }
+          },
+          "exact_boundary_checks_per_branch": [
+            45,
+            45
+          ]
+        },
+        {
+          "turn": 5,
+          "p_prefix": 224,
+          "p_tokens": 128,
+          "p_capacity": 128,
+          "request_rows": [
+            1,
+            2,
+            3,
+            4
+          ],
+          "ring_before": {
+            "base": [
+              0,
+              0,
+              29,
+              17,
+              21
+            ],
+            "write": [
+              0,
+              0,
+              5,
+              0,
+              16
+            ]
+          },
+          "ring_read_wrap": true,
+          "ring_write_wrap": false,
+          "native_verify_graph": true,
+          "native_decisions": {
+            "accept": [
+              0,
+              3,
+              7
+            ],
+            "commits": [
+              1,
+              4,
+              8
+            ],
+            "bonus": [
+              198,
+              460,
+              220
+            ]
+          },
+          "acceptance_equal": true,
+          "native_acceptance_equal": true,
+          "safety_passed": true,
+          "state_mismatch_fields": [
+            "mamba.conv.0",
+            "mamba.temporal.0",
+            "mamba.replayssm_d.0",
+            "mamba.replayssm_k.0",
+            "mamba.replayssm_g.0",
+            "mamba.replayssm_rawv.0",
+            "mamba.conv_window_physical.0",
+            "target.key.3",
+            "target.value.3",
+            "target.key.7",
+            "target.value.7",
+            "target.key.11",
+            "target.value.11",
+            "target.key.15",
+            "target.value.15",
+            "target.key.19",
+            "target.value.19",
+            "target.key.23",
+            "target.value.23",
+            "target.key.27",
+            "target.value.27",
+            "target.key.31",
+            "target.value.31",
+            "target.key.35",
+            "target.value.35",
+            "target.key.39",
+            "target.value.39",
+            "draft.key.0",
+            "draft.value.0",
+            "draft.key.1",
+            "draft.value.1",
+            "draft.key.2",
+            "draft.value.2",
+            "draft.key.3",
+            "draft.value.3",
+            "draft.key.4",
+            "draft.value.4",
+            "draft.key.5",
+            "draft.value.5"
+          ],
+          "max_state_abs_difference": 15.8671875,
+          "selected_regions": {
+            "mamba.conv.0.P": {
+              "max_abs": 1.4287109375,
+              "rel_l2": 0.03904329612851143
+            },
+            "mamba.conv.0.V": {
+              "max_abs": 1.354736328125,
+              "rel_l2": 0.032993048429489136
+            },
+            "mamba.temporal.0.P": {
+              "max_abs": 0.2512636184692383,
+              "rel_l2": 0.010994927957654
+            },
+            "mamba.temporal.0.V": {
+              "max_abs": 0.03991347551345825,
+              "rel_l2": 0.0013226163573563099
+            },
+            "target.value.39.P": {
+              "max_abs": 3.376953125,
+              "rel_l2": 0.04008202627301216
+            },
+            "target.value.39.V": {
+              "max_abs": 0.474609375,
+              "rel_l2": 0.018623273819684982
+            },
+            "draft.value.5.P": {
+              "max_abs": 15.8671875,
+              "rel_l2": 0.1645464301109314
+            },
+            "draft.value.5.V": {
+              "max_abs": 2.73828125,
+              "rel_l2": 0.038325414061546326
+            }
+          },
+          "exact_boundary_checks_per_branch": [
+            45,
+            45
+          ]
+        },
+        {
+          "turn": 6,
+          "p_prefix": 352,
+          "p_tokens": 257,
+          "p_capacity": 512,
+          "request_rows": [
+            1,
+            2,
+            3,
+            4
+          ],
+          "ring_before": {
+            "base": [
+              0,
+              0,
+              26,
+              14,
+              10
+            ],
+            "write": [
+              0,
+              0,
+              6,
+              4,
+              0
+            ]
+          },
+          "ring_read_wrap": false,
+          "ring_write_wrap": false,
+          "native_verify_graph": true,
+          "native_decisions": {
+            "accept": [
+              0,
+              3,
+              7
+            ],
+            "commits": [
+              1,
+              4,
+              8
+            ],
+            "bonus": [
+              285,
+              11290,
+              348
+            ]
+          },
+          "acceptance_equal": true,
+          "native_acceptance_equal": true,
+          "safety_passed": true,
+          "state_mismatch_fields": [
+            "mamba.conv.0",
+            "mamba.temporal.0",
+            "mamba.replayssm_d.0",
+            "mamba.replayssm_k.0",
+            "mamba.replayssm_g.0",
+            "mamba.replayssm_rawv.0",
+            "mamba.conv_window_physical.0",
+            "target.key.3",
+            "target.value.3",
+            "target.key.7",
+            "target.value.7",
+            "target.key.11",
+            "target.value.11",
+            "target.key.15",
+            "target.value.15",
+            "target.key.19",
+            "target.value.19",
+            "target.key.23",
+            "target.value.23",
+            "target.key.27",
+            "target.value.27",
+            "target.key.31",
+            "target.value.31",
+            "target.key.35",
+            "target.value.35",
+            "target.key.39",
+            "target.value.39",
+            "draft.key.0",
+            "draft.value.0",
+            "draft.key.1",
+            "draft.value.1",
+            "draft.key.2",
+            "draft.value.2",
+            "draft.key.3",
+            "draft.value.3",
+            "draft.key.4",
+            "draft.value.4",
+            "draft.key.5",
+            "draft.value.5"
+          ],
+          "max_state_abs_difference": 21.27734375,
+          "selected_regions": {
+            "mamba.conv.0.P": {
+              "max_abs": 3.5,
+              "rel_l2": 0.10257089138031006
+            },
+            "mamba.conv.0.V": {
+              "max_abs": 1.3125,
+              "rel_l2": 0.019934436306357384
+            },
+            "mamba.temporal.0.P": {
+              "max_abs": 0.7290319204330444,
+              "rel_l2": 0.017120379954576492
+            },
+            "mamba.temporal.0.V": {
+              "max_abs": 0.0,
+              "rel_l2": 0.0
+            },
+            "target.value.39.P": {
+              "max_abs": 2.732421875,
+              "rel_l2": 0.040149956941604614
+            },
+            "target.value.39.V": {
+              "max_abs": 0.978759765625,
+              "rel_l2": 0.03632321208715439
+            },
+            "draft.value.5.P": {
+              "max_abs": 20.341796875,
+              "rel_l2": 0.17735227942466736
+            },
+            "draft.value.5.V": {
+              "max_abs": 7.67578125,
+              "rel_l2": 0.0819590613245964
+            }
+          },
+          "exact_boundary_checks_per_branch": [
+            45,
+            45
+          ]
+        },
+        {
+          "turn": 7,
+          "p_prefix": 609,
+          "p_tokens": 430,
+          "p_capacity": 512,
+          "request_rows": [
+            1,
+            2,
+            3,
+            4
+          ],
+          "ring_before": {
+            "base": [
+              0,
+              0,
+              26,
+              14,
+              10
+            ],
+            "write": [
+              0,
+              0,
+              7,
+              8,
+              8
+            ]
+          },
+          "ring_read_wrap": true,
+          "ring_write_wrap": false,
+          "native_verify_graph": true,
+          "native_decisions": {
+            "accept": [
+              0,
+              3,
+              7
+            ],
+            "commits": [
+              1,
+              4,
+              8
+            ],
+            "bonus": [
+              413,
+              198,
+              271
+            ]
+          },
+          "acceptance_equal": true,
+          "native_acceptance_equal": true,
+          "safety_passed": true,
+          "state_mismatch_fields": [
+            "mamba.conv.0",
+            "mamba.temporal.0",
+            "mamba.replayssm_d.0",
+            "mamba.replayssm_k.0",
+            "mamba.replayssm_g.0",
+            "mamba.replayssm_rawv.0",
+            "mamba.conv_window_physical.0",
+            "target.key.3",
+            "target.value.3",
+            "target.key.7",
+            "target.value.7",
+            "target.key.11",
+            "target.value.11",
+            "target.key.15",
+            "target.value.15",
+            "target.key.19",
+            "target.value.19",
+            "target.key.23",
+            "target.value.23",
+            "target.key.27",
+            "target.value.27",
+            "target.key.31",
+            "target.value.31",
+            "target.key.35",
+            "target.value.35",
+            "target.key.39",
+            "target.value.39",
+            "draft.key.0",
+            "draft.value.0",
+            "draft.key.1",
+            "draft.value.1",
+            "draft.key.2",
+            "draft.value.2",
+            "draft.key.3",
+            "draft.value.3",
+            "draft.key.4",
+            "draft.value.4",
+            "draft.key.5",
+            "draft.value.5"
+          ],
+          "max_state_abs_difference": 25.9375,
+          "selected_regions": {
+            "mamba.conv.0.P": {
+              "max_abs": 11.59375,
+              "rel_l2": 0.2221662998199463
+            },
+            "mamba.conv.0.V": {
+              "max_abs": 10.7421875,
+              "rel_l2": 0.07273738831281662
+            },
+            "mamba.temporal.0.P": {
+              "max_abs": 1.131611943244934,
+              "rel_l2": 0.032622382044792175
+            },
+            "mamba.temporal.0.V": {
+              "max_abs": 0.0,
+              "rel_l2": 0.0
+            },
+            "target.value.39.P": {
+              "max_abs": 10.31109619140625,
+              "rel_l2": 0.04841853305697441
+            },
+            "target.value.39.V": {
+              "max_abs": 1.4193115234375,
+              "rel_l2": 0.036526456475257874
+            },
+            "draft.value.5.P": {
+              "max_abs": 25.9375,
+              "rel_l2": 0.20165713131427765
+            },
+            "draft.value.5.V": {
+              "max_abs": 8.5078125,
+              "rel_l2": 0.08325342833995819
+            }
+          },
+          "exact_boundary_checks_per_branch": [
+            45,
+            45
+          ]
+        },
+        {
+          "turn": 8,
+          "p_prefix": 1039,
+          "p_tokens": 512,
+          "p_capacity": 512,
+          "request_rows": [
+            1,
+            2,
+            3,
+            4
+          ],
+          "ring_before": {
+            "base": [
+              0,
+              0,
+              26,
+              14,
+              10
+            ],
+            "write": [
+              0,
+              0,
+              8,
+              12,
+              16
+            ]
+          },
+          "ring_read_wrap": true,
+          "ring_write_wrap": true,
+          "native_verify_graph": true,
+          "native_decisions": {
+            "accept": [
+              0,
+              3,
+              7
+            ],
+            "commits": [
+              1,
+              4,
+              8
+            ],
+            "bonus": [
+              869,
+              2958,
+              1067
+            ]
+          },
+          "acceptance_equal": true,
+          "native_acceptance_equal": true,
+          "safety_passed": true,
+          "state_mismatch_fields": [
+            "mamba.conv.0",
+            "mamba.temporal.0",
+            "mamba.replayssm_d.0",
+            "mamba.replayssm_k.0",
+            "mamba.replayssm_g.0",
+            "mamba.replayssm_rawv.0",
+            "mamba.conv_window_physical.0",
+            "target.key.3",
+            "target.value.3",
+            "target.key.7",
+            "target.value.7",
+            "target.key.11",
+            "target.value.11",
+            "target.key.15",
+            "target.value.15",
+            "target.key.19",
+            "target.value.19",
+            "target.key.23",
+            "target.value.23",
+            "target.key.27",
+            "target.value.27",
+            "target.key.31",
+            "target.value.31",
+            "target.key.35",
+            "target.value.35",
+            "target.key.39",
+            "target.value.39",
+            "draft.key.0",
+            "draft.value.0",
+            "draft.key.1",
+            "draft.value.1",
+            "draft.key.2",
+            "draft.value.2",
+            "draft.key.3",
+            "draft.value.3",
+            "draft.key.4",
+            "draft.value.4",
+            "draft.key.5",
+            "draft.value.5"
+          ],
+          "max_state_abs_difference": 18.90234375,
+          "selected_regions": {
+            "mamba.conv.0.P": {
+              "max_abs": 0.8125,
+              "rel_l2": 0.02471480518579483
+            },
+            "mamba.conv.0.V": {
+              "max_abs": 0.9609375,
+              "rel_l2": 0.025816326960921288
+            },
+            "mamba.temporal.0.P": {
+              "max_abs": 0.17622795701026917,
+              "rel_l2": 0.010925574228167534
+            },
+            "mamba.temporal.0.V": {
+              "max_abs": 0.288909912109375,
+              "rel_l2": 0.003219262696802616
+            },
+            "target.value.39.P": {
+              "max_abs": 8.64398193359375,
+              "rel_l2": 0.043279293924570084
+            },
+            "target.value.39.V": {
+              "max_abs": 0.41357421875,
+              "rel_l2": 0.01755177043378353
+            },
+            "draft.value.5.P": {
+              "max_abs": 18.6328125,
+              "rel_l2": 0.19061556458473206
+            },
+            "draft.value.5.V": {
+              "max_abs": 1.84375,
+              "rel_l2": 0.03935321792960167
+            }
+          },
+          "exact_boundary_checks_per_branch": [
+            45,
+            45
+          ]
+        }
+      ],
+      "count": 9,
+      "acceptance_equal": 9,
+      "native_acceptance_equal": 9,
+      "safety_passed": 9,
+      "numerical_state_passed": 0,
+      "native_verify_graph_hits": 9,
+      "draft_graph_calls": 9,
+      "draft_graph_hits": 9,
+      "read_wrap_cases": 6,
+      "write_wrap_cases": 3
+    },
+    "frozen-input-state-reference": {
+      "stage": "completed",
+      "gate_passed": false,
+      "diagnostic_only": true,
+      "cases": [
+        {
+          "turn": 0,
+          "p_prefix": 0,
+          "p_tokens": 23,
+          "p_capacity": 32,
+          "request_rows": [
+            1,
+            2,
+            3,
+            4
+          ],
+          "ring_before": {
+            "base": [
+              0,
+              0,
+              0,
+              0,
+              0
+            ],
+            "write": [
+              0,
+              0,
+              0,
+              0,
+              0
+            ]
+          },
+          "ring_read_wrap": false,
+          "ring_write_wrap": false,
+          "native_verify_graph": true,
+          "native_decisions": {
+            "accept": [
+              0,
+              3,
+              7
+            ],
+            "commits": [
+              1,
+              4,
+              8
+            ],
+            "bonus": [
+              364,
+              25,
+              835
+            ]
+          },
+          "acceptance_equal": true,
+          "native_acceptance_equal": true,
+          "safety_passed": true,
+          "state_mismatch_fields": [],
+          "max_state_abs_difference": 0.0,
+          "selected_regions": {
+            "mamba.conv.0.P": {
+              "max_abs": 0.0,
+              "rel_l2": 0.0
+            },
+            "mamba.conv.0.V": {
+              "max_abs": 0.0,
+              "rel_l2": 0.0
+            },
+            "mamba.temporal.0.P": {
+              "max_abs": 0.0,
+              "rel_l2": 0.0
+            },
+            "mamba.temporal.0.V": {
+              "max_abs": 0.0,
+              "rel_l2": 0.0
+            },
+            "target.value.39.P": {
+              "max_abs": 0.0,
+              "rel_l2": 0.0
+            },
+            "target.value.39.V": {
+              "max_abs": 0.0,
+              "rel_l2": 0.0
+            },
+            "draft.value.5.P": {
+              "max_abs": 0.0,
+              "rel_l2": 0.0
+            },
+            "draft.value.5.V": {
+              "max_abs": 0.0,
+              "rel_l2": 0.0
+            }
+          },
+          "exact_boundary_checks_per_branch": [
+            45,
+            45
+          ]
+        },
+        {
+          "turn": 1,
+          "p_prefix": 23,
+          "p_tokens": 32,
+          "p_capacity": 32,
+          "request_rows": [
+            1,
+            2,
+            3,
+            4
+          ],
+          "ring_before": {
+            "base": [
+              0,
+              0,
+              0,
+              0,
+              0
+            ],
+            "write": [
+              0,
+              0,
+              1,
+              4,
+              8
+            ]
+          },
+          "ring_read_wrap": false,
+          "ring_write_wrap": false,
+          "native_verify_graph": true,
+          "native_decisions": {
+            "accept": [
+              0,
+              3,
+              7
+            ],
+            "commits": [
+              1,
+              4,
+              8
+            ],
+            "bonus": [
+              869,
+              869,
+              3553
+            ]
+          },
+          "acceptance_equal": true,
+          "native_acceptance_equal": true,
+          "safety_passed": true,
+          "state_mismatch_fields": [],
+          "max_state_abs_difference": 0.0,
+          "selected_regions": {
+            "mamba.conv.0.P": {
+              "max_abs": 0.0,
+              "rel_l2": 0.0
+            },
+            "mamba.conv.0.V": {
+              "max_abs": 0.0,
+              "rel_l2": 0.0
+            },
+            "mamba.temporal.0.P": {
+              "max_abs": 0.0,
+              "rel_l2": 0.0
+            },
+            "mamba.temporal.0.V": {
+              "max_abs": 0.0,
+              "rel_l2": 0.0
+            },
+            "target.value.39.P": {
+              "max_abs": 0.0,
+              "rel_l2": 0.0
+            },
+            "target.value.39.V": {
+              "max_abs": 0.0,
+              "rel_l2": 0.0
+            },
+            "draft.value.5.P": {
+              "max_abs": 0.0,
+              "rel_l2": 0.0
+            },
+            "draft.value.5.V": {
+              "max_abs": 0.0,
+              "rel_l2": 0.0
+            }
+          },
+          "exact_boundary_checks_per_branch": [
+            45,
+            45
+          ]
+        },
+        {
+          "turn": 2,
+          "p_prefix": 55,
+          "p_tokens": 40,
+          "p_capacity": 64,
+          "request_rows": [
+            1,
+            2,
+            3,
+            4
+          ],
+          "ring_before": {
+            "base": [
+              0,
+              0,
+              29,
+              29,
+              29
+            ],
+            "write": [
+              0,
+              0,
+              2,
+              8,
+              16
+            ]
+          },
+          "ring_read_wrap": true,
+          "ring_write_wrap": true,
+          "native_verify_graph": true,
+          "native_decisions": {
+            "accept": [
+              0,
+              3,
+              7
+            ],
+            "commits": [
+              1,
+              4,
+              8
+            ],
+            "bonus": [
+              303,
+              25,
+              1067
+            ]
+          },
+          "acceptance_equal": true,
+          "native_acceptance_equal": true,
+          "safety_passed": true,
+          "state_mismatch_fields": [],
+          "max_state_abs_difference": 0.0,
+          "selected_regions": {
+            "mamba.conv.0.P": {
+              "max_abs": 0.0,
+              "rel_l2": 0.0
+            },
+            "mamba.conv.0.V": {
+              "max_abs": 0.0,
+              "rel_l2": 0.0
+            },
+            "mamba.temporal.0.P": {
+              "max_abs": 0.0,
+              "rel_l2": 0.0
+            },
+            "mamba.temporal.0.V": {
+              "max_abs": 0.0,
+              "rel_l2": 0.0
+            },
+            "target.value.39.P": {
+              "max_abs": 0.0,
+              "rel_l2": 0.0
+            },
+            "target.value.39.V": {
+              "max_abs": 0.0,
+              "rel_l2": 0.0
+            },
+            "draft.value.5.P": {
+              "max_abs": 0.0,
+              "rel_l2": 0.0
+            },
+            "draft.value.5.V": {
+              "max_abs": 0.0,
+              "rel_l2": 0.0
+            }
+          },
+          "exact_boundary_checks_per_branch": [
+            45,
+            45
+          ]
+        },
+        {
+          "turn": 3,
+          "p_prefix": 95,
+          "p_tokens": 64,
+          "p_capacity": 64,
+          "request_rows": [
+            1,
+            2,
+            3,
+            4
+          ],
+          "ring_before": {
+            "base": [
+              0,
+              0,
+              29,
+              29,
+              21
+            ],
+            "write": [
+              0,
+              0,
+              3,
+              12,
+              0
+            ]
+          },
+          "ring_read_wrap": true,
+          "ring_write_wrap": false,
+          "native_verify_graph": true,
+          "native_decisions": {
+            "accept": [
+              0,
+              3,
+              7
+            ],
+            "commits": [
+              1,
+              4,
+              8
+            ],
+            "bonus": [
+              2663,
+              1989,
+              262
+            ]
+          },
+          "acceptance_equal": true,
+          "native_acceptance_equal": true,
+          "safety_passed": true,
+          "state_mismatch_fields": [],
+          "max_state_abs_difference": 0.0,
+          "selected_regions": {
+            "mamba.conv.0.P": {
+              "max_abs": 0.0,
+              "rel_l2": 0.0
+            },
+            "mamba.conv.0.V": {
+              "max_abs": 0.0,
+              "rel_l2": 0.0
+            },
+            "mamba.temporal.0.P": {
+              "max_abs": 0.0,
+              "rel_l2": 0.0
+            },
+            "mamba.temporal.0.V": {
+              "max_abs": 0.0,
+              "rel_l2": 0.0
+            },
+            "target.value.39.P": {
+              "max_abs": 0.0,
+              "rel_l2": 0.0
+            },
+            "target.value.39.V": {
+              "max_abs": 0.0,
+              "rel_l2": 0.0
+            },
+            "draft.value.5.P": {
+              "max_abs": 0.0,
+              "rel_l2": 0.0
+            },
+            "draft.value.5.V": {
+              "max_abs": 0.0,
+              "rel_l2": 0.0
+            }
+          },
+          "exact_boundary_checks_per_branch": [
+            45,
+            45
+          ]
+        },
+        {
+          "turn": 4,
+          "p_prefix": 159,
+          "p_tokens": 65,
+          "p_capacity": 128,
+          "request_rows": [
+            1,
+            2,
+            3,
+            4
+          ],
+          "ring_before": {
+            "base": [
+              0,
+              0,
+              29,
+              29,
+              21
+            ],
+            "write": [
+              0,
+              0,
+              4,
+              16,
+              8
+            ]
+          },
+          "ring_read_wrap": true,
+          "ring_write_wrap": true,
+          "native_verify_graph": true,
+          "native_decisions": {
+            "accept": [
+              0,
+              3,
+              7
+            ],
+            "commits": [
+              1,
+              4,
+              8
+            ],
+            "bonus": [
+              25,
+              17,
+              303
+            ]
+          },
+          "acceptance_equal": true,
+          "native_acceptance_equal": true,
+          "safety_passed": true,
+          "state_mismatch_fields": [],
+          "max_state_abs_difference": 0.0,
+          "selected_regions": {
+            "mamba.conv.0.P": {
+              "max_abs": 0.0,
+              "rel_l2": 0.0
+            },
+            "mamba.conv.0.V": {
+              "max_abs": 0.0,
+              "rel_l2": 0.0
+            },
+            "mamba.temporal.0.P": {
+              "max_abs": 0.0,
+              "rel_l2": 0.0
+            },
+            "mamba.temporal.0.V": {
+              "max_abs": 0.0,
+              "rel_l2": 0.0
+            },
+            "target.value.39.P": {
+              "max_abs": 0.0,
+              "rel_l2": 0.0
+            },
+            "target.value.39.V": {
+              "max_abs": 0.0,
+              "rel_l2": 0.0
+            },
+            "draft.value.5.P": {
+              "max_abs": 0.0,
+              "rel_l2": 0.0
+            },
+            "draft.value.5.V": {
+              "max_abs": 0.0,
+              "rel_l2": 0.0
+            }
+          },
+          "exact_boundary_checks_per_branch": [
+            45,
+            45
+          ]
+        },
+        {
+          "turn": 5,
+          "p_prefix": 224,
+          "p_tokens": 128,
+          "p_capacity": 128,
+          "request_rows": [
+            1,
+            2,
+            3,
+            4
+          ],
+          "ring_before": {
+            "base": [
+              0,
+              0,
+              29,
+              17,
+              21
+            ],
+            "write": [
+              0,
+              0,
+              5,
+              0,
+              16
+            ]
+          },
+          "ring_read_wrap": true,
+          "ring_write_wrap": false,
+          "native_verify_graph": true,
+          "native_decisions": {
+            "accept": [
+              0,
+              3,
+              7
+            ],
+            "commits": [
+              1,
+              4,
+              8
+            ],
+            "bonus": [
+              198,
+              460,
+              220
+            ]
+          },
+          "acceptance_equal": true,
+          "native_acceptance_equal": true,
+          "safety_passed": true,
+          "state_mismatch_fields": [],
+          "max_state_abs_difference": 0.0,
+          "selected_regions": {
+            "mamba.conv.0.P": {
+              "max_abs": 0.0,
+              "rel_l2": 0.0
+            },
+            "mamba.conv.0.V": {
+              "max_abs": 0.0,
+              "rel_l2": 0.0
+            },
+            "mamba.temporal.0.P": {
+              "max_abs": 0.0,
+              "rel_l2": 0.0
+            },
+            "mamba.temporal.0.V": {
+              "max_abs": 0.0,
+              "rel_l2": 0.0
+            },
+            "target.value.39.P": {
+              "max_abs": 0.0,
+              "rel_l2": 0.0
+            },
+            "target.value.39.V": {
+              "max_abs": 0.0,
+              "rel_l2": 0.0
+            },
+            "draft.value.5.P": {
+              "max_abs": 0.0,
+              "rel_l2": 0.0
+            },
+            "draft.value.5.V": {
+              "max_abs": 0.0,
+              "rel_l2": 0.0
+            }
+          },
+          "exact_boundary_checks_per_branch": [
+            45,
+            45
+          ]
+        },
+        {
+          "turn": 6,
+          "p_prefix": 352,
+          "p_tokens": 257,
+          "p_capacity": 512,
+          "request_rows": [
+            1,
+            2,
+            3,
+            4
+          ],
+          "ring_before": {
+            "base": [
+              0,
+              0,
+              26,
+              14,
+              10
+            ],
+            "write": [
+              0,
+              0,
+              6,
+              4,
+              0
+            ]
+          },
+          "ring_read_wrap": false,
+          "ring_write_wrap": false,
+          "native_verify_graph": true,
+          "native_decisions": {
+            "accept": [
+              0,
+              3,
+              7
+            ],
+            "commits": [
+              1,
+              4,
+              8
+            ],
+            "bonus": [
+              285,
+              11290,
+              348
+            ]
+          },
+          "acceptance_equal": true,
+          "native_acceptance_equal": true,
+          "safety_passed": true,
+          "state_mismatch_fields": [],
+          "max_state_abs_difference": 0.0,
+          "selected_regions": {
+            "mamba.conv.0.P": {
+              "max_abs": 0.0,
+              "rel_l2": 0.0
+            },
+            "mamba.conv.0.V": {
+              "max_abs": 0.0,
+              "rel_l2": 0.0
+            },
+            "mamba.temporal.0.P": {
+              "max_abs": 0.0,
+              "rel_l2": 0.0
+            },
+            "mamba.temporal.0.V": {
+              "max_abs": 0.0,
+              "rel_l2": 0.0
+            },
+            "target.value.39.P": {
+              "max_abs": 0.0,
+              "rel_l2": 0.0
+            },
+            "target.value.39.V": {
+              "max_abs": 0.0,
+              "rel_l2": 0.0
+            },
+            "draft.value.5.P": {
+              "max_abs": 0.0,
+              "rel_l2": 0.0
+            },
+            "draft.value.5.V": {
+              "max_abs": 0.0,
+              "rel_l2": 0.0
+            }
+          },
+          "exact_boundary_checks_per_branch": [
+            45,
+            45
+          ]
+        },
+        {
+          "turn": 7,
+          "p_prefix": 609,
+          "p_tokens": 430,
+          "p_capacity": 512,
+          "request_rows": [
+            1,
+            2,
+            3,
+            4
+          ],
+          "ring_before": {
+            "base": [
+              0,
+              0,
+              26,
+              14,
+              10
+            ],
+            "write": [
+              0,
+              0,
+              7,
+              8,
+              8
+            ]
+          },
+          "ring_read_wrap": true,
+          "ring_write_wrap": false,
+          "native_verify_graph": true,
+          "native_decisions": {
+            "accept": [
+              0,
+              3,
+              7
+            ],
+            "commits": [
+              1,
+              4,
+              8
+            ],
+            "bonus": [
+              413,
+              198,
+              271
+            ]
+          },
+          "acceptance_equal": true,
+          "native_acceptance_equal": true,
+          "safety_passed": true,
+          "state_mismatch_fields": [],
+          "max_state_abs_difference": 0.0,
+          "selected_regions": {
+            "mamba.conv.0.P": {
+              "max_abs": 0.0,
+              "rel_l2": 0.0
+            },
+            "mamba.conv.0.V": {
+              "max_abs": 0.0,
+              "rel_l2": 0.0
+            },
+            "mamba.temporal.0.P": {
+              "max_abs": 0.0,
+              "rel_l2": 0.0
+            },
+            "mamba.temporal.0.V": {
+              "max_abs": 0.0,
+              "rel_l2": 0.0
+            },
+            "target.value.39.P": {
+              "max_abs": 0.0,
+              "rel_l2": 0.0
+            },
+            "target.value.39.V": {
+              "max_abs": 0.0,
+              "rel_l2": 0.0
+            },
+            "draft.value.5.P": {
+              "max_abs": 0.0,
+              "rel_l2": 0.0
+            },
+            "draft.value.5.V": {
+              "max_abs": 0.0,
+              "rel_l2": 0.0
+            }
+          },
+          "exact_boundary_checks_per_branch": [
+            45,
+            45
+          ]
+        },
+        {
+          "turn": 8,
+          "p_prefix": 1039,
+          "p_tokens": 512,
+          "p_capacity": 512,
+          "request_rows": [
+            1,
+            2,
+            3,
+            4
+          ],
+          "ring_before": {
+            "base": [
+              0,
+              0,
+              26,
+              14,
+              10
+            ],
+            "write": [
+              0,
+              0,
+              8,
+              12,
+              16
+            ]
+          },
+          "ring_read_wrap": true,
+          "ring_write_wrap": true,
+          "native_verify_graph": true,
+          "native_decisions": {
+            "accept": [
+              0,
+              3,
+              7
+            ],
+            "commits": [
+              1,
+              4,
+              8
+            ],
+            "bonus": [
+              869,
+              2958,
+              1067
+            ]
+          },
+          "acceptance_equal": true,
+          "native_acceptance_equal": true,
+          "safety_passed": true,
+          "state_mismatch_fields": [],
+          "max_state_abs_difference": 0.0,
+          "selected_regions": {
+            "mamba.conv.0.P": {
+              "max_abs": 0.0,
+              "rel_l2": 0.0
+            },
+            "mamba.conv.0.V": {
+              "max_abs": 0.0,
+              "rel_l2": 0.0
+            },
+            "mamba.temporal.0.P": {
+              "max_abs": 0.0,
+              "rel_l2": 0.0
+            },
+            "mamba.temporal.0.V": {
+              "max_abs": 0.0,
+              "rel_l2": 0.0
+            },
+            "target.value.39.P": {
+              "max_abs": 0.0,
+              "rel_l2": 0.0
+            },
+            "target.value.39.V": {
+              "max_abs": 0.0,
+              "rel_l2": 0.0
+            },
+            "draft.value.5.P": {
+              "max_abs": 0.0,
+              "rel_l2": 0.0
+            },
+            "draft.value.5.V": {
+              "max_abs": 0.0,
+              "rel_l2": 0.0
+            }
+          },
+          "exact_boundary_checks_per_branch": [
+            45,
+            45
+          ]
+        }
+      ],
+      "count": 9,
+      "acceptance_equal": 9,
+      "native_acceptance_equal": 9,
+      "safety_passed": 9,
+      "numerical_state_passed": 9,
+      "native_verify_graph_hits": 9,
+      "draft_graph_calls": 9,
+      "draft_graph_hits": 9,
+      "read_wrap_cases": 6,
+      "write_wrap_cases": 3
+    }
+  },
+  "resolved_configuration_comparison": {
+    "baseline": "pdmux-throughput-action-fixed-20261024/baseline-1-server-info.json",
+    "runtime_differences": {
+      "startup_time": {
+        "baseline": {
+          "load_weight": 41.96273362822831,
+          "kv_cache_allocation": 1.6793522257357836,
+          "scheduler_e2e": 67.10567946359515,
+          "cuda_graph": {
+            "prefill": 0.0,
+            "decode": 0.0,
+            "target_verify": 3.486548848450184,
+            "draft_prefill": 0.0,
+            "draft_decode": 1.6239722296595573,
+            "draft_extend": 0.0
+          },
+          "tokenizer_e2e": 78.52493151091039
+        },
+        "offline": {
+          "load_weight": 44.89366962388158,
+          "kv_cache_allocation": 1.7005335073918104,
+          "scheduler_e2e": 68.6837663706392,
+          "cuda_graph": {
+            "prefill": 0.0,
+            "decode": 0.0,
+            "target_verify": 3.3920378983020782,
+            "draft_prefill": 0.0,
+            "draft_decode": 1.5717385467141867,
+            "draft_extend": 0.0
+          },
+          "tokenizer_e2e": 79.40031863003969
+        }
+      }
+    },
+    "unexpected_differences": {},
+    "nested_runtime_states_excluded": true
+  },
+  "final_validation": {
+    "stage": "completed",
+    "suite": [
+      {
+        "nonce": "native-reductions-natural",
+        "stage": "completed",
+        "gate_passed": false,
+        "error": null
+      },
+      {
+        "nonce": "native-reductions-rejection",
+        "stage": "completed",
+        "gate_passed": false,
+        "error": null
+      },
+      {
+        "nonce": "frozen-input-state-reference",
+        "stage": "completed",
+        "gate_passed": false,
+        "error": null
+      }
+    ],
+    "current": "test/registered/attention/unittests/gdn/test_gdn_replayssm_spec_fold.py",
+    "tests": [
+      {
+        "test": "test/registered/unit/spec/test_mixed_eager.py",
+        "exit_code": 0
+      },
+      {
+        "test": "test/registered/attention/unittests/gdn/test_gdn_replayssm_direct_commit.py",
+        "exit_code": 0
+      },
+      {
+        "test": "test/registered/attention/unittests/gdn/test_gdn_replayssm_spec_fold.py",
+        "exit_code": 0
+      }
+    ],
+    "cli_exit_code": 2,
+    "cli_summary": {
+      "runs": [
+        {
+          "nonce": "native-natural",
+          "stage": "completed",
+          "gate_passed": false
+        },
+        {
+          "nonce": "native-rejection",
+          "stage": "completed",
+          "gate_passed": false
+        },
+        {
+          "nonce": "state-routing-reference",
+          "stage": "completed",
+          "gate_passed": false
+        }
+      ],
+      "mixed_graph_gate": false,
+      "serving_path_changed": false,
+      "diagnostic_timings_are_not_performance_results": true
+    }
+  },
+  "gpu_after": "pid, process_name, used_gpu_memory [MiB]\n",
+  "cli_smoke": {
+    "runs": [
+      {
+        "nonce": "native-natural",
+        "stage": "completed",
+        "gate_passed": false
+      },
+      {
+        "nonce": "native-rejection",
+        "stage": "completed",
+        "gate_passed": false
+      },
+      {
+        "nonce": "state-routing-reference",
+        "stage": "completed",
+        "gate_passed": false
+      }
+    ],
+    "mixed_graph_gate": false,
+    "serving_path_changed": false,
+    "diagnostic_timings_are_not_performance_results": true
+  },
+  "cli_smoke_cases": {
+    "native-natural": {
+      "stage": "completed",
+      "pools_flushed": true,
+      "draft_graph_hits": [
+        true
+      ],
+      "cases": [
+        {
+          "turn": 0,
+          "p_prefix": 0,
+          "p_tokens": 23,
+          "p_capacity": 32,
+          "request_rows": [
+            1,
+            2,
+            3,
+            4
+          ],
+          "ring_before": {
+            "base": [
+              0,
+              0,
+              0,
+              0,
+              0
+            ],
+            "write": [
+              0,
+              0,
+              0,
+              0,
+              0
+            ]
+          },
+          "ring_read_wrap": false,
+          "ring_write_wrap": false,
+          "native_verify_graph": true,
+          "native_decisions": {
+            "accept": [
+              7,
+              7,
+              7
+            ],
+            "commits": [
+              8,
+              8,
+              8
+            ],
+            "bonus": [
+              413,
+              869,
+              835
+            ]
+          },
+          "acceptance_equal": true,
+          "native_acceptance_equal": true,
+          "safety_passed": true,
+          "state_mismatch_fields": [
+            "mamba.conv.0",
+            "mamba.temporal.0",
+            "mamba.replayssm_d.0",
+            "mamba.replayssm_k.0",
+            "mamba.replayssm_g.0",
+            "mamba.replayssm_rawv.0",
+            "mamba.conv_window_physical.0",
+            "target.key.3",
+            "target.key.7",
+            "target.value.7",
+            "target.key.11",
+            "target.value.11",
+            "target.key.15",
+            "target.value.15",
+            "target.key.19",
+            "target.value.19",
+            "target.key.23",
+            "target.value.23",
+            "target.key.27",
+            "target.value.27",
+            "target.key.31",
+            "target.value.31",
+            "target.key.35",
+            "target.value.35",
+            "target.key.39",
+            "target.value.39",
+            "draft.key.0",
+            "draft.value.0",
+            "draft.key.1",
+            "draft.value.1",
+            "draft.key.2",
+            "draft.value.2",
+            "draft.key.3",
+            "draft.value.3",
+            "draft.key.4",
+            "draft.value.4",
+            "draft.key.5",
+            "draft.value.5"
+          ],
+          "max_state_abs_difference": 6.173561096191406,
+          "selected_regions": {
+            "mamba.conv.0.P": {
+              "max_abs": 0.96875,
+              "rel_l2": 0.018541369587183
+            },
+            "mamba.conv.0.V": {
+              "max_abs": 1.93359375,
+              "rel_l2": 0.04265761002898216
+            },
+            "mamba.temporal.0.P": {
+              "max_abs": 0.07719135284423828,
+              "rel_l2": 0.0052798776887357235
+            },
+            "mamba.temporal.0.V": {
+              "max_abs": 0.0,
+              "rel_l2": 0.0
+            },
+            "target.value.39.P": {
+              "max_abs": 0.546875,
+              "rel_l2": 0.006540503352880478
+            },
+            "target.value.39.V": {
+              "max_abs": 0.76171875,
+              "rel_l2": 0.025607243180274963
+            },
+            "draft.value.5.P": {
+              "max_abs": 1.3125,
+              "rel_l2": 0.022698456421494484
+            },
+            "draft.value.5.V": {
+              "max_abs": 3.390625,
+              "rel_l2": 0.07882405072450638
+            }
+          },
+          "exact_boundary_checks_per_branch": [
+            45,
+            45
+          ]
+        }
+      ]
+    },
+    "native-rejection": {
+      "stage": "completed",
+      "pools_flushed": true,
+      "draft_graph_hits": [
+        true
+      ],
+      "cases": [
+        {
+          "turn": 0,
+          "p_prefix": 0,
+          "p_tokens": 23,
+          "p_capacity": 32,
+          "request_rows": [
+            1,
+            2,
+            3,
+            4
+          ],
+          "ring_before": {
+            "base": [
+              0,
+              0,
+              0,
+              0,
+              0
+            ],
+            "write": [
+              0,
+              0,
+              0,
+              0,
+              0
+            ]
+          },
+          "ring_read_wrap": false,
+          "ring_write_wrap": false,
+          "native_verify_graph": true,
+          "native_decisions": {
+            "accept": [
+              0,
+              3,
+              7
+            ],
+            "commits": [
+              1,
+              4,
+              8
+            ],
+            "bonus": [
+              364,
+              25,
+              835
+            ]
+          },
+          "acceptance_equal": true,
+          "native_acceptance_equal": true,
+          "safety_passed": true,
+          "state_mismatch_fields": [
+            "mamba.conv.0",
+            "mamba.temporal.0",
+            "mamba.replayssm_d.0",
+            "mamba.replayssm_k.0",
+            "mamba.replayssm_g.0",
+            "mamba.replayssm_rawv.0",
+            "mamba.conv_window_physical.0",
+            "target.key.3",
+            "target.key.7",
+            "target.value.7",
+            "target.key.11",
+            "target.value.11",
+            "target.key.15",
+            "target.value.15",
+            "target.key.19",
+            "target.value.19",
+            "target.key.23",
+            "target.value.23",
+            "target.key.27",
+            "target.value.27",
+            "target.key.31",
+            "target.value.31",
+            "target.key.35",
+            "target.value.35",
+            "target.key.39",
+            "target.value.39",
+            "draft.key.0",
+            "draft.value.0",
+            "draft.key.1",
+            "draft.value.1",
+            "draft.key.2",
+            "draft.value.2",
+            "draft.key.3",
+            "draft.value.3",
+            "draft.key.4",
+            "draft.value.4",
+            "draft.key.5",
+            "draft.value.5"
+          ],
+          "max_state_abs_difference": 4.1328125,
+          "selected_regions": {
+            "mamba.conv.0.P": {
+              "max_abs": 0.696044921875,
+              "rel_l2": 0.02287599816918373
+            },
+            "mamba.conv.0.V": {
+              "max_abs": 2.0546875,
+              "rel_l2": 0.028665998950600624
+            },
+            "mamba.temporal.0.P": {
+              "max_abs": 0.08315145969390869,
+              "rel_l2": 0.005880880169570446
+            },
+            "mamba.temporal.0.V": {
+              "max_abs": 0.0,
+              "rel_l2": 0.0
+            },
+            "target.value.39.P": {
+              "max_abs": 0.166015625,
+              "rel_l2": 0.0058412617072463036
+            },
+            "target.value.39.V": {
+              "max_abs": 0.67578125,
+              "rel_l2": 0.02102005109190941
+            },
+            "draft.value.5.P": {
+              "max_abs": 1.1787109375,
+              "rel_l2": 0.02272632345557213
+            },
+            "draft.value.5.V": {
+              "max_abs": 2.787109375,
+              "rel_l2": 0.04370018467307091
+            }
+          },
+          "exact_boundary_checks_per_branch": [
+            45,
+            45
+          ]
+        }
+      ]
+    },
+    "state-routing-reference": {
+      "stage": "completed",
+      "pools_flushed": true,
+      "draft_graph_hits": [
+        true
+      ],
+      "cases": [
+        {
+          "turn": 0,
+          "p_prefix": 0,
+          "p_tokens": 23,
+          "p_capacity": 32,
+          "request_rows": [
+            1,
+            2,
+            3,
+            4
+          ],
+          "ring_before": {
+            "base": [
+              0,
+              0,
+              0,
+              0,
+              0
+            ],
+            "write": [
+              0,
+              0,
+              0,
+              0,
+              0
+            ]
+          },
+          "ring_read_wrap": false,
+          "ring_write_wrap": false,
+          "native_verify_graph": true,
+          "native_decisions": {
+            "accept": [
+              0,
+              3,
+              7
+            ],
+            "commits": [
+              1,
+              4,
+              8
+            ],
+            "bonus": [
+              364,
+              25,
+              835
+            ]
+          },
+          "acceptance_equal": true,
+          "native_acceptance_equal": true,
+          "safety_passed": true,
+          "state_mismatch_fields": [],
+          "max_state_abs_difference": 0.0,
+          "selected_regions": {
+            "mamba.conv.0.P": {
+              "max_abs": 0.0,
+              "rel_l2": 0.0
+            },
+            "mamba.conv.0.V": {
+              "max_abs": 0.0,
+              "rel_l2": 0.0
+            },
+            "mamba.temporal.0.P": {
+              "max_abs": 0.0,
+              "rel_l2": 0.0
+            },
+            "mamba.temporal.0.V": {
+              "max_abs": 0.0,
+              "rel_l2": 0.0
+            },
+            "target.value.39.P": {
+              "max_abs": 0.0,
+              "rel_l2": 0.0
+            },
+            "target.value.39.V": {
+              "max_abs": 0.0,
+              "rel_l2": 0.0
+            },
+            "draft.value.5.P": {
+              "max_abs": 0.0,
+              "rel_l2": 0.0
+            },
+            "draft.value.5.V": {
+              "max_abs": 0.0,
+              "rel_l2": 0.0
+            }
+          },
+          "exact_boundary_checks_per_branch": [
+            45,
+            45
+          ]
+        }
+      ]
+    }
+  },
+  "cli_resolved_configuration_comparison": {
+    "unexpected_differences": {},
+    "ignored_runtime_keys": [
+      "internal_states",
+      "launch_command",
+      "nccl_port",
+      "port",
+      "startup_time"
+    ]
+  },
+  "final_source_sha256": {
+    "python/sglang/srt/speculative/mixed_eager.py": "5aac2d9f586db7a58eff589d808ee742c2f7659691b40b462cdae2c2c7033796",
+    "test/manual/pdmux/mixed_eager_harness.py": "1ec1eeef78d9ce23c6721adc0898f07c240636a10b1ad5e197b3443b38693d20",
+    "test/manual/pdmux/mixed_eager_control.py": "8c80751d01c1c808a172af7f0508559ead495ea034b8cdf02c1f26dc5b4dd510",
+    "test/manual/pdmux/run_mixed_eager.py": "ec4db83196507f657706b08310dd52411541b4b3b99090e5dca8ae18422395b2"
+  },
+  "final_local_source_sha256": {
+    "python/sglang/srt/speculative/mixed_eager.py": "5aac2d9f586db7a58eff589d808ee742c2f7659691b40b462cdae2c2c7033796",
+    "test/registered/unit/spec/test_mixed_eager.py": "20e903e641c5a7391cf1010339406ace4f52bc3d0daa59078b393e61db82e5ba",
+    "test/manual/pdmux/mixed_eager_harness.py": "1ec1eeef78d9ce23c6721adc0898f07c240636a10b1ad5e197b3443b38693d20",
+    "test/manual/pdmux/mixed_eager_control.py": "8c80751d01c1c808a172af7f0508559ead495ea034b8cdf02c1f26dc5b4dd510",
+    "test/manual/pdmux/run_mixed_eager.py": "ec4db83196507f657706b08310dd52411541b4b3b99090e5dca8ae18422395b2"
+  },
+  "diagnosis": {
+    "harness_lifecycle": "Full 27-case matrix used the frozen original harness. Final public harness additionally requires graph hits and uses no_grad for lazy worker planning-buffer allocation; a separate three-lane GPU smoke validates these changes. The first public CLI attempt failed after one case due to inference-tensor reuse by native warmup, and is retained as a failed run.",
+    "original_eager_self_repeat": "Original nondeterministic AWQ separate-eager repetition also has floating state differences; it is retained as a negative control.",
+    "fixed_reduction_diagnostic": "Disabling atomic reductions and selecting batch-invariant Marlin MoE stabilizes self repetition but actual mixed still fails the original tolerance; this diagnostic is not a permitted baseline change.",
+    "feature_probe": "First-layer projection relative L2 differences are small (about 2e-5 to 3e-4); MoE output differences amplify by layer 3 in a fixed-reduction diagnostic. This supports batch-shape numerical sensitivity, not proof every discrepancy is harmless.",
+    "routing_reference": "Frozen token-local intermediates isolate routing/commit correctness; full-suite numerical and boundary counts are reported separately from the real mixed gate.",
+    "disposition": "Do not capture/adopt Mixed Graph or claim throughput gains until the actual AWQ mixed state criterion is satisfied without changing the agreed model/precision/configuration."
+  },
+  "graph_capacity_decision": {
+    "captured": [],
+    "candidates": [
+      32,
+      64,
+      128,
+      512
+    ],
+    "reason": "Short prior P tails are mostly 18-46 tokens; P128 alone wastes capacity. These are hypotheses, not a measured optimum. P512 is covered offline but no graph is authorized by the failed gate."
+  },
+  "raw_artifacts": {
+    "local": ".tmp/mixed-eager-20261025/raw-artifacts.tar.gz",
+    "sha256_file": ".tmp/mixed-eager-20261025/raw-artifacts.sha256",
+    "contents": "Reports, failed smoke attempts, diagnostics, source snapshots, configuration, native unit/kernel logs, public CLI smoke and cleanup evidence.",
+    "sha256": "4c647a9d73c3432aa8d7cb84f2235f7956d0e270a69f123b2f672547a989c431"
+  },
+  "verification": {
+    "raw_archive_sha256_verified": true,
+    "archive_members": 10477,
+    "final_local_sources_match_gpu_smoke": true,
+    "core_and_cpu_tests_unchanged_since_full_suite": true,
+    "resolved_configuration_unexpected_differences": 0
+  }
+}

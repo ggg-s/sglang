@@ -165,6 +165,7 @@ def fused_marlin_moe(
     gemm1_alpha: Optional[float] = None,
     activation: str = "silu",
     is_gated: bool = True,
+    deterministic_block_size_m: int = 8,
 ) -> torch.Tensor:
     """
     This function computes a Mixture of Experts (MoE) layer using two sets of
@@ -241,8 +242,13 @@ def fused_marlin_moe(
     # M block size selection logic
     # TODO: tune this further for specific models
     deterministic = is_batch_invariant_mode_enabled()
-    block_size_m = 8
-    if not deterministic:
+    if deterministic:
+        # Fixed across Separate/Mixed shapes. Full-K alone does not guarantee
+        # invariance if M changes the thread tile and its accumulation order.
+        if deterministic_block_size_m not in (8, 16, 32, 48, 64):
+            raise ValueError("Unsupported deterministic Marlin block size")
+        block_size_m = deterministic_block_size_m
+    else:
         for block_size_m in [8, 16, 32, 48, 64]:
             if M * topk / E / block_size_m < 0.9:
                 break

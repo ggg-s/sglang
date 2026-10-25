@@ -1,0 +1,416 @@
+{
+  "date": "2026-10-25 Asia/Shanghai",
+  "provenance": "Confirmed remote report summaries read during this task before SSH became unavailable; raw reports are not yet downloaded. This record does not replace those per-case reports.",
+  "fixed_contract": {
+    "model": "QuantTrio/Qwen3.5-35B-A3B-AWQ",
+    "draft": "z-lab/Qwen3.5-35B-A3B-DFlash",
+    "gpu": "A100-PCIE-40GB",
+    "tp": 1,
+    "block_size": 8,
+    "concurrency": 4,
+    "rtol": 0.02,
+    "atol": 0.002
+  },
+  "formal_serving_changed": false,
+  "C_implemented": false,
+  "sm_partition": false,
+  "quantization": {
+    "awq_moe_layers": 39,
+    "unquantized_moe_layers": 1,
+    "ordinary_awq_marlin_linear_calls": 0,
+    "excluded": [
+      "visual",
+      "linear_attn",
+      "self_attn",
+      "shared_expert",
+      "mlp.gate",
+      "model.layers.0.",
+      "mtp"
+    ]
+  },
+  "reference_contract": "Repaired Separate Eager versus repaired Mixed Eager/Graph with the same fixed FP16 Linear and full-K expert arithmetic. Original native Draft/Verify Graph supplies an additional acceptance/bonus control, not floating-state equivalence. Native original self-repeat failures remain negative evidence.",
+  "repair": {
+    "fp16_linear": "Fixed M16/N32/K64 tiles, FP32 accumulation, original FP16 inputs/weights/outputs; no checkpoint conversion.",
+    "marlin_moe": "Existing non-atomic full-K block-M8 expert path and consistent first-layer sum.",
+    "routing": "Native TopK unchanged; no forced/cached routes or accepted lengths.",
+    "scope": "Explicit offline context; restored on exit; original native arithmetic remains outside the context."
+  },
+  "audits": {
+    "layers": [
+      0,
+      3,
+      7,
+      15,
+      31,
+      39
+    ],
+    "expert_difference_unit": "Sum of token-row sorted expert-set differences across sampled layers; not distinct requests or tokens.",
+    "original": {
+      "repeat_state_fields_over_tolerance": 36,
+      "mixed_state_fields_over_tolerance": 38,
+      "repeat_expert_set_row_differences": 22,
+      "mixed_expert_set_row_differences": 43
+    },
+    "repaired": {
+      "repeat_state_fields_over_tolerance": 0,
+      "mixed_state_fields_over_tolerance": 0,
+      "repeat_expert_set_row_differences": 0,
+      "mixed_expert_set_row_differences": 0
+    },
+    "diagnostic_reports_qualify_gate": false
+  },
+  "eager": {
+    "gate_passed": true,
+    "cases": 18,
+    "natural_cases": 9,
+    "rejection_cases": 9,
+    "state_passed": 18,
+    "safety_passed": 18,
+    "acceptance_bonus_equal": 18,
+    "native_graph_acceptance_bonus_equal": 18,
+    "separate_repeat_checked": 18,
+    "separate_repeat_passed": 18,
+    "max_state_abs_difference": 0.0,
+    "chunks": [
+      23,
+      32,
+      40,
+      64,
+      65,
+      128,
+      257,
+      430,
+      512
+    ],
+    "capacities": [
+      32,
+      32,
+      64,
+      64,
+      128,
+      128,
+      512,
+      512,
+      512
+    ],
+    "same_previous_proposals": true,
+    "native_draft_verify_graphs_retained": true,
+    "reports": [
+      "/root/rivermind-data/validation/mixed-state-fix-20261025/stable-full-natural-report.json",
+      "/root/rivermind-data/validation/mixed-state-fix-20261025/stable-full-rejection-report.json"
+    ]
+  },
+  "mixed_graph": {
+    "implemented": true,
+    "serving_enabled": false,
+    "captured_after_full_eager_gates": true,
+    "gate_passed": true,
+    "cases": 18,
+    "natural_cases": 9,
+    "rejection_cases": 9,
+    "state_passed": 18,
+    "safety_passed": 18,
+    "acceptance_bonus_equal": 18,
+    "native_graph_acceptance_bonus_equal": 18,
+    "max_state_abs_difference": 0.0,
+    "replays": 18,
+    "reused_replays": 10,
+    "captures": 8,
+    "chunks": [
+      32,
+      32,
+      32,
+      128,
+      128,
+      512,
+      512,
+      23,
+      23
+    ],
+    "capacities": [
+      32,
+      32,
+      32,
+      128,
+      128,
+      512,
+      512,
+      32,
+      32
+    ],
+    "supported_capacities": [
+      32,
+      128,
+      512
+    ],
+    "exact_valid_length_is_eligibility": true,
+    "same_previous_proposals": true,
+    "reports": [
+      "/root/rivermind-data/validation/mixed-state-fix-20261025/graph-full-natural-fixed-memory-report.json",
+      "/root/rivermind-data/validation/mixed-state-fix-20261025/graph-full-rejection-fixed-memory-report.json"
+    ],
+    "extra_padding_cases": [
+      {
+        "p_tokens": 23,
+        "capacity": 32,
+        "gate_passed": true,
+        "max_state_abs_difference": 0.0
+      },
+      {
+        "p_tokens": 65,
+        "capacity": 128,
+        "gate_passed": true,
+        "max_state_abs_difference": 0.0,
+        "prefill_tracks": true,
+        "prefill_state_slots": [
+          10
+        ],
+        "verify_state_slots": [
+          1,
+          4,
+          7
+        ]
+      }
+    ],
+    "initial_failure": {
+      "report": "/root/rivermind-data/validation/mixed-state-fix-20261025/graph-full-natural-report.json",
+      "cause": "Private validator retained backend cycles and staged a redundant 1.46 GiB SSM device copy before capture.",
+      "repair": "Collect private cycles and restore CPU snapshot directly to existing GPU pool; no cache/model budget change."
+    }
+  },
+  "tests": {
+    "total_passed": 15,
+    "files": [
+      {
+        "path": "test/registered/unit/spec/test_mixed_eager.py",
+        "passed": 6
+      },
+      {
+        "path": "test/registered/unit/spec/test_mixed_marlin.py",
+        "passed": 4
+      },
+      {
+        "path": "test/registered/attention/unittests/gdn/test_gdn_replayssm_direct_commit.py",
+        "passed": 1
+      },
+      {
+        "path": "test/registered/attention/unittests/gdn/test_gdn_replayssm_spec_fold.py",
+        "passed": 4
+      }
+    ]
+  },
+  "controls": {
+    "original_reports_unchanged": [
+      "/root/rivermind-data/validation/mixed-eager-20261025/native-reductions-natural-report.json",
+      "/root/rivermind-data/validation/mixed-eager-20261025/native-reductions-rejection-report.json"
+    ],
+    "fixed_linear_only": "Failed: expert reduction repair is also required.",
+    "fp32_router_diagnostic": "Failed; not adopted.",
+    "obsolete_probe": "stable-fp16-and-marlin-4 used a cached old adapter, superseded by actual reloaded complete repair.",
+    "timings_are_performance": false
+  },
+  "limitations": [
+    "Floating-state equality is to repaired Separate arithmetic, not original native runtime.",
+    "KV snapshots cover allocated request locations plus sentinel zero, not every unallocated page.",
+    "Each case branches from native-advanced state; independent long chained mixed generation remains additional coverage.",
+    "Actual-model D prefixes stay below the 256-token tracking boundary; native component tests cover tracking/fold/rollback and P65 covers actual P tracking.",
+    "No scheduler integration, finish/admission transition coverage, long-context validation or throughput/latency gain established. Fixed-tile GEMMs may cost performance."
+  ],
+  "remote_evidence_root": "/root/rivermind-data/validation/mixed-state-fix-20261025",
+  "retrieval": {
+    "status": "server_powered_off_by_user",
+    "endpoint": "fj02-ssh.gpuhome.cc:30154",
+    "full_raw_reports_downloaded": false,
+    "raw_archive_sha256": null,
+    "private_matrix_server": "Stopped before standalone CLI smoke.",
+    "independent_cli_smoke": "Started after all 15 tests; final result/exit code not retrieved.",
+    "gpu_after_cleanup": "Not retrieved; standalone CLI driver owns a private process group and has finally cleanup, but final cleanup is unconfirmed.",
+    "pending": [
+      "Read finalize-status.json and standalone CLI summary/exit code.",
+      "Verify GPU process cleanup.",
+      "Run collect_results.py/package_results.py, download raw artifacts, verify SHA256 and frozen source hashes."
+    ]
+  },
+  "local_source_sha256": {
+    "python/sglang/srt/speculative/mixed_eager.py": "65d63dbdb4797ebf574ac5940fc331a167bd8f75664bd3d169ca33f04cc09529",
+    "python/sglang/srt/speculative/mixed_marlin.py": "d7a0b29ae80f96215e7f898d3bca78a18f4c112302ab6b5ae865a7c581d5b419",
+    "python/sglang/srt/speculative/mixed_graph.py": "33afb79adac8cf8cf9b1fdf95e3c417b25cbbff03fdb8836490d9e13722737c3",
+    "test/manual/pdmux/mixed_eager_harness.py": "23ee2c3ac7593d4cddc08a582f27be5cb003a46c51044d6c495a3a2c0f644e3f",
+    "test/manual/pdmux/mixed_eager_numerics.py": "bd8aa5023e66e5072119a1f6d36958004de3ea7e69ef257fd3fe3a62d76e82c7",
+    "test/manual/pdmux/mixed_eager_control.py": "8c80751d01c1c808a172af7f0508559ead495ea034b8cdf02c1f26dc5b4dd510",
+    "test/manual/pdmux/run_mixed_eager.py": "be0005e18a11a33bc314768206769f1f82afc4288283dfc7304454b3e8fd5cee",
+    "test/registered/unit/spec/test_mixed_eager.py": "20e903e641c5a7391cf1010339406ace4f52bc3d0daa59078b393e61db82e5ba",
+    "test/registered/unit/spec/test_mixed_marlin.py": "554ef045b0257276d1cc0fdefcb0902b28bc8760ae0e8c7949adb5a16ccf1d1b"
+  },
+  "local_source_note": "Pre-shutdown local source hashes; earlier A100 results retain their own frozen source snapshots. The post_shutdown_adaptation section separately records the current revision.",
+  "post_shutdown_adaptation": {
+    "status": "code_adaptation_and_local_regressions_complete",
+    "numerical_kernels_changed": false,
+    "graph_input_and_validation_contracts_changed": true,
+    "formal_serving_changed": false,
+    "full_model_rerun_required": true,
+    "a100_current_revision_tested": false,
+    "baseline_configuration_changed": false,
+    "tolerances_changed": false,
+    "local_prepare_only_plan": ".tmp/mixed-adapt-20261025/ready-plan/plan.json",
+    "wsl_unit_validation": {
+      "stage": "completed",
+      "interpreter": "/workspace/mixed-adapt-20261025/venv/bin/python",
+      "source_root": "/workspace/mixed-adapt-20261025/source",
+      "full_model_tested": false,
+      "numerical_mocks": false,
+      "serving_performance_measured": false,
+      "tests": [
+        {
+          "path": "test/registered/unit/spec/test_mixed_eager.py",
+          "exit_code": 0,
+          "tests_ran": 7,
+          "seconds": 4.534884929656982,
+          "log": "wsl-test_mixed_eager.log",
+          "skipped": 0,
+          "passed": true
+        },
+        {
+          "path": "test/registered/unit/spec/test_mixed_marlin.py",
+          "exit_code": 0,
+          "tests_ran": 5,
+          "seconds": 10.80348801612854,
+          "log": "wsl-test_mixed_marlin.log",
+          "skipped": 0,
+          "passed": true
+        },
+        {
+          "path": "test/registered/attention/unittests/gdn/test_gdn_replayssm_direct_commit.py",
+          "exit_code": 0,
+          "tests_ran": 1,
+          "seconds": 10.099753856658936,
+          "log": "wsl-test_gdn_replayssm_direct_commit.log",
+          "skipped": 0,
+          "passed": true
+        },
+        {
+          "path": "test/registered/attention/unittests/gdn/test_gdn_replayssm_spec_fold.py",
+          "exit_code": 0,
+          "tests_ran": 4,
+          "seconds": 11.836657762527466,
+          "log": "wsl-test_gdn_replayssm_spec_fold.log",
+          "skipped": 0,
+          "passed": true
+        },
+        {
+          "path": "test/registered/unit/spec/test_mixed_validation.py",
+          "exit_code": 0,
+          "tests_ran": 14,
+          "seconds": 0.16578269004821777,
+          "log": "wsl-test_mixed_validation.log",
+          "skipped": 0,
+          "passed": true
+        }
+      ],
+      "source_sha256": {
+        "python/sglang/srt/speculative/mixed_eager.py": "5a7078c3f26b3160dc2c9cbcaddca20b53b84dec0727860bdc3d00c5cdcd540a",
+        "python/sglang/srt/speculative/mixed_marlin.py": "d7a0b29ae80f96215e7f898d3bca78a18f4c112302ab6b5ae865a7c581d5b419",
+        "python/sglang/srt/speculative/mixed_graph.py": "bad3d9fff83d3c11a6f758a388fffe21aa50531552018af8facee1c497464622",
+        "test/manual/pdmux/mixed_eager_harness.py": "1cab9bf2eac7898d6e1ac1d59e40a59e01447fbee68d734eefadf75c4beacf3d",
+        "test/manual/pdmux/mixed_eager_validation.py": "5fa7f0407b6ea40cbc9682638359e3bcb80fef536465bb847dea21de50326557",
+        "test/manual/pdmux/mixed_eager_control.py": "850acada94b3672c2a2005469e2e27c5d11957450c10ebab364637172e3f2049",
+        "test/manual/pdmux/run_mixed_eager.py": "604b1076eff6ede2a548b6e376618666d20d0e10d417dbd9dff1d8ce4e09eb46",
+        "python/sglang/srt/layers/attention/hybrid_linear_attn_backend.py": "5bd4816c7336b3aacd6d33d7c21e44922862f33d752caec4e17871d2c6478f47",
+        "python/sglang/kernels/ops/attention/fla/gdn_replayssm_spec_fold.py": "46dfbf4273b8705603bd4d5c881c28542f21610ce31165f3785f2396e4c82b53",
+        "python/sglang/kernels/ops/attention/fla/gdn_replayssm_spec_decode.py": "a87cb14dda7502f2772439547f3768f7e7c104d8640f2b5de0d75bd8df525dca",
+        "python/sglang/kernels/ops/attention/fla/fused_sigmoid_gating_recurrent.py": "1e684ef763c98652a44fe56310c3499938dfc9bec1cd1ad9ebd0623c15b58fca",
+        "test/registered/unit/spec/test_mixed_eager.py": "055df61243503303d08e7b5c3aefa1c672a300e0d28f48727bc259fcf1df0a8a",
+        "test/registered/unit/spec/test_mixed_marlin.py": "f5e71bc6c32441649f6ad513ba1d4286002312a8864e7981e9ccb2cecf3f6388",
+        "test/registered/attention/unittests/gdn/test_gdn_replayssm_direct_commit.py": "3c0c6653a96a151dbde6fe38daaec15e6f9247706a1345768a51b00bb59da684",
+        "test/registered/attention/unittests/gdn/test_gdn_replayssm_spec_fold.py": "9e1bb7988b682ca0ff4aa0dc4f9d8a70ee5013696a4547c70e489e5b98cb36a3",
+        "test/registered/unit/spec/test_mixed_validation.py": "4fec9bac0bc14b865a1059739ab788e516923c22a6f5271e96c02438c4ccec3c"
+      },
+      "environment": {
+        "torch": "2.13.0+cu130",
+        "cuda": "13.0",
+        "triton": "3.7.1",
+        "gpu": "NVIDIA GeForce RTX 4060 Laptop GPU",
+        "compute_capability": [
+          8,
+          9
+        ],
+        "memory_bytes": 8585216000
+      },
+      "all_passed": true,
+      "total_tests": 31,
+      "compute_apps_after": "",
+      "compute_apps_after_runner_exit": "",
+      "gpu_driver_info": "NVIDIA GeForce RTX 4060 Laptop GPU, 592.82, 8188 MiB, 75 MiB",
+      "system": "Linux gq 6.6.87.2-microsoft-standard-WSL2 #1 SMP PREEMPT_DYNAMIC Thu Jun  5 18:30:46 UTC 2025 x86_64 x86_64 x86_64 GNU/Linux"
+    },
+    "baseline_source_comparison": {
+      "python/sglang/srt/models/qwen3_5.py": {
+        "bytes_equal": false,
+        "text_equal": true,
+        "executable_ast_equal": true
+      },
+      "python/sglang/srt/models/qwen3_next.py": {
+        "bytes_equal": true,
+        "text_equal": true,
+        "executable_ast_equal": true
+      },
+      "python/sglang/srt/layers/attention/hybrid_linear_attn_backend.py": {
+        "bytes_equal": false,
+        "text_equal": false,
+        "executable_ast_equal": true
+      },
+      "python/sglang/kernels/ops/attention/fla/gdn_replayssm_spec_fold.py": {
+        "bytes_equal": true,
+        "text_equal": true,
+        "executable_ast_equal": true
+      },
+      "python/sglang/kernels/ops/attention/fla/fused_sigmoid_gating_recurrent.py": {
+        "bytes_equal": false,
+        "text_equal": true,
+        "executable_ast_equal": true
+      },
+      "python/sglang/srt/layers/moe/fused_moe_triton/fused_marlin_moe.py": {
+        "bytes_equal": false,
+        "text_equal": true,
+        "executable_ast_equal": true
+      },
+      "python/sglang/srt/layers/moe/moe_runner/triton_utils/fused_moe.py": {
+        "bytes_equal": true,
+        "text_equal": true,
+        "executable_ast_equal": true
+      }
+    },
+    "tests_note": "The suite includes CPU layout/contracts, real CUDA FP16 GEMM/Graph and native GDN kernels. Mocked collaborators are restricted to orchestration tests; there is no full-model or throughput claim.",
+    "changes": [
+      "GPU-free prepare-only freezes unchanged baseline, all jobs and complete saved proposals with digests.",
+      "Graph gates require complete nine-case stable Eager with repeat checks, actual graph hits, successful cleanup, fixed tolerances and matching candidate source hashes.",
+      "Without previous proposal files, Graph replays proposals from its matching Eager lane.",
+      "Graph validates P/V buffers and host branches before copying; rejects unsupported real multimodal, LoRA, embedding overrides, tree/ragged verify inputs.",
+      "Atomic terminal reports preserve worker/cleanup/nonfinite failures; runtime summaries distinguish preparation, Eager and Graph outcomes."
+    ],
+    "pending": [
+      "Retrieve pre-shutdown A100 standalone CLI status and raw evidence after server power-on.",
+      "Rerun this revision on A100 with the same full-model proposals before performance A/B or scheduler integration."
+    ],
+    "source_sha256": {
+      "python/sglang/srt/speculative/mixed_eager.py": "5a7078c3f26b3160dc2c9cbcaddca20b53b84dec0727860bdc3d00c5cdcd540a",
+      "python/sglang/srt/speculative/mixed_graph.py": "bad3d9fff83d3c11a6f758a388fffe21aa50531552018af8facee1c497464622",
+      "python/sglang/srt/speculative/mixed_marlin.py": "d7a0b29ae80f96215e7f898d3bca78a18f4c112302ab6b5ae865a7c581d5b419",
+      "test/manual/pdmux/launch_qwen35_awq_dflash_overlap.sh": "bb30a982415acd6268f4acab509a266c92d10aa9ca05cd025f37657b90542558",
+      "test/manual/pdmux/mixed_eager_control.py": "850acada94b3672c2a2005469e2e27c5d11957450c10ebab364637172e3f2049",
+      "test/manual/pdmux/mixed_eager_harness.py": "1cab9bf2eac7898d6e1ac1d59e40a59e01447fbee68d734eefadf75c4beacf3d",
+      "test/manual/pdmux/mixed_eager_numerics.py": "bd8aa5023e66e5072119a1f6d36958004de3ea7e69ef257fd3fe3a62d76e82c7",
+      "test/manual/pdmux/mixed_eager_validation.py": "5fa7f0407b6ea40cbc9682638359e3bcb80fef536465bb847dea21de50326557",
+      "test/manual/pdmux/qwen35_dflash_overlap_runbook.md": "d5b87267617bf5845df47f95f4996ffdf9da4f43d5968dae4ef3851d79b0c0cd",
+      "test/manual/pdmux/run_mixed_eager.py": "604b1076eff6ede2a548b6e376618666d20d0e10d417dbd9dff1d8ce4e09eb46",
+      "test/registered/unit/spec/test_mixed_eager.py": "055df61243503303d08e7b5c3aefa1c672a300e0d28f48727bc259fcf1df0a8a",
+      "test/registered/unit/spec/test_mixed_marlin.py": "f5e71bc6c32441649f6ad513ba1d4286002312a8864e7981e9ccb2cecf3f6388",
+      "test/registered/unit/spec/test_mixed_validation.py": "4fec9bac0bc14b865a1059739ab788e516923c22a6f5271e96c02438c4ccec3c"
+    },
+    "archive": {
+      "local": ".tmp\\mixed-adapt-20261025\\mixed-code-adaptation.zip",
+      "sha256": "09da012b229ce11439cfc203f79b0c855abb2d51805a740a05bef1006cd66c4d",
+      "bytes": 146680
+    }
+  }
+}
