@@ -484,6 +484,13 @@ class Scheduler(
             not get_schedule().disable_overlap_schedule and use_mlx()
         )
         self.enable_pdmux = get_disagg().enable_pdmux
+        if (
+            envs.SGLANG_PDMUX_TEMPORAL_ADAPTIVE.get()
+            and envs.SGLANG_PDMUX_TEMPORAL_LAYERS.get() != 8
+        ):
+            raise ValueError("Adaptive temporal scheduling requires temporal_layers=8")
+        if envs.SGLANG_PDMUX_TEMPORAL_LAYERS.get() and not self.enable_pdmux:
+            raise ValueError("Temporal layer scheduling requires --enable-pdmux")
         # PDMux prefill lane mode. "standard" submits a prefill as one ordinary
         # EXTEND through the standard worker; "layer_split" keeps the per-layer
         # split path. Resolved once here -- server_args is frozen for the
@@ -1655,6 +1662,30 @@ class Scheduler(
             needs_cpu_seq_lens=needs_cpu_seq_lens,
             needs_confidence_relay=needs_confidence_relay,
         )
+
+        decode_ready_mode = envs.SGLANG_PDMUX_DECODE_READY.get()
+        if decode_ready_mode not in ("off", "mirror", "dispatch"):
+            raise ValueError(
+                "SGLANG_PDMUX_DECODE_READY must be off, mirror or dispatch"
+            )
+        self._pdmux_decode_ready_dispatch = decode_ready_mode == "dispatch"
+        if decode_ready_mode != "off":
+            if not (
+                is_cuda()
+                and self.enable_overlap
+                and self.enable_pdmux
+                and not self.pdmux_standard
+                and self.spec_algorithm.is_dflash()
+                and self.ps.tp_size == 1
+                and self.ps.pp_size == 1
+                and self.ps.attn_dp_size == 1
+            ):
+                raise ValueError(
+                    "PDMux decode-ready experiments require CUDA, DFlash overlap, "
+                    "layer_split, TP=1 and PP=1"
+                )
+            self.future_map.enable_eager_seq_lens_cpu()
+            logger.info("PDMux decode-ready experiment: %s", decode_ready_mode)
 
         self._confidence_budget_prepare = None
         if (
@@ -4761,6 +4792,14 @@ class Scheduler(
         batch: ScheduleBatch,
         result: Union[GenerationBatchResult, EmbeddingBatchResult],
     ):
+        throughput_snapshot = None
+        if (
+            getattr(self, "pdmux_temporal_adaptive", False)
+            and batch.forward_mode.is_decode()
+        ):
+            throughput_snapshot = [
+                (req, len(req.output_ids_through_stop)) for req in batch.reqs
+            ]
         # Flush async trace ops here: in overlap mode this CPU work runs while
         # the next batch's GPU forward is in flight, giving free overlap.
         flush_trace_batch(batch.reqs)
@@ -4797,6 +4836,14 @@ class Scheduler(
 
         self._maybe_clear_mm_inputs(batch)
         self.maybe_send_health_check_signal()
+        if throughput_snapshot is not None:
+            useful_tokens = sum(
+                max(0, len(req.output_ids_through_stop) - before)
+                for req, before in throughput_snapshot
+            )
+            self._temporal_policy.observe_output(
+                len(throughput_snapshot), useful_tokens
+            )
         self.metrics_reporter.update_device_timer()
 
     def _record_step_counters(

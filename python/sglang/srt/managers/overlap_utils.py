@@ -245,6 +245,21 @@ class ConfidenceRelay(msgspec.Struct):
         )
 
 
+@dataclass
+class SeqLensCpuTicket:
+    """One publication's host lengths; completion says nothing about draft KV.
+
+    The GPU snapshot isolates this D2H from subsequent relay writes. Host pool
+    generations reject recycled request rows, and publication generation rejects
+    a ticket superseded by a decode or prefill-merge publication.
+    """
+
+    generation: int
+    cpu_lens: torch.Tensor
+    pool_generation: torch.Tensor
+    done: Any
+
+
 class FutureMap:
     """Always-on pool-indexed relay for cross-iter values. Forward writes via
     publish/stash; next iter reads via resolve_forward_inputs / resolve_seq_lens_cpu.
@@ -269,6 +284,10 @@ class FutureMap:
         self.req_pool_size = req_to_token_pool.req_to_token.shape[0]
         # Kept for the mixed-tail late binding (reserved-slot gather).
         self.req_to_token = req_to_token_pool.req_to_token
+        self._req_pool = req_to_token_pool
+        self._seq_lens_cpu_slots = None
+        self._seq_lens_cpu_generation = 0
+        self._seq_lens_cpu_ticket: Optional[SeqLensCpuTicket] = None
 
         if _DEBUG_ASSERT:
             # Poisoned init: every row must be written before its first gather.
@@ -510,6 +529,65 @@ class FutureMap:
             int(x) for x in fresh_cpu.tolist()
         ]
 
+    def enable_eager_seq_lens_cpu(self) -> None:
+        """Opt in only for the audited single-rank DFlash PDMux experiment."""
+        if not _is_cuda or not self.needs_cpu_seq_lens:
+            raise ValueError("Eager sequence lengths require CUDA and CPU planning")
+        if self._seq_lens_cpu_slots is not None:
+            return
+        self._seq_lens_cpu_slots = [
+            (
+                torch.empty_like(self.new_seq_lens_buf),
+                torch.empty_like(self.new_seq_lens_cpu_pinned, pin_memory=True),
+                None,
+            )
+            for _ in range(2)
+        ]
+
+    def _issue_seq_lens_cpu_ticket(self) -> None:
+        if self._seq_lens_cpu_slots is None:
+            return
+        slot = self._seq_lens_cpu_generation % len(self._seq_lens_cpu_slots)
+        snapshot, host, previous_done = self._seq_lens_cpu_slots[slot]
+        device_module = torch.get_device_module(self.device)
+        if previous_done is not None:
+            # Reusing a GPU snapshot must not race the old private-stream read.
+            # This is a device dependency, never a host synchronization.
+            device_module.current_stream().wait_event(previous_done)
+        snapshot.copy_(self.new_seq_lens_buf)
+        snapshot_ready = device_module.Event()
+        snapshot_ready.record()
+        self.fwd_prepare_d2h_stream.wait_event(snapshot_ready)
+        done = device_module.Event()
+        with device_module.stream(self.fwd_prepare_d2h_stream):
+            host.copy_(snapshot, non_blocking=True)
+            done.record()
+        self._seq_lens_cpu_generation += 1
+        self._seq_lens_cpu_slots[slot] = (snapshot, host, done)
+        self._seq_lens_cpu_ticket = SeqLensCpuTicket(
+            generation=self._seq_lens_cpu_generation,
+            cpu_lens=host,
+            pool_generation=self._req_pool.req_generation.clone(),
+            done=done,
+        )
+
+    def get_seq_lens_cpu_ticket(
+        self, batch: ScheduleBatch
+    ) -> Optional[SeqLensCpuTicket]:
+        info = batch.spec_info
+        if (
+            info is None
+            or info.future_indices is None
+            or info.future_indices.shape[0] == 0
+        ):
+            return None
+        return self._seq_lens_cpu_ticket
+
+    def seq_lens_cpu_ticket_ready(self, ticket: SeqLensCpuTicket) -> bool:
+        if ticket is not self._seq_lens_cpu_ticket:
+            raise RuntimeError("Sequence-length ticket superseded before submission")
+        return ticket.done.query()
+
     def resolve_seq_lens_cpu(self, batch: ScheduleBatch) -> None:
         # Lazy pull from new_seq_lens_buf for spec_v2 (accept_lens not known to
         # schedule). The CPU mirror is gated by needs_cpu_seq_lens; backends that
@@ -553,15 +631,34 @@ class FutureMap:
                 _assert_nonneg_and_invalidate(batch.seq_lens, self.new_seq_lens_buf, fi)
             return
 
-        # Mechanism: don't sync the schedule stream; gate a private stream on the
-        # publish event and copy into the static pinned buffer.
-        self.fwd_prepare_d2h_stream.wait_event(self.publish_ready)
-        with torch.get_device_module(self.device).stream(self.fwd_prepare_d2h_stream):
-            self.new_seq_lens_cpu_pinned.copy_(self.new_seq_lens_buf, non_blocking=True)
-        self.fwd_prepare_d2h_stream.synchronize()
+        ticket = self.get_seq_lens_cpu_ticket(batch)
+        if ticket is not None:
+            if not self.seq_lens_cpu_ticket_ready(ticket):
+                # A waits only for this publication; B first uses its bounded
+                # prefill budget in the dispatcher. Preserve the blocking
+                # fallback when there is no schedulable P work.
+                ticket.done.synchronize()
+            idx = batch.req_pool_indices_cpu
+            if not torch.equal(
+                ticket.pool_generation[idx], self._req_pool.req_generation[idx]
+            ):
+                raise RuntimeError("Sequence-length ticket refers to recycled rows")
+            host_lengths = ticket.cpu_lens
+        else:
+            # Legacy/bootstrap path: don't sync the schedule stream; gate a
+            # private stream on publish and copy into the static pinned buffer.
+            self.fwd_prepare_d2h_stream.wait_event(self.publish_ready)
+            with torch.get_device_module(self.device).stream(
+                self.fwd_prepare_d2h_stream
+            ):
+                self.new_seq_lens_cpu_pinned.copy_(
+                    self.new_seq_lens_buf, non_blocking=True
+                )
+            self.fwd_prepare_d2h_stream.synchronize()
+            host_lengths = self.new_seq_lens_cpu_pinned
 
         # FIXME: fi == batch.req_pool_indices; unify future_indices and req_pool_indices.
-        batch.seq_lens_cpu = self.new_seq_lens_cpu_pinned[batch.req_pool_indices_cpu]
+        batch.seq_lens_cpu = host_lengths[batch.req_pool_indices_cpu]
         batch.seq_lens_sum = int(batch.seq_lens_cpu.sum())
         if _DEBUG_ASSERT:
             # After the D2H copy completed (synchronize above), so the pinned
@@ -587,6 +684,7 @@ class FutureMap:
                 self.publish_ready = torch.get_device_module(self.device).Event()
             self.publish_ready.record()
             self._publish_fresh = True
+            self._issue_seq_lens_cpu_ticket()
         if publish_confidence:
             self.confidence_relay.issue_ring_copy(
                 stream=self.fwd_prepare_d2h_stream,

@@ -5,6 +5,8 @@ from typing import List
 import torch
 import yaml
 
+from sglang.srt.environ import envs
+
 STREAM_GROUPS = []
 SM_COUNTS = []
 SM_GROUP_NUM = 8  # Default number of SM groups
@@ -161,9 +163,20 @@ def divide_sm(total_sms, compute_capability, groups):
 
 
 def initialize_stream_groups(gpu_id: int, config: PDMuxConfig):
+    global STREAM_GROUPS, SM_COUNTS, SM_GROUP_NUM, CURRENT_STREAM_GROUP
+    if envs.SGLANG_PDMUX_TEMPORAL_LAYERS.get() > 0:
+        # Separate logical lanes/backends, one physical full-device stream.
+        # No green context or model-side SM cap is created in this mode.
+        stream = torch.cuda.Stream(gpu_id)
+        total_sm_count = torch.cuda.get_device_properties(gpu_id).multi_processor_count
+        STREAM_GROUPS = [(stream, stream)]
+        SM_COUNTS = [(total_sm_count, total_sm_count)]
+        CURRENT_STREAM_IDX.set(0)
+        CURRENT_STREAM_GROUP = STREAM_GROUPS[0]
+        return
+
     from sgl_kernel import spatial
 
-    global STREAM_GROUPS, SM_COUNTS, SM_GROUP_NUM, CURRENT_STREAM_GROUP
     # for pd_multiplexing, Init stream_groups
     device = torch.cuda.current_device()
     total_sm_count = spatial.get_sm_available(gpu_id)

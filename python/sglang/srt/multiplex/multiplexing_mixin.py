@@ -15,6 +15,7 @@ import torch.distributed as dist
 from torch.cuda.streams import ExternalStream
 
 from sglang.srt.distributed.parallel_state import set_pdmux_status
+from sglang.srt.environ import envs
 from sglang.srt.model_executor.forward_batch_info import ForwardMode
 from sglang.srt.multiplex.pdmux_context import (
     get_current_stream_idx,
@@ -88,6 +89,30 @@ class SchedulerMultiplexMixin:
 
         # for pd_multiplexing, Init stream_groups, exclude normal stream for prefill only and decode only
         self.pdmux_config = load_pdmux_config(get_disagg().pdmux_config_path)
+        self.pdmux_temporal_layers = envs.SGLANG_PDMUX_TEMPORAL_LAYERS.get()
+        self.pdmux_temporal_adaptive = envs.SGLANG_PDMUX_TEMPORAL_ADAPTIVE.get()
+        if self.pdmux_temporal_adaptive:
+            from sglang.srt.multiplex.throughput_policy import TemporalThroughputPolicy
+
+            self._temporal_policy = TemporalThroughputPolicy()
+            self._temporal_timings = deque()
+            self._temporal_prefill_started = time.perf_counter()
+            self._temporal_last_decode_submit = 0.0
+        self._temporal_prefill_done = None
+        if self.pdmux_temporal_layers:
+            if not (
+                torch.cuda.is_available()
+                and self.pdmux_temporal_layers > 0
+                and self.enable_overlap
+                and not self.pdmux_standard
+                and self.spec_algorithm.is_dflash()
+                and self.ps.tp_size == self.ps.pp_size == self.ps.attn_dp_size == 1
+                and envs.SGLANG_PDMUX_DECODE_READY.get() == "off"
+            ):
+                raise ValueError(
+                    "Temporal PDMux requires positive layers, CUDA DFlash overlap, "
+                    "layer_split, TP=PP=DP=1 and decode-ready=off"
+                )
         initialize_stream_groups(self.ps.gpu_id, self.pdmux_config)
         self.stream_groups = get_stream_groups()
         self.sm_counts = get_sm_counts()
@@ -158,6 +183,8 @@ class SchedulerMultiplexMixin:
         return stream_idx, self.stream_groups[stream_idx]
 
     def _select_pdmux_stream_idx(self, *, has_prefill: bool, decode_bs: int) -> int:
+        if getattr(self, "pdmux_temporal_layers", 0):
+            return 0
         if decode_bs > 0 and has_prefill:
             manual_divisions = self.pdmux_config.manual_divisions
             if manual_divisions:
@@ -252,6 +279,8 @@ class SchedulerMultiplexMixin:
             batch.split_forward_count = 1
             batch.split_forward_batch = None
             self.split_prefill_batch = batch
+            if getattr(self, "pdmux_temporal_adaptive", False):
+                self._temporal_prefill_started = time.perf_counter()
             return True, running_batch
         return False, running_batch
 
@@ -261,6 +290,19 @@ class SchedulerMultiplexMixin:
         remaining_layers = (
             self.model_config.num_hidden_layers - self.split_prefill_batch.split_index
         )
+        temporal_layers = getattr(self, "pdmux_temporal_layers", 0)
+        if temporal_layers:
+            active_decode = (
+                self.running_batch is not None and not self.running_batch.is_empty()
+            )
+            if active_decode and getattr(self, "pdmux_temporal_adaptive", False):
+                self._poll_temporal_timings()
+                return self._temporal_policy.choose(**self._temporal_policy_context())
+            return (
+                min(remaining_layers, temporal_layers)
+                if active_decode
+                else remaining_layers
+            )
         max_layers = getattr(self.pdmux_config, "split_forward_max_layers", 0)
 
         def limit_active_decode(count: int) -> int:
@@ -533,6 +575,169 @@ class SchedulerMultiplexMixin:
             return self.event_loop_pdmux_standard()
         return self.event_loop_pdmux_layer_split()
 
+    def _submit_pdmux_prefill_layer(self: Scheduler, decode_bs: int):
+        """Submit exactly one complete layer, including finalization if last.
+
+        This runs inside the prefill stream context. It never prepares decode,
+        ingests requests, processes results or publishes the prefill relay.
+        """
+        batch = self.split_prefill_batch
+        start = batch.split_index
+        batch.split_forward_count = 1
+        with profile_range(
+            f"pdmux.split_prefill.tokens={batch.extend_num_tokens}"
+            f".layers=1.start={start}.decode_bs={decode_bs}",
+            nvtx_enabled=NVTX_SCHEDULER_ENABLED,
+        ):
+            result = self.run_batch(batch)
+        batch.split_index = start + 1
+        done = None
+        if batch.split_index == self.model_config.num_hidden_layers:
+            batch.split_prefill_finished = True
+            done = self.pdmux_prefill_stream.record_event()
+        return result, done
+
+    def _wait_temporal_prefill_credit(self: Scheduler, pending_decode_result):
+        """Allow at most one unfinished prefill quantum in the GPU queue.
+
+        The next complete DFlash round has already been submitted on the same
+        stream. Process the previous round's CPU result while P runs, then poll
+        its event; never device-synchronize or enqueue another P quantum behind
+        an unfinished one. Decode's independent metadata can be planned ahead.
+        """
+        done = self._temporal_prefill_done
+        if (
+            getattr(self, "pdmux_temporal_adaptive", False)
+            and pending_decode_result is not None
+        ):
+            # N has already been prepared/submitted. Deliver N-1 before the
+            # CPU-heavy P submission rather than delaying it until afterwards.
+            set_pdmux_status(False)
+            self.process_batch_result(*pending_decode_result)
+            pending_decode_result = None
+            set_pdmux_status(True)
+        if done is not None and not done.query():
+            if pending_decode_result is not None:
+                set_pdmux_status(False)
+                self.process_batch_result(*pending_decode_result)
+                pending_decode_result = None
+                set_pdmux_status(True)
+            while not done.query():
+                time.sleep(0.00005)
+        self._temporal_prefill_done = None
+        return pending_decode_result
+
+    def _temporal_policy_context(self: Scheduler):
+        def remaining(req):
+            limit = req.sampling_params.max_new_tokens
+            return max(
+                0, (128 if limit is None else limit) - len(req.output_ids_through_stop)
+            )
+
+        return dict(
+            remaining=self.model_config.num_hidden_layers
+            - self.split_prefill_batch.split_index,
+            tokens=self.split_prefill_batch.extend_num_tokens,
+            current_remaining=[
+                remaining(r) for r in self.running_batch.reqs if not r.finished()
+            ],
+            new_remaining=[
+                remaining(r)
+                for r in self.split_prefill_batch.reqs
+                if r is not self.chunked_req
+                and r is not self.split_prefill_batch.chunked_req
+                and not r.finished()
+            ],
+        )
+
+    def _should_run_temporal_decode(self: Scheduler):
+        if (
+            self.split_prefill_batch is None
+            or self.split_prefill_batch.split_prefill_finished
+        ):
+            return True
+        self._poll_temporal_timings()
+        context = self._temporal_policy_context()
+        quantum = self._temporal_policy.choose(**context)
+        return self._temporal_policy.decode_first(
+            tokens=context["tokens"],
+            quantum=quantum,
+            current_remaining=context["current_remaining"],
+            new_remaining=context["new_remaining"],
+            since_decode_ms=(time.perf_counter() - self._temporal_last_decode_submit)
+            * 1000,
+        )
+
+    def _advance_temporal_running_batch(self: Scheduler, batch, run_decode):
+        if run_decode:
+            return self.update_running_batch(batch)
+        # Filtering completed requests is safe; prepare_for_decode is stateful
+        # (KV allocation and Mamba counters) and must only run for a submitted D.
+        self._filter_temporal_running_batch(batch)
+        return batch
+
+    def _filter_temporal_running_batch(self: Scheduler, batch):
+        initial_bs = batch.batch_size()
+        batch.filter_batch()
+        if batch.batch_size() < initial_bs:
+            # Admission runs before update_running_batch. Retain its normal
+            # fullness reset when early consumption opens request slots.
+            batch.batch_is_full = False
+
+    def _poll_temporal_timings(self: Scheduler):
+        while self._temporal_timings and self._temporal_timings[0][1].query():
+            start_event, end_event, cpu_ms, detail = self._temporal_timings.popleft()
+            gpu_ms = start_event.elapsed_time(end_event)
+            if "decode_bs" in detail:
+                self._temporal_policy.observe_decode(
+                    cpu_ms, gpu_ms, detail["decode_bs"]
+                )
+            else:
+                self._temporal_policy.observe_prefill(
+                    cpu_ms=cpu_ms, gpu_ms=gpu_ms, **detail
+                )
+
+    def _run_temporal_adaptive_batch(self: Scheduler, batch):
+        self._poll_temporal_timings()
+        # Bound event lifetimes even if the GPU stops making progress. The
+        # normal P credit still prevents a second unfinished P quantum.
+        if len(self._temporal_timings) >= 16:
+            result = self.run_batch(batch)
+            if batch is not self.split_prefill_batch:
+                self._temporal_last_decode_submit = time.perf_counter()
+            return result
+        detail = dict(decode_bs=batch.batch_size())
+        if batch is self.split_prefill_batch:
+            detail = dict(
+                tokens=batch.extend_num_tokens,
+                layers=batch.split_forward_count,
+                start=batch.split_index,
+                final=batch.split_index + batch.split_forward_count
+                >= self.model_config.num_hidden_layers,
+            )
+        a = torch.cuda.Event(enable_timing=True)
+        b = torch.cuda.Event(enable_timing=True)
+        started = time.perf_counter()
+        a.record()
+        result = self.run_batch(batch)
+        if batch is not self.split_prefill_batch:
+            self._temporal_last_decode_submit = time.perf_counter()
+        b.record()
+        self._temporal_timings.append(
+            (a, b, (time.perf_counter() - started) * 1000, detail)
+        )
+        return result
+
+    def _consume_ready_temporal_decode(self: Scheduler, result):
+        # copy_done follows the entire DFlash forward, including state commit
+        # and draft KV. A length-publication ticket alone is insufficient.
+        if result is not None and result[1].copy_done.query():
+            set_pdmux_status(False)
+            self.process_batch_result(*result)
+            set_pdmux_status(True)
+            return None
+        return result
+
     @torch.inference_mode()
     def event_loop_pdmux_layer_split(self: Scheduler):
         """A scheduler loop for pd multiplexing."""
@@ -559,6 +764,16 @@ class SchedulerMultiplexMixin:
         logger.debug("Starting event loop for pd multiplexing...")
 
         while True:
+            if (
+                getattr(self, "pdmux_temporal_adaptive", False)
+                and pending_decode_result is not None
+            ):
+                with torch.cuda.stream(decode_stream):
+                    pending_decode_result = self._consume_ready_temporal_decode(
+                        pending_decode_result
+                    )
+                    set_pdmux_status(False)
+                    self._filter_temporal_running_batch(self.running_batch)
             # Synchronous speculation and CPU-dependent sampling need the
             # previous result before preparing the next forward. Overlap
             # DFlash instead carries lengths and bonus tokens through FutureMap.
@@ -644,8 +859,11 @@ class SchedulerMultiplexMixin:
                     decode_stream.wait_event(formation_done)
                 if carried_batch_pending and not running_batch.is_empty():
                     publish_carried_tensors(running_batch, decode_stream)
+                adaptive = getattr(self, "pdmux_temporal_adaptive", False)
+                run_decode = not adaptive or self._should_run_temporal_decode()
                 if (
-                    pending_decode_result is not None
+                    run_decode
+                    and pending_decode_result is not None
                     and not running_batch.is_empty()
                     and not running_batch.check_decode_mem()
                 ):
@@ -667,7 +885,11 @@ class SchedulerMultiplexMixin:
                         and running_batch.sampling_info.penalizer_orchestrator.is_required
                     )
                 )
-                running_batch = self.update_running_batch(running_batch)
+                running_batch = (
+                    self._advance_temporal_running_batch(running_batch, run_decode)
+                    if adaptive
+                    else self.update_running_batch(running_batch)
+                )
                 self.running_batch = running_batch
                 adjust_stream_group = adjust_stream_group or (
                     stream_idx > 0 and running_batch.is_empty()
@@ -683,7 +905,9 @@ class SchedulerMultiplexMixin:
                 # also drive the segment budget below; the batch is unchanged
                 # between this point and submission.
                 decode_batch = self.dp_attn_adapter.maybe_prepare_mlp_sync_batch(
-                    running_batch if not running_batch.is_empty() else None
+                    running_batch
+                    if run_decode and not running_batch.is_empty()
+                    else None
                 )
 
             if self.ps.attn_dp_size > 1:
@@ -695,8 +919,11 @@ class SchedulerMultiplexMixin:
                     self.on_idle()
 
             if adjust_stream_group:
-                prefill_stream.synchronize()
-                decode_stream.synchronize()
+                # Temporal mode always uses the same physical stream/backend
+                # group. Preserve its queued work and normal overlap pipeline.
+                if not getattr(self, "pdmux_temporal_layers", 0):
+                    prefill_stream.synchronize()
+                    decode_stream.synchronize()
                 if self.ps.attn_dp_size > 1:
                     stream_idx = next_stream_idx
                     set_current_stream_idx(stream_idx)
@@ -718,6 +945,36 @@ class SchedulerMultiplexMixin:
                     f"Adjusting stream groups: {stream_idx}, prefill sm: {self.sm_counts[stream_idx][0]}, decode sm: {self.sm_counts[stream_idx][1]}"
                 )
 
+            # Preparation above executes exactly once for this decode. While
+            # its length ticket is pending, advance P inside this iteration,
+            # without repeating allocation, counters, pumps or result handling.
+            # Pre- and post-decode P share the original per-round layer budget.
+            prefill_budget_left = None
+            dispatch_ready = getattr(self, "_pdmux_decode_ready_dispatch", False)
+            if (
+                dispatch_ready
+                and decode_batch is not None
+                and self.split_prefill_batch is not None
+                and not wait_prefill_kernel_done
+            ):
+                prefill_budget_left = self._get_split_forward_count(decode_batch)
+                ticket = self.future_map.get_seq_lens_cpu_ticket(decode_batch)
+                with torch.cuda.stream(prefill_stream):
+                    set_pdmux_status(True)
+                    while (
+                        prefill_budget_left > 0
+                        and ticket is not None
+                        and not self.future_map.seq_lens_cpu_ticket_ready(ticket)
+                    ):
+                        prefill_result, done = self._submit_pdmux_prefill_layer(
+                            running_batch.batch_size()
+                        )
+                        prefill_budget_left -= 1
+                        if done is not None:
+                            prefill_exe_done = done
+                            wait_prefill_kernel_done = True
+                            break
+
             with torch.cuda.stream(decode_stream):
                 set_pdmux_status(False)
                 # A group switch may replace the consumer stream after the
@@ -726,7 +983,10 @@ class SchedulerMultiplexMixin:
                     publish_carried_tensors(running_batch, decode_stream)
                 carried_batch_pending = False
                 if decode_batch is not None:
-                    decode_result = self.run_batch(decode_batch)
+                    if getattr(self, "pdmux_temporal_adaptive", False):
+                        decode_result = self._run_temporal_adaptive_batch(decode_batch)
+                    else:
+                        decode_result = self.run_batch(decode_batch)
                     current_decode_result = (decode_batch.copy(), decode_result)
                 else:
                     current_decode_result = None
@@ -737,37 +997,77 @@ class SchedulerMultiplexMixin:
                     and not wait_prefill_kernel_done
                 ):
                     prefill_done = True
-                    forward_count = self._get_split_forward_count(decode_batch)
-                    next_split_index = min(
-                        self.split_prefill_batch.split_index + forward_count,
-                        self.model_config.num_hidden_layers,
-                    )
-                    forward_count = (
-                        next_split_index - self.split_prefill_batch.split_index
-                    )
+                    if getattr(self, "pdmux_temporal_layers", 0):
+                        pending_decode_result = self._wait_temporal_prefill_credit(
+                            pending_decode_result
+                        )
+                        if getattr(self, "pdmux_temporal_adaptive", False):
+                            current_decode_result = self._consume_ready_temporal_decode(
+                                current_decode_result
+                            )
+                    if dispatch_ready and decode_batch is not None:
+                        if prefill_budget_left is None:
+                            prefill_budget_left = self._get_split_forward_count(
+                                decode_batch
+                            )
+                        ticket = self.future_map.get_seq_lens_cpu_ticket(decode_batch)
+                        while prefill_budget_left > 0:
+                            prefill_result, done = self._submit_pdmux_prefill_layer(
+                                running_batch.batch_size()
+                            )
+                            prefill_budget_left -= 1
+                            if done is not None:
+                                prefill_exe_done = done
+                                break
+                            # Check after each full layer. One layer gives P
+                            # a service opportunity even with very fast decode;
+                            # final draft KV remains atomic until experiment C.
+                            if (
+                                ticket is not None
+                                and self.future_map.seq_lens_cpu_ticket_ready(ticket)
+                            ):
+                                break
+                    else:
+                        forward_count = self._get_split_forward_count(decode_batch)
+                        next_split_index = min(
+                            self.split_prefill_batch.split_index + forward_count,
+                            self.model_config.num_hidden_layers,
+                        )
+                        forward_count = (
+                            next_split_index - self.split_prefill_batch.split_index
+                        )
 
-                    self.split_prefill_batch.split_forward_count = forward_count
-                    split_submit_start = time.perf_counter()
-                    with profile_range(
-                        f"pdmux.split_prefill.tokens={self.split_prefill_batch.extend_num_tokens}"
-                        f".layers={forward_count}.start={self.split_prefill_batch.split_index}"
-                        f".decode_bs={running_batch.batch_size()}",
-                        nvtx_enabled=NVTX_SCHEDULER_ENABLED,
-                    ):
-                        prefill_result = self.run_batch(self.split_prefill_batch)
-                    logger.debug(
-                        "PDMux split submit: tokens=%d layers=%d start=%d "
-                        "decode_bs=%d submit_ms=%.3f",
-                        self.split_prefill_batch.extend_num_tokens,
-                        forward_count,
-                        self.split_prefill_batch.split_index,
-                        running_batch.batch_size(),
-                        (time.perf_counter() - split_submit_start) * 1000,
-                    )
-                    if next_split_index == self.model_config.num_hidden_layers:
-                        self.split_prefill_batch.split_prefill_finished = True
-                        prefill_exe_done = prefill_stream.record_event()
-                    self.split_prefill_batch.split_index = next_split_index
+                        self.split_prefill_batch.split_forward_count = forward_count
+                        split_submit_start = time.perf_counter()
+                        with profile_range(
+                            f"pdmux.split_prefill.tokens={self.split_prefill_batch.extend_num_tokens}"
+                            f".layers={forward_count}.start={self.split_prefill_batch.split_index}"
+                            f".decode_bs={running_batch.batch_size()}",
+                            nvtx_enabled=NVTX_SCHEDULER_ENABLED,
+                        ):
+                            if getattr(self, "pdmux_temporal_adaptive", False):
+                                prefill_result = self._run_temporal_adaptive_batch(
+                                    self.split_prefill_batch
+                                )
+                            else:
+                                prefill_result = self.run_batch(
+                                    self.split_prefill_batch
+                                )
+                        logger.debug(
+                            "PDMux split submit: tokens=%d layers=%d start=%d "
+                            "decode_bs=%d submit_ms=%.3f",
+                            self.split_prefill_batch.extend_num_tokens,
+                            forward_count,
+                            self.split_prefill_batch.split_index,
+                            running_batch.batch_size(),
+                            (time.perf_counter() - split_submit_start) * 1000,
+                        )
+                        if next_split_index == self.model_config.num_hidden_layers:
+                            self.split_prefill_batch.split_prefill_finished = True
+                            prefill_exe_done = prefill_stream.record_event()
+                        self.split_prefill_batch.split_index = next_split_index
+                        if getattr(self, "pdmux_temporal_layers", 0):
+                            self._temporal_prefill_done = prefill_stream.record_event()
 
                 elif wait_prefill_kernel_done:
                     prefill_done = True

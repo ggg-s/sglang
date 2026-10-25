@@ -112,7 +112,11 @@ def build_attention_backends(*, model_runner: ModelRunner) -> AttentionBackends:
                 resolved=resolved,
                 init_new_workspace=False,
             )
-            for _ in range(get_disagg().sm_group_num)
+            for _ in range(
+                1
+                if envs.SGLANG_PDMUX_TEMPORAL_LAYERS.get() > 0
+                else get_disagg().sm_group_num
+            )
         ]
         decode_attn_backend = decode_attn_backend_group[0]
     elif (

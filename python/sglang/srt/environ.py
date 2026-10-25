@@ -489,6 +489,13 @@ class Envs:
     # ===================================================================
     SGLANG_DETECT_SLOW_RANK = EnvBool(False)
     SGLANG_DEBUG_MEMORY_POOL = EnvBool(False)
+    # Experimental TP=1 DFlash split-PDMux controls. Keep launch/YAML settings
+    # identical when comparing off (control), mirror (A), dispatch (A+B).
+    SGLANG_PDMUX_DECODE_READY = EnvStr("off")
+    # Experimental full-device temporal PDMux. Zero preserves spatial PDMux;
+    # a positive value is the layer quantum while decode is active.
+    SGLANG_PDMUX_TEMPORAL_LAYERS = EnvInt(0)
+    SGLANG_PDMUX_TEMPORAL_ADAPTIVE = EnvBool(False)
     SGLANG_VALIDATE_MAMBA_REPLAY_STATE_INDICES = EnvBool(False)
     SGLANG_GDN_DECODE_FUSION_LOG_LAYER_HITS = EnvBool(False)
     SGLANG_GDN_DECODE_FUSION_VERIFY_REAL_TENSORS = EnvBool(False)
