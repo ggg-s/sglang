@@ -56,8 +56,7 @@ from sglang.srt.model_executor.forward_batch_info import (
     ForwardBatch,
     ForwardMode,
 )
-from sglang.srt.multiplex.pdmux_context import is_pdmux_standard_prefill
-from sglang.srt.runtime_context import get_exec, get_parallel
+from sglang.srt.runtime_context import get_disagg, get_exec, get_parallel
 from sglang.srt.sampling.sampling_observer import DeviceAuxiliaryOutput
 from sglang.srt.utils.common import (
     is_cpu,
@@ -449,13 +448,13 @@ class LogitsProcessor(nn.Module):
             ),
             # One instance owns one symmetric buffer and one signal pad, and
             # skip_entry_sync assumes a cross-rank sync separates consecutive
-            # calls. Under PDMux standard the two lanes can gather concurrently
+            # calls. In both PDMux modes the two lanes can gather concurrently
             # from different streams, which breaks both assumptions; fall back
             # to the plain all-gather, which resolves its group per call.
             enabled=(
                 self.do_tensor_parallel_all_gather
                 and not self.use_attn_tp_group
-                and not is_pdmux_standard_prefill()
+                and not get_disagg().enable_pdmux
             ),
             skip_entry_sync=True,
         )

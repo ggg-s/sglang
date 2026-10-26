@@ -2133,6 +2133,12 @@ def get_attn_tp_group() -> GroupCoordinator:
     assert _ATTN_TP is not None, (
         "attention tensor model parallel group is not initialized"
     )
+    # With plain TP this is an alias of _TP. Preserve PDMux's lane selection:
+    # attention reductions must not use decode's communicator on the prefill
+    # stream while the target verify graph is in flight. Actual subgroups
+    # (DP/CP attention) keep their own membership and communicator.
+    if _ATTN_TP is _TP:
+        return get_tp_group()
     return _ATTN_TP
 
 
@@ -2169,6 +2175,9 @@ def get_moe_ep_group() -> GroupCoordinator:
 
 def get_moe_tp_group() -> GroupCoordinator:
     assert _MOE_TP is not None, "expert model parallel group is not initialized"
+    # The full-width MoE group has the same lane ownership as ordinary TP.
+    if _MOE_TP is _TP:
+        return get_tp_group()
     return _MOE_TP
 
 

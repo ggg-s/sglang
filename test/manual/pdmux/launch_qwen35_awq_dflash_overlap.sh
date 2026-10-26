@@ -22,7 +22,7 @@ case "$hicache_io" in
 esac
 args=(
   --model-path "$TARGET_MODEL" --trust-remote-code --language-only
-  --quantization awq_marlin --dtype "$dtype" --tp-size 1
+  --quantization awq_marlin --dtype "$dtype" --tp-size "${TP_SIZE:-1}"
   --attention-backend "$attention_backend"
   --linear-attn-prefill-backend triton --linear-attn-decode-backend triton
   --mamba-radix-cache-strategy extra_buffer

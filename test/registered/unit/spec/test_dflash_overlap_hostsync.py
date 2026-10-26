@@ -228,6 +228,7 @@ class TestHybridNeedsCpuSeqLens(CustomTestCase):
             return SimpleNamespace(
                 needs_cpu_seq_lens=flag,
                 extend_dummy_seqs_capped_by_req_pool=False,
+                max_prefill_plan_tokens=None,
             )
 
         runner = SimpleNamespace(

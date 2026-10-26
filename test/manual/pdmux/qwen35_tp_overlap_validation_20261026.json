@@ -1,0 +1,65 @@
+{
+  "date": "2026-10-26",
+  "branch": "codex/pdmux-tp-cpu-overlap",
+  "environment": {
+    "gpu": "NVIDIA GeForce RTX 4060 Laptop GPU",
+    "gpu_count": 1,
+    "python": "3.12.3",
+    "torch": "2.13.0+cu130"
+  },
+  "source_sha256": {
+    "python/sglang/srt/arg_groups/validation_hook.py": "b29f02d067e3751456055a4cccb6a527670c50048b4fcf193fa29c0104bf0d0a",
+    "python/sglang/srt/distributed/parallel_state.py": "2a1424211a2115588123a32fabff13642bd305c6127e52275ede79043662c90f",
+    "python/sglang/srt/layers/logits_processor.py": "0fa72e67e1575ecbd0c6ccd0483579d651fdf5b960f2b05bb3cbc9db65012ec7",
+    "python/sglang/srt/layers/sampler.py": "2066eeeda3bc85bb3ba4fbc715a172a0fb7523b8a2c05ddf8707b257c4d32401",
+    "test/registered/unit/multiplex/test_pdmux_tp_overlap.py": "2b1e6f927ab15917309d4414acc1c0129c38a969f52a62304f8f0a0d4f710776",
+    "test/manual/pdmux/test_pdmux_tp_overlap_cuda.py": "772b0081cb1467349f9d13631a2f0afa1fdf1f1c1860909ae77460310998f083",
+    "test/manual/pdmux/test_pdmux_port_cuda.py": "809870e8337cc8728c6abeb043b6953746a7d5f746132f927691669c097634b0",
+    "test/registered/unit/spec/test_dflash_overlap_hostsync.py": "753f7ce0993d908dacca98f1787a9582b8f925faac758a9f7d33fb509bfdafcc"
+  },
+  "checks": {
+    "pdmux_qwen_split_scheduler": {
+      "passed": 198,
+      "failed": 0,
+      "subtests_passed": 162
+    },
+    "targeted_tp_overlap_after_multichunk_test_added": {
+      "passed": 10,
+      "failed": 0,
+      "subtests_passed": 12,
+      "two_real_gloo_ranks": true,
+      "scheduler_overlap_modes": [
+        false,
+        true
+      ],
+      "chunks_per_scheduler_run": 3,
+      "rank_completion_delays_differ": true
+    },
+    "cuda_regressions": {
+      "passed": 18,
+      "failed": 0,
+      "skipped": 1,
+      "skip_reason": "The two-GPU NCCL test requires two distinct CUDA GPUs."
+    },
+    "server_arguments": {
+      "passed_initial_run": 234,
+      "passed_after_test_dependencies_added": 1,
+      "remaining_failures": 0,
+      "note": "One HTTP import test initially lacked jsonschema/soundfile; it passed after dependencies were installed under the isolated validation directory."
+    },
+    "baseline_regression_detection": {
+      "targeted_tests_failed_on_pre_fix_HEAD": 3,
+      "errors": 0
+    },
+    "ruff_0_15_1_format_and_F401_F821_UP037": "passed",
+    "git_diff_check": "passed",
+    "launcher_bash_syntax": "passed"
+  },
+  "remote_artifacts": "/workspace/pdmux-tp-overlap-20261026/",
+  "limitations": [
+    "The 4060 singleton NCCL/stream/CUDA Graph check is not a two-GPU TP validation.",
+    "No checkpoint weights or SWE/LongBench throughput replay were run for this change.",
+    "The original 4219-request multi-chunk workload and reported NCCL BROADCAST timeout must be revalidated on the deployment TP2 host.",
+    "CPU overlap admits plain TP; DP attention, EP, MoE DP, CP and DCP subgroups remain restricted at TP>1. Temporal/decode-ready experiments retain their TP1 restriction."
+  ]
+}

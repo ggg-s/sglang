@@ -20,8 +20,12 @@ from sglang.srt.layers.logits_processor import (
 from sglang.srt.layers.logprob_processor import (
     OutputLogprobProcessor,
 )
-from sglang.srt.multiplex.pdmux_context import is_pdmux_standard_prefill
-from sglang.srt.runtime_context import get_exec, get_parallel, get_server_args
+from sglang.srt.runtime_context import (
+    get_disagg,
+    get_exec,
+    get_parallel,
+    get_server_args,
+)
 from sglang.srt.sampling.sampling_batch_info import SamplingBatchInfo
 from sglang.srt.sampling.sampling_params import TOP_K_ALL
 from sglang.srt.utils.async_probe import sanitize_nan_logits
@@ -115,14 +119,13 @@ class Sampler(nn.Module):
         if is_dp_attention_enabled():
             self.tp_sync_group = get_parallel().attn_tp_group.device_group
             self.cp_sync_group = get_parallel().attn_cp_group.device_group
-        # Under PDMux standard the TP group is lane-dependent: get_tp_group()
-        # returns the duplicate prefill communicator while the prefill lane is
-        # active. A group cached here would make the prefill lane's sync share
-        # the decode lane's communicator with a decode collective in flight, so
-        # that mode resolves the group per call instead. DP attention keeps the
+        # In both PDMux modes get_tp_group() returns the duplicate prefill
+        # communicator while the prefill lane is active. A cached group would
+        # make prefill sync share decode's communicator with decode collectives
+        # in flight, so both modes resolve the group per call. DP attention keeps the
         # cached attn_tp_group to synchronize only within each attention group.
         self._resolve_tp_sync_group_per_call = (
-            is_pdmux_standard_prefill() and not is_dp_attention_enabled()
+            get_disagg().enable_pdmux and not is_dp_attention_enabled()
         )
 
         self.rl_on_policy_target = get_exec().deterministic.rl_on_policy_target

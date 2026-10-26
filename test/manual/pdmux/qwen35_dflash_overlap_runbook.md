@@ -102,11 +102,36 @@ ID comparisons. Raw SSE timestamps, output IDs and logs are archived locally at
 
 The original spatial-PDMux instructions and prior experiments follow below.
 
-This lane supports text-only Qwen3.5 MoE with DFlash, TP=1 and PP=1.
+This lane supports text-only Qwen3.5 MoE with DFlash, plain TP and PP=1.
 CPU overlap is enabled by default; omit `--disable-overlap-schedule`.
+Both launchers accept `TP_SIZE=2` (default: 1). At TP>1 the overlap lane
+requires EP, MoE DP, attention CP and DCP sizes of one, and DP attention
+disabled; their subgroup communicators are not duplicated by lane. The
+temporal and decode-ready experiments above/below still require TP=1.
 Other speculative algorithms and PDMux `standard` prefill still require the
 synchronous scheduler. Grammar and penalties consume the pending CPU result
 before preparing their next decode.
+
+TP overlap routes full-width attention/MoE TP aliases and sampling sync to
+the current lane's communicator. Both PDMux modes use the ordinary logits
+all-gather instead of sharing one multimem buffer/signal pad across streams.
+The CPU regression includes two real Gloo ranks, unequal completion timings,
+multiple prefill chunks, HiCache pumps and overlap on/off:
+
+```bash
+PYTHONPATH=python python -m pytest \
+  test/registered/unit/multiplex/test_pdmux_tp_overlap.py -q
+python -m pytest test/manual/pdmux/test_pdmux_tp_overlap_cuda.py -q
+```
+
+The CUDA file runs a singleton NCCL/graph/stream check on one GPU, and an
+additional two-rank check only when two distinct CUDA GPUs are available.
+These are operator/control-flow checks without checkpoint weights. On the
+deployment host, also replay the original long-prompt, multi-chunk workload
+past the reported ~1030-request failure point, with HiCache and ReplaySSM
+enabled, before drawing reliability or throughput conclusions.
+The [2026-10-26 validation record](qwen35_tp_overlap_validation_20261026.json)
+contains the 4060 results, source hashes and remaining deployment checks.
 
 For the A100 40 GB AWQ lane, use the FP16 AWQ-Marlin target and the
 unquantized DFlash draft:

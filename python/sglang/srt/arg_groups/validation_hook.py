@@ -151,14 +151,7 @@ def check_server_args(server_args: Any):
             "PD-Multiplexing is not compatible with disaggregation mode."
         )
         if not cfg.disable_overlap_schedule:
-            assert (
-                cfg.pdmux_prefill_mode == "layer_split"
-                and cfg.speculative_algorithm == "DFLASH"
-                and cfg.tp_size == 1
-            ), (
-                "PD-Multiplexing overlap schedule currently requires "
-                "layer_split prefill, DFLASH, and tp_size=1."
-            )
+            check_pdmux_overlap(cfg)
 
         if cfg.enable_hierarchical_cache and cfg.hicache_write_policy == "write_back":
             logger.warning(
@@ -527,6 +520,33 @@ def check_two_batch_overlap(server_args: Any):
             "(moe_a2a_backend='none'), --enable-dp-attention is required "
             "(DeepSeek-V4 non-EP DP TBO path)."
         )
+
+
+def check_pdmux_overlap(cfg):
+    """The overlap lane duplicates full-width TP communicators only.
+
+    Subgroup parallelism needs its own lane-specific communicators before it
+    can use the asynchronous speculative scheduler.
+    """
+    assert (
+        cfg.pdmux_prefill_mode == "layer_split"
+        and cfg.speculative_algorithm == "DFLASH"
+    ), "PD-Multiplexing overlap schedule requires layer_split prefill and DFLASH."
+    if cfg.tp_size > 1:
+        assert not cfg.enable_dp_attention, (
+            "PD-Multiplexing overlap schedule with TP>1 does not yet support "
+            "DP attention; omit --enable-dp-attention."
+        )
+        for name, value in (
+            ("--ep-size", cfg.ep_size),
+            ("--moe-dp-size", cfg.moe_dp_size),
+            ("--attn-cp-size", cfg.attn_cp_size),
+            ("--dcp-size", cfg.dcp_size),
+        ):
+            assert value == 1, (
+                f"PD-Multiplexing overlap schedule with TP>1 requires {name}=1: "
+                "subgroup communicators are not isolated between prefill and decode."
+            )
 
 
 def check_pdmux_standard_prefill(cfg):

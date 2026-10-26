@@ -245,6 +245,7 @@ def test_split_prefill_keeps_cuda_inputs_until_final_mtp_extend(lanes):
     )
     worker.forward_batch_split_prefill = lambda b: forward(worker, b)
     scheduler = NS(
+        enable_overlap=False,
         model_worker=worker,
         tp_worker=worker,
         future_map=None,

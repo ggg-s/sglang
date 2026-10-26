@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# Single A100 40 GB, FP16 GPTQ-Marlin target, unquantized DFlash draft.
+# A100-compatible FP16 GPTQ-Marlin target, unquantized DFlash draft.
 set -euo pipefail
 : "${TARGET_MODEL:?Set TARGET_MODEL to Qwen3.5-35B-A3B-GPTQ-Int4}"
 : "${DRAFT_MODEL:?Set DRAFT_MODEL to Qwen3.5-35B-A3B-DFlash}"
@@ -8,7 +8,7 @@ export SGLANG_MAMBA_CONV_DTYPE=float16
 exec python -m sglang.launch_server \
   --model-path "$TARGET_MODEL" --language-only \
   --quantization gptq_marlin --dtype float16 \
-  --linear-attn-backend triton --attention-backend triton --tp-size 1 \
+  --linear-attn-backend triton --attention-backend triton --tp-size "${TP_SIZE:-1}" \
   --context-length 16384 --max-running-requests 4 \
   --chunked-prefill-size 32768 --max-prefill-tokens 32768 \
   --max-total-tokens 32768 --max-mamba-cache-size 20 --mem-fraction-static 0.92 \
