@@ -1,0 +1,220 @@
+{
+  "date": "2026-10-26 Asia/Shanghai",
+  "base_commit": "c2a6417f6ffbacf407acd6bf423f8cf122ba730e",
+  "gpu": "NVIDIA A100-PCIE-40GB",
+  "model": "QuantTrio/Qwen3.5-35B-A3B-AWQ",
+  "draft": "z-lab/Qwen3.5-35B-A3B-DFlash",
+  "workload": "Synthetic repeated Python code, three 64-token prompts generating 512 tokens each, then two sequential 2048-token prompts generating 64 tokens each; concurrency at most four.",
+  "measured_trials": 1,
+  "excluded_warmup_trials": 1,
+  "fixture_sha256": "b248930e8401bffff182f729c7fa979872fe6619884dc3126e3a298269ff7298",
+  "groups": {
+    "dflash": {
+      "joint": {
+        "wall_s": 4.436580069363117,
+        "output_tok_s": 375.0636693093362,
+        "request_s": 1.1269941986458418,
+        "completion_tokens": [
+          512,
+          512,
+          512,
+          64,
+          64
+        ],
+        "ttft_ms": [
+          210.6610480695963,
+          202.2912222892046,
+          209.2882003635168,
+          1606.7258920520544,
+          1590.1565197855234
+        ],
+        "tpot_ms": [
+          8.26905146168286,
+          8.254192091539181,
+          8.239148191947294,
+          2.282512714228933,
+          2.2440753167583827
+        ],
+        "stats_including_warmup": {
+          "mode": "native",
+          "pairs": 0,
+          "mixed": 0,
+          "captures": 0,
+          "fallbacks": 0,
+          "prefill_batches": 70,
+          "prefill_tokens": 8583,
+          "draft_calls": 138,
+          "draft_graph_hits": 138,
+          "native_verify_calls": 138,
+          "native_verify_graph_hits": 138
+        }
+      },
+      "decode_only": {
+        "wall_s": 1.2810480501502752,
+        "output_tok_s": 1199.0182568248063,
+        "request_s": 2.3418325328609497,
+        "completion_tokens": [
+          512,
+          512,
+          512
+        ],
+        "ttft_ms": [
+          199.12224635481834,
+          205.7806197553873,
+          204.8072498291731
+        ],
+        "tpot_ms": [
+          2.116546238938423,
+          2.0725585323432187,
+          2.0726762763033175
+        ],
+        "stats_including_warmup": {
+          "mode": "native",
+          "pairs": 0,
+          "mixed": 0,
+          "captures": 0,
+          "fallbacks": 0,
+          "prefill_batches": 74,
+          "prefill_tokens": 8967,
+          "draft_calls": 270,
+          "draft_graph_hits": 270,
+          "native_verify_calls": 270,
+          "native_verify_graph_hits": 270
+        }
+      },
+      "runtime_config": {
+        "chunked_prefill_size": 128,
+        "max_prefill_tokens": 128,
+        "max_total_tokens": 65536,
+        "max_running_requests": 4,
+        "disable_overlap_schedule": false,
+        "enable_hierarchical_cache": false,
+        "tp_size": 1
+      }
+    },
+    "mixed": {
+      "joint": {
+        "wall_s": 2.2680218052119017,
+        "output_tok_s": 733.6790132158947,
+        "request_s": 2.2045643425958374,
+        "completion_tokens": [
+          512,
+          512,
+          512,
+          64,
+          64
+        ],
+        "ttft_ms": [
+          204.94936406612396,
+          102.76785120368004,
+          203.58644798398018,
+          745.6076052039862,
+          743.8208945095539
+        ],
+        "tpot_ms": [
+          4.036524542652931,
+          4.206744589480168,
+          4.008481315466523,
+          2.509278023526782,
+          2.432004829484319
+        ],
+        "stats_including_warmup": {
+          "mode": "mixed",
+          "pairs": 64,
+          "mixed": 64,
+          "captures": 1,
+          "fallbacks": 0,
+          "prefill_batches": 70,
+          "prefill_tokens": 8583,
+          "draft_calls": 134,
+          "draft_graph_hits": 134,
+          "native_verify_calls": 70,
+          "native_verify_graph_hits": 70
+        }
+      },
+      "decode_only": {
+        "wall_s": 1.3431602213531733,
+        "output_tok_s": 1143.5716868182333,
+        "request_s": 2.233538450816862,
+        "completion_tokens": [
+          512,
+          512,
+          512
+        ],
+        "ttft_ms": [
+          211.34969219565392,
+          104.79398630559444,
+          209.9080178886652
+        ],
+        "tpot_ms": [
+          2.2140481926632023,
+          2.3942082836028415,
+          2.1872174016650177
+        ],
+        "stats_including_warmup": {
+          "mode": "mixed",
+          "pairs": 64,
+          "mixed": 64,
+          "captures": 1,
+          "fallbacks": 0,
+          "prefill_batches": 74,
+          "prefill_tokens": 8967,
+          "draft_calls": 264,
+          "draft_graph_hits": 264,
+          "native_verify_calls": 200,
+          "native_verify_graph_hits": 200
+        }
+      },
+      "runtime_config": {
+        "chunked_prefill_size": 128,
+        "max_prefill_tokens": 128,
+        "max_total_tokens": 65536,
+        "max_running_requests": 4,
+        "disable_overlap_schedule": true,
+        "enable_hierarchical_cache": false,
+        "tp_size": 1
+      }
+    }
+  },
+  "exact_output_ids_equal": {
+    "joint": [
+      true,
+      true,
+      true,
+      true,
+      true
+    ],
+    "decode_only": [
+      true,
+      true,
+      true
+    ]
+  },
+  "source_hashes": {
+    "test/manual/pdmux/live_mixed_target.py": "ebaed7a20aa97211a2ad24ce4db210b4f4a3b4eb1956f7527f14ca19c180fded",
+    "test/manual/pdmux/bench_mixed_reduction_tuning.py": "02b37aca1147aa9d3182d1421d98ac6a0608cf739a10c72bfec8327aaf69b66e",
+    "test/manual/pdmux/bench_mixed_selection.py": "f3f3403cbc0a52ee62afb6bf28e326e2007ba22dbeaaa0a33e9641e48dcb4f5a",
+    "test/manual/pdmux/bench_mixed_operators.py": "ea9ad620a3d9346fa10bd37c7cc6e1b2624e2f721efc34c0093a969e778617aa",
+    "test/manual/pdmux/run_live_mixed_target.py": "313fccfbcc6b57d8608fe7a3a72c8f8a3b1a8e4d1ea3fdf4989d5f50beaa48a5",
+    "test/manual/pdmux/run_mixed_eager.py": "f87346c8784bc16d5066df0725e9c8fc455507ab76962f314ec99af323bf9a6c",
+    "test/manual/pdmux/mixed_eager_numerics.py": "bd8aa5023e66e5072119a1f6d36958004de3ea7e69ef257fd3fe3a62d76e82c7",
+    "test/manual/pdmux/mixed_eager_control.py": "850acada94b3672c2a2005469e2e27c5d11957450c10ebab364637172e3f2049",
+    "test/manual/pdmux/mixed_eager_validation.py": "f857592ee8cdfb08896bbe68e0a737b2d8af65d50e8f14a0032a77ea5d24b9b5",
+    "test/manual/pdmux/bench_live_mixed_target.py": "dbb0fd2b85ab6ca0a2d7ec784dc9e7d1f1d006c8f219795143233cba3361a8e2",
+    "test/manual/pdmux/bench_mixed_full_model.py": "7cad4b6f881dca2facea17215e19cc4b9251a7958534886037a72a7c1380ea01",
+    "test/manual/pdmux/mixed_eager_harness.py": "c34f15e0b6bf6eb7bc856ebd2f384005b0ca32ca876b2a70d2e9a0b298c1da5f"
+  },
+  "limitations": [
+    "One measured trial per group, no confidence interval.",
+    "Synthetic high-acceptance workload, not SWE or a production traffic trace.",
+    "Both groups use chunk128 and HiCache disabled; no PDMux A/B in this quick run.",
+    "Native DFlash uses CPU overlap; the private Mixed scheduler uses non-overlap.",
+    "Fixed legacy numerical profile and fixed Mixed admission; no adaptive six-graph policy."
+  ],
+  "raw_archive": {
+    "path": "/Users/guoqing/.codex/visualizations/2026/10/26/01a175cf-dbdf-7ce0-b26f-3707e8e44e1c/pdmux-a100-20261026/mixed-live-quick-evidence-20261026.tar.gz",
+    "sha256": "67c19711365f7dd87e60bf909942746299e1fefd2202de86da4e1c215be8f745"
+  },
+  "gpu_cleanup": "No compute processes after run.",
+  "integration_scope": "Private opt-in live scheduler hook; not a production default."
+}

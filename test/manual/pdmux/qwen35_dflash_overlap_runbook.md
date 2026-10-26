@@ -1194,3 +1194,82 @@ repository's 1500 KiB limit, with parsed contents checked identical before and
 after formatting. Raw logs and caches remain local. Pre-push validation paths,
 counts and working-tree source hashes are recorded in
 [`qwen35_awq_push_validation_results.json`](qwen35_awq_push_validation_results.json).
+
+### Full-model target-stage benchmark
+
+`run_mixed_eager.py --mixed-graph --benchmark-trials 12` first runs both fresh
+stable Eager gates, then measures each validated Mixed Graph fixture. Retain
+the model paths, baseline environment JSON and optional compatibility script
+from the full validation command above, and use a fresh output directory.
+
+The three paths are native Separate (native Prefill plus the original Target
+Verify Graph), repaired Separate (one captured graph containing both forwards),
+and repaired Mixed Graph. The additional Separate Graph must match Mixed
+outputs and target pool writes before timing. Native Verify must report a
+graph hit on every measured call. Each trial starts from the same restored
+state, with rotated/reversed execution order and three discarded warmups.
+Reports retain all GPU-event and wall-time samples. Preparation is included;
+snapshot restoration, graph capture, and final snapshot comparisons are not.
+
+These are complete target-model forward measurements, not serving throughput:
+Draft, acceptance/commit, admission, request completion and cache scheduling
+remain outside timing. The existing `diagnostic_wall_s` fields still cannot
+be used as performance measurements. Use `cases[].target_benchmark` only when
+the containing Graph report and its correctness gate both pass.
+
+The driver retries temporary `/health_generate` failures while native warmup
+finishes; a successful server-info response alone does not establish readiness.
+
+### Private live Mixed experiment with preserved serving settings
+
+Correction: the historical runs below explicitly used chunk32768. That is
+not the intended unchanged native chunk configuration. The driver and launcher
+now leave chunk size unspecified unless supplied by the existing base config,
+environment or an explicit CLI override. Only max-prefill-tokens defaults to
+32768. The current engine resolves an unspecified chunk to 4096 on A100 40GB;
+confirm the actual value in server-info before comparing groups. Historical
+throughput results do not establish gains under this corrected configuration.
+
+`run_live_mixed_target.py` applies the same chunk, Prefill budget, CPU overlap
+and HiCache settings to every group. It inherits the base configuration unless
+explicitly overridden. For the corrected A100 SWE replay, append:
+
+```bash
+--swe-workload /path/to/swe-multiturn.json \
+--max-prefill-tokens 32768 \
+--cpu-overlap 1 --hicache 0 --groups mixed --trials 1
+```
+
+Retain the required model, base-config, compatibility, output and full-model
+gate arguments. The hook preserves actual native chunk lengths and native CPU
+overlap. Only validated, profitable P1+D3 block8 pairings use a joint Graph;
+other batches follow the native path. Existing Draft and independent Verify
+Graphs remain active. This is a private experiment, not a serving flag.
+
+The [corrected SWE report](qwen35_awq_mixed_preserve_swe_results.md) supersedes
+the old chunk128/overlap-off interpretation. It measures 305.44 tok/s versus
+preceding controls of 295.10/297.44, with only two joint replays and no measured
+capture. One pass with reused controls cannot establish a stable improvement.
+First-shape admission makes warmup take 139.83 seconds; this excluded cost and
+the rejected greedy-mismatch shape remain material limitations.
+
+The [kernel optimization report](qwen35_awq_mixed_optimization_results.md)
+records an opt-in P1576 candidate using `LIVE_MIXED_LINEAR_TILE=wide` and
+`LIVE_MIXED_MOE_BLOCK=32`. Its validated bounded configuration also sets
+`LIVE_MIXED_MIN_TOKENS=1576`, `LIVE_MIXED_CAPACITY_LIMIT=1576` and
+`LIVE_MIXED_GRAPH_LIMIT=1` as strings in the base-config JSON. These eligibility
+limits preserve the native chunk shape. Omit `MIXED_TARGET_PROFILE_DIR` for
+unprofiled runs. Legacy tile defaults remain unchanged.
+
+This candidate reduces the profiled target-stage median from 220.04 to
+119.47 ms and executes a joint Graph in the real request loop. End-to-end
+throughput improvement is not established. A broad MoE32 attempt exhausted
+memory in a subsequent large native Prefill, so the bounded candidate must
+not be treated as validated full-workload admission or a production memory fix.
+
+## Native-chunk tail-fill follow-up
+
+See [joint execution results](qwen35_awq_tailfill_joint_results.md) for the
+chunk4096/max-prefill32768 A100 run, the opt-in fixed-arithmetic reference,
+the pipeline projection candidate and the bounded P2184 admission settings.
+The single-pass +2% serving result is not a demonstrated stable gain.

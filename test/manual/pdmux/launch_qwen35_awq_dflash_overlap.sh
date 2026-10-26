@@ -26,7 +26,7 @@ args=(
   --attention-backend "$attention_backend"
   --linear-attn-prefill-backend triton --linear-attn-decode-backend triton
   --mamba-radix-cache-strategy extra_buffer
-  --context-length 16384 --chunked-prefill-size 32768 --max-prefill-tokens 32768
+  --context-length 16384 --max-prefill-tokens "${MAX_PREFILL_TOKENS:-32768}"
   --max-total-tokens "${MAX_TOTAL_TOKENS:-32768}" --max-mamba-cache-size "${MAMBA_CACHE:-24}"
   --max-running-requests "${MAX_RUNNING_REQUESTS:-4}"
   --cuda-graph-max-bs-decode "${MAX_RUNNING_REQUESTS:-4}"
@@ -35,6 +35,9 @@ args=(
   --random-seed 42 --watchdog-timeout 300 --enable-metrics
   --host "${HOST:-127.0.0.1}" --port "${PORT:-39926}"
 )
+if [[ -n ${CHUNKED_PREFILL_SIZE:-} ]]; then
+  args+=(--chunked-prefill-size "$CHUNKED_PREFILL_SIZE")
+fi
 if [[ ${DFLASH:-1} == 1 ]]; then
   args+=(--speculative-algorithm DFLASH --speculative-dflash-block-size "${BLOCK_SIZE:-8}"
     --speculative-draft-model-path "$DRAFT_MODEL"

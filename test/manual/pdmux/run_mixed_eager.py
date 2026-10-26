@@ -32,6 +32,43 @@ from mixed_eager_validation import (
 )
 
 
+def wait_for_generation_ready(requests, process, url, *, timeout=600):
+    """Server metadata is available before the native generation warmup ends."""
+    deadline = time.monotonic() + timeout
+    last_error = None
+    while time.monotonic() < deadline:
+        if process.poll() is not None:
+            raise RuntimeError("Private server exited during generation warmup")
+        try:
+            response = requests.get(url + "/health_generate", timeout=30)
+            if response.ok:
+                return
+            last_error = f"HTTP {response.status_code}"
+        except requests.RequestException as exc:
+            last_error = str(exc)
+        time.sleep(2)
+    raise TimeoutError(f"Native generation did not become ready: {last_error}")
+
+
+def reusable_eager_gates(folder, *, repo, effective):
+    """Reuse complete gates only for identical numerical sources and launch config."""
+    previous = json.loads((folder / "config.json").read_text())
+    host_keys = {"MIXED_OFFLINE_ROOT", "PORT", "HOST"}
+    if {k: v for k, v in previous.items() if k not in host_keys} != {
+        k: v for k, v in effective.items() if k not in host_keys
+    }:
+        raise ValueError("Reusable Eager launch configuration differs")
+    reports = {}
+    for rejection, lane in ((False, "natural"), (True, "rejection")):
+        name = f"native-{lane}"
+        report = json.loads((folder / f"{name}-report.json").read_text())
+        validate_eager_gate(
+            report, expected_sources=source_hashes(repo), rejection=rejection
+        )
+        reports[name] = report
+    return reports
+
+
 def prepare_run(args):
     """Validate and freeze the launch plan without torch, CUDA or a server."""
     manual = Path(__file__).resolve().parent
@@ -39,6 +76,15 @@ def prepare_run(args):
     jobs = build_jobs(
         smoke=args.smoke, numerics=args.numerics, mixed_graph=args.mixed_graph
     )
+    benchmark_trials = getattr(args, "benchmark_trials", 0)
+    if getattr(args, "reuse_eager_from", None) and not args.mixed_graph:
+        raise ValueError("Reusing Eager gates requires --mixed-graph")
+    if benchmark_trials and (not args.mixed_graph or benchmark_trials < 6):
+        raise ValueError("Benchmarking requires --mixed-graph and at least six trials")
+    if benchmark_trials:
+        for job in jobs:
+            if job["mixed_graph_candidate"]:
+                job["benchmark_trials"] = benchmark_trials
     base = json.loads(args.base_config.read_text())
     if not isinstance(base, dict) or not all(
         isinstance(k, str) and isinstance(v, str) for k, v in base.items()
@@ -118,6 +164,14 @@ def prepare_run(args):
             HOST="127.0.0.1",
         )
     )
+    reuse_folder = getattr(args, "reuse_eager_from", None)
+    reused = (
+        reusable_eager_gates(reuse_folder, repo=repo, effective=effective)
+        if reuse_folder is not None
+        else {}
+    )
+    for name, report in reused.items():
+        write_json(root / f"{name}-report.json", report)
     env = (
         os.environ
         | effective
@@ -150,6 +204,7 @@ def prepare_run(args):
             lane: dict(path=str(path), proposals_sha256=digest)
             for lane, (path, _, digest) in proposal_inputs.items()
         },
+        reused_eager_gates=str(reuse_folder.resolve()) if reused else None,
     )
     write_json(root / "plan.json", plan)
     return root, manual, repo, env, plan
@@ -167,6 +222,17 @@ def main():
     parser.add_argument("--numerics", choices=["original", "stable"], default="stable")
     parser.add_argument("--proposals-from", type=Path)
     parser.add_argument("--mixed-graph", action="store_true")
+    parser.add_argument(
+        "--reuse-eager-from",
+        type=Path,
+        help="Reuse source/config-matched completed Eager gates from a previous run",
+    )
+    parser.add_argument(
+        "--benchmark-trials",
+        type=int,
+        default=0,
+        help="Measure the full-model target stage after Graph correctness checks (>=6)",
+    )
     parser.add_argument(
         "--prepare-only",
         action="store_true",
@@ -223,7 +289,7 @@ def main():
             raise TimeoutError("Private validation server did not become ready")
         # server-info may be available before the built-in generation warmup
         # completes. Drain a native generation before injecting offline work.
-        requests.get(url + "/health_generate", timeout=120).raise_for_status()
+        wait_for_generation_ready(requests, process, url)
         jobs = plan["jobs"]
         for config in jobs:
             nonce = config["nonce"]
@@ -244,21 +310,24 @@ def main():
                     config["proposals_sha256"] = digest
                 elif digest != config["proposals_sha256"]:
                     raise RuntimeError("Prepared proposals changed before submission")
-            write_json(root / "trigger.json", config)
             path = root / (nonce + "-report.json")
-            deadline = time.monotonic() + 1800
-            while time.monotonic() < deadline:
-                if process.poll() is not None:
-                    raise RuntimeError(f"Private server exited: {root / 'server.log'}")
-                try:
-                    result = json.loads(path.read_text())
-                    if result["stage"] in ("completed", "failed"):
-                        break
-                except (FileNotFoundError, json.JSONDecodeError):
-                    pass
-                time.sleep(2)
+            if plan["reused_eager_gates"] and config["repeat_control"]:
+                result = json.loads(path.read_text())
             else:
-                raise TimeoutError(nonce)
+                write_json(root / "trigger.json", config)
+                deadline = time.monotonic() + 1800
+                while time.monotonic() < deadline:
+                    if process.poll() is not None:
+                        raise RuntimeError(f"Private server exited: {root / 'server.log'}")
+                    try:
+                        result = json.loads(path.read_text())
+                        if result["stage"] in ("completed", "failed"):
+                            break
+                    except (FileNotFoundError, json.JSONDecodeError):
+                        pass
+                    time.sleep(2)
+                else:
+                    raise TimeoutError(nonce)
             gate = result.get("gate_passed") is True
             gate_error = None
             if (

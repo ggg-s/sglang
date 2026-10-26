@@ -65,12 +65,23 @@ def fixed_linear(x, weight, *, tile=(16, 32, 4)):
     n = weight.shape[0]
     if tile == "projection":
         tile = projection_tile(weight)
-    bm, bn, warps = tile
-    if bm not in (16, 32, 64) or bn not in (32, 64, 128) or warps not in (4, 8):
+    if len(tile) == 3:
+        bm, bn, warps = tile
+        stages = 2
+    elif len(tile) == 4:
+        bm, bn, warps, stages = tile
+    else:
+        raise ValueError(f"Unsupported fixed linear tile: {tile}")
+    if (
+        bm not in (16, 32, 64, 128)
+        or bn not in (32, 64, 128)
+        or warps not in (4, 8)
+        or stages not in (2, 3)
+    ):
         raise ValueError(f"Unsupported fixed linear tile: {tile}")
     y = x.new_empty((m, n))
     _router[(triton.cdiv(m, bm), triton.cdiv(n, bn))](
-        x, weight, y, m, n, k, bm, bn, num_warps=warps, num_stages=2
+        x, weight, y, m, n, k, bm, bn, num_warps=warps, num_stages=stages
     )
     return y
 

@@ -10,6 +10,7 @@ from __future__ import annotations
 
 import copy
 import dataclasses
+from contextlib import nullcontext
 
 import torch
 
@@ -143,13 +144,38 @@ def _refresh_metadata(pinned, fresh):
 class MixedTargetGraph:
     @torch.no_grad()
     def __init__(
-        self, model_runner, prefill_batch, verify_batch, *, prefill_capacity, restore
+        self,
+        model_runner,
+        prefill_batch,
+        verify_batch,
+        *,
+        prefill_capacity,
+        restore,
+        prefill_capacity_limit=None,
+        linear_tile=(16, 32, 4),
+        moe_block_size=8,
+        variable_batch=False,
+        stable_numerics=True,
     ):
         self.mr = model_runner
-        if prefill_capacity not in SUPPORTED_PREFILL_CAPACITIES:
+        self.variable_batch = variable_batch
+        self.stable_numerics = stable_numerics
+        self.numerical_options = dict(
+            linear_tile=linear_tile, moe_block_size=moe_block_size
+        )
+        if prefill_capacity_limit is not None and (
+            type(prefill_capacity_limit) is not int
+            or not 0 < prefill_capacity_limit <= 32768
+        ):
+            raise MixedGraphLayoutChanged("Invalid experimental P capacity limit")
+        if prefill_capacity not in SUPPORTED_PREFILL_CAPACITIES and not (
+            prefill_capacity_limit is not None
+            and 0 < prefill_capacity <= prefill_capacity_limit
+        ):
             raise MixedGraphLayoutChanged("Unsupported offline P graph capacity")
         self.layout = validate_mixed_layout(
-            prefill_batch, verify_batch, prefill_capacity
+            prefill_batch, verify_batch, prefill_capacity,
+            variable_batch=self.variable_batch,
         )
         self.prefill_batch = copy.copy(prefill_batch)
         self.verify_batch = copy.copy(verify_batch)
@@ -183,15 +209,21 @@ class MixedTargetGraph:
         try:
             # Warm planner/JIT paths with the exact pinned buffers used by capture.
             restore()
-            with stable_marlin(self.mr.model):
+            with self._numerical_context():
                 self._forward()
             torch.cuda.synchronize()
             restore()
-            with stable_marlin(self.mr.model), torch.cuda.graph(self.graph):
+            with self._numerical_context(), torch.cuda.graph(self.graph):
                 self.outputs = self._forward()
             torch.cuda.synchronize()
         finally:
             restore()
+
+    def _numerical_context(self):
+        return (
+            stable_marlin(self.mr.model, **self.numerical_options)
+            if self.stable_numerics else nullcontext()
+        )
 
     def _keep_chunk_metadata(self):
         from sglang.kernels.ops.attention.fla.index import (
@@ -223,7 +255,8 @@ class MixedTargetGraph:
     @torch.no_grad()
     def prepare(self, prefill_batch, verify_batch):
         layout = validate_mixed_layout(
-            prefill_batch, verify_batch, self.layout.prefill_capacity
+            prefill_batch, verify_batch, self.layout.prefill_capacity,
+            variable_batch=self.variable_batch,
         )
         if layout != self.layout:
             raise MixedGraphLayoutChanged("P valid length/capacity changed")

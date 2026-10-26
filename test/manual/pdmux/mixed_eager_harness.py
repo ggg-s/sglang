@@ -801,6 +801,22 @@ def run(scheduler, config):
                         assert turn_report["safety_passed"], (
                             "Padding/ownership/write-boundary violation"
                         )
+                    if config.get("benchmark_trials"):
+                        if not config.get("mixed_graph_candidate"):
+                            raise ValueError("Performance measurement requires Mixed Graph")
+                        from bench_mixed_full_model import benchmark_target
+
+                        turn_report["target_benchmark"] = benchmark_target(
+                            model_runner=mr,
+                            graph=graph,
+                            prefill_batch=pfb,
+                            verify_batch=vfb,
+                            prefill_backend=pbackend,
+                            native_verify=lambda: original(*args, **kwargs),
+                            restore=before.restore,
+                            snapshot=lambda: StateSnapshot(scheduler, locations),
+                            trials=config["benchmark_trials"],
+                        )
                 finally:
                     before.restore()
                     # Replay metadata after the independent backend experiments.

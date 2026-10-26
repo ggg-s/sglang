@@ -22,6 +22,7 @@ NUMERICAL_SOURCES = (
     "python/sglang/srt/layers/moe/fused_moe_triton/fused_marlin_moe.py",
     "test/manual/pdmux/mixed_eager_harness.py",
     "test/manual/pdmux/mixed_eager_validation.py",
+    "test/manual/pdmux/bench_mixed_full_model.py",
 )
 DIAGNOSTIC_FLAGS = (
     "numerical_probe",

@@ -64,6 +64,63 @@ def gate_report():
 
 
 class TestMixedValidation(unittest.TestCase):
+    def test_generation_warmup_retries_starting_health(self):
+        responses = iter(
+            [
+                types.SimpleNamespace(ok=False, status_code=503),
+                types.SimpleNamespace(ok=True),
+            ]
+        )
+        requests = types.SimpleNamespace(
+            get=lambda *a, **kw: next(responses), RequestException=ConnectionError
+        )
+        process = types.SimpleNamespace(poll=lambda: None)
+        with patch.object(driver.time, "sleep") as sleep:
+            driver.wait_for_generation_ready(requests, process, "http://private")
+        sleep.assert_called_once_with(2)
+
+    def test_generation_warmup_detects_server_exit(self):
+        process = types.SimpleNamespace(poll=lambda: 1)
+        with self.assertRaisesRegex(RuntimeError, "exited during generation warmup"):
+            driver.wait_for_generation_ready(None, process, "http://private")
+
+    def test_benchmark_requires_graph_correctness_plan_and_enough_trials(self):
+        for graph, trials in ((False, 6), (True, 5), (True, -1)):
+            args = types.SimpleNamespace(
+                smoke=False,
+                numerics="stable",
+                mixed_graph=graph,
+                benchmark_trials=trials,
+            )
+            with self.subTest(graph=graph, trials=trials), self.assertRaisesRegex(
+                ValueError, "Benchmarking requires"
+            ):
+                driver.prepare_run(args)
+
+    def test_reusable_eager_gates_validate_sources_both_lanes_and_launch(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            folder = Path(temporary)
+            effective = dict(TARGET_MODEL="target", PORT="39927")
+            validation.write_json(folder / "config.json", effective)
+            for rejection, lane in ((False, "natural"), (True, "rejection")):
+                report = gate_report()
+                report["config"]["rejection_fixture"] = rejection
+                validation.write_json(folder / f"native-{lane}-report.json", report)
+            self.assertEqual(
+                set(driver.reusable_eager_gates(folder, repo=ROOT, effective=effective)),
+                {"native-natural", "native-rejection"},
+            )
+            with self.assertRaisesRegex(ValueError, "configuration differs"):
+                driver.reusable_eager_gates(
+                    folder, repo=ROOT, effective=effective | dict(TARGET_MODEL="other")
+                )
+            path = folder / "native-rejection-report.json"
+            report = json.loads(path.read_text())
+            report["numerical_source_sha256"] = {}
+            validation.write_json(path, report)
+            with self.assertRaisesRegex(ValueError, "source-matched"):
+                driver.reusable_eager_gates(folder, repo=ROOT, effective=effective)
+
     def check_gate(self, report):
         return validation.validate_eager_gate(
             report, expected_sources=validation.source_hashes(ROOT), rejection=False
@@ -190,6 +247,8 @@ class TestMixedValidation(unittest.TestCase):
                     "--proposals-from",
                     str(folder),
                     "--mixed-graph",
+                    "--benchmark-trials",
+                    "6",
                     "--prepare-only",
                 ],
                 capture_output=True,
@@ -201,6 +260,10 @@ class TestMixedValidation(unittest.TestCase):
             self.assertFalse(plan["gpu_executed"])
             self.assertIsNone(plan["correctness_passed"])
             self.assertEqual(len(plan["jobs"]), 4)
+            self.assertEqual(
+                [job.get("benchmark_trials", 0) for job in plan["jobs"]],
+                [0, 0, 6, 6],
+            )
             self.assertFalse((output / "server.log").exists())
             self.assertFalse((output / "server-process.json").exists())
             for job in plan["jobs"]:

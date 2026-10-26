@@ -1,0 +1,1570 @@
+{
+  "scope": "One profiled measured SWE replay per mode; diagnostic, not throughput A/B",
+  "remote_root": "/root/rivermind-data/validation/mixed-tailfill-service-profile-20261026",
+  "local_artifacts": "/Users/guoqing/.codex/visualizations/2026/10/26/01a175cf-dbdf-7ce0-b26f-3707e8e44e1c/pdmux-service-profile-a100-20261026",
+  "exit_code": 0,
+  "modes": {
+    "dflash": {
+      "settings": {
+        "chunked_prefill_size": 4096,
+        "max_prefill_tokens": 32768,
+        "disable_overlap_schedule": false,
+        "max_running_requests": 4,
+        "max_total_tokens": 65536,
+        "enable_hierarchical_cache": false
+      },
+      "measured_instrumented": {
+        "requests": 18,
+        "output_tokens": 2304,
+        "wall_s": 8.170591564849019,
+        "output_tok_s": 281.9869261256574,
+        "ttft_p50_ms": 178.19611635059118,
+        "ttft_p95_ms": 898.5166123136867,
+        "tpot_mean_ms": 8.981001041079965,
+        "cached_tokens": 115008,
+        "graph_counters": {
+          "pairs": 0,
+          "mixed": 0,
+          "captures": 0,
+          "fallbacks": 0,
+          "prefill_batches": 16,
+          "prefill_tokens": 26197,
+          "draft_calls": 289,
+          "draft_graph_hits": 289,
+          "native_verify_calls": 289,
+          "native_verify_graph_hits": 289,
+          "admission_verify_calls": 0,
+          "admission_graph_captures": 0,
+          "unsupported_prefill": 0,
+          "unpaired_prefill": 0,
+          "rejected_prefill": 0,
+          "mixed_prefill_tokens": 0,
+          "tail_opportunities": 0,
+          "tail_unused_tokens": 0,
+          "mixed_verify_tokens": 0,
+          "partial_decode_pairs": 0,
+          "native_tail_pairs": 0,
+          "native_tail_verify_tokens": 0,
+          "native_tail_prefill_tokens": 0
+        }
+      },
+      "trace": {
+        "kernel": {
+          "count": 402028,
+          "sum_ms": 6281.517610000001,
+          "busy_ms": 5737.006382568359
+        },
+        "gpu_span_ms": 8106.637490966797,
+        "stages": {
+          "stage/prefill": {
+            "count": 22506,
+            "sum_ms": 1634.732983,
+            "busy_ms": 1634.7329580078126
+          },
+          "outside-stage": {
+            "count": 18113,
+            "sum_ms": 137.743381,
+            "busy_ms": 133.76728051757811
+          },
+          "stage/draft": {
+            "count": 34960,
+            "sum_ms": 585.411523,
+            "busy_ms": 584.4729763183594
+          },
+          "stage/verify": {
+            "count": 326449,
+            "sum_ms": 3923.629723,
+            "busy_ms": 3388.4990776367185
+          }
+        },
+        "rounds": {
+          "round/prefill_4096": {
+            "count": 2861,
+            "sum_ms": 440.885048,
+            "busy_ms": 440.8850515136719
+          },
+          "outside-round": {
+            "count": 872,
+            "sum_ms": 5.151981,
+            "busy_ms": 5.151978759765625
+          },
+          "round/prefill_3866": {
+            "count": 1416,
+            "sum_ms": 221.915346,
+            "busy_ms": 221.91534741210938
+          },
+          "round/decode_3": {
+            "count": 108621,
+            "sum_ms": 1342.940734,
+            "busy_ms": 1159.4448657226562
+          },
+          "round/decode_2": {
+            "count": 126100,
+            "sum_ms": 1486.9416999999999,
+            "busy_ms": 1274.4194506835938
+          },
+          "round/prefill_2184": {
+            "count": 1416,
+            "sum_ms": 132.780764,
+            "busy_ms": 132.7807673339844
+          },
+          "round/decode_4": {
+            "count": 132759,
+            "sum_ms": 1676.625968,
+            "busy_ms": 1552.6506716308593
+          },
+          "round/prefill_522": {
+            "count": 1415,
+            "sum_ms": 46.632429,
+            "busy_ms": 46.63242529296875
+          },
+          "round/prefill_463": {
+            "count": 1415,
+            "sum_ms": 43.423165,
+            "busy_ms": 43.423159423828125
+          },
+          "round/prefill_1495": {
+            "count": 1415,
+            "sum_ms": 93.55100900000001,
+            "busy_ms": 93.55101123046875
+          },
+          "round/prefill_274": {
+            "count": 1425,
+            "sum_ms": 32.412534,
+            "busy_ms": 32.412533935546875
+          },
+          "round/prefill_939": {
+            "count": 1416,
+            "sum_ms": 68.76992299999999,
+            "busy_ms": 68.76992358398438
+          },
+          "round/prefill_1896": {
+            "count": 1445,
+            "sum_ms": 122.826081,
+            "busy_ms": 122.8260849609375
+          },
+          "round/prefill_1021": {
+            "count": 1415,
+            "sum_ms": 70.542316,
+            "busy_ms": 70.54230322265624
+          },
+          "round/prefill_2451": {
+            "count": 1415,
+            "sum_ms": 148.41291,
+            "busy_ms": 148.41290454101562
+          },
+          "round/prefill_476": {
+            "count": 1415,
+            "sum_ms": 44.440664,
+            "busy_ms": 44.4406533203125
+          },
+          "round/prefill_597": {
+            "count": 1415,
+            "sum_ms": 50.238226000000004,
+            "busy_ms": 50.23822705078125
+          },
+          "round/decode_1": {
+            "count": 10962,
+            "sum_ms": 117.890806,
+            "busy_ms": 98.03105493164063
+          },
+          "round/prefill_944": {
+            "count": 1415,
+            "sum_ms": 68.37530000000001,
+            "busy_ms": 68.37530346679688
+          },
+          "round/prefill_877": {
+            "count": 1415,
+            "sum_ms": 66.760706,
+            "busy_ms": 66.7607001953125
+          }
+        },
+        "top_kernels": [
+          {
+            "name": "void sglang::device::marlin_moe::Marlin<__half, 1125899906843648l, 1125899906910725l, 128, 1, 8, 4, true, 4, 8, false, false, false>(int4 const*, int4 const*, int4*, int4*, int4 const*, int4 const*, unsigned short const*, int4 const*, int const*, int const*, int const*, int const*, float const*, int, bool, bool, int, int, int, int, int*, bool, bool, bool, int, bool)",
+            "count": 22542,
+            "sum_ms": 1228.479696,
+            "busy_ms": 1228.4796967773439
+          },
+          {
+            "name": "ampere_fp16_s16816gemm_fp16_64x64_sliced1x2_ldg8_f2f_stages_64x5_tn",
+            "count": 17308,
+            "sum_ms": 610.64678,
+            "busy_ms": 610.6467214355469
+          },
+          {
+            "name": "void sglang::device::marlin_moe::Marlin<__half, 1125899906843648l, 1125899906910725l, 128, 4, 8, 4, false, 4, 8, false, false, false>(int4 const*, int4 const*, int4*, int4*, int4 const*, int4 const*, unsigned short const*, int4 const*, int const*, int const*, int const*, int const*, float const*, int, bool, bool, int, int, int, int, int*, bool, bool, bool, int, bool)",
+            "count": 546,
+            "sum_ms": 436.043515,
+            "busy_ms": 436.0435158691406
+          },
+          {
+            "name": "ampere_fp16_s16816gemm_fp16_128x64_ldg8_f2f_stages_64x4_tn",
+            "count": 10667,
+            "sum_ms": 317.605648,
+            "busy_ms": 317.6056381835937
+          },
+          {
+            "name": "void flashinfer::BatchPrefillWithPagedKVCacheKernel<true, flashinfer::KernelTraits<(flashinfer::MaskMode)1, 64u, 1u, 2u, 16u, 16u, 4u, 1u, (flashinfer::PosEncodingMode)0, __half, __half, __half, float, int, flashinfer::DefaultAttention<false, false, false, false>, true>, PagedParams>(PagedParams)",
+            "count": 3050,
+            "sum_ms": 305.732541,
+            "busy_ms": 305.7325437011719
+          },
+          {
+            "name": "ampere_fp16_s16816gemm_fp16_128x64_ldg8_f2f_stages_64x3_tn",
+            "count": 440,
+            "sum_ms": 275.413854,
+            "busy_ms": 275.41385278320314
+          },
+          {
+            "name": "gdn_replayssm_spec_circular_kernel",
+            "count": 8670,
+            "sum_ms": 206.220333,
+            "busy_ms": 206.22031982421876
+          },
+          {
+            "name": "ampere_s16816gemm_fp16_128x64_ldg8_stages_32x6_tn",
+            "count": 11754,
+            "sum_ms": 161.795107,
+            "busy_ms": 161.79511401367188
+          },
+          {
+            "name": "fused_moe_kernel",
+            "count": 610,
+            "sum_ms": 149.07722099999998,
+            "busy_ms": 149.07722143554687
+          },
+          {
+            "name": "sm80_xmma_gemm_f16f16_f16f32_f32_tn_n_tilesize32x32x64_stage6_warpsize2x2x1_tensor16x8x16_execute_kernel__5x_cublas",
+            "count": 13420,
+            "sum_ms": 137.580448,
+            "busy_ms": 90.88085791015625
+          },
+          {
+            "name": "ampere_fp16_s16816gemm_fp16_128x256_ldg8_f2f_stages_64x3_tn",
+            "count": 203,
+            "sum_ms": 134.37089799999998,
+            "busy_ms": 134.3708974609375
+          },
+          {
+            "name": "kernel_cutlass_kernel_flashinfernormkernelsfused_add_rmsnormFusedAddRMSNormKernel_object_at__tensorptrf16gmemalign128oi64204820481_tensorptrf16gmemalign128oi64204820481_tensorptrf16gmemal_0",
+            "count": 27868,
+            "sum_ms": 128.460527,
+            "busy_ms": 128.4607333984375
+          },
+          {
+            "name": "void cutlass::Kernel2<cutlass_80_wmma_tensorop_f16_s161616gemm_f16_16x16_128x2_tn_align8>(cutlass_80_wmma_tensorop_f16_s161616gemm_f16_16x16_128x2_tn_align8::Params)",
+            "count": 5400,
+            "sum_ms": 116.58875599999999,
+            "busy_ms": 116.58876196289063
+          },
+          {
+            "name": "_causal_conv1d_update_kernel",
+            "count": 8670,
+            "sum_ms": 103.71708100000001,
+            "busy_ms": 103.717109375
+          },
+          {
+            "name": "void cutlass::Kernel2<cutlass_80_wmma_tensorop_f16_s161616gemm_f16_16x16_128x1_tn_align8>(cutlass_80_wmma_tensorop_f16_s161616gemm_f16_16x16_128x1_tn_align8::Params)",
+            "count": 3000,
+            "sum_ms": 101.79032600000001,
+            "busy_ms": 101.79032934570313
+          },
+          {
+            "name": "void sglang::device::marlin_moe::Marlin<__half, 1125899906843648l, 1125899906910725l, 128, 2, 8, 4, false, 4, 8, false, false, false>(int4 const*, int4 const*, int4*, int4*, int4 const*, int4 const*, unsigned short const*, int4 const*, int const*, int const*, int const*, int const*, float const*, int, bool, bool, int, int, int, int, int*, bool, bool, bool, int, bool)",
+            "count": 390,
+            "sum_ms": 98.639148,
+            "busy_ms": 98.6391494140625
+          },
+          {
+            "name": "void sglang::act_and_mul_kernel<__half, (sglang::ActivationKind)0, false, false, false, false>(sglang::ActivationParams)",
+            "count": 26134,
+            "sum_ms": 87.537388,
+            "busy_ms": 87.53740405273437
+          },
+          {
+            "name": "void sglang::device::marlin_moe::Marlin<__half, 1125899906843648l, 1125899906910725l, 128, 3, 8, 4, false, 4, 8, false, false, false>(int4 const*, int4 const*, int4*, int4*, int4 const*, int4 const*, unsigned short const*, int4 const*, int const*, int const*, int const*, int const*, float const*, int, bool, bool, int, int, int, int, int*, bool, bool, bool, int, bool)",
+            "count": 234,
+            "sum_ms": 82.059504,
+            "busy_ms": 82.05950170898437
+          },
+          {
+            "name": "void cublasLt::splitKreduce_kernel<32, 16, int, float, __half, float, __half, false, __half, __half, __half, true, false, false, false>(cublasLt::cublasSplitKParams<float>, float const*, __half const*, __half*, __half*, float const*, float const*, __half const*, float const*, __half*, void*, long, float*, int*, float*, float*, float const*, float const*, float const*, float const*, float const*)",
+            "count": 23994,
+            "sum_ms": 79.09517699999999,
+            "busy_ms": 71.88084643554687
+          },
+          {
+            "name": "ampere_s16816gemm_fp16_128x64_ldg8_stages_64x4_tn",
+            "count": 3807,
+            "sum_ms": 74.33339699999999,
+            "busy_ms": 74.33338989257813
+          },
+          {
+            "name": "_router_triton_kernel",
+            "count": 12200,
+            "sum_ms": 68.039481,
+            "busy_ms": 68.03950927734375
+          },
+          {
+            "name": "ampere_fp16_s16816gemm_fp16_256x128_ldg8_f2f_stages_64x3_tn",
+            "count": 155,
+            "sum_ms": 67.09548299999999,
+            "busy_ms": 67.09548388671875
+          },
+          {
+            "name": "ampere_fp16_s16816gemm_fp16_128x128_ldg8_f2f_stages_32x5_tn",
+            "count": 423,
+            "sum_ms": 66.315466,
+            "busy_ms": 66.315466796875
+          },
+          {
+            "name": "void cutlass::Kernel2<cutlass_80_wmma_tensorop_s161616gemm_f16_32x32_128x2_tn_align8>(cutlass_80_wmma_tensorop_s161616gemm_f16_32x32_128x2_tn_align8::Params)",
+            "count": 7200,
+            "sum_ms": 65.270968,
+            "busy_ms": 65.27097924804687
+          },
+          {
+            "name": "void at::native::vectorized_elementwise_kernel<4, at::native::FillFunctor<c10::Half>, std::array<char*, 1ul>, false>(int, at::native::FillFunctor<c10::Half>, std::array<char*, 1ul>)",
+            "count": 17640,
+            "sum_ms": 58.907974,
+            "busy_ms": 58.90786596679688
+          },
+          {
+            "name": "void moe_align_block_size_kernel<int>(int const*, int*, int*, int*, int, int, unsigned long, int*, bool, bool, int, int)",
+            "count": 11840,
+            "sum_ms": 55.892311,
+            "busy_ms": 55.892414794921876
+          },
+          {
+            "name": "void cublasLt::splitKreduce_kernel<32, 16, int, __half, __half, float, __half, false, __half, __half, __half, true, false, false, false>(cublasLt::cublasSplitKParams<float>, __half const*, __half const*, __half*, __half*, float const*, float const*, __half const*, __half const*, __half*, void*, long, float*, int*, float*, float*, float const*, float const*, float const*, float const*, float const*)",
+            "count": 14423,
+            "sum_ms": 52.984172,
+            "busy_ms": 52.98408618164063
+          },
+          {
+            "name": "void flashinfer::BatchPrefillWithPagedKVCacheKernel<true, flashinfer::KernelTraits<(flashinfer::MaskMode)1, 128u, 2u, 4u, 8u, 8u, 4u, 1u, (flashinfer::PosEncodingMode)0, __half, __half, __half, float, int, flashinfer::DefaultAttention<false, false, false, false>, true>, PagedParams>(PagedParams)",
+            "count": 900,
+            "sum_ms": 52.136300999999996,
+            "busy_ms": 52.13630395507813
+          },
+          {
+            "name": "_fused_gate_sigmoid_mul_add_kernel",
+            "count": 12200,
+            "sum_ms": 45.422256999999995,
+            "busy_ms": 45.422265625
+          },
+          {
+            "name": "chunk_gated_delta_rule_fwd_kernel_h_blockdim64",
+            "count": 480,
+            "sum_ms": 41.057313,
+            "busy_ms": 41.0573134765625
+          }
+        ],
+        "runtime_names": {
+          "cudaStreamIsCapturing": 10340,
+          "cudaEventRecordWithFlags": 3491,
+          "cudaStreamWaitEvent": 2071,
+          "cudaMemcpyAsync": 11294,
+          "cudaEventRecord": 348,
+          "cudaEventQuery": 2924,
+          "cuLaunchKernelEx": 12469,
+          "cudaLaunchKernel": 28576,
+          "cudaPeekAtLastError": 3916,
+          "cudaOccupancyMaxActiveBlocksPerMultiprocessorWithFlags": 941,
+          "cudaDeviceGetAttribute": 6090,
+          "cudaStreamSynchronize": 2495,
+          "cudaLaunchKernelExC": 4950,
+          "cudaMalloc": 17,
+          "cudaMemsetAsync": 869,
+          "cudaOccupancyMaxActiveBlocksPerMultiprocessor": 1408,
+          "cudaFuncGetAttributes": 3623,
+          "cudaFuncSetAttribute": 1418,
+          "cudaPointerGetAttributes": 15,
+          "cudaEventSynchronize": 305,
+          "cuLaunchKernel": 404,
+          "cudaGraphLaunch": 578,
+          "cudaDeviceSynchronize": 2
+        },
+        "event_categories": {
+          "": 76,
+          "user_annotation": 3342,
+          "cpu_op": 321896,
+          "overhead": 58,
+          "cuda_runtime": 85671,
+          "ac2g": 513024,
+          "gpu_memcpy": 11294,
+          "kernel": 402028,
+          "cuda_driver": 12873,
+          "gpu_memset": 1158,
+          "gpu_user_annotation": 2467,
+          "Trace": 1
+        },
+        "paired_rounds": [],
+        "unique_kernel_events": 402028,
+        "gpu_idle_ms": 2369.6311083984374
+      }
+    },
+    "tailfill_native": {
+      "settings": {
+        "chunked_prefill_size": 4096,
+        "max_prefill_tokens": 32768,
+        "disable_overlap_schedule": false,
+        "max_running_requests": 4,
+        "max_total_tokens": 65536,
+        "enable_hierarchical_cache": false
+      },
+      "measured_instrumented": {
+        "requests": 18,
+        "output_tokens": 2304,
+        "wall_s": 9.059343261644244,
+        "output_tok_s": 254.3230710502773,
+        "ttft_p50_ms": 222.72896952927113,
+        "ttft_p95_ms": 949.3105919100332,
+        "tpot_mean_ms": 9.992691318317922,
+        "cached_tokens": 115008,
+        "graph_counters": {
+          "pairs": 15,
+          "mixed": 0,
+          "captures": 0,
+          "fallbacks": 0,
+          "prefill_batches": 17,
+          "prefill_tokens": 26197,
+          "draft_calls": 299,
+          "draft_graph_hits": 299,
+          "native_verify_calls": 299,
+          "native_verify_graph_hits": 299,
+          "admission_verify_calls": 0,
+          "admission_graph_captures": 0,
+          "unsupported_prefill": 0,
+          "unpaired_prefill": 0,
+          "rejected_prefill": 0,
+          "mixed_prefill_tokens": 0,
+          "tail_opportunities": 15,
+          "tail_unused_tokens": 43435,
+          "mixed_verify_tokens": 0,
+          "partial_decode_pairs": 0,
+          "native_tail_pairs": 15,
+          "native_tail_verify_tokens": 280,
+          "native_tail_prefill_tokens": 18005
+        }
+      },
+      "trace": {
+        "kernel": {
+          "count": 415642,
+          "sum_ms": 6423.9372730000005,
+          "busy_ms": 5854.841912597656
+        },
+        "gpu_span_ms": 8983.189282226562,
+        "stages": {
+          "stage/prefill": {
+            "count": 23957,
+            "sum_ms": 1635.8849850000001,
+            "busy_ms": 1635.8849440917968
+          },
+          "outside-stage": {
+            "count": 18744,
+            "sum_ms": 141.07103,
+            "busy_ms": 136.49512890625
+          },
+          "stage/draft": {
+            "count": 36162,
+            "sum_ms": 603.078478,
+            "busy_ms": 602.1002758789062
+          },
+          "stage/verify": {
+            "count": 336779,
+            "sum_ms": 4043.90278,
+            "busy_ms": 3484.8269052734377
+          }
+        },
+        "rounds": {
+          "round/prefill_4096": {
+            "count": 2861,
+            "sum_ms": 441.460822,
+            "busy_ms": 441.4608151855469
+          },
+          "outside-round": {
+            "count": 901,
+            "sum_ms": 5.088776,
+            "busy_ms": 5.08877685546875
+          },
+          "round/prefill_3866": {
+            "count": 2635,
+            "sum_ms": 235.37605499999998,
+            "busy_ms": 233.0344104003906
+          },
+          "round/decode_3": {
+            "count": 97893,
+            "sum_ms": 1203.458723,
+            "busy_ms": 1038.412921875
+          },
+          "round/decode_2": {
+            "count": 128622,
+            "sum_ms": 1524.739193,
+            "busy_ms": 1308.2240461425781
+          },
+          "round/prefill_2184": {
+            "count": 2678,
+            "sum_ms": 141.036266,
+            "busy_ms": 138.93061889648436
+          },
+          "round/decode_4": {
+            "count": 128736,
+            "sum_ms": 1633.115772,
+            "busy_ms": 1512.6869794921874
+          },
+          "round/prefill_522": {
+            "count": 2757,
+            "sum_ms": 63.314688000000004,
+            "busy_ms": 61.07466772460938
+          },
+          "round/prefill_463": {
+            "count": 2757,
+            "sum_ms": 60.404793,
+            "busy_ms": 58.1713828125
+          },
+          "round/prefill_1495": {
+            "count": 2757,
+            "sum_ms": 107.777019,
+            "busy_ms": 105.52468725585938
+          },
+          "round/prefill_274": {
+            "count": 2767,
+            "sum_ms": 49.196298000000006,
+            "busy_ms": 46.94337939453125
+          },
+          "round/prefill_405": {
+            "count": 2807,
+            "sum_ms": 54.43251,
+            "busy_ms": 52.19912084960937
+          },
+          "round/prefill_534": {
+            "count": 2757,
+            "sum_ms": 64.015609,
+            "busy_ms": 61.783686767578125
+          },
+          "round/prefill_1896": {
+            "count": 2787,
+            "sum_ms": 136.237006,
+            "busy_ms": 133.99696020507812
+          },
+          "round/prefill_1021": {
+            "count": 2757,
+            "sum_ms": 86.465824,
+            "busy_ms": 84.19998120117188
+          },
+          "round/prefill_2451": {
+            "count": 2757,
+            "sum_ms": 162.492538,
+            "busy_ms": 160.25265063476562
+          },
+          "round/prefill_476": {
+            "count": 2677,
+            "sum_ms": 58.998874,
+            "busy_ms": 56.9047294921875
+          },
+          "round/decode_1": {
+            "count": 15834,
+            "sum_ms": 171.745687,
+            "busy_ms": 142.89276196289063
+          },
+          "round/prefill_597": {
+            "count": 2634,
+            "sum_ms": 63.698135,
+            "busy_ms": 61.50465307617188
+          },
+          "round/prefill_944": {
+            "count": 2634,
+            "sum_ms": 80.87094,
+            "busy_ms": 78.66708178710938
+          },
+          "round/prefill_877": {
+            "count": 2634,
+            "sum_ms": 80.01174499999999,
+            "busy_ms": 77.81495874023437
+          }
+        },
+        "top_kernels": [
+          {
+            "name": "void sglang::device::marlin_moe::Marlin<__half, 1125899906843648l, 1125899906910725l, 128, 1, 8, 4, true, 4, 8, false, false, false>(int4 const*, int4 const*, int4*, int4*, int4 const*, int4 const*, unsigned short const*, int4 const*, int const*, int const*, int const*, int const*, float const*, int, bool, bool, int, int, int, int, int*, bool, bool, bool, int, bool)",
+            "count": 23322,
+            "sum_ms": 1260.564237,
+            "busy_ms": 1260.5642478027344
+          },
+          {
+            "name": "ampere_fp16_s16816gemm_fp16_64x64_sliced1x2_ldg8_f2f_stages_64x5_tn",
+            "count": 17923,
+            "sum_ms": 653.525599,
+            "busy_ms": 653.5255383300781
+          },
+          {
+            "name": "void sglang::device::marlin_moe::Marlin<__half, 1125899906843648l, 1125899906910725l, 128, 4, 8, 4, false, 4, 8, false, false, false>(int4 const*, int4 const*, int4*, int4*, int4 const*, int4 const*, unsigned short const*, int4 const*, int const*, int const*, int const*, int const*, float const*, int, bool, bool, int, int, int, int, int*, bool, bool, bool, int, bool)",
+            "count": 546,
+            "sum_ms": 428.786979,
+            "busy_ms": 428.78697802734376
+          },
+          {
+            "name": "ampere_fp16_s16816gemm_fp16_128x64_ldg8_f2f_stages_64x4_tn",
+            "count": 10760,
+            "sum_ms": 315.866485,
+            "busy_ms": 315.86648022460935
+          },
+          {
+            "name": "void flashinfer::BatchPrefillWithPagedKVCacheKernel<true, flashinfer::KernelTraits<(flashinfer::MaskMode)1, 64u, 1u, 2u, 16u, 16u, 4u, 1u, (flashinfer::PosEncodingMode)0, __half, __half, __half, float, int, flashinfer::DefaultAttention<false, false, false, false>, true>, PagedParams>(PagedParams)",
+            "count": 3160,
+            "sum_ms": 304.798995,
+            "busy_ms": 304.79898876953126
+          },
+          {
+            "name": "ampere_fp16_s16816gemm_fp16_128x64_ldg8_f2f_stages_64x3_tn",
+            "count": 476,
+            "sum_ms": 272.889364,
+            "busy_ms": 272.88936450195314
+          },
+          {
+            "name": "gdn_replayssm_spec_circular_kernel",
+            "count": 8970,
+            "sum_ms": 211.827846,
+            "busy_ms": 211.82782348632813
+          },
+          {
+            "name": "ampere_s16816gemm_fp16_128x64_ldg8_stages_32x6_tn",
+            "count": 11536,
+            "sum_ms": 158.11281400000001,
+            "busy_ms": 158.1128193359375
+          },
+          {
+            "name": "fused_moe_kernel",
+            "count": 632,
+            "sum_ms": 153.720377,
+            "busy_ms": 153.7203759765625
+          },
+          {
+            "name": "sm80_xmma_gemm_f16f16_f16f32_f32_tn_n_tilesize32x32x64_stage6_warpsize2x2x1_tensor16x8x16_execute_kernel__5x_cublas",
+            "count": 14890,
+            "sum_ms": 153.470407,
+            "busy_ms": 101.54381616210938
+          },
+          {
+            "name": "ampere_fp16_s16816gemm_fp16_128x256_ldg8_f2f_stages_64x3_tn",
+            "count": 204,
+            "sum_ms": 133.12431099999998,
+            "busy_ms": 133.1243103027344
+          },
+          {
+            "name": "kernel_cutlass_kernel_flashinfernormkernelsfused_add_rmsnormFusedAddRMSNormKernel_object_at__tensorptrf16gmemalign128oi64204820481_tensorptrf16gmemalign128oi64204820481_tensorptrf16gmemal_0",
+            "count": 28868,
+            "sum_ms": 132.03011600000002,
+            "busy_ms": 132.03037573242187
+          },
+          {
+            "name": "void sglang::device::marlin_moe::Marlin<__half, 1125899906843648l, 1125899906910725l, 128, 2, 8, 4, false, 4, 8, false, false, false>(int4 const*, int4 const*, int4*, int4*, int4 const*, int4 const*, unsigned short const*, int4 const*, int const*, int const*, int const*, int const*, float const*, int, bool, bool, int, int, int, int, int*, bool, bool, bool, int, bool)",
+            "count": 468,
+            "sum_ms": 117.611523,
+            "busy_ms": 117.61152319335937
+          },
+          {
+            "name": "void cutlass::Kernel2<cutlass_80_wmma_tensorop_f16_s161616gemm_f16_16x16_128x2_tn_align8>(cutlass_80_wmma_tensorop_f16_s161616gemm_f16_16x16_128x2_tn_align8::Params)",
+            "count": 5340,
+            "sum_ms": 117.290995,
+            "busy_ms": 117.290998046875
+          },
+          {
+            "name": "_causal_conv1d_update_kernel",
+            "count": 8970,
+            "sum_ms": 105.720795,
+            "busy_ms": 105.72080444335937
+          },
+          {
+            "name": "void cutlass::Kernel2<cutlass_80_wmma_tensorop_f16_s161616gemm_f16_16x16_128x1_tn_align8>(cutlass_80_wmma_tensorop_f16_s161616gemm_f16_16x16_128x1_tn_align8::Params)",
+            "count": 3120,
+            "sum_ms": 103.34216599999999,
+            "busy_ms": 103.34215771484375
+          },
+          {
+            "name": "void sglang::act_and_mul_kernel<__half, (sglang::ActivationKind)0, false, false, false, false>(sglang::ActivationParams)",
+            "count": 27074,
+            "sum_ms": 89.614025,
+            "busy_ms": 89.61401904296875
+          },
+          {
+            "name": "void cublasLt::splitKreduce_kernel<32, 16, int, float, __half, float, __half, false, __half, __half, __half, true, false, false, false>(cublasLt::cublasSplitKParams<float>, float const*, __half const*, __half*, __half*, float const*, float const*, __half const*, float const*, __half*, void*, long, float*, int*, float*, float*, float const*, float const*, float const*, float const*, float const*)",
+            "count": 24413,
+            "sum_ms": 79.838669,
+            "busy_ms": 72.59992895507813
+          },
+          {
+            "name": "ampere_s16816gemm_fp16_128x64_ldg8_stages_64x4_tn",
+            "count": 3854,
+            "sum_ms": 75.25589599999999,
+            "busy_ms": 75.25589184570312
+          },
+          {
+            "name": "_router_triton_kernel",
+            "count": 12640,
+            "sum_ms": 70.745582,
+            "busy_ms": 70.74562670898437
+          },
+          {
+            "name": "ampere_fp16_s16816gemm_fp16_128x128_ldg8_f2f_stages_32x5_tn",
+            "count": 473,
+            "sum_ms": 69.563896,
+            "busy_ms": 69.56389379882812
+          },
+          {
+            "name": "void cutlass::Kernel2<cutlass_80_wmma_tensorop_s161616gemm_f16_32x32_128x2_tn_align8>(cutlass_80_wmma_tensorop_s161616gemm_f16_32x32_128x2_tn_align8::Params)",
+            "count": 7120,
+            "sum_ms": 64.566834,
+            "busy_ms": 64.56684887695313
+          },
+          {
+            "name": "ampere_fp16_s16816gemm_fp16_256x128_ldg8_f2f_stages_64x3_tn",
+            "count": 144,
+            "sum_ms": 64.278284,
+            "busy_ms": 64.27828295898438
+          },
+          {
+            "name": "void at::native::vectorized_elementwise_kernel<4, at::native::FillFunctor<c10::Half>, std::array<char*, 1ul>, false>(int, at::native::FillFunctor<c10::Half>, std::array<char*, 1ul>)",
+            "count": 18299,
+            "sum_ms": 59.686107,
+            "busy_ms": 59.68604223632813
+          },
+          {
+            "name": "void cublasLt::splitKreduce_kernel<32, 16, int, __half, __half, float, __half, false, __half, __half, __half, true, false, false, false>(cublasLt::cublasSplitKParams<float>, __half const*, __half const*, __half*, __half*, float const*, float const*, __half const*, __half const*, __half*, void*, long, float*, int*, float*, float*, float const*, float const*, float const*, float const*, float const*)",
+            "count": 14714,
+            "sum_ms": 56.318221,
+            "busy_ms": 56.31810888671875
+          },
+          {
+            "name": "void moe_align_block_size_kernel<int>(int const*, int*, int*, int*, int, int, unsigned long, int*, bool, bool, int, int)",
+            "count": 11960,
+            "sum_ms": 55.950341,
+            "busy_ms": 55.950460693359375
+          },
+          {
+            "name": "void sglang::device::marlin_moe::Marlin<__half, 1125899906843648l, 1125899906910725l, 128, 3, 8, 4, false, 4, 8, false, false, false>(int4 const*, int4 const*, int4*, int4*, int4 const*, int4 const*, unsigned short const*, int4 const*, int const*, int const*, int const*, int const*, float const*, int, bool, bool, int, int, int, int, int*, bool, bool, bool, int, bool)",
+            "count": 156,
+            "sum_ms": 54.743699,
+            "busy_ms": 54.74369873046875
+          },
+          {
+            "name": "void flashinfer::BatchPrefillWithPagedKVCacheKernel<true, flashinfer::KernelTraits<(flashinfer::MaskMode)1, 128u, 2u, 4u, 8u, 8u, 4u, 1u, (flashinfer::PosEncodingMode)0, __half, __half, __half, float, int, flashinfer::DefaultAttention<false, false, false, false>, true>, PagedParams>(PagedParams)",
+            "count": 890,
+            "sum_ms": 51.450099,
+            "busy_ms": 51.45009936523437
+          },
+          {
+            "name": "_fused_gate_sigmoid_mul_add_kernel",
+            "count": 12640,
+            "sum_ms": 46.574665,
+            "busy_ms": 46.574697021484376
+          },
+          {
+            "name": "chunk_gated_delta_rule_fwd_kernel_h_blockdim64",
+            "count": 510,
+            "sum_ms": 40.977117,
+            "busy_ms": 40.9771142578125
+          }
+        ],
+        "runtime_names": {
+          "cudaStreamIsCapturing": 10699,
+          "cudaEventRecordWithFlags": 3606,
+          "cudaStreamWaitEvent": 2129,
+          "cudaMemcpyAsync": 11762,
+          "cudaEventRecord": 377,
+          "cudaEventQuery": 3152,
+          "cuLaunchKernelEx": 13109,
+          "cudaLaunchKernel": 29909,
+          "cudaPeekAtLastError": 4064,
+          "cudaOccupancyMaxActiveBlocksPerMultiprocessorWithFlags": 985,
+          "cudaDeviceGetAttribute": 6452,
+          "cudaStreamSynchronize": 2594,
+          "cudaLaunchKernelExC": 5218,
+          "cudaMalloc": 17,
+          "cudaMemsetAsync": 930,
+          "cudaOccupancyMaxActiveBlocksPerMultiprocessor": 1575,
+          "cudaFuncGetAttributes": 3726,
+          "cudaFuncSetAttribute": 1516,
+          "cudaPointerGetAttributes": 16,
+          "cudaEventSynchronize": 316,
+          "cudaGraphLaunch": 598,
+          "cuLaunchKernel": 445,
+          "cudaDeviceSynchronize": 2
+        },
+        "event_categories": {
+          "": 76,
+          "user_annotation": 3402,
+          "cpu_op": 336344,
+          "overhead": 60,
+          "cuda_runtime": 89643,
+          "ac2g": 531830,
+          "gpu_memcpy": 11762,
+          "kernel": 415642,
+          "cuda_driver": 13554,
+          "gpu_memset": 1229,
+          "gpu_user_annotation": 2557,
+          "Trace": 1
+        },
+        "paired_rounds": [
+          {
+            "round": "round/prefill_3866",
+            "stages": {
+              "outside-stage": {
+                "count": 71,
+                "sum_ms": 2.87627,
+                "busy_ms": 2.876269287109375,
+                "start_us": 2153150168964.497,
+                "end_us": 2153150415974.5989,
+                "streams": [
+                  13,
+                  37,
+                  49
+                ]
+              },
+              "stage/draft": {
+                "count": 120,
+                "sum_ms": 1.9285230000000002,
+                "busy_ms": 1.92564306640625,
+                "start_us": 2153150170395.641,
+                "end_us": 2153150174358.4148,
+                "streams": [
+                  13
+                ]
+              },
+              "stage/verify": {
+                "count": 1041,
+                "sum_ms": 11.871201000000001,
+                "busy_ms": 9.532438232421875,
+                "start_us": 2153150176833.502,
+                "end_us": 2153150186424.596,
+                "streams": [
+                  13,
+                  148
+                ]
+              },
+              "stage/prefill": {
+                "count": 1403,
+                "sum_ms": 218.70006099999998,
+                "busy_ms": 218.7000598144531,
+                "start_us": 2153150186769.878,
+                "end_us": 2153150412882.262,
+                "streams": [
+                  13
+                ]
+              }
+            }
+          },
+          {
+            "round": "round/prefill_2184",
+            "stages": {
+              "outside-stage": {
+                "count": 73,
+                "sum_ms": 1.677991,
+                "busy_ms": 1.67799072265625,
+                "start_us": 2153151094992.459,
+                "end_us": 2153151295759.739,
+                "streams": [
+                  13,
+                  37,
+                  49
+                ]
+              },
+              "stage/draft": {
+                "count": 121,
+                "sum_ms": 1.8817709999999999,
+                "busy_ms": 1.878570556640625,
+                "start_us": 2153151096586.42,
+                "end_us": 2153151101009.069,
+                "streams": [
+                  13
+                ]
+              },
+              "stage/verify": {
+                "count": 1081,
+                "sum_ms": 12.784039,
+                "busy_ms": 10.681594970703125,
+                "start_us": 2153151103845.181,
+                "end_us": 2153151114574.522,
+                "streams": [
+                  13,
+                  146
+                ]
+              },
+              "stage/prefill": {
+                "count": 1403,
+                "sum_ms": 124.692465,
+                "busy_ms": 124.69246264648437,
+                "start_us": 2153151114933.66,
+                "end_us": 2153151294002.001,
+                "streams": [
+                  13
+                ]
+              }
+            }
+          },
+          {
+            "round": "round/prefill_522",
+            "stages": {
+              "outside-stage": {
+                "count": 73,
+                "sum_ms": 0.745989,
+                "busy_ms": 0.745989501953125,
+                "start_us": 2153151362499.989,
+                "end_us": 2153151576638.5132,
+                "streams": [
+                  13,
+                  37,
+                  49
+                ]
+              },
+              "stage/draft": {
+                "count": 121,
+                "sum_ms": 2.033165,
+                "busy_ms": 2.029965087890625,
+                "start_us": 2153151366617.612,
+                "end_us": 2153151371290.919,
+                "streams": [
+                  13
+                ]
+              },
+              "stage/verify": {
+                "count": 1161,
+                "sum_ms": 14.483221,
+                "busy_ms": 12.246399169921874,
+                "start_us": 2153151374225.527,
+                "end_us": 2153151386506.717,
+                "streams": [
+                  13,
+                  144
+                ]
+              },
+              "stage/prefill": {
+                "count": 1402,
+                "sum_ms": 46.052313000000005,
+                "busy_ms": 46.05231396484375,
+                "start_us": 2153151386848.191,
+                "end_us": 2153151575078.888,
+                "streams": [
+                  13
+                ]
+              }
+            }
+          },
+          {
+            "round": "round/prefill_463",
+            "stages": {
+              "outside-stage": {
+                "count": 73,
+                "sum_ms": 0.9513980000000001,
+                "busy_ms": 0.95139794921875,
+                "start_us": 2153151602350.467,
+                "end_us": 2153151805081.918,
+                "streams": [
+                  13,
+                  37,
+                  49
+                ]
+              },
+              "stage/draft": {
+                "count": 121,
+                "sum_ms": 2.017643,
+                "busy_ms": 2.014572265625,
+                "start_us": 2153151604111.021,
+                "end_us": 2153151608569.67,
+                "streams": [
+                  13
+                ]
+              },
+              "stage/verify": {
+                "count": 1161,
+                "sum_ms": 14.419668,
+                "busy_ms": 12.1893408203125,
+                "start_us": 2153151611207.349,
+                "end_us": 2153151623432.218,
+                "streams": [
+                  13,
+                  144
+                ]
+              },
+              "stage/prefill": {
+                "count": 1402,
+                "sum_ms": 43.016084,
+                "busy_ms": 43.01607177734375,
+                "start_us": 2153151624053.95,
+                "end_us": 2153151803481.301,
+                "streams": [
+                  13
+                ]
+              }
+            }
+          },
+          {
+            "round": "round/prefill_1495",
+            "stages": {
+              "outside-stage": {
+                "count": 73,
+                "sum_ms": 1.256901,
+                "busy_ms": 1.256902099609375,
+                "start_us": 2153152564061.062,
+                "end_us": 2153152746081.933,
+                "streams": [
+                  13,
+                  37,
+                  49
+                ]
+              },
+              "stage/draft": {
+                "count": 121,
+                "sum_ms": 2.013868,
+                "busy_ms": 2.010251953125,
+                "start_us": 2153152566746.678,
+                "end_us": 2153152571167.215,
+                "streams": [
+                  13
+                ]
+              },
+              "stage/verify": {
+                "count": 1161,
+                "sum_ms": 13.440521,
+                "busy_ms": 11.1918037109375,
+                "start_us": 2153152573688.541,
+                "end_us": 2153152584916.381,
+                "streams": [
+                  13,
+                  144
+                ]
+              },
+              "stage/prefill": {
+                "count": 1402,
+                "sum_ms": 91.065729,
+                "busy_ms": 91.0657294921875,
+                "start_us": 2153152585255.454,
+                "end_us": 2153152744634.853,
+                "streams": [
+                  13
+                ]
+              }
+            }
+          },
+          {
+            "round": "round/prefill_274",
+            "stages": {
+              "outside-stage": {
+                "count": 73,
+                "sum_ms": 0.591527,
+                "busy_ms": 0.59152685546875,
+                "start_us": 2153153033791.977,
+                "end_us": 2153153208188.8042,
+                "streams": [
+                  13,
+                  37,
+                  49
+                ]
+              },
+              "stage/draft": {
+                "count": 121,
+                "sum_ms": 2.0311790000000003,
+                "busy_ms": 2.0278837890625,
+                "start_us": 2153153038166.274,
+                "end_us": 2153153042531.323,
+                "streams": [
+                  13
+                ]
+              },
+              "stage/verify": {
+                "count": 1161,
+                "sum_ms": 14.481618000000001,
+                "busy_ms": 12.231998779296875,
+                "start_us": 2153153044934.536,
+                "end_us": 2153153057201.87,
+                "streams": [
+                  13,
+                  144
+                ]
+              },
+              "stage/prefill": {
+                "count": 1412,
+                "sum_ms": 32.091974,
+                "busy_ms": 32.091969970703126,
+                "start_us": 2153153057542.288,
+                "end_us": 2153153206722.332,
+                "streams": [
+                  13
+                ]
+              }
+            }
+          },
+          {
+            "round": "round/prefill_405",
+            "stages": {
+              "outside-stage": {
+                "count": 73,
+                "sum_ms": 0.662306,
+                "busy_ms": 0.66230712890625,
+                "start_us": 2153153272750.802,
+                "end_us": 2153153449355.93,
+                "streams": [
+                  13,
+                  37,
+                  49
+                ]
+              },
+              "stage/draft": {
+                "count": 121,
+                "sum_ms": 2.023114,
+                "busy_ms": 2.019818603515625,
+                "start_us": 2153153277378.668,
+                "end_us": 2153153281711.301,
+                "streams": [
+                  13
+                ]
+              },
+              "stage/verify": {
+                "count": 1161,
+                "sum_ms": 14.235790999999999,
+                "busy_ms": 12.005697021484375,
+                "start_us": 2153153284047.73,
+                "end_us": 2153153296087.638,
+                "streams": [
+                  13,
+                  144
+                ]
+              },
+              "stage/prefill": {
+                "count": 1452,
+                "sum_ms": 37.511299,
+                "busy_ms": 37.511298095703125,
+                "start_us": 2153153296426.424,
+                "end_us": 2153153447917.682,
+                "streams": [
+                  13
+                ]
+              }
+            }
+          },
+          {
+            "round": "round/prefill_534",
+            "stages": {
+              "outside-stage": {
+                "count": 73,
+                "sum_ms": 0.8904679999999999,
+                "busy_ms": 0.890468505859375,
+                "start_us": 2153153570250.534,
+                "end_us": 2153153751437.2612,
+                "streams": [
+                  13,
+                  37,
+                  49
+                ]
+              },
+              "stage/draft": {
+                "count": 121,
+                "sum_ms": 2.0254190000000003,
+                "busy_ms": 2.0220908203125,
+                "start_us": 2153153575933.478,
+                "end_us": 2153153580081.1821,
+                "streams": [
+                  13
+                ]
+              },
+              "stage/verify": {
+                "count": 1161,
+                "sum_ms": 14.272593,
+                "busy_ms": 12.0440009765625,
+                "start_us": 2153153582097.033,
+                "end_us": 2153153594176.301,
+                "streams": [
+                  13,
+                  144
+                ]
+              },
+              "stage/prefill": {
+                "count": 1402,
+                "sum_ms": 46.827129,
+                "busy_ms": 46.82712646484375,
+                "start_us": 2153153594654.8,
+                "end_us": 2153153749899.044,
+                "streams": [
+                  13
+                ]
+              }
+            }
+          },
+          {
+            "round": "round/prefill_1896",
+            "stages": {
+              "outside-stage": {
+                "count": 73,
+                "sum_ms": 1.693896,
+                "busy_ms": 1.693896240234375,
+                "start_us": 2153154326659.885,
+                "end_us": 2153154513495.516,
+                "streams": [
+                  13,
+                  37,
+                  49
+                ]
+              },
+              "stage/draft": {
+                "count": 121,
+                "sum_ms": 2.03297,
+                "busy_ms": 2.029707275390625,
+                "start_us": 2153154331013.382,
+                "end_us": 2153154335342.111,
+                "streams": [
+                  13
+                ]
+              },
+              "stage/verify": {
+                "count": 1161,
+                "sum_ms": 14.645237,
+                "busy_ms": 12.40845263671875,
+                "start_us": 2153154337648.812,
+                "end_us": 2153154350092.468,
+                "streams": [
+                  13,
+                  144
+                ]
+              },
+              "stage/prefill": {
+                "count": 1432,
+                "sum_ms": 117.86490300000001,
+                "busy_ms": 117.86490405273437,
+                "start_us": 2153154350573.878,
+                "end_us": 2153154511913.555,
+                "streams": [
+                  13
+                ]
+              }
+            }
+          },
+          {
+            "round": "round/prefill_1021",
+            "stages": {
+              "outside-stage": {
+                "count": 73,
+                "sum_ms": 1.152838,
+                "busy_ms": 1.152838623046875,
+                "start_us": 2153154747434.68,
+                "end_us": 2153154922717.605,
+                "streams": [
+                  13,
+                  37,
+                  49
+                ]
+              },
+              "stage/draft": {
+                "count": 121,
+                "sum_ms": 2.035915,
+                "busy_ms": 2.032620849609375,
+                "start_us": 2153154753009.56,
+                "end_us": 2153154757225.681,
+                "streams": [
+                  13
+                ]
+              },
+              "stage/verify": {
+                "count": 1161,
+                "sum_ms": 13.647249,
+                "busy_ms": 11.384698486328125,
+                "start_us": 2153154759408.829,
+                "end_us": 2153154770831.4229,
+                "streams": [
+                  13,
+                  144
+                ]
+              },
+              "stage/prefill": {
+                "count": 1402,
+                "sum_ms": 69.629822,
+                "busy_ms": 69.6298232421875,
+                "start_us": 2153154771314.561,
+                "end_us": 2153154921276.669,
+                "streams": [
+                  13
+                ]
+              }
+            }
+          },
+          {
+            "round": "round/prefill_2451",
+            "stages": {
+              "outside-stage": {
+                "count": 73,
+                "sum_ms": 1.950729,
+                "busy_ms": 1.950729248046875,
+                "start_us": 2153155030675.408,
+                "end_us": 2153155213162.117,
+                "streams": [
+                  13,
+                  37,
+                  49
+                ]
+              },
+              "stage/draft": {
+                "count": 121,
+                "sum_ms": 2.0377709999999998,
+                "busy_ms": 2.0345078125,
+                "start_us": 2153155035900.366,
+                "end_us": 2153155040077.7979,
+                "streams": [
+                  13
+                ]
+              },
+              "stage/verify": {
+                "count": 1161,
+                "sum_ms": 14.248334999999999,
+                "busy_ms": 12.011709716796876,
+                "start_us": 2153155042275.058,
+                "end_us": 2153155054321.527,
+                "streams": [
+                  13,
+                  144
+                ]
+              },
+              "stage/prefill": {
+                "count": 1402,
+                "sum_ms": 144.255703,
+                "busy_ms": 144.25570385742188,
+                "start_us": 2153155054660.057,
+                "end_us": 2153155211186.554,
+                "streams": [
+                  13
+                ]
+              }
+            }
+          },
+          {
+            "round": "round/prefill_476",
+            "stages": {
+              "outside-stage": {
+                "count": 73,
+                "sum_ms": 0.820102,
+                "busy_ms": 0.820101318359375,
+                "start_us": 2153155959442.586,
+                "end_us": 2153156137110.868,
+                "streams": [
+                  13,
+                  37,
+                  49
+                ]
+              },
+              "stage/draft": {
+                "count": 121,
+                "sum_ms": 1.905006,
+                "busy_ms": 1.901996337890625,
+                "start_us": 2153155963248.976,
+                "end_us": 2153155967435.8481,
+                "streams": [
+                  13
+                ]
+              },
+              "stage/verify": {
+                "count": 1081,
+                "sum_ms": 12.186155000000001,
+                "busy_ms": 10.09503125,
+                "start_us": 2153155969750.453,
+                "end_us": 2153155979892.944,
+                "streams": [
+                  13,
+                  146
+                ]
+              },
+              "stage/prefill": {
+                "count": 1402,
+                "sum_ms": 44.087610999999995,
+                "busy_ms": 44.0876005859375,
+                "start_us": 2153155980370.578,
+                "end_us": 2153156135688.4602,
+                "streams": [
+                  13
+                ]
+              }
+            }
+          },
+          {
+            "round": "round/prefill_597",
+            "stages": {
+              "outside-stage": {
+                "count": 71,
+                "sum_ms": 0.921476,
+                "busy_ms": 0.921475341796875,
+                "start_us": 2153156271997.305,
+                "end_us": 2153156438096.369,
+                "streams": [
+                  13,
+                  37,
+                  49
+                ]
+              },
+              "stage/draft": {
+                "count": 120,
+                "sum_ms": 1.800874,
+                "busy_ms": 1.79825,
+                "start_us": 2153156274248.87,
+                "end_us": 2153156278175.133,
+                "streams": [
+                  13
+                ]
+              },
+              "stage/verify": {
+                "count": 1041,
+                "sum_ms": 11.073048,
+                "busy_ms": 8.882190185546875,
+                "start_us": 2153156280378.569,
+                "end_us": 2153156289307.5479,
+                "streams": [
+                  13,
+                  148
+                ]
+              },
+              "stage/prefill": {
+                "count": 1402,
+                "sum_ms": 49.902737,
+                "busy_ms": 49.90273754882813,
+                "start_us": 2153156289759.935,
+                "end_us": 2153156436720.361,
+                "streams": [
+                  13
+                ]
+              }
+            }
+          },
+          {
+            "round": "round/prefill_944",
+            "stages": {
+              "outside-stage": {
+                "count": 71,
+                "sum_ms": 0.93911,
+                "busy_ms": 0.9391103515625,
+                "start_us": 2153157308602.062,
+                "end_us": 2153157478249.0498,
+                "streams": [
+                  13,
+                  37,
+                  49
+                ]
+              },
+              "stage/draft": {
+                "count": 120,
+                "sum_ms": 1.8065689999999999,
+                "busy_ms": 1.80381689453125,
+                "start_us": 2153157309901.141,
+                "end_us": 2153157313873.42,
+                "streams": [
+                  13
+                ]
+              },
+              "stage/verify": {
+                "count": 1041,
+                "sum_ms": 10.489823,
+                "busy_ms": 8.288717529296875,
+                "start_us": 2153157316184.537,
+                "end_us": 2153157324524.617,
+                "streams": [
+                  13,
+                  148
+                ]
+              },
+              "stage/prefill": {
+                "count": 1402,
+                "sum_ms": 67.635438,
+                "busy_ms": 67.63543701171875,
+                "start_us": 2153157324818.603,
+                "end_us": 2153157476819.026,
+                "streams": [
+                  13
+                ]
+              }
+            }
+          },
+          {
+            "round": "round/prefill_877",
+            "stages": {
+              "outside-stage": {
+                "count": 71,
+                "sum_ms": 0.939365,
+                "busy_ms": 0.939365234375,
+                "start_us": 2153157658401.312,
+                "end_us": 2153157825968.545,
+                "streams": [
+                  13,
+                  37,
+                  49
+                ]
+              },
+              "stage/draft": {
+                "count": 120,
+                "sum_ms": 1.806345,
+                "busy_ms": 1.80320849609375,
+                "start_us": 2153157660423.436,
+                "end_us": 2153157664329.283,
+                "streams": [
+                  13
+                ]
+              },
+              "stage/verify": {
+                "count": 1041,
+                "sum_ms": 11.041767,
+                "busy_ms": 8.848121337890625,
+                "start_us": 2153157666463.088,
+                "end_us": 2153157675360.42,
+                "streams": [
+                  13,
+                  148
+                ]
+              },
+              "stage/prefill": {
+                "count": 1402,
+                "sum_ms": 66.224268,
+                "busy_ms": 66.224263671875,
+                "start_us": 2153157675662.278,
+                "end_us": 2153157824542.872,
+                "streams": [
+                  13
+                ]
+              }
+            }
+          }
+        ],
+        "unique_kernel_events": 415642,
+        "gpu_idle_ms": 3128.3473696289057
+      }
+    }
+  },
+  "paired_analysis": {
+    "count": 15,
+    "verify_kernel_sum_ms": 197.320266,
+    "verify_busy_ms": 164.04219482421877,
+    "draft_kernel_sum_ms": 29.380131999999996,
+    "verify_to_prefill_gaps_ms": [
+      0.345281982421875,
+      0.359137939453125,
+      0.341473876953125,
+      0.62173193359375,
+      0.339072998046875,
+      0.34041796875,
+      0.3387861328125,
+      0.4784990234375,
+      0.481409912109375,
+      0.48313818359375,
+      0.33852978515625,
+      0.4776337890625,
+      0.45238720703125,
+      0.293986083984375,
+      0.301858154296875
+    ]
+  },
+  "archive_sha256": {
+    "service-profile-traces.tar.gz": "1855b4ba24d957c27ef76a615d3f2140ffdf9d69e2c075ffa51cff430e2e2d32",
+    "service-profile-evidence.tar.gz": "89ae7b1244a20e3085469d01a8d56c5e8e847a74316f353f0633a75c6205604c"
+  },
+  "source_sha256": {
+    "test/manual/pdmux/profile_live_service.py": "35952cbdbd16de523bb690ace8ce8258c832e4fce1e877aefadc0a325ea53126",
+    "test/manual/pdmux/live_mixed_target.py": "2b9fe2de94e9819c24467943fbf5b5b3ab771be7e838c2200f543ef009efdd64",
+    "test/manual/pdmux/run_live_mixed_target.py": "35e2f0ce1c4381706547d4090dfb09501a51f489b607c5a08e4cb0b4e18c9406",
+    "test/manual/pdmux/bench_swe_mixed_target.py": "00027923ebedcafbb325259d7dc8963a8347d9b7a0efe9449725a918b66fa0d3",
+    "test/manual/pdmux/tailfill_policy.py": "ce7001614829690e65d888d1e1b1041212fd6b68c2b5cdf1d62540d38563f9ed"
+  }
+}

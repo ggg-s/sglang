@@ -1,0 +1,134 @@
+{
+  "date": "2026-10-26 Asia/Shanghai",
+  "gpu": "A100 PCIe 40GB",
+  "base_commit": "c2a6417f6ffbacf407acd6bf423f8cf122ba730e",
+  "scope": "Single real SWE P1576+D3x8 target-stage diagnostic; no new serving throughput claim",
+  "timings": {
+    "native": {
+      "samples": [
+        {
+          "gpu_ms": 168.6138916015625,
+          "wall_ms": 168.69139671325684
+        },
+        {
+          "gpu_ms": 122.89740753173828,
+          "wall_ms": 122.95304983854294
+        },
+        {
+          "gpu_ms": 123.37971496582031,
+          "wall_ms": 123.43317456543446
+        }
+      ],
+      "median_gpu_ms": 123.37971496582031,
+      "median_wall_ms": 123.43317456543446
+    },
+    "repaired_separate": {
+      "samples": [
+        {
+          "gpu_ms": 228.5199432373047,
+          "wall_ms": 228.59711572527885
+        },
+        {
+          "gpu_ms": 227.41912841796875,
+          "wall_ms": 227.52943076193333
+        },
+        {
+          "gpu_ms": 227.91783142089844,
+          "wall_ms": 227.97482088208199
+        }
+      ],
+      "median_gpu_ms": 227.91783142089844,
+      "median_wall_ms": 227.97482088208199
+    },
+    "mixed": {
+      "samples": [
+        {
+          "gpu_ms": 219.68690490722656,
+          "wall_ms": 219.75538320839405
+        },
+        {
+          "gpu_ms": 220.03814697265625,
+          "wall_ms": 220.09644657373428
+        },
+        {
+          "gpu_ms": 220.67404174804688,
+          "wall_ms": 220.73808312416077
+        }
+      ],
+      "median_gpu_ms": 220.03814697265625,
+      "median_wall_ms": 220.09644657373428
+    }
+  },
+  "kernel_groups": {
+    "mixed-trace": {
+      "kernel_ms": {
+        "copy_fill_cat": 2.418700000000001,
+        "other": 11.747964999999981,
+        "fixed_fp16_gemm": 93.87117799999999,
+        "attention_gdn_conv_and_related": 28.764921,
+        "marlin_moe": 79.21805899999998,
+        "native_fp16_gemm_including_lm_head": 1.479625
+      },
+      "kernel_counts": {
+        "copy_fill_cat": 213,
+        "other": 828,
+        "fixed_fp16_gemm": 230,
+        "attention_gdn_conv_and_related": 350,
+        "marlin_moe": 78,
+        "native_fp16_gemm_including_lm_head": 2
+      }
+    },
+    "native-trace": {
+      "kernel_ms": {
+        "other": 13.856436999999996,
+        "copy_fill_cat": 2.284817999999992,
+        "native_fp16_gemm_including_lm_head": 27.209294000000032,
+        "attention_gdn_conv_and_related": 26.11907000000001,
+        "marlin_moe": 46.38162000000002
+      },
+      "kernel_counts": {
+        "other": 1371,
+        "copy_fill_cat": 246,
+        "native_fp16_gemm_including_lm_head": 432,
+        "attention_gdn_conv_and_related": 350,
+        "marlin_moe": 156
+      }
+    },
+    "repaired_separate-trace": {
+      "kernel_ms": {
+        "copy_fill_cat": 2.173669999999992,
+        "other": 12.850379999999992,
+        "fixed_fp16_gemm": 100.73593099999997,
+        "attention_gdn_conv_and_related": 26.863534999999985,
+        "marlin_moe": 80.21624799999995,
+        "native_fp16_gemm_including_lm_head": 1.474953
+      },
+      "kernel_counts": {
+        "copy_fill_cat": 246,
+        "other": 1170,
+        "fixed_fp16_gemm": 460,
+        "attention_gdn_conv_and_related": 350,
+        "marlin_moe": 156,
+        "native_fp16_gemm_including_lm_head": 2
+      }
+    }
+  },
+  "source_sha256": {
+    "test/manual/pdmux/mixed_target_admission.py": "ca03ba052c5e2b16e96725d08d24f46ae4d53a8684162afe24075665aa866057",
+    "test/manual/pdmux/profile_mixed_target.py": "3255537c0d182fe022f4714b0d919b69a548df4ebb581f0ea20b48f6dde4cc69"
+  },
+  "raw_archive": {
+    "path": "/Users/guoqing/.codex/visualizations/2026/10/26/01a175cf-dbdf-7ce0-b26f-3707e8e44e1c/pdmux-target-profile-a100-20261026/mixed-target-profile-evidence-20261026.tar.gz",
+    "sha256": "08dec858440806a250471de31d4f79557c6ce0981b64b086faf9d0d67333e4ca"
+  },
+  "driver_exit": 0,
+  "gpu_compute_processes_after_run": [],
+  "limitations": [
+    "Three balanced timing samples per path; native first sample was 168.61 ms versus later 122.90/123.38 ms. Medians reported.",
+    "One profiler replay per path, collected after ordinary timings. Kernel totals are activity-duration sums rather than critical-path attribution.",
+    "Kernel families grouped by name; copy/fill/cat bucket includes all matching operations, not just Mixed packing.",
+    "Native FP16 GEMM bucket includes LM head; corrected Mixed FP16 total combines _router fixed GEMMs and the remaining native GEMMs.",
+    "Repaired Separate differs from native in numerical kernels and capture; the 104.54 ms difference is not a pure isolated numerical-repair measurement.",
+    "One shape/context, no inference of all shapes or steady serving throughput. Profiling run throughput is excluded."
+  ]
+}

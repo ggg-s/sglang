@@ -26,8 +26,8 @@ class MixedTokenLayout:
     def __post_init__(self):
         if not 0 < self.prefill_tokens <= self.prefill_capacity:
             raise ValueError("P must have positive valid tokens within its capacity")
-        if self.verify_requests != 3 or self.block_size != 8:
-            raise ValueError("Offline prototype requires one P + D3 x block8")
+        if self.verify_requests < 1 or self.block_size != 8:
+            raise ValueError("Mixed requires positive D count and complete block8")
 
     @property
     def verify_tokens(self):
@@ -134,10 +134,12 @@ def _text_head(model):
     raise NotImplementedError("Offline mixed prototype requires a Qwen3.5 text decoder")
 
 
-def validate_mixed_layout(prefill_batch, verify_batch, prefill_capacity):
+def validate_mixed_layout(prefill_batch, verify_batch, prefill_capacity, *, variable_batch=False):
     """Validate request ownership outside CUDA capture/replay."""
-    if prefill_batch.batch_size != 1 or verify_batch.batch_size != 3:
+    if not variable_batch and (prefill_batch.batch_size != 1 or verify_batch.batch_size != 3):
         raise ValueError("Expected P1 + D3")
+    if min(prefill_batch.batch_size, verify_batch.batch_size) < 1:
+        raise ValueError("Mixed requires nonempty P and D batches")
     if not prefill_batch.forward_mode.is_extend_without_speculative():
         raise ValueError("P must be a native prefill/continuation batch")
     if not verify_batch.forward_mode.is_target_verify():
@@ -164,7 +166,10 @@ def validate_mixed_layout(prefill_batch, verify_batch, prefill_capacity):
                 raise ValueError(f"Unsupported offline mixed input: {name}")
     if torch.isin(prefill_batch.req_pool_indices, verify_batch.req_pool_indices).any():
         raise ValueError("P and V request rows must be disjoint")
-    layout = MixedTokenLayout(len(prefill_batch.input_ids), prefill_capacity)
+    layout = MixedTokenLayout(
+        len(prefill_batch.input_ids), prefill_capacity,
+        verify_requests=verify_batch.batch_size,
+    )
     if len(verify_batch.input_ids) != layout.verify_tokens:
         raise ValueError("Cannot truncate or pad a DFlash block to fit P")
     return layout
@@ -215,7 +220,7 @@ def run_mixed_eager(
             verify_batch.positions,
         )
     )
-    packed.batch_size = 4
+    packed.batch_size = prefill_batch.batch_size + verify_batch.batch_size
     packed.req_pool_indices = torch.cat(
         (prefill_batch.req_pool_indices, verify_batch.req_pool_indices)
     )
