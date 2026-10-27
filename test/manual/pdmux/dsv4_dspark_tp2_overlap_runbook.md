@@ -103,6 +103,8 @@ PCP gate to accept a false DP-attention value hides a later DP1 reset. Verify
 `enable_dp_attention=true` in `/server_info` as well as in each worker's
 published configuration. `test_dsv4_pcp_resolution.py` covers the real pipeline,
 readback and pickled worker publication without loading model weights.
+The subsequent full-chain audit, including real decode-context activation and
+24 CLI combinations, is documented in `dsv4_pcp_configuration_audit_20261027.md`.
 
 `--enable-cp-decode-attn-tp` can now be added to this configuration. The target
 and DSpark draft each cache an unregistered decode attention module with their
