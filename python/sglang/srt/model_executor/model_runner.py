@@ -180,6 +180,7 @@ from sglang.srt.runtime_context import (
     assert_published,
     get_context,
     get_device,
+    get_disagg,
     get_exec,
     get_global_dwdp_manager,
     get_lora,
@@ -348,6 +349,13 @@ class ModelRunner:
         self.dist_port = nccl_port
         self.server_args = server_args
         self.is_draft_worker = is_draft_worker
+        self._pdmux_index_shadow_enabled = (
+            envs.SGLANG_PDMUX_INDEX_SHADOW.get() and get_disagg().enable_pdmux
+        )
+        if self._pdmux_index_shadow_enabled:
+            logger.info(
+                "PDMux index shadow diagnostics enabled (extra GPU copies/checks)"
+            )
         # The process entry published; a draft runner is not one (it must not
         # clobber the target's config), so only the target checks.
         if not is_draft_worker:
@@ -1611,6 +1619,14 @@ class ModelRunner:
             if is_cp_active(forward_batch):
                 prepare_cp_forward(forward_batch)
             self.attn_backend.init_forward_metadata(forward_batch)
+        shadow = None
+        if getattr(self, "_pdmux_index_shadow_enabled", False):
+            from sglang.srt.multiplex.pdmux_index_shadow import split_prefill_shadow
+
+            shadow = split_prefill_shadow(
+                self, forward_batch, reset=reinit_attn_backend
+            )
+            shadow.check(f"before-segment-{forward_batch.split_index}")
         next_split_index = min(
             forward_batch.split_index + forward_count,
             self.model_config.num_hidden_layers,
@@ -1622,6 +1638,8 @@ class ModelRunner:
                 forward_batch,
                 (forward_batch.split_index, next_split_index),
             )
+        if shadow is not None:
+            shadow.check(f"after-segment-{forward_batch.split_index}")
         forward_batch.split_index = next_split_index
         return ret
 
@@ -1670,12 +1688,22 @@ class ModelRunner:
                 forward_batch,
             ) as recorder_outputs,
         ):
+            shadow = None
+            if getattr(self, "_pdmux_index_shadow_enabled", False) and not (
+                split_forward_count is not None
+                or forward_batch.forward_mode.is_split_prefill()
+            ):
+                from sglang.srt.multiplex.pdmux_index_shadow import capture_inputs
+
+                shadow = capture_inputs(self, forward_batch, site="forward")
             output = self._forward_raw(
                 forward_batch,
                 pp_proxy_tensors,
                 reinit_attn_backend,
                 split_forward_count,
             )
+            if shadow is not None:
+                shadow.check("after-forward")
             if self.enable_elastic_ep:
                 output = self._maybe_rebalance_after_rank_fault(
                     output,

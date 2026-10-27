@@ -4,7 +4,10 @@ The reported SWE failures used commit `657c717729`, 4219 requests and a
 16384-token prefill chunk. The first failure surfaced in GDN/FLA preparation
 after roughly 96 requests; the second surfaced in the guarded native KV store
 after 331. The original logs are unavailable. These observations do not prove
-that the earlier NCCL broadcast deadlock has been fixed or reproduced.
+that the earlier NCCL broadcast deadlock has been fixed or reproduced. A later
+user-supplied H100 follow-up completed the overlap-off replay without that
+timeout; its overlap-on ablations did not contain this allocator patch. See
+[the follow-up and diagnostic workflow](cpu_overlap_race_diagnostics.md).
 
 ## Reproduced defect
 
@@ -58,10 +61,13 @@ Use two independent fresh server launches with the original frozen 4219 SWE
 requests, request order, concurrency, model/draft paths, TP topology and HiCache
 configuration. Keep chunk size 16384 and CPU overlap enabled. Retain the full
 server log from startup through completion, including the first CUDA error if
-one occurs. Both runs must complete all requests without CUDA asserts,
-exceptions, watchdog termination or collective timeout before declaring this
-load stable. Recheck output correctness and performance against the control.
+one occurs. Both runs must process all requests without CUDA asserts, watchdog
+termination or collective timeout before declaring this load stable. The later
+control has one shared failed request: acceptance should match that request
+identity and reason, in addition to eliminating CUDA errors.
+Recheck output correctness and performance against the control.
 
 Passing single-GPU regression does not establish that either production crash
 or the original roughly-request-1030 NCCL deadlock is resolved. Until the full
-deployment workload passes, the original deadlock remains unverified.
+deployment workload passes, CPU-overlap-on stability remains unverified. The
+subsequent overlap-off full replay did not reproduce the original timeout.

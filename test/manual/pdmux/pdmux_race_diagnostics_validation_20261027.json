@@ -1,0 +1,145 @@
+{
+  "date": "2026-10-27",
+  "branch": "codex/pdmux-tp-cpu-overlap",
+  "parent_commit": "4b797d693e11a72fb887e0146cb3491d78635661",
+  "deployment_evidence": {
+    "source": "User-supplied H100 follow-up; original artifact bundle not read in this local session.",
+    "contains_4b797d693e": false,
+    "overlap_off": {
+      "processed": 4219,
+      "successful": 4218,
+      "known_shared_failure": 1,
+      "original_broadcast_timeout_reproduced": false
+    },
+    "overlap_on": "Repeated crashes across HiCache/ReplaySSM/chunk/concurrency ablations; not accepted for deployment.",
+    "launch_blocking_control": {
+      "clean_requests_reported": 2246,
+      "complete_replay": false
+    },
+    "first_reported_invariant": "sampler: next_token_logits NaN"
+  },
+  "new_defect": {
+    "component": "DFlash FusedKVMaterializeHelper",
+    "cause": "Prefill context injection and decode commit shared mutable projection/K/V scratch while queued consumers ran on different streams.",
+    "fix": "Cache scratch tuples by actual execution stream and retain the selected tuple locally during materialization; weights/RoPE remain shared reads.",
+    "memory_tradeoff": "Scratch capacity can grow separately for every stream that uses the helper.",
+    "baseline_reproducer": {
+      "failed_as_expected": 1,
+      "first_k_comparison_mismatches": 32768,
+      "first_k_comparison_elements": 32768,
+      "log": "fused-kv-baseline.log"
+    },
+    "fixed_reproducer": {
+      "passed": 1,
+      "comparison": "Exact K/V equality to serial references across both lanes and three repetitions.",
+      "log": "fused-kv-fixed.log"
+    },
+    "identified_as_h100_root_cause": false
+  },
+  "diagnostics": {
+    "environment_switch": "SGLANG_PDMUX_INDEX_SHADOW=1",
+    "default_enabled": false,
+    "scope": [
+      "Target/draft logical forward out_cache_loc and req_pool_indices.",
+      "Actual decode graph static indices after load, checked after replay.",
+      "Persistent split-prefill indices/lengths, GDN query_start_loc/mamba_cache_indices, and metadata bindings across segments."
+    ],
+    "messages": [
+      "target/draft role",
+      "P/D lane",
+      "TP rank",
+      "forward pass",
+      "stream group",
+      "field name",
+      "observation stage",
+      "tensor address/shape"
+    ],
+    "limitations": [
+      "Adds copies/check kernels and retains references, which can mask timing/lifetime races.",
+      "No added cross-lane wait or explicit host synchronization.",
+      "Covers selected indices, not every intermediate or legal in-bounds overwrite.",
+      "A reported change must be assessed against intentional backend writes."
+    ],
+    "launcher": "test/manual/pdmux/run_overlap_race_diagnostics.sh"
+  },
+  "environment": {
+    "gpu": "NVIDIA GeForce RTX 4060 Laptop GPU",
+    "gpu_count": 1,
+    "kernel": "6.6.87.2-microsoft-standard-WSL2",
+    "python": "3.12.3",
+    "torch": "2.13.0+cu130"
+  },
+  "checks": {
+    "final_cpu_gloo": {
+      "passed": 185,
+      "failed": 0,
+      "subtests_passed": 201,
+      "log": "unit.log"
+    },
+    "final_cuda": {
+      "passed": 59,
+      "failed": 0,
+      "subtests_passed": 40,
+      "skipped": 1,
+      "skip_reason": "TP2 NCCL requires two distinct CUDA GPUs.",
+      "log": "cuda-final.log"
+    },
+    "cuda_fault_injection": {
+      "intentional_assert_cases": 2,
+      "process_isolation": true,
+      "observed_fields": [
+        "out_cache_loc",
+        "req_pool_indices"
+      ]
+    },
+    "isort_7_0_0": "passed",
+    "ruff_format_and_F401_F821_UP037": "passed",
+    "python_ast_and_no_bare_pytest_main": "passed",
+    "bash_syntax_and_exit_code_tests": "passed",
+    "git_diff_check": "passed"
+  },
+  "memcheck_attempts": {
+    "system_tool": {
+      "version": "2022.4.1",
+      "exit_code": 13,
+      "error": "Unable to find injection library libsanitizer-collection.so"
+    },
+    "system_tool_with_injection_path": {
+      "exit_code": 255,
+      "error": "Target application terminated before first instrumented API call"
+    },
+    "isolated_cuda13_tool": {
+      "package": "cuda-sanitizer-13-0 13.0.85-1",
+      "tool_version": "2025.3.1.0",
+      "package_url": "https://developer.download.nvidia.com/compute/cuda/repos/ubuntu2404/x86_64/cuda-sanitizer-13-0_13.0.85-1_amd64.deb",
+      "package_sha256": "5913520009ecc86be1c62b5793b032f81fdffdfcd4493da6212e14c3dc1f35a4",
+      "system_package_modified": false,
+      "application_tests_passed": 2,
+      "tool_exit_code": 86,
+      "tool_errors": [
+        "Failed to initialize WDDM debugger interface.",
+        "Device not supported."
+      ],
+      "status": "Blocked by workstation debugger/device support; not a clean memcheck result.",
+      "log_directory": "memcheck13"
+    }
+  },
+  "source_sha256": {
+    "python/sglang/kernels/ops/speculative/fused_kv_materialize.py": "d20924725ed1b501f9fcb82a8f923029e068505be07191c69ffaa06e9ca7b591",
+    "python/sglang/srt/environ.py": "3f83d49df8169fa4621fef024d8424b63c6f2544425f858ef3e5f4cb303a6f4d",
+    "python/sglang/srt/model_executor/model_runner.py": "4cb2980fee0e2ffc6df0df9c7c78c810e166b4c26aebc07ce6008fc658da6b6e",
+    "python/sglang/srt/model_executor/runner/decode_cuda_graph_runner.py": "bb2c878d655c74665201599eb5259a7de6052f23a910e9bd93e34d72ba1386a3",
+    "python/sglang/srt/multiplex/pdmux_index_shadow.py": "ee4f6d8f911a1d718ae82359892fd06d0122957afd3cfeca2ce02400242ecac4",
+    "test/registered/unit/multiplex/test_pdmux_index_shadow.py": "4c25a938bf8d32dbb165616e052a1b5ff577307fd9491e93f5f667a5f45b01a1",
+    "test/manual/pdmux/test_pdmux_index_shadow_cuda.py": "9dee70d790724764a9126665071628a7e5f2c4f27d6799cd56501cf1b909c81b",
+    "test/manual/pdmux/test_dflash_fused_kv_streams_cuda.py": "3efe0b41b5212471d34ab1b56ce0ee27b11eada48f3b4e885a1c6f3ad4fc6da3",
+    "test/manual/pdmux/run_overlap_race_diagnostics.sh": "3c44cdf4c538e544898beed496274bd13fc3326c4bba73e6e69fbfcfc73f7c6d"
+  },
+  "remote_source_hash_check": "passed: all 9 runtime/test files match",
+  "remote_artifacts": "/workspace/pdmux-race-diagnostics-20261027/",
+  "remaining_deployment_validation": [
+    "Native H100 memcheck against the original reproduction command.",
+    "Two fresh uninstrumented SWE 4219 replays with the patch, matching the control failure identity/reason and with no CUDA asserts, NaN invariant errors, collective timeout or watchdog termination.",
+    "Output correctness and throughput/latency comparison after stability passes."
+  ]
+}

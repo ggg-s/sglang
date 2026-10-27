@@ -1520,7 +1520,14 @@ class DecodeCudaGraphRunner(BaseCudaGraphRunner):
             if shared_read_ends is SharedReadEnds.PRE_REPLAY:
                 self._publish_read_done(in_graph=False)
 
+            shadow = None
+            if getattr(self.model_runner, "_pdmux_index_shadow_enabled", False):
+                from sglang.srt.multiplex.pdmux_index_shadow import capture_inputs
+
+                shadow = capture_inputs(self.model_runner, self.buffers, site="graph")
             output = self.backend.replay(self._replay_graph_key, forward_batch)
+            if shadow is not None:
+                shadow.check("after-graph-replay")
 
             if shared_read_ends is SharedReadEnds.IN_REPLAY:
                 self._publish_read_done(in_graph=True)

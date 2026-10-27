@@ -496,6 +496,9 @@ class Envs:
     # a positive value is the layer quantum while decode is active.
     SGLANG_PDMUX_TEMPORAL_LAYERS = EnvInt(0)
     SGLANG_PDMUX_TEMPORAL_ADAPTIVE = EnvBool(False)
+    # Debug-only index snapshots and async immutability assertions on PDMux
+    # forwards. Extra copies/check kernels can perturb the race being observed.
+    SGLANG_PDMUX_INDEX_SHADOW = EnvBool(False)
     SGLANG_VALIDATE_MAMBA_REPLAY_STATE_INDICES = EnvBool(False)
     SGLANG_GDN_DECODE_FUSION_LOG_LAYER_HITS = EnvBool(False)
     SGLANG_GDN_DECODE_FUSION_VERIFY_REAL_TENSORS = EnvBool(False)

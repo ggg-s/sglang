@@ -16,7 +16,7 @@
 Combines: KV projection + RMSNorm + RoPE, then pool-managed KV writes.
 """
 
-from typing import Callable, List, Optional
+from typing import Callable, List, Optional, Tuple
 
 import torch
 import triton
@@ -283,11 +283,11 @@ class FusedKVMaterializeHelper:
             getattr(self.rotary_emb, "cos_sin_cache", torch.empty((0,))).shape[0]
         )
         self._mm_out_supported = True
-        self._workspace_capacity = 0
-        self._workspace_dtype: Optional[torch.dtype] = None
-        self._proj_workspace: Optional[torch.Tensor] = None
-        self._k_workspace: Optional[torch.Tensor] = None
-        self._v_workspace: Optional[torch.Tensor] = None
+        # Prefill context injection and decode commit share this helper under
+        # PDMux, but their queued consumers must not share mutable scratch.
+        self._stream_workspaces: dict[
+            int, Tuple[torch.Tensor, torch.Tensor, torch.Tensor]
+        ] = {}
 
         kv_weights = []
         k_norm_weights = []
@@ -358,33 +358,37 @@ class FusedKVMaterializeHelper:
             cos_sin_cache = cos_sin_cache.to(self.device)
         return cos_sin_cache
 
-    def _ensure_workspace(self, total_ctx: int, dtype: torch.dtype) -> None:
+    def _ensure_workspace(
+        self, total_ctx: int, dtype: torch.dtype
+    ) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+        stream = torch.get_device_module(self.device).current_stream(self.device)
+        key = int(stream.stream_id)
+        previous = self._stream_workspaces.get(key)
         if (
-            self._workspace_capacity >= total_ctx
-            and self._workspace_dtype == dtype
-            and self._proj_workspace is not None
-            and self._k_workspace is not None
-            and self._v_workspace is not None
+            previous is not None
+            and previous[0].shape[0] >= total_ctx
+            and previous[0].dtype == dtype
         ):
-            return
+            return previous
 
         new_capacity = max(1, total_ctx)
-        if self._workspace_capacity > 0:
-            new_capacity = max(new_capacity, self._workspace_capacity * 2)
+        if previous is not None:
+            new_capacity = max(new_capacity, previous[0].shape[0] * 2)
 
-        self._proj_workspace = torch.empty(
+        proj_workspace = torch.empty(
             (new_capacity, self.n_layers * self.layer_out_dim),
             dtype=dtype,
             device=self.device,
         )
-        self._k_workspace = torch.empty(
+        k_workspace = torch.empty(
             (self.n_layers, new_capacity, self.num_kv_heads, self.head_dim),
             dtype=dtype,
             device=self.device,
         )
-        self._v_workspace = torch.empty_like(self._k_workspace)
-        self._workspace_capacity = new_capacity
-        self._workspace_dtype = dtype
+        v_workspace = torch.empty_like(k_workspace)
+        workspace = (proj_workspace, k_workspace, v_workspace)
+        self._stream_workspaces[key] = workspace
+        return workspace
 
     def materialize(
         self,
@@ -423,12 +427,13 @@ class FusedKVMaterializeHelper:
         )
         cos_sin_cache = self._ensure_rope_cache(max_position)
 
-        self._ensure_workspace(total_ctx, ctx_hidden.dtype)
-        assert self._proj_workspace is not None
-        assert self._k_workspace is not None
-        assert self._v_workspace is not None
+        # Keep the selected tuple local: another host submitter selecting its
+        # own stream must not rebind the buffers used below.
+        proj_workspace, k_workspace, v_workspace = self._ensure_workspace(
+            total_ctx, ctx_hidden.dtype
+        )
 
-        proj_out_2d = self._proj_workspace[:total_ctx]
+        proj_out_2d = proj_workspace[:total_ctx]
         if self._mm_out_supported:
             try:
                 torch.mm(ctx_hidden, self.flat_kv_weight_t, out=proj_out_2d)
@@ -439,8 +444,8 @@ class FusedKVMaterializeHelper:
             proj_out_2d = torch.mm(ctx_hidden, self.flat_kv_weight_t)
 
         proj_out = proj_out_2d.view(total_ctx, self.n_layers, self.layer_out_dim)
-        tmp_k = self._k_workspace[:, :total_ctx]
-        tmp_v = self._v_workspace[:, :total_ctx]
+        tmp_k = k_workspace[:, :total_ctx]
+        tmp_v = v_workspace[:, :total_ctx]
         cache_k, cache_v = _fused_norm_rope_stacked(
             proj_out,
             self.k_norm_weights,
