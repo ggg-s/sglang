@@ -1140,11 +1140,11 @@ class HiRadixCache(RadixCache):
         finish_event = self.cache_controller.layer_done_counter.events[
             consumer_index
         ].finish_event
-        if not finish_event.query():
-            return False
-
-        self.loading_check()
-        return True
+        # This is a rank-local readiness predicate. loading_check() performs
+        # collectives and belongs to the scheduler's unconditional HiCache
+        # pump: DMA completion can differ across ranks and even their poll
+        # counts can differ after one rank advances its restore state.
+        return finish_event.query()
 
     def evictable_size(self):
         return self.evictable_size_

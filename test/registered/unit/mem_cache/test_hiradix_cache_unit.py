@@ -3,6 +3,7 @@
 import os
 import unittest
 from array import array
+from unittest.mock import patch
 
 import torch
 
@@ -73,7 +74,12 @@ class TestHiRadixCacheKVEvents(CustomTestCase):
             enable_kv_cache_events=True,
             tp_cache_group=torch.distributed.group.WORLD,
         )
-        cache = HiRadixCache(params, server_args)
+        # These tiny unit-test pools still check actual free RAM, but need not
+        # reserve the production default of 10 GiB on a small CUDA test host.
+        with patch(
+            "sglang.srt.mem_cache.pool_host.base.HICACHE_HOST_MEMORY_RESERVE_BYTES", 0
+        ):
+            cache = HiRadixCache(params, server_args)
         # Disable hit-count-driven write-through; tests back up explicitly.
         cache.write_through_threshold = 1 << 30
         return cache, allocator

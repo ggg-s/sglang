@@ -1,0 +1,77 @@
+{
+  "date": "2026-10-27",
+  "branch": "codex/pdmux-tp-cpu-overlap",
+  "base_commit": "cc4631e52afacb1eaa5cb94c60a9672f6ea926ee",
+  "fixes": [
+    "HiRadixCache and UnifiedRadixCache load-back readiness predicates no longer enter loading_check collectives behind rank-local CUDA event queries. The unconditional scheduler HiCache pump still retires acks.",
+    "PDMux bypasses FlashInfer all-reduce fusion workspaces shared across prefill/decode lanes. Ordinary lane-specific TP communication and CPU overlap remain enabled.",
+    "FlashInfer workspace reuse requires matching communication groups and rank, as well as world size and capacity. This includes the legacy rendezvous-group argument."
+  ],
+  "source_sha256": {
+    "python/sglang/srt/layers/flashinfer_comm_fusion.py": "d7dc60a71a2fa88999a6afe8a0fdca60d9ef686bda281474f76640d823df6b48",
+    "python/sglang/srt/mem_cache/hiradix_cache.py": "1a4b68446732ef85f9d2aabc846788183ba1c3fc400487fdfb1d041f65bade21",
+    "python/sglang/srt/mem_cache/unified_radix_cache.py": "948572dddcd4090a55c3ba50cf6ca3dd70965f560c6957097c8b79444a1322b5",
+    "test/registered/unit/multiplex/test_pdmux_collective_safety.py": "244b06e55ae0c7c6e444270ab4e7dba0f540d46964f1ee606f94fc2e8bf46842",
+    "test/registered/unit/mem_cache/test_hiradix_cache_unit.py": "70000fbfce2670dd741c09942913282f5981821c24da0a4f33d10f749a08fa20",
+    "test/registered/unit/mem_cache/test_hiradix_pp_sync_drain.py": "d237f1d88f95ce921e400c383ddc83367fe9e695b51a24cc9491daa33468ee5d"
+  },
+  "environment": {
+    "gpu": "NVIDIA GeForce RTX 4060 Laptop GPU",
+    "gpu_count": 1,
+    "python": "3.12.3",
+    "torch": "2.13.0+cu130"
+  },
+  "checks": {
+    "pdmux_qwen_split_scheduler": {
+      "passed": 204,
+      "failed": 0,
+      "subtests_passed": 171,
+      "note": "Run before the final legacy-group test was added; production sources unchanged afterward."
+    },
+    "final_collective_safety_suite": {
+      "passed": 7,
+      "failed": 0,
+      "subtests_passed": 11,
+      "real_gloo_ranks": 2,
+      "unequal_dma_readiness_and_poll_counts": true
+    },
+    "fusion_and_decode_restore_contracts": {
+      "passed": 33,
+      "failed": 0,
+      "subtests_passed": 23
+    },
+    "hicache_extended": {
+      "passed": 20,
+      "native_hash_gpu_cache_test_passed_on_retry": 1,
+      "remaining_failures": 0
+    },
+    "cuda_regression": {
+      "passed": 18,
+      "failed": 0,
+      "skipped": 1,
+      "skip_reason": "Two distinct CUDA GPUs are required for the TP2 NCCL check."
+    },
+    "baseline_regression_detection": {
+      "distinct_regression_cases_failed_on_base_commit": 3,
+      "errors": 0
+    },
+    "ruff_0_15_1_format_and_F401_F821_UP037": "passed",
+    "git_diff_check": "passed",
+    "no_bare_pytest_main": "passed"
+  },
+  "test_fixture_repairs": [
+    "The PP event-pump fixture now declares its write-through policy.",
+    "The tiny HiRadixCache GPU fixture excludes the production 10-GiB reserve while still checking actual available RAM."
+  ],
+  "test_environment_repairs": [
+    "Added the existing virtualenv Ninja and CUDA compiler directories to PATH for native cache tests.",
+    "Downloaded and unpacked Ubuntu OpenSSL development headers under the isolated validation directory; no system package installation."
+  ],
+  "remote_artifacts": "/workspace/pdmux-tp-overlap-20261026/",
+  "limitations": [
+    "One GPU cannot validate two-GPU NCCL progress or the original 4219-request SWE workload.",
+    "FlashInfer fusion contract tests mock collectives; native SM90/SM10X fusion performance was not measured on the SM89 4060.",
+    "The HiCache local polling bug belongs to the decode restore path and is not asserted to be the cause of the original PDMux timeout.",
+    "PDMux intentionally falls back from the shared FlashInfer all-reduce fusion fast path; throughput on the deployment host must be remeasured."
+  ]
+}

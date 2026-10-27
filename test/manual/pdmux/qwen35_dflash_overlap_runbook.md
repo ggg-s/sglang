@@ -133,6 +133,20 @@ enabled, before drawing reliability or throughput conclusions.
 The [2026-10-26 validation record](qwen35_tp_overlap_validation_20261026.json)
 contains the 4060 results, source hashes and remaining deployment checks.
 
+The subsequent collective-safety fixes keep HiCache DMA readiness polling
+rank-local: ack retirement and its collectives run only in the scheduler's
+unconditional event pump. This also covers the disaggregated decode restore
+path, where ranks may poll different numbers of times. FlashInfer all-reduce
+fusion is unavailable while PDMux communicators exist: its shared workspace
+and signal pad are not isolated by lane. PDMux keeps using its ordinary,
+lane-specific TP communicators; CPU and prefill/decode overlap remain enabled.
+Workspace reuse outside PDMux also requires the same communicator and rank,
+including the legacy rendezvous-group argument, in addition to matching size.
+Run `test/registered/unit/multiplex/test_pdmux_collective_safety.py` for the
+two-rank polling and workspace regression checks.
+The [2026-10-27 validation record](qwen35_tp_collective_safety_validation_20261027.json)
+records this follow-up's tests, source hashes and hardware limits.
+
 For the A100 40 GB AWQ lane, use the FP16 AWQ-Marlin target and the
 unquantized DFlash draft:
 

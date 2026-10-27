@@ -12,7 +12,10 @@ from sglang.srt.distributed import (
     get_moe_tp_group,
     get_tp_group,
 )
-from sglang.srt.distributed.parallel_state import in_the_same_node_as
+from sglang.srt.distributed.parallel_state import (
+    in_the_same_node_as,
+    is_pdmux_enabled,
+)
 from sglang.srt.runtime_context import (
     get_exec,
     get_parallel,
@@ -84,6 +87,8 @@ def resolve_flashinfer_allreduce_fusion_backend() -> Optional[str]:
     Reads the published leaves (`exec.comm`, `parallel`): the backend is a
     resolution decision, and the node count is launch topology.
     """
+    if is_flashinfer_allreduce_unavailable():
+        return None
     backend = get_exec().comm.flashinfer_allreduce_fusion_backend
     if backend is None:
         return None
@@ -218,7 +223,11 @@ if is_flashinfer_available():
 
 
 def is_flashinfer_allreduce_unavailable() -> bool:
-    return _flashinfer_allreduce_unavailable
+    # These workspaces own shared signal pads/buffers keyed only by attention
+    # vs MoE. PDMux can use both from two streams concurrently, including a
+    # captured decode graph. Use the lane-specific ordinary TP communicators
+    # until fusion workspaces and their capture lifetimes are lane-specific.
+    return _flashinfer_allreduce_unavailable or is_pdmux_enabled()
 
 
 def _make_flashinfer_workspace_allocation_prop(cuda_driver):
@@ -444,9 +453,12 @@ class FlashInferWorkspaceManager:
         self._max_hidden_dim_seen = max(hidden_dim, self._max_hidden_dim_seen or 0)
 
         # Reuse existing workspace if it already covers this problem size
+        group_key = (device_group, cpu_group if cpu_group is not None else group)
         if (
             self.initialized
             and self.world_size == world_size
+            and self.rank == rank
+            and self.group == group_key
             and self.is_buffer_size_sufficient(
                 token_num=max_token_num,
                 hidden_dim=hidden_dim,
@@ -456,8 +468,9 @@ class FlashInferWorkspaceManager:
         ):
             return
 
-        # Same world_size but buffer too small: free old workspace before creating new
-        if self.initialized and self.world_size == world_size:
+        # A different communicator needs a new rendezvous even at the same
+        # world size; never silently reuse buffers registered on other peers.
+        if self.initialized:
             self.cleanup()
 
         if _flashinfer_comm is None or _create_allreduce_fusion_workspace is None:
@@ -528,7 +541,7 @@ class FlashInferWorkspaceManager:
             self._configure_workspace_size_check()
             self.world_size = world_size
             self.rank = rank
-            self.group = (device_group, cpu_group)
+            self.group = group_key
             self.max_token_num = alloc_token_num
             self.hidden_dim = alloc_hidden_dim
             self.dtype = dtype or torch.bfloat16
@@ -688,7 +701,7 @@ def ensure_workspace_initialized(
     use_attn_tp_group: bool = True,
 ):
     """Ensure workspace is initialized."""
-    if _flashinfer_allreduce_unavailable:
+    if is_flashinfer_allreduce_unavailable():
         return False
 
     if not is_flashinfer_available() or _flashinfer_comm is None:
@@ -808,7 +821,11 @@ def flashinfer_allreduce_residual_rmsnorm(
     Returns:
         Tuple[torch.Tensor, torch.Tensor]: (norm_output, residual_output)
     """
-    if not is_flashinfer_available() or _flashinfer_comm is None:
+    if (
+        is_flashinfer_allreduce_unavailable()
+        or not is_flashinfer_available()
+        or _flashinfer_comm is None
+    ):
         logger.debug(
             "FlashInfer not available, falling back to standard implementation"
         )
@@ -899,7 +916,7 @@ def can_use_flashinfer_allreduce(
     the rest are pure functions of the group identity and of tensor metadata,
     which is identical on every rank of the group.
     """
-    if _flashinfer_allreduce_unavailable or _flashinfer_comm is None:
+    if is_flashinfer_allreduce_unavailable() or _flashinfer_comm is None:
         return False
 
     if input_.ndim != 2 or not input_.is_contiguous():
@@ -1000,7 +1017,7 @@ def pre_initialize_workspaces(
     (broadcasts, barriers) inside the graph capture context, which can
     deadlock with custom_all_reduce.register_graph_buffers.
     """
-    if _flashinfer_allreduce_unavailable or _flashinfer_comm is None:
+    if is_flashinfer_allreduce_unavailable() or _flashinfer_comm is None:
         return
 
     # Initialize MoE workspace
