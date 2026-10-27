@@ -114,3 +114,13 @@ checks CP2/4/8, decode attention TP off/on, resolved readback and pickled worker
 publication. A run that bypassed the gate while reporting DP attention false
 must be rerun before comparing full-model performance with this recipe. The
 isolated projection timings above do not validate configuration resolution.
+
+Validation of the follow-up: the new real-pipeline case fails in all six
+CP2/4/8 x decode-TP-off/on combinations before the fix. After the fix, all four
+new test methods pass, also with `CUDA_VISIBLE_DEVICES` empty. The broader
+server-argument/model-override run has 360 passes and two unrelated failures:
+one multimodal transport case sees an inherited legacy environment variable
+(it passes in a clean standalone process), and one gRPC/HTTP import lacks
+`jsonschema` in the workstation venv. The 17 lightweight PCP/PDMux regressions
+also pass. Full-model performance with the corrected resolved flag is still
+unmeasured.
