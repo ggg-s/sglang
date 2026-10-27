@@ -11,6 +11,7 @@ import argparse
 import gc
 import json
 import statistics
+import subprocess
 import sys
 import time
 from pathlib import Path
@@ -119,8 +120,14 @@ def main():
     assert torch.cuda.is_available(), "CUDA required"
     torch.manual_seed(42)
     result = {
+        "source_commit": subprocess.check_output(
+            ["git", "rev-parse", "HEAD"], cwd=ROOT, text=True
+        ).strip(),
         "torch": torch.__version__,
+        "cuda": torch.version.cuda,
         "gpu": torch.cuda.get_device_name(),
+        "compute_capability": torch.cuda.get_device_capability(),
+        "sm_count": torch.cuda.get_device_properties(0).multi_processor_count,
         "scope": "synthetic projection/scope overhead; no full-model performance claim",
         "cp_size": args.cp_size,
         "dimensions": dict(
@@ -133,6 +140,13 @@ def main():
             dtype="bfloat16",
         ),
     }
+    # Import the runtime before patch.dict snapshots sys.modules. Otherwise
+    # lazy Torch imports inside the fixture can be removed on restoration,
+    # causing duplicate c10d operator registration when the runtime imports.
+    try:
+        result["runtime_dispatch"] = runtime_dispatch_cost()
+    except Exception as exc:
+        result["runtime_dispatch_unavailable"] = f"{type(exc).__name__}: {exc}"
     model, _, linear_module = fixture(size=args.cp_size)
     model = model.to("cuda")
     model.n_heads = model.n_local_heads = 64
@@ -232,10 +246,6 @@ def main():
             result["projection"][rows] = {"median": summary, "samples": samples}
             del graphs, samples, reference, value, graph, x
             gc.collect()
-    try:
-        result["runtime_dispatch"] = runtime_dispatch_cost()
-    except Exception as exc:
-        result["runtime_dispatch_unavailable"] = f"{type(exc).__name__}: {exc}"
     args.output.write_text(json.dumps(result, indent=2) + "\n")
     print(
         json.dumps(
