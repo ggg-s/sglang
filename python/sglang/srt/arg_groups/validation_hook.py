@@ -528,10 +528,12 @@ def check_pdmux_overlap(cfg):
     Subgroup parallelism needs its own lane-specific communicators before it
     can use the asynchronous speculative scheduler.
     """
-    assert (
-        cfg.pdmux_prefill_mode == "layer_split"
-        and cfg.speculative_algorithm == "DFLASH"
-    ), "PD-Multiplexing overlap schedule requires layer_split prefill and DFLASH."
+    assert cfg.pdmux_prefill_mode == "layer_split" and cfg.speculative_algorithm in (
+        "DFLASH",
+        "DSPARK",
+    ), (
+        "PD-Multiplexing overlap schedule requires layer_split prefill and DFLASH or DSPARK."
+    )
     if cfg.tp_size > 1:
         assert not cfg.enable_dp_attention, (
             "PD-Multiplexing overlap schedule with TP>1 does not yet support "

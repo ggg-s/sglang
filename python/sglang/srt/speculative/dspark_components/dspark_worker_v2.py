@@ -9,6 +9,7 @@ from sglang.kernels.ops.attention.dsv4.unified_kv_kernels.env_gate import (
     is_unified_kv_triton,
 )
 from sglang.srt.configs.hybrid_arch import mambaish_config
+from sglang.srt.distributed import get_tp_group
 from sglang.srt.distributed.parallel_state_wrapper import ParallelState
 from sglang.srt.environ import envs
 from sglang.srt.layers.logprob_processor import compute_spec_logprobs
@@ -23,6 +24,7 @@ from sglang.srt.model_executor.forward_batch_info import (
     PPProxyTensors,
     compute_position,
 )
+from sglang.srt.multiplex.pdmux_context import decode_lane_attn_backend
 from sglang.srt.runtime_context import (
     get_disagg,
     get_exec,
@@ -603,7 +605,17 @@ class DSparkWorkerV2(BaseSpecWorker):
         )
         logits_output = batch_output.logits_output
         next_token_ids = batch_output.next_token_ids
-        self._tp_sync.sync(SpecTpSyncSite.DSPARK_TARGET, next_token_ids)
+        # The final prefill sample must stay on the prefill communicator;
+        # _tp_sync's default group belongs to concurrent draft/verify decode.
+        self._tp_sync.sync(
+            SpecTpSyncSite.DSPARK_TARGET,
+            next_token_ids,
+            group=(
+                get_parallel().attn_tp_group
+                if get_parallel().enable_dp_attention
+                else get_tp_group()
+            ),
+        )
         new_seq_lens = batch.seq_lens
         batch_output.new_seq_lens = new_seq_lens
         if on_publish is not None:
@@ -969,7 +981,7 @@ class DSparkWorkerV2(BaseSpecWorker):
         # layout would need the accept-index mapping the shared spec_utils
         # commit helper does.
         assert get_spec().speculative_eagle_topk in (None, 1)
-        attn_backend = self.target_worker.model_runner.attn_backend
+        attn_backend = decode_lane_attn_backend(self.target_worker.model_runner)
 
         last_correct_step_indices = commit_lens.to(torch.int64) - 1
         mamba_steps_to_track = None

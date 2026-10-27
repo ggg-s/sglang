@@ -42,6 +42,7 @@ from sglang.srt.distributed import (
 from sglang.srt.distributed.device_communicators.pynccl_allocator import (
     use_symmetric_memory,
 )
+from sglang.srt.distributed.parallel_state import is_pdmux_enabled
 from sglang.srt.environ import envs
 from sglang.srt.eplb.expert_distribution import get_global_expert_distribution_recorder
 from sglang.srt.eplb.expert_location import ModelConfigForExpertLocation
@@ -155,7 +156,6 @@ from sglang.srt.models.deepseek_v2 import (
     _is_npu,
     _is_xpu,
 )
-from sglang.srt.multiplex.pdmux_context import is_pdmux_standard_prefill
 from sglang.srt.runtime_context import (
     get_device,
     get_exec,
@@ -2867,9 +2867,9 @@ class DeepseekV4Model(nn.Module):
                 )
             )
             or (_is_npu and envs.SGLANG_NPU_USE_MULTI_STREAM.get())
-        ) and not is_pdmux_standard_prefill()
-        # PDMux standard runs prefill and decode concurrently on two
-        # green-context streams. These helper streams are created on the plain
+        ) and not is_pdmux_enabled()
+        # Both PDMux modes run prefill and decode on separate lane streams.
+        # These helper streams are created on the plain
         # context, so work forked onto them is not placed by the lane that
         # forked it. Leaving them unset routes the attention KV / compressor /
         # indexer split, the indexer's internal split and the MoE shared-expert

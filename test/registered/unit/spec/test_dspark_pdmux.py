@@ -2,14 +2,153 @@ import unittest
 from types import SimpleNamespace
 from unittest.mock import Mock, patch
 
+import torch
+
 from sglang.srt.model_executor.forward_batch_info import CaptureHiddenMode
 from sglang.srt.speculative.dspark_components.dspark_worker_v2 import DSparkWorkerV2
+from sglang.srt.speculative.spec_tp_sync import SpecTpSyncSite
 from sglang.test.ci.ci_register import register_cpu_ci
 
 register_cpu_ci(est_time=2, suite="base-a-test-cpu")
 
+WORKER_MODULE = "sglang.srt.speculative.dspark_components.dspark_worker_v2"
+
+
+def make_prefill_worker(device, tp_sync):
+    """Small prefill fixture; model execution is supplied by separate tests."""
+    worker = object.__new__(DSparkWorkerV2)
+    worker._target_hidden_projection_enabled = False
+    worker._tp_sync = tp_sync
+    worker.model_runner = SimpleNamespace(
+        prefill_attention_backend_str=(
+            "torch_native" if torch.device(device).type == "cpu" else "triton"
+        )
+    )
+    worker._kv_injector = SimpleNamespace(inject_target_hidden=Mock())
+    batch = SimpleNamespace(
+        seq_lens=torch.tensor([5, 9], dtype=torch.int32, device=device),
+        seq_lens_cpu=torch.tensor([5, 9], dtype=torch.int32),
+        extend_lens=[3, 2],
+        prefix_lens=[2, 7],
+        out_cache_loc=torch.arange(5, device=device),
+        req_pool_indices=torch.tensor([1, 3], device=device),
+    )
+    output = SimpleNamespace(
+        logits_output=SimpleNamespace(hidden_states=torch.ones(5, 8, device=device)),
+        next_token_ids=torch.tensor([11, 13], device=device),
+    )
+    return worker, batch, output
+
 
 class TestDSparkPDMux(unittest.TestCase):
+    def test_deepseek_v4_hicache_packs_all_draft_stage_pools(self):
+        from sglang.srt.speculative import base_spec_worker as spec
+        from sglang.srt.speculative.spec_info import SpeculativeAlgorithm
+
+        pools = (object(), object())
+        runners = tuple(
+            SimpleNamespace(
+                token_to_kv_pool=pool,
+                model_config=SimpleNamespace(
+                    hf_config=SimpleNamespace(
+                        architectures=["DeepseekV4ForCausalLMDSpark"]
+                    )
+                ),
+            )
+            for pool in pools
+        )
+        target = SimpleNamespace(spec_algorithm=SpeculativeAlgorithm.DSPARK)
+        worker = SimpleNamespace(
+            target_worker=SimpleNamespace(model_runner=target),
+            _draft_model_runners=lambda: runners,
+        )
+        with patch.object(
+            spec,
+            "get_memory",
+            return_value=SimpleNamespace(enable_hierarchical_cache=True),
+        ):
+            plan = spec.BaseSpecWorker._build_hicache_draft_plan(worker)
+        self.assertEqual(plan.mode, spec.HiCacheDraftMode.PACKED)
+        self.assertEqual(plan.device_pools, pools)
+        self.assertEqual(target.mtp_draft_device_pools, pools)
+
+    def test_prefill_sync_selects_current_lane_and_preserves_cpu_lengths(self):
+        for dp_attention in (False, True):
+            for unified in (False, True):
+                with self.subTest(dp_attention=dp_attention, unified=unified):
+                    prefill_group, attn_group = object(), object()
+                    sync, publish = Mock(), Mock()
+                    worker, batch, output = make_prefill_worker("cpu", sync)
+                    seq_lens, seq_lens_cpu = batch.seq_lens, batch.seq_lens_cpu
+                    with (
+                        patch(
+                            f"{WORKER_MODULE}.get_tp_group", return_value=prefill_group
+                        ),
+                        patch(
+                            f"{WORKER_MODULE}.get_parallel",
+                            return_value=SimpleNamespace(
+                                enable_dp_attention=dp_attention,
+                                attn_tp_group=attn_group,
+                            ),
+                        ),
+                        patch(
+                            f"{WORKER_MODULE}.is_unified_kv_triton",
+                            return_value=unified,
+                        ),
+                    ):
+                        result = worker._finalize_prefill(batch, output, publish)
+
+                    sync.sync.assert_called_once_with(
+                        SpecTpSyncSite.DSPARK_TARGET,
+                        output.next_token_ids,
+                        group=attn_group if dp_attention else prefill_group,
+                    )
+                    self.assertIs(result.new_seq_lens, seq_lens)
+                    self.assertIs(batch.seq_lens_cpu, seq_lens_cpu)
+                    torch.testing.assert_close(
+                        seq_lens_cpu, torch.tensor([5, 9], dtype=torch.int32)
+                    )
+                    publish.assert_called_once_with(seq_lens)
+                    kwargs = worker._kv_injector.inject_target_hidden.call_args.kwargs
+                    torch.testing.assert_close(
+                        kwargs["positions"], torch.tensor([2, 3, 4, 7, 8])
+                    )
+                    if unified:
+                        torch.testing.assert_close(
+                            kwargs["state_slot"], torch.tensor([1, 1, 1, 3, 3])
+                        )
+                        torch.testing.assert_close(
+                            kwargs["final_pos"], torch.tensor([4, 4, 4, 8, 8])
+                        )
+                    else:
+                        self.assertIsNone(kwargs["state_slot"])
+                        self.assertIsNone(kwargs["final_pos"])
+                    self.assertIsNone(output.logits_output.hidden_states)
+                    self.assertIs(
+                        result.next_draft_input.bonus_tokens, output.next_token_ids
+                    )
+
+    def test_verify_metadata_uses_decode_backend_during_split_prefill(self):
+        from sglang.srt.speculative.dspark_components.dspark_verify import (
+            TargetVerifyExecutor,
+        )
+
+        executor = object.__new__(TargetVerifyExecutor)
+        executor._verify_backend_self_adds_seq_lens_cache = None
+        executor.target_worker = SimpleNamespace(
+            model_runner=SimpleNamespace(
+                attn_backend=object(),
+                decode_attn_backend=SimpleNamespace(
+                    make_forward_metadata_from_raw_verify=Mock()
+                ),
+            )
+        )
+        with patch(
+            "sglang.srt.runtime_context.get_disagg",
+            return_value=SimpleNamespace(enable_pdmux=True),
+        ):
+            self.assertTrue(executor._verify_backend_self_adds_seq_lens())
+
     def test_scheduler_pp_proxy_argument_is_accepted_for_decode(self):
         worker = object.__new__(DSparkWorkerV2)
         worker._forward_decode = Mock(return_value="decoded")

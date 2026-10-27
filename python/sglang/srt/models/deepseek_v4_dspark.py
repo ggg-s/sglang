@@ -17,6 +17,7 @@ from sglang.kernels.ops.speculative.dspark.dspark_draft_model import (
     CommitKvProj,
 )
 from sglang.srt.configs.deepseek_v4 import DeepSeekV4Config
+from sglang.srt.distributed.parallel_state import is_pdmux_enabled
 from sglang.srt.environ import envs
 from sglang.srt.layers.dp_attention import is_dp_attention_enabled
 from sglang.srt.layers.layernorm import RMSNorm
@@ -50,7 +51,6 @@ from sglang.srt.models.dspark import (
     project_through_lm_head,
     run_markov_block,
 )
-from sglang.srt.multiplex.pdmux_context import is_pdmux_standard_prefill
 from sglang.srt.runtime_context import (
     get_parallel,
     get_platform,
@@ -720,7 +720,7 @@ class DeepseekV4ForCausalLMDSpark(nn.Module):
             # Created on the plain context, so work forked onto it is not
             # placed by the PDMux lane that forked it. See the same gate in
             # DeepseekV4Model.
-            and not is_pdmux_standard_prefill()
+            and not is_pdmux_enabled()
         )
         self.alt_streams: Optional[List[torch.cuda.Stream]] = (
             [torch.cuda.Stream()] if use_multi_stream else None

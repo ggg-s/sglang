@@ -29,6 +29,7 @@ from sglang.kernels.ops.speculative.dspark.dspark_verify_window import (
 from sglang.srt.layers.logits_processor import LogitsProcessorOutput
 from sglang.srt.managers.schedule_batch import ScheduleBatch
 from sglang.srt.model_executor.forward_batch_info import CaptureHiddenMode, ForwardMode
+from sglang.srt.multiplex.pdmux_context import decode_lane_attn_backend
 from sglang.srt.speculative.dflash_info import DFlashVerifyInput
 from sglang.srt.speculative.dflash_info_v2 import DFlashDraftInputV2
 from sglang.srt.speculative.dflash_utils import apply_dflash_verify_logits_adjustments
@@ -467,7 +468,7 @@ class TargetVerifyExecutor:
 
     def _verify_backend_self_adds_seq_lens(self) -> bool:
         if self._verify_backend_self_adds_seq_lens_cache is None:
-            backend = self.target_worker.model_runner.attn_backend
+            backend = decode_lane_attn_backend(self.target_worker.model_runner)
             self._verify_backend_self_adds_seq_lens_cache = hasattr(
                 backend, "make_forward_metadata_from_raw_verify"
             )

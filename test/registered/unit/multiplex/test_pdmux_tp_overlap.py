@@ -65,6 +65,43 @@ def load_constructor(path, name, namespace, *, methods=()):
 
 
 class TestPdmuxTPGroups(unittest.TestCase):
+    def test_deepseek_v4_target_and_dspark_helpers_stay_on_pdmux_streams(self):
+        for path, name in (
+            ("models/deepseek_v4.py", "use_stream_pool"),
+            ("models/deepseek_v4_dspark.py", "use_multi_stream"),
+        ):
+            tree = ast.parse((SRT / path).read_text())
+            assignment = next(
+                node
+                for node in ast.walk(tree)
+                if isinstance(node, ast.Assign)
+                and any(isinstance(t, ast.Name) and t.id == name for t in node.targets)
+            )
+            expr = compile(ast.Expression(assignment.value), path, "eval")
+            for enabled in (False, True):
+                with self.subTest(model=path, pdmux=enabled):
+                    self.assertEqual(
+                        eval(
+                            expr,
+                            dict(
+                                _is_cuda=True,
+                                _is_hip=False,
+                                _is_npu=False,
+                                torch=NS(cuda=NS(is_available=lambda: True)),
+                                envs=NS(
+                                    SGLANG_OPT_USE_MULTI_STREAM_OVERLAP=NS(
+                                        get=lambda: True
+                                    ),
+                                    SGLANG_DSPARK_ENABLE_MULTI_STREAM=NS(
+                                        get=lambda: True
+                                    ),
+                                ),
+                                is_pdmux_enabled=lambda: enabled,
+                            ),
+                        ),
+                        not enabled,
+                    )
+
     def test_full_width_attention_and_moe_follow_each_lane(self):
         decode, prefill = object(), object()
         lanes = lane_namespace(decode, prefill)
@@ -124,8 +161,14 @@ class TestPdmuxTPAdmission(unittest.TestCase):
         check["check_pdmux_overlap"](cfg)
 
     def test_plain_tp_and_hicache_are_admitted(self):
-        for size in (1, 2, 4, 8):
-            self.check(tp_size=size, enable_hierarchical_cache=True)
+        for algorithm in ("DFLASH", "DSPARK"):
+            for size in (1, 2, 4, 8):
+                with self.subTest(algorithm=algorithm, tp_size=size):
+                    self.check(
+                        speculative_algorithm=algorithm,
+                        tp_size=size,
+                        enable_hierarchical_cache=True,
+                    )
 
     def test_other_prefill_modes_and_algorithms_still_fail(self):
         for overrides in (
@@ -141,18 +184,22 @@ class TestPdmuxTPAdmission(unittest.TestCase):
                 self.check(**overrides)
 
     def test_subgroup_parallelism_is_not_silently_enabled(self):
-        for name in (
-            "enable_dp_attention",
-            "ep_size",
-            "moe_dp_size",
-            "attn_cp_size",
-            "dcp_size",
-        ):
-            with (
-                self.subTest(name=name),
-                self.assertRaisesRegex(AssertionError, "TP>1"),
+        for algorithm in ("DFLASH", "DSPARK"):
+            for name in (
+                "enable_dp_attention",
+                "ep_size",
+                "moe_dp_size",
+                "attn_cp_size",
+                "dcp_size",
             ):
-                self.check(**{name: True if name == "enable_dp_attention" else 2})
+                with (
+                    self.subTest(algorithm=algorithm, name=name),
+                    self.assertRaisesRegex(AssertionError, "TP>1"),
+                ):
+                    self.check(
+                        speculative_algorithm=algorithm,
+                        **{name: True if name == "enable_dp_attention" else 2},
+                    )
 
 
 class TestPdmuxTPSampling(unittest.TestCase):
@@ -406,6 +453,10 @@ def _gloo_lane_rank(rank, store_path):
             self.reductions += 1
             return tensor
 
+        def broadcast(self, tensor, src=0):
+            self.broadcasts = getattr(self, "broadcasts", 0) + 1
+            dist.broadcast(tensor, src=src, group=self.process_group)
+
     dist.init_process_group(
         "gloo",
         init_method=f"file://{store_path}",
@@ -433,6 +484,38 @@ def _gloo_lane_rank(rank, store_path):
                 torch.testing.assert_close(d, torch.tensor([1 + 2 * segment]))
         assert prefill.reductions == 32 * 3 * 2
         assert decode.reductions == 32 * 3
+        # Exercise the production prefill finalizer and SpecTpSync with two
+        # real groups. A cached decode group must not receive DSPARK_TARGET.
+        sync_method = load_methods(
+            "speculative/spec_tp_sync.py", "SpecTpSync", ["sync"]
+        )["sync"]
+        sync = NS(_sites={"prefill", "plan"}, _tp_group=decode)
+        sync.sync = lambda *args, **kwargs: sync_method(sync, *args, **kwargs)
+        finalize = load_methods(
+            "speculative/dspark_components/dspark_worker_v2.py",
+            "DSparkWorkerV2",
+            ["_finalize_prefill"],
+            SpecTpSyncSite=NS(DSPARK_TARGET="prefill"),
+            get_parallel=lambda: NS(enable_dp_attention=False),
+            get_tp_group=lanes.get_tp_group,
+        )["_finalize_prefill"]
+        worker = NS(_target_hidden_projection_enabled=False, _tp_sync=sync)
+        for chunk in range(32):
+            lanes.set_pdmux_status(True)
+            output = NS(
+                logits_output=NS(hidden_states=None),
+                next_token_ids=torch.tensor([chunk + rank]),
+            )
+            try:
+                finalize(worker, NS(seq_lens=None), output, None)
+            except RuntimeError as exc:
+                assert "aux hidden capture" in str(exc)
+            assert output.next_token_ids.item() == chunk
+            lanes.set_pdmux_status(False)
+            plan = torch.tensor([chunk + rank, chunk + rank])
+            sync.sync("plan", plan)
+            assert plan.tolist() == [chunk, chunk]
+        assert prefill.broadcasts == decode.broadcasts == 32
         for overlap in (False, True):
             _exercise_chunked_scheduler(rank, decode.process_group, overlap=overlap)
     finally:

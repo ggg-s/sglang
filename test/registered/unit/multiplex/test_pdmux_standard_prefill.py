@@ -691,7 +691,7 @@ class TestEagerRunnerBackendResolution(unittest.TestCase):
 
 
 class TestPdmuxStandardPrefillMode(unittest.TestCase):
-    """`is_pdmux_standard_prefill` is the single switch every lane gate reads."""
+    """Resolved mode detection and decode backend selection."""
 
     @staticmethod
     @contextlib.contextmanager

@@ -25,6 +25,7 @@ keep draining under long overlapped prefills.
 from __future__ import annotations
 
 import os
+import random
 import re
 import tempfile
 import threading
@@ -93,6 +94,7 @@ class PDMuxHiCacheMixin:
     # layer_split path it was written against; the *StandardPrefill subclasses
     # run the same checks against the standard-EXTEND lane.
     pdmux_prefill_mode = "layer_split"
+    disable_overlap_schedule = True
     # Extra launch args and env, appended after the shared ones.
     extra_server_args: list = []
     server_env: dict = {}
@@ -127,7 +129,11 @@ class PDMuxHiCacheMixin:
             timeout=DEFAULT_TIMEOUT_FOR_SERVER_LAUNCH,
             other_args=[
                 "--enable-pdmux",
-                "--disable-overlap-schedule",
+                *(
+                    ["--disable-overlap-schedule"]
+                    if cls.disable_overlap_schedule
+                    else []
+                ),
                 "--sm-group-num",
                 str(cls.sm_group_num),
                 "--pdmux-config-path",
@@ -156,6 +162,8 @@ class PDMuxHiCacheMixin:
         # --max-total-tokens, and a hardcoded round count silently stops
         # evicting when it drifts.
         info = requests.get(cls.base_url + "/get_server_info", timeout=120).json()
+        if info["disable_overlap_schedule"] != cls.disable_overlap_schedule:
+            raise AssertionError("server resolved an unexpected CPU overlap schedule")
         # A server that resolved to the other lane would validate nothing about
         # the mode this class is about, so check what actually took effect.
         if info["pdmux_prefill_mode"] != cls.pdmux_prefill_mode:
@@ -232,8 +240,11 @@ class PDMuxHiCacheMixin:
         requests.post(self.base_url + "/flush_cache", timeout=120).raise_for_status()
 
     def _prompt(self, seed) -> list:
-        base = 1000 + seed * self.prompt_len
-        return list(range(base, base + self.prompt_len))
+        # Seed 200 at length 4096 previously produced token IDs above 820k,
+        # outside the DSV4 vocabulary. Keep distinct, deterministic prompts
+        # inside the common vocabulary range of the models used here.
+        rng = random.Random(seed)
+        return [rng.randrange(1000, 20000) for _ in range(self.prompt_len)]
 
     # --- cases -------------------------------------------------------------
 

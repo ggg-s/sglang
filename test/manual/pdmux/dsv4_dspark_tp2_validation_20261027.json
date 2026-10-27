@@ -1,0 +1,101 @@
+{
+  "date": "2026-10-27",
+  "branch": "codex/pdmux-tp-cpu-overlap",
+  "base_commit": "657c7177290445b6b306d802470e3a2acdfbb825",
+  "target_model": "DeepSeek-V4 with a compatible DSpark draft checkpoint",
+  "configuration": {
+    "tp_size": 2,
+    "pp_size": 1,
+    "ep_size": 1,
+    "moe_dp_size": 1,
+    "attn_cp_size": 1,
+    "dcp_size": 1,
+    "enable_dp_attention": false,
+    "disable_overlap_schedule": false,
+    "pdmux_prefill_mode": "layer_split",
+    "enable_hierarchical_cache": true
+  },
+  "fixes": [
+    "Admit DSPARK with the asynchronous PDMux layer-split scheduler for plain TP.",
+    "Route the prefill DSPARK_TARGET broadcast through the current prefill TP group, retaining the decode group for proposal, planning and acceptance.",
+    "Plan verify metadata and Mamba verify commits against the selected per-stream decode backend.",
+    "Disable plain-context helper streams in the DeepSeek-V4 target and DSpark draft in both PDMux modes.",
+    "Add a full-model TP2 acceptance recipe with multi-chunk prefill, CPU overlap and packed HiCache draft KV."
+  ],
+  "environment": {
+    "gpu": "NVIDIA GeForce RTX 4060 Laptop GPU",
+    "gpu_count": 1,
+    "vram_mib": 8188,
+    "python": "3.12.3",
+    "torch": "2.13.0+cu130"
+  },
+  "checks": {
+    "dspark_pdmux_unit": {
+      "passed": 184,
+      "failed": 0,
+      "subtests_passed": 194,
+      "real_gloo_ranks": 2,
+      "log": "unit.log"
+    },
+    "cuda_regression": {
+      "passed": 39,
+      "failed": 0,
+      "skipped": 1,
+      "subtests_passed": 40,
+      "skip_reason": "Two distinct CUDA GPUs required for TP2 NCCL.",
+      "log": "cuda.log"
+    },
+    "hicache_dspark_extended": {
+      "passed": 36,
+      "failed": 0,
+      "skipped": 2,
+      "subtests_passed": 10,
+      "skip_reason": "The full-model TP2 acceptance methods require two GPUs and model weights.",
+      "log": "hicache-and-dspark.log"
+    },
+    "baseline_regression_detection": {
+      "distinct_regression_methods": 3,
+      "expected_failure_reports": 9,
+      "errors": 0,
+      "log": "baseline.log"
+    },
+    "ruff_0_15_1_format_and_F401_F821_UP037": "passed",
+    "python_ast_and_no_bare_pytest_main": "passed",
+    "git_diff_check": "passed",
+    "gpu_memory_after_tests_mib": 0
+  },
+  "test_fixture_repairs": [
+    "The CPU prefill fixture uses torch_native position computation; CUDA checks retain the production Triton path.",
+    "HiCache test prompts use deterministic token IDs below 20000, including the concurrent seed-200 cases.",
+    "Manual HiCache acceptance tests use sibling imports so the Python standard-library test package cannot shadow repository namespace imports."
+  ],
+  "cuda_test_scope": [
+    "Production DSpark prefill finalizer, MLA injector and DeepSeek-V4 multi-stage KV projection on alternating green-context prefill streams, interleaved with decode graph replays.",
+    "The synthetic KV store omits FlashMLA encoding; broadcast ownership is checked with spies in this fixture.",
+    "Separate existing tests exercise actual singleton NCCL lane operations, graph replay and DSpark Triton-vs-Torch parity."
+  ],
+  "source_sha256": {
+    "python/sglang/srt/arg_groups/validation_hook.py": "3d219951bf6a0075f82aa92449b2ba8ba29e141e1b4b748dabae94c6c80792be",
+    "python/sglang/srt/models/deepseek_v4.py": "61c5252f71b69b130b449fada5628439f8984754bf8c2e0c624409f7e7650d12",
+    "python/sglang/srt/models/deepseek_v4_dspark.py": "df712671f9a0302ad0fd8178054eb8271bb2aa74c7040ab851622dc7d02ddecf",
+    "python/sglang/srt/speculative/dspark_components/dspark_verify.py": "3a6f5240e8e76c98dc04b73acd5fee2d55585c8d4f5dcc283c016edd0a057f31",
+    "python/sglang/srt/speculative/dspark_components/dspark_worker_v2.py": "4d0b50afd39f439502d4cb3801dec50173ef503b4efb52e9f3ab488244f0553b",
+    "test/manual/pdmux/test_dsv4_pdmux_hicache_tp8.py": "a2253b10581e5d138b7a2ac67ef59f27f041b915df221e588b0398bcc5314658",
+    "test/manual/pdmux/test_pdmux_hicache.py": "37a44e7b811aaf3075a67468564f2e483059780fd40e3e22cce11c1b160562b7",
+    "test/registered/unit/multiplex/test_pdmux_standard_prefill.py": "7ea74a2375dd15afa81d1c9bbfd520d5264ab8a6802970be8f8b96b8c6a6ba15",
+    "test/registered/unit/multiplex/test_pdmux_sxf_port.py": "8233dec7cc97f8c93dff9135bd3969638f28daff63995bd950cfad203fb93f2b",
+    "test/registered/unit/multiplex/test_pdmux_tp_overlap.py": "cafcf5c92e155aa5499cdcf84f768579ec74a9a9cc8382c335887cae08de3cd4",
+    "test/registered/unit/spec/test_dspark_pdmux.py": "4055a1cd6ab17e6d0a56ff59b9b1076a2883f57f81a4cb15d172e86dc498135c",
+    "test/manual/pdmux/test_dspark_pdmux_cuda.py": "1bc8390b6517ec56f27922dbd6948d8e92e4c6c7bcf8adb394fb82b5e5cbeff2",
+    "test/manual/pdmux/test_dsv4_dspark_pdmux_hicache_tp2.py": "087e5500757336893a28be8e5cffcb0ded8006d938217ffa6c8031da3313db92"
+  },
+  "remote_source_hash_check": "passed: all 13 modified Python files match",
+  "remote_artifacts": "/workspace/dspark-pdmux-tp2-20261027/",
+  "limitations": [
+    "The single 4060 cannot validate two-GPU NCCL progress or full DeepSeek-V4 model execution.",
+    "No production throughput or latency benefit is asserted.",
+    "The original 4219-request long-prompt workload remains to be rerun on the deployment host; these tests do not prove all NCCL hangs are eliminated.",
+    "DP attention, EP>1, MoE-DP>1, attention-CP>1 and DCP>1 remain rejected for TP>1 CPU-overlap PDMux.",
+    "PDMux standard-prefill CPU overlap, temporal and decode-ready experiment restrictions are unchanged."
+  ]
+}

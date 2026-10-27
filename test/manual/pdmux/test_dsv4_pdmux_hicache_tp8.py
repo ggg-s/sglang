@@ -24,7 +24,7 @@ from __future__ import annotations
 
 import os
 import unittest
-from test.manual.pdmux.test_pdmux_hicache import (
+from test_pdmux_hicache import (
     SPLIT_FORWARD_TOKEN_BUDGET,
     PDMuxHiCacheMixin,
     sm_multiple,

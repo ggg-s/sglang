@@ -372,6 +372,8 @@ class TestPdmuxSxfPort(unittest.TestCase):
             "DSparkWorkerV2",
             ["_finalize_prefill"],
             SpecTpSyncSite=SimpleNamespace(DSPARK_TARGET="target"),
+            get_parallel=lambda: SimpleNamespace(enable_dp_attention=False),
+            get_tp_group=lambda: None,
         )["_finalize_prefill"]
         batch = SimpleNamespace(seq_lens=object())
         output = SimpleNamespace(
