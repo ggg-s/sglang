@@ -809,23 +809,21 @@ class SchedulerMultiplexMixin:
                 # HiCache of ack processing and host-lock release for the whole
                 # prefill, while doubling up desyncs the pump's collective
                 # all-reduces across TP ranks, which deadlocks rather than
-                # degrades. The pump's cache actions can free device KV
-                # segments and zero full-to-SWA mapping rows on this stream, so
-                # it needs the same dependency publication as batch formation
-                # -- decode allocates from that free list and the decode graph
-                # re-reads the mapping on replay.
+                # degrades. The in-flight pump runs on the decode stream:
+                # write-back/storage actions can read and replace allocator
+                # lists last written there. No D->P dependency exists while
+                # split kernels are in flight. P->D publication after the pump
+                # would not order those earlier reads and would drain prefill.
                 had_inflight_split = self.split_prefill_batch is not None
                 if wait_prefill_kernel_done or had_inflight_split:
                     self._hicache_pump_tick += 1
                     if self._hicache_pump_tick % self.HICACHE_PUMP_INTERVAL == 0:
-                        # Publish a dependency only when the pump reports it
-                        # may have enqueued device work (write_back frees,
-                        # storage-queue actions): an event recorded here lands
-                        # after the in-flight split segments and serializes
-                        # decode behind the whole prefill's completion, so a
-                        # host-only ack drain must not pay it.
-                        if self.check_hicache_events_if_enabled():
-                            formation_done = prefill_stream.record_event()
+                        # Match the standard lane: mutations follow earlier
+                        # decode work and precede this iteration's allocation.
+                        with torch.cuda.stream(decode_stream):
+                            set_pdmux_status(False)
+                            self.check_hicache_events_if_enabled()
+                        set_pdmux_status(True)
                 if not wait_prefill_kernel_done:
                     if not had_inflight_split:
                         # Includes the previous iteration's decode result writes.

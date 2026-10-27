@@ -20,6 +20,8 @@ from typing import TYPE_CHECKING, Protocol
 
 import torch
 
+from sglang.srt.mem_cache.allocator.stream_utils import record_index_stream
+
 if TYPE_CHECKING:
     from sglang.srt.mem_cache.memory_pool import KVCache
 
@@ -116,6 +118,7 @@ class BaseTokenToKVPoolAllocator(abc.ABC):
             return None
         if self.release_pages is None or len(self.release_pages) == 0:
             return self.free_pages
+        record_index_stream(self.free_pages, self.release_pages)
         return torch.cat((self.free_pages, self.release_pages))
 
     def free_group_begin(self):
@@ -125,15 +128,18 @@ class BaseTokenToKVPoolAllocator(abc.ABC):
     def free_group_end(self):
         pending, self.free_group = self.free_group, None
         if pending:
+            record_index_stream(*pending)
             self.free(torch.cat(pending))
 
     @staticmethod
     def _copy_for_free_group(free_index: torch.Tensor) -> torch.Tensor:
         """Take ownership before a caller can mutate a deferred tensor view."""
+        record_index_stream(free_index)
         return free_index.clone()
 
     def merge_and_sort_free(self):
         if len(self.release_pages) > 0:
+            record_index_stream(self.free_pages, self.release_pages)
             self.free_pages = torch.cat((self.free_pages, self.release_pages))
             self.free_pages, _ = torch.sort(self.free_pages)
             self.release_pages = torch.empty(

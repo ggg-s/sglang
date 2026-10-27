@@ -24,6 +24,7 @@ from sglang.kernels.ops.memory.allocator import (
     alloc_extend_kernel,
 )
 from sglang.srt.mem_cache.allocator.base import BaseTokenToKVPoolAllocator
+from sglang.srt.mem_cache.allocator.stream_utils import record_index_stream
 from sglang.srt.utils import (
     get_bool_env_var,
     get_num_new_pages,
@@ -148,6 +149,7 @@ class PagedTokenToKVPoolAllocator(BaseTokenToKVPoolAllocator):
         return (len(self.free_pages) + self.num_staged_pages) * self.page_size
 
     def get_all_free_pages(self):
+        record_index_stream(self.free_pages, *self.staged_pages)
         return torch.cat((self.free_pages, *self.staged_pages))
 
     def merge_and_sort_free(self):
@@ -170,6 +172,7 @@ class PagedTokenToKVPoolAllocator(BaseTokenToKVPoolAllocator):
         if num_pages > len(self.free_pages):
             return None
 
+        record_index_stream(self.free_pages)
         out_pages = self.free_pages[:num_pages]
         self.free_pages = self.free_pages[num_pages:]
 
@@ -203,6 +206,7 @@ class PagedTokenToKVPoolAllocator(BaseTokenToKVPoolAllocator):
             (extend_num_tokens,), dtype=torch.int64, device=self.device
         )
 
+        record_index_stream(prefix_lens, seq_lens, last_loc, self.free_pages)
         alloc_extend_kernel[(bs,)](
             prefix_lens,
             seq_lens,
@@ -244,6 +248,7 @@ class PagedTokenToKVPoolAllocator(BaseTokenToKVPoolAllocator):
             self.merge_and_sort_free()
 
         out_indices = torch.empty((bs,), dtype=torch.int64, device=self.device)
+        record_index_stream(seq_lens, last_loc, self.free_pages)
         alloc_decode_kernel[(bs,)](
             seq_lens,
             last_loc,
@@ -271,6 +276,7 @@ class PagedTokenToKVPoolAllocator(BaseTokenToKVPoolAllocator):
         if free_index.numel() == 0:
             return
 
+        record_index_stream(free_index)
         if self.free_group is None:
             self._release_page_ids(torch.unique(free_index // self.page_size))
         else:
@@ -287,6 +293,7 @@ class PagedTokenToKVPoolAllocator(BaseTokenToKVPoolAllocator):
 
         ps = self.page_size
         assert start_pos % ps == 0, f"segment start {start_pos} is not page-aligned"
+        record_index_stream(free_index)
         reps = free_index[::ps]
 
         if self.debug_mode:
@@ -319,6 +326,7 @@ class PagedTokenToKVPoolAllocator(BaseTokenToKVPoolAllocator):
             self.staged_pages.extend(page_ids)
             self.num_staged_pages += sum(ids.numel() for ids in page_ids)
         else:
+            record_index_stream(*page_ids, self.free_pages)
             self.free_pages = torch.cat((*page_ids, self.free_pages))
 
     def free_group_begin(self):
@@ -328,6 +336,7 @@ class PagedTokenToKVPoolAllocator(BaseTokenToKVPoolAllocator):
     def free_group_end(self):
         super().free_group_end()
         if self.free_page_ids_group:
+            record_index_stream(*self.free_page_ids_group)
             self._release_page_ids(torch.cat(self.free_page_ids_group))
             self.free_page_ids_group = []
         if self.debug_mode:

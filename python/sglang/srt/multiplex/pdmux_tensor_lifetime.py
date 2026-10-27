@@ -34,7 +34,9 @@ the containers listed in `iter_carried_tensors` are visited, one level each.
 Fields intentionally not visited, and why:
 
 - ``req_to_token_pool`` / ``token_to_kv_pool_allocator`` / ``tree_cache`` --
-  engine-lifetime pools, not per-batch state.
+  outside this per-batch traversal. Allocators separately register their
+  replaceable free-list/index tensors on each consuming CUDA stream; those
+  tensors do not inherit the allocator object's engine lifetime.
 - ``reqs`` and everything reachable from a ``Req`` -- request-lifetime; a
   request outlives the batch it is in and is never freed by the allocator on a
   lane boundary.

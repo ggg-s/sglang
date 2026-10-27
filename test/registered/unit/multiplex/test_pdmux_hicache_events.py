@@ -221,6 +221,43 @@ def _run_loop(*, max_iterations, query_results, pump_interval=1):
 
 
 class TestPDMuxHiCacheEvents(CustomTestCase):
+    def test_inflight_pump_mutations_follow_decode_allocator_writes(self):
+        for device_work in (False, True):
+            with self.subTest(device_work=device_work):
+                scheduler = _FakeScheduler(max_iterations=3, query_results=[False])
+                prefill, decode = _Stream([False]), _Stream([])
+                scheduler.stream_groups = [(prefill, decode)]
+                state = SimpleNamespace(stream=None, prefill=False)
+                observed = []
+
+                @contextlib.contextmanager
+                def stream_context(stream):
+                    previous, state.stream = state.stream, stream
+                    try:
+                        yield
+                    finally:
+                        state.stream = previous
+
+                def pump():
+                    observed.append((scheduler.iteration, state.stream, state.prefill))
+                    return device_work
+
+                scheduler.check_hicache_events_if_enabled = pump
+                with (
+                    _stubbed_cuda(),
+                    patch("torch.cuda.stream", stream_context),
+                    patch(
+                        "sglang.srt.multiplex.multiplexing_mixin.set_pdmux_status",
+                        lambda enabled: setattr(state, "prefill", enabled),
+                    ),
+                    self.assertRaises(_LoopFinished),
+                ):
+                    scheduler.event_loop_pdmux()
+                self.assertEqual(
+                    observed,
+                    [(0, prefill, True), (1, decode, False), (2, decode, False)],
+                )
+
     def test_spec_overlap_submits_next_decode_before_committing_previous(self):
         """DFlash must not drain N-1 before issuing N while a split is active.
 

@@ -26,6 +26,8 @@ from typing import Iterator, Optional
 
 import torch
 
+from sglang.srt.mem_cache.allocator.stream_utils import record_index_stream
+
 
 class MambaSlotAllocator:
     """Free-list of Mamba pool slot indices. Deliberately not a subclass of
@@ -59,6 +61,7 @@ class MambaSlotAllocator:
         if self._alloc_iter is not None:
             remaining = list(self._alloc_iter)
             if remaining:
+                record_index_stream(*remaining)
                 self.free(torch.cat(remaining))
         self._alloc_iter = None
 
@@ -72,6 +75,7 @@ class MambaSlotAllocator:
     def _do_alloc(self, need_size: int) -> Optional[torch.Tensor]:
         if need_size > len(self.free_slots):
             return None
+        record_index_stream(self.free_slots)
         select_index = self.free_slots[:need_size]
         self.free_slots = self.free_slots[need_size:]
         return select_index
@@ -79,6 +83,7 @@ class MambaSlotAllocator:
     def free(self, free_index: torch.Tensor):
         if free_index.numel() == 0:
             return
+        record_index_stream(self.free_slots, free_index)
         self.free_slots = torch.cat((self.free_slots, free_index))
 
     def clear(self):

@@ -1,0 +1,107 @@
+{
+  "date": "2026-10-27",
+  "branch": "codex/pdmux-tp-cpu-overlap",
+  "parent_commit": "fbac96fa419963cee0a4d52f053b1f2cdbd53beb",
+  "reported_failure_commit": "657c717729",
+  "reported_workload": {
+    "requests": 4219,
+    "chunked_prefill_size": 16384,
+    "failure_request_counts_approx": [
+      96,
+      331
+    ],
+    "logs_available": false
+  },
+  "original_nccl_deadlock_status": "Unverified: neither reproduced nor established resolved on the deployment workload.",
+  "reproduced_defect": "A free-list tensor created on one CUDA stream can be read on the other and recycled on the original stream after the allocator replaces it. The allocator object lifetime does not protect the previous tensor storage.",
+  "initial_probe": {
+    "trials": 4,
+    "corrupt_trials_before_fix": 3,
+    "corrupt_trials_after_fix": 0,
+    "synthetic_poison_page_id": 1000000,
+    "page_size": 16,
+    "corrupt_slot_range": [
+      16000000,
+      16000015
+    ],
+    "valid_slot_upper_bound_exclusive": 32784
+  },
+  "fixes": [
+    "Register consuming streams before reading paged/token free lists, Mamba slot lists, allocation metadata and deferred free-group inputs.",
+    "Run in-flight layer-split HiCache pumping on the decode stream so allocator mutations follow previous decode work and precede this iteration allocation.",
+    "Preserve the existing data-ready events, batch-formation pump placement and rank-uniform pump cadence."
+  ],
+  "environment": {
+    "gpu": "NVIDIA GeForce RTX 4060 Laptop GPU",
+    "gpu_count": 1,
+    "python": "3.12.3",
+    "torch": "2.13.0+cu130"
+  },
+  "checks": {
+    "baseline_allocator_cuda": {
+      "failed_as_expected": 16,
+      "passed": 0,
+      "errors": 0,
+      "source_commit": "657c717729",
+      "log": "baseline-cuda.log"
+    },
+    "baseline_pump_ordering": {
+      "failed_subtests_as_expected": 2,
+      "errors": 0,
+      "source_commit": "657c717729",
+      "log": "baseline-pump.log"
+    },
+    "fixed_allocator_cuda": {
+      "passed": 16,
+      "failed": 0,
+      "included_in_final_cuda_suite": true,
+      "log": "cuda-lifetime.log"
+    },
+    "final_cpu_gloo_regression": {
+      "passed": 227,
+      "failed": 0,
+      "subtests_passed": 196,
+      "real_gloo_ranks": 2,
+      "log": "unit.log"
+    },
+    "final_cuda_regression": {
+      "passed": 55,
+      "failed": 0,
+      "skipped": 1,
+      "subtests_passed": 40,
+      "skip_reason": "The TP2 NCCL test requires two distinct CUDA GPUs.",
+      "log": "cuda-final.log"
+    },
+    "ruff_0_15_1_format_and_F401_F821_UP037": "passed",
+    "python_ast_and_no_bare_pytest_main": "passed",
+    "git_diff_check": "passed",
+    "gpu_memory_after_tests_mib": 0
+  },
+  "cuda_test_scope": [
+    "Production paged allocation kernels and native guarded KV store.",
+    "Token and Mamba slot free-list replacement and state-slot advanced indexing.",
+    "16384-token synthetic chunks; plain/green-context streams in both directions; immediate and sorted release.",
+    "PDMux graph/stream checks, singleton NCCL and DSpark kernel parity regression."
+  ],
+  "source_sha256": {
+    "python/sglang/srt/mem_cache/allocator/base.py": "602dc6c4b22852a4384b7eb35f236e2bb1020831388bc8dfba599116ed5abfdb",
+    "python/sglang/srt/mem_cache/allocator/mamba.py": "b9d38e3d9e9fde2178edd69a039204681fac5e2bc12e8845ca6350f517586c3d",
+    "python/sglang/srt/mem_cache/allocator/paged.py": "189122d89aa2a8276890978d9630a5793d3e315a669c5a721580e2232bacba2b",
+    "python/sglang/srt/mem_cache/allocator/stream_utils.py": "f8655cd7b40597b6ff12430d18b153a4bd278e789692625bbee08fbcfa597c13",
+    "python/sglang/srt/mem_cache/allocator/token.py": "48af30c2c3f758e398ec5a83f51047440355eebcccc2304bfd01c0eedcd34493",
+    "python/sglang/srt/multiplex/multiplexing_mixin.py": "503ed2b93fae7325fff135e6540d2f1b027edb7c645fe4dbe4faad35c8c95a13",
+    "python/sglang/srt/multiplex/pdmux_tensor_lifetime.py": "d6e69f7a0f21e77d2c3256f4729c91da123bbbdf29bc9201878015140e84eb73",
+    "test/manual/pdmux/test_pdmux_allocator_lifetime_cuda.py": "767d5ef96fbe601d8264605f903ba33f29f4896bca870209a843cd7f963d58d1",
+    "test/registered/unit/multiplex/test_pdmux_hicache_events.py": "cf4f31a9f7faab0e1bdb6b8835c083d6886ee50e7e4d7d0448d18e71238505e6"
+  },
+  "remote_source_hash_check": "passed: all 9 modified Python files match",
+  "remote_artifacts": "/workspace/pdmux-index-lifetime-20261027/",
+  "limitations": [
+    "No full SWE replay or model execution matching the reported crash was performed.",
+    "No two-GPU NCCL progress test was possible on the single 4060.",
+    "No original GDN prepare_chunk_indices stack was recovered; an asynchronous error surfacing there does not identify the first failing kernel.",
+    "No assertion is made that all allocator implementations or every metadata race are fixed.",
+    "Production throughput and latency must be remeasured."
+  ],
+  "deployment_acceptance": "Two independent fresh launches completing the original frozen 4219-request workload at chunk size 16384 without CUDA asserts, exceptions, watchdog termination or collective timeouts, plus output correctness checks."
+}

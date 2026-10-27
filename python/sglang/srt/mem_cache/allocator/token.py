@@ -20,6 +20,7 @@ from typing import TYPE_CHECKING
 import torch
 
 from sglang.srt.mem_cache.allocator.base import BaseTokenToKVPoolAllocator
+from sglang.srt.mem_cache.allocator.stream_utils import record_index_stream
 
 if TYPE_CHECKING:
     from sglang.srt.mem_cache.memory_pool import KVCache
@@ -58,6 +59,7 @@ class TokenToKVPoolAllocator(BaseTokenToKVPoolAllocator):
         if need_size > len(self.free_pages):
             return None
 
+        record_index_stream(self.free_pages)
         select_index = self.free_pages[:need_size]
         self.free_pages = self.free_pages[need_size:]
         return select_index
@@ -68,8 +70,10 @@ class TokenToKVPoolAllocator(BaseTokenToKVPoolAllocator):
 
         if self.free_group is None:
             if self.need_sort:
+                record_index_stream(self.release_pages, free_index)
                 self.release_pages = torch.cat((self.release_pages, free_index))
             else:
+                record_index_stream(self.free_pages, free_index)
                 self.free_pages = torch.cat((self.free_pages, free_index))
         else:
             self.free_group.append(self._copy_for_free_group(free_index))
