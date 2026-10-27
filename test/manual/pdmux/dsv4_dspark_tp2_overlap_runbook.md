@@ -148,6 +148,13 @@ acceptance run above and the original long-prompt workload.
 
 ## 4060 regression coverage
 
+The PCP/decode-TP adaptation was pulled over SSH and validated on 2026-10-27:
+82 compatibility unit tests passed, and the related CUDA suite had 19 passes
+and one two-GPU skip. See
+`dsv4_dspark_pcp_decode_tp_performance_20261027.md` for the performance audit and
+`dsv4_dspark_pcp_decode_tp_validation_20261027.json` for raw CP2/CP4 benchmark
+samples, exact commands, tested source commit and test outputs.
+
 The 4060 is a single 8-GiB SM89 GPU and cannot load the full target model or
 exercise two-GPU NCCL. GPU checks use synthetic tensors with the production
 DSpark finalizer, MLA injector and multi-stage KV projection on alternating

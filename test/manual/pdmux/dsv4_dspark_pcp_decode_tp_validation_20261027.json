@@ -1,0 +1,1571 @@
+{
+  "date": "2026-10-27",
+  "branch": "codex/pdmux-tp-cpu-overlap",
+  "tested_source_commit": "ab9ba6ed7360383c8d5fc6ae1ab20712fb47155c",
+  "remote_checkout": "/workspace/cp-decode-review-20261027/repo",
+  "remote_artifacts": "/workspace/cp-decode-review-20261027",
+  "environment": {
+    "gpu": "NVIDIA GeForce RTX 4060 Laptop GPU",
+    "gpu_count": 1,
+    "vram_mib": 8188,
+    "driver": "592.82",
+    "compute_capability": [
+      8,
+      9
+    ],
+    "torch": "2.13.0+cu130",
+    "cuda": "13.0",
+    "python": "3.12.3",
+    "venv": "/workspace/mixed-adapt-20261025/venv",
+    "env": {
+      "PATH": "/workspace/mixed-adapt-20261025/venv/bin:$PATH",
+      "PYTHONPATH": "<checkout>/python:<checkout>/test/registered/unit/multiplex",
+      "SGLANG_SKIP_SGL_KERNEL_VERSION_CHECK": "1"
+    }
+  },
+  "checks": {
+    "compatibility_unit_suite": {
+      "passed": 82,
+      "failed": 0,
+      "skipped": 0,
+      "includes": [
+        "10 decode-attention-TP view tests including actual CUDA graph replay",
+        "Real two-process Gloo lane tests",
+        "Server-argument restrictions, CP padding and continuation, ForwardFlags and DP buffer lane isolation"
+      ],
+      "command": "GLOO_SOCKET_IFNAME=lo python -m unittest test_pdmux_cp_decode_attn_tp test_pdmux_prefill_cp test_pdmux_tp_overlap test_pdmux_sxf_port test_pdmux_collective_safety test_pdmux_main_compat test_pdmux_decode_ready test_pdmux_temporal",
+      "output": "..................................................................................\n----------------------------------------------------------------------\nRan 82 tests in 6.239s\n\nOK\n"
+    },
+    "related_cuda_regressions": {
+      "passed": 19,
+      "failed": 0,
+      "skipped": 1,
+      "skip_reason": "Two distinct GPUs required for TP2 NCCL",
+      "command": "python -m pytest --tb=short -q test/manual/pdmux/test_pdmux_tp_overlap_cuda.py test/manual/pdmux/test_dspark_pdmux_cuda.py test/manual/pdmux/test_pdmux_allocator_lifetime_cuda.py",
+      "output": ".s..................                                                     [100%]\n=============================== warnings summary ===============================\n../../conditional-graph-20261019/venv/lib/python3.12/site-packages/_pytest/config/__init__.py:1464\n  /workspace/conditional-graph-20261019/venv/lib/python3.12/site-packages/_pytest/config/__init__.py:1464: PytestConfigWarning: Unknown config option: asyncio_mode\n  \n    self._warn_or_fail_if_strict(f\"Unknown config option: {key}\\n\")\n\n../../mixed-adapt-20261025/venv/lib/python3.12/site-packages/torch/jit/_script.py:365: 14 warnings\n  /workspace/mixed-adapt-20261025/venv/lib/python3.12/site-packages/torch/jit/_script.py:365: DeprecationWarning: `torch.jit.script_method` is deprecated. Please switch to `torch.compile` or `torch.export`.\n    warnings.warn(\n\n-- Docs: https://docs.pytest.org/en/stable/how-to/capture-warnings.html\n19 passed, 1 skipped, 15 warnings in 17.08s\n"
+    },
+    "initial_environment_failure": {
+      "cause": "The venv bin directory was absent from PATH; 12 paged KV-store cases could not launch ninja. That failing combined process also aborted during CUDA cleanup.",
+      "resolution": "Put the existing venv bin directory on PATH, rerun the allocator file (16 passed, exit 0) and then the combined CUDA suite (19 passed, 1 skipped, exit 0). No allocator source changes."
+    }
+  },
+  "source_sha256": {
+    "python/sglang/srt/arg_groups/validation_hook.py": "0cf48878f2216424a0e50063a6255a33dbcb2ee6ec89dfde4cccf1f5b41d30fc",
+    "python/sglang/srt/distributed/parallel_state.py": "ab701507c413da782531ce5f0497b24db336adf5150e92dd9549a81618f1dfb9",
+    "python/sglang/srt/runtime_context.py": "63d8d2f48de9f48e5d966dc7966b473d96cb7da052bdf1992cba879002572a26",
+    "python/sglang/srt/layers/dp_attention.py": "24c87d1b6719d7a217dc9a606079f5f2eb92ad8f96aa9ab219ca864f9b9a3e64",
+    "python/sglang/srt/layers/cp/cp_decode_attn_tp.py": "52925619d29a4c78673bd6fd6f80b2fd53e9a20dc8e159b476df954e7b2c8e10",
+    "python/sglang/srt/model_executor/model_runner.py": "cc99e9d655a8af1d8d17b34e8f8196eaa9d8c2c90f81a09f656ca7b276d99cbc",
+    "python/sglang/srt/models/deepseek_v4.py": "30ccd287efea915c1da39576effe3e0a8d848ee45f040cc18cc49193143580fc",
+    "python/sglang/srt/models/deepseek_v4_dspark.py": "e0f6972f27ad3f3c0edb88c8b929187563b5fba81860c43bc15c7e406240cd0a",
+    "test/registered/unit/multiplex/test_pdmux_cp_decode_attn_tp.py": "4411fc0fd5919c5a739e1ab1754b6bcb57f591e974a13bd6577593bd107ce610",
+    "test/manual/pdmux/bench_cp_decode_tp_overhead.py": "4a67603b098155263b0ac958a6e0ff80bd0956272efcd799994e077e8fed71f6"
+  },
+  "benchmark_command": "python test/manual/pdmux/bench_cp_decode_tp_overhead.py --cp-size <2|4> --iterations 60 --repeats 7 --output <output.json>",
+  "benchmark_results": {
+    "cp2": {
+      "source_commit": "ab9ba6ed7360383c8d5fc6ae1ab20712fb47155c",
+      "torch": "2.13.0+cu130",
+      "cuda": "13.0",
+      "gpu": "NVIDIA GeForce RTX 4060 Laptop GPU",
+      "compute_capability": [
+        8,
+        9
+      ],
+      "sm_count": 24,
+      "scope": "synthetic projection/scope overhead; no full-model performance claim",
+      "cp_size": 2,
+      "dimensions": {
+        "heads": 64,
+        "head_dim": 512,
+        "q_rank": 1024,
+        "groups": 8,
+        "o_rank": 1024,
+        "hidden": 4096,
+        "dtype": "bfloat16"
+      },
+      "runtime_dispatch": {
+        "forward_original_direct": {
+          "median_us": 0.0240066,
+          "samples_us": [
+            0.0236264,
+            0.023527,
+            0.0242724,
+            0.024075399999999997,
+            0.0240066,
+            0.024187999999999998,
+            0.0235704
+          ]
+        },
+        "forward_pdmux_decode": {
+          "median_us": 0.2662078,
+          "samples_us": [
+            0.2636874,
+            0.2662078,
+            0.2566912,
+            0.26378039999999997,
+            0.2810614,
+            0.2779778,
+            0.27619580000000005
+          ]
+        },
+        "dp_original_direct": {
+          "median_us": 0.021803,
+          "samples_us": [
+            0.0211358,
+            0.021053799999999998,
+            0.021803,
+            0.0220942,
+            0.0224976,
+            0.0216424,
+            0.022068400000000002
+          ]
+        },
+        "dp_pdmux_decode": {
+          "median_us": 0.11237739999999999,
+          "samples_us": [
+            0.11237739999999999,
+            0.1133444,
+            0.1118814,
+            0.1151828,
+            0.1117728,
+            0.1166862,
+            0.10832800000000001
+          ]
+        },
+        "forward_pdmux_prefill": {
+          "median_us": 0.2531684,
+          "samples_us": [
+            0.2718474,
+            0.26137900000000003,
+            0.2500856,
+            0.250029,
+            0.25517259999999997,
+            0.2531684,
+            0.2511812
+          ]
+        },
+        "cp_cached_metadata_prepare": {
+          "median_us": 2.6242015999999997,
+          "samples_us": [
+            2.6973702,
+            2.6484948,
+            2.7758478,
+            2.6242015999999997,
+            2.5230616,
+            2.4943434,
+            2.4859496
+          ]
+        },
+        "cp_physical_length_setter_only": {
+          "median_us": 0.2586908,
+          "samples_us": [
+            0.27277280000000004,
+            0.2571474,
+            0.2586908,
+            0.2636918,
+            0.2623096,
+            0.2438418,
+            0.2527296
+          ]
+        }
+      },
+      "cold": {
+        "legacy": {
+          "wall_us": 11077.358,
+          "added_cuda_bytes": 33554432
+        },
+        "persistent_view": {
+          "wall_us": 660.599,
+          "added_cuda_bytes": 33554432
+        }
+      },
+      "host_scope": {
+        "legacy": {
+          "median_us": 29.8254312,
+          "samples_us": [
+            30.278453600000002,
+            29.541176800000002,
+            29.4103346,
+            29.8254312,
+            29.9163436,
+            29.763839,
+            29.8557558
+          ],
+          "steady_cuda_bytes_delta": 0
+        },
+        "persistent_view": {
+          "median_us": 0.9146810000000001,
+          "samples_us": [
+            0.9056332,
+            0.9027904,
+            0.9183216,
+            0.9188618000000001,
+            0.9146810000000001,
+            0.9091372,
+            0.9476359999999999
+          ],
+          "steady_cuda_bytes_delta": 0
+        }
+      },
+      "projection": {
+        "1": {
+          "median": {
+            "legacy": {
+              "eager": {
+                "wall_us": 415.9644333333334,
+                "gpu_timeline_us": 413.47999572753906
+              },
+              "graph": {
+                "wall_us": 410.06663333333336,
+                "gpu_timeline_us": 408.678404490153
+              }
+            },
+            "persistent_view": {
+              "eager": {
+                "wall_us": 414.98611666666665,
+                "gpu_timeline_us": 413.64161173502606
+              },
+              "graph": {
+                "wall_us": 409.87485,
+                "gpu_timeline_us": 408.6570739746094
+              }
+            }
+          },
+          "samples": {
+            "legacy": {
+              "eager": [
+                {
+                  "wall_us": 416.8321833333334,
+                  "gpu_timeline_us": 413.25867970784503
+                },
+                {
+                  "wall_us": 415.43559999999997,
+                  "gpu_timeline_us": 414.8314793904622
+                },
+                {
+                  "wall_us": 416.10134999999997,
+                  "gpu_timeline_us": 414.91626103719074
+                },
+                {
+                  "wall_us": 416.23906666666664,
+                  "gpu_timeline_us": 413.1338755289714
+                },
+                {
+                  "wall_us": 415.9644333333334,
+                  "gpu_timeline_us": 414.5423889160156
+                },
+                {
+                  "wall_us": 414.97785,
+                  "gpu_timeline_us": 413.47999572753906
+                },
+                {
+                  "wall_us": 415.00803333333334,
+                  "gpu_timeline_us": 413.28372955322266
+                }
+              ],
+              "graph": [
+                {
+                  "wall_us": 409.81034999999997,
+                  "gpu_timeline_us": 409.36107635498047
+                },
+                {
+                  "wall_us": 410.14245,
+                  "gpu_timeline_us": 409.0367952982585
+                },
+                {
+                  "wall_us": 410.06663333333336,
+                  "gpu_timeline_us": 409.25865173339844
+                },
+                {
+                  "wall_us": 411.80879999999996,
+                  "gpu_timeline_us": 408.678404490153
+                },
+                {
+                  "wall_us": 410.76529999999997,
+                  "gpu_timeline_us": 408.43947728474933
+                },
+                {
+                  "wall_us": 409.6668833333334,
+                  "gpu_timeline_us": 408.5930824279785
+                },
+                {
+                  "wall_us": 409.16855,
+                  "gpu_timeline_us": 408.57601165771484
+                }
+              ]
+            },
+            "persistent_view": {
+              "eager": [
+                {
+                  "wall_us": 416.0088333333333,
+                  "gpu_timeline_us": 413.64161173502606
+                },
+                {
+                  "wall_us": 414.98611666666665,
+                  "gpu_timeline_us": 413.8671875
+                },
+                {
+                  "wall_us": 415.0949166666667,
+                  "gpu_timeline_us": 414.48694864908856
+                },
+                {
+                  "wall_us": 415.89756666666665,
+                  "gpu_timeline_us": 413.27571868896484
+                },
+                {
+                  "wall_us": 414.05738333333335,
+                  "gpu_timeline_us": 412.87145614624023
+                },
+                {
+                  "wall_us": 413.2534,
+                  "gpu_timeline_us": 412.94240951538086
+                },
+                {
+                  "wall_us": 414.00561666666664,
+                  "gpu_timeline_us": 413.6869430541992
+                }
+              ],
+              "graph": [
+                {
+                  "wall_us": 410.3097666666667,
+                  "gpu_timeline_us": 408.9856147766113
+                },
+                {
+                  "wall_us": 409.96683333333334,
+                  "gpu_timeline_us": 409.0197245279948
+                },
+                {
+                  "wall_us": 409.87485,
+                  "gpu_timeline_us": 408.71254603068036
+                },
+                {
+                  "wall_us": 409.27068333333335,
+                  "gpu_timeline_us": 408.45387776692706
+                },
+                {
+                  "wall_us": 409.84481666666665,
+                  "gpu_timeline_us": 408.4735870361328
+                },
+                {
+                  "wall_us": 410.89885,
+                  "gpu_timeline_us": 408.5589408874512
+                },
+                {
+                  "wall_us": 409.66459999999995,
+                  "gpu_timeline_us": 408.6570739746094
+                }
+              ]
+            }
+          }
+        },
+        "8": {
+          "median": {
+            "legacy": {
+              "eager": {
+                "wall_us": 441.20376666666664,
+                "gpu_timeline_us": 439.5962715148926
+              },
+              "graph": {
+                "wall_us": 433.4110166666667,
+                "gpu_timeline_us": 432.5669288635254
+              }
+            },
+            "persistent_view": {
+              "eager": {
+                "wall_us": 438.1660166666667,
+                "gpu_timeline_us": 437.6175880432129
+              },
+              "graph": {
+                "wall_us": 431.9354666666667,
+                "gpu_timeline_us": 431.05281194051105
+              }
+            }
+          },
+          "samples": {
+            "legacy": {
+              "eager": [
+                {
+                  "wall_us": 441.20376666666664,
+                  "gpu_timeline_us": 439.4757270812988
+                },
+                {
+                  "wall_us": 441.0380666666666,
+                  "gpu_timeline_us": 439.5962715148926
+                },
+                {
+                  "wall_us": 442.6098,
+                  "gpu_timeline_us": 441.98665618896484
+                },
+                {
+                  "wall_us": 439.78615,
+                  "gpu_timeline_us": 439.407475789388
+                },
+                {
+                  "wall_us": 441.90245,
+                  "gpu_timeline_us": 441.62880579630536
+                },
+                {
+                  "wall_us": 439.58726666666666,
+                  "gpu_timeline_us": 439.19518788655597
+                },
+                {
+                  "wall_us": 441.28801666666664,
+                  "gpu_timeline_us": 439.78614807128906
+                }
+              ],
+              "graph": [
+                {
+                  "wall_us": 434.2239,
+                  "gpu_timeline_us": 432.24747975667316
+                },
+                {
+                  "wall_us": 432.74123333333335,
+                  "gpu_timeline_us": 431.63305918375653
+                },
+                {
+                  "wall_us": 433.20278333333334,
+                  "gpu_timeline_us": 432.7594757080078
+                },
+                {
+                  "wall_us": 433.3204,
+                  "gpu_timeline_us": 432.5669288635254
+                },
+                {
+                  "wall_us": 433.4110166666667,
+                  "gpu_timeline_us": 432.9642613728841
+                },
+                {
+                  "wall_us": 434.3292333333333,
+                  "gpu_timeline_us": 433.62986246744794
+                },
+                {
+                  "wall_us": 435.00713333333334,
+                  "gpu_timeline_us": 432.3840141296387
+                }
+              ]
+            },
+            "persistent_view": {
+              "eager": [
+                {
+                  "wall_us": 438.95533333333333,
+                  "gpu_timeline_us": 436.7530822753906
+                },
+                {
+                  "wall_us": 438.1660166666667,
+                  "gpu_timeline_us": 437.6175880432129
+                },
+                {
+                  "wall_us": 438.29265000000004,
+                  "gpu_timeline_us": 437.5952084859212
+                },
+                {
+                  "wall_us": 438.0353,
+                  "gpu_timeline_us": 437.62346903483075
+                },
+                {
+                  "wall_us": 438.1591666666667,
+                  "gpu_timeline_us": 437.89974848429364
+                },
+                {
+                  "wall_us": 437.85956666666664,
+                  "gpu_timeline_us": 437.04694112141925
+                },
+                {
+                  "wall_us": 439.03198333333336,
+                  "gpu_timeline_us": 437.7872149149577
+                }
+              ],
+              "graph": [
+                {
+                  "wall_us": 433.11215000000004,
+                  "gpu_timeline_us": 431.46241505940753
+                },
+                {
+                  "wall_us": 431.82155,
+                  "gpu_timeline_us": 430.6405385335286
+                },
+                {
+                  "wall_us": 431.9354666666667,
+                  "gpu_timeline_us": 430.83092371622723
+                },
+                {
+                  "wall_us": 431.89206666666666,
+                  "gpu_timeline_us": 431.1039924621582
+                },
+                {
+                  "wall_us": 432.31875,
+                  "gpu_timeline_us": 431.05281194051105
+                },
+                {
+                  "wall_us": 431.61445000000003,
+                  "gpu_timeline_us": 431.1552047729492
+                },
+                {
+                  "wall_us": 431.94875,
+                  "gpu_timeline_us": 430.7248115539551
+                }
+              ]
+            }
+          }
+        },
+        "32": {
+          "median": {
+            "legacy": {
+              "eager": {
+                "wall_us": 466.46761666666663,
+                "gpu_timeline_us": 464.8720105489095
+              },
+              "graph": {
+                "wall_us": 458.3096,
+                "gpu_timeline_us": 457.25011825561523
+              }
+            },
+            "persistent_view": {
+              "eager": {
+                "wall_us": 465.9628,
+                "gpu_timeline_us": 464.19680913289386
+              },
+              "graph": {
+                "wall_us": 458.12086666666664,
+                "gpu_timeline_us": 456.9258689880371
+              }
+            }
+          },
+          "samples": {
+            "legacy": {
+              "eager": [
+                {
+                  "wall_us": 464.1498833333334,
+                  "gpu_timeline_us": 463.81012598673504
+                },
+                {
+                  "wall_us": 469.0740333333333,
+                  "gpu_timeline_us": 467.4960136413574
+                },
+                {
+                  "wall_us": 466.7051666666667,
+                  "gpu_timeline_us": 465.50881067911786
+                },
+                {
+                  "wall_us": 467.2455833333333,
+                  "gpu_timeline_us": 465.4490788777669
+                },
+                {
+                  "wall_us": 466.46761666666663,
+                  "gpu_timeline_us": 464.51412836710614
+                },
+                {
+                  "wall_us": 465.3046,
+                  "gpu_timeline_us": 464.8720105489095
+                },
+                {
+                  "wall_us": 466.2651666666667,
+                  "gpu_timeline_us": 464.7989273071289
+                }
+              ],
+              "graph": [
+                {
+                  "wall_us": 458.18129999999996,
+                  "gpu_timeline_us": 457.2133382161458
+                },
+                {
+                  "wall_us": 458.3452833333333,
+                  "gpu_timeline_us": 457.0111910502116
+                },
+                {
+                  "wall_us": 458.3096,
+                  "gpu_timeline_us": 457.3184013366699
+                },
+                {
+                  "wall_us": 458.1031666666667,
+                  "gpu_timeline_us": 457.3184013366699
+                },
+                {
+                  "wall_us": 458.63995,
+                  "gpu_timeline_us": 457.3322614034017
+                },
+                {
+                  "wall_us": 457.7786666666667,
+                  "gpu_timeline_us": 457.0586522420247
+                },
+                {
+                  "wall_us": 460.0097666666667,
+                  "gpu_timeline_us": 457.25011825561523
+                }
+              ]
+            },
+            "persistent_view": {
+              "eager": [
+                {
+                  "wall_us": 468.26135,
+                  "gpu_timeline_us": 466.4517402648926
+                },
+                {
+                  "wall_us": 465.30375,
+                  "gpu_timeline_us": 463.3717219034831
+                },
+                {
+                  "wall_us": 467.3914666666667,
+                  "gpu_timeline_us": 465.67039489746094
+                },
+                {
+                  "wall_us": 464.7800833333333,
+                  "gpu_timeline_us": 464.19680913289386
+                },
+                {
+                  "wall_us": 469.5161166666666,
+                  "gpu_timeline_us": 468.18186442057294
+                },
+                {
+                  "wall_us": 465.9628,
+                  "gpu_timeline_us": 463.0773226420085
+                },
+                {
+                  "wall_us": 465.94135,
+                  "gpu_timeline_us": 463.4661356608073
+                }
+              ],
+              "graph": [
+                {
+                  "wall_us": 458.97985,
+                  "gpu_timeline_us": 456.97491963704425
+                },
+                {
+                  "wall_us": 458.15978333333334,
+                  "gpu_timeline_us": 456.9258689880371
+                },
+                {
+                  "wall_us": 457.54335,
+                  "gpu_timeline_us": 457.04479217529297
+                },
+                {
+                  "wall_us": 458.3,
+                  "gpu_timeline_us": 457.4207941691081
+                },
+                {
+                  "wall_us": 458.12086666666664,
+                  "gpu_timeline_us": 456.75201416015625
+                },
+                {
+                  "wall_us": 457.4277833333333,
+                  "gpu_timeline_us": 456.82347615559894
+                },
+                {
+                  "wall_us": 458.0878,
+                  "gpu_timeline_us": 456.83733622233075
+                }
+              ]
+            }
+          }
+        },
+        "128": {
+          "median": {
+            "legacy": {
+              "eager": {
+                "wall_us": 578.1206999999999,
+                "gpu_timeline_us": 577.135976155599
+              },
+              "graph": {
+                "wall_us": 574.096,
+                "gpu_timeline_us": 572.6037343343099
+              }
+            },
+            "persistent_view": {
+              "eager": {
+                "wall_us": 579.7448333333334,
+                "gpu_timeline_us": 578.1136194864908
+              },
+              "graph": {
+                "wall_us": 573.70395,
+                "gpu_timeline_us": 571.9722747802734
+              }
+            }
+          },
+          "samples": {
+            "legacy": {
+              "eager": [
+                {
+                  "wall_us": 538.79335,
+                  "gpu_timeline_us": 538.1018956502279
+                },
+                {
+                  "wall_us": 576.2901833333334,
+                  "gpu_timeline_us": 573.4885533650717
+                },
+                {
+                  "wall_us": 580.6592833333333,
+                  "gpu_timeline_us": 578.0618667602539
+                },
+                {
+                  "wall_us": 578.1206999999999,
+                  "gpu_timeline_us": 576.4015833536783
+                },
+                {
+                  "wall_us": 577.5328499999999,
+                  "gpu_timeline_us": 577.135976155599
+                },
+                {
+                  "wall_us": 579.79975,
+                  "gpu_timeline_us": 578.326416015625
+                },
+                {
+                  "wall_us": 583.5819833333333,
+                  "gpu_timeline_us": 583.2602818806967
+                }
+              ],
+              "graph": [
+                {
+                  "wall_us": 559.94975,
+                  "gpu_timeline_us": 558.2666397094727
+                },
+                {
+                  "wall_us": 573.4827166666666,
+                  "gpu_timeline_us": 572.4159876505533
+                },
+                {
+                  "wall_us": 574.096,
+                  "gpu_timeline_us": 572.8938420613607
+                },
+                {
+                  "wall_us": 573.3984833333333,
+                  "gpu_timeline_us": 571.1210886637369
+                },
+                {
+                  "wall_us": 574.4457,
+                  "gpu_timeline_us": 572.8421529134115
+                },
+                {
+                  "wall_us": 575.0523333333334,
+                  "gpu_timeline_us": 572.6037343343099
+                },
+                {
+                  "wall_us": 590.3073833333333,
+                  "gpu_timeline_us": 589.3632253011068
+                }
+              ]
+            },
+            "persistent_view": {
+              "eager": [
+                {
+                  "wall_us": 587.5775333333333,
+                  "gpu_timeline_us": 586.1855824788412
+                },
+                {
+                  "wall_us": 579.7448333333334,
+                  "gpu_timeline_us": 576.475715637207
+                },
+                {
+                  "wall_us": 579.1623666666667,
+                  "gpu_timeline_us": 577.7530670166016
+                },
+                {
+                  "wall_us": 578.8618,
+                  "gpu_timeline_us": 577.4560292561849
+                },
+                {
+                  "wall_us": 578.4888333333333,
+                  "gpu_timeline_us": 578.1136194864908
+                },
+                {
+                  "wall_us": 580.02305,
+                  "gpu_timeline_us": 579.042116800944
+                },
+                {
+                  "wall_us": 594.3390833333334,
+                  "gpu_timeline_us": 592.8138732910156
+                }
+              ],
+              "graph": [
+                {
+                  "wall_us": 578.4912166666667,
+                  "gpu_timeline_us": 577.4981180826823
+                },
+                {
+                  "wall_us": 572.9602666666667,
+                  "gpu_timeline_us": 571.1845397949219
+                },
+                {
+                  "wall_us": 572.9825999999999,
+                  "gpu_timeline_us": 571.784528096517
+                },
+                {
+                  "wall_us": 576.0093333333334,
+                  "gpu_timeline_us": 571.9722747802734
+                },
+                {
+                  "wall_us": 573.70395,
+                  "gpu_timeline_us": 572.2282409667969
+                },
+                {
+                  "wall_us": 571.2057666666667,
+                  "gpu_timeline_us": 570.6218719482422
+                },
+                {
+                  "wall_us": 591.1616333333333,
+                  "gpu_timeline_us": 590.2138392130533
+                }
+              ]
+            }
+          }
+        }
+      }
+    },
+    "cp4": {
+      "source_commit": "ab9ba6ed7360383c8d5fc6ae1ab20712fb47155c",
+      "torch": "2.13.0+cu130",
+      "cuda": "13.0",
+      "gpu": "NVIDIA GeForce RTX 4060 Laptop GPU",
+      "compute_capability": [
+        8,
+        9
+      ],
+      "sm_count": 24,
+      "scope": "synthetic projection/scope overhead; no full-model performance claim",
+      "cp_size": 4,
+      "dimensions": {
+        "heads": 64,
+        "head_dim": 512,
+        "q_rank": 1024,
+        "groups": 8,
+        "o_rank": 1024,
+        "hidden": 4096,
+        "dtype": "bfloat16"
+      },
+      "runtime_dispatch": {
+        "forward_original_direct": {
+          "median_us": 0.0224886,
+          "samples_us": [
+            0.0239048,
+            0.0224886,
+            0.027911000000000002,
+            0.0218046,
+            0.0222804,
+            0.0238562,
+            0.022234200000000003
+          ]
+        },
+        "forward_pdmux_decode": {
+          "median_us": 0.2563654,
+          "samples_us": [
+            0.254849,
+            0.25635739999999996,
+            0.2603532,
+            0.2563654,
+            0.2707776,
+            0.255596,
+            0.2582926
+          ]
+        },
+        "dp_original_direct": {
+          "median_us": 0.0224434,
+          "samples_us": [
+            0.0214148,
+            0.023027799999999998,
+            0.0306804,
+            0.028581,
+            0.0216206,
+            0.0224434,
+            0.0202974
+          ]
+        },
+        "dp_pdmux_decode": {
+          "median_us": 0.1016058,
+          "samples_us": [
+            0.0986354,
+            0.10019159999999999,
+            0.1024794,
+            0.1033364,
+            0.1016058,
+            0.1013116,
+            0.10167820000000001
+          ]
+        },
+        "forward_pdmux_prefill": {
+          "median_us": 0.2645118,
+          "samples_us": [
+            0.26419400000000004,
+            0.26429719999999995,
+            0.26184199999999996,
+            0.26579539999999996,
+            0.27339179999999996,
+            0.2645118,
+            0.2695066
+          ]
+        },
+        "cp_cached_metadata_prepare": {
+          "median_us": 2.4401362,
+          "samples_us": [
+            2.5348562,
+            2.392114,
+            2.4401362,
+            2.4812538,
+            2.41823,
+            2.4878486,
+            2.4339524
+          ]
+        },
+        "cp_physical_length_setter_only": {
+          "median_us": 0.24718020000000002,
+          "samples_us": [
+            0.25880000000000003,
+            0.24718020000000002,
+            0.2422122,
+            0.24784219999999998,
+            0.2436816,
+            0.2516874,
+            0.24103460000000002
+          ]
+        }
+      },
+      "cold": {
+        "legacy": {
+          "wall_us": 11620.155,
+          "added_cuda_bytes": 16777216
+        },
+        "persistent_view": {
+          "wall_us": 573.867,
+          "added_cuda_bytes": 16777216
+        }
+      },
+      "host_scope": {
+        "legacy": {
+          "median_us": 29.8134114,
+          "samples_us": [
+            29.255109,
+            29.1551828,
+            29.8134114,
+            30.654052,
+            30.688007000000002,
+            30.598243,
+            29.5117736
+          ],
+          "steady_cuda_bytes_delta": 0
+        },
+        "persistent_view": {
+          "median_us": 0.9354941999999999,
+          "samples_us": [
+            0.9445442000000001,
+            0.9267576000000001,
+            0.966827,
+            0.926918,
+            0.950988,
+            0.9354941999999999,
+            0.921418
+          ],
+          "steady_cuda_bytes_delta": 0
+        }
+      },
+      "projection": {
+        "1": {
+          "median": {
+            "legacy": {
+              "eager": {
+                "wall_us": 214.69958333333335,
+                "gpu_timeline_us": 213.49120140075684
+              },
+              "graph": {
+                "wall_us": 208.59798333333333,
+                "gpu_timeline_us": 207.98986752827963
+              }
+            },
+            "persistent_view": {
+              "eager": {
+                "wall_us": 213.33228333333332,
+                "gpu_timeline_us": 212.29653358459473
+              },
+              "graph": {
+                "wall_us": 208.774,
+                "gpu_timeline_us": 207.6159954071045
+              }
+            }
+          },
+          "samples": {
+            "legacy": {
+              "eager": [
+                {
+                  "wall_us": 287.02028333333334,
+                  "gpu_timeline_us": 284.4586690266927
+                },
+                {
+                  "wall_us": 215.8827,
+                  "gpu_timeline_us": 214.1285260518392
+                },
+                {
+                  "wall_us": 213.96966666666665,
+                  "gpu_timeline_us": 212.80585924784342
+                },
+                {
+                  "wall_us": 214.9926,
+                  "gpu_timeline_us": 214.70239957173666
+                },
+                {
+                  "wall_us": 213.77679999999998,
+                  "gpu_timeline_us": 213.49120140075684
+                },
+                {
+                  "wall_us": 214.69958333333335,
+                  "gpu_timeline_us": 213.17119598388672
+                },
+                {
+                  "wall_us": 212.41888333333333,
+                  "gpu_timeline_us": 211.76427205403647
+                }
+              ],
+              "graph": [
+                {
+                  "wall_us": 209.671,
+                  "gpu_timeline_us": 208.96426836649576
+                },
+                {
+                  "wall_us": 208.8078,
+                  "gpu_timeline_us": 207.98986752827963
+                },
+                {
+                  "wall_us": 208.59798333333333,
+                  "gpu_timeline_us": 208.1925392150879
+                },
+                {
+                  "wall_us": 208.69618333333332,
+                  "gpu_timeline_us": 207.46240615844727
+                },
+                {
+                  "wall_us": 208.36370000000002,
+                  "gpu_timeline_us": 208.02559852600098
+                },
+                {
+                  "wall_us": 208.16341666666665,
+                  "gpu_timeline_us": 207.52639770507812
+                },
+                {
+                  "wall_us": 208.00596666666667,
+                  "gpu_timeline_us": 207.4453353881836
+                }
+              ]
+            },
+            "persistent_view": {
+              "eager": [
+                {
+                  "wall_us": 232.93553333333332,
+                  "gpu_timeline_us": 232.55467414855957
+                },
+                {
+                  "wall_us": 211.98166666666665,
+                  "gpu_timeline_us": 211.5503946940104
+                },
+                {
+                  "wall_us": 213.87768333333332,
+                  "gpu_timeline_us": 213.61279487609863
+                },
+                {
+                  "wall_us": 211.99145000000001,
+                  "gpu_timeline_us": 211.70132954915366
+                },
+                {
+                  "wall_us": 213.33228333333332,
+                  "gpu_timeline_us": 212.53600120544434
+                },
+                {
+                  "wall_us": 213.50516666666667,
+                  "gpu_timeline_us": 212.29653358459473
+                },
+                {
+                  "wall_us": 211.32141666666666,
+                  "gpu_timeline_us": 210.9381357828776
+                }
+              ],
+              "graph": [
+                {
+                  "wall_us": 210.76423333333335,
+                  "gpu_timeline_us": 208.02559852600098
+                },
+                {
+                  "wall_us": 208.95641666666666,
+                  "gpu_timeline_us": 208.09067090352377
+                },
+                {
+                  "wall_us": 208.7202,
+                  "gpu_timeline_us": 208.44853719075522
+                },
+                {
+                  "wall_us": 208.774,
+                  "gpu_timeline_us": 207.6159954071045
+                },
+                {
+                  "wall_us": 209.53904999999997,
+                  "gpu_timeline_us": 207.59305953979492
+                },
+                {
+                  "wall_us": 208.58411666666666,
+                  "gpu_timeline_us": 207.59894053141275
+                },
+                {
+                  "wall_us": 208.01661666666666,
+                  "gpu_timeline_us": 207.41119384765625
+                }
+              ]
+            }
+          }
+        },
+        "8": {
+          "median": {
+            "legacy": {
+              "eager": {
+                "wall_us": 236.56878333333333,
+                "gpu_timeline_us": 235.90240478515625
+              },
+              "graph": {
+                "wall_us": 228.42691666666667,
+                "gpu_timeline_us": 227.891206741333
+              }
+            },
+            "persistent_view": {
+              "eager": {
+                "wall_us": 235.031,
+                "gpu_timeline_us": 234.73332722981772
+              },
+              "graph": {
+                "wall_us": 228.58041666666665,
+                "gpu_timeline_us": 227.97226905822754
+              }
+            }
+          },
+          "samples": {
+            "legacy": {
+              "eager": [
+                {
+                  "wall_us": 261.92225,
+                  "gpu_timeline_us": 261.03572845458984
+                },
+                {
+                  "wall_us": 235.31146666666666,
+                  "gpu_timeline_us": 234.76053873697916
+                },
+                {
+                  "wall_us": 235.5723166666667,
+                  "gpu_timeline_us": 235.16480127970377
+                },
+                {
+                  "wall_us": 237.3528,
+                  "gpu_timeline_us": 237.04479535420737
+                },
+                {
+                  "wall_us": 238.12068333333332,
+                  "gpu_timeline_us": 237.6709302266439
+                },
+                {
+                  "wall_us": 236.56878333333333,
+                  "gpu_timeline_us": 235.90240478515625
+                },
+                {
+                  "wall_us": 235.28048333333334,
+                  "gpu_timeline_us": 234.42187309265137
+                }
+              ],
+              "graph": [
+                {
+                  "wall_us": 228.41458333333335,
+                  "gpu_timeline_us": 227.68640518188477
+                },
+                {
+                  "wall_us": 228.42691666666667,
+                  "gpu_timeline_us": 227.77172724405924
+                },
+                {
+                  "wall_us": 228.72043333333332,
+                  "gpu_timeline_us": 227.99359957377115
+                },
+                {
+                  "wall_us": 228.1682,
+                  "gpu_timeline_us": 227.80586878458658
+                },
+                {
+                  "wall_us": 228.27186666666668,
+                  "gpu_timeline_us": 227.891206741333
+                },
+                {
+                  "wall_us": 228.6565666666667,
+                  "gpu_timeline_us": 228.04479598999023
+                },
+                {
+                  "wall_us": 229.06718333333333,
+                  "gpu_timeline_us": 228.2325267791748
+                }
+              ]
+            },
+            "persistent_view": {
+              "eager": [
+                {
+                  "wall_us": 238.83718333333331,
+                  "gpu_timeline_us": 237.50294049580893
+                },
+                {
+                  "wall_us": 235.031,
+                  "gpu_timeline_us": 234.73332722981772
+                },
+                {
+                  "wall_us": 236.08561666666668,
+                  "gpu_timeline_us": 235.80586115519205
+                },
+                {
+                  "wall_us": 234.77471666666668,
+                  "gpu_timeline_us": 234.27039782206217
+                },
+                {
+                  "wall_us": 234.88315,
+                  "gpu_timeline_us": 234.60586865743002
+                },
+                {
+                  "wall_us": 234.62538333333333,
+                  "gpu_timeline_us": 234.28959846496582
+                },
+                {
+                  "wall_us": 236.67526666666666,
+                  "gpu_timeline_us": 235.34560203552246
+                }
+              ],
+              "graph": [
+                {
+                  "wall_us": 228.95589999999999,
+                  "gpu_timeline_us": 228.26666831970215
+                },
+                {
+                  "wall_us": 228.58041666666665,
+                  "gpu_timeline_us": 227.97226905822754
+                },
+                {
+                  "wall_us": 228.89981666666668,
+                  "gpu_timeline_us": 228.57386271158853
+                },
+                {
+                  "wall_us": 228.49768333333333,
+                  "gpu_timeline_us": 227.82293955485025
+                },
+                {
+                  "wall_us": 228.393,
+                  "gpu_timeline_us": 228.0229409535726
+                },
+                {
+                  "wall_us": 228.50466666666665,
+                  "gpu_timeline_us": 227.82293955485025
+                },
+                {
+                  "wall_us": 228.91070000000002,
+                  "gpu_timeline_us": 227.7034600575765
+                }
+              ]
+            }
+          }
+        },
+        "32": {
+          "median": {
+            "legacy": {
+              "eager": {
+                "wall_us": 240.80098333333333,
+                "gpu_timeline_us": 239.10293579101562
+              },
+              "graph": {
+                "wall_us": 236.21618333333333,
+                "gpu_timeline_us": 235.40053367614746
+              }
+            },
+            "persistent_view": {
+              "eager": {
+                "wall_us": 243.53846666666666,
+                "gpu_timeline_us": 241.9823964436849
+              },
+              "graph": {
+                "wall_us": 235.2131,
+                "gpu_timeline_us": 234.17119979858398
+              }
+            }
+          },
+          "samples": {
+            "legacy": {
+              "eager": [
+                {
+                  "wall_us": 238.93316666666666,
+                  "gpu_timeline_us": 238.37173779805502
+                },
+                {
+                  "wall_us": 252.7663,
+                  "gpu_timeline_us": 236.85919443766275
+                },
+                {
+                  "wall_us": 240.80098333333333,
+                  "gpu_timeline_us": 240.57653745015463
+                },
+                {
+                  "wall_us": 239.58146666666667,
+                  "gpu_timeline_us": 239.10293579101562
+                },
+                {
+                  "wall_us": 239.24371666666667,
+                  "gpu_timeline_us": 238.37706247965494
+                },
+                {
+                  "wall_us": 297.5385833333333,
+                  "gpu_timeline_us": 296.88533147176105
+                },
+                {
+                  "wall_us": 296.47661666666664,
+                  "gpu_timeline_us": 295.794137318929
+                }
+              ],
+              "graph": [
+                {
+                  "wall_us": 235.882,
+                  "gpu_timeline_us": 235.40053367614746
+                },
+                {
+                  "wall_us": 235.55708333333334,
+                  "gpu_timeline_us": 235.19573211669922
+                },
+                {
+                  "wall_us": 236.45211666666665,
+                  "gpu_timeline_us": 235.29814084370932
+                },
+                {
+                  "wall_us": 236.21618333333333,
+                  "gpu_timeline_us": 235.5504035949707
+                },
+                {
+                  "wall_us": 237.01688333333334,
+                  "gpu_timeline_us": 235.26399930318198
+                },
+                {
+                  "wall_us": 236.91426666666666,
+                  "gpu_timeline_us": 235.87573369344076
+                },
+                {
+                  "wall_us": 236.21608333333333,
+                  "gpu_timeline_us": 235.57119369506836
+                }
+              ]
+            },
+            "persistent_view": {
+              "eager": [
+                {
+                  "wall_us": 244.02631666666667,
+                  "gpu_timeline_us": 241.9823964436849
+                },
+                {
+                  "wall_us": 241.58745000000002,
+                  "gpu_timeline_us": 240.05014101664224
+                },
+                {
+                  "wall_us": 245.22216666666665,
+                  "gpu_timeline_us": 244.91519927978516
+                },
+                {
+                  "wall_us": 239.99296666666666,
+                  "gpu_timeline_us": 239.63093757629395
+                },
+                {
+                  "wall_us": 243.53846666666666,
+                  "gpu_timeline_us": 242.93386141459146
+                },
+                {
+                  "wall_us": 245.20908333333335,
+                  "gpu_timeline_us": 244.16000048319498
+                },
+                {
+                  "wall_us": 241.79489999999998,
+                  "gpu_timeline_us": 240.8357302347819
+                }
+              ],
+              "graph": [
+                {
+                  "wall_us": 235.09201666666667,
+                  "gpu_timeline_us": 234.08160209655762
+                },
+                {
+                  "wall_us": 235.04226666666665,
+                  "gpu_timeline_us": 234.39359664916992
+                },
+                {
+                  "wall_us": 235.39853333333332,
+                  "gpu_timeline_us": 234.6325397491455
+                },
+                {
+                  "wall_us": 234.93725,
+                  "gpu_timeline_us": 233.8816006978353
+                },
+                {
+                  "wall_us": 235.34175,
+                  "gpu_timeline_us": 234.15145874023438
+                },
+                {
+                  "wall_us": 236.07745,
+                  "gpu_timeline_us": 234.17119979858398
+                },
+                {
+                  "wall_us": 235.2131,
+                  "gpu_timeline_us": 234.18879508972168
+                }
+              ]
+            }
+          }
+        },
+        "128": {
+          "median": {
+            "legacy": {
+              "eager": {
+                "wall_us": 324.0191666666667,
+                "gpu_timeline_us": 323.5338528951009
+              },
+              "graph": {
+                "wall_us": 315.0436666666667,
+                "gpu_timeline_us": 313.9413197835286
+              }
+            },
+            "persistent_view": {
+              "eager": {
+                "wall_us": 321.65868333333333,
+                "gpu_timeline_us": 320.54080963134766
+              },
+              "graph": {
+                "wall_us": 314.26936666666666,
+                "gpu_timeline_us": 313.4592056274414
+              }
+            }
+          },
+          "samples": {
+            "legacy": {
+              "eager": [
+                {
+                  "wall_us": 308.23188333333337,
+                  "gpu_timeline_us": 306.79359436035156
+                },
+                {
+                  "wall_us": 325.67386666666664,
+                  "gpu_timeline_us": 325.3184000651042
+                },
+                {
+                  "wall_us": 324.6415833333333,
+                  "gpu_timeline_us": 323.5893249511719
+                },
+                {
+                  "wall_us": 323.5148333333333,
+                  "gpu_timeline_us": 321.89226150512695
+                },
+                {
+                  "wall_us": 326.05493333333334,
+                  "gpu_timeline_us": 323.98773829142254
+                },
+                {
+                  "wall_us": 324.0191666666667,
+                  "gpu_timeline_us": 323.4634717305501
+                },
+                {
+                  "wall_us": 323.8658833333334,
+                  "gpu_timeline_us": 323.5338528951009
+                }
+              ],
+              "graph": [
+                {
+                  "wall_us": 305.52729999999997,
+                  "gpu_timeline_us": 303.38932673136395
+                },
+                {
+                  "wall_us": 316.1259,
+                  "gpu_timeline_us": 313.9413197835286
+                },
+                {
+                  "wall_us": 315.1779,
+                  "gpu_timeline_us": 314.12906646728516
+                },
+                {
+                  "wall_us": 314.95675,
+                  "gpu_timeline_us": 313.3605321248372
+                },
+                {
+                  "wall_us": 312.69376666666665,
+                  "gpu_timeline_us": 312.3311996459961
+                },
+                {
+                  "wall_us": 315.0436666666667,
+                  "gpu_timeline_us": 314.0949249267578
+                },
+                {
+                  "wall_us": 315.62846666666667,
+                  "gpu_timeline_us": 314.65492248535156
+                }
+              ]
+            },
+            "persistent_view": {
+              "eager": [
+                {
+                  "wall_us": 320.8766166666666,
+                  "gpu_timeline_us": 320.54080963134766
+                },
+                {
+                  "wall_us": 322.36813333333333,
+                  "gpu_timeline_us": 322.05174763997394
+                },
+                {
+                  "wall_us": 317.8964,
+                  "gpu_timeline_us": 317.62399673461914
+                },
+                {
+                  "wall_us": 321.84434999999996,
+                  "gpu_timeline_us": 321.36160532633465
+                },
+                {
+                  "wall_us": 319.27254999999997,
+                  "gpu_timeline_us": 316.97813669840497
+                },
+                {
+                  "wall_us": 321.65868333333333,
+                  "gpu_timeline_us": 320.2186584472656
+                },
+                {
+                  "wall_us": 323.14725,
+                  "gpu_timeline_us": 321.43627802530926
+                }
+              ],
+              "graph": [
+                {
+                  "wall_us": 311.2943333333333,
+                  "gpu_timeline_us": 309.38453674316406
+                },
+                {
+                  "wall_us": 318.32905,
+                  "gpu_timeline_us": 316.6549364725749
+                },
+                {
+                  "wall_us": 315.48948333333334,
+                  "gpu_timeline_us": 315.18719991048175
+                },
+                {
+                  "wall_us": 316.0457,
+                  "gpu_timeline_us": 314.9994532267253
+                },
+                {
+                  "wall_us": 313.23563333333334,
+                  "gpu_timeline_us": 311.99572881062824
+                },
+                {
+                  "wall_us": 313.37398333333334,
+                  "gpu_timeline_us": 312.0298703511556
+                },
+                {
+                  "wall_us": 314.26936666666666,
+                  "gpu_timeline_us": 313.4592056274414
+                }
+              ]
+            }
+          }
+        }
+      }
+    }
+  },
+  "measurement_limits": [
+    "CP2/CP4 select a synthetic rank-0 shard on one GPU; this is not distributed CP execution.",
+    "Projection benchmark compares legacy slicing with persistent decode views using the same BF16 GEMMs, not feature on versus off.",
+    "Full-model throughput, FlashMLA, MoE, HiCache DMA, target/draft acceptance and TP2 NCCL progress are unmeasured.",
+    "Cold wall times are order-dependent and include first-use setup; they are not a controlled startup-speed comparison.",
+    "Host getter measurements isolate Python helpers and do not establish cumulative end-to-end latency.",
+    "The original 4219-request workload still requires the deployment host."
+  ]
+}
