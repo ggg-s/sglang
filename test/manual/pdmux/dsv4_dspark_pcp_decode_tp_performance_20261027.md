@@ -101,3 +101,16 @@ available. Explicit prefill graph overrides are outside the admitted recipe.
 Run the full-model graph and eager acceptance variants from the runbook, then
 the original 4219-request workload, to compare throughput, TTFT, TPOT, memory,
 acceptance rate and HiCache hit/reload behavior with each option enabled.
+
+## Configuration-resolution follow-up
+
+A subsequent real-pipeline regression exposed a configuration bug outside the
+projection benchmark: `_data_parallelism_defaults` reset the DSV4 PCP model
+hook's `enable_dp_attention=True` at DP1. The earlier unit fixtures supplied
+the resolved flag directly and could not detect that reset. Preserve the model
+decision in the DP1 pass and retain the PDMux gate's requirement that the final
+flag is true. The new config-only regression starts with CLI defaults and
+checks CP2/4/8, decode attention TP off/on, resolved readback and pickled worker
+publication. A run that bypassed the gate while reporting DP attention false
+must be rerun before comparing full-model performance with this recipe. The
+isolated projection timings above do not validate configuration resolution.

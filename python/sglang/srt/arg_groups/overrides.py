@@ -1422,7 +1422,13 @@ def _page_size_default(view: Any) -> dict:
 @register_post_process
 def _data_parallelism_defaults(view: Any) -> dict:
     if view.dp_size == 1 and view.ep_join_mode != "scale":
-        return {"enable_dp_attention": False, "enable_dp_lm_head": False}
+        defaults = {"enable_dp_lm_head": False}
+        # PCP can require DP-attention's buffer/forward paths even with DP=1.
+        # Preserve the model hook's decision (e.g. DSV4 interleave CP) rather
+        # than overwriting it after model-specific resolution has completed.
+        if not view.enable_prefill_cp:
+            defaults["enable_dp_attention"] = False
+        return defaults
     return {}
 
 

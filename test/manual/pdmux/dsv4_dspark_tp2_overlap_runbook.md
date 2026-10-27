@@ -97,6 +97,13 @@ continuations restore CP's padded physical length on every segment. DSpark
 sampling/planning/acceptance sync spans the full CP group rather than the
 singleton attention-TP group.
 
+The DP1 default pass must preserve the PCP model hook's DP-attention decision.
+`check_server_args` runs after resolution in the current launcher; weakening its
+PCP gate to accept a false DP-attention value hides a later DP1 reset. Verify
+`enable_dp_attention=true` in `/server_info` as well as in each worker's
+published configuration. `test_dsv4_pcp_resolution.py` covers the real pipeline,
+readback and pickled worker publication without loading model weights.
+
 `--enable-cp-decode-attn-tp` can now be added to this configuration. The target
 and DSpark draft each cache an unregistered decode attention module with their
 own sliced projection Parameters, linear dimensions, radix head count and sink

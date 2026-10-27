@@ -2924,9 +2924,29 @@ class TestGoldenModelOverrides(_IsolatedPublish):
 
         self.assertEqual(
             _data_parallelism_defaults(
-                ResolvedView(SimpleNamespace(dp_size=1, ep_join_mode=None))
+                ResolvedView(
+                    SimpleNamespace(
+                        dp_size=1, ep_join_mode=None, enable_prefill_cp=False
+                    )
+                )
             ),
             {"enable_dp_attention": False, "enable_dp_lm_head": False},
+        )
+        self.assertEqual(
+            _data_parallelism_defaults(
+                ResolvedView(
+                    SimpleNamespace(
+                        dp_size=1, ep_join_mode=None, enable_prefill_cp=True
+                    )
+                )
+            ),
+            {"enable_dp_lm_head": False},
+        )
+        self.assertEqual(
+            _data_parallelism_defaults(
+                ResolvedView(SimpleNamespace(dp_size=1, ep_join_mode="scale"))
+            ),
+            {},
         )
         self.assertEqual(
             _data_parallelism_defaults(
