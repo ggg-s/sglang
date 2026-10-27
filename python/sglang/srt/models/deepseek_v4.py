@@ -873,9 +873,30 @@ class MqaAttentionBase(nn.Module):
             self._attn_sink_local = sink
         return self._attn_sink_local[:kernel_num_heads]
 
+    def refresh_pdmux_decode_attn_tp_view(self):
+        view = getattr(self, "_pdmux_decode_attn_tp_view", None)
+        if view is not None:
+            get_cp_decode_attn_tp_ctx().refresh_decode_attention_view(self, view)
+
     @contextmanager
     def maybe_use_decode_attn_tp(self, forward_batch: ForwardBatch):
         ctx = get_cp_decode_attn_tp_ctx()
+        if is_pdmux_enabled():
+            if ctx.should_use_decode_attn_tp(forward_batch):
+                view = getattr(self, "_pdmux_decode_attn_tp_view", None)
+                if view is None:
+                    view = ctx.make_decode_attention_view(
+                        self,
+                        radix_attn_name="attn_mqa"
+                        if isinstance(self, MQALayer)
+                        else "attn",
+                    )
+                    # A runtime view, not an additional checkpoint submodule.
+                    object.__setattr__(self, "_pdmux_decode_attn_tp_view", view)
+                yield view
+            else:
+                yield self
+            return
         attn = self.attn_mqa if isinstance(self, MQALayer) else self.attn
         with ctx.maybe_use_decode_attn_tp(
             forward_batch,
@@ -895,7 +916,7 @@ class MqaAttentionBase(nn.Module):
                 self.attn_tp_rank = ctx.decode_tp_rank
                 self.attn_tp_size = decode_tp_size
                 try:
-                    yield
+                    yield self
                 finally:
                     (
                         self.n_local_heads,
@@ -904,7 +925,7 @@ class MqaAttentionBase(nn.Module):
                         self.attn_tp_size,
                     ) = orig
             else:
-                yield
+                yield self
 
 
 class MQALayer(MqaAttentionBase):
@@ -2335,8 +2356,8 @@ class DeepseekV4DecoderLayer(nn.Module):
             else:
                 x_quant = None
 
-        with self.self_attn.maybe_use_decode_attn_tp(forward_batch):
-            hidden_states = self.self_attn(
+        with self.self_attn.maybe_use_decode_attn_tp(forward_batch) as attention:
+            hidden_states = attention(
                 x=hidden_states,
                 positions=positions,
                 forward_batch=forward_batch,
@@ -3572,6 +3593,7 @@ class DeepseekV4ForCausalLM(nn.Module):
         for layer_id in range(self.model.start_layer, self.model.end_layer):
             layer = self.model.layers[layer_id]
             self_attn = layer.self_attn
+            self_attn.refresh_pdmux_decode_attn_tp_view()
             if (
                 self_attn.compress_ratio in (4, 128)
                 and not self_attn.compressor.ape_converted

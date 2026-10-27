@@ -622,8 +622,8 @@ class DSparkV4Stage(DeepseekV4DecoderLayer):
             hidden_states, self.hc_attn_fn, self.hc_attn_scale, self.hc_attn_base
         )
         x = self.input_layernorm(x)
-        with self.self_attn.maybe_use_decode_attn_tp(forward_batch):
-            x = self.self_attn(positions, x, forward_batch)
+        with self.self_attn.maybe_use_decode_attn_tp(forward_batch) as attention:
+            x = attention(positions, x, forward_batch)
         x = self._hc_post_block(x, residual, post, comb)
 
         residual = x
@@ -988,6 +988,8 @@ class DeepseekV4ForCausalLMDSpark(nn.Module):
         self._assert_confidence_head_loaded(
             params_dict=params_dict, loaded_params=loaded_params
         )
+        for stage in self.stages:
+            stage.self_attn.refresh_pdmux_decode_attn_tp_view()
 
     def _assert_confidence_head_loaded(
         self, *, params_dict: dict, loaded_params: set

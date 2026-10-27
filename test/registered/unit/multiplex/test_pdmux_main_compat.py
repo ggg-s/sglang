@@ -160,7 +160,7 @@ class TestPdmuxMainCompat(unittest.TestCase):
         self.assertFalse(active(mode.DECODE))
         self.assertFalse(active(mode.DRAFT_EXTEND_V2))
 
-    def test_split_cp_is_planned_before_attention_and_only_once(self):
+    def test_split_cp_restores_padding_each_segment_and_plans_attention_once(self):
         journal = []
         cp = SimpleNamespace(
             is_cp_active=lambda batch: True,
@@ -186,7 +186,7 @@ class TestPdmuxMainCompat(unittest.TestCase):
         with patch.dict(sys.modules, {"sglang.srt.layers.cp.utils": cp}):
             self.assertIsNone(forward(runner, batch))
             self.assertEqual(forward(runner, batch), "logits")
-        self.assertEqual(journal, ["cp", "metadata"])
+        self.assertEqual(journal, ["cp", "metadata", "cp"])
         self.assertEqual(batch.split_index, 2)
         self.assertEqual(runner.model.forward_split_prefill.call_args.args[-1], (1, 2))
 

@@ -10,6 +10,7 @@ from typing import Any, Dict, List, Optional
 
 from sglang.srt.arg_groups.overrides import (
     _hisparse_validation,
+    model_config_of,
     resolved_view,
     resolving_view,
     run_post_process_pass,
@@ -523,7 +524,7 @@ def check_two_batch_overlap(server_args: Any):
 
 
 def check_pdmux_overlap(cfg):
-    """The overlap lane duplicates full-width TP communicators only.
+    """Admit plain TP or DSV4 interleave PCP over the full TP group.
 
     Subgroup parallelism needs its own lane-specific communicators before it
     can use the asynchronous speculative scheduler.
@@ -535,14 +536,49 @@ def check_pdmux_overlap(cfg):
         "PD-Multiplexing overlap schedule requires layer_split prefill and DFLASH or DSPARK."
     )
     if cfg.tp_size > 1:
-        assert not cfg.enable_dp_attention, (
+        prefill_cp = getattr(cfg, "enable_prefill_cp", False)
+        if prefill_cp:
+            assert (
+                cfg.speculative_algorithm == "DSPARK"
+                and cfg.cp_strategy == "interleave"
+                and cfg.dp_size == 1
+                and cfg.attn_cp_size == cfg.tp_size
+                and cfg.enable_dp_attention
+                and model_config_of(cfg).hf_config.architectures
+                == ["DeepseekV4ForCausalLM"]
+            ), (
+                "PD-Multiplexing overlap prefill CP requires DeepSeek-V4 DSPARK, "
+                "interleave, DP=1 and attention CP=TP."
+            )
+            assert cfg.moe_a2a_backend == "none", (
+                "PD-Multiplexing overlap prefill CP requires --moe-a2a-backend none: "
+                "A2A dispatch buffers are not isolated between lanes."
+            )
+            assert not cfg.enable_torch_compile, (
+                "PD-Multiplexing overlap prefill CP does not support --enable-torch-compile."
+            )
+            assert cfg.cuda_graph_config.prefill.backend == "disabled", (
+                "PD-Multiplexing overlap prefill CP requires "
+                "--cuda-graph-backend-prefill disabled."
+            )
+            assert not cfg.enable_two_batch_overlap, (
+                "PD-Multiplexing overlap prefill CP cannot use "
+                "--enable-two-batch-overlap: PDMux backends are per lane, "
+                "not TBO micro-batch backends."
+            )
+            assert envs.SGLANG_RAGGED_VERIFY_MODE.get() != "compact", (
+                "PD-Multiplexing overlap prefill CP cannot use "
+                "SGLANG_RAGGED_VERIFY_MODE=compact: DSV4 ragged verify "
+                "does not support CP. Use SGLANG_RAGGED_VERIFY_MODE=static."
+            )
+        assert not cfg.enable_dp_attention or prefill_cp, (
             "PD-Multiplexing overlap schedule with TP>1 does not yet support "
             "DP attention; omit --enable-dp-attention."
         )
         for name, value in (
             ("--ep-size", cfg.ep_size),
             ("--moe-dp-size", cfg.moe_dp_size),
-            ("--attn-cp-size", cfg.attn_cp_size),
+            ("--attn-cp-size", 1 if prefill_cp else cfg.attn_cp_size),
             ("--dcp-size", cfg.dcp_size),
         ):
             assert value == 1, (

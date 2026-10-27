@@ -648,9 +648,8 @@ class ForwardFlags:
     (``_GRAPH_VISIBLE``) are backed by plain dict slots instead: dynamo
     cannot trace ``ContextVar.get``/``set``, while plain reads it guards on
     — the storage form these flags had before joining the tier. Their
-    writers and readers are single-threaded per process (TBO interleaves
-    ubatches on one thread; attention-TP input scattering excludes TBO), so
-    context isolation is not needed for correctness.
+    TBO interleaves ubatches on one thread. PDMux uses a separate ForwardFlags
+    instance per lane, so plain flags cannot leak between its submitters.
 
     ``scoped(**kw)`` — the one regular write path — restores on exit for
     both backings. ``set()`` exists for the legacy unscoped setters' shims.
@@ -979,6 +978,7 @@ class RuntimeContext:
         "flags",
         "resources",
         "forward",
+        "prefill_forward",
     )
 
     def __init__(self, parallel: ParallelContext):
@@ -990,6 +990,7 @@ class RuntimeContext:
         self.flags = Flags()
         self.resources = Resources()
         self.forward = ForwardFlags()
+        self.prefill_forward: ForwardFlags | None = None
 
     def get_stream(self, name: str) -> Any:
         """Named process-level side stream: get-or-create, shared by
@@ -1052,6 +1053,14 @@ class RuntimeContext:
             _resolved_or_field(server_args, "enable_torch_compile", False)
         )
         self._server_args = server_args
+        # PDMux can submit P and D on different host threads. Compiled-model
+        # flags (notably mlp_reduce_scatter) also need separate lane storage:
+        # a CP prefill skips MoE all-reduce while decode must still perform it.
+        if _resolved_or_field(server_args, "enable_pdmux", False):
+            if self.prefill_forward is None:
+                self.prefill_forward = ForwardFlags()
+        else:
+            self.prefill_forward = None
         # Snapshot resolved config into the namespace bags (the single source of
         # truth for config reads). Placed by `namespace_of`; a mock/partial
         # config that declares no namespace yields an empty tree (no bags).
@@ -1369,6 +1378,8 @@ def get_resources() -> Resources:
 
 
 def get_forward() -> ForwardFlags:
+    if _CONTEXT.prefill_forward is not None and _ps().is_pdmux_prefill_enabled():
+        return _CONTEXT.prefill_forward
     return _CONTEXT.forward
 
 
@@ -1773,6 +1784,7 @@ def reset_context() -> None:
     _CONTEXT.flags = Flags()
     _CONTEXT.resources = Resources()
     _CONTEXT.forward = ForwardFlags()
+    _CONTEXT.prefill_forward = None
     set_global_dwdp_manager(None)
 
 

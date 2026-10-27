@@ -24,6 +24,8 @@ def lane_namespace(decode, prefill, *, attention=None, moe=None):
     namespace = dict(
         _TP=decode,
         _ATTN_TP=decode if attention is None else attention,
+        _ATTN_CP=decode,
+        _MOE_DP=decode,
         _MOE_TP=decode if moe is None else moe,
         _PDMUX_PREFILL_TP_GROUP=prefill,
         _ENABLE_PDMUX_P_TP=ContextVar("test_prefill_lane", default=False),
@@ -31,7 +33,14 @@ def lane_namespace(decode, prefill, *, attention=None, moe=None):
     functions = load_methods(
         "distributed/parallel_state.py",
         None,
-        ["set_pdmux_status", "get_tp_group", "get_attn_tp_group", "get_moe_tp_group"],
+        [
+            "set_pdmux_status",
+            "get_tp_group",
+            "get_attn_tp_group",
+            "get_attn_cp_group",
+            "get_moe_dp_group",
+            "get_moe_tp_group",
+        ],
         **namespace,
     )
     # load_methods gives every function the same globals dict.
@@ -115,6 +124,8 @@ class TestPdmuxTPGroups(unittest.TestCase):
                 self.assertIs(lanes.get_tp_group(), expected)
                 self.assertIs(lanes.get_attn_tp_group(), expected)
                 self.assertIs(lanes.get_moe_tp_group(), expected)
+                self.assertIs(lanes.get_attn_cp_group(), expected)
+                self.assertIs(lanes.get_moe_dp_group(), expected)
 
     def test_real_subgroups_keep_their_membership(self):
         attention, moe = object(), object()
@@ -472,7 +483,12 @@ def _gloo_lane_rank(rank, store_path):
         for chunk in range(32):
             for segment in range(3):
                 lanes.set_pdmux_status(True)
-                for get_group in (lanes.get_attn_tp_group, lanes.get_moe_tp_group):
+                for get_group in (
+                    lanes.get_attn_tp_group,
+                    lanes.get_moe_tp_group,
+                    lanes.get_attn_cp_group,
+                    lanes.get_moe_dp_group,
+                ):
                     p = torch.full((17,), rank + chunk + segment, dtype=torch.int64)
                     get_group().all_reduce(p)
                     torch.testing.assert_close(
@@ -482,7 +498,7 @@ def _gloo_lane_rank(rank, store_path):
                 d = torch.tensor([rank + segment], dtype=torch.int64)
                 lanes.get_attn_tp_group().all_reduce(d)
                 torch.testing.assert_close(d, torch.tensor([1 + 2 * segment]))
-        assert prefill.reductions == 32 * 3 * 2
+        assert prefill.reductions == 32 * 3 * 4
         assert decode.reductions == 32 * 3
         # Exercise the production prefill finalizer and SpecTpSync with two
         # real groups. A cached decode group must not receive DSPARK_TARGET.
@@ -496,7 +512,7 @@ def _gloo_lane_rank(rank, store_path):
             "DSparkWorkerV2",
             ["_finalize_prefill"],
             SpecTpSyncSite=NS(DSPARK_TARGET="prefill"),
-            get_parallel=lambda: NS(enable_dp_attention=False),
+            get_parallel=lambda: NS(enable_dp_attention=True, attn_cp_size=2),
             get_tp_group=lanes.get_tp_group,
         )["_finalize_prefill"]
         worker = NS(_target_hidden_projection_enabled=False, _tp_sync=sync)

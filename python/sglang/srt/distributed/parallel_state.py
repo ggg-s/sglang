@@ -2146,6 +2146,10 @@ def get_attn_cp_group() -> GroupCoordinator:
     assert _ATTN_CP is not None, (
         "attention context model parallel group is not initialized"
     )
+    # DSV4 prefill CP spans the full TP group. Its gathers must use the
+    # prefill communicator while decode runs on the original TP group.
+    if _ATTN_CP is _TP:
+        return get_tp_group()
     return _ATTN_CP
 
 
@@ -2165,6 +2169,8 @@ _MOE_TP: Optional[GroupCoordinator] = None
 
 def get_moe_dp_group() -> GroupCoordinator:
     assert _MOE_DP is not None, "moe data parallel group is not initialized"
+    if _MOE_DP is _TP:
+        return get_tp_group()
     return _MOE_DP
 
 

@@ -1615,9 +1615,12 @@ class ModelRunner:
     ) -> Optional[LogitsProcessorOutput]:
         from sglang.srt.layers.cp.utils import is_cp_active, prepare_cp_forward
 
+        # A continuation republishes the original DP sizing before reaching
+        # this method. Restore CP's padded physical length on every segment,
+        # including when the logical token count is not divisible by CP size.
+        if is_cp_active(forward_batch):
+            prepare_cp_forward(forward_batch)
         if forward_batch.split_index == 0 or reinit_attn_backend:
-            if is_cp_active(forward_batch):
-                prepare_cp_forward(forward_batch)
             self.attn_backend.init_forward_metadata(forward_batch)
         shadow = None
         if getattr(self, "_pdmux_index_shadow_enabled", False):

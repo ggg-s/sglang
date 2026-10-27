@@ -2,8 +2,9 @@
 
 Use `codex/pdmux-tp-cpu-overlap`. This configuration uses plain TP2, PP1,
 EP1, MoE-DP1, attention-CP1 and DCP1. Leave DP attention disabled. PDMux's
-duplicated communication groups cover full-width TP; subgroup parallelism
-remains rejected. CPU overlap is the asynchronous CPU/GPU scheduler for CUDA,
+duplicated communication groups cover full-width TP. The optional PCP path
+below also uses full-width groups; other subgroup parallelism remains rejected.
+CPU overlap is the asynchronous CPU/GPU scheduler for CUDA,
 and is enabled by omitting `--disable-overlap-schedule`.
 
 The DSpark prefill finalizer now broadcasts on the current prefill TP group;
@@ -76,6 +77,74 @@ checkpoint's DSpark block size unless the checkpoint explicitly supports a
 different size. After the smoke checks, rerun the original 4219-request long
 prompt workload, retaining server logs and comparing outputs with the control.
 The small tests do not establish long-run progress or performance gains.
+
+## Optional prefill context parallelism (PCP)
+
+The branch now admits an experimental DeepSeek-V4 DSpark PCP configuration:
+interleave, CP=TP, DP1, EP1, MoE-DP1, DCP1, PP1, and MoE A2A backend `none`.
+It requires a DeepSeek-V4 DSpark draft. Add these arguments to the launch above:
+
+```bash
+--enable-prefill-cp --cp-strategy interleave --dp-size 1 \
+--moe-a2a-backend none --cuda-graph-backend-prefill disabled
+```
+
+DSV4 resolves `enable_dp_attention=true` for PCP even with DP1. This specific
+case is admitted; actual DP attention with DP>1 is still rejected. CP and MoE-DP
+aliases of the full TP group now follow the active PDMux lane. Per-forward DP
+buffer sizes/counts and MoE collective flags have separate P/D storage. Split
+continuations restore CP's padded physical length on every segment. DSpark
+sampling/planning/acceptance sync spans the full CP group rather than the
+singleton attention-TP group.
+
+`--enable-cp-decode-attn-tp` can now be added to this configuration. The target
+and DSpark draft each cache an unregistered decode attention module with their
+own sliced projection Parameters, linear dimensions, radix head count and sink
+cache. PDMux forwards select that module without changing the prefill module or
+the context's global activation flag. Shards retain stable addresses for decode
+graphs; model refits refresh their contents in place. KV pools and HiCache layer
+identities remain shared, since KV layout does not depend on the query head TP.
+
+`--enable-torch-compile`, A2A MoE, partial-width CP, and PDMux `standard` prefill
+remain rejected for this path.
+Prefill CUDA graphs must be disabled; decode CUDA graphs remain available.
+Keep `SGLANG_RAGGED_VERIFY_MODE=static` (the default). `compact` is rejected
+because the DSV4 ragged-verify backend does not support CP. Do not enable TBO
+(`--enable-two-batch-overlap`): its micro-batch backend is not constructed by
+the PDMux backend setup.
+
+The eager draft logits path also keeps the full TP group under PCP. PCP's
+DP-attention flag must not select a singleton attention-TP group for the
+TP-sharded LM head. This matters when folded proposal is disabled, memory
+headroom disables draft graphs, or a batch falls outside the graph buckets.
+
+Run the full-model acceptance on the deployment host:
+
+```bash
+python -m pytest -v \
+  test/manual/pdmux/test_pdmux_tp_overlap_cuda.py::test_two_gpu_nccl_lanes_with_decode_graph \
+  test/manual/pdmux/test_dsv4_dspark_pcp_pdmux_hicache_tp2.py
+```
+
+The PCP file runs decode-graph and all-eager variants (folded proposal disabled),
+each with CP decode attention TP off and on. All inherit the host-reload parity
+and concurrent backup-progress checks. To run only the newly enabled variants:
+
+```bash
+python -m pytest -v \
+  test/manual/pdmux/test_dsv4_dspark_pcp_pdmux_hicache_tp2.py::TestDSV4DSparkPCPDecodeTP2CPUOverlapHiCache \
+  test/manual/pdmux/test_dsv4_dspark_pcp_pdmux_hicache_tp2.py::TestDSV4DSparkPCPDecodeTP2EagerCPUOverlapHiCache
+```
+
+Local regression uses an isolated PyTorch 2.8 CPU environment, including CP2/CP4
+projection parity for target/draft fixtures, FP8 scales and parameter subclasses,
+concurrent P/D scopes, stable addresses, refits and real two-process Gloo. The
+numeric fixtures run the production view/context code with small PyTorch
+linears; they do not run FlashMLA. A CUDA-only graph replay test is included in
+`test/registered/unit/multiplex/test_pdmux_cp_decode_attn_tp.py` and skips locally.
+The earlier validation JSON covers plain TP, not these PCP changes. Full-model
+multi-GPU correctness, NCCL progress, HiCache DMA and performance still need the
+acceptance run above and the original long-prompt workload.
 
 ## 4060 regression coverage
 

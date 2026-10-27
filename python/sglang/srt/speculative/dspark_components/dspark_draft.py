@@ -235,7 +235,11 @@ class DraftBlockProposer:
         self._draft_sampler = draft_sampler
 
     def _base_logits_context(self):
-        if self._dp_moe_sync:
+        # PCP enables DP-attention metadata with DP=1, but its LM head can
+        # still be sharded over the full TP group. Replacing TP with its
+        # singleton attention-TP group would drop the other vocabulary shards
+        # when folded proposal is disabled or cannot run for this batch.
+        if self._dp_moe_sync and get_parallel().attn_cp_size == 1:
             return draft_tp_context(get_parallel().attn_tp_group)
         return nullcontext()
 

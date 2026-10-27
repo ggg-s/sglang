@@ -8,10 +8,10 @@ from __future__ import annotations
 
 import logging
 from contextlib import contextmanager
+from copy import copy
 from typing import TYPE_CHECKING, Dict, List, Optional, Tuple
 
 import torch
-
 from sglang.srt.layers.attention.dsa.utils import dsa_use_prefill_cp
 from sglang.srt.layers.cp.utils import is_cp_active
 from sglang.srt.layers.radix_attention import RadixAttention
@@ -69,14 +69,15 @@ class CpDecodeAttnTpContext:
         return self.decode_tp_size is not None and self.decode_tp_size > 1
 
     def set_decode_attn_tp(self, forward_batch: ForwardBatch):
+        self.use_decode_attn_tp = self.should_use_decode_attn_tp(forward_batch)
+
+    def should_use_decode_attn_tp(self, forward_batch: ForwardBatch) -> bool:
+        """Pure selection: PDMux must not publish a process-wide forward flag."""
         if not self.is_enabled:
-            self.use_decode_attn_tp = False
-            return
+            return False
         # Skip during prefill context parallel (needs all heads); apply on every
         # other forward, which includes decode.
-        self.use_decode_attn_tp = not is_cp_active(
-            forward_batch
-        ) and not dsa_use_prefill_cp(forward_batch)
+        return not is_cp_active(forward_batch) and not dsa_use_prefill_cp(forward_batch)
 
     def _slice(self, tensor: torch.Tensor, dim: int) -> torch.Tensor:
         assert dim in (0, 1)
@@ -141,6 +142,94 @@ class CpDecodeAttnTpContext:
             if getattr(linear_instance, scale_name, None) is not None:
                 attrs.append((linear_instance, scale_name, dim))
         return attrs
+
+    @staticmethod
+    def _copy_module(module):
+        # nn.Module's shallow copy otherwise shares its registration dictionaries;
+        # replacing a child or Parameter would still modify the prefill module.
+        view = copy(module)
+        view._parameters = module._parameters.copy()
+        view._buffers = module._buffers.copy()
+        view._modules = module._modules.copy()
+        return view
+
+    @torch.inference_mode(False)
+    def make_decode_attention_view(self, attention, *, radix_attn_name: str):
+        """A persistent DSV4 decode module, without rebinding prefill weights.
+
+        The dim-0 shards alias immutable source storage. Row-parallel shards
+        retain the contiguous copies required by the existing slice path.
+        The caller caches this unregistered module so CUDA graphs retain stable
+        weight addresses without adding duplicate entries to the checkpoint.
+        """
+        assert self.is_enabled
+        assert attention.n_heads % self.decode_tp_size == 0
+        assert attention.n_groups % self.decode_tp_size == 0
+        view = self._copy_module(attention)
+        from sglang.srt.layers.linear import RowParallelLinear
+
+        for name in ("wq_b", "wo_a", "wo_b"):
+            linear = self._copy_module(getattr(attention, name))
+            for obj, attr_name, dim in self._get_linear_attrs(linear):
+                tensor = getattr(obj, attr_name, None)
+                if tensor is None:
+                    continue
+                assert (
+                    tensor.dim() > dim and tensor.shape[dim] % self.decode_tp_size == 0
+                ), (
+                    f"CP decode attn TP: {name}.{attr_name} shape {tensor.shape} "
+                    f"is not divisible by CP={self.decode_tp_size} along dim {dim}"
+                )
+                sliced = self._slice(tensor.detach(), dim)
+                if isinstance(tensor, torch.nn.Parameter):
+                    # Preserve quantized Parameter subclasses without rerunning
+                    # their loader-specific __init__ methods.
+                    sliced = torch.nn.Parameter.__new__(
+                        type(tensor), sliced, requires_grad=tensor.requires_grad
+                    )
+                # FP8 kernels read metadata attached to scale tensors.
+                sliced.__dict__.update(tensor.__dict__)
+                setattr(obj, attr_name, sliced)
+            size_attr = (
+                "input_size_per_partition"
+                if isinstance(linear, RowParallelLinear)
+                else "output_size_per_partition"
+            )
+            setattr(
+                linear, size_attr, getattr(linear, size_attr) // self.decode_tp_size
+            )
+            if isinstance(linear, RowParallelLinear):
+                linear.use_decode_attn_tp = True
+            setattr(view, name, linear)
+
+        radix_attn = self._copy_module(getattr(attention, radix_attn_name))
+        radix_attn.tp_q_head_num //= self.decode_tp_size
+        setattr(view, radix_attn_name, radix_attn)
+        view.n_local_heads = attention.n_heads // self.decode_tp_size
+        view.n_local_groups = attention.n_groups // self.decode_tp_size
+        view.attn_tp_rank = self.decode_tp_rank
+        view.attn_tp_size = self.decode_tp_size
+        # Never inherit a sink cached for prefill's full head count.
+        view._attn_sink_local = None
+        return view
+
+    def refresh_decode_attention_view(self, attention, view):
+        """Refresh refitted weights in place, preserving captured addresses."""
+        with torch.inference_mode():
+            for name in ("wq_b", "wo_a", "wo_b"):
+                for _, attr_name, dim in self._get_linear_attrs(getattr(view, name)):
+                    source = getattr(getattr(attention, name), attr_name, None)
+                    if source is not None:
+                        dest = getattr(getattr(view, name), attr_name)
+                        dest.copy_(self._slice(source.detach(), dim))
+                        dest.__dict__.update(source.__dict__)
+            sink = view._attn_sink_local
+            if sink is not None:
+                sink.zero_()
+                start = self.decode_tp_rank * view.n_local_heads
+                sink[: view.n_local_heads].copy_(
+                    attention.attn_sink[start : start + view.n_local_heads]
+                )
 
     # ==================== Context manager ====================
 

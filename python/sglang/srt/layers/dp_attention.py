@@ -31,6 +31,10 @@ from sglang.srt.distributed import (
 from sglang.srt.distributed.device_communicators.pynccl_allocator import (
     use_symmetric_memory,
 )
+from sglang.srt.distributed.parallel_state import (
+    is_pdmux_enabled,
+    is_pdmux_prefill_enabled,
+)
 from sglang.srt.environ import envs
 from sglang.srt.runtime_context import (
     derive_attention_widths,
@@ -149,7 +153,8 @@ class DpPaddingMode(IntEnum):
 class _DpGatheredBufferWrapper:
     """Facade for the DP gathered-buffer state: allocation metadata lives on
     ``flags.dp`` (set once at initialize_dp_attention). The per-forward
-    sizing quartet stays as class attributes: the values are read inside
+    sizing quartet stays as class attributes (separate subclasses per PDMux
+    lane): the values are read inside
     torch.compile-traced model code, and attribute-source ints get dynamo's
     automatic-dynamic treatment, while contextvars are untraceable and dict
     slots value-guard into the recompile limit (one recompile per distinct
@@ -271,6 +276,26 @@ class _DpGatheredBufferWrapper:
         return cls._dp_max_padding
 
 
+class _PdmuxPrefillDpBuffer(_DpGatheredBufferWrapper):
+    pass
+
+
+class _PdmuxDecodeDpBuffer(_DpGatheredBufferWrapper):
+    pass
+
+
+def _dp_buffer_wrapper():
+    # Preserve class-attribute ints for Dynamo outside PDMux. The two lanes
+    # must never overwrite each other's lengths, padding mode or count tensor.
+    if is_pdmux_enabled():
+        return (
+            _PdmuxPrefillDpBuffer
+            if is_pdmux_prefill_enabled()
+            else _PdmuxDecodeDpBuffer
+        )
+    return _DpGatheredBufferWrapper
+
+
 def set_dp_buffer_len(
     global_dp_buffer_len: int,
     local_dp_buffer_len: int,
@@ -278,7 +303,7 @@ def set_dp_buffer_len(
     global_num_tokens: Optional[List[int]] = None,
     global_num_tokens_gpu: Optional[torch.Tensor] = None,
 ):
-    _DpGatheredBufferWrapper.set_dp_buffer_len(
+    _dp_buffer_wrapper().set_dp_buffer_len(
         global_dp_buffer_len,
         local_dp_buffer_len,
         dp_max_padding,
@@ -288,43 +313,43 @@ def set_dp_buffer_len(
 
 
 def get_global_dp_buffer(group: GroupCoordinator) -> torch.Tensor:
-    return _DpGatheredBufferWrapper.get_global_dp_buffer(group=group)
+    return _dp_buffer_wrapper().get_global_dp_buffer(group=group)
 
 
 def get_local_dp_buffer(group: GroupCoordinator) -> torch.Tensor:
-    return _DpGatheredBufferWrapper.get_local_dp_buffer(group=group)
+    return _dp_buffer_wrapper().get_local_dp_buffer(group=group)
 
 
 def get_local_dp_buffer_mhc(group: GroupCoordinator, n: int = 1) -> torch.Tensor:
-    return _DpGatheredBufferWrapper.get_local_dp_buffer_mhc(group=group, n=n)
+    return _dp_buffer_wrapper().get_local_dp_buffer_mhc(group=group, n=n)
 
 
 def get_global_dp_buffer_len() -> int:
-    return _DpGatheredBufferWrapper.get_global_dp_buffer_len()
+    return _dp_buffer_wrapper().get_global_dp_buffer_len()
 
 
 def get_local_dp_buffer_len() -> int:
-    return _DpGatheredBufferWrapper.get_local_dp_buffer_len()
+    return _dp_buffer_wrapper().get_local_dp_buffer_len()
 
 
 def set_local_dp_buffer_len(local_dp_buffer_len: int) -> None:
-    _DpGatheredBufferWrapper.set_local_dp_buffer_len(local_dp_buffer_len)
+    _dp_buffer_wrapper().set_local_dp_buffer_len(local_dp_buffer_len)
 
 
 def get_dp_global_num_tokens() -> List[int]:
-    return _DpGatheredBufferWrapper.get_dp_global_num_tokens()
+    return _dp_buffer_wrapper().get_dp_global_num_tokens()
 
 
 def get_dp_hidden_size() -> int:
-    return _DpGatheredBufferWrapper.get_dp_hidden_size()
+    return _dp_buffer_wrapper().get_dp_hidden_size()
 
 
 def get_dp_dtype() -> torch.dtype:
-    return _DpGatheredBufferWrapper.get_dp_dtype()
+    return _dp_buffer_wrapper().get_dp_dtype()
 
 
 def get_dp_device() -> torch.device:
-    return _DpGatheredBufferWrapper.get_dp_device()
+    return _dp_buffer_wrapper().get_dp_device()
 
 
 def set_is_extend_in_batch(is_extend_in_batch: bool):
@@ -341,7 +366,7 @@ def get_is_extend_in_batch() -> bool:
 
 
 def is_dp_max_padding() -> bool:
-    return _DpGatheredBufferWrapper.is_dp_max_padding()
+    return _dp_buffer_wrapper().is_dp_max_padding()
 
 
 def compute_dp_attention_world_info(
@@ -689,10 +714,10 @@ def mask_dp_pad_moe_topk_ids(topk_ids: torch.Tensor) -> None:
     the mapping table's last entry).  Capture-safe: per-batch state is read
     only from the replay-updated global_num_tokens_gpu tensor.
     """
-    counts = _DpGatheredBufferWrapper.get_dp_global_num_tokens_gpu()
+    counts = _dp_buffer_wrapper().get_dp_global_num_tokens_gpu()
     if counts is None:
         return
-    max_len = _DpGatheredBufferWrapper.get_local_dp_buffer_len()
+    max_len = _dp_buffer_wrapper().get_local_dp_buffer_len()
     rows, topk = topk_ids.shape
     if max_len <= 0 or rows != counts.shape[0] * max_len:
         # Layout mismatch (e.g. non-DP or logits-path caller): do nothing.
@@ -751,7 +776,7 @@ def is_dp_gatherv_active() -> bool:
       - SUM_LEN padding mode. The gatherv pair (all_gatherv + reduce_scatterv) is
         only valid under SUM_LEN; under MAX_LEN the buffer is equal-padded and the
         gather/combine use all_gather / (aiter) reduce_scatter instead. Reading the
-        per-forward padding via _DpGatheredBufferWrapper.is_dp_max_padding() (set by
+        per-forward padding via _dp_buffer_wrapper().is_dp_max_padding() (set by
         set_dp_buffer_len) keeps callers that lack a ForwardBatch (e.g.
         dp_reduce_scatter_tensor) consistent."""
     return (
@@ -759,7 +784,7 @@ def is_dp_gatherv_active() -> bool:
         and not world_dp_gather_enabled()
         and get_attn_tensor_model_parallel_world_size() == 1
         and get_tensor_model_parallel_world_size() == get_attention_dp_size()
-        and not _DpGatheredBufferWrapper.is_dp_max_padding()
+        and not _dp_buffer_wrapper().is_dp_max_padding()
     )
 
 

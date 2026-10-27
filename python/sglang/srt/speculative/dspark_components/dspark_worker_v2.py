@@ -163,6 +163,12 @@ class DSparkWorkerV2(BaseSpecWorker):
             )
 
         self._draft_is_moe = draft_is_deepseek_v4()
+        if (
+            disagg.enable_pdmux
+            and get_parallel().enable_prefill_cp
+            and not self._draft_is_moe
+        ):
+            raise ValueError("PDMux prefill CP requires a DeepSeek-V4 DSpark draft.")
         self._draft_dp_context_enabled = (
             get_parallel().enable_dp_attention and not self._draft_is_moe
         )
@@ -228,9 +234,11 @@ class DSparkWorkerV2(BaseSpecWorker):
         self._mask_token_id = runtime_config.mask_token_id
 
         parallel = get_parallel()
+        # PCP sets enable_dp_attention with DP=1, but its decisions must
+        # agree across CP ranks, not the singleton attention-TP groups.
         self._tp_sync = SpecTpSync(
             parallel.attn_tp_group
-            if parallel.enable_dp_attention
+            if parallel.enable_dp_attention and parallel.attn_cp_size == 1
             else parallel.tp_group
         )
         self._draft_graph_group = (
@@ -612,7 +620,10 @@ class DSparkWorkerV2(BaseSpecWorker):
             next_token_ids,
             group=(
                 get_parallel().attn_tp_group
-                if get_parallel().enable_dp_attention
+                if (
+                    get_parallel().enable_dp_attention
+                    and get_parallel().attn_cp_size == 1
+                )
                 else get_tp_group()
             ),
         )

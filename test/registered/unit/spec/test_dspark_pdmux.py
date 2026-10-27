@@ -88,6 +88,7 @@ class TestDSparkPDMux(unittest.TestCase):
                             f"{WORKER_MODULE}.get_parallel",
                             return_value=SimpleNamespace(
                                 enable_dp_attention=dp_attention,
+                                attn_cp_size=1,
                                 attn_tp_group=attn_group,
                             ),
                         ),
