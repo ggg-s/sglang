@@ -327,7 +327,9 @@ def _exercise_chunked_scheduler(rank, group, *, overlap):
             return self.polls > rank + 1
 
     stream = NS(
-        record_event=Event, synchronize=lambda: None, wait_event=lambda event: None
+        record_event=Event,
+        synchronize=lambda: trace.append(("stream_drain", rank)),
+        wait_event=lambda event: None,
     )
     methods = load_methods(
         "multiplex/multiplexing_mixin.py",
@@ -438,6 +440,9 @@ def _exercise_chunked_scheduler(rank, group, *, overlap):
     except StopIteration:
         pass
     assert merged == [0, 1, 2]
+    assert not any(row[0] == "stream_drain" for row in trace), (
+        "Unchanged stream selection drained at a chunk boundary"
+    )
     # The overlap path really submits N before committing N-1. The synchronous
     # path must retain the reverse order while exercising the same TP votes.
     second_decode = trace.index(("decode", 2))

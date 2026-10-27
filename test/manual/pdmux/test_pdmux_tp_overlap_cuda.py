@@ -137,6 +137,58 @@ def test_single_gpu_nccl_lanes_with_decode_graph():
         run_rank(0, 1, str(Path(tmp) / "store"))
 
 
+def test_same_group_selection_keeps_cuda_graph_work_queued_and_transition_drains():
+    """Real CUDA work and graph replay across repeated chunk selections."""
+    state, drains, rebound = [0], [], []
+    raw_streams = [torch.cuda.Stream() for _ in range(4)]
+    values = [torch.zeros(32, device="cuda") for _ in range(2)]
+    graph = torch.cuda.CUDAGraph()
+    for stream in raw_streams:
+        stream.wait_stream(torch.cuda.current_stream())
+    with torch.cuda.graph(graph, stream=raw_streams[1]):
+        values[1].add_(1)
+    torch.cuda.synchronize()
+    values[1].zero_()
+    raw_streams[1].wait_stream(torch.cuda.current_stream())
+
+    class Stream:
+        def __init__(self, idx):
+            self.idx = idx
+
+        def synchronize(self):
+            raw_streams[self.idx].synchronize()
+            drains.append(self.idx)
+
+    activate = load_methods(
+        "multiplex/multiplexing_mixin.py",
+        "SchedulerMultiplexMixin",
+        ["_activate_pdmux_stream_group"],
+        get_current_stream_idx=lambda: state[0],
+        set_current_stream_idx=lambda idx: state.__setitem__(0, idx),
+    )["_activate_pdmux_stream_group"]
+    from types import SimpleNamespace
+
+    scheduler = SimpleNamespace(
+        stream_groups=[(Stream(0), Stream(1)), (Stream(2), Stream(3))],
+        _update_decode_attn_backends=lambda idx: rebound.append(idx),
+    )
+    for _ in range(32):
+        with torch.cuda.stream(raw_streams[0]):
+            values[0].add_(1)
+        with torch.cuda.stream(raw_streams[1]):
+            graph.replay()
+        activate(scheduler, 0)
+    assert drains == []
+    assert rebound == []
+    # A real transition must complete both old lanes before rebinding metadata.
+    activate(scheduler, 1)
+    assert drains == [0, 1]
+    assert rebound == [1]
+    assert state == [1]
+    for value in values:
+        torch.testing.assert_close(value, torch.full_like(value, 32))
+
+
 @pytest.mark.skipif(
     torch.cuda.device_count() < 2, reason="Two distinct CUDA GPUs required"
 )

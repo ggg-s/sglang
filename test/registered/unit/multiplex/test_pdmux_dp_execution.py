@@ -587,6 +587,7 @@ class TestActualLoop(CustomTestCase):
         )
         names = [
             "event_loop_pdmux_layer_split",
+            "_activate_pdmux_stream_group",
             "_select_pdmux_stream_idx",
             "_get_pdmux_dp_stream_idx",
             "_get_split_forward_count",

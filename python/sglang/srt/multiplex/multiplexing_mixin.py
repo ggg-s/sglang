@@ -178,6 +178,25 @@ class SchedulerMultiplexMixin:
         stream_idx = self._select_pdmux_stream_idx(
             has_prefill=has_prefill, decode_bs=running_batch.batch_size()
         )
+        return self._activate_pdmux_stream_group(stream_idx)
+
+    def _activate_pdmux_stream_group(
+        self: Scheduler, stream_idx: int
+    ) -> tuple[int, tuple[ExternalStream, ExternalStream]]:
+        """Drain and rebind only when the physical stream group changes.
+
+        Chunk formation/completion requests a new selection even when the same
+        shared group still fits. That is not a transition: its P/D dependencies
+        are already published by formation and merge events. Draining there
+        stalls host submission behind unrelated queued decode work.
+        """
+        current_idx = get_current_stream_idx()
+        if stream_idx == current_idx:
+            return stream_idx, self.stream_groups[stream_idx]
+        if not getattr(self, "pdmux_temporal_layers", 0):
+            prefill_stream, decode_stream = self.stream_groups[current_idx]
+            prefill_stream.synchronize()
+            decode_stream.synchronize()
         set_current_stream_idx(stream_idx)
         self._update_decode_attn_backends(stream_idx)
         return stream_idx, self.stream_groups[stream_idx]
@@ -917,16 +936,10 @@ class SchedulerMultiplexMixin:
                     self.on_idle()
 
             if adjust_stream_group:
-                # Temporal mode always uses the same physical stream/backend
-                # group. Preserve its queued work and normal overlap pipeline.
-                if not getattr(self, "pdmux_temporal_layers", 0):
-                    prefill_stream.synchronize()
-                    decode_stream.synchronize()
                 if self.ps.attn_dp_size > 1:
-                    stream_idx = next_stream_idx
-                    set_current_stream_idx(stream_idx)
-                    self._update_decode_attn_backends(stream_idx)
-                    stream_group = self.stream_groups[stream_idx]
+                    stream_idx, stream_group = self._activate_pdmux_stream_group(
+                        next_stream_idx
+                    )
                 else:
                     stream_idx, stream_group = self.adjust_stream_groups(
                         running_batch=running_batch,
@@ -1350,8 +1363,6 @@ class SchedulerMultiplexMixin:
             # streams and rebinds the decode attention backends. A pending
             # prefill is fine -- it is submitted below, on the new lane.
             if adjust_stream_group and self._pdmux_prefill_inflight is None:
-                prefill_stream.synchronize()
-                decode_stream.synchronize()
                 stream_idx, stream_group = self.adjust_stream_groups(
                     running_batch=running_batch,
                     has_prefill=self._pdmux_prefill_pending is not None,
