@@ -97,3 +97,19 @@ prefill-max-requests, chunk size, split budget, maximum split layers and SM caps
 Use time-weighted queue/KV occupancy and separate queue wait from GPU prefill
 service. Rerun the same 400-request/c=24 workload after the fix; the 4060 checks
 validate ordering and progress, not DSV4 end-to-end TTFT or throughput.
+
+## Validation results
+
+Tested source: `703d479a282324f9cfaa06339f42469982473081`, pulled over SSH on
+the RTX 4060 Laptop workstation (PyTorch 2.13.0+cu130). The complete registered
+`unit/multiplex` directory plus `test_dsv4_pcp_resolution.py` and
+`observability/test_forward_pass_metrics.py` passed: **234 tests and 298
+subtests**, no failures. `test_pdmux_tp_overlap_cuda.py` passed both the native
+singleton-NCCL case and the new CUDA graph/group-transition case; the distinct
+two-GPU NCCL case skipped. Both pre-fix regression checks failed with the
+expected assertions against the parent source without changing workspace files.
+
+Workstation evidence is under `/workspace/cp-decode-review-20261027/` in
+`prefill-progress-unit.log` and `prefill-progress-cuda.log`. The source changes
+do not implement additional active prefill batches, alter the configured split
+budget or shard DSV4 KV storage.

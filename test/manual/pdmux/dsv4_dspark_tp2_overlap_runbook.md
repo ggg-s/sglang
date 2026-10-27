@@ -105,6 +105,9 @@ published configuration. `test_dsv4_pcp_resolution.py` covers the real pipeline,
 readback and pickled worker publication without loading model weights.
 The subsequent full-chain audit, including real decode-context activation and
 24 CLI combinations, is documented in `dsv4_pcp_configuration_audit_20261027.md`.
+For chunk-boundary scheduling fixes, the provisional 32k split budget and why
+this DSV4 PCP path does not shard KV storage, see
+`dsv4_pdmux_prefill_progress_20261027.md`.
 
 `--enable-cp-decode-attn-tp` can now be added to this configuration. The target
 and DSpark draft each cache an unregistered decode attention module with their
