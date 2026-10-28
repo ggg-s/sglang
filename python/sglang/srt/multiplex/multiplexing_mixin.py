@@ -1336,7 +1336,6 @@ class SchedulerMultiplexMixin:
         logger.debug("Starting event loop for pd multiplexing (standard prefill)...")
 
         while True:
-            inflight = self._pdmux_prefill_inflight
             with torch.cuda.stream(decode_stream):
                 set_pdmux_status(False)
                 # Grammar and CPU-dependent penalizers need committed tokens
@@ -1354,6 +1353,7 @@ class SchedulerMultiplexMixin:
                     publish_carried_tensors(self.running_batch, decode_stream)
                 self.ingest_requests()
                 running_batch = self.running_batch
+                inflight = self._pdmux_prefill_inflight
                 # E0 covers input handling AND every previous decode-side
                 # write (results, retraction, HiCache pump). It is consumed
                 # only when forming a batch, so skip recording it in flight.

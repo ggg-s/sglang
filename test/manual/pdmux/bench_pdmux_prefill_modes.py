@@ -1,7 +1,7 @@
 """Fixed-work CUDA scheduling comparison, not a DSV4/DSPARK benchmark.
 
-Runs production standard/layer_split loops with fixture model/cache/TP peers,
-and a minimal single-stream reference with the same GEMMs and decode replays.
+Runs production standard/layer_split and generic overlap scheduler loops with
+fixture model/cache/TP peers, the same GEMMs and decode replays.
 All modes execute identical GPU arithmetic. There is no FlashMLA, DSpark
 proposal/verify, NCCL, CP communication, HiCache DMA or green-context SM cap.
 """
@@ -9,6 +9,7 @@ proposal/verify, NCCL, CP communication, HiCache DMA or green-context SM cap.
 from __future__ import annotations
 
 import argparse
+import inspect
 import json
 import statistics
 import subprocess
@@ -30,6 +31,7 @@ from test_pdmux_standard_prefill import (
 )
 
 from sglang.srt.multiplex import multiplexing_mixin as mux
+from sglang.srt.managers.scheduler import Scheduler as NativeScheduler
 
 
 class Scheduler(_FakeScheduler):
@@ -50,6 +52,8 @@ class Scheduler(_FakeScheduler):
         ]
         self.decode_steps = decode_steps
         self.decode_count = self.prefill_calls = self.prefill_layer_count = 0
+        self.last_decode_result = None
+        self.last_decode_processed = True
         self.prefill_submit_ns = 0
         self.weight = torch.eye(256, device="cuda") * 0.5
         self.decode_input = torch.ones((32, 256), device="cuda")
@@ -86,6 +90,8 @@ class Scheduler(_FakeScheduler):
     def process_batch_result(self, batch, result):
         result.copy_done.synchronize()
         super().process_batch_result(batch, result)
+        if self.last_decode_result is not None and result is self.last_decode_result[1]:
+            self.last_decode_processed = True
 
     def run_batch(self, batch):
         prefill = (
@@ -110,12 +116,60 @@ class Scheduler(_FakeScheduler):
             payload = self.decode_output
         event = torch.cuda.Event()
         event.record()
-        return NS(
+        result = NS(
             is_prefill=prefill,
             submitted_iteration=self.iteration,
             copy_done=event,
             extra_keep_alive_refs=[batch, payload],
         )
+        if not prefill:
+            self.last_decode_result = (batch.copy(), result)
+            self.last_decode_processed = False
+        return result
+
+
+def run_native_overlap(scheduler):
+    """Production overlap loop, with the same fixed-work admission fixture."""
+    scheduler.pdmux_standard = True  # fixture worker executes full chunks
+    scheduler.gracefully_exit = scheduler._engine_paused = False
+    scheduler.last_batch = None
+    scheduler.is_generation = True
+    scheduler.enable_unified_memory = False
+    scheduler._apply_war_barrier = lambda: None  # private fixture inputs
+    scheduler.is_disable_overlap_for_batch = lambda *args, **kwargs: False
+    scheduler.launch_batch_sample_if_needed = lambda *args: None  # no sampler
+    next_chunk = [0]
+
+    def plan(*, running_batch, last_batch):
+        index = next_chunk[0]
+        if index < len(scheduler.chunks) and scheduler.decode_count >= (
+            index * scheduler.decode_steps // len(scheduler.chunks)
+        ):
+            batch = scheduler.chunks[index]
+            next_chunk[0] += 1
+        else:
+            batch = (
+                running_batch
+                if scheduler.decode_count < scheduler.decode_steps
+                else None
+            )
+        return NS(running_batch=running_batch, batch_to_run=batch)
+
+    worker = scheduler.run_batch
+
+    def forward(batch):
+        scheduler._pdmux_prefill_batch = (
+            batch if any(batch is chunk for chunk in scheduler.chunks) else None
+        )
+        try:
+            with torch.cuda.stream(scheduler.stream_groups[0][1]):
+                return worker(batch)
+        finally:
+            scheduler._pdmux_prefill_batch = None
+
+    scheduler.get_next_batch_to_run = plan
+    scheduler.run_batch = forward
+    inspect.unwrap(NativeScheduler.event_loop_overlap)(scheduler)
 
 
 def run(mode, *, rows, layers, chunks, decode_steps, split_layers):
@@ -130,42 +184,27 @@ def run(mode, *, rows, layers, chunks, decode_steps, split_layers):
     _STREAM_IDX[0] = 0
     torch.cuda.synchronize()
     wall = time.perf_counter_ns()
-    if mode == "single_stream_reference":
-        # Minimal fixed-work reference, not the native SGLang/DSPARK scheduler.
-        stream = scheduler.stream_groups[0][1]
-        with torch.cuda.stream(stream):
-            done = 0
-            for i, batch in enumerate(scheduler.chunks):
-                start = time.perf_counter_ns()
-                for _ in range(layers):
-                    batch.hidden = torch.nn.functional.linear(
-                        batch.hidden, scheduler.weight
-                    )
-                scheduler.prefill_submit_ns += time.perf_counter_ns() - start
-                scheduler.prefill_calls += 1
-                scheduler.prefill_layer_count += layers
-                next_done = (i + 1) * decode_steps // chunks
-                for _ in range(next_done - done):
-                    scheduler.decode_graph.replay()
-                    scheduler.decode_count += 1
-                done = next_done
-    else:
-        with (
-            patch.object(mux, "get_current_stream_idx", lambda: _STREAM_IDX[0]),
-            patch.object(
-                mux,
-                "set_current_stream_idx",
-                lambda idx: _STREAM_IDX.__setitem__(0, idx),
-            ),
-            patch.object(mux.dist, "get_world_size", lambda group: 2),
-            patch.object(torch.cuda, "empty_cache", lambda: None),
-        ):
-            try:
+    try:
+        if mode == "native_overlap_reference":
+            run_native_overlap(scheduler)
+        else:
+            with (
+                patch.object(mux, "get_current_stream_idx", lambda: _STREAM_IDX[0]),
+                patch.object(
+                    mux,
+                    "set_current_stream_idx",
+                    lambda idx: _STREAM_IDX.__setitem__(0, idx),
+                ),
+                patch.object(mux.dist, "get_world_size", lambda group: 2),
+                patch.object(torch.cuda, "empty_cache", lambda: None),
+            ):
                 scheduler.event_loop_pdmux()
-            except _LoopFinished:
-                pass
-            finally:
-                mux.set_pdmux_status(False)
+    except _LoopFinished:
+        pass
+    finally:
+        mux.set_pdmux_status(False)
+    if not scheduler.last_decode_processed:
+        scheduler.process_batch_result(*scheduler.last_decode_result)
     torch.cuda.synchronize()
     wall_ms = (time.perf_counter_ns() - wall) / 1e6
     assert scheduler.decode_count == decode_steps, scheduler.decode_count
@@ -198,7 +237,7 @@ def main():
     parser.add_argument("--split-layers", type=int, default=2)
     args = parser.parse_args()
     assert torch.cuda.is_available()
-    modes = ["single_stream_reference", "layer_split", "standard"]
+    modes = ["native_overlap_reference", "layer_split", "standard"]
     result = dict(
         source_commit=subprocess.check_output(
             ["git", "rev-parse", "HEAD"], cwd=ROOT, text=True
