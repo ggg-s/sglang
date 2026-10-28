@@ -10,7 +10,9 @@ maybe_stub_sgl_kernel()
 from sglang.srt.environ import envs  # noqa: E402
 from sglang.srt.managers.scheduler_components import dp_attn  # noqa: E402
 from sglang.srt.model_executor.forward_batch_info import ForwardMode  # noqa: E402
+from sglang.srt.runtime_context import get_context  # noqa: E402
 from sglang.srt.speculative.spec_info import SpeculativeAlgorithm  # noqa: E402
+from sglang.srt.utils.common import require_mlp_tp_gather  # noqa: E402
 
 register_cpu_ci(est_time=11, suite="base-a-test-cpu")
 
@@ -24,6 +26,11 @@ class TestDPAttnSchedulerMetadata(CustomTestCase):
             self.assertTrue(dp_attn.should_skip_scheduler_all_gather(dp_size=2))
 
     def test_dp1_skip_preserves_local_tbo_metadata(self):
+        for attn_tp_size, attn_cp_size in ((4, 1), (1, 2), (1, 8)):
+            with self.subTest(attn_tp=attn_tp_size, cp=attn_cp_size):
+                self._check_dp1_local_metadata(attn_tp_size, attn_cp_size)
+
+    def _check_dp1_local_metadata(self, attn_tp_size, attn_cp_size):
         batch = SimpleNamespace(
             forward_mode=ForwardMode.DECODE,
             batch_size=lambda: 4,
@@ -36,6 +43,14 @@ class TestDPAttnSchedulerMetadata(CustomTestCase):
         tbo_preparer.compute_output.return_value = (2, ForwardMode.DECODE)
 
         with (
+            get_context().override_server_args(
+                enable_dp_attention=True,
+                dp_size=1,
+                tp_size=attn_tp_size * attn_cp_size,
+                attn_cp_size=attn_cp_size,
+                moe_dense_tp_size=1,
+                enable_pdmux=False,
+            ),
             envs.SGLANG_SCHEDULER_SKIP_ALL_GATHER.override(False),
             patch.object(dp_attn, "TboDPAttentionPreparer", return_value=tbo_preparer),
             patch.object(dp_attn, "world_dp_gather_enabled", return_value=False),
@@ -50,8 +65,8 @@ class TestDPAttnSchedulerMetadata(CustomTestCase):
                     model_config=object(),
                 ),
                 dp_size=1,
-                attn_tp_size=4,
-                attn_cp_size=1,
+                attn_tp_size=attn_tp_size,
+                attn_cp_size=attn_cp_size,
                 tp_group=SimpleNamespace(
                     device_group=object(), device="cpu", cpu_group=object()
                 ),
@@ -59,7 +74,7 @@ class TestDPAttnSchedulerMetadata(CustomTestCase):
                     side_effect=AssertionError("DP1 must not emit idle batch")
                 ),
                 disable_cuda_graph=False,
-                require_mlp_tp_gather=False,
+                require_mlp_tp_gather=require_mlp_tp_gather(),
                 disable_overlap_schedule=True,
                 offload_tags=set(),
             )
