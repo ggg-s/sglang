@@ -61,6 +61,13 @@ class Scheduler(_FakeScheduler):
         self.decode_graph = torch.cuda.CUDAGraph()
         stream = self.stream_groups[0][1]
         stream.wait_stream(torch.cuda.current_stream())
+        # cuBLAS handle/workspace initialization cannot happen inside capture.
+        with torch.cuda.stream(stream):
+            value = self.decode_input
+            for _ in range(4):
+                value = torch.nn.functional.linear(value, self.weight)
+            self.decode_output.copy_(value)
+        stream.synchronize()
         with torch.cuda.graph(self.decode_graph, stream=stream):
             value = self.decode_input
             for _ in range(4):
@@ -74,6 +81,10 @@ class Scheduler(_FakeScheduler):
         for pair in self.stream_groups:
             for stream in pair:
                 stream.wait_event(ready)
+            # Each repeat owns fresh streams. Warm the per-stream cuBLAS
+            # workspace outside the timed region, including every prefill lane.
+            with torch.cuda.stream(pair[0]):
+                torch.nn.functional.linear(self.chunks[0].hidden, self.weight)
 
     def _recv_requests(self):
         if (
