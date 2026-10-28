@@ -8,7 +8,7 @@ repos:
       - id: check-symlinks
       - id: destroyed-symlinks
       - id: trailing-whitespace
-        # Preserve the supplied handoff control plane and reference inputs byte-for-byte.
+        # Preserve handoff baseline formatting for targeted gateway fixes and reference inputs.
         exclude: ^plugins/remote_attn/(control_plane/|migration/)
       - id: end-of-file-fixer
         exclude: ^plugins/remote_attn/(control_plane/|migration/)

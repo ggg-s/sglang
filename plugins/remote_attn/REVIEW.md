@@ -3,7 +3,7 @@
 本次复查针对本地 `main@1335d372f0a58857422e40b89a097daa7d3bf86c` 的插件适配，
 重点追踪 TP2 命令、源/目标 KV 所有权、逐层 LOCAL 切换和传输/计算之间的依赖。
 初轮接口检查和 CPU 测试没有覆盖以下运行时问题；本轮已修复并补充回归。
-控制面两个 Python 文件保持原样。
+原始移植保留控制面；后续已在 gateway 修复 C1 epoch 交互，driver 仍保持原样。
 
 ## 发现及修复
 
@@ -42,7 +42,7 @@ ACK 等待前必须发送旧 layer control，避免形成控制消息与槽位�
 
 ## 验证证据
 
-- 31 项 CPU 回归通过；请求 row 与 KV allocator 使用本分支真实实现的 source-loaded 方法和真实 CPU tensor。
+- 36 项 CPU 回归通过；请求 row 与 KV allocator 使用本分支真实实现的 source-loaded 方法和真实 CPU tensor。
 - 真实双进程 Gloo TP2：leader-only poll、普通请求/timeout-abort 与 control 混合广播、双方成功、
   单 rank 失败、调度状态分歧、双方一致拒绝。
 - CPU tensor + 可控 CUDA/TE/socket 边界：验证 rank 设备、TE 完成前不覆盖 staging、
@@ -80,3 +80,6 @@ CUDA trace 记录到独立 stream 上 H2D 与 GEMM 的重叠。详见
 部分执行的命令；registered host buffer 的远端完成状态不明时会保留到进程退出，status 中的
 `quarantined_transfers` 可见这部分内存。无法 fence 的 GPU KV 也会保留，需要进程重启回收。
 TP Graph-on、异构 TP、跨主机、其他 KV layout 不在本次支持范围内。
+
+C1 重复预留 epoch 交互、预留不足的重复 free，以及 host 缓冲区完成凭据/注销重试已修复，
+详见 [C1-RECLAIM.md](validation/C1-RECLAIM.md)。原文中“保留到进程退出”的描述仅适用于仍无法证明完成或无法 fence 的状态。

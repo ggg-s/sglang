@@ -16,9 +16,9 @@ still need acceptance on the target deployment.
   Remote, Fast Freeze/Resume, RemoteHub, progressive LOCAL, epochs, fences and leases.
 - `sglang_remote_attn/hooks.py`: 16 function-boundary hooks. No scheduler event
   loop, graph runner, allocation function or Mooncake connector is copied/replaced.
-- `control_plane/p2d_driver.py` and `p4_gateway.py`: byte-for-byte copies of the
-  supplied control plane. Its local file protocol, loopback sockets, state paths
-  and gateway behavior remain experimental.
+- `control_plane/p2d_driver.py`: original supplied driver. `p4_gateway.py` now
+  carries a targeted C1 reservation/epoch fix; its protocol and fixed state paths
+  remain experimental. Original input hashes stay in the provenance manifest.
 - `deploy/`: the three functional P/D0/D1 TP2 launch configurations and common
   transport defaults. Ports, GPU assignments and topology retain the supplied defaults.
 - `migration/`: the supplied reference patches and porting instructions, plus
@@ -106,7 +106,7 @@ PYTHONPATH=plugins/remote_attn python -m sglang_remote_attn.check --source-only
 
 ## Local validation
 
-- 31 CPU contract tests passed, using real CPU PyTorch tensors and source-loaded
+- 36 CPU contract tests passed, using real CPU PyTorch tensors and source-loaded
   upstream pool/KV methods. The local environment lacks the full SGLang model/eval
   dependencies, so its reduced test harness also source-loaded the repository's
   `CustomTestCase`; full installed-runtime import was not exercised locally.
@@ -121,7 +121,8 @@ PYTHONPATH=plugins/remote_attn python -m sglang_remote_attn.check --source-only
   wheel entry-point metadata checks passed.
 - Launcher checks captured the real shell commands and environment without starting
   servers: all three retain GPU pairs, ports, TP2, role directories and required envs.
-- Both control-plane files still match their supplied SHA256 values.
+- The driver still matches its supplied SHA256; the gateway changes are covered
+  by C1 reservation, stale-epoch and cutover/drain ordering regressions.
 - RTX 4060 Laptop (8 GB): FP16/BF16 split-prefix attention matched an FP32
   reference; five real two-process CUDA/Mooncake transfer configurations and
   a cancellation/reuse check passed. A CUDA trace recorded H2D/GEMM overlap.
@@ -139,8 +140,11 @@ python test/registered/unit/plugins/test_remote_attn.py
 
 See [REVIEW.md](REVIEW.md) for the review findings, fixes and remaining GPU
 acceptance requirements. On uncertain transport completion, registered host
-buffers are quarantined until process exit; `quarantined_transfers` in status
-reports them. A CUDA reader/writer that cannot be fenced prevents KV reuse.
+buffers are quarantined until completion is proven; `quarantined_transfers` in
+status reports them. A completed local-drop transfer releases host storage
+without requiring every layer to be LOCAL. For disconnects, sender completion
+records under the shared control root allow idle-loop retries after CUDA fencing.
+Native unregister failures retain storage and retry too. A CUDA reader/writer that cannot be fenced prevents KV reuse.
 These failures can retain memory and require a process restart. TP command
 agreement stops inconsistent scheduling; it does not provide atomic rollback
 or automatic recovery after a partial-rank failure.
@@ -212,7 +216,7 @@ D0 additionally retains `HANDOFF_FAST_FREEZE=1`, `HANDOFF_FAST_BUFFERS=2`,
 `HANDOFF_REMOTE_HIGH_PRIORITY=1`. Both decode roles retain
 `HANDOFF_REMOTE_FALLBACK_MS=10000`. Existing env values may override defaults.
 
-Start the unchanged gateway:
+Start the gateway:
 
 ```bash
 HANDOFF_CTL_DIR="$HANDOFF_CTL_ROOT" \
@@ -223,7 +227,7 @@ HANDOFF_ADMISSION_POLICY=decoupled \
 "$HANDOFF_PYTHON" plugins/remote_attn/control_plane/p4_gateway.py --port 31080
 ```
 
-The unchanged control plane still stores its journal under
+The control plane still stores its journal under
 `/workspace/handoff_state`. Use separate state paths/containers when running
 multiple experiments; changing those control-plane paths is outside this port.
 
@@ -244,3 +248,6 @@ multiple experiments; changing those control-plane paths is outside this port.
 The source module's original local test/control surface and authentication
 assumptions are retained. This port does not add a production router, automatic
 scaling, gateway SSE reconnect or P5.19 functionality.
+
+See [C1 and host-reclaim fixes](validation/C1-RECLAIM.md) for completion proof,
+retry cleanup, compatibility and the remaining unprovable-completion boundary.

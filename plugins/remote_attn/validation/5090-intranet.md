@@ -41,7 +41,7 @@ P5.18 的 watchdog、claim、epoch、fence、resume/abort_import 检查均在位
 
 C4 只覆盖四条请求中的一条实际迁移，不能视为四条都经历迁移。
 C1 直连场景的 `ROLLED_BACK` 在旧栈也复现，报告归因于 gateway pre-reserve / cutover reserve 的 epoch 交互；
-这是仍保留的共同问题，本次两项修复不处理它。
+这是当时保留的共同问题；后续仓库修复见 [C1-RECLAIM.md](C1-RECLAIM.md)，需要内网再次验收。
 
 ## 问题一：原部署 N=8 在新 main 上造成同步拆批
 

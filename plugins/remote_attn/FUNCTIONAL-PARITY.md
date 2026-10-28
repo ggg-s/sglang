@@ -20,9 +20,9 @@ runtime 环境变量开关及默认值保留；部署批次默认值因内网回
 | Mooncake send lock / pre-send probe | 由插件 hook 接入当前 native PD connector；`send_probe` 缺失则拒绝启动 |
 | P5.10 prefill/decode interval | 使用 main 已有实现，无重复 scheduler loop |
 | 输出 owner | handoff 请求由控制面读取，过滤常规 output streamer，避免重复输出 |
-| 控制面 | `p2d_driver.py`、`p4_gateway.py` 与实际原包逐字节相同，SHA256 已核对 |
+| 控制面 | driver 保持原包字节；gateway 有针对性的 C1 epoch 修复，原包 SHA256 留作来源记录 |
 
-为保留原始输入的字节内容，提交格式工具只对 `control_plane/` 和 `migration/` 的格式/拼写处理
+为保留原始控制面的格式并审查小范围补丁，提交格式工具只对 `control_plane/` 和 `migration/` 的格式/拼写处理
 设置了路径例外；Python AST、密钥检测等检查仍运行。runtime 和新增测试按仓库格式检查。
 
 ## 范围与验收状态
@@ -31,7 +31,9 @@ runtime 环境变量开关及默认值保留；部署批次默认值因内网回
 page size 1、禁用 radix cache、scheduler overlap 和 CUDA Graph。TP2 Graph-on 会被显式拒绝。
 原包没有完成的 P5.19、生产 router、SSE 重连续传、自动扩缩容，以及可选观测日志，不计为已适配功能。
 
-已通过 31 项 CPU 契约回归（含真实 Gloo TP2 控制广播）和 4060 上的 10 项 CUDA/Mooncake/Remote RPC 检查；
+已通过 36 项 CPU 契约回归（含真实 Gloo TP2 控制广播）和 4060 上的 10 项 CUDA/Mooncake/Remote RPC 检查；
 详见 [REVIEW.md](REVIEW.md)、[4060 验证](validation/4060.md)。
 仍需双 GPU TP2/NCCL、完整模型服务器迁移、session 重启与 controller 故障的端到端验收。
 因此结论是：**所收到原包的功能代码和必要 hook 已移植；完整部署验收尚未完成。**
+
+后续 C1 预留和 host 缓冲区回收修复见 [C1-RECLAIM.md](validation/C1-RECLAIM.md)。

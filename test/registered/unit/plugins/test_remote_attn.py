@@ -5,7 +5,10 @@ loading Triton/CUDA just to exercise row ownership and token-map lifetimes.
 """
 
 import ast
+import copy
 import dataclasses
+import functools
+import gc
 import importlib
 import importlib.util
 import json
@@ -17,7 +20,10 @@ import subprocess
 import sys
 import tempfile
 import threading
+import time
 import unittest
+import uuid
+import weakref
 from array import array
 from contextlib import ExitStack, nullcontext
 from pathlib import Path
@@ -29,7 +35,7 @@ import torch
 from sglang.test.ci.ci_register import register_cpu_ci
 from sglang.test.test_utils import CustomTestCase
 
-register_cpu_ci(est_time=5, suite="base-a-test-cpu")
+register_cpu_ci(est_time=8, suite="base-a-test-cpu")
 
 ROOT = Path(__file__).resolve().parents[4]
 PLUGIN = ROOT / "plugins" / "remote_attn"
@@ -411,6 +417,7 @@ class TestRemoteAttn(CustomTestCase):
                         stream=lambda stream: nullcontext(),
                     )
                     conn = SimpleNamespace(close=lambda: None)
+                    released = []
                     with (
                         patch.object(torch, "cuda", cuda),
                         patch.object(
@@ -434,6 +441,15 @@ class TestRemoteAttn(CustomTestCase):
                         ),
                         patch.object(runtime, "_TRANSFER_QUARANTINE", {}),
                         patch.object(runtime, "_TRANSFER_ERRORS", {}),
+                        patch.object(
+                            runtime,
+                            "_get_registration_manager",
+                            return_value=SimpleNamespace(
+                                release_safe=lambda owner: (
+                                    released.append(owner) or True
+                                )
+                            ),
+                        ),
                     ):
                         receiver = (
                             runtime._slot_layer_receiver
@@ -451,7 +467,11 @@ class TestRemoteAttn(CustomTestCase):
                             "fault",
                             0,
                         )
-                        self.assertIn("fault", runtime._TRANSFER_QUARANTINE)
+                        if fault == "drop":
+                            self.assertEqual(released, ["fault"])
+                            self.assertNotIn("fault", runtime._TRANSFER_QUARANTINE)
+                        else:
+                            self.assertIn("fault", runtime._TRANSFER_QUARANTINE)
                     expected = [False, True] if fault == "drop" else [True, False]
                     self.assertEqual(
                         [event.is_set() for event in state.events], expected
@@ -504,6 +524,171 @@ class TestRemoteAttn(CustomTestCase):
                             ),
                             "local-result",
                         )
+
+    def test_c1_cutover_reuses_drain_reservation_epoch(self):
+        """Pre-reserve and C1 cutover must reuse one allocation/epoch."""
+        path = PLUGIN / "control_plane/p4_gateway.py"
+        tree = ast.parse(path.read_text())
+        nodes = [
+            n
+            for n in tree.body
+            if isinstance(n, ast.FunctionDef)
+            or isinstance(n, ast.ClassDef)
+            and n.name in ("Gateway", "RequestState")
+        ]
+        namespace = dict(
+            os=os,
+            threading=threading,
+            functools=functools,
+            time=time,
+            uuid=uuid,
+            copy=copy,
+            Path=Path,
+            json=json,
+        )
+        module = ast.Module(
+            body=[
+                ast.ImportFrom(
+                    module="__future__", names=[ast.alias(name="annotations")], level=0
+                ),
+                *nodes,
+            ],
+            type_ignores=[],
+        )
+        exec(compile(ast.fix_missing_locations(module), str(path), "exec"), namespace)
+        gateway = namespace["Gateway"].__new__(namespace["Gateway"])
+        gateway.migration_lock = threading.RLock()
+        gateway.journal_lock = threading.Lock()
+        gateway.admission_lock = threading.Lock()
+        st = namespace["RequestState"]("c1", 2, 4, 1)
+        gateway.journal = {st.rid: {"drid": st.drid, "prompt_len": 2, "max_new": 4}}
+        allocator = self._allocator()
+        allocator.size = 2048
+        allocator.clear()
+        scheduler = SimpleNamespace(
+            token_to_kv_pool_allocator=allocator,
+            req_to_token_pool=self._pool(),
+            max_running_requests=2,
+        )
+        requests = []
+
+        def send(payload, **kwargs):
+            if payload["cmd"] == "status":
+                return {"max_running": 2, "reqs": []}
+            requests.append(payload)
+            return self.runtime._handle(scheduler, payload)
+
+        gateway.dst = SimpleNamespace(send=send)
+
+        class FreezeReached(Exception):
+            pass
+
+        def timed(role, payload, *args):
+            if payload["cmd"] == "freeze":
+                self.assertEqual(payload["epoch"], "drain-epoch")
+                raise FreezeReached()
+            return role.send(payload)
+
+        gateway._send_timed = timed
+        gateway.src = SimpleNamespace()
+        gateway._maybe_kill = lambda stage: None
+        context = SimpleNamespace(
+            get_schedule=lambda: SimpleNamespace(max_running_requests=2)
+        )
+        with (
+            tempfile.TemporaryDirectory() as directory,
+            patch.dict(sys.modules, {"sglang.srt.runtime_context": context}),
+        ):
+            gateway.journal_path = Path(directory) / "journal.json"
+            drain = {"epoch": "drain-epoch", "state": "REQUESTED", "members": [st.rid]}
+            self.assertTrue(gateway._pre_reserve_drain(drain, [st.rid]))
+            gateway.journal["__drain__"] = drain
+            before = allocator.available_size()
+            reservation = scheduler._handoff_reserved[st.drid]["indices"]
+            with self.assertRaises(FreezeReached):
+                gateway._cutover(None, st, "remote", "none")
+            self.assertEqual(allocator.available_size(), before)
+            self.assertIs(scheduler._handoff_reserved[st.drid]["indices"], reservation)
+            self.assertEqual({r["epoch"] for r in requests}, {"drain-epoch"})
+            # A genuinely different epoch still cannot steal the reservation.
+            rejected = send(
+                {
+                    "cmd": "reserve",
+                    "epoch": "stale",
+                    "items": [{"rid": st.drid, "tokens": 10}],
+                }
+            )
+            self.assertIn(st.drid, rejected["errors"])
+            # Drain must wait for an already-started cutover before taking its
+            # snapshot, while ordinary admission remains available.
+            frozen = threading.Event()
+            continue_freeze = threading.Event()
+            drain_waiting = threading.Event()
+            order = []
+            errors = []
+
+            class MigrationGate:
+                def __init__(self):
+                    self.lock = threading.RLock()
+
+                def __enter__(self):
+                    if threading.current_thread().name == "drain-race":
+                        drain_waiting.set()
+                    self.lock.acquire()
+
+                def __exit__(self, *args):
+                    self.lock.release()
+
+            gateway.migration_lock = MigrationGate()
+
+            def freeze_gate(role, payload, *args):
+                if payload["cmd"] == "freeze":
+                    frozen.set()
+                    if not continue_freeze.wait(timeout=3):
+                        raise TimeoutError("test gate")
+                    order.append("freeze-exit")
+                    raise FreezeReached()
+                return role.send(payload)
+
+            gateway._send_timed = freeze_gate
+            gateway.drain_status = lambda: (
+                order.append("drain-snapshot") or {"state": "REQUESTED"}
+            )
+
+            def cutover():
+                try:
+                    gateway._cutover(None, st, "remote", "none")
+                except FreezeReached:
+                    pass
+                except Exception as exc:
+                    errors.append(exc)
+
+            def drain_call():
+                try:
+                    gateway.start_drain(["dst"])
+                except Exception as exc:
+                    errors.append(exc)
+
+            threads = [
+                threading.Thread(target=cutover),
+                threading.Thread(target=drain_call, name="drain-race"),
+            ]
+            try:
+                threads[0].start()
+                self.assertTrue(frozen.wait(timeout=3))
+                threads[1].start()
+                self.assertTrue(drain_waiting.wait(timeout=3))
+                self.assertTrue(gateway.admission_lock.acquire(blocking=False))
+                gateway.admission_lock.release()
+                self.assertEqual(order, [])
+            finally:
+                continue_freeze.set()
+                for thread in threads:
+                    if thread.ident is not None:
+                        thread.join(timeout=3)
+            self.assertEqual(errors, [])
+            self.assertTrue(all(not thread.is_alive() for thread in threads))
+            self.assertEqual(order, ["freeze-exit", "drain-snapshot"])
 
     def test_remote_downgrade_still_rejects_abort_missing_client_and_unsafe_copy(self):
         for condition in (
@@ -605,12 +790,154 @@ class TestRemoteAttn(CustomTestCase):
             runtime._layer_receiver(
                 scheduler, state, conn, {}, [[], []], None, "early", 1
             )
-            self.assertIn("early", runtime._TRANSFER_QUARANTINE)
+            self.assertNotIn("early", runtime._TRANSFER_QUARANTINE)
         self.assertIn("incomplete", state.error)
         self.assertIsNone(state.import_done_at)
         self.assertTrue(all(event.is_set() for event in state.events))
         with self.assertRaises(RuntimeError):
             runtime._check_target_state(state)
+
+    def test_quarantined_host_buffer_waits_for_matching_sender_and_gpu_fences(self):
+        rt = self.runtime
+        for gpu_safe in (False, True):
+            with (
+                self.subTest(gpu_safe=gpu_safe),
+                tempfile.TemporaryDirectory() as directory,
+                ExitStack() as stack,
+            ):
+                for name in (
+                    "_TRANSFER_TICKETS",
+                    "_TRANSFER_RELEASES",
+                    "_TRANSFER_QUARANTINE",
+                    "_TRANSFER_ERRORS",
+                ):
+                    stack.enter_context(patch.object(rt, name, {}))
+                stack.enter_context(
+                    patch.object(rt, "_CTL_DIR", str(Path(directory) / "src"))
+                )
+                token = "a" * 32
+                meta = rt._with_transfer_ticket(token, {})
+                rt._CTL_DIR = str(Path(directory) / "dst")
+                owner = "target:" + token
+                rt._bind_transfer_ticket(owner, token, meta)
+                released = []
+                stack.enter_context(
+                    patch.object(
+                        rt,
+                        "_get_registration_manager",
+                        return_value=SimpleNamespace(
+                            release_safe=lambda who: released.append(who) or True
+                        ),
+                    )
+                )
+                tensor = torch.zeros(4)
+                rt._release_transfer_buffers(owner, tensor, "EOF", gpu_safe=gpu_safe)
+                rt.reap_transfer_buffers()
+                self.assertEqual(released, [])
+                path = Path(meta["host_completion"]["path"])
+                path.write_text("[]")
+                rt.reap_transfer_buffers()
+                self.assertEqual(released, [])
+                path.write_text(json.dumps({"token": "stale", "complete": True}))
+                rt.reap_transfer_buffers()
+                self.assertEqual(released, [])
+                rt._publish_transfer_complete(token, True)
+                rt.reap_transfer_buffers()
+                self.assertEqual(released, [owner] if gpu_safe else [])
+                self.assertEqual(owner in rt._TRANSFER_QUARANTINE, not gpu_safe)
+                if gpu_safe:
+                    self.assertFalse(path.exists())
+                    self.assertFalse(path.with_suffix(".ack").exists())
+
+    def test_native_unregister_failure_keeps_storage_until_retry(self):
+        rt = self.runtime
+        returns = iter([-1, 0])
+        engine = SimpleNamespace(
+            batch_register_memory=lambda *args: 0,
+            batch_unregister_memory=lambda *args: next(returns),
+        )
+        manager = rt.RegistrationManager(engine)
+        tensor = torch.zeros(4)
+        pointer = weakref.ref(tensor)
+        manager.register(
+            "failed", [tensor.data_ptr()], [tensor.numel() * tensor.element_size()]
+        )
+        with (
+            patch.object(rt, "_TRANSFER_QUARANTINE", {}),
+            patch.object(rt, "_TRANSFER_RELEASES", {}),
+            patch.object(rt, "_TRANSFER_TICKETS", {}),
+            patch.object(rt, "_TRANSFER_ERRORS", {}),
+            patch.object(rt, "_get_registration_manager", return_value=manager),
+        ):
+            self.assertFalse(
+                rt._release_transfer_buffers(
+                    "failed", tensor, "retry", remote_complete=True
+                )
+            )
+            del tensor
+            gc.collect()
+            self.assertIsNotNone(pointer())
+            self.assertEqual(manager.stats()["stale"], 1)
+            rt.reap_transfer_buffers()
+            gc.collect()
+            self.assertIsNone(pointer())
+            self.assertEqual(manager.stats()["stale"], 0)
+            self.assertEqual(manager.stats()["live"], 0)
+            self.assertEqual(rt._TRANSFER_QUARANTINE, {})
+
+    def test_completion_proof_cleans_up_in_both_ack_orders(self):
+        rt = self.runtime
+        for consumer_first in (False, True):
+            with (
+                self.subTest(consumer_first=consumer_first),
+                tempfile.TemporaryDirectory() as directory,
+                ExitStack() as stack,
+            ):
+                for name in (
+                    "_TRANSFER_TICKETS",
+                    "_TRANSFER_RELEASES",
+                    "_TRANSFER_QUARANTINE",
+                    "_TRANSFER_ERRORS",
+                ):
+                    stack.enter_context(patch.object(rt, name, {}))
+                stack.enter_context(
+                    patch.object(rt, "_CTL_DIR", str(Path(directory) / "src"))
+                )
+                token = "b" * 32
+                meta = rt._with_transfer_ticket(token, {})
+                rt._CTL_DIR = str(Path(directory) / "dst")
+                rt._bind_transfer_ticket("target", token, meta)
+                stack.enter_context(
+                    patch.object(
+                        rt,
+                        "_get_registration_manager",
+                        return_value=SimpleNamespace(release_safe=lambda owner: True),
+                    )
+                )
+                if not consumer_first:
+                    rt._publish_transfer_complete(token, True)
+                rt._release_transfer_buffers(
+                    "target", torch.zeros(4), "done", remote_complete=True
+                )
+                if consumer_first:
+                    rt._publish_transfer_complete(token, True)
+                self.assertEqual(
+                    list((Path(directory) / "src" / "transfer-completion").iterdir()),
+                    [],
+                )
+
+    def test_undersized_reservation_returns_allocation_once(self):
+        allocator = self._allocator()
+        index = allocator.alloc(4)
+        scheduler = SimpleNamespace(
+            token_to_kv_pool_allocator=allocator,
+            _handoff_reserved={"small": {"indices": index}},
+        )
+        with self.assertRaises(RuntimeError):
+            self.runtime._take_reserved(scheduler, "small", 8)
+        self.assertEqual(allocator.available_size(), 32)
+        self.assertEqual(torch.unique(allocator.free_pages).numel(), 32)
+        self.assertEqual(scheduler._handoff_reserved, {})
 
     def test_full_copy_failure_after_gpu_load_rolls_back_allocation(self):
         allocator = self._allocator()
@@ -664,7 +991,9 @@ class TestRemoteAttn(CustomTestCase):
             with self.subTest(ack=repr(ack)), ExitStack() as stack:
                 unregistered = []
                 manager = SimpleNamespace(
-                    register=lambda *a, **kw: None, unregister=unregistered.append
+                    register=lambda *a, **kw: None,
+                    unregister=unregistered.append,
+                    release_safe=lambda owner: unregistered.append(owner) or True,
                 )
                 for name, value in {
                     "_get_te": lambda: SimpleNamespace(get_rpc_port=lambda: 123),
@@ -924,7 +1253,9 @@ class TestRemoteAttn(CustomTestCase):
         )
         unregistered = []
         manager = SimpleNamespace(
-            register=lambda *a, **kw: None, unregister=unregistered.append
+            register=lambda *a, **kw: None,
+            unregister=unregistered.append,
+            release_safe=lambda owner: unregistered.append(owner) or True,
         )
         original_empty = torch.empty
         with ExitStack() as stack:

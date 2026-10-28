@@ -74,6 +74,7 @@ def source_worker(
     result_queue,
     cancel_request=None,
     source_release=None,
+    completion_root=None,
 ):
     try:
         os.environ.update(
@@ -95,6 +96,13 @@ def source_worker(
             req_to_token_pool=SimpleNamespace(req_to_token=indices.unsqueeze(0)),
             token_to_kv_pool_allocator=SimpleNamespace(get_kvcache=lambda: pool),
         )
+        # This probe has no SGLang RuntimeContext. Create its real RPC hub
+        # before enabling the shared completion directory (no ready files).
+        rt._CTL_DIR = ""
+        if source_release is not None:
+            rt.get_remote_hub(scheduler)
+        if completion_root is not None:
+            rt._CTL_DIR = str(Path(completion_root) / "src")
         meta = dict(
             rid=req.rid,
             dtype=dtype_name,
@@ -137,6 +145,7 @@ def source_worker(
             while hub.stats()["in_flight"] and time.monotonic() < deadline:
                 time.sleep(0.001)
             hub_stats = hub.stats()
+            rt._CTL_DIR = ""
             rt.close_handoff_hub(scheduler)
         result_queue.put(
             {
@@ -182,13 +191,24 @@ def transfer_probe(
     from sglang_remote_attn import handoff_control as rt
 
     rt.TARGET_STAGING_SLOTS = slots
+    completion_root = output.resolve() / "control"
+    (completion_root / "dst").mkdir(parents=True, exist_ok=True)
+    rt._CTL_DIR = str(completion_root / "dst")
     context = mp.get_context("spawn")
     messages = context.Queue()
     cancel_request = context.Event() if cancel else None
     source_release = context.Event() if remote_drop else None
     source = context.Process(
         target=source_worker,
-        args=(mode, dtype_name, buffers, messages, cancel_request, source_release),
+        args=(
+            mode,
+            dtype_name,
+            buffers,
+            messages,
+            cancel_request,
+            source_release,
+            str(completion_root),
+        ),
     )
     source.start()
     receiver = None
@@ -282,7 +302,7 @@ def transfer_probe(
             profiler = None
         if cancel:
             assert state.error is not None and state.import_done_at is None
-            assert owner in rt._TRANSFER_QUARANTINE
+            initially_quarantined = owner in rt._TRANSFER_QUARANTINE
             # Simulate allocator reuse only AFTER abort has fenced GPU writes.
             for tensor in keys + values:
                 tensor.fill_(-5)
@@ -293,18 +313,24 @@ def transfer_probe(
             assert "error" not in packet, packet
             source.join(timeout=10)
             assert source.exitcode == 0, source.exitcode
+            rt.reap_transfer_buffers()
+            assert owner not in rt._TRANSFER_QUARANTINE
+            assert rt._get_registration_manager().stats()["live"] == 0
             return dict(
                 mode=mode,
                 cancelled=True,
                 gpu_reuse_safe=True,
-                target_quarantined=True,
+                initially_quarantined=initially_quarantined,
+                target_quarantined=False,
+                host_registration_reclaimed=True,
                 **packet,
             )
         if remote_drop:
             assert state.error is not None and state.import_done_at is None
             assert not state.events[0].is_set(), "dropped layer falsely became LOCAL"
             assert all(event.is_set() for event in state.events[1:])
-            assert owner in rt._TRANSFER_QUARANTINE
+            assert owner not in rt._TRANSFER_QUARANTINE
+            assert rt._get_registration_manager().stats()["live"] == 0
             assert torch.isnan(keys[0]).all(), (
                 "dropped layer should still have no local KV"
             )
@@ -385,7 +411,8 @@ def transfer_probe(
                 local_layers=LAYERS - 1,
                 max_abs_errors=errors,
                 dropped_layer_still_remote=True,
-                target_quarantined=True,
+                target_quarantined=False,
+                host_registration_reclaimed=True,
                 **source_packet,
             )
         assert state.error is None, state.error

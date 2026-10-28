@@ -5,7 +5,7 @@
 默认部署沿用 handoff P0–P5.18：**单机 6 张 GPU，P / D0 / D1 各 TP2，Qwen3-8B，Mooncake TCP**。
 命令中的 `/workspace/sglang`、Python 和模型目录需要与内网机器实际路径一致。
 
-代码已完成移植，已有 31 项 CPU 回归和 4060 上 10 项 CUDA/Mooncake/Remote RPC 检查。
+代码已完成移植，已有 36 项 CPU 回归和 4060 上 10 项 CUDA/Mooncake/Remote RPC 检查。
 完整模型服务器、真实双 GPU TP2/NCCL、迁移前后 token/logprob 一致性和重启故障恢复仍需内网验收。
 4060 是单卡 8 GB 的验证环境，不能按本文默认配置同时部署三个 TP2 实例。
 
@@ -22,7 +22,7 @@
 | `plugins/remote_attn/sglang_remote_attn/` | 渐进式 KV 传输、Remote attention、生命周期与 16 个 hook | 安装插件包 |
 | `plugins/remote_attn/pyproject.toml` | `sglang.srt.plugins` entry point | 与插件源码一起保留 |
 | `plugins/remote_attn/control_plane/p2d_driver.py` | 文件控制协议、TP 结果聚合 | 保留原包版本 |
-| `plugins/remote_attn/control_plane/p4_gateway.py` | SSE、请求提交、D2D drain、journal | 保留原包版本 |
+| `plugins/remote_attn/control_plane/p4_gateway.py` | SSE、请求提交、D2D drain、journal | 使用本分支的 C1 epoch 修复版 |
 | `plugins/remote_attn/deploy/` | 公共 env 和三个功能启动脚本 | 整个目录一起带入 |
 | `test/manual/remote_attn/cuda_handoff_probe.py` | 单 GPU CUDA/Mooncake 验证 | 建议带入做环境自检 |
 | `migration/`、`REVIEW.md`、`FUNCTIONAL-PARITY.md`、`validation/` | 原包来源、适配边界及证据 | 留作核对；不是运行时补丁 |
@@ -202,7 +202,7 @@ PYTHONPATH=plugins/remote_attn "$HANDOFF_PYTHON" \
 
 ## 5. 控制面保留的固定路径
 
-控制面两个文件保持原样，下列配置不能只靠 server 的 env 自动覆盖：
+控制面保留原协议和目录，网关增加了 C1 epoch 修复。下列配置不能只靠 server 的 env 自动覆盖：
 
 - 网关 tokenizer 的 `MODEL` 固定为 `/workspace/models/Qwen3-8B`。
   本手册使用该目录；若换模型，需要同步适配控制面，不能只改 `HANDOFF_MODEL_PATH`。
@@ -440,7 +440,7 @@ kill -TERM "$(cat "$HANDOFF_RUN_DIR/d0.pid")"
 | 网关模型/tokenizer 加载失败 | 原控制面固定模型目录是否完整，是否错把 server 模型 env 当作网关配置 |
 | 命令不执行 | 根目录和 `p/src/dst` 是否一致，每个 rank 是否活着，是否加载了旧 p2d_driver |
 | TP command diverged | 保存各 rank 的 result 和日志；引擎主动停止不一致调度，不能靠重发命令认定已自动恢复 |
-| `quarantined_transfers` 非空 | 远端完成状态不明，host buffer 按设计保留；记录状态并按故障恢复流程重启回收 |
+| `quarantined_transfers` 非空 | 完成凭据或 native unregister 尚未成功时保留；scheduler 会重试回收。不能确认远端完成或 GPU fence 失败时仍需故障恢复 |
 | Remote 本地缺层 / `remote downgrade` | 有可用 client 且未取消、GPU fence 安全时继续远端读缺失层；不能将错误唤醒当作 LOCAL-ready |
 | drain 长期 BLOCKED | 结合 target commit、epoch、fence、reservation、lease 和所有 rank 的事实排查，不能直接清 journal |
 
@@ -481,3 +481,7 @@ TP 命令一致性检查在分歧时停止引擎，不是跨 rank 原子回滚�
 Mooncake 实验代码参考为 `pd-handoff-p518-stable@17261ca0`。
 实际收到的 runtime MD5 与原文档声明不同，详见功能对应表；本部署使用已适配的 `remote-attn` 分支，
 不依赖重新找到原 dirty tree 或重新应用迁移 patch。
+
+C1 及 host 回收更新详见 [修复说明](validation/C1-RECLAIM.md)。升级时同时更新并重启网关与 P/D 实例，
+保留 journal；`HANDOFF_CTL_ROOT` 必须共享，新增 `p/src/dst/transfer-completion/` 用于已完成传输的回收凭据。
+不要在进程存活时删除未确认完成的凭据。

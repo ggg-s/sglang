@@ -486,14 +486,127 @@ def _import_cancelled(rid: str, epoch) -> bool:
 _TRANSFER_ERRORS: dict[str, str] = {}
 _TRANSFER_STATS: dict[str, dict] = {}
 # On an unacknowledged transport failure, keep registered CPU buffers alive
-# until process teardown. Disconnect alone is not proof that a remote DMA/TCP
-# write no longer targets them. Normal completed transfers never enter here.
+# until completion and safe unregister are proven. Disconnect alone is not
+# proof that a remote DMA/TCP write no longer targets them.
 _TRANSFER_QUARANTINE: dict[str, tuple[Any, str]] = {}
+_TRANSFER_TICKETS: dict[str, dict] = {}
+_TRANSFER_RELEASES: dict[str, dict] = {}
+_TRANSFER_RELEASE_LOCK = threading.RLock()
 
 
 def _quarantine_transfer(owner, buffers, reason):
-    _TRANSFER_QUARANTINE[owner] = (buffers, str(reason))
-    _TRANSFER_ERRORS[owner] = str(reason)
+    with _TRANSFER_RELEASE_LOCK:
+        _TRANSFER_QUARANTINE[owner] = (buffers, str(reason))
+        _TRANSFER_ERRORS[owner] = str(reason)
+
+
+def _with_transfer_ticket(token, meta):
+    if not _CTL_DIR:
+        return meta
+    root = Path(_CTL_DIR) / "transfer-completion"
+    root.mkdir(parents=True, exist_ok=True)
+    ticket = {"path": str(root / f"{token}.json"), "token": token}
+    _TRANSFER_TICKETS[token] = ticket
+    return {**meta, "host_completion": ticket}
+
+
+def _bind_transfer_ticket(owner, token, meta):
+    ticket = meta.get("host_completion")
+    if not _CTL_DIR or not isinstance(ticket, dict):
+        return
+    path = Path(str(ticket.get("path", ""))).resolve()
+    # The supported topology shares one control root. Never delete arbitrary
+    # paths supplied over the control socket.
+    if (
+        len(token) == 32
+        and all(c in "0123456789abcdef" for c in token)
+        and ticket.get("token") == token
+        and path.name == f"{token}.json"
+        and path.parent.name == "transfer-completion"
+        and path.is_relative_to(Path(_CTL_DIR).resolve().parent)
+    ):
+        _TRANSFER_TICKETS[owner] = {"path": str(path), "token": token}
+
+
+def _finish_transfer_ticket(ticket, *, publish):
+    if ticket is None:
+        return
+    path = Path(ticket["path"])
+    other = path.with_suffix(".ack") if publish else path
+    destination = path if publish else path.with_suffix(".ack")
+    tmp = destination.with_name(
+        destination.name + f".{os.getpid()}.{threading.get_ident()}.tmp"
+    )
+    try:
+        tmp.write_text(json.dumps({"token": ticket["token"], "complete": True}))
+        os.replace(tmp, destination)
+        # Either publisher/consumer may win. The second writer removes both
+        # records, avoiding a normal-transfer completion-file accumulation.
+        if other.exists():
+            other.unlink(missing_ok=True)
+            destination.unlink(missing_ok=True)
+    except OSError as exc:
+        print(f"[handoff-transfer] completion record failed: {exc!r}", flush=True)
+    finally:
+        try:
+            tmp.unlink(missing_ok=True)
+        except OSError:
+            pass
+
+
+def _publish_transfer_complete(owner, safe):
+    if safe:
+        _finish_transfer_ticket(_TRANSFER_TICKETS.get(owner), publish=True)
+
+
+def _release_transfer_buffers(
+    owner, buffers, reason, *, remote_complete=False, gpu_safe=True
+):
+    with _TRANSFER_RELEASE_LOCK:
+        ticket = _TRANSFER_TICKETS.get(owner)
+        if not remote_complete and ticket is not None:
+            try:
+                record = json.loads(Path(ticket["path"]).read_text())
+                remote_complete = (
+                    isinstance(record, dict)
+                    and record.get("token") == ticket["token"]
+                    and record.get("complete") is True
+                )
+            except (OSError, ValueError):
+                pass
+        if remote_complete and gpu_safe:
+            try:
+                released = _get_registration_manager().release_safe(owner)
+            except Exception as exc:
+                released = False
+                reason = f"host unregister failed: {exc!r}"
+            if released:
+                _TRANSFER_QUARANTINE.pop(owner, None)
+                _TRANSFER_RELEASES.pop(owner, None)
+                _TRANSFER_TICKETS.pop(owner, None)
+                # Source publication owns the source token. Only the target
+                # acknowledges/deletes the shared completion proof.
+                if ticket is not None and owner != ticket["token"]:
+                    _finish_transfer_ticket(ticket, publish=False)
+                return True
+        _quarantine_transfer(owner, buffers, reason)
+        _TRANSFER_RELEASES[owner] = {
+            "remote_complete": remote_complete,
+            "gpu_safe": gpu_safe,
+        }
+        return False
+
+
+def reap_transfer_buffers():
+    """Retry only proven-complete transfers; TTL alone never permits reuse."""
+    with _TRANSFER_RELEASE_LOCK:
+        for owner, flags in list(_TRANSFER_RELEASES.items()):
+            entry = _TRANSFER_QUARANTINE.get(owner)
+            if entry is None:
+                _TRANSFER_RELEASES.pop(owner, None)
+                continue
+            buffers, reason = entry
+            _release_transfer_buffers(owner, buffers, reason, **flags)
 
 
 def _mark_source_transfer(scheduler, token, active):
@@ -2713,6 +2826,31 @@ class RegistrationManager:
                     self.unregistrations += 1
             return True
 
+    def release_safe(self, owner):
+        """Keep storage alive until native unregister succeeds, including retry."""
+        owner = str(owner)
+        with self._lock:
+            live = owner in self._by_owner
+        if live:
+            self.unregister(owner)
+        else:
+            with self._lock:
+                stale = [rr for rr in self._stale if rr.owner == owner]
+                for rr in stale:
+                    try:
+                        rc = int(self._engine().batch_unregister_memory(rr.addrs))
+                    except Exception:
+                        rc = -1
+                    if rc == 0:
+                        self._stale.remove(rr)
+                        self.unregistrations += 1
+                if not self._stale:
+                    self.last_unregister_error = None
+        with self._lock:
+            return owner not in self._by_owner and not any(
+                rr.owner == owner for rr in self._stale
+            )
+
     def clear_stale(self):
         """Forget ranges whose TE unregistration failed. Returns the count.
 
@@ -2947,6 +3085,7 @@ def _start_mooncake_server(scheduler, req, meta: dict, kv_cpu) -> dict:
     (``batch_transfer_sync_write``, TCP transport on this host).
     """
     token = secrets.token_hex(16)
+    meta = _with_transfer_ticket(token, meta)
     te = _get_te()
     tensors = _flatten_cpu(kv_cpu)
     addrs = [int(t.data_ptr()) for t in tensors]
@@ -3031,12 +3170,14 @@ def _start_mooncake_server(scheduler, req, meta: dict, kv_cpu) -> dict:
                 if getattr(req, "_handoff_transfer_conn", None) is conn:
                     req._handoff_transfer_conn = None
                 _mark_source_transfer(scheduler, token, False)
-                if safe_cleanup:
-                    mgr.unregister(token)
-                else:
-                    _quarantine_transfer(
-                        token, kv_cpu, "copy source completion unknown"
-                    )
+                _publish_transfer_complete(token, safe_cleanup)
+                _release_transfer_buffers(
+                    token,
+                    kv_cpu,
+                    "source transfer completion unknown",
+                    remote_complete=safe_cleanup,
+                    gpu_safe=not getattr(req, "_handoff_transfer_unsafe", False),
+                )
                 if getattr(req, "_handoff_transfer_cancel", None) is not None:
                     handle = req._handoff_transfer_cancel
                     if handle[1] is cancel:
@@ -3059,7 +3200,9 @@ def _start_mooncake_server(scheduler, req, meta: dict, kv_cpu) -> dict:
     except Exception:
         # Rollback everything opened after the TE registration: if the thread
         # never started, its finally block cannot do this for us.
-        mgr.unregister(token)
+        _release_transfer_buffers(
+            token, kv_cpu, "source setup rollback", remote_complete=True
+        )
         _mark_source_transfer(scheduler, token, False)
         if listener is not None:
             try:
@@ -3117,6 +3260,7 @@ def _start_layer_gpu_server(scheduler, req, meta, remote):
     source_ready = torch.cuda.Event()
     source_ready.record(torch.cuda.current_stream(source_device))
     token = secrets.token_hex(16)
+    meta = _with_transfer_ticket(token, meta)
     timeline = {"enter_at": time.monotonic()}
     te = _get_te()
     pool = scheduler.token_to_kv_pool_allocator.get_kvcache()
@@ -3487,12 +3631,14 @@ def _start_layer_gpu_server(scheduler, req, meta, remote):
                 except Exception:
                     safe_cleanup = False
                     req._handoff_transfer_unsafe = True
-                if safe_cleanup:
-                    mgr.unregister(token)
-                else:
-                    _quarantine_transfer(
-                        token, stage, "source transfer completion unknown"
-                    )
+                _publish_transfer_complete(token, safe_cleanup)
+                _release_transfer_buffers(
+                    token,
+                    stage,
+                    "source transfer completion unknown",
+                    remote_complete=safe_cleanup,
+                    gpu_safe=not getattr(req, "_handoff_transfer_unsafe", False),
+                )
                 if getattr(req, "_handoff_transfer_cancel", None) is not None:
                     handle = req._handoff_transfer_cancel
                     if handle[1] is cancel:
@@ -3519,7 +3665,9 @@ def _start_layer_gpu_server(scheduler, req, meta, remote):
         timeline["thread_start_at"] = time.monotonic()
         req._handoff_transfer_thread = thread
     except Exception:
-        mgr.unregister(token)
+        _release_transfer_buffers(
+            token, stage, "source setup rollback", remote_complete=True
+        )
         if remote_info is not None:
             try:
                 get_remote_hub(scheduler).registry.discard(
@@ -3562,6 +3710,7 @@ def _start_layer_mooncake_server(
     The target's receiver copies that layer to GPU and sets its layer event.
     """
     token = secrets.token_hex(16)
+    meta = _with_transfer_ticket(token, meta)
     timeline = {"enter_at": time.monotonic()}
     te = _get_te()
     tensors = _flatten_cpu(kv_cpu)
@@ -3721,12 +3870,14 @@ def _start_layer_mooncake_server(
                         outstanding.clear()
                 except Exception:
                     safe_cleanup = False
-                if safe_cleanup:
-                    mgr.unregister(token)
-                else:
-                    _quarantine_transfer(
-                        token, kv_cpu, "copy source completion unknown"
-                    )
+                _publish_transfer_complete(token, safe_cleanup)
+                _release_transfer_buffers(
+                    token,
+                    kv_cpu,
+                    "source transfer completion unknown",
+                    remote_complete=safe_cleanup,
+                    gpu_safe=not getattr(req, "_handoff_transfer_unsafe", False),
+                )
                 if getattr(req, "_handoff_transfer_cancel", None) is not None:
                     handle = req._handoff_transfer_cancel
                     if handle[1] is cancel:
@@ -3751,7 +3902,9 @@ def _start_layer_mooncake_server(
         # Rollback everything opened after the TE registration (remote hub
         # registration, listener, cancel handle): if the thread never started,
         # its finally block cannot do this for us.
-        mgr.unregister(token)
+        _release_transfer_buffers(
+            token, kv_cpu, "source setup rollback", remote_complete=True
+        )
         if remote_info is not None:
             # The hub registration has no transfer behind it now; drop it
             # without firing on_release (the request is still live).
@@ -3797,6 +3950,7 @@ def _recv_transfer_layer_setup(transfer: dict):
     owner = f"target-layer:{token}"
     mgr = _get_registration_manager()
     registered = False
+    exposed = False
     t_setup0 = time.monotonic()
     conn = socket.create_connection((host, port), timeout=600)
     t_connect = time.monotonic()
@@ -3805,6 +3959,7 @@ def _recv_transfer_layer_setup(transfer: dict):
     try:
         _send_json(conn, {"token": token})
         meta = _recv_json(conn)
+        _bind_transfer_ticket(owner, token, meta)
         t_meta = time.monotonic()
         dtype = {
             "bfloat16": torch.bfloat16,
@@ -3839,6 +3994,7 @@ def _recv_transfer_layer_setup(transfer: dict):
             mgr.register(owner, addrs, sizes, label="target-fast-slots")
             t_reg = time.monotonic()
             registered = True
+            exposed = True
             _send_json(
                 conn,
                 {
@@ -3869,6 +4025,7 @@ def _recv_transfer_layer_setup(transfer: dict):
             mgr.register(owner, addrs, sizes, label="target-layer")
             t_reg = time.monotonic()
             registered = True
+            exposed = True
             _send_json(
                 conn,
                 {"session": f"127.0.0.1:{te.get_rpc_port()}", "addrs": addrs},
@@ -3877,7 +4034,9 @@ def _recv_transfer_layer_setup(transfer: dict):
     except Exception:
         if registered:
             try:
-                mgr.unregister(owner)
+                _release_transfer_buffers(
+                    owner, tensors, "layer setup failed", remote_complete=not exposed
+                )
             except Exception:
                 pass
         conn.close()
@@ -3931,6 +4090,7 @@ def _recv_transfer_mooncake(transfer: dict):
         conn.setsockopt(socket.IPPROTO_TCP, socket.TCP_NODELAY, 1)
         _send_json(conn, {"token": token})
         meta = _recv_json(conn)
+        _bind_transfer_ticket(owner, token, meta)
         dtype = {
             "bfloat16": torch.bfloat16,
             "float16": torch.float16,
@@ -3974,12 +4134,12 @@ def _recv_transfer_mooncake(transfer: dict):
                 raise RuntimeError(f"Mooncake transfer failed: {ack.get('error')}")
             complete = True
         finally:
-            if complete:
-                mgr.unregister(owner)
-            else:
-                _quarantine_transfer(
-                    owner, kv_cpu, "copy transfer disconnected before completion ACK"
-                )
+            _release_transfer_buffers(
+                owner,
+                kv_cpu,
+                "copy transfer disconnected before completion ACK",
+                remote_complete=complete,
+            )
     return meta, kv_cpu
 
 
@@ -4047,7 +4207,6 @@ def _take_reserved(scheduler, rid, kv_len: int):
         raise RuntimeError(f"reservation {rid!r} KV already consumed")
     n = int(idx.numel())
     if n < kv_len:
-        allocator.free(idx)
         _reservation_free(scheduler, rid)
         raise RuntimeError(f"reserved {n} KV slots < import needs {kv_len}")
     if n > kv_len:
@@ -4778,6 +4937,7 @@ def maybe_handle_handoff_control(scheduler):
     _ITER_AT = now
     scheduler._handoff_iter_id = _ITER
     scheduler._handoff_iter_period_ms = _ITER_PERIOD_MS
+    reap_transfer_buffers()
     _ensure_frozen_watchdog(scheduler)
     _drain_watchdog_actions(scheduler)
     _expire_stale_reservations(scheduler)
@@ -7240,6 +7400,7 @@ def _layer_receiver(
     scheduler, state, conn, meta, kv_cpu, new_indices, reg_owner, device
 ):
     copy_stream = None
+    transfer_done = False
     try:
         # Each TP rank owns its own KV shard: the receiver must use the device
         # of the scheduler that started it, not local device 0.
@@ -7256,6 +7417,7 @@ def _layer_receiver(
             if msg.get("ok") is False:
                 raise RuntimeError(msg.get("error", "source transfer failed"))
             if msg.get("done"):
+                transfer_done = True
                 break
             l = int(msg["layer"])
             if l < 0 or l >= len(state.events) or state.events[l].is_set():
@@ -7291,10 +7453,14 @@ def _layer_receiver(
             state.events[l].set()
         _finish_layer_import(state)
         # Consume the source's final {"done": true} so its stats/cleanup can run.
-        try:
-            _recv_json(conn)
-        except Exception:
-            pass
+        if not transfer_done:
+            try:
+                final = _recv_json(conn)
+                transfer_done = (
+                    final.get("done") is True and final.get("ok") is not False
+                )
+            except Exception:
+                pass
     except Exception as exc:
         _record_local_import_error(state, repr(exc))
     finally:
@@ -7304,19 +7470,18 @@ def _layer_receiver(
             except Exception as exc:
                 state.receiver_unsafe = True
                 state.error = f"target copy fence failed: {exc!r}"
-        try:
-            if (
+        _release_transfer_buffers(
+            reg_owner,
+            kv_cpu,
+            state.error or "target transfer incomplete",
+            remote_complete=transfer_done
+            or (
                 state.import_done_at is not None
                 and state.error is None
                 and not state.abort_event.is_set()
-            ):
-                _get_registration_manager().unregister(reg_owner)
-            else:
-                _quarantine_transfer(
-                    reg_owner, kv_cpu, state.error or "target transfer incomplete"
-                )
-        except Exception:
-            pass
+            ),
+            gpu_safe=not getattr(state, "receiver_unsafe", False),
+        )
         try:
             conn.close()
         except OSError:
@@ -7334,6 +7499,7 @@ def _slot_layer_receiver(
     slot is never reused while a copy or an attention read could still use it.
     """
     copy_stream = None
+    transfer_done = False
     try:
         torch.cuda.set_device(device)
         copy_stream = _fast_copy_streams(device, 1, role="target")[0]
@@ -7354,6 +7520,7 @@ def _slot_layer_receiver(
             if msg.get("ok") is False:
                 raise RuntimeError(msg.get("error", "source transfer failed"))
             if msg.get("done"):
+                transfer_done = True
                 break
             l = int(msg["layer"])
             if l < 0 or l >= len(state.events) or state.events[l].is_set():
@@ -7406,10 +7573,14 @@ def _slot_layer_receiver(
                 pass
         _finish_layer_import(state)
         # Consume the source's final {"done": true} so its stats/cleanup can run.
-        try:
-            _recv_json(conn)
-        except Exception:
-            pass
+        if not transfer_done:
+            try:
+                final = _recv_json(conn)
+                transfer_done = (
+                    final.get("done") is True and final.get("ok") is not False
+                )
+            except Exception:
+                pass
     except Exception as exc:
         _record_local_import_error(state, repr(exc))
     finally:
@@ -7419,19 +7590,18 @@ def _slot_layer_receiver(
             except Exception as exc:
                 state.receiver_unsafe = True
                 state.error = f"target copy fence failed: {exc!r}"
-        try:
-            if (
+        _release_transfer_buffers(
+            reg_owner,
+            slots,
+            state.error or "target transfer incomplete",
+            remote_complete=transfer_done
+            or (
                 state.import_done_at is not None
                 and state.error is None
                 and not state.abort_event.is_set()
-            ):
-                _get_registration_manager().unregister(reg_owner)
-            else:
-                _quarantine_transfer(
-                    reg_owner, slots, state.error or "target transfer incomplete"
-                )
-        except Exception:
-            pass
+            ),
+            gpu_safe=not getattr(state, "receiver_unsafe", False),
+        )
         try:
             conn.close()
         except OSError:
@@ -8238,7 +8408,7 @@ def _handle(scheduler, data):
                     # The receiver thread never owned the connection or the
                     # registration, so this frame must release both.
                     try:
-                        _quarantine_transfer(
+                        _release_transfer_buffers(
                             reg_owner,
                             slot_bufs or kv_cpu,
                             "target setup failed after advertising addresses",
@@ -9322,9 +9492,10 @@ def _handle(scheduler, data):
         hub = getattr(scheduler, "_handoff_hub", None)
         result["handoff_registry"] = hub.registry.stats() if hub is not None else None
         result["hub_stats"] = hub.stats() if hub is not None else None
-        result["quarantined_transfers"] = {
-            key: reason for key, (_, reason) in _TRANSFER_QUARANTINE.items()
-        }
+        with _TRANSFER_RELEASE_LOCK:
+            result["quarantined_transfers"] = {
+                key: reason for key, (_, reason) in _TRANSFER_QUARANTINE.items()
+            }
         result["registration_manager"] = _get_registration_manager().stats()
         with _TARGET_CLIENTS_LOCK:
             clients = list(_TARGET_CLIENTS.items())

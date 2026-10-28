@@ -16,6 +16,7 @@ from __future__ import annotations
 
 import argparse
 import copy
+import functools
 import http.client
 import json
 import os
@@ -302,6 +303,16 @@ class RequestState:
         self.ctl = {}
 
 
+def _serialize_migration(function):
+    @functools.wraps(function)
+    def call(self, *args, **kwargs):
+        # Keep drain snapshot/pre-reserve and legacy cutovers in one order.
+        # Admission remains unlocked while a cutover performs backend I/O.
+        with self.migration_lock:
+            return function(self, *args, **kwargs)
+    return call
+
+
 class Gateway:
     def __init__(self, out: Path, poll_ms: float = 3.0):
         self.src = Role("src", poll_ms / 1000.0)
@@ -317,6 +328,7 @@ class Gateway:
         # drain member snapshot, so a request cannot read READY and then be
         # submitted to a source that already committed DRAINING/SAFE.
         self.admission_lock = threading.Lock()
+        self.migration_lock = threading.RLock()
         self.journal: dict[str, dict] = {}
         self.draining = False
         self.drain_started_t = None
@@ -843,10 +855,25 @@ class Gateway:
             self._send_event(handler, st, self._event(st, seq, src_ids[seq], "src"))
         return len(src_ids)
 
+    def _cutover_epoch(self, members):
+        with self.journal_lock:
+            drain = self.journal.get("__drain__") or {}
+            if drain.get("state") in self.DRAIN_LIVE:
+                covered = [st.rid in (drain.get("members") or []) for st in members]
+                if any(covered):
+                    if not all(covered):
+                        raise RuntimeError("cutover group crosses drain membership")
+                    epoch = str(drain.get("reserved_epoch") or drain.get("epoch") or "")
+                    if not epoch or epoch != str(drain.get("epoch") or ""):
+                        raise RuntimeError("drain reservation epoch is inconsistent")
+                    return epoch
+        return uuid.uuid4().hex
+
+    @_serialize_migration
     def _cutover(self, handler, st: RequestState, transfer: str, inject: str):
         print(f"[gw] enter _cutover rid={st.rid} wave={st.wave} "
               f"group={st.group}", flush=True)
-        epoch = uuid.uuid4().hex
+        epoch = self._cutover_epoch([st])
         n = st.prompt_len + st.cut + 64
         if inject == "capacity":
             n += 10_000_000
@@ -880,7 +907,7 @@ class Gateway:
             st.cutover["capacity_rejected"] = rv.get("errors")
             return False
         self._maybe_kill("reserve")
-        self._journal_update(st, force=True, phase="reserved")
+        self._journal_update(st, force=True, phase="reserved", epoch=epoch)
 
         t_freeze = time.monotonic()
         st.freeze_send_t = t_freeze
@@ -1209,6 +1236,7 @@ class Gateway:
             time.sleep(0.05)
 
 
+    @_serialize_migration
     def _wave_freeze(self, handler, st: RequestState, transfer: str, inject: str):
         print(f"[gw] enter _wave_freeze rid={st.rid} group={st.group}",
               flush=True)
@@ -1218,7 +1246,7 @@ class Gateway:
         that request freezes.  The wave batches the *target* import/admit in a
         single command once all members are frozen.
         """
-        epoch = uuid.uuid4().hex
+        epoch = self._cutover_epoch([st])
         st.freeze_epoch = epoch
         st.transfer = transfer
         with self.group_lock:
@@ -1621,6 +1649,7 @@ class Gateway:
                     daemon=True,
                 ).start()
 
+    @_serialize_migration
     def _batch_cutover(self, group: str, transfer: str, inject: str):
         print(f"[gw] enter _batch_cutover group={group}", flush=True)
         with self.group_lock:
@@ -1628,7 +1657,7 @@ class Gateway:
         wave_all = bool(members) and all(
             st.wave and st.wave_freeze == "all" for st in members
         )
-        epoch = uuid.uuid4().hex
+        epoch = self._cutover_epoch(members)
         rids = [st.rid for st in members]
         n_tp = 1
         try:
@@ -3807,6 +3836,7 @@ class Gateway:
         )
         return True
 
+    @_serialize_migration
     def start_drain(self, targets: list[str], mode: str = "d2d",
                     transfer: str = ""):
         # Arm aliases are accepted at the API boundary; ``mode`` stays the
