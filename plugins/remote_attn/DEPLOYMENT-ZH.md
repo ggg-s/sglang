@@ -1,12 +1,14 @@
 # Remote-attn 内网部署手册
 
 本文对应 SGLang 的 `remote-attn` 分支，首次功能移植提交为 `a67ca2bb36`，部署应使用分支最新版本。
-后续内网反馈与修复见 [5090 等价性验证记录](validation/5090-intranet.md)。
+后续内网反馈与修复见 [5090 等价性验证记录](validation/5090-intranet.md) 和
+[新提交复验与 KV 重复释放修复](validation/5090-new-commits.md)。
 默认部署沿用 handoff P0–P5.18：**单机 6 张 GPU，P / D0 / D1 各 TP2，Qwen3-8B，Mooncake TCP**。
 命令中的 `/workspace/sglang`、Python 和模型目录需要与内网机器实际路径一致。
 
-代码已完成移植，已有 36 项 CPU 回归和 4060 上 10 项 CUDA/Mooncake/Remote RPC 检查。
-完整模型服务器、真实双 GPU TP2/NCCL、迁移前后 token/logprob 一致性和重启故障恢复仍需内网验收。
+代码已完成移植，已有 38 项 CPU 回归和此前 4060 上 10 项 CUDA/Mooncake/Remote RPC 检查。
+内网反馈确认 C1/C4 token 一致、故障矩阵及新提交下 TP2 稳定性 23/23；
+单独重启 D 后首请求的 session 失效窗口仍未解决，详见上述复验记录。
 4060 是单卡 8 GB 的验证环境，不能按本文默认配置同时部署三个 TP2 实例。
 
 ## 1. 需要带入内网的代码
@@ -50,6 +52,10 @@
 | SGLang 依赖 | 以本分支 `python/pyproject.toml` 为准 |
 
 当前分支声明的核心依赖包括 `torch==2.14.1`、`flashinfer_python[cu13]==0.7.2`。
+2026-10-28 内网完整模型复验使用 `torch==2.14.1+cu130`、`torchvision==0.29.0+cu130`、
+`sglang-kernel==0.4.10`、FlashInfer `0.7.2`，已移除 `SKIP_SGL_KERNEL_VERSION_CHECK`。
+现场 kernel 0.4.9/0.4.10 配合 torch 2.13 曾发生 `CUDAErrorLogCapture` 符号错误；
+应使用上述配套组合并执行 `pip check`，不要用跳过版本检查掩盖 ABI 不兼容。
 4060 的轻量 probe 使用 PyTorch `2.13.0+cu130` / FlashInfer `0.6.18`，
 它验证了插件的实际 CUDA/TE 运算，**不是完整 SGLang 部署的依赖锁定文件**。
 不要把其简化环境直接当成已验收的模型服务器环境。
@@ -65,6 +71,8 @@ from mooncake.engine import TransferEngine
 
 print("torch:", torch.__version__)
 print("torch CUDA:", torch.version.cuda)
+print("torchvision:", metadata.version("torchvision"))
+print("sglang-kernel:", metadata.version("sglang-kernel"))
 print("CUDA available:", torch.cuda.is_available())
 print("GPU count:", torch.cuda.device_count())
 print("Mooncake:", metadata.version("mooncake-transfer-engine-cuda13"))
@@ -300,6 +308,12 @@ HANDOFF_REMOTE_HIGH_PRIORITY=1
 ```
 
 env 允许外部覆盖；有旧实验变量时，应先核对有效值，避免意外关闭 Fast Freeze、锁或 probe。
+D0/D1 默认 `HANDOFF_RETRACTION_BACKUP=none`，显式使用
+`--disaggregation-decode-retraction-backup none`。
+这与内网验证配置一致：原生 decode 因显存压力发生 retraction 时会返回 503，不保留 KV backup。
+该开关不关闭 handoff 的 host 传输缓冲区，也不能替代重复释放修复。
+可通过 `HANDOFF_RETRACTION_BACKUP=cpu_tensor` 或 `host_pool` 覆盖；这些覆盖配置需另做容量和故障验证。
+
 尤其要检查旧 shell 中是否仍有 `SGLANG_MOONCAKE_MAX_TRANSFER_BATCH_INDICES=8`。
 旧实验 connector 不使用该开关，新 main 会按它拆成多次同步调用，32K 请求因此增加数千次往返。
 当前默认 `2048` 与 `--chunked-prefill-size 2048` 对齐；部署更新后要重启实例并核对有效值。
@@ -469,6 +483,11 @@ PYTHONPATH=plugins/remote_attn "$HANDOFF_PYTHON" \
 当前适配范围为收到的 P0–P5.18 功能包；P5.19 pre-layerwise、TP Graph-on、跨主机、
 生产 router、通用 SSE 重连续传和自动扩缩容不作为本次交付能力。
 TP 命令一致性检查在分歧时停止引擎，不是跨 rank 原子回滚协议；故障路径可能保留内存直到进程退出。
+
+**D 重启注意事项：**目前单独重启 D 后立即请求可能因旧 Mooncake session 返回 500，
+后台 probe 恢复只影响后续请求。维护时按内网规避方法配套重启 P 与 D，
+完成实际 KV 传输请求验证后再恢复流量；health 200 不等于传输链路已恢复。
+该窗口尚未修复，不要将 KV 重复释放修复解释为无损滚动重启支持。
 
 - [插件总览与安装边界](README.md)
 - [原包功能对应与来源差异](FUNCTIONAL-PARITY.md)

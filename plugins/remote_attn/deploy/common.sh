@@ -4,6 +4,10 @@ set -euo pipefail
 HANDOFF_PLUGIN_ROOT=$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)
 export HANDOFF_PYTHON=${HANDOFF_PYTHON:-/opt/conda/envs/sglang/bin/python}
 export HANDOFF_MODEL_PATH=${HANDOFF_MODEL_PATH:-/workspace/models/Qwen3-8B}
+# Match the validated TP2 setup. This controls native decode retraction only;
+# it does not disable handoff's registered transfer buffers. With "none", a
+# memory-pressure retraction aborts the request with 503 instead of backing up KV.
+export HANDOFF_RETRACTION_BACKUP=${HANDOFF_RETRACTION_BACKUP:-none}
 export HANDOFF_PROFILE=${HANDOFF_PROFILE:-0}
 export HANDOFF_RPC_PROFILE=${HANDOFF_RPC_PROFILE:-1}
 export HANDOFF_REMOTE_FALLBACK_MS=${HANDOFF_REMOTE_FALLBACK_MS:-10000}

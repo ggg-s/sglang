@@ -10,6 +10,7 @@ exec "$HANDOFF_PYTHON" -m sglang.launch_server \
   --max-running-requests 8 --chunked-prefill-size 2048 \
   --disable-radix-cache --disable-cuda-graph --disable-overlap-schedule \
   --disaggregation-mode decode \
+  --disaggregation-decode-retraction-backup "$HANDOFF_RETRACTION_BACKUP" \
   --disaggregation-transfer-backend mooncake_tcp \
   --disaggregation-bootstrap-port 35409 \
   ${EXTRA_ARGS[@]+"${EXTRA_ARGS[@]}"} "$@"

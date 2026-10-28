@@ -67,6 +67,26 @@ def _source_class(relative, owner, members=None):
     return namespace[owner]
 
 
+def _source_function(relative, name):
+    path = ROOT / "python" / "sglang" / "srt" / relative
+    tree = ast.parse(path.read_text())
+    node = next(
+        n for n in tree.body if isinstance(n, ast.FunctionDef) and n.name == name
+    )
+    module = ast.Module(
+        body=[
+            ast.ImportFrom(
+                module="__future__", names=[ast.alias(name="annotations")], level=0
+            ),
+            node,
+        ],
+        type_ignores=[],
+    )
+    namespace = {}
+    exec(compile(ast.fix_missing_locations(module), str(path), "exec"), namespace)
+    return namespace[name]
+
+
 class TestRemoteAttn(CustomTestCase):
     @classmethod
     def setUpClass(cls):
@@ -232,6 +252,61 @@ class TestRemoteAttn(CustomTestCase):
         self.assertEqual(allocator.available_size(), 32)
         self.assertTrue(req.kv.is_kv_released)
         self.assertIsNone(req.handoff_prefix_indices)
+
+    def test_deferred_release_after_plugin_cleanup_is_idempotent(self):
+        # Run the actual upstream entry point used by decode's deferred releases.
+        release = _source_function("mem_cache/common.py", "release_kv_cache")
+        for cleanup in ("source", "pending_import"):
+            with self.subTest(cleanup=cleanup):
+                allocator = self._allocator()
+                pool = self._pool()
+                req = self._req(allocator.alloc(3))
+                req.kv.kv_committed_len = 3
+                tree = SimpleNamespace(
+                    token_to_kv_pool_allocator=allocator,
+                    supports_mamba=lambda: False,
+                )
+                # A pending import has no row yet, but still owns prefix slots.
+                self.assertTrue(req.kv.is_kv_released)
+                if cleanup == "source":
+                    scheduler = SimpleNamespace(
+                        token_to_kv_pool_allocator=allocator,
+                        req_to_token_pool=pool,
+                        waiting_queue=[req],
+                        running_batch=None,
+                        last_batch=None,
+                    )
+                    self.runtime._free_source_request(scheduler, req)
+                else:
+                    self.hooks._release_kv(release, req, tree, checkpoint=True)
+                self.assertEqual(allocator.available_size(), 32)
+                self.assertIsNone(req.handoff_prefix_indices)
+                # New requests can reuse those slots before deferred cleanup runs.
+                in_use = allocator.alloc(5)
+                for checkpoint in (False, True):
+                    self.hooks._release_kv(release, req, tree, checkpoint=checkpoint)
+                self.assertEqual(allocator.available_size(), 27)
+                free = torch.cat((allocator.free_pages, allocator.release_pages))
+                self.assertFalse(torch.isin(in_use, free).any())
+                self.assertEqual(torch.unique(free).numel(), 27)
+                self.assertEqual(pool.available_size(), 2)
+
+    def test_release_without_kv_still_frees_independent_mamba_state(self):
+        release = _source_function("mem_cache/common.py", "release_kv_cache")
+        req = self._req()
+        req.kv.mamba_pool_idx = torch.tensor([7])
+        freed = []
+        tree = SimpleNamespace(
+            supports_mamba=lambda: True,
+            req_to_token_pool=SimpleNamespace(
+                mamba_allocator=SimpleNamespace(free=freed.append)
+            ),
+        )
+        self.hooks._release_kv(release, req, tree, checkpoint=False)
+        self.hooks._release_kv(release, req, tree, checkpoint=False)
+        self.assertIsNone(req.kv.mamba_pool_idx)
+        self.assertEqual(len(freed), 1)
+        self.assertEqual(freed[0].tolist(), [[7]])
 
     def test_running_receiver_blocks_kv_reuse(self):
         allocator = self._allocator()
@@ -715,7 +790,7 @@ class TestRemoteAttn(CustomTestCase):
                 with self.assertRaises(RuntimeError):
                     state.begin_step(SimpleNamespace())
 
-    def test_launchers_default_to_one_native_transfer_batch_per_prefill_chunk(self):
+    def test_launchers_preserve_native_batching_and_retraction_configuration(self):
         """N=8 used to split each native PD chunk into synchronous TE calls."""
         with tempfile.TemporaryDirectory() as directory:
             root = Path(directory)
@@ -743,10 +818,12 @@ class TestRemoteAttn(CustomTestCase):
                             "SGLANG_MOONCAKE_MAX_TRANSFER_BATCH_INDICES",
                             "HANDOFF_CTL_DIR",
                             "HANDOFF_SERVER_EXTRA",
+                            "HANDOFF_RETRACTION_BACKUP",
                         ):
                             env.pop(name, None)
                         if override is not None:
                             env["SGLANG_MOONCAKE_MAX_TRANSFER_BATCH_INDICES"] = override
+                            env["HANDOFF_RETRACTION_BACKUP"] = "cpu_tensor"
                         subprocess.run(
                             [
                                 "bash",
@@ -765,6 +842,15 @@ class TestRemoteAttn(CustomTestCase):
                         chunk = int(args[args.index("--chunked-prefill-size") + 1])
                         self.assertGreaterEqual(int(server["batch"]), chunk)
                         self.assertEqual(server["batch"], override or "2048")
+                        backup_flag = "--disaggregation-decode-retraction-backup"
+                        if role == "p":
+                            self.assertNotIn(backup_flag, args)
+                        else:
+                            self.assertEqual(args.count(backup_flag), 1)
+                            self.assertEqual(
+                                args[args.index(backup_flag) + 1],
+                                "cpu_tensor" if override else "none",
+                            )
 
     def test_early_layer_done_wakes_waiters_with_error(self):
         runtime = self.runtime

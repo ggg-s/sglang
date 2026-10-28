@@ -182,6 +182,11 @@ def _release_kv(original, req, tree_cache, *, checkpoint):
         req.kv.mark_kv_released()
         req.kv.kv_committed_len = 0
         return
+    # Plugin cleanup can precede native decode's deferred release. The receiver
+    # fence and pending-prefix cleanup above still apply without an admitted row.
+    # Mamba state is independent of KV and must retain upstream's release path.
+    if req.kv.is_kv_released and not req.kv.holds_kv and not req.kv.holds_mamba:
+        return
     return original(req, tree_cache, checkpoint=checkpoint)
 
 

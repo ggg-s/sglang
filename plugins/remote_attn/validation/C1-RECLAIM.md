@@ -14,7 +14,8 @@ reserve 与 freeze 之间先持久化相同 epoch。原先的严格 epoch/大小
 随后 `_reservation_free` 又 free 一次。现在只由 reservation owner 释放一次。
 
 控制面变更是对原 gateway 的针对性修补，不能再称其与原包逐字节相同；driver 和原始来源 manifest 保留。
-完整 5090 模型 C1 的端到端 drain 还应在升级后复跑，本次 CPU 回归验证的是实际 reserve/cutover 控制逻辑。
+初次提交的 CPU 回归验证实际 reserve/cutover 控制逻辑；后续内网已反馈 Copy / Layer / Remote
+三模式完整模型 C1 均 SAFE_TO_STOP、96/96 exact，见 [5090 新提交复验](5090-new-commits.md)。
 
 ## Host：完成、CUDA fence、native unregister 三个条件
 
