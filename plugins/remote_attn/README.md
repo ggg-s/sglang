@@ -1,5 +1,7 @@
 # Remote attention / progressive KV handoff plugin
 
+中文部署入口：[内网部署手册](DEPLOYMENT-ZH.md)，包含交付清单、Mooncake 版本、离线准备、安装、启动和迁移验收。
+
 This ports the supplied P0–P5.18 experiment onto local `main` at
 `1335d372f0a58857422e40b89a097daa7d3bf86c`, using the existing
 `sglang.srt.plugins` entry point. It is an experimental port, with CPU contract
