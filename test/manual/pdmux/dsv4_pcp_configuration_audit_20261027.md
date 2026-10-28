@@ -98,3 +98,76 @@ intentional and decode graph disabling remains opt-in for this recipe.
 Rerun the full-model acceptance and workload on the deployment host before
 claiming throughput or latency. The former `enable_dp_attention=false` workload
 results are not equivalent to the resolved configuration audited here.
+
+## Runtime gather / CUDA graph follow-up, 2026-10-28
+
+Preserving the PCP declaration exposed a separate runtime assumption at
+`c9880b53bb`: `require_mlp_tp_gather()` asserted that DP attention implies
+DP > 1. `GraphSharedOutput.create_for_model_runner()` reaches this predicate
+through logits-row sizing and decode graph bucket alignment, before serving
+requests. The configuration audit above did not cover that startup entry.
+
+The fix keeps DP attention enabled and changes two predicates:
+
+- MLP TP gather requires DP attention **and DP > 1**. At DP1 there are no
+  independent attention-DP batches to gather. DSV4's prefill CP token gathers
+  remain model-owned and are not disabled by this predicate.
+- Attention TP gather tests the actual `attn_tp_size > 1`, rather than
+  `dp_size < tp_size`. The latter also counts CP ranks and incorrectly asks
+  for an upstream attention gathered buffer at TP8/CP8/DP1. A blanket DP1
+  exemption would break ordinary TP sequence-scattering / A2A configurations.
+
+For the supported recipe, the resulting state is:
+
+| Runtime value | TP8/CP8/DP1 |
+|---|---|
+| base attention TP / CP width | 1 / 8 |
+| MLP TP gather / attention TP gather | false / false |
+| upstream gathered-buffer requirement | false |
+| MLP-sync metadata preparation | true |
+| decode graph token-row alignment | 8, retained for CP |
+
+`--enable-cp-decode-attn-tp` still selects the separate decode module views;
+it does not rewrite the base attention TP width used by these predicates.
+
+The follow-up review covered attention-width derivation, attention-DP rank
+arithmetic and model-parallel group construction, the DP1 scheduler-local
+metadata path, DSpark's DP-only argument checks and CP-aware synchronization,
+and graph bucket / buffer metadata consumers. DP1 still generates one local
+token-count entry and skips cross-DP scheduler gathering. The separate DP>=2
+requirements for unsupported MoE backends are not relaxed.
+
+Regression coverage now includes the real resolved/pickled/published PCP
+configuration reaching `GraphSharedOutput -> ModelRunner.max_decode_logits_rows
+-> get_batch_sizes_to_capture -> get_cuda_graph_batch_size_alignment`, for
+CP2/4/8, decode attention TP off/on, and target/draft token widths. It checks
+request-pool clamping and CP-aligned buckets. On CUDA it also allocates the
+shared logits output and captures/replays a small tensor operation. Additional
+controls cover ordinary TP, multi-DP, mixed CP/attention-TP widths, the gather
+opt-out, and DP1 scheduler metadata with CP2/CP8.
+
+The actual graph-output startup entry was also run with the two old gather
+functions loaded in memory from `c9880b53bb`, reproducing the reported assertion
+without modifying the workstation checkout. The old attention predicate also
+returns true for the same published configuration; the fixed predicate returns
+false while retaining CP alignment 8.
+
+These checks do not execute a TP8 DSV4 model, FlashMLA, MoE or HiCache transfers.
+A deployment-host startup and request test is still required for full-model
+acceptance; the 4060 only validates the planning path and small CUDA graphs.
+
+Validation on the RTX 4060 Laptop workstation (PyTorch 2.13.0+cu130), tested
+source `ec76ab0881`:
+
+- PCP resolution/runtime tests, scheduler DP metadata, CUDA graph buffer
+  registry and the complete `unit/multiplex` directory: **265 tests and 355
+  subtests passed**, including the new CUDA output allocation/replay case.
+- `test_pdmux_tp_overlap_cuda.py`: **2 passed, 1 skipped**; the skipped case
+  needs two distinct GPUs.
+- PCP resolution/runtime tests with `CUDA_VISIBLE_DEVICES=''`: **9 passed,
+  1 skipped, 102 subtests passed**; only the CUDA replay case skipped.
+- Formatting, focused static checks and `git diff --check` passed locally.
+
+Workstation evidence is under `/workspace/cp-decode-review-20261027/`:
+`pcp-graph-baseline-20261028.log`, `pcp-graph-regression-20261028.log`,
+`pcp-graph-lanes-20261028.log` and `pcp-graph-cpu-20261028.log`.
