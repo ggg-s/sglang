@@ -164,6 +164,10 @@ def _expire_target_states(scheduler) -> None:
         return
     for st in list(_TARGET_STATES):
         req = getattr(st, "req", None)
+        if req is not None and getattr(req, "_pre_layerwise_target", None) is not None:
+            # Native PD cancellation/reclamation fences its own receiver. The
+            # experimental controller watchdog must not free its allocation.
+            continue
         if req is not None and req.finished():
             if st.finished_at is None:
                 st.finished_at = time.monotonic()
@@ -1771,7 +1775,7 @@ class RemoteHub:
                 self._in_flight = max(0, self._in_flight - int(n))
             self.scheduler._handoff_remote_active = self._in_flight > 0
 
-    def register_handoff(self, req, meta: dict) -> dict:
+    def register_handoff(self, req, meta: dict, *, on_release=None) -> dict:
         """Register a frozen request and return the target-side route info."""
         scheduler = self.scheduler
         kv_len = int(req.kv.kv_committed_len)
@@ -1805,7 +1809,7 @@ class RemoteHub:
             contiguous=contiguous,
             # Free on the scheduler thread; this callback runs in a socket
             # thread (or under the registry lock path) and must stay cheap.
-            on_release=self._release_q.put,
+            on_release=self._release_q.put if on_release is None else on_release,
         )
         print(
             f"[handoff-hub] register id={ctx.handoff_id} epoch={ctx.owner_epoch} "

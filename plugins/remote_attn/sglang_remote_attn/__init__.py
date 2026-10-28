@@ -1,4 +1,4 @@
-"""Optional P0–P5.18 handoff integration, loaded through SGLang entry points."""
+"""Optional P0–P5.19 handoff integration, loaded through SGLang entry points."""
 
 
 def register():

@@ -6,6 +6,8 @@ import pkgutil
 import threading
 import time
 
+from . import pre_layerwise
+
 logger = logging.getLogger(__name__)
 
 
@@ -39,6 +41,9 @@ def _scheduler_init(original, scheduler, *args, **kwargs):
             "remote_attn currently requires dense NHD MHA KV in BF16/FP16"
         )
     _runtime().get_remote_hub(scheduler)
+    from .pre_layerwise import initialize
+
+    initialize(scheduler)
 
 
 def validate_config():
@@ -97,7 +102,12 @@ def _event_loop(original, scheduler, *args, **kwargs):
     try:
         return original(scheduler, *args, **kwargs)
     finally:
-        _runtime().shutdown_handoff(scheduler)
+        from .pre_layerwise import shutdown
+
+        try:
+            shutdown(scheduler)
+        finally:
+            _runtime().shutdown_handoff(scheduler)
 
 
 def _broadcast(original, receiver, recv_reqs, local_reqs=None):
@@ -124,6 +134,9 @@ def _process_requests(original, scheduler, recv_reqs):
     for control in controls:
         runtime.execute_handoff_control(scheduler, control)
     runtime.maybe_handle_handoff_control(scheduler)
+    from .pre_layerwise import poll
+
+    poll(scheduler)
     return result
 
 
@@ -169,6 +182,10 @@ def _reset_retracted(original, req):
 
 
 def _release_kv(original, req, tree_cache, *, checkpoint):
+    from .pre_layerwise import defer_release
+
+    if defer_release(req, lambda: original(req, tree_cache, checkpoint=checkpoint)):
+        return
     runtime = _runtime()
     runtime.stop_target_receivers(req)
     prefix = getattr(req, "handoff_prefix_indices", None)
@@ -193,8 +210,21 @@ def _release_kv(original, req, tree_cache, *, checkpoint):
 def _stream_output(original, streamer, reqs, *args, **kwargs):
     # The controller reads these requests through status/status_many. Sending
     # them to the normal detokenizer would create a second output owner.
-    reqs = [req for req in reqs if not getattr(req, "_handoff_req", False)]
-    return original(streamer, reqs, *args, **kwargs)
+    selected = []
+    for req in reqs:
+        if getattr(req, "_handoff_req", False):
+            continue
+        source = getattr(req, "_pre_layerwise_source", None)
+        snapshot = getattr(req, "_pre_layerwise_response_snapshot", False)
+        if source is not None and source.responded and not snapshot:
+            continue
+        selected.append(req)
+    result = original(streamer, selected, *args, **kwargs)
+    for req in selected:
+        source = getattr(req, "_pre_layerwise_source", None)
+        if source is not None:
+            source.responded = True
+    return result
 
 
 def _decode_graph(original, runner, forward_batch):
@@ -284,6 +314,17 @@ HOOKS = {
     "sglang.srt.disaggregation.mooncake.conn.MooncakeKVManager._transfer_data": _transfer,
     "sglang.srt.disaggregation.mooncake.conn.MooncakeKVManager._publish_peer_registration": _publish_peer,
 }
+
+# Thin adapters; layer-pipeline state is owned by the scheduler instance.
+HOOKS.update(
+    {
+        "sglang.srt.managers.scheduler.Scheduler.run_batch": pre_layerwise.run_batch,
+        "sglang.srt.managers.scheduler.Scheduler.is_fully_idle": pre_layerwise.is_fully_idle,
+        "sglang.srt.model_executor.model_runner.ModelRunner.forward": pre_layerwise.forward,
+        "sglang.srt.disaggregation.prefill.SchedulerDisaggregationPrefillMixin.send_kv_chunk": pre_layerwise.send_chunk,
+        "sglang.srt.disaggregation.decode.DecodeTransferQueue.pop_transferred": pre_layerwise.pop_transferred,
+    }
+)
 
 
 def register_hooks():

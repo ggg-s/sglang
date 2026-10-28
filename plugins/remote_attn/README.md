@@ -14,7 +14,7 @@ still need acceptance on the target deployment.
 
 - `sglang_remote_attn/handoff_control.py`: adapted runtime, including Copy, Layer,
   Remote, Fast Freeze/Resume, RemoteHub, progressive LOCAL, epochs, fences and leases.
-- `sglang_remote_attn/hooks.py`: 16 function-boundary hooks. No scheduler event
+- `sglang_remote_attn/hooks.py`: 21 function-boundary hooks. No scheduler event
   loop, graph runner, allocation function or Mooncake connector is copied/replaced.
 - `control_plane/p2d_driver.py`: original supplied driver. `p4_gateway.py` now
   carries a targeted C1 reservation/epoch fix; its protocol and fixed state paths
@@ -30,7 +30,8 @@ with uncommitted changes; experiment commit `17261ca0` is the supplied
 `ad5290feffe0109dc8bbd18c94a4bafb`, which differs from the documented
 `e545304a50a64f64e1f1cf9e679e634f`. The original file was not modified.
 The manifest records the input SHA256 values so this discrepancy stays visible.
-P5.19 / pre-layerwise PD transfer is not part of this package.
+P5.19 now has an opt-in same-host pre-layerwise PD prototype; see the
+[implementation and experiment guide](P5.19-PRE-LAYERWISE-ZH.md). GPU E2E validation is pending.
 The [functional parity checklist](FUNCTIONAL-PARITY.md) maps the supplied
 P0–P5.18 features to this port and distinguishes code coverage from deployment acceptance.
 
@@ -52,10 +53,10 @@ P0–P5.18 features to this port and distinguishes code coverage from deployment
 Main's existing `prefill_decode_interval` implements P5.10. The old scheduler
 instrumentation in the reference patch is not installed.
 
-The only core source edit is the typed
-`envs.SGLANG_MOONCAKE_SEND_LOCK = EnvBool(True)` declaration in `environ.py`.
-The plugin reads it; ordinary SGLang transport does not change when the plugin
-is absent or `HANDOFF_CTL_DIR` is unset. No source patch in Mooncake C++ is needed.
+Core integration includes the typed `SGLANG_MOONCAKE_SEND_LOCK` declaration,
+optional Mooncake buffer-subset/completion fields, and a Decode metadata commit
+option that retains its receiver. These additions keep their ordinary behavior
+by default; the P5.19 adapter is enabled only through the plugin and its explicit mode. No source patch in Mooncake C++ is needed.
 
 ## Supported port envelope
 

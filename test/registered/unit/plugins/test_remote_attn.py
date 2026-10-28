@@ -1207,6 +1207,8 @@ class TestRemoteAttn(CustomTestCase):
         self.assertEqual(rows[0]["requests"][::2], ["request", "timeout-abort"])
         self.assertEqual(rows[0]["polls"], [0])
         self.assertEqual(rows[1]["polls"], [])
+        self.assertEqual(rows[0]["retirements"], [[], ["a"], ["a", "b"]])
+        self.assertEqual(rows[0]["retirements"], rows[1]["retirements"])
         self.assertEqual(rows[0]["outcomes"], rows[1]["outcomes"])
         self.assertEqual(
             [r["fatal"] for r in rows[0]["outcomes"]], [False, True, True, False]
@@ -1573,6 +1575,440 @@ class TestRemoteAttn(CustomTestCase):
         self.assertFalse(second.is_alive())
         self.assertEqual(errors, [])
         self.assertEqual(calls, ["first", "second"])
+
+    def test_prelayer_coverage_rejects_holes_and_stale_generations(self):
+        pl = self.hooks.pre_layerwise
+        with tempfile.TemporaryDirectory() as directory:
+            path = Path(directory)
+            state = SimpleNamespace(
+                events=[threading.Event(), threading.Event()],
+                layer_ready_at=[None, None],
+                import_done_at=None,
+            )
+            target = pl.Target(
+                None, None, None, path, "current", pl.LayerCoverage(9, 2), state
+            )
+
+            def proof(layer, start, end, generation="current"):
+                pl.write_json(
+                    path / f"layer-{layer}.json",
+                    dict(generation=generation, layer=layer, start=start, end=end),
+                )
+
+            proof(0, 0, 9, "old")
+            proof(1, 0, 4)
+            target.refresh()
+            self.assertFalse(any(e.is_set() for e in state.events))
+            proof(0, 0, 9)
+            proof(1, 5, 9)
+            target.refresh()
+            self.assertTrue(state.events[0].is_set())
+            self.assertFalse(state.events[1].is_set())
+            self.assertIsNone(state.import_done_at)
+            proof(1, 4, 5)
+            target.refresh()
+            self.assertTrue(all(e.is_set() for e in state.events))
+            self.assertIsNotNone(state.import_done_at)
+            with self.assertRaises(ValueError):
+                target.coverage.complete(2, 0, 9)
+            with self.assertRaises(ValueError):
+                target.coverage.complete(0, 0, 10)
+
+    def test_prelayer_selects_matching_kv_buffers_without_mutating_pool(self):
+        pl = self.hooks.pre_layerwise
+        manager_cls = _source_class(
+            "disaggregation/mooncake/conn.py", "MooncakeKVManager", {"send_kvcache"}
+        )
+        manager = manager_cls()
+        manager.is_mla_backend = manager.is_hybrid_mla_backend = False
+        manager.pp_size = manager.attn_tp_size = 1
+        manager.kv_args = SimpleNamespace(
+            kv_layer_ids=[], kv_data_ptrs=[10, 20, 30, 40, 50, 60], kv_item_lens=[8] * 6
+        )
+        manager._validate_envelope_kv_layout = lambda *args: None
+        manager._send_kvcache_generic = lambda **kw: kw
+        dst = [110, 120, 130, 140, 150, 160]
+        groups = pl.buffer_groups([0, 1, 2, 0, 1, 2], 3, 2)
+        self.assertEqual(groups, [((0, 1), (0, 1, 3, 4)), ((2,), (2, 5))])
+        result = manager.send_kvcache(
+            "peer",
+            [3, 8],
+            dst,
+            [1, 9],
+            None,
+            dst_attn_tp_size=1,
+            kv_buffer_indices=groups[1][1],
+        )
+        self.assertEqual(result["src_data_ptrs"], [30, 60])
+        self.assertEqual(result["dst_data_ptrs"], [130, 160])
+        self.assertEqual(result["prefill_data_indices"], [3, 8])
+        self.assertEqual(manager.kv_args.kv_data_ptrs, [10, 20, 30, 40, 50, 60])
+        self.assertEqual(dst, [110, 120, 130, 140, 150, 160])
+        for bad in [(), (0, 0), (6,), (-1,)]:
+            with self.assertRaises(ValueError):
+                manager.send_kvcache(
+                    "peer",
+                    [3],
+                    dst,
+                    [1],
+                    None,
+                    dst_attn_tp_size=1,
+                    kv_buffer_indices=bad,
+                )
+        with self.assertRaises(ValueError):
+            pl.buffer_groups([0, 1, 2], 3, 2)
+
+    def test_prelayer_source_release_requires_native_and_rpc_drain(self):
+        pl = self.hooks.pre_layerwise
+        with tempfile.TemporaryDirectory() as directory:
+            owner = SimpleNamespace(
+                config=pl.Config("remote", Path(directory)), scheduler=object()
+            )
+            status = SimpleNamespace(done=False)
+            req = SimpleNamespace(disagg_kv_sender=status)
+            source = pl.Source(
+                owner, req, Path(directory), "g", [], slice(0, 3), (), 3, finalized=True
+            )
+            req._pre_layerwise_source = source
+            registry = self.runtime.HandoffRegistry()
+            ctx = registry.register(
+                "h",
+                req,
+                1,
+                3,
+                3,
+                "token",
+                on_release=lambda _: source.remote_closed.set(),
+            )
+            source.service = dict(handoff_id="h", epoch=ctx.owner_epoch)
+            registry.acquire("h", ctx.owner_epoch)
+            released = []
+            self.assertTrue(pl.defer_release(req, lambda: released.append("KV")))
+            self.assertTrue(pl.defer_release(req, lambda: released.append("duplicate")))
+            pl.write_json(source.path / "done.json", {"generation": "old"})
+            with (
+                patch.object(
+                    pl, "_poll_success", side_effect=lambda sender: sender.done
+                ),
+                patch.object(
+                    self.runtime,
+                    "get_remote_hub",
+                    return_value=SimpleNamespace(registry=registry),
+                ),
+            ):
+                self.assertFalse(source.poll())
+                self.assertIsNotNone(registry.get("h", ctx.owner_epoch))
+                pl.write_json(source.path / "done.json", {"generation": "g"})
+                self.assertFalse(source.poll())
+                self.assertIsNone(registry.acquire("h", ctx.owner_epoch))
+                registry.release_ref("h", ctx.owner_epoch)
+                self.assertFalse(source.poll())  # RPC drained, native still writing.
+                status.done = True
+                self.assertTrue(source.poll())
+                self.assertEqual(released, [])  # TP agreement must precede freeing.
+                source.retire()
+                source.retire()
+            self.assertEqual(released, ["KV"])
+            self.assertIsNone(req._pre_layerwise_source)
+
+    def test_prelayer_target_keeps_metadata_until_native_completion(self):
+        pl = self.hooks.pre_layerwise
+        with tempfile.TemporaryDirectory() as directory:
+            path = Path(directory)
+            freed, cleared, dropped = [], [], []
+            receiver = SimpleNamespace(done=False, clear=lambda: cleared.append(1))
+            req = SimpleNamespace()
+            dr = SimpleNamespace(req=req, kv_receiver=receiver, metadata_buffer_index=0)
+            queue_ = SimpleNamespace(
+                metadata_buffers=SimpleNamespace(bootstrap_room=torch.tensor([[7]])),
+                req_to_metadata_buffer_idx_allocator=SimpleNamespace(free=freed.append),
+            )
+            state = SimpleNamespace(
+                events=[threading.Event()],
+                layer_ready_at=[None],
+                import_done_at=None,
+                remote_calls=2,
+                admitted_at=1.0,
+            )
+            owner = SimpleNamespace(config=pl.Config("remote", path))
+            target = pl.Target(
+                owner, queue_, dr, path, "g", pl.LayerCoverage(3, 1), state
+            )
+            req._pre_layerwise_target = target
+            pl.write_json(
+                path / "layer-0.json", dict(generation="g", layer=0, start=0, end=3)
+            )
+            with (
+                patch.object(pl, "_poll_success", side_effect=lambda r: r.done),
+                patch.object(
+                    self.runtime, "_drop_target_state_for", side_effect=dropped.append
+                ),
+            ):
+                target.finish(wait=False)
+                self.assertTrue(state.events[0].is_set())
+                self.assertEqual(freed + cleared + dropped, [])
+                self.assertEqual(queue_.metadata_buffers.bootstrap_room.item(), 7)
+                receiver.done = True
+                target.finish(wait=False)
+                target.finish(wait=False)
+            self.assertEqual(freed, [0])
+            self.assertEqual(cleared, [1])
+            self.assertEqual(dropped, [req])
+            self.assertEqual(queue_.metadata_buffers.bootstrap_room.item(), 0)
+            self.assertIsNone(dr.kv_receiver)
+            self.assertEqual(pl.read_json(path / "done.json")["remote_calls"], 2)
+
+    def test_prelayer_target_failure_never_frees_destination(self):
+        pl = self.hooks.pre_layerwise
+        with tempfile.TemporaryDirectory() as directory:
+            freed = []
+            req = SimpleNamespace()
+            receiver = SimpleNamespace()
+            target = pl.Target(
+                SimpleNamespace(config=pl.Config("remote", Path(directory))),
+                SimpleNamespace(
+                    req_to_metadata_buffer_idx_allocator=SimpleNamespace(
+                        free=freed.append
+                    )
+                ),
+                SimpleNamespace(req=req, kv_receiver=receiver),
+                Path(directory),
+                "g",
+                pl.LayerCoverage(3, 1),
+            )
+            req._pre_layerwise_target = target
+            with patch.object(
+                pl, "_poll_success", side_effect=RuntimeError("unsettled transport")
+            ):
+                with self.assertRaisesRegex(RuntimeError, "unsettled"):
+                    pl.defer_release(req, lambda: freed.append("KV"))
+            self.assertEqual(freed, [])
+            self.assertFalse(target.closed)
+            self.assertIs(target.decode_req.kv_receiver, receiver)
+
+    def test_prelayer_streams_prefill_response_exactly_once(self):
+        for native_first in (False, True):
+            with self.subTest(native_first=native_first):
+                source = SimpleNamespace(responded=False)
+                req = SimpleNamespace(_pre_layerwise_source=source)
+                snapshot = copy.copy(req)
+                snapshot._pre_layerwise_response_snapshot = True
+                outputs = []
+                emit = lambda streamer, reqs: outputs.extend(reqs)
+                if native_first:
+                    self.hooks._stream_output(emit, None, [req])
+                    self.assertTrue(source.responded)  # Controller must skip snapshot.
+                else:
+                    self.hooks._stream_output(emit, None, [snapshot])
+                    self.hooks._stream_output(emit, None, [req])
+                self.assertEqual(len(outputs), 1)
+
+    def test_prelayer_worker_proves_completion_only_after_all_writes(self):
+        import logging
+        from collections import defaultdict
+
+        manager_cls = _source_class(
+            "disaggregation/mooncake/conn.py", "MooncakeKVManager", {"transfer_worker"}
+        )
+        polls = _source_class("disaggregation/base/conn.py", "KVPoll")
+        manager_cls.transfer_worker.__globals__.update(
+            time=time, logger=logging.getLogger(__name__), KVPoll=polls
+        )
+        for outcome in ("success", "failed_peer", "cancelled", "short_destination"):
+            with self.subTest(outcome=outcome):
+                events = []
+                manager = manager_cls()
+                manager.enable_trace = manager.enable_staging = (
+                    manager.enable_deferred_decode_kv_release
+                ) = False
+                manager.is_mla_backend = manager.is_hybrid_mla_backend = False
+                manager.attn_tp_size = 1
+                manager.bootstrap_port = 1
+                manager.session_lock = threading.Lock()
+                manager.state_layout_rejections = manager.failed_session_probes = {}
+                manager.failed_sessions = {"b"} if outcome == "failed_peer" else set()
+                manager._staging_outstanding = defaultdict(int)
+                manager.kv_args = SimpleNamespace(kv_data_ptrs=[10, 20])
+                manager.request_status = {7: polls.Transferring}
+                manager.req_to_decode_prefix_len = {}
+                manager.check_status = lambda room: manager.request_status[room]
+                manager._get_dsa_cache_transfer_skip_flags = lambda peer: (False, False)
+                manager.conclude_failure = lambda bootstrap_room, **kw: (
+                    manager.request_status.update({bootstrap_room: polls.Failed})
+                )
+                manager.poison_deferred_ack_room = lambda room: None
+                manager.decode_kv_args_table = {
+                    session: SimpleNamespace(
+                        requires_dcp_relayout=False,
+                        dst_attn_tp_size=1,
+                        dst_kv_ptrs=[30, 40],
+                        dst_kv_layer_ids=[],
+                        dst_kv_item_len=8,
+                    )
+                    for session in ("a", "b")
+                }
+                manager.transfer_infos = {
+                    7: {
+                        session: SimpleNamespace(
+                            is_dummy=False,
+                            mooncake_session_id=session,
+                            dst_device_kv_indices=None,
+                            dst_kv_indices=(
+                                [5] if outcome == "short_destination" else [5, 6]
+                            ),
+                        )
+                        for session in ("a", "b")
+                    }
+                }
+
+                def send(session, *args, **kwargs):
+                    events.append(session)
+                    if outcome == "cancelled":
+                        manager.request_status.pop(7, None)
+                    return 0
+
+                manager.send_kvcache = send
+                chunk = SimpleNamespace(
+                    room=7,
+                    staging_counted=False,
+                    wait_event=SimpleNamespace(
+                        synchronize=lambda: events.append("gpu-ready")
+                    ),
+                    indices_event=None,
+                    prefill_kv_indices=[1, 2],
+                    index_slice=slice(0, 2),
+                    is_last_chunk=False,
+                    kv_buffer_indices=(0, 1),
+                    on_complete=lambda: events.append("proof"),
+                )
+                tasks = queue.Queue()
+                tasks.put(chunk)
+                tasks.put(None)
+                if outcome == "short_destination":
+                    with self.assertRaisesRegex(RuntimeError, "does not cover"):
+                        manager.transfer_worker(tasks, None)
+                else:
+                    manager.transfer_worker(tasks, None)
+                if outcome == "success":
+                    self.assertEqual(events, ["gpu-ready", "a", "b", "proof"])
+                else:
+                    self.assertNotIn("proof", events)
+
+    def test_prelayer_chunk_tail_reserves_once_and_preserves_middle_chunks(self):
+        pl = self.hooks.pre_layerwise
+        sender_cls = _source_class(
+            "disaggregation/common/conn.py", "CommonKVSender", {"_prepare_send_indices"}
+        )
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            peer = SimpleNamespace(
+                is_dummy=False, mooncake_session_id="peer", dst_device_kv_indices=None
+            )
+            registration = SimpleNamespace(
+                dst_attn_tp_size=1,
+                requires_dcp_relayout=False,
+                dst_kv_layer_ids=[],
+                dst_kv_ptrs=[11, 22, 33, 44],
+            )
+            sender = sender_cls()
+            sender.kv_mgr = SimpleNamespace(
+                transfer_infos={7: {0: peer}},
+                decode_kv_args_table={"peer": registration},
+                enable_staging=False,
+                attn_tp_size=1,
+                kv_shard_size=1,
+                enable_all_cp_ranks_for_transfer=False,
+                is_dummy_cp_rank=False,
+                kv_args=SimpleNamespace(
+                    kv_layer_ids=[], kv_data_ptrs=[1, 2, 3, 4], state_data_ptrs=[]
+                ),
+            )
+            sender.curr_idx, sender.num_kv_indices = 4, 9
+            sender._record_transfer_indices = lambda *args: None
+            sender._transfer_start_time = None
+            req = SimpleNamespace(
+                disagg_kv_sender=sender,
+                pending_bootstrap=False,
+                inflight_middle_chunks=1,
+                extend_end=9,
+                origin_input_ids=list(range(9)),
+                multimodal_inputs=None,
+                input_embeds=None,
+                bootstrap_room=7,
+                start_send_idx=4,
+                kv=SimpleNamespace(req_pool_idx=0),
+            )
+            batch = SimpleNamespace(
+                reqs=[req],
+                forward_mode=SimpleNamespace(
+                    is_extend=lambda: True,
+                    is_split_prefill=lambda: False,
+                    is_mixed=lambda: False,
+                ),
+                is_prefill_only=False,
+                return_hidden_states=False,
+                input_embeds=None,
+                replace_embeds=None,
+            )
+            controller = pl.Controller.__new__(pl.Controller)
+            controller.scheduler = SimpleNamespace(
+                disaggregation_mode="prefill",
+                req_to_token_pool=SimpleNamespace(
+                    req_to_token=torch.arange(100, 109, dtype=torch.int32).reshape(1, 9)
+                ),
+            )
+            controller.config = pl.Config("remote", root, 1)
+            controller.rank, controller.tp_size, controller.layers = 0, 1, 2
+            controller.sources, controller.batches = [], 0
+            pl.write_json(
+                root / "7/0/offer.json",
+                dict(
+                    generation="g",
+                    session="peer",
+                    prefix_len=9,
+                    tp_size=1,
+                    layers=2,
+                    mode="remote",
+                ),
+            )
+            with patch.dict(
+                sys.modules,
+                {
+                    "sglang.srt.disaggregation.mooncake.conn": SimpleNamespace(
+                        MooncakeKVSender=sender_cls
+                    ),
+                    "sglang.srt.disaggregation.utils": SimpleNamespace(
+                        DisaggregationMode=SimpleNamespace(PREFILL="prefill")
+                    ),
+                },
+            ):
+                self.assertIsNone(controller.prepare(batch))
+                self.assertEqual(sender.curr_idx, 4)
+                req.inflight_middle_chunks = 0
+                jobs = controller.prepare(batch)
+                self.assertEqual(jobs[0][0].indices.tolist(), [104, 105, 106, 107, 108])
+                self.assertEqual(jobs[0][0].index_slice, slice(4, 9))
+                self.assertEqual(sender.curr_idx, 9)
+                self.assertEqual(req.start_send_idx, 9)
+                self.assertIsNone(controller.prepare(batch))
+                self.assertEqual(len(controller.sources), 1)
+                self.assertEqual(sender.curr_idx, 9)
+
+    def test_prelayer_leases_prevent_idle_cache_reset(self):
+        pl = self.hooks.pre_layerwise
+        controller = SimpleNamespace(sources=[], targets=[])
+        scheduler = SimpleNamespace(_pre_layerwise=controller)
+        idle = lambda scheduler, **kwargs: True
+        self.assertTrue(pl.is_fully_idle(idle, scheduler))
+        controller.sources.append(object())
+        self.assertFalse(pl.is_fully_idle(idle, scheduler))
+        self.assertTrue(pl.is_fully_idle(idle, scheduler, for_health_check=True))
+        controller.sources.clear()
+        controller.targets.append(object())
+        self.assertFalse(pl.is_fully_idle(idle, scheduler))
+        controller.targets.clear()
+        self.assertTrue(pl.is_fully_idle(idle, scheduler))
+        self.assertFalse(pl.is_fully_idle(lambda scheduler, **kwargs: False, scheduler))
 
     def test_hook_targets_match_current_main(self):
         self.check.check_sources(ROOT)

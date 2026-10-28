@@ -3,7 +3,7 @@ import dataclasses
 import struct
 import threading
 from collections import deque
-from typing import List, Optional, Tuple, Union
+from typing import Callable, List, Optional, Tuple, Union
 
 import numpy as np
 import numpy.typing as npt
@@ -35,6 +35,11 @@ class TransferKVChunk:
     wait_event: Optional[object] = None
     # Must complete before reading asynchronously copied host indices.
     indices_event: Optional[object] = None
+    # Optional same-layout subset, used by layer-pipelined prefill. Both K and V
+    # entries must be included before a consumer declares a layer readable.
+    kv_buffer_indices: Optional[Tuple[int, ...]] = None
+    # Runs on the transfer worker only after every destination write succeeds.
+    on_complete: Optional[Callable[[], None]] = None
 
 
 def pack_list_of_buffers(buffers: List[bytes]) -> bytes:

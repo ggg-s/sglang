@@ -1349,10 +1349,39 @@ class MooncakeKVManager(StagingManagerMixin, CommonKVManager):
         dst_device_kv_indices: Optional[npt.NDArray[np.int32]] = None,
         dst_kv_item_len: Optional[int] = None,
         dst_attn_tp_size: Optional[int] = None,
+        kv_buffer_indices: Optional[tuple[int, ...]] = None,
     ):
         self._validate_envelope_kv_layout(
             dst_kv_ptrs, dst_kv_item_len, dst_attn_tp_size
         )
+        if kv_buffer_indices is not None:
+            if (
+                self.is_mla_backend
+                or self.is_hybrid_mla_backend
+                or self.pp_size != 1
+                or dst_attn_tp_size != self.attn_tp_size
+                or dst_device_kv_indices is not None
+                or self.kv_args.kv_layer_ids != (dst_layer_ids or [])
+                or len(dst_kv_ptrs) != len(self.kv_args.kv_data_ptrs)
+                or not kv_buffer_indices
+                or len(set(kv_buffer_indices)) != len(kv_buffer_indices)
+                or any(i < 0 or i >= len(dst_kv_ptrs) for i in kv_buffer_indices)
+            ):
+                raise ValueError(
+                    "layer-pipelined transfer requires matching MHA buffers"
+                )
+            # Select identical entries on both peers. Do not mutate kv_args:
+            # other transfer workers may be using the full layout concurrently.
+            return self._send_kvcache_generic(
+                mooncake_session_id=mooncake_session_id,
+                src_data_ptrs=[self.kv_args.kv_data_ptrs[i] for i in kv_buffer_indices],
+                dst_data_ptrs=[dst_kv_ptrs[i] for i in kv_buffer_indices],
+                item_lens=[self.kv_args.kv_item_lens[i] for i in kv_buffer_indices],
+                prefill_data_indices=prefill_kv_indices,
+                dst_data_indices=dst_kv_indices,
+                executor=executor,
+                force_flat=True,
+            )
         dst_device_kv_ptrs = None
         if dst_device_kv_indices is not None:
             compression_ratios = self.kv_args.mla_compression_ratios
@@ -2541,7 +2570,7 @@ class MooncakeKVManager(StagingManagerMixin, CommonKVManager):
                 ):
                     staging_strategy = self._try_create_staging_strategy(staging_buffer)
                 reqs_to_be_processed = (
-                    self.transfer_infos[kv_chunk.room].values()
+                    list(self.transfer_infos[kv_chunk.room].values())
                     if kv_chunk.room in self.transfer_infos
                     else []
                 )
@@ -2550,6 +2579,7 @@ class MooncakeKVManager(StagingManagerMixin, CommonKVManager):
                 # When staging transfer is not yet ready (watermark/allocation pending),
                 # the chunk is re-enqueued and we break out of the req loop to retry later.
                 staging_deferred = False
+                completed_destinations = 0
                 for req in reqs_to_be_processed:
                     start_ts = time.perf_counter()
                     if not req.is_dummy:
@@ -2606,6 +2636,10 @@ class MooncakeKVManager(StagingManagerMixin, CommonKVManager):
                             if len(chunked_dst_kv_indice) < len(
                                 kv_chunk.prefill_kv_indices
                             ):
+                                if kv_chunk.kv_buffer_indices is not None:
+                                    raise ValueError(
+                                        "layer-pipelined destination does not cover the chunk"
+                                    )
                                 logger.warning(
                                     f"len(chunked_dst_kv_indice) = {len(chunked_dst_kv_indice)}, len(kv_chunk.prefill_kv_indices) = {len(kv_chunk.prefill_kv_indices)}"
                                 )
@@ -2624,6 +2658,14 @@ class MooncakeKVManager(StagingManagerMixin, CommonKVManager):
                         skip_kv, skip_state = self._get_dsa_cache_transfer_skip_flags(
                             target_rank_registration_info
                         )
+                        if kv_chunk.kv_buffer_indices is not None and (
+                            skip_kv
+                            or is_dcp_transfer
+                            or self.enable_staging
+                            or self.attn_tp_size
+                            != target_rank_registration_info.dst_attn_tp_size
+                        ):
+                            raise ValueError("unsupported layer-pipelined destination")
                         if (
                             len(kv_chunk.prefill_kv_indices) == 0
                             or not self.kv_args.kv_data_ptrs
@@ -2676,6 +2718,7 @@ class MooncakeKVManager(StagingManagerMixin, CommonKVManager):
                                 dst_device_kv_indices=chunked_dst_device_kv_indice,
                                 dst_kv_item_len=target_rank_registration_info.dst_kv_item_len,
                                 dst_attn_tp_size=target_rank_registration_info.dst_attn_tp_size,
+                                kv_buffer_indices=kv_chunk.kv_buffer_indices,
                             )
                         elif (
                             self.enable_staging
@@ -2804,6 +2847,8 @@ class MooncakeKVManager(StagingManagerMixin, CommonKVManager):
                             MooncakeRequestStage.MOONCAKE_WORKER_SEND_SESSION,
                             start_ts,
                         )
+                    if not req.is_dummy:
+                        completed_destinations += 1
 
                 if self.enable_trace:
                     kv_chunk.trace_ctx.trace_slice_end(
@@ -2814,6 +2859,16 @@ class MooncakeKVManager(StagingManagerMixin, CommonKVManager):
 
                 if staging_deferred:
                     continue
+
+                if (
+                    kv_chunk.on_complete is not None
+                    and completed_destinations > 0
+                    and completed_destinations
+                    == sum(not req.is_dummy for req in reqs_to_be_processed)
+                    and kv_chunk.room in self.request_status
+                    and self.request_status[kv_chunk.room] != KVPoll.Failed
+                ):
+                    kv_chunk.on_complete()
 
                 self._staging_outstanding[kv_chunk.room] -= 1
                 if self.enable_deferred_decode_kv_release:
@@ -3064,6 +3119,8 @@ class MooncakeKVManager(StagingManagerMixin, CommonKVManager):
         wait_event: Optional[object] = None,
         indices_event: Optional[object] = None,
         trace_ctx: Optional[Union[TraceReqContext, TraceNullContext]] = None,
+        kv_buffer_indices: Optional[tuple[int, ...]] = None,
+        on_complete=None,
     ):
         assert self.disaggregation_mode == DisaggregationMode.PREFILL
         assert not is_last_chunk or (is_last_chunk and aux_index is not None)
@@ -3105,6 +3162,8 @@ class MooncakeKVManager(StagingManagerMixin, CommonKVManager):
                 trace_ctx=trace_ctx,
                 wait_event=wait_event,
                 indices_event=indices_event,
+                kv_buffer_indices=kv_buffer_indices,
+                on_complete=on_complete,
             )
         )
 

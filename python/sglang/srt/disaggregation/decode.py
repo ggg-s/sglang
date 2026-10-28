@@ -2551,7 +2551,9 @@ class DecodeTransferQueue(DecodeHiCacheTransferMixin):
         if prealloc_queue is not None:
             prealloc_queue.note_destinations_queued(len(decode_reqs))
 
-    def _commit_transfer_to_req(self, decode_req: DecodeRequest):
+    def _commit_transfer_to_req(
+        self, decode_req: DecodeRequest, *, keep_receiver=False
+    ):
         # Preserve the checksum before the metadata slot is freed so it can be
         # re-verified when the request enters a batch, including after retraction.
         idx = decode_req.metadata_buffer_index
@@ -2720,8 +2722,11 @@ class DecodeTransferQueue(DecodeHiCacheTransferMixin):
                 output_token_sampling_logprobs[:num_logprobs].cpu().numpy(),
             )
 
-        decode_req.kv_receiver.clear()
-        decode_req.kv_receiver = None
+        # Early Remote admission owns the receiver and metadata slot until
+        # canonical transfer completion. Error exits above still fail closed.
+        if not keep_receiver:
+            decode_req.kv_receiver.clear()
+            decode_req.kv_receiver = None
         decode_req.req.time_stats.set_wait_queue_entry_time()
         return
 
