@@ -6379,9 +6379,51 @@ def _batch_remote_attention(module, q, k, v, forward_batch, meta, save_kv_cache)
     return out
 
 
+def _can_serve_remote(state) -> bool:
+    """A failed local import can retain its frozen source prefix via RPC."""
+    return (
+        getattr(state, "mode", None) == "remote"
+        and getattr(state, "client", None) is not None
+        and not getattr(state, "aborted", False)
+        and not getattr(state, "receiver_unsafe", False)
+        and not (
+            getattr(state, "abort_event", None) is not None
+            and state.abort_event.is_set()
+        )
+    )
+
+
 def _check_target_state(state):
-    if state.error is not None or state.aborted:
-        raise RuntimeError(f"handoff import is not usable: {state.error or 'aborted'}")
+    error = getattr(state, "error", None)
+    if (
+        getattr(state, "aborted", False)
+        or getattr(state, "receiver_unsafe", False)
+        or (
+            getattr(state, "abort_event", None) is not None
+            and state.abort_event.is_set()
+        )
+    ):
+        raise RuntimeError(f"handoff import is not usable: {error or 'aborted/unsafe'}")
+    if error is None:
+        return
+    if _can_serve_remote(state):
+        if not getattr(state, "_downgrade_logged", False):
+            state._downgrade_logged = True
+            print(
+                f"[handoff-target] remote downgrade id={state.handoff_id} reason={error}",
+                flush=True,
+            )
+        return
+    raise RuntimeError(f"handoff import is not usable: {error}")
+
+
+def _record_local_import_error(state, error):
+    state.error = str(error)
+    # Remote events are data-ready bits, not error wakeups. A dropped or
+    # incomplete layer must remain remote in every subsequent step mask.
+    if not _can_serve_remote(state):
+        for event in state.events:
+            event.set()
 
 
 def _handoff_attention_forward(
@@ -6858,9 +6900,12 @@ class _TargetHandoffState:
             self.step_remote_counts.append(int(self._step_remote))
             self._flush_rpc_records()
         if self.mode == "remote" and self._pending_fallback:
-            self.mode = "layer"
             self._pending_fallback = False
-            self.remote_fallback += 1
+            # Once the local import fails, waiting for it cannot recover.
+            # Keep using the source even if an earlier slow RPC asked to wait.
+            if self.error is None:
+                self.mode = "layer"
+                self.remote_fallback += 1
         if PROFILE and self._step_fb is not None:
             self.step_log.append(
                 {
@@ -7187,7 +7232,8 @@ def _finish_layer_import(state) -> None:
             state.error = f"layer import incomplete: {missing[:8]}"
         # Keep import_done_at unset: the source KV is still required by at
         # least one layer, so the controller must not release it.
-        raise RuntimeError(state.error)
+        if not _can_serve_remote(state):
+            raise RuntimeError(state.error)
 
 
 def _layer_receiver(
@@ -7250,9 +7296,7 @@ def _layer_receiver(
         except Exception:
             pass
     except Exception as exc:
-        state.error = repr(exc)
-        for ev in state.events:
-            ev.set()
+        _record_local_import_error(state, repr(exc))
     finally:
         if copy_stream is not None:
             try:
@@ -7367,9 +7411,7 @@ def _slot_layer_receiver(
         except Exception:
             pass
     except Exception as exc:
-        state.error = repr(exc)
-        for ev in state.events:
-            ev.set()
+        _record_local_import_error(state, repr(exc))
     finally:
         if copy_stream is not None:
             try:

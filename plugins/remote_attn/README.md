@@ -5,8 +5,10 @@
 This ports the supplied P0–P5.18 experiment onto local `main` at
 `1335d372f0a58857422e40b89a097daa7d3bf86c`, using the existing
 `sglang.srt.plugins` entry point. It is an experimental port, with CPU contract
-tests and single-GPU CUDA/Mooncake probes; model-level TP2/NCCL numerical and
-fault-recovery validation is still pending.
+tests and single-GPU CUDA/Mooncake probes. User-reported 5090 TP2 equivalence,
+fault results and the resulting fixes are recorded in
+[validation/5090-intranet.md](validation/5090-intranet.md); the merged fixes
+still need acceptance on the target deployment.
 
 ## Files and provenance
 
@@ -104,7 +106,7 @@ PYTHONPATH=plugins/remote_attn python -m sglang_remote_attn.check --source-only
 
 ## Local validation
 
-- 28 CPU contract tests passed, using real CPU PyTorch tensors and source-loaded
+- 31 CPU contract tests passed, using real CPU PyTorch tensors and source-loaded
   upstream pool/KV methods. The local environment lacks the full SGLang model/eval
   dependencies, so its reduced test harness also source-loaded the repository's
   `CustomTestCase`; full installed-runtime import was not exercised locally.
@@ -124,6 +126,10 @@ PYTHONPATH=plugins/remote_attn python -m sglang_remote_attn.check --source-only
   reference; five real two-process CUDA/Mooncake transfer configurations and
   a cancellation/reuse check passed. A CUDA trace recorded H2D/GEMM overlap.
   See [validation/4060.md](validation/4060.md) for the scope and raw results.
+- After the intranet fixes, all 10 CUDA probes passed, including two real
+  RemoteHub/TargetClient socket cases with a missing local layer, three RPCs
+  each and FP32 reference comparisons. Missing layers stayed Remote and copied
+  layers stayed LOCAL. See [the new results](validation/4060-intranet-fixes-results.json).
 
 In a complete SGLang test environment, run the registered test directly:
 
@@ -180,7 +186,7 @@ are `p`, `src` and `dst`; the gateway uses their parent directory.
 
 ```bash
 MC_FORCE_TCP=1
-SGLANG_MOONCAKE_MAX_TRANSFER_BATCH_INDICES=8
+SGLANG_MOONCAKE_MAX_TRANSFER_BATCH_INDICES=2048
 MC_TCP_MAX_QUEUED_TRANSFERS_PER_PEER=8192
 MC_TCP_MAX_PENDING_ADMISSIONS_PER_PEER=8192
 SGLANG_ENABLE_FAILED_SESSION_PROBE=1
@@ -188,6 +194,18 @@ SGLANG_FAILED_SESSION_PROBE_INTERVAL_S=1.0
 SGLANG_ENABLE_STRICT_MEM_CHECK_DURING_IDLE=0
 SGLANG_MOONCAKE_SEND_LOCK=1
 ```
+
+The native PD connector on this main actively splits index batches into
+synchronous TE calls. The former deployment value `8` introduced thousands
+of calls at 32K context. The default is now `2048`, matching the launchers'
+`--chunked-prefill-size 2048`. If changing chunk size, review the batch bound
+and transport queue limits together. An existing exported value still overrides
+the default; clear a stale `8` or explicitly export `2048` before restarting.
+
+Remote mode can keep serving a frozen prefix after a local import/drop error.
+Only H2D-completed layers become LOCAL; missing layers keep using Remote RPC.
+Abort, missing clients and unsafe GPU copy fences still reject serving. A local
+import error also prevents the slow-RPC policy from switching into layer-wait.
 
 D0 additionally retains `HANDOFF_FAST_FREEZE=1`, `HANDOFF_FAST_BUFFERS=2`,
 `HANDOFF_FAST_COPY_STREAMS=2`, `HANDOFF_FAST_ASYNC=1`,

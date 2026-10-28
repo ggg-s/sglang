@@ -6,7 +6,7 @@
 原包参考 SGLang base 为 `3a869635c`；本分支以 `main@1335d372f0` 为基础。
 
 AST 清单核对：原文件的 **124 个顶层函数、15 个类及其全部方法、40 个 `cmd` 分支**均保留，
-环境变量开关及默认值没有删除或改变。这是代码覆盖核对，不代表每个命令都做过端到端测试。
+runtime 环境变量开关及默认值保留；部署批次默认值因内网回归从 8 修正为 2048，见 [5090 内网反馈](validation/5090-intranet.md)。这是代码覆盖核对，不代表每个命令都做过端到端测试。
 
 | 原包功能 | 当前适配 |
 | --- | --- |
@@ -31,7 +31,7 @@ AST 清单核对：原文件的 **124 个顶层函数、15 个类及其全部方
 page size 1、禁用 radix cache、scheduler overlap 和 CUDA Graph。TP2 Graph-on 会被显式拒绝。
 原包没有完成的 P5.19、生产 router、SSE 重连续传、自动扩缩容，以及可选观测日志，不计为已适配功能。
 
-已通过 28 项 CPU 契约回归（含真实 Gloo TP2 控制广播）和 4060 上的 8 项 CUDA/Mooncake 检查；
+已通过 31 项 CPU 契约回归（含真实 Gloo TP2 控制广播）和 4060 上的 10 项 CUDA/Mooncake/Remote RPC 检查；
 详见 [REVIEW.md](REVIEW.md)、[4060 验证](validation/4060.md)。
 仍需双 GPU TP2/NCCL、完整模型服务器迁移、session 重启与 controller 故障的端到端验收。
 因此结论是：**所收到原包的功能代码和必要 hook 已移植；完整部署验收尚未完成。**

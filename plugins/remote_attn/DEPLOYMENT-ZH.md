@@ -1,10 +1,11 @@
 # Remote-attn 内网部署手册
 
-本文对应 SGLang 的 `remote-attn` 分支，功能实现提交为 `a67ca2bb36`。
+本文对应 SGLang 的 `remote-attn` 分支，首次功能移植提交为 `a67ca2bb36`，部署应使用分支最新版本。
+后续内网反馈与修复见 [5090 等价性验证记录](validation/5090-intranet.md)。
 默认部署沿用 handoff P0–P5.18：**单机 6 张 GPU，P / D0 / D1 各 TP2，Qwen3-8B，Mooncake TCP**。
 命令中的 `/workspace/sglang`、Python 和模型目录需要与内网机器实际路径一致。
 
-代码已完成移植，已有 28 项 CPU 回归和 4060 上 8 项 CUDA/Mooncake 检查。
+代码已完成移植，已有 31 项 CPU 回归和 4060 上 10 项 CUDA/Mooncake/Remote RPC 检查。
 完整模型服务器、真实双 GPU TP2/NCCL、迁移前后 token/logprob 一致性和重启故障恢复仍需内网验收。
 4060 是单卡 8 GB 的验证环境，不能按本文默认配置同时部署三个 TP2 实例。
 
@@ -276,7 +277,7 @@ PP/DP/CP/DCP、MLA/混合或量化 KV、HiCache、speculative decoding、mixed c
 
 ```bash
 MC_FORCE_TCP=1
-SGLANG_MOONCAKE_MAX_TRANSFER_BATCH_INDICES=8
+SGLANG_MOONCAKE_MAX_TRANSFER_BATCH_INDICES=2048
 MC_TCP_MAX_QUEUED_TRANSFERS_PER_PEER=8192
 MC_TCP_MAX_PENDING_ADMISSIONS_PER_PEER=8192
 SGLANG_ENABLE_FAILED_SESSION_PROBE=1
@@ -299,6 +300,15 @@ HANDOFF_REMOTE_HIGH_PRIORITY=1
 ```
 
 env 允许外部覆盖；有旧实验变量时，应先核对有效值，避免意外关闭 Fast Freeze、锁或 probe。
+尤其要检查旧 shell 中是否仍有 `SGLANG_MOONCAKE_MAX_TRANSFER_BATCH_INDICES=8`。
+旧实验 connector 不使用该开关，新 main 会按它拆成多次同步调用，32K 请求因此增加数千次往返。
+当前默认 `2048` 与 `--chunked-prefill-size 2048` 对齐；部署更新后要重启实例并核对有效值。
+
+```bash
+export SGLANG_MOONCAKE_MAX_TRANSFER_BATCH_INDICES=2048
+```
+
+修改 chunk size 时，需要同步评估批次上限与 TE 队列容量；不能把任意更大的值直接视为已验证配置。
 公共脚本还提供 `LD_PRELOAD`、`LD_LIBRARY_PATH`、`LIBRARY_PATH` 默认路径；
 如内网 CUDA/libstdc++ 安装位置不同，在启动前导出正确值。
 现有 `LD_LIBRARY_PATH` 会整体保留，脚本不会自动给它补 CUDA 路径。
@@ -431,6 +441,7 @@ kill -TERM "$(cat "$HANDOFF_RUN_DIR/d0.pid")"
 | 命令不执行 | 根目录和 `p/src/dst` 是否一致，每个 rank 是否活着，是否加载了旧 p2d_driver |
 | TP command diverged | 保存各 rank 的 result 和日志；引擎主动停止不一致调度，不能靠重发命令认定已自动恢复 |
 | `quarantined_transfers` 非空 | 远端完成状态不明，host buffer 按设计保留；记录状态并按故障恢复流程重启回收 |
+| Remote 本地缺层 / `remote downgrade` | 有可用 client 且未取消、GPU fence 安全时继续远端读缺失层；不能将错误唤醒当作 LOCAL-ready |
 | drain 长期 BLOCKED | 结合 target commit、epoch、fence、reservation、lease 和所有 rank 的事实排查，不能直接清 journal |
 
 内网至少完成以下验收，再判断适配可用于目标部署：
@@ -450,7 +461,7 @@ PYTHONPATH=plugins/remote_attn "$HANDOFF_PYTHON" \
   --output "$HANDOFF_RUN_DIR/cuda-probe" --profile
 ```
 
-它包含 2 项 attention 比较、5 组实际 CUDA/Mooncake 传输和 1 项取消 fence 检查，
+它包含 2 项 attention 比较、5 组实际 CUDA/Mooncake 传输、2 组缺层 Remote RPC 数值比较和 1 项取消 fence 检查，
 使用小型 KV storage fixture，不启动完整模型服务。与服务压测分开运行，避免争用 GPU。
 
 ## 12. 当前功能边界和参考记录
@@ -464,6 +475,7 @@ TP 命令一致性检查在分歧时停止引擎，不是跨 rank 原子回滚�
 - [复查问题与修复](REVIEW.md)
 - [4060 验证记录](validation/4060.md)
 - [4060 原始结构化结果](validation/4060-results.json)
+- [5090 内网等价性与故障反馈、修复说明](validation/5090-intranet.md)
 
 原实验 SGLang 基线为 `feat/dsv4-pdmux-opt@3a869635c` 的 dirty working tree，
 Mooncake 实验代码参考为 `pd-handoff-p518-stable@17261ca0`。

@@ -67,7 +67,14 @@ def kv_pool(dtype):
     )
 
 
-def source_worker(mode, dtype_name, sender_buffers, result_queue, cancel_request=None):
+def source_worker(
+    mode,
+    dtype_name,
+    sender_buffers,
+    result_queue,
+    cancel_request=None,
+    source_release=None,
+):
     try:
         os.environ.update(
             HANDOFF_FAST_BUFFERS=str(sender_buffers),
@@ -98,7 +105,9 @@ def source_worker(mode, dtype_name, sender_buffers, result_queue, cancel_request
             fast_freeze=mode.startswith("fast"),
         )
         if mode.startswith("fast"):
-            transfer = rt._start_layer_gpu_server(scheduler, req, meta, False)
+            transfer = rt._start_layer_gpu_server(
+                scheduler, req, meta, source_release is not None
+            )
         else:
             snapshot = [
                 [[pool.keys[layer][indices].cpu(), pool.values[layer][indices].cpu()]]
@@ -120,8 +129,23 @@ def source_worker(mode, dtype_name, sender_buffers, result_queue, cancel_request
         registrations = rt._get_registration_manager().stats()
         if cancel_request is None:
             assert registrations["live"] == 0, registrations
+        hub_stats = None
+        if source_release is not None:
+            assert source_release.wait(timeout=60), "target did not finish remote reads"
+            hub = rt.get_remote_hub(scheduler)
+            deadline = time.monotonic() + 5
+            while hub.stats()["in_flight"] and time.monotonic() < deadline:
+                time.sleep(0.001)
+            hub_stats = hub.stats()
+            rt.close_handoff_hub(scheduler)
         result_queue.put(
-            {"source": {"registration": registrations, "stats": rt._TRANSFER_STATS}}
+            {
+                "source": {
+                    "registration": registrations,
+                    "stats": rt._TRANSFER_STATS,
+                    "hub": hub_stats,
+                }
+            }
         )
     except BaseException:
         result_queue.put({"error": traceback.format_exc()})
@@ -146,7 +170,14 @@ def target_state():
 
 
 def transfer_probe(
-    mode, dtype_name, slots, buffers, output, profile=False, cancel=False
+    mode,
+    dtype_name,
+    slots,
+    buffers,
+    output,
+    profile=False,
+    cancel=False,
+    remote_drop=False,
 ):
     from sglang_remote_attn import handoff_control as rt
 
@@ -154,8 +185,10 @@ def transfer_probe(
     context = mp.get_context("spawn")
     messages = context.Queue()
     cancel_request = context.Event() if cancel else None
+    source_release = context.Event() if remote_drop else None
     source = context.Process(
-        target=source_worker, args=(mode, dtype_name, buffers, messages, cancel_request)
+        target=source_worker,
+        args=(mode, dtype_name, buffers, messages, cancel_request, source_release),
     )
     source.start()
     receiver = None
@@ -168,6 +201,16 @@ def transfer_probe(
         conn, meta, mirror, _, _, owner, staging, _, _ = rt._recv_transfer_layer_setup(
             packet["transfer"]
         )
+        if remote_drop:
+            state = rt._TargetHandoffState(
+                0,
+                TOKENS,
+                [threading.Event() for _ in range(LAYERS)],
+                "remote",
+                remote_service=packet["transfer"]["remote_service"],
+                handoff_id=meta["rid"],
+            )
+            os.environ["HANDOFF_LAYER_DROP"] = "0"
         dtype = getattr(torch, dtype_name)
         shape = (TOKENS + 32, HEADS, DIM)
         keys = [
@@ -257,6 +300,94 @@ def transfer_probe(
                 target_quarantined=True,
                 **packet,
             )
+        if remote_drop:
+            assert state.error is not None and state.import_done_at is None
+            assert not state.events[0].is_set(), "dropped layer falsely became LOCAL"
+            assert all(event.is_set() for event in state.events[1:])
+            assert owner in rt._TRANSFER_QUARANTINE
+            assert torch.isnan(keys[0]).all(), (
+                "dropped layer should still have no local KV"
+            )
+            reference = kv_pool(dtype)
+            source_indices = torch.arange(TOKENS, device="cuda") * 2 + 1
+            for layer in range(1, LAYERS):
+                torch.testing.assert_close(
+                    keys[layer][mapping],
+                    reference.keys[layer][source_indices],
+                    rtol=0,
+                    atol=0,
+                )
+                torch.testing.assert_close(
+                    values[layer][mapping],
+                    reference.values[layer][source_indices],
+                    rtol=0,
+                    atol=0,
+                )
+            errors = []
+            service = packet["transfer"]["remote_service"]
+            state.client.attach(state.handoff_id, service["token"], state.owner_epoch)
+            state._pending_fallback = True
+            for _ in range(3):
+                state.begin_step(SimpleNamespace(seq_lens=torch.tensor([TOKENS + 17])))
+                assert state.mode == "remote" and state.is_remote_layer(0)
+                assert not any(
+                    state.is_remote_layer(layer) for layer in range(1, LAYERS)
+                )
+                q = torch.randn(4, DIM, device="cuda", dtype=dtype)
+                raw = q.cpu().view(torch.uint8).numpy().tobytes()
+                header, remote_o, remote_lse = state.client.call(
+                    dict(
+                        handoff_id=state.handoff_id,
+                        epoch=state.owner_epoch,
+                        layer=0,
+                        q_dtype=dtype_name,
+                        q_shape=list(q.shape),
+                        q_bytes=len(raw),
+                        sm_scale=DIM**-0.5,
+                    ),
+                    raw,
+                )
+                rt._check_remote_header(header, state.handoff_id)
+                tail_k = torch.randn(17, HEADS, DIM, device="cuda", dtype=dtype)
+                tail_v = torch.randn_like(tail_k)
+                local_o, local_lse = rt._single_decode(q, tail_k, tail_v, DIM**-0.5)
+                remote_o, remote_lse = rt._h2d_pair(remote_o, remote_lse, q.device)
+                merged, _ = rt._merge_states(local_o, local_lse, remote_o, remote_lse)
+                k = torch.cat([reference.keys[0][source_indices], tail_k])
+                v = torch.cat([reference.values[0][source_indices], tail_v])
+                expected = (
+                    torch.nn.functional.scaled_dot_product_attention(
+                        q[None, :, None, :].float(),
+                        k.permute(1, 0, 2)[None].repeat_interleave(2, dim=1).float(),
+                        v.permute(1, 0, 2)[None].repeat_interleave(2, dim=1).float(),
+                    )
+                    .squeeze(0)
+                    .squeeze(1)
+                )
+                torch.testing.assert_close(
+                    merged.squeeze(0).float(), expected, rtol=0.03, atol=0.004
+                )
+                errors.append(float((merged.squeeze(0).float() - expected).abs().max()))
+            state.close()
+            rt._close_target_clients()
+            source_release.set()
+            source_packet = messages.get(timeout=15)
+            assert "error" not in source_packet, source_packet
+            source.join(timeout=10)
+            assert source.exitcode == 0, source.exitcode
+            assert source_packet["source"]["hub"]["rpc_completed"] == 3
+            assert source_packet["source"]["hub"]["in_flight"] == 0
+            return dict(
+                mode=mode,
+                slots=slots,
+                remote_drop=True,
+                rpc_calls=3,
+                local_layers=LAYERS - 1,
+                max_abs_errors=errors,
+                dropped_layer_still_remote=True,
+                target_quarantined=True,
+                **source_packet,
+            )
         assert state.error is None, state.error
         assert state.import_done_at is not None
         assert all(event.is_set() for event in state.events)
@@ -296,6 +427,13 @@ def transfer_probe(
             **source_packet,
         )
     finally:
+        if source_release is not None:
+            source_release.set()
+        if remote_drop:
+            os.environ.pop("HANDOFF_LAYER_DROP", None)
+            if hasattr(state, "close"):
+                state.close()
+            rt._close_target_clients()
         if profiler is not None:
             profiler.__exit__(None, None, None)
         if receiver is not None and receiver.is_alive():
@@ -421,12 +559,19 @@ def main():
         report["transfers"].append(result)
         print("TRANSFER", json.dumps(result), flush=True)
         (args.output / "results.json").write_text(json.dumps(report, indent=2))
+    for slots in (1, 0):
+        result = transfer_probe(
+            "fast-async", "float16", slots, 3, args.output, remote_drop=True
+        )
+        report["transfers"].append(result)
+        (args.output / "results.json").write_text(json.dumps(report, indent=2))
+        print("REMOTE DROP", json.dumps(result), flush=True)
     result = transfer_probe("fast-async", "float16", 1, 3, args.output, cancel=True)
     report["transfers"].append(result)
     (args.output / "results.json").write_text(json.dumps(report, indent=2))
     print("CANCELLATION", json.dumps(result), flush=True)
     print(
-        "PASS: two attention comparisons, five transfers and a cancellation fence",
+        "PASS: two attention comparisons, five transfers, two Remote Drop RPC probes and a cancellation fence",
         flush=True,
     )
 

@@ -15,7 +15,7 @@
 | P1 | 源传输线程默认 CUDA device 0，TP rank 1 可能访问错误设备；生产 stream 与传输 stream 没有完整依赖 | 显式设置 rank device，并用 event/stream wait 等待冻结前的 KV 和 indices；目标端也等待 indices 的生产 event |
 | P1 | source release/resume 只关监听端口，已连接的传输线程仍可能读取随后被复用的 KV | 设置 cancel、关闭已接受连接、join 线程、同步 GPU reader；不能证明退出时禁止复用 |
 | P1 | 目标取消、正常释放、reset 没有一致地等待 receiver；可能在异步 H2D 仍写入时回收槽位 | 先停止并 join receiver，排空 copy stream，再调用上游 free；正常传输完成不再被标成 abort |
-| P1 | 接收失败设置所有 event 唤醒等待者，但事件可能被误认为 LOCAL-ready；提前 done 则可能不唤醒等待者 | attention 在等待前后检查 error/abort；提前结束显式报错并唤醒；等待超时抛错；异常状态禁止 Graph replay |
+| P1 | 接收失败设置所有 event 唤醒等待者，但事件可能被误认为 LOCAL-ready；提前 done 则可能不唤醒等待者 | attention 检查状态；可降级 Remote 错误保留真实就绪位并继续远端读；Layer/无 client/abort/unsafe 仍报错并退出等待；异常状态禁止 Graph replay |
 | P1 | source staging 被 TE 持有时可能注销/回收；目标断连也不能证明远端已停止写注册内存 | 正常路径等待 TE completion/H2D，再注销或复用；完成状态不明时保留注册及其 tensor，记录 quarantine |
 | P1 | Fast 异步 pipeline 在 target slots < source buffers 时，源端可能先等 ACK，而产生 ACK 所需的 layer control 尚未发送 | 等槽位前先完成并发送相关 layer control；测试覆盖 source buffers=3、target slots=1 |
 | P1 | 完整 Copy 在 GPU load 成功后构建请求/采样失败会泄漏 allocation；abort_import 也可能只释放 prefix 而遗留 row/tail | 将整个后续构建阶段纳入回滚，统一按 pending/已绑定 row 的所有权释放 |
@@ -42,7 +42,7 @@ ACK 等待前必须发送旧 layer control，避免形成控制消息与槽位�
 
 ## 验证证据
 
-- 28 项 CPU 回归通过；请求 row 与 KV allocator 使用本分支真实实现的 source-loaded 方法和真实 CPU tensor。
+- 31 项 CPU 回归通过；请求 row 与 KV allocator 使用本分支真实实现的 source-loaded 方法和真实 CPU tensor。
 - 真实双进程 Gloo TP2：leader-only poll、普通请求/timeout-abort 与 control 混合广播、双方成功、
   单 rank 失败、调度状态分歧、双方一致拒绝。
 - CPU tensor + 可控 CUDA/TE/socket 边界：验证 rank 设备、TE 完成前不覆盖 staging、
@@ -56,6 +56,11 @@ ACK 等待前必须发送旧 layer control，避免形成控制消息与槽位�
 本机没有完整 SGLang 模型依赖或 CUDA/Mooncake 服务环境；本地 harness 只加载仓库的
 `CustomTestCase`，没有执行完整 serving 包的导入或推理。
 Gloo 测试验证 CPU 控制协议，不代表 NCCL/TP2 推理或 Mooncake 网络故障已验证。
+
+内网反馈又暴露了两处问题：新 main 读取原部署值 `N=8` 导致同步 TE 过度拆批，以及
+一律拒绝 `state.error` 破坏 Remote LOCAL Drop 降级。已改为默认 `N=2048`，并在接收器、
+step mask 与 fallback 之间保留缺层 Remote 路径。新增三项 CPU 回归，其中缺层/默认批次用例在修复前失败，完整 31 项通过。
+详见 [5090 内网反馈与修复](validation/5090-intranet.md)。
 
 后续已在 RTX 4060 Laptop 8 GB 上完成单 GPU 验证：FP16/BF16 attention 与
 FP32 参考比较、五组真实双进程 Mooncake TCP + CUDA 逐层传输、取消后 GPU 槽位复用。

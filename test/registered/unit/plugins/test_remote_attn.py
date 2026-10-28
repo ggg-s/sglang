@@ -12,6 +12,7 @@ import json
 import os
 import pickle
 import queue
+import shlex
 import subprocess
 import sys
 import tempfile
@@ -355,6 +356,230 @@ class TestRemoteAttn(CustomTestCase):
         copied = self.compat.snapshot_layout(3, fast=False, kv_cpu=full)
         self.assertEqual(fast, ([[3], [3]], 2, 4, torch.bfloat16))
         self.assertEqual(copied, ([[1, 2], [1, 2]], 2, 4, torch.bfloat16))
+
+    def _remote_state(self):
+        # The real state constructor writes diagnostic paths; isolate that I/O.
+        with (
+            tempfile.TemporaryDirectory() as directory,
+            patch.object(self.runtime, "Path", return_value=Path(directory)),
+            patch.object(self.runtime, "PROFILE", False),
+            patch.object(self.runtime, "RPC_PROFILE", False),
+        ):
+            state = self.runtime._TargetHandoffState(
+                0, 2, [threading.Event(), threading.Event()], "remote"
+            )
+        state.client = SimpleNamespace()
+        self.addCleanup(state.close)
+        return state
+
+    def test_remote_import_failure_keeps_unready_layers_remote(self):
+        """LOCAL Drop/EOF must preserve Remote routing instead of killing D1
+        or turning error-wakeup events into locally readable KV.
+        """
+        runtime = self.runtime
+        for slot_receiver in (False, True):
+            for fault in ("drop", "eof"):
+                with self.subTest(slot_receiver=slot_receiver, fault=fault):
+                    state = self._remote_state()
+                    keys = [torch.full((4, 1, 2), -99.0) for _ in range(2)]
+                    values = [torch.full_like(keys[0], -99.0) for _ in range(2)]
+                    scheduler = SimpleNamespace(
+                        token_to_kv_pool_allocator=SimpleNamespace(
+                            get_kvcache=lambda: SimpleNamespace(
+                                get_key_buffer=keys.__getitem__,
+                                get_value_buffer=values.__getitem__,
+                            )
+                        )
+                    )
+                    k = torch.arange(4.0).reshape(2, 1, 2)
+                    v = k + 10
+                    index = torch.tensor([1, 3])
+                    # On EOF the first layer was copied; on Drop it is skipped.
+                    messages = (
+                        [{"layer": 0, "slot": 0}, EOFError("transfer EOF")]
+                        if fault == "eof"
+                        else [
+                            {"layer": 0, "slot": 0},
+                            {"layer": 1, "slot": 0},
+                            {"done": True},
+                        ]
+                    )
+                    acknowledgements = []
+                    stream = SimpleNamespace(synchronize=lambda: None)
+                    cuda = SimpleNamespace(
+                        set_device=lambda device: None,
+                        stream=lambda stream: nullcontext(),
+                    )
+                    conn = SimpleNamespace(close=lambda: None)
+                    with (
+                        patch.object(torch, "cuda", cuda),
+                        patch.object(
+                            runtime, "_fast_copy_streams", return_value=[stream]
+                        ),
+                        patch.object(runtime, "_layer_delay_s", return_value=0),
+                        patch.object(
+                            runtime,
+                            "_layer_dropped",
+                            side_effect=lambda scheduler, layer: (
+                                fault == "drop" and layer == 0
+                            ),
+                        ),
+                        patch.object(runtime, "_recv_json", side_effect=messages),
+                        patch.object(
+                            runtime,
+                            "_send_json",
+                            side_effect=lambda conn, message: acknowledgements.append(
+                                message
+                            ),
+                        ),
+                        patch.object(runtime, "_TRANSFER_QUARANTINE", {}),
+                        patch.object(runtime, "_TRANSFER_ERRORS", {}),
+                    ):
+                        receiver = (
+                            runtime._slot_layer_receiver
+                            if slot_receiver
+                            else runtime._layer_receiver
+                        )
+                        buffers = [[(k, v)]] if slot_receiver else [[(k, v)], [(k, v)]]
+                        receiver(
+                            scheduler,
+                            state,
+                            conn,
+                            {"chunks": [[2], [2]]},
+                            buffers,
+                            index,
+                            "fault",
+                            0,
+                        )
+                        self.assertIn("fault", runtime._TRANSFER_QUARANTINE)
+                    expected = [False, True] if fault == "drop" else [True, False]
+                    self.assertEqual(
+                        [event.is_set() for event in state.events], expected
+                    )
+                    ready_layer = 1 if fault == "drop" else 0
+                    torch.testing.assert_close(keys[ready_layer][index], k)
+                    self.assertTrue((keys[1 - ready_layer] == -99).all())
+                    self.assertIsNone(state.import_done_at)
+                    self.assertIsNotNone(state.error)
+                    if slot_receiver:
+                        self.assertEqual(
+                            len(acknowledgements), 2 if fault == "drop" else 1
+                        )
+                    state._pending_fallback = True
+                    fb = SimpleNamespace(
+                        seq_lens=torch.tensor([3]),
+                        forward_mode=SimpleNamespace(is_mixed=lambda: False),
+                    )
+                    state.begin_step(fb)
+                    self.assertEqual(state.mode, "remote")
+                    self.assertEqual(state._step_mask, expected)
+                    self.assertTrue(state.is_remote_layer(1 - ready_layer))
+                    self.assertFalse(state.is_remote_layer(ready_layer))
+                    with (
+                        patch.object(runtime, "_TARGET_STATES", [state]),
+                        patch.object(
+                            runtime,
+                            "_row_meta",
+                            return_value={"states": [state], "rp": [0]},
+                        ),
+                        patch.object(
+                            runtime,
+                            "_batch_remote_attention",
+                            return_value="remote-result",
+                        ),
+                    ):
+                        self.assertTrue(runtime.has_remote_work())
+                        module = SimpleNamespace(layer_id=1 - ready_layer)
+                        out = runtime._handoff_attention_forward(
+                            module, torch.zeros(1, 2), None, None, fb
+                        )
+                        self.assertEqual(out, "remote-result")
+                        module = SimpleNamespace(
+                            layer_id=ready_layer,
+                            _handoff_orig_forward=lambda *a, **kw: "local-result",
+                        )
+                        self.assertEqual(
+                            runtime._handoff_attention_forward(
+                                module, None, None, None, fb
+                            ),
+                            "local-result",
+                        )
+
+    def test_remote_downgrade_still_rejects_abort_missing_client_and_unsafe_copy(self):
+        for condition in (
+            "aborted",
+            "abort-event",
+            "no-client",
+            "unsafe",
+            "layer",
+            "copy",
+        ):
+            with self.subTest(condition=condition):
+                state = self._remote_state()
+                state.error = "local transfer failed"
+                if condition == "aborted":
+                    state.aborted = True
+                elif condition == "abort-event":
+                    state.abort_event.set()
+                elif condition == "no-client":
+                    state.client = None
+                elif condition == "unsafe":
+                    state.receiver_unsafe = True
+                else:
+                    state.mode = condition
+                with self.assertRaises(RuntimeError):
+                    state.begin_step(SimpleNamespace())
+
+    def test_launchers_default_to_one_native_transfer_batch_per_prefill_chunk(self):
+        """N=8 used to split each native PD chunk into synchronous TE calls."""
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            capture = root / "capture.py"
+            capture.write_text(
+                "import json,os,sys\nwith open(os.environ['CAPTURE'], 'a') as f: f.write(json.dumps({'args':sys.argv[1:], 'batch':os.environ['SGLANG_MOONCAKE_MAX_TRANSFER_BATCH_INDICES']})+'\\n')\n"
+            )
+            executable = root / "python"
+            executable.write_text(
+                f'#!/bin/sh\nexec {shlex.quote(sys.executable)} {shlex.quote(str(capture))} "$@"\n'
+            )
+            executable.chmod(0o755)
+            for role in ("p", "d0", "d1"):
+                for override in (None, "4096"):
+                    with self.subTest(role=role, override=override):
+                        log = root / "capture.jsonl"
+                        log.write_text("")
+                        env = dict(
+                            os.environ,
+                            HANDOFF_PYTHON=str(executable),
+                            HANDOFF_CTL_ROOT=str(root / "ctl"),
+                            CAPTURE=str(log),
+                        )
+                        for name in (
+                            "SGLANG_MOONCAKE_MAX_TRANSFER_BATCH_INDICES",
+                            "HANDOFF_CTL_DIR",
+                            "HANDOFF_SERVER_EXTRA",
+                        ):
+                            env.pop(name, None)
+                        if override is not None:
+                            env["SGLANG_MOONCAKE_MAX_TRANSFER_BATCH_INDICES"] = override
+                        subprocess.run(
+                            [
+                                "bash",
+                                str(PLUGIN / "deploy" / f"start_p511_{role}_tp2.sh"),
+                            ],
+                            env=env,
+                            check=True,
+                        )
+                        preflight, server = map(
+                            json.loads, log.read_text().splitlines()
+                        )
+                        self.assertEqual(
+                            preflight["args"], ["-m", "sglang_remote_attn.check"]
+                        )
+                        args = server["args"]
+                        chunk = int(args[args.index("--chunked-prefill-size") + 1])
+                        self.assertGreaterEqual(int(server["batch"]), chunk)
+                        self.assertEqual(server["batch"], override or "2048")
 
     def test_early_layer_done_wakes_waiters_with_error(self):
         runtime = self.runtime
