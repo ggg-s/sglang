@@ -1,6 +1,6 @@
 # DeepSeek-V4 DSpark + CPU overlap + PDMux + HiCache, TP2
 
-Use `codex/pdmux-tp-cpu-overlap`. This configuration uses plain TP2, PP1,
+Use `codex/dsv4-pdmux-latest-main`. This configuration uses plain TP2, PP1,
 EP1, MoE-DP1, attention-CP1 and DCP1. Leave DP attention disabled. PDMux's
 duplicated communication groups cover full-width TP. The optional PCP path
 below also uses full-width groups; other subgroup parallelism remains rejected.
@@ -12,9 +12,9 @@ draft proposal, verify planning and acceptance keep the decode group. Verify
 metadata uses the per-stream decode backend. DeepSeek-V4 target/draft helper
 streams are disabled under both PDMux modes so work stays on the managed lane.
 The existing layer-split auxiliary-hidden capture and packed HiCache draft-KV
-registration remain in use. This patch admits CPU overlap with `layer_split`;
-the `standard`, temporal and decode-ready experiments retain their existing
-restrictions.
+registration remain in use. CPU overlap supports `layer_split` and, as of
+2026-10-28, `standard` with the DSV4 DSpark PCP recipe below. The temporal and
+decode-ready experiments retain their separate restrictions.
 
 ## Full-model acceptance on the deployment host
 
@@ -176,3 +176,72 @@ actual singleton NCCL operations and DSpark Triton-vs-Torch kernel parity.
 Two-process Gloo tests check prefill/decode broadcast ownership and rank-uniform
 chunk completion and HiCache pumping. See the accompanying validation JSON for
 the exact results and limits.
+
+## Standard chunk prefill + PCP + CPU overlap (2026-10-28)
+
+The same DSV4/DSPARK/interleave/DP1/CP=TP/EP1/MoE-DP1/DCP1/PP1 recipe now
+accepts `--pdmux-prefill-mode standard`. Retain `--enable-cp-decode-attn-tp`,
+`--moe-a2a-backend none`, `--cuda-graph-backend-prefill disabled`,
+`SGLANG_RAGGED_VERIFY_MODE=static`, and HiCache write-through. Leave
+`--disable-overlap-schedule` unset. Torch compile, TBO and unified memory remain
+unsupported with this recipe; temporal/decode-ready experiments are separate.
+
+For the existing long-prompt launch, select:
+
+```bash
+--pdmux-prefill-mode standard --chunked-prefill-size 16384
+```
+
+Each admitted chunk is one ordinary target EXTEND through the model worker,
+running every target layer before returning; it does not use the persistent
+split-forward path or yield at layer intervals. DSpark still performs its
+normal auxiliary-state/draft bootstrap. `split_forward_token_budget` and
+`split_forward_max_layers` do not control standard mode. The existing SM
+configuration still caps prefill and selects the decode lane.
+
+The standard loop keeps one decode result pending: N is submitted before
+N-1 is processed. Grammar/CPU penalizers and memory retraction drain the pending
+result before preparation. A rank-uniform ready vote drains the current decode
+before prefill merge and FutureMap seeding. Prefill inputs/results are pinned
+until completion, independently of the decode ring. Formation/merge events and
+carried-tensor stream registration protect allocator/KV state, while HiCache
+event pumping continues on the decode lane during prefill.
+
+Standard mode still permits only one prefill batch in flight; this change
+removes layer-interval submissions, not the one-prefill admission limit. There
+is no full-model throughput/TTFT claim without rerunning the deployment load.
+
+Two-GPU full-model acceptance, with greedy host-reload parity and concurrent
+HiCache progress inherited from the original tests:
+
+```bash
+python -m pytest -v \
+  test/manual/pdmux/test_dsv4_dspark_pcp_pdmux_hicache_tp2.py::TestDSV4DSparkPCPDecodeTP2StandardCPUOverlapHiCache \
+  test/manual/pdmux/test_dsv4_dspark_pcp_pdmux_hicache_tp2.py::TestDSV4DSparkPCPDecodeTP2StandardEagerCPUOverlapHiCache
+```
+
+Validated source `2764ef4f90` was pushed and pulled over SSH on the RTX 4060
+Laptop workstation, PyTorch 2.13.0+cu130:
+
+- Complete `unit/multiplex`, PCP CLI/runtime resolution, scheduler DP metadata
+  and CUDA graph buffer registry: **274 tests, 440 subtests passed**. The real
+  two-process Gloo test now runs three standard chunks with unequal rank-local
+  readiness and verifies that both ranks finalize on the same iterations.
+- Standard CUDA loop plus existing TP/NCCL/graph lane checks: **4 passed,
+  1 skipped** (the distinct two-GPU NCCL case). The new two cases use real CUDA
+  streams, whole-chunk fixture forwards, delayed completion and decode graph
+  replays, with and without the grammar preparation barrier.
+- GPU-hidden PCP configuration/runtime tests: **12 passed, 1 skipped,
+  149 subtests passed**; the skipped case is CUDA output replay.
+- Local baseline check: three new progress/FutureMap regressions fail against the pre-change
+  `5088a34a92` loop, loaded in memory without modifying the checkout. The local
+  standard-loop harness passes all 18 cases with the fix.
+- The two new full-model acceptance classes collect successfully; their four
+  cases skip on the 4060 because two GPUs/local checkpoint resources are absent.
+
+Workstation logs are under `/workspace/cp-decode-review-20261027/`:
+`standard-pcp-unit-20261028.log`, `standard-pcp-cuda-20261028.log`,
+`standard-pcp-cpu-20261028.log`, and `standard-pcp-full-model-20261028.log`.
+The 4060 checks use small model/HiCache collaborators; they do not run DSV4
+FlashMLA, distributed model attention or HiCache DMA. The full-model tests need
+two GPUs and local checkpoints and skip when those resources are absent.
