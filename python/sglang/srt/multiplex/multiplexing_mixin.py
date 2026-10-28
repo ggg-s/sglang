@@ -516,14 +516,15 @@ class SchedulerMultiplexMixin:
         that state still set, which prevents a second finalize -- it is not a
         retry mechanism, and nothing re-enters this for the same batch.
         """
-        if all_segments_run and self.enable_overlap:
-            # Decode has drained before this merge. Seed only now: publishing
-            # from the final split submission would overwrite FutureMap's
+        if self.enable_overlap:
+            # Both modes have drained decode before this merge. Seed only now:
+            # publishing during prefill submission would overwrite FutureMap's
             # decode-ready event with a wait on the entire prefill lane.
             future_indices = batch.req_pool_indices
             self.future_map.publish(future_indices, batch.seq_lens)
             self._relay_forward_payload(batch, future_indices, prefill_result)
-            batch.spec_info.future_indices = future_indices
+            if batch.spec_info is not None:
+                batch.spec_info.future_indices = future_indices
 
         self.process_batch_result(batch, prefill_result)
 
@@ -1162,6 +1163,7 @@ class SchedulerMultiplexMixin:
         prefill_stream,
         decode_stream,
         decode_done,
+        before_finalize=None,
     ) -> tuple[ScheduleBatch, bool]:
         """One iteration of the completion pipeline for the in-flight prefill.
 
@@ -1189,6 +1191,10 @@ class SchedulerMultiplexMixin:
             inflight.done_work = None
             inflight.done_flags = None
             if ready_ranks == self.pdmux_done_group_size:
+                if before_finalize is not None:
+                    # Commit the one decode result still in flight before
+                    # merging request/counter state or reusing its KV pages.
+                    decode_done = before_finalize()
                 # Finalize frees pages, inserts into the radix cache and
                 # rewrites req_to_token rows. Order it after the decode work
                 # this iteration already enqueued.
@@ -1234,6 +1240,8 @@ class SchedulerMultiplexMixin:
         self._pdmux_completion_votes = 0
         self._pdmux_completion_wait_s = 0.0
 
+        if running_batch is not None and not running_batch.is_empty():
+            publish_carried_tensors(running_batch, prefill_stream)
         running_batch = self._merge_completed_prefill_batch(
             batch=inflight.batch,
             prefill_result=inflight.result,
@@ -1278,8 +1286,9 @@ class SchedulerMultiplexMixin:
         """PDMux loop that submits each prefill as one standard EXTEND.
 
         One CPU thread, two lanes. The prefill lane submits a whole work item
-        and never blocks on it; the decode lane keeps its existing synchronous
-        shape. Cross-lane ordering is published with four events:
+        and never blocks on it. CPU overlap keeps one decode result pending,
+        consuming N-1 only after submitting N; synchronous mode retains its
+        per-step wait. Cross-lane ordering is published with four events:
 
             E0 input_done      D -> P   input handling's device work
             E1 formation_done  P -> D   batch formation and its HiCache pump
@@ -1305,6 +1314,24 @@ class SchedulerMultiplexMixin:
         self.pdmux_prefill_stream = prefill_stream
         adjust_stream_group = False
         decode_done = None
+        pending_decode_result = None
+        carried_batch_pending = False
+        self.result_queue = deque()
+        if self.enable_overlap:
+            self.forward_stream = decode_stream
+            self.forward_stream_ctx = torch.cuda.stream(decode_stream)
+
+        def drain_decode_for_merge():
+            nonlocal pending_decode_result
+            with torch.cuda.stream(decode_stream):
+                set_pdmux_status(False)
+                if pending_decode_result is not None:
+                    self.process_batch_result(*pending_decode_result)
+                    pending_decode_result = None
+                done = decode_stream.record_event()
+            set_pdmux_status(True)
+            return done
+
         torch.cuda.empty_cache()
 
         logger.debug("Starting event loop for pd multiplexing (standard prefill)...")
@@ -1312,6 +1339,19 @@ class SchedulerMultiplexMixin:
         while True:
             with torch.cuda.stream(decode_stream):
                 set_pdmux_status(False)
+                # Grammar and CPU-dependent penalizers need committed tokens
+                # before the next batch is prepared, just as in layer_split.
+                if pending_decode_result is not None and (
+                    self.running_batch.has_grammar
+                    or (
+                        self.running_batch.sampling_info is not None
+                        and self.running_batch.sampling_info.penalizer_orchestrator.is_required
+                    )
+                ):
+                    self.process_batch_result(*pending_decode_result)
+                    pending_decode_result = None
+                if carried_batch_pending and not self.running_batch.is_empty():
+                    publish_carried_tensors(self.running_batch, decode_stream)
                 self.ingest_requests()
                 running_batch = self.running_batch
                 # E0: prefetch's prefix matching concatenates on this stream.
@@ -1326,6 +1366,8 @@ class SchedulerMultiplexMixin:
                     prefill_stream.wait_event(input_done)
                     if decode_done is not None:
                         prefill_stream.wait_event(decode_done)
+                    if not running_batch.is_empty():
+                        publish_carried_tensors(running_batch, prefill_stream)
                     # No prefill forward is in flight, which matches the normal
                     # loop's safe point for tearing down an aborted chunked
                     # request before its next chunk is formed.
@@ -1344,19 +1386,41 @@ class SchedulerMultiplexMixin:
                     # the HiCache pump, and admission's host-to-device load-back
                     # allocates and can evict, both on this stream.
                     formation_done = prefill_stream.record_event()
+                    carried_batch_pending = True
 
             with torch.cuda.stream(decode_stream):
                 set_pdmux_status(False)
                 if formation_done is not None:
                     decode_stream.wait_event(formation_done)
+                if carried_batch_pending and not running_batch.is_empty():
+                    publish_carried_tensors(running_batch, decode_stream)
                 if inflight is not None:
                     self._pump_hicache_events_inflight()
+                if (
+                    pending_decode_result is not None
+                    and not running_batch.is_empty()
+                    and not running_batch.check_decode_mem()
+                ):
+                    # Retraction mutates request counters and releases pages.
+                    self.process_batch_result(*pending_decode_result)
+                    pending_decode_result = None
+                running_batch.enable_overlap = self.enable_overlap and not (
+                    running_batch.has_grammar
+                    or (
+                        running_batch.sampling_info is not None
+                        and running_batch.sampling_info.penalizer_orchestrator.is_required
+                    )
+                )
                 running_batch = self.update_running_batch(running_batch)
                 self.running_batch = running_batch
                 adjust_stream_group = adjust_stream_group or (
                     stream_idx > 0 and running_batch.is_empty()
                 )
-                if running_batch.is_empty() and not self._extra_inflight_batches():
+                if (
+                    running_batch.is_empty()
+                    and pending_decode_result is None
+                    and not self._extra_inflight_batches()
+                ):
                     self.on_idle()
 
             # Never switch with a forward in flight: the switch drains both
@@ -1369,6 +1433,9 @@ class SchedulerMultiplexMixin:
                 )
                 prefill_stream, decode_stream = stream_group
                 self.pdmux_prefill_stream = prefill_stream
+                if self.enable_overlap:
+                    self.forward_stream = decode_stream
+                    self.forward_stream_ctx = torch.cuda.stream(decode_stream)
                 adjust_stream_group = False
                 logger.debug(
                     f"Adjusting stream groups: {stream_idx}, prefill sm: "
@@ -1379,6 +1446,9 @@ class SchedulerMultiplexMixin:
             decode_result = None
             with torch.cuda.stream(decode_stream):
                 set_pdmux_status(False)
+                if carried_batch_pending and not running_batch.is_empty():
+                    publish_carried_tensors(running_batch, decode_stream)
+                carried_batch_pending = False
                 decode_batch = self.dp_attn_adapter.maybe_prepare_mlp_sync_batch(
                     running_batch
                     if running_batch is not None and not running_batch.is_empty()
@@ -1386,6 +1456,11 @@ class SchedulerMultiplexMixin:
                 )
                 if decode_batch is not None:
                     decode_result = self.run_batch(decode_batch)
+                current_decode_result = (
+                    (decode_batch.copy(), decode_result)
+                    if self.enable_overlap and decode_result is not None
+                    else None
+                )
 
             with torch.cuda.stream(prefill_stream):
                 set_pdmux_status(True)
@@ -1395,9 +1470,14 @@ class SchedulerMultiplexMixin:
 
             with torch.cuda.stream(decode_stream):
                 set_pdmux_status(False)
-                decode_stream.synchronize()
-                if decode_result is not None:
-                    self.process_batch_result(decode_batch, decode_result)
+                if self.enable_overlap:
+                    if pending_decode_result is not None:
+                        self.process_batch_result(*pending_decode_result)
+                    pending_decode_result = current_decode_result
+                else:
+                    decode_stream.synchronize()
+                    if decode_result is not None:
+                        self.process_batch_result(decode_batch, decode_result)
                 # E3: covers this iteration's decode result handling, the
                 # retract/free inside update_running_batch, and the pump above.
                 decode_done = decode_stream.record_event()
@@ -1410,6 +1490,11 @@ class SchedulerMultiplexMixin:
                         prefill_stream=prefill_stream,
                         decode_stream=decode_stream,
                         decode_done=decode_done,
+                        before_finalize=(
+                            drain_decode_for_merge if self.enable_overlap else None
+                        ),
                     )
+                    self.running_batch = running_batch
                     if merged:
                         adjust_stream_group = True
+                        carried_batch_pending = True

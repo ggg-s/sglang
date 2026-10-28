@@ -181,15 +181,19 @@ class TestPdmuxTPAdmission(unittest.TestCase):
                         enable_hierarchical_cache=True,
                     )
 
+    def test_standard_mode_accepts_the_same_plain_tp_algorithms(self):
+        for algorithm in ("DFLASH", "DSPARK"):
+            self.check(pdmux_prefill_mode="standard", speculative_algorithm=algorithm)
+
     def test_other_prefill_modes_and_algorithms_still_fail(self):
         for overrides in (
-            dict(pdmux_prefill_mode="standard"),
+            dict(pdmux_prefill_mode="unknown"),
             dict(speculative_algorithm="EAGLE"),
         ):
             with (
                 self.subTest(overrides=overrides),
                 self.assertRaisesRegex(
-                    AssertionError, "layer_split prefill and DFLASH"
+                    AssertionError, "layer_split or standard prefill and DFLASH"
                 ),
             ):
                 self.check(**overrides)
@@ -455,6 +459,38 @@ def _exercise_chunked_scheduler(rank, group, *, overlap):
     assert traces[0] == traces[1], "TP ranks took different chunk/pump/merge paths"
 
 
+def _exercise_standard_scheduler(rank, group):
+    import torch.distributed as dist
+
+    from test_pdmux_standard_prefill import (
+        _Batch,
+        _FakeScheduler,
+        _LoopFinished,
+        _stubbed_cuda,
+    )
+
+    scheduler = _FakeScheduler(
+        max_iterations=16,
+        enable_overlap=True,
+        prefill_batches=[_Batch(f"chunk-{i}") for i in range(3)],
+        copy_done_script=[True] if rank == 0 else [False, False, False, True],
+    )
+    scheduler.tp_cpu_group = group
+    with _stubbed_cuda():
+        try:
+            scheduler.event_loop_pdmux_standard()
+        except _LoopFinished:
+            pass
+    finalized = [(step, batch.name) for step, batch in scheduler.processed_prefills]
+    assert len(finalized) == 3, finalized
+    gathered = [None, None]
+    dist.all_gather_object(gathered, finalized, group=group)
+    assert gathered[0] == gathered[1], gathered
+    assert [batch.name for _, batch, _ in scheduler.submitted] == [
+        f"chunk-{i}" for i in range(3)
+    ]
+
+
 def _gloo_lane_rank(rank, store_path):
     import torch
     import torch.distributed as dist
@@ -539,6 +575,7 @@ def _gloo_lane_rank(rank, store_path):
         assert prefill.broadcasts == decode.broadcasts == 32
         for overlap in (False, True):
             _exercise_chunked_scheduler(rank, decode.process_group, overlap=overlap)
+        _exercise_standard_scheduler(rank, decode.process_group)
     finally:
         dist.destroy_process_group()
 

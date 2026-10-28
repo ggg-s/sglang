@@ -26,6 +26,7 @@ from __future__ import annotations
 
 import ast
 import contextlib
+import copy
 import pathlib
 import unittest
 from types import SimpleNamespace
@@ -33,6 +34,7 @@ from unittest.mock import Mock, patch
 
 import sglang.srt.managers.scheduler as scheduler_module
 import sglang.srt.multiplex.multiplexing_mixin as multiplexing_mixin
+from sglang.srt.model_executor.forward_batch_info import ForwardMode
 from sglang.srt.model_executor.forward_context import (
     ForwardContext,
     forward_context,
@@ -126,6 +128,20 @@ class _Batch:
         self.chunked_req = None
         self.reqs = []
         self.split_prefill_finished = False
+        self.has_grammar = False
+        self.sampling_info = None
+        self.spec_info = SimpleNamespace(future_indices=None)
+        self.req_pool_indices = object()
+        self.seq_lens = object()
+        self.enable_overlap = False
+        self.decode_mem_ok = True
+        self.forward_mode = ForwardMode.EXTEND
+
+    def check_decode_mem(self):
+        return self.decode_mem_ok
+
+    def copy(self):
+        return copy.copy(self)
 
     def is_empty(self):
         return self._empty
@@ -154,6 +170,10 @@ class _FakeScheduler(SchedulerMultiplexMixin):
         prefill_batches=None,
         decode_empty=False,
         fail_prefill_finalize=False,
+        enable_overlap=False,
+        grammar=False,
+        penalizer=False,
+        retract_iteration=None,
     ):
         self.max_iterations = max_iterations
         self.iteration = -1
@@ -164,6 +184,8 @@ class _FakeScheduler(SchedulerMultiplexMixin):
         self.issued_votes = []
         self.decode_backend_switches = []
         self._fail_prefill_finalize = fail_prefill_finalize
+        self.enable_overlap = enable_overlap
+        self._retract_iteration = retract_iteration
 
         # Per-query readiness for this rank's copy_done, and the peer ranks'
         # votes per allreduce (default: the peers agree with this rank).
@@ -183,7 +205,16 @@ class _FakeScheduler(SchedulerMultiplexMixin):
         self._pdmux_prefill_pending = None
         self._pdmux_prefill_inflight = None
         self.running_batch = _Batch("decode", empty=decode_empty)
+        self.running_batch.has_grammar = grammar
+        if penalizer:
+            self.running_batch.sampling_info = SimpleNamespace(
+                penalizer_orchestrator=SimpleNamespace(is_required=True)
+            )
         self.tree_cache = Mock()
+        self.future_map = SimpleNamespace(
+            publish=lambda *args: self.journal.append(("future_seed", None, args))
+        )
+        self._relay_forward_payload = Mock()
 
         self.ps = SimpleNamespace(tp_size=TP_SIZE, gpu_id=0)
         # No manual divisions: with three groups, a non-empty decode batch that
@@ -212,6 +243,7 @@ class _FakeScheduler(SchedulerMultiplexMixin):
         self.iteration += 1
         if self.iteration >= self.max_iterations:
             raise _LoopFinished
+        self.running_batch.decode_mem_ok = self.iteration != self._retract_iteration
         return []
 
     def _allreduce(self, flags, op):
@@ -238,6 +270,7 @@ class _FakeScheduler(SchedulerMultiplexMixin):
         return SimpleNamespace(batch_to_run=batch, running_batch=running_batch)
 
     def update_running_batch(self, running_batch):
+        self.journal.append(("prepare_decode", None, self.iteration))
         return running_batch
 
     def on_idle(self):
@@ -254,11 +287,14 @@ class _FakeScheduler(SchedulerMultiplexMixin):
             # published, read at submit time.
             self.submitted.append((self.iteration, batch, self.pdmux_prefill_stream))
             self.journal.append(("submit", self.pdmux_prefill_stream, batch))
+        else:
+            self.journal.append(("decode_submit", None, self.iteration))
         # The result remembers what it was submitted as. The batch object cannot
         # tell: after a finalize into an empty decode batch, the prefill batch
         # *is* the running batch and runs decode steps under the same name.
         return SimpleNamespace(
             is_prefill=is_prefill,
+            submitted_iteration=self.iteration,
             extra_keep_alive_refs=[batch, "attrs"],
             copy_done=_ScriptedEvent(
                 "copy_done", self._copy_done_script if is_prefill else None
@@ -271,6 +307,8 @@ class _FakeScheduler(SchedulerMultiplexMixin):
             self.journal.append(("finalize", None, batch))
             if self._fail_prefill_finalize:
                 raise RuntimeError("finalize failed")
+        else:
+            self.journal.append(("decode_result", None, result.submitted_iteration))
 
     def stash_chunked_request(self, req):
         pass
@@ -302,6 +340,10 @@ def _stubbed_cuda():
             "sglang.srt.multiplex.multiplexing_mixin.dist.get_world_size",
             lambda group: TP_SIZE,
         ),
+        patch(
+            "sglang.srt.multiplex.multiplexing_mixin.publish_carried_tensors",
+            lambda batch, stream: stream.journal.append(("publish", stream, batch)),
+        ),
     ):
         yield
 
@@ -325,6 +367,76 @@ def _events(journal, kind, lane):
 
 
 class TestPDMuxStandardPrefillLoop(unittest.TestCase):
+    def test_overlap_submits_next_decode_before_consuming_previous(self):
+        scheduler = _run_loop(
+            max_iterations=6, enable_overlap=True, copy_done_script=[False] * 20
+        )
+        journal = scheduler.journal
+        for step in range(1, 6):
+            self.assertLess(
+                journal.index(("decode_submit", None, step)),
+                journal.index(("decode_result", None, step - 1)),
+            )
+        self.assertEqual(
+            [e[2] for e in journal if e[0] == "decode_result"], list(range(5))
+        )
+        submit_at = next(i for i, e in enumerate(journal) if e[0] == "submit")
+        self.assertFalse(any(e[0] == "sync" for e in journal[submit_at:]))
+        self.assertEqual(scheduler.pumps, list(range(1, 6)))
+        self.assertFalse(any(e[0] == "future_seed" for e in journal))
+        self.assertTrue(scheduler.running_batch.enable_overlap)
+        self.assertIs(scheduler.forward_stream, scheduler.stream_groups[1][1])
+
+    def test_overlap_commits_current_decode_before_prefill_merge(self):
+        scheduler = _run_loop(max_iterations=4, enable_overlap=True)
+        journal = scheduler.journal
+        finalize = next(i for i, e in enumerate(journal) if e[0] == "finalize")
+        self.assertLess(journal.index(("decode_result", None, 1)), finalize)
+        seed = next(i for i, e in enumerate(journal) if e[0] == "future_seed")
+        self.assertLess(journal.index(("decode_result", None, 1)), seed)
+        self.assertLess(seed, finalize)
+        self.assertEqual([e[2] for e in journal if e[0] == "decode_result"], [0, 1, 2])
+        self.assertTrue(
+            any(
+                e[0] == "publish" and e[1] is scheduler.stream_groups[2][1]
+                for e in journal[finalize:]
+            )
+        )
+        self.assertIs(scheduler.forward_stream, scheduler.stream_groups[2][1])
+
+    def test_overlap_keeps_grammar_penalizer_and_retraction_barriers(self):
+        for options in (
+            dict(grammar=True),
+            dict(penalizer=True),
+            dict(retract_iteration=1),
+        ):
+            with self.subTest(**options):
+                scheduler = _run_loop(
+                    max_iterations=3,
+                    enable_overlap=True,
+                    copy_done_script=[False] * 20,
+                    **options,
+                )
+                journal = scheduler.journal
+                self.assertLess(
+                    journal.index(("decode_result", None, 0)),
+                    journal.index(("prepare_decode", None, 1)),
+                )
+                if "retract_iteration" not in options:
+                    self.assertFalse(scheduler.running_batch.enable_overlap)
+
+    def test_standard_submits_each_chunk_once_as_a_full_extend(self):
+        batches = [_Batch(f"chunk-{i}") for i in range(3)]
+        scheduler = _run_loop(
+            max_iterations=8, enable_overlap=True, prefill_batches=batches
+        )
+        self.assertEqual([b for _, b, _ in scheduler.submitted], batches)
+        self.assertEqual([b for _, b in scheduler.processed_prefills], batches)
+        self.assertTrue(all(b.forward_mode == ForwardMode.EXTEND for b in batches))
+        self.assertIsNone(scheduler.split_prefill_batch)
+        for batch in batches:
+            self.assertIs(batch.spec_info.future_indices, batch.req_pool_indices)
+
     def test_marker_is_cleared_once_the_submit_returns(self):
         """The identity marker must not outlive the run_batch call.
 
@@ -837,6 +949,58 @@ class TestPDMuxStandardPrefillWiring(unittest.TestCase):
     These inspect the AST, never the raw text, so a docstring that happens to
     mention `synchronize` or `query()` cannot fail or pass them.
     """
+
+    def test_overlap_routes_standard_prefill_to_its_own_submit_path(self):
+        node = _function_node(scheduler_module, "run_batch")
+        node.decorator_list = []
+        namespace = dict(vars(scheduler_module))
+        exec(
+            compile(
+                ast.fix_missing_locations(
+                    ast.Module(
+                        body=[
+                            ast.ImportFrom(
+                                module="__future__",
+                                names=[ast.alias(name="annotations")],
+                                level=0,
+                            ),
+                            node,
+                        ],
+                        type_ignores=[],
+                    )
+                ),
+                scheduler_module.__file__,
+                "exec",
+            ),
+            namespace,
+        )
+        result = SimpleNamespace()
+        batch = SimpleNamespace(
+            forward_mode=ForwardMode.EXTEND,
+            extend_num_tokens=16384,
+            return_logprob=False,
+            return_hidden_states=False,
+        )
+        scheduler = SimpleNamespace(
+            enable_overlap=True,
+            enable_pdmux=True,
+            pdmux_standard=True,
+            split_prefill_batch=None,
+            _pdmux_prefill_batch=batch,
+            _run_pdmux_standard_prefill=Mock(return_value=result),
+            _maybe_report_active_ranks=Mock(),
+            metrics_reporter=Mock(),
+            forward_ct=0,
+            _sched_idled=False,
+            processed_tokens_counter=0,
+            scripted_scheduler_hook=None,
+            profiler_manager=Mock(),
+            forward_sleep_time=None,
+            disaggregation_mode="null",
+            is_generation=True,
+        )
+        self.assertIs(namespace["run_batch"](scheduler, batch), result)
+        scheduler._run_pdmux_standard_prefill.assert_called_once_with(batch)
 
     def test_overlap_branch_keeps_every_side_path(self):
         """Extracting the shared primitives must not drop overlap behaviour.

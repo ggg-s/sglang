@@ -4446,7 +4446,11 @@ class Scheduler(
         # Run forward
         if self.is_generation:
             if self.enable_overlap and not (
-                self.enable_pdmux and batch is self.split_prefill_batch
+                self.enable_pdmux
+                and (
+                    batch is self.split_prefill_batch
+                    or (self.pdmux_standard and batch is self._pdmux_prefill_batch)
+                )
             ):
                 # Self-gates on batch.spec_info.future_indices; non-spec_v2
                 # no-ops (ForwardBatch.init_new lazily computes the sum).

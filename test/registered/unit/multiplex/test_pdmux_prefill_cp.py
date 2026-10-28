@@ -65,14 +65,16 @@ class TestPdmuxPrefillCPAdmission(unittest.TestCase):
         methods["check_pdmux_overlap"](cfg)
 
     def test_full_width_cp_with_hicache_is_admitted(self):
-        for size in (2, 4, 8):
-            for decode_tp in (False, True):
-                with self.subTest(size=size, decode_tp=decode_tp):
-                    self.check(
-                        tp_size=size,
-                        attn_cp_size=size,
-                        enable_cp_decode_attn_tp=decode_tp,
-                    )
+        for mode in ("layer_split", "standard"):
+            for size in (2, 4, 8):
+                for decode_tp in (False, True):
+                    with self.subTest(mode=mode, size=size, decode_tp=decode_tp):
+                        self.check(
+                            pdmux_prefill_mode=mode,
+                            tp_size=size,
+                            attn_cp_size=size,
+                            enable_cp_decode_attn_tp=decode_tp,
+                        )
 
     def test_other_topologies_and_shared_resources_remain_rejected(self):
         for overrides in (
@@ -92,10 +94,14 @@ class TestPdmuxPrefillCPAdmission(unittest.TestCase):
             dict(ragged_mode="compact"),
             dict(cuda_graph_config=NS(prefill=NS(backend="tc_piecewise"))),
             dict(cuda_graph_config=NS(prefill=NS(backend="full"))),
-            dict(pdmux_prefill_mode="standard"),
+            dict(pdmux_prefill_mode="unknown"),
         ):
-            with self.subTest(overrides=overrides), self.assertRaises(AssertionError):
-                self.check(**overrides)
+            for mode in ("layer_split", "standard"):
+                with (
+                    self.subTest(mode=mode, overrides=overrides),
+                    self.assertRaises(AssertionError),
+                ):
+                    self.check(**{"pdmux_prefill_mode": mode, **overrides})
 
 
 class TestPdmuxPrefillCPState(unittest.TestCase):

@@ -12,6 +12,7 @@ import enum
 import importlib.util
 import sys
 import unittest
+from collections import deque
 from http import HTTPStatus
 from pathlib import Path
 from types import SimpleNamespace
@@ -70,6 +71,7 @@ class TestPdmuxMainCompat(unittest.TestCase):
             ),
             set_pdmux_status=Mock(),
             logger=Mock(),
+            deque=deque,
         )
         abort = SimpleNamespace(
             rid="expired", abort_message="Request running timeout reached."
@@ -82,6 +84,7 @@ class TestPdmuxMainCompat(unittest.TestCase):
                     ),
                     tp_cpu_group=object(),
                     stream_groups=[(object(), object())],
+                    enable_overlap=False,
                     _poll_timeout_aborts=Mock(return_value=[abort]),
                     request_receiver=SimpleNamespace(
                         recv_requests=Mock(return_value=[abort])

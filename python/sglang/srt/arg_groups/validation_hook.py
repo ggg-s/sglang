@@ -529,11 +529,14 @@ def check_pdmux_overlap(cfg):
     Subgroup parallelism needs its own lane-specific communicators before it
     can use the asynchronous speculative scheduler.
     """
-    assert cfg.pdmux_prefill_mode == "layer_split" and cfg.speculative_algorithm in (
+    assert cfg.pdmux_prefill_mode in (
+        "layer_split",
+        "standard",
+    ) and cfg.speculative_algorithm in (
         "DFLASH",
         "DSPARK",
     ), (
-        "PD-Multiplexing overlap schedule requires layer_split prefill and DFLASH or DSPARK."
+        "PD-Multiplexing overlap schedule requires layer_split or standard prefill and DFLASH or DSPARK."
     )
     if cfg.tp_size > 1:
         prefill_cp = getattr(cfg, "enable_prefill_cp", False)
@@ -629,9 +632,15 @@ def check_pdmux_standard_prefill(cfg):
         "a single forward_done event recorded on one forward stream, which "
         "cannot describe two lanes running at once."
     )
+    prefill_cp = getattr(cfg, "enable_prefill_cp", False)
+    if prefill_cp:
+        # Both modes share lane-isolated full-TP/CP communicators. Keep the
+        # same DSV4/DSPARK/interleave/DP1/CP=TP restrictions in standard mode,
+        # including when the caller disables CPU overlap.
+        check_pdmux_overlap(cfg)
     for name, value in (
         ("--ep-size", cfg.ep_size),
-        ("--attn-cp-size", cfg.attn_cp_size),
+        ("--attn-cp-size", 1 if prefill_cp else cfg.attn_cp_size),
         ("--dcp-size", cfg.dcp_size),
     ):
         assert value == 1, (

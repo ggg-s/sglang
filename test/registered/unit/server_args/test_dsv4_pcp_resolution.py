@@ -15,7 +15,7 @@ from unittest.mock import patch
 
 import torch
 
-from sglang.srt.arg_groups.overrides import declare_resolution
+from sglang.srt.arg_groups.overrides import declare_resolution, resolving_view
 from sglang.srt.layers.cp import base as cp_base
 from sglang.srt.layers.cp import cp_decode_attn_tp as decode_tp_module
 from sglang.srt.model_executor.forward_batch_info import ForwardMode
@@ -114,7 +114,9 @@ class TestDSV4PCPResolution(unittest.TestCase):
         options.update(overrides)
         return ServerArgs(**options)
 
-    def make_cli_args(self, *, size, decode_tp, eager, separate_draft):
+    def make_cli_args(
+        self, *, size, decode_tp, eager, separate_draft, prefill_mode="layer_split"
+    ):
         pdmux_path = Path(self.model_path, "pdmux.yaml")
         pdmux_path.write_text(
             "sm_group_num: 3\n"
@@ -154,7 +156,7 @@ class TestDSV4PCPResolution(unittest.TestCase):
             "interleave",
             "--enable-pdmux",
             "--pdmux-prefill-mode",
-            "layer_split",
+            prefill_mode,
             "--pdmux-config-path",
             str(pdmux_path),
             "--sm-group-num",
@@ -457,7 +459,7 @@ class TestDSV4PCPResolution(unittest.TestCase):
                     self.assertFalse(require_attn_tp_gather())
                     self.assertEqual(require_gathered_buffer(), mlp)
 
-    def _check_runtime_graph_output_planning(self, device):
+    def _check_runtime_graph_output_planning(self, device, prefill_mode="layer_split"):
         from sglang.srt.model_executor.graph_shared_output import GraphSharedOutput
         from sglang.srt.model_executor.model_runner import ModelRunner
         from sglang.srt.model_executor.runner.base_cuda_graph_runner import (
@@ -477,6 +479,7 @@ class TestDSV4PCPResolution(unittest.TestCase):
                     enable_cp_decode_attn_tp=decode_tp,
                     max_running_requests=16,
                     cuda_graph_bs_decode=[1, 2, 4, 8, 12, 16],
+                    pdmux_prefill_mode=prefill_mode,
                 )
                 args.resolve_once()
                 args.check_server_args()
@@ -538,6 +541,86 @@ class TestDSV4PCPResolution(unittest.TestCase):
     def test_resolved_pcp_reaches_real_graph_shared_output_planning(self):
         self._check_runtime_graph_output_planning("cpu")
 
+    def test_standard_pcp_reaches_real_graph_shared_output_planning(self):
+        self._check_runtime_graph_output_planning("cpu", "standard")
+
+    def test_standard_cli_publishes_full_chain_with_no_fallback(self):
+        for size in (2, 4, 8):
+            for decode_tp in (False, True):
+                for eager in (False, True):
+                    for separate_draft in (False, True):
+                        with self.subTest(
+                            size=size,
+                            decode_tp=decode_tp,
+                            eager=eager,
+                            separate_draft=separate_draft,
+                        ):
+                            args = self.make_cli_args(
+                                size=size,
+                                decode_tp=decode_tp,
+                                eager=eager,
+                                separate_draft=separate_draft,
+                                prefill_mode="standard",
+                            )
+                            args.resolve_once()
+                            args.check_server_args()
+                            publish(pickle.loads(pickle.dumps(args)), role="scheduler")
+                            info = get_context().resolved_server_args_dict()
+                            self.assertEqual(info["pdmux_prefill_mode"], "standard")
+                            self.assertFalse(info["disable_overlap_schedule"])
+                            self.assertTrue(info["enable_dp_attention"])
+                            self.assertTrue(info["enable_hierarchical_cache"])
+                            self.assertTrue(info["enable_prefill_cp"])
+                            self.assertEqual(info["attn_cp_size"], size)
+                            self.assertEqual(
+                                info["enable_cp_decode_attn_tp"], decode_tp
+                            )
+                            self.assertEqual(info["speculative_algorithm"], "DSPARK")
+                            self.assertEqual(get_parallel().attn_tp_size, 1)
+                            self.assertEqual(
+                                get_exec().graph.cuda_graph_config.decode.backend,
+                                "disabled" if eager else "full",
+                            )
+                            self.assertEqual(
+                                get_exec().graph.cuda_graph_config.prefill.backend,
+                                "disabled",
+                            )
+                            reset_context()
+
+    def test_standard_pcp_retains_parallelism_and_backend_guards(self):
+        from sglang.srt.model_executor.cuda_graph_config import with_phase
+
+        for fields in (
+            dict(enable_dp_attention=False),
+            dict(dp_size=2),
+            dict(attn_cp_size=4),
+            dict(ep_size=2),
+            dict(moe_dp_size=2),
+            dict(dcp_size=2),
+            dict(cp_strategy="zigzag"),
+            dict(moe_a2a_backend="deepep"),
+            dict(enable_torch_compile=True),
+            dict(enable_two_batch_overlap=True),
+            dict(enable_unified_memory=True),
+        ):
+            with self.subTest(fields=fields):
+                args = self.make_args(pdmux_prefill_mode="standard")
+                args.resolve_once()
+                declare_resolution(args, "invalid_standard_pcp", **fields)
+                with self.assertRaises(AssertionError):
+                    args.check_server_args()
+        args = self.make_args(pdmux_prefill_mode="standard")
+        args.resolve_once()
+        declare_resolution(
+            args,
+            "invalid_standard_prefill_graph",
+            cuda_graph_config=with_phase(
+                resolving_view(args).cuda_graph_config, "prefill", backend="full"
+            ),
+        )
+        with self.assertRaises(AssertionError):
+            args.check_server_args()
+
     def test_pcp_dp1_keeps_local_scheduler_metadata_on_every_rank(self):
         from sglang.srt.layers.dp_attention import compute_dp_attention_world_info
         from sglang.srt.managers.scheduler_components.dp_attn import (
@@ -596,6 +679,7 @@ class TestDSV4PCPResolution(unittest.TestCase):
         # CP sizes here are logical topology settings; this checks graph
         # planning/storage/replay, not multi-GPU model attention or collectives.
         self._check_runtime_graph_output_planning("cuda")
+        self._check_runtime_graph_output_planning("cuda", "standard")
 
     def test_plain_tp_dp1_still_disables_dp_attention_and_dp_lm_head(self):
         for requested in (False, True):
