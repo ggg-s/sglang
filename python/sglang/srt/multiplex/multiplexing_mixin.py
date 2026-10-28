@@ -1162,8 +1162,7 @@ class SchedulerMultiplexMixin:
         running_batch: ScheduleBatch,
         prefill_stream,
         decode_stream,
-        decode_done,
-        before_finalize=None,
+        before_finalize,
     ) -> tuple[ScheduleBatch, bool]:
         """One iteration of the completion pipeline for the in-flight prefill.
 
@@ -1191,10 +1190,10 @@ class SchedulerMultiplexMixin:
             inflight.done_work = None
             inflight.done_flags = None
             if ready_ranks == self.pdmux_done_group_size:
-                if before_finalize is not None:
-                    # Commit the one decode result still in flight before
-                    # merging request/counter state or reusing its KV pages.
-                    decode_done = before_finalize()
+                # Commit the one decode result still in flight before merging
+                # request/counter state or reusing its KV pages. Record this
+                # event only at merge, not on every intervening decode step.
+                decode_done = before_finalize()
                 # Finalize frees pages, inserts into the radix cache and
                 # rewrites req_to_token rows. Order it after the decode work
                 # this iteration already enqueued.
@@ -1275,7 +1274,8 @@ class SchedulerMultiplexMixin:
         recorded on the prefill stream while it is in flight would land after
         the entire forward and serialize every decode step behind it. The pump's
         device work (write-back frees, storage-queue actions) therefore lands on
-        the decode stream and is covered by that iteration's decode_done.
+        the decode stream and is covered by the merge-only decode_done or the
+        next batch formation's input_done.
         """
         self._hicache_pump_tick += 1
         if self._hicache_pump_tick % self.HICACHE_PUMP_INTERVAL == 0:
@@ -1293,7 +1293,7 @@ class SchedulerMultiplexMixin:
             E0 input_done      D -> P   input handling's device work
             E1 formation_done  P -> D   batch formation and its HiCache pump
             E2 merge_done      P -> D   finalize's frees, inserts and rewrites
-            E3 decode_done     D -> P   decode result processing, retract, pump
+            E3 decode_done     D -> P   merge-only drain of the current decode
 
         Scheduling invariant: between submitting a prefill forward and its
         copy_done being ready, the prefill stream records no event that the
@@ -1313,7 +1313,6 @@ class SchedulerMultiplexMixin:
         prefill_stream, decode_stream = self.stream_groups[stream_idx]
         self.pdmux_prefill_stream = prefill_stream
         adjust_stream_group = False
-        decode_done = None
         pending_decode_result = None
         carried_batch_pending = False
         self.result_queue = deque()
@@ -1337,6 +1336,7 @@ class SchedulerMultiplexMixin:
         logger.debug("Starting event loop for pd multiplexing (standard prefill)...")
 
         while True:
+            inflight = self._pdmux_prefill_inflight
             with torch.cuda.stream(decode_stream):
                 set_pdmux_status(False)
                 # Grammar and CPU-dependent penalizers need committed tokens
@@ -1354,18 +1354,16 @@ class SchedulerMultiplexMixin:
                     publish_carried_tensors(self.running_batch, decode_stream)
                 self.ingest_requests()
                 running_batch = self.running_batch
-                # E0: prefetch's prefix matching concatenates on this stream.
-                input_done = decode_stream.record_event()
-
-            inflight = self._pdmux_prefill_inflight
+                # E0 covers input handling AND every previous decode-side
+                # write (results, retraction, HiCache pump). It is consumed
+                # only when forming a batch, so skip recording it in flight.
+                input_done = decode_stream.record_event() if inflight is None else None
 
             formation_done = None
             with torch.cuda.stream(prefill_stream):
                 set_pdmux_status(True)
                 if inflight is None:
                     prefill_stream.wait_event(input_done)
-                    if decode_done is not None:
-                        prefill_stream.wait_event(decode_done)
                     if not running_batch.is_empty():
                         publish_carried_tensors(running_batch, prefill_stream)
                     # No prefill forward is in flight, which matches the normal
@@ -1478,10 +1476,6 @@ class SchedulerMultiplexMixin:
                     decode_stream.synchronize()
                     if decode_result is not None:
                         self.process_batch_result(decode_batch, decode_result)
-                # E3: covers this iteration's decode result handling, the
-                # retract/free inside update_running_batch, and the pump above.
-                decode_done = decode_stream.record_event()
-
             with torch.cuda.stream(prefill_stream):
                 set_pdmux_status(True)
                 if self._pdmux_prefill_inflight is not None:
@@ -1489,10 +1483,7 @@ class SchedulerMultiplexMixin:
                         running_batch=running_batch,
                         prefill_stream=prefill_stream,
                         decode_stream=decode_stream,
-                        decode_done=decode_done,
-                        before_finalize=(
-                            drain_decode_for_merge if self.enable_overlap else None
-                        ),
+                        before_finalize=drain_decode_for_merge,
                     )
                     self.running_batch = running_batch
                     if merged:

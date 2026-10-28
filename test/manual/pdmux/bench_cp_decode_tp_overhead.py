@@ -110,6 +110,22 @@ def runtime_dispatch_cost():
     return result
 
 
+def standard_event_cost():
+    """Host API cost of the two removed per-decode event records, in isolation."""
+    stream = torch.cuda.Stream()
+
+    def old_inflight_tick():
+        return stream.record_event(), stream.record_event()
+
+    result = {
+        "scope": "isolated host API cost, not model latency or throughput",
+        "old_two_unused_events": host_us(old_inflight_tick, loops=2000, repeats=5),
+        "new_no_event": host_us(lambda: None, loops=2000, repeats=5),
+    }
+    stream.synchronize()
+    return result
+
+
 def main():
     parser = argparse.ArgumentParser()
     parser.add_argument("--output", type=Path, required=True)
@@ -129,6 +145,7 @@ def main():
         "compute_capability": torch.cuda.get_device_capability(),
         "sm_count": torch.cuda.get_device_properties(0).multi_processor_count,
         "scope": "synthetic projection/scope overhead; no full-model performance claim",
+        "native_shard_scope": "same GEMMs and local weights without the CP view selector; not a full DSPARK baseline",
         "cp_size": args.cp_size,
         "dimensions": dict(
             heads=64,
@@ -140,6 +157,7 @@ def main():
             dtype="bfloat16",
         ),
     }
+    result["standard_event_cost"] = standard_event_cost()
     # Import the runtime before patch.dict snapshots sys.modules. Otherwise
     # lazy Torch imports inside the fixture can be removed on restoration,
     # causing duplicate c10d operator registration when the runtime imports.
@@ -171,6 +189,7 @@ def main():
         torch.zeros(64, device="cuda"), requires_grad=False
     )
     mode = [False]
+    native_mode = [False]
     globals_ = model.maybe_use_decode_attn_tp.__wrapped__.__globals__
     globals_["is_pdmux_enabled"] = lambda: mode[0]
     batch = NS(cp_active=False)
@@ -201,17 +220,31 @@ def main():
                 torch.cuda.memory_allocated() - allocated
             )
 
+        mode[0] = True
+        with model.maybe_use_decode_attn_tp(batch) as native_attention:
+            pass
+        result["host_scope"]["native_shard_no_selector"] = host_us(
+            lambda: native_attention.n_local_heads
+        )
+
         result["projection"] = {}
         for rows in (1, 8, 32, 128):
             x = torch.randn(rows, 1024, device="cuda", dtype=torch.bfloat16)
 
             def forward(x=x):
+                if native_mode[0]:
+                    return projection(native_attention, x)
                 with model.maybe_use_decode_attn_tp(batch) as selected:
                     return projection(selected, x)
 
             graphs, reference = {}, None
-            for name, enabled in (("legacy", False), ("persistent_view", True)):
+            for name, enabled, native in (
+                ("legacy", False, False),
+                ("persistent_view", True, False),
+                ("native_shard", True, True),
+            ):
                 mode[0] = enabled
+                native_mode[0] = native
                 for _ in range(10):
                     value = forward()
                 torch.cuda.synchronize()
@@ -222,13 +255,18 @@ def main():
                 graph = torch.cuda.CUDAGraph()
                 with torch.cuda.graph(graph):
                     value = forward()
-                graphs[name] = (enabled, graph, value)
+                graphs[name] = (enabled, native, graph, value)
             samples = {name: {"eager": [], "graph": []} for name in graphs}
             for repeat in range(args.repeats):
-                order = list(graphs) if repeat % 2 == 0 else list(reversed(graphs))
+                names = list(graphs)
+                shift = repeat % len(names)
+                order = names[shift:] + names[:shift]
+                if repeat % 2:
+                    order.reverse()
                 for name in order:
-                    enabled, graph, value = graphs[name]
+                    enabled, native, graph, value = graphs[name]
                     mode[0] = enabled
+                    native_mode[0] = native
                     samples[name]["eager"].append(timed_cuda(forward, args.iterations))
                     samples[name]["graph"].append(
                         timed_cuda(graph.replay, args.iterations)

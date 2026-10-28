@@ -7,6 +7,7 @@ allocation/replay is also checked when a GPU is available.
 import json
 import os
 import pickle
+import sys
 import tempfile
 import unittest
 from pathlib import Path
@@ -543,6 +544,110 @@ class TestDSV4PCPResolution(unittest.TestCase):
 
     def test_standard_pcp_reaches_real_graph_shared_output_planning(self):
         self._check_runtime_graph_output_planning("cpu", "standard")
+
+    def test_standard_published_flag_selects_real_target_and_draft_views(self):
+        # Reuse the small numerical fixture, but replace its context stand-in
+        # with the real singleton built from the published CLI configuration.
+        fixture_dir = Path(__file__).resolve().parents[1] / "multiplex"
+        with patch.object(sys, "path", [str(fixture_dir), *sys.path]):
+            from test_pdmux_cp_decode_attn_tp import fixture
+
+        x = torch.arange(32, dtype=torch.float64).reshape(4, 8) / 100
+        for size in (2, 4, 8):
+            for enabled in (False, True):
+                args = self.make_cli_args(
+                    size=size,
+                    decode_tp=enabled,
+                    eager=False,
+                    separate_draft=False,
+                    prefill_mode="standard",
+                )
+                args.resolve_once()
+                args.check_server_args()
+                publish(pickle.loads(pickle.dumps(args)), role="scheduler")
+                for draft in (False, True):
+                    partitions = []
+                    for rank in range(size):
+                        with (
+                            self.subTest(
+                                size=size, enabled=enabled, draft=draft, rank=rank
+                            ),
+                            get_parallel().override(attn_cp_rank=rank),
+                            patch.object(
+                                decode_tp_module, "_global_cp_decode_attn_tp_ctx", None
+                            ),
+                        ):
+                            torch.manual_seed(7)
+                            model, _, linear = fixture(
+                                size=size, rank=rank, draft=draft
+                            )
+                            # Eight groups permit a nonempty CP8 partition.
+                            model.n_groups = model.n_local_groups = 8
+                            for name, rows, cols in (
+                                ("wq_b", 32, 8),
+                                ("wo_a", 32, 4),
+                                ("wo_b", 8, 32),
+                            ):
+                                layer = getattr(model, name)
+                                layer.weight = torch.nn.Parameter(
+                                    torch.randn(rows, cols, dtype=torch.float64),
+                                    requires_grad=False,
+                                )
+                                setattr(
+                                    layer,
+                                    "input_size_per_partition"
+                                    if name == "wo_b"
+                                    else "output_size_per_partition",
+                                    cols if name == "wo_b" else rows,
+                                )
+                            ctx = decode_tp_module.get_cp_decode_attn_tp_ctx()
+                            scope_globals = (
+                                model.maybe_use_decode_attn_tp.__wrapped__.__globals__
+                            )
+                            scope_globals["get_cp_decode_attn_tp_ctx"] = (
+                                lambda ctx=ctx: ctx
+                            )
+                            scope_globals["is_pdmux_enabled"] = lambda: (
+                                get_disagg().enable_pdmux
+                            )
+                            reference = model(x)
+                            with patch.dict(sys.modules, {linear.__name__: linear}):
+                                for mode in (
+                                    ForwardMode.DECODE,
+                                    ForwardMode.TARGET_VERIFY,
+                                    ForwardMode.DRAFT_EXTEND_V2,
+                                    ForwardMode.EXTEND,
+                                ):
+                                    batch = SimpleNamespace(
+                                        forward_mode=mode,
+                                        input_ids=list(range(16)),
+                                        extend_seq_lens_cpu=[16],
+                                        attn_cp_metadata=None,
+                                    )
+                                    sharded = enabled and mode != ForwardMode.EXTEND
+                                    with model.maybe_use_decode_attn_tp(
+                                        batch
+                                    ) as selected:
+                                        self.assertEqual(selected is not model, sharded)
+                                        self.assertEqual(
+                                            selected.attn_tp_size,
+                                            size if sharded else 1,
+                                        )
+                                        self.assertEqual(
+                                            selected.n_local_heads,
+                                            8 // size if sharded else 8,
+                                        )
+                                        value = selected(x)
+                                        if mode == ForwardMode.DECODE:
+                                            partitions.append(value)
+                                        if not sharded:
+                                            torch.testing.assert_close(value, reference)
+                            self.assertEqual(model.wq_b.weight.shape, (32, 8))
+                            self.assertEqual(model.n_local_heads, 8)
+                            self.assertFalse(ctx.use_decode_attn_tp)
+                    if enabled:
+                        torch.testing.assert_close(sum(partitions), reference)
+                reset_context()
 
     def test_standard_cli_publishes_full_chain_with_no_fallback(self):
         for size in (2, 4, 8):

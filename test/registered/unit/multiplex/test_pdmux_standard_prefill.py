@@ -387,6 +387,14 @@ class TestPDMuxStandardPrefillLoop(unittest.TestCase):
         self.assertTrue(scheduler.running_batch.enable_overlap)
         self.assertIs(scheduler.forward_stream, scheduler.stream_groups[1][1])
 
+    def test_inflight_decode_records_no_unused_cross_lane_events(self):
+        scheduler = _run_loop(
+            max_iterations=8, enable_overlap=True, copy_done_script=[False] * 20
+        )
+        journal = scheduler.journal
+        submit = next(i for i, e in enumerate(journal) if e[0] == "submit")
+        self.assertEqual([e for e in journal[submit + 1 :] if e[0] == "record"], [])
+
     def test_overlap_commits_current_decode_before_prefill_merge(self):
         scheduler = _run_loop(max_iterations=4, enable_overlap=True)
         journal = scheduler.journal
@@ -395,6 +403,13 @@ class TestPDMuxStandardPrefillLoop(unittest.TestCase):
         seed = next(i for i, e in enumerate(journal) if e[0] == "future_seed")
         self.assertLess(journal.index(("decode_result", None, 1)), seed)
         self.assertLess(seed, finalize)
+        submit = next(i for i, e in enumerate(journal) if e[0] == "submit")
+        merge_barriers = [
+            e
+            for e in journal[submit + 1 : finalize]
+            if e[0] == "record" and e[1].lane == "D"
+        ]
+        self.assertEqual(len(merge_barriers), 1)
         self.assertEqual([e[2] for e in journal if e[0] == "decode_result"], [0, 1, 2])
         self.assertTrue(
             any(
