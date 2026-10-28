@@ -430,15 +430,19 @@ class TestDSV4PCPResolution(unittest.TestCase):
             (True, 2, 4, 1, "none", True, False, 4),
         )
         for enabled, dp, cp, dense, a2a, mlp, attn, alignment in cases:
+            topology = dict(
+                enable_dp_attention=enabled,
+                dp_size=dp,
+                tp_size=8,
+                attn_cp_size=cp,
+                moe_dense_tp_size=dense,
+                enable_dp_lm_head=False,
+                disable_attn_tp_gather=False,
+                enable_two_batch_overlap=False,
+            )
             with (
                 self.subTest(enabled=enabled, dp=dp, cp=cp, dense=dense, a2a=a2a),
-                get_parallel().override(
-                    enable_dp_attention=enabled,
-                    dp_size=dp,
-                    attn_cp_size=cp,
-                    attn_tp_size=8 // (dp if enabled else 1) // cp,
-                    moe_dense_tp_size=dense,
-                ),
+                get_context().override_server_args(**topology),
                 get_flags().moe.override(a2a_backend=MoeA2ABackend(a2a)),
             ):
                 self.assertEqual(require_mlp_tp_gather(), mlp)
@@ -447,7 +451,9 @@ class TestDSV4PCPResolution(unittest.TestCase):
                 # PCP still needs scheduler metadata and CP-aligned buffers.
                 self.assertEqual(require_mlp_sync(), enabled or mlp or attn)
                 self.assertEqual(get_cuda_graph_batch_size_alignment(), alignment)
-                with get_parallel().override(disable_attn_tp_gather=True):
+                with get_context().override_server_args(
+                    **{**topology, "disable_attn_tp_gather": True}
+                ):
                     self.assertFalse(require_attn_tp_gather())
                     self.assertEqual(require_gathered_buffer(), mlp)
 
