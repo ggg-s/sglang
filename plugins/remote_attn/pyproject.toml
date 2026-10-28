@@ -1,0 +1,15 @@
+[build-system]
+requires = ["setuptools>=64"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "sglang-remote-attn"
+version = "0.1.0"
+description = "Experimental progressive KV handoff and remote attention for SGLang"
+requires-python = ">=3.12"
+
+[project.entry-points."sglang.srt.plugins"]
+remote_attn = "sglang_remote_attn:register"
+
+[tool.setuptools.packages.find]
+include = ["sglang_remote_attn*"]

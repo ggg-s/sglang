@@ -1,0 +1,19 @@
+{
+  "sglang_target_base": "1335d372f0a58857422e40b89a097daa7d3bf86c",
+  "sglang_experiment_base": "3a869635ce3020e3ae6998473309465250a9628c",
+  "experiment_branch": "pd-handoff-p518-stable",
+  "experiment_commit": "17261ca0",
+  "expected_handoff_md5": "e545304a50a64f64e1f1cf9e679e634f",
+  "supplied_handoff_md5": "ad5290feffe0109dc8bbd18c94a4bafb",
+  "source_sha256": {
+    "handoff_control.py": "0e9a49dd1798e56d0a98c45b0c887a7a5456864b364be0827fa43e4d7006cc72",
+    "p2d_driver.py": "9f881ddec5cd5d9c6e08a5432bd891d0c74b61e223e3be3b04d062057007728b",
+    "p4_gateway.py": "8969a5b1c92dc5a23deefd4064a05b34c3cef69fac496f65662dbc70c83835d2",
+    "core_handoff_hooks.patch": "a661939a60b169f7986a66eb9c1aa4f5d6fb85b834614ddbcadd508725d73e27",
+    "mooncake_session.patch": "704b8d632ca24ff61353c938c24907f2ffd7dc8fef2e9933b10f424bd59e6dbc",
+    "PORTING-FUNCTIONAl.md": "5fe0d555206701ded25cec971598a83ac89a1c230b0d3e2599ef77e4355c760f",
+    "start_p511_p_tp2.sh": "210268b74210d6a0a5accc57e82ebf175d6c53296578f7bd3d055afc557b1dc9",
+    "start_p511_d0_tp2.sh": "cfb4bd79532d086a81f3d881195d4f4ecaf9a3637064f61afc86ddbc75a7c496",
+    "start_p511_d1_tp2.sh": "fe107cf558308080f0d7fe92ccf1f49de3d5420a24a1dcb9bd2c2726f774b785"
+  }
+}

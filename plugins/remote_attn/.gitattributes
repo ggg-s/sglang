@@ -1,0 +1,3 @@
+# Original experiment inputs retain their exact whitespace and EOF bytes.
+control_plane/*.py -whitespace
+migration/* -whitespace

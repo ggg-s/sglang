@@ -1,0 +1,99 @@
+diff --git a/python/sglang/srt/disaggregation/mooncake/conn.py b/python/sglang/srt/disaggregation/mooncake/conn.py
+index 66ac63b34..05af89970 100644
+--- a/python/sglang/srt/disaggregation/mooncake/conn.py
++++ b/python/sglang/srt/disaggregation/mooncake/conn.py
+@@ -1,6 +1,7 @@
+ from __future__ import annotations
+ 
+ import concurrent.futures
++import contextlib
+ import dataclasses
+ import logging
+ import os
+@@ -215,6 +216,17 @@ class MooncakeKVManager(CommonKVManager):
+             # zero so a deferred chunk is not dropped by an early conclude.
+             self._staging_outstanding = defaultdict(int)
+             self.session_lock = threading.Lock()
++            # One in-flight batch_transfer_sync per peer session.  Bounding
++            # the index batch alone is not enough when several short P->D
++            # requests overlap: their batches still share the TCP lane
++            # admission queue.  Serializing per session caps actual queued
++            # transfers at one batch (<=1152 entries with a 16-token batch).
++            self._send_locks = {}
++            self._send_locks_guard = threading.Lock()
++            self._send_global_lock = threading.Lock()
++            self._send_lock_enabled = (
++                os.environ.get("SGLANG_MOONCAKE_SEND_LOCK", "1") != "0"
++            )
+             # Determine the number of threads to use for kv sender
+             cpu_count = os.cpu_count()
+             transfer_thread_pool_size = (
+@@ -645,14 +657,27 @@ class MooncakeKVManager(CommonKVManager):
+             )
+         return ret
+ 
++    def _session_send_lock(self, mooncake_session_id):
++        # A TP rank may hold one session per decode rank; a process-wide
++        # lock keeps at most one transport batch in flight per P process.
++        # The env switch exists for the P5.15 lock-cost A/B only; production
++        # keeps the bounded setting.
++        if not self._send_lock_enabled:
++            return contextlib.nullcontext()
++        return self._send_global_lock
++
+     def _transfer_data(self, mooncake_session_id, transfer_blocks):
+         if not transfer_blocks:
+             return 0
+ 
+         src_addrs, dst_addrs, lengths = zip(*transfer_blocks)
+-        return self.engine.batch_transfer_sync(
+-            mooncake_session_id, list(src_addrs), list(dst_addrs), list(lengths)
+-        )
++        with self._session_send_lock(mooncake_session_id):
++            return self.engine.batch_transfer_sync(
++                mooncake_session_id,
++                list(src_addrs),
++                list(dst_addrs),
++                list(lengths),
++            )
+ 
+     def _send_kvcache_generic(
+         self,
+@@ -2033,6 +2058,37 @@ class MooncakeKVManager(CommonKVManager):
+                                 * len(self.kv_args.kv_item_lens)
+                             )
+                         )
++                    # A restarted decode process can reuse host:port (and
++                    # therefore the mooncake_session_id) while the old TCP
++                    # lane still points at the dead process.  Registration is
++                    # the only point where the peer's KV base is known to
++                    # have changed, so probe once before publishing it.  The
++                    # probe rebuilds the lane; without it the first chunk
++                    # races a stale connection and fails with broken pipe.
++                    old = self.decode_kv_args_table.get(mooncake_session_id)
++                    peer_changed = (
++                        old is None
++                        or old.dst_kv_ptrs[:1] != decode_kv_args.dst_kv_ptrs[:1]
++                        or old.dst_kv_item_len != decode_kv_args.dst_kv_item_len
++                    )
++                    if peer_changed:
++                        probe = getattr(self.engine, "send_probe", None)
++                        if probe is not None:
++                            rc = -1
++                            for _ in range(3):
++                                try:
++                                    rc = probe(mooncake_session_id)
++                                except Exception:
++                                    rc = -1
++                                if rc == 0:
++                                    break
++                                time.sleep(0.05)
++                            logger.info(
++                                "peer %s %s; pre-send probe rc=%d",
++                                mooncake_session_id,
++                                "new" if old is None else "re-registered",
++                                rc,
++                            )
+                     self.decode_kv_args_table[mooncake_session_id] = decode_kv_args
+                     with self.session_lock:
+                         if mooncake_session_id in self.failed_sessions:
