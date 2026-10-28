@@ -174,6 +174,7 @@ class _FakeScheduler(SchedulerMultiplexMixin):
         grammar=False,
         penalizer=False,
         retract_iteration=None,
+        dsv4=False,
     ):
         self.max_iterations = max_iterations
         self.iteration = -1
@@ -195,6 +196,11 @@ class _FakeScheduler(SchedulerMultiplexMixin):
         self._prefill_batches = list(
             prefill_batches if prefill_batches is not None else [_Batch("prefill")]
         )
+        self.waiting_queue = self._prefill_batches
+        self.model_config = SimpleNamespace(is_deepseek_v4_arch=dsv4)
+        self.prefill_delayer = None
+        self.enable_hicache_storage = False
+        self.grammar_manager = SimpleNamespace(has_waiting_grammars=lambda: False)
 
         self.pdmux_standard = True
         self.draft_worker = None
@@ -216,7 +222,7 @@ class _FakeScheduler(SchedulerMultiplexMixin):
         )
         self._relay_forward_payload = Mock()
 
-        self.ps = SimpleNamespace(tp_size=TP_SIZE, gpu_id=0)
+        self.ps = SimpleNamespace(tp_size=TP_SIZE, attn_dp_size=1, gpu_id=0)
         # No manual divisions: with three groups, a non-empty decode batch that
         # runs alongside a prefill selects the single shared group, index 1.
         self.pdmux_config = SimpleNamespace(
@@ -367,6 +373,52 @@ def _events(journal, kind, lane):
 
 
 class TestPDMuxStandardPrefillLoop(unittest.TestCase):
+    def test_dsv4_decode_only_skips_formation_events_but_keeps_hicache_pump(self):
+        scheduler = _run_loop(
+            max_iterations=6, enable_overlap=True, dsv4=True, prefill_batches=[]
+        )
+        self.assertEqual([e for e in scheduler.journal if e[0] == "record"], [])
+        self.assertEqual(scheduler.pumps, list(range(6)))
+        self.assertEqual(scheduler.submitted, [])
+
+    def test_decode_only_fast_path_resumes_prefill_on_arrival(self):
+        scheduler = _FakeScheduler(
+            max_iterations=6, enable_overlap=True, dsv4=True, prefill_batches=[]
+        )
+        ingest = scheduler.ingest_requests
+        incoming = _Batch("arrived")
+
+        def receive():
+            ingest()
+            if scheduler.iteration == 2:
+                scheduler.waiting_queue.append(incoming)
+
+        scheduler.ingest_requests = receive
+        with _stubbed_cuda():
+            with self.assertRaises(_LoopFinished):
+                scheduler.event_loop_pdmux_standard()
+        self.assertEqual([(i, b) for i, b, _ in scheduler.submitted], [(2, incoming)])
+        self.assertEqual(scheduler.processed_prefills, [(3, incoming)])
+
+    def test_decode_only_fast_path_retains_all_formation_side_work(self):
+        scheduler = _FakeScheduler(max_iterations=1, dsv4=True, prefill_batches=[])
+        self.assertTrue(scheduler._skip_empty_standard_prefill())
+        for name, value in (
+            ("waiting_queue", [object()]),
+            ("chunked_req", object()),
+            ("_pending_chunked_abort_req", object()),
+            ("prefill_delayer", object()),
+            ("enable_hicache_storage", True),
+            ("grammar_manager", SimpleNamespace(has_waiting_grammars=lambda: True)),
+            ("ps", SimpleNamespace(attn_dp_size=2)),
+            ("model_config", SimpleNamespace(is_deepseek_v4_arch=False)),
+        ):
+            with (
+                self.subTest(name=name),
+                patch.object(scheduler, name, value, create=True),
+            ):
+                self.assertFalse(scheduler._skip_empty_standard_prefill())
+
     def test_overlap_submits_next_decode_before_consuming_previous(self):
         scheduler = _run_loop(
             max_iterations=6, enable_overlap=True, copy_done_script=[False] * 20

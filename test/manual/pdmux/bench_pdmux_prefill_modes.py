@@ -43,7 +43,7 @@ class Scheduler(_FakeScheduler):
         self.pdmux_standard = mode == "standard"
         self.spec_algorithm = NS(is_none=lambda: False)
         self.ps.attn_dp_size = 1
-        self.model_config = NS(num_hidden_layers=layers)
+        self.model_config = NS(num_hidden_layers=layers, is_deepseek_v4_arch=True)
         self.pdmux_config.split_forward_token_budget = rows * split_layers
         self.pdmux_config.split_forward_max_layers = 0
         self._check_pdmux_dp_graph_capability = lambda: None
@@ -185,7 +185,8 @@ def run_native_overlap(scheduler):
 
     scheduler.get_next_batch_to_run = plan
     scheduler.run_batch = forward
-    inspect.unwrap(NativeScheduler.event_loop_overlap)(scheduler)
+    with torch.inference_mode():
+        inspect.unwrap(NativeScheduler.event_loop_overlap)(scheduler)
 
 
 def run(mode, *, rows, layers, chunks, decode_steps, split_layers):

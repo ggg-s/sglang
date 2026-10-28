@@ -1134,6 +1134,24 @@ class SchedulerMultiplexMixin:
     # Standard prefill lane
     # ------------------------------------------------------------------
 
+    def _skip_empty_standard_prefill(self: Scheduler) -> bool:
+        """DSV4/DP1: no prefill-side work exists beyond the HiCache pump.
+
+        Mirror _get_new_batch_prefill_raw's empty-queue return, preserving its
+        other early work. DP peers, waiting grammars, storage retries and the
+        prefill controller must still enter the normal formation path.
+        """
+        return (
+            getattr(self.model_config, "is_deepseek_v4_arch", False)
+            and self.ps.attn_dp_size == 1
+            and not self.waiting_queue
+            and self.chunked_req is None
+            and getattr(self, "_pending_chunked_abort_req", None) is None
+            and self.prefill_delayer is None
+            and not self.enable_hicache_storage
+            and not self.grammar_manager.has_waiting_grammars()
+        )
+
     def _submit_standard_prefill(self: Scheduler, batch: ScheduleBatch) -> None:
         """Submit one prefill work item on the prefill lane.
 
@@ -1354,15 +1372,18 @@ class SchedulerMultiplexMixin:
                 self.ingest_requests()
                 running_batch = self.running_batch
                 inflight = self._pdmux_prefill_inflight
+                form_prefill = (
+                    inflight is None and not self._skip_empty_standard_prefill()
+                )
                 # E0 covers input handling AND every previous decode-side
                 # write (results, retraction, HiCache pump). It is consumed
                 # only when forming a batch, so skip recording it in flight.
-                input_done = decode_stream.record_event() if inflight is None else None
+                input_done = decode_stream.record_event() if form_prefill else None
 
             formation_done = None
-            with torch.cuda.stream(prefill_stream):
-                set_pdmux_status(True)
-                if inflight is None:
+            if form_prefill:
+                with torch.cuda.stream(prefill_stream):
+                    set_pdmux_status(True)
                     prefill_stream.wait_event(input_done)
                     if not running_batch.is_empty():
                         publish_carried_tensors(running_batch, prefill_stream)
@@ -1394,6 +1415,11 @@ class SchedulerMultiplexMixin:
                     publish_carried_tensors(running_batch, decode_stream)
                 if inflight is not None:
                     self._pump_hicache_events_inflight()
+                elif not form_prefill:
+                    # Formation's only remaining task in this DP1 fast path.
+                    # Keep the original once-per-iteration pump cadence. Its
+                    # writes stay on decode and precede any future input_done.
+                    self.check_hicache_events_if_enabled()
                 if (
                     pending_decode_result is not None
                     and not running_batch.is_empty()
@@ -1460,9 +1486,9 @@ class SchedulerMultiplexMixin:
                     else None
                 )
 
-            with torch.cuda.stream(prefill_stream):
-                set_pdmux_status(True)
-                if self._pdmux_prefill_pending is not None:
+            if self._pdmux_prefill_pending is not None:
+                with torch.cuda.stream(prefill_stream):
+                    set_pdmux_status(True)
                     self._submit_standard_prefill(self._pdmux_prefill_pending)
                     self._pdmux_prefill_pending = None
 
@@ -1476,9 +1502,9 @@ class SchedulerMultiplexMixin:
                     decode_stream.synchronize()
                     if decode_result is not None:
                         self.process_batch_result(decode_batch, decode_result)
-            with torch.cuda.stream(prefill_stream):
-                set_pdmux_status(True)
-                if self._pdmux_prefill_inflight is not None:
+            if self._pdmux_prefill_inflight is not None:
+                with torch.cuda.stream(prefill_stream):
+                    set_pdmux_status(True)
                     running_batch, merged = self._advance_standard_prefill(
                         running_batch=running_batch,
                         prefill_stream=prefill_stream,

@@ -40,6 +40,7 @@ def test_standard_whole_chunk_with_decode_graph_and_delayed_completion(grammar):
                 enable_overlap=True,
                 prefill_batches=self.chunks,
                 grammar=grammar,
+                dsv4=True,
             )
             self.stream_groups = [
                 (torch.cuda.Stream(), torch.cuda.Stream()) for _ in range(3)
@@ -56,6 +57,7 @@ def test_standard_whole_chunk_with_decode_graph_and_delayed_completion(grammar):
             self.prefill_outputs = []
             self.decode_outputs = []
             self.forward_counts = {}
+            self.tail_start = None
             ready = torch.cuda.current_stream().record_event()
             for streams in self.stream_groups:
                 for stream in streams:
@@ -63,7 +65,10 @@ def test_standard_whole_chunk_with_decode_graph_and_delayed_completion(grammar):
 
         def _recv_requests(self):
             if len(self.processed_prefills) == len(self.chunks):
-                raise _LoopFinished
+                if self.tail_start is None:
+                    self.tail_start = self.iteration
+                if self.iteration - self.tail_start >= 8:
+                    raise _LoopFinished
             return super()._recv_requests()
 
         def run_batch(self, batch):
