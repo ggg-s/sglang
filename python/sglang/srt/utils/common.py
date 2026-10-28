@@ -3839,8 +3839,9 @@ def require_mlp_tp_gather():
     from sglang.srt.layers.moe.utils import get_moe_a2a_backend
 
     # elastic-EP scale-up rewrites dp_size on the published config
-    if get_parallel().enable_dp_attention:
-        assert get_parallel().dp_size > 1, "dp_size must be greater than 1"
+    # DSV4 PCP keeps DP attention enabled at DP=1. Its CP token gathers are
+    # model-owned; there are no distinct attention-DP batches to gather here.
+    if get_parallel().enable_dp_attention and get_parallel().dp_size > 1:
         if get_exec().moe.elastic_ep_backend is not None:
             from sglang.srt.elastic_ep.elastic_ep import (
                 elastic_expanded_world_enabled,
@@ -3907,7 +3908,10 @@ def require_attn_tp_gather():
         or get_parallel().moe_dense_tp_size is not None
     ):
         if get_parallel().enable_dp_attention:
-            return get_parallel().dp_size < get_parallel().tp_size
+            # CP ranks partition tokens, not attention TP shards. In particular,
+            # DSV4 PCP has DP=1, CP=TP and attention TP=1; its model owns the CP
+            # gathers and does not consume the upstream attention gathered buffer.
+            return get_parallel().attn_tp_size > 1
         else:
             return True
     else:

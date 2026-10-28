@@ -1,6 +1,7 @@
-"""Resolve DSV4 PCP from CLI defaults through validation, readback and publish.
+"""Resolve DSV4 PCP through publish and runtime CUDA graph output planning.
 
-Only config.json is needed: no model weights, CUDA kernels or process groups.
+Only config.json is needed: no model weights or process groups. CUDA output
+allocation/replay is also checked when a GPU is available.
 """
 
 import json
@@ -12,6 +13,8 @@ from pathlib import Path
 from types import SimpleNamespace
 from unittest.mock import patch
 
+import torch
+
 from sglang.srt.arg_groups.overrides import declare_resolution
 from sglang.srt.layers.cp import base as cp_base
 from sglang.srt.layers.cp import cp_decode_attn_tp as decode_tp_module
@@ -20,6 +23,7 @@ from sglang.srt.runtime_context import (
     get_context,
     get_disagg,
     get_exec,
+    get_flags,
     get_memory,
     get_parallel,
     get_schedule,
@@ -396,6 +400,196 @@ class TestDSV4PCPResolution(unittest.TestCase):
         args.resolve_once()
         args.check_server_args()
         self.assertTrue(args.resolved_dict()["enable_dp_attention"])
+
+    def test_runtime_gather_predicates_use_attention_tp_not_cp_width(self):
+        from sglang.srt.layers.moe.utils import MoeA2ABackend
+        from sglang.srt.utils.common import (
+            get_cuda_graph_batch_size_alignment,
+            require_attn_tp_gather,
+            require_gathered_buffer,
+            require_mlp_sync,
+            require_mlp_tp_gather,
+        )
+
+        args = self.make_args()
+        args.resolve_once()
+        publish(args, role="scheduler")
+        # DP1 is not a blanket attention-gather exemption: ordinary TP with
+        # dense-TP/A2A sequence scattering must retain its existing behavior.
+        # dp_attention, dp, cp, dense_tp, a2a, mlp_gather, attn_gather, alignment
+        cases = (
+            (False, 1, 1, None, "none", False, False, 1),
+            (False, 1, 1, 1, "none", False, True, 8),
+            (False, 1, 1, None, "deepep", False, True, 8),
+            (True, 1, 1, 1, "none", False, True, 8),
+            (True, 1, 8, 1, "none", False, False, 8),
+            (True, 1, 8, None, "deepep", False, False, 8),
+            (True, 1, 4, 1, "none", False, True, 8),
+            (True, 2, 1, 1, "none", True, True, 4),
+            (True, 8, 1, 1, "none", True, False, 1),
+            (True, 2, 4, 1, "none", True, False, 4),
+        )
+        for enabled, dp, cp, dense, a2a, mlp, attn, alignment in cases:
+            with (
+                self.subTest(enabled=enabled, dp=dp, cp=cp, dense=dense, a2a=a2a),
+                get_parallel().override(
+                    enable_dp_attention=enabled,
+                    dp_size=dp,
+                    attn_cp_size=cp,
+                    attn_tp_size=8 // (dp if enabled else 1) // cp,
+                    moe_dense_tp_size=dense,
+                ),
+                get_flags().moe.override(a2a_backend=MoeA2ABackend(a2a)),
+            ):
+                self.assertEqual(require_mlp_tp_gather(), mlp)
+                self.assertEqual(require_attn_tp_gather(), attn)
+                self.assertEqual(require_gathered_buffer(), mlp or attn)
+                # PCP still needs scheduler metadata and CP-aligned buffers.
+                self.assertEqual(require_mlp_sync(), enabled or mlp or attn)
+                self.assertEqual(get_cuda_graph_batch_size_alignment(), alignment)
+                with get_parallel().override(disable_attn_tp_gather=True):
+                    self.assertFalse(require_attn_tp_gather())
+                    self.assertEqual(require_gathered_buffer(), mlp)
+
+    def _check_runtime_graph_output_planning(self, device):
+        from sglang.srt.model_executor.graph_shared_output import GraphSharedOutput
+        from sglang.srt.model_executor.model_runner import ModelRunner
+        from sglang.srt.model_executor.runner.base_cuda_graph_runner import (
+            get_batch_sizes_to_capture,
+        )
+        from sglang.srt.speculative.spec_info import SpeculativeAlgorithm
+        from sglang.srt.utils.common import (
+            get_cuda_graph_batch_size_alignment,
+            require_gathered_buffer,
+            require_mlp_sync,
+        )
+
+        for size in (2, 4, 8):
+            for decode_tp in (False, True):
+                args = self.make_args(
+                    tp_size=size,
+                    enable_cp_decode_attn_tp=decode_tp,
+                    max_running_requests=16,
+                    cuda_graph_bs_decode=[1, 2, 4, 8, 12, 16],
+                )
+                args.resolve_once()
+                args.check_server_args()
+                publish(pickle.loads(pickle.dumps(args)), role="scheduler")
+                self.assertFalse(require_gathered_buffer())
+                self.assertTrue(require_mlp_sync())
+                self.assertEqual(get_parallel().attn_tp_size, 1)
+                self.assertEqual(get_cuda_graph_batch_size_alignment(), size)
+                for draft in (False, True):
+                    with (
+                        self.subTest(size=size, decode_tp=decode_tp, draft=draft),
+                        patch.object(GraphSharedOutput, "_process_shared", None),
+                    ):
+                        # Skip weights and CUDA backend construction, but execute
+                        # the actual failing startup chain, including ModelRunner
+                        # logits-row sizing and graph bucket filtering.
+                        runner = ModelRunner.__new__(ModelRunner)
+                        runner.device = device
+                        runner.is_draft_worker = draft
+                        runner.spec_algorithm = SpeculativeAlgorithm.DSPARK
+                        runner.model_config = SimpleNamespace(
+                            hf_config=SimpleNamespace(**_CONFIG)
+                        )
+                        runner.req_to_token_pool = SimpleNamespace(size=13)
+                        width = runner.decode_num_tokens_per_req()
+                        self.assertEqual(width, 4 if draft else 5)
+                        capture_bs, compile_bs = get_batch_sizes_to_capture(
+                            runner, width
+                        )
+                        expected_bs = {
+                            (2, False): [2, 4, 8, 12, 14],
+                            (2, True): [1, 2, 4, 8, 12, 14],
+                            (4, False): [4, 8, 12, 16],
+                            (4, True): [1, 2, 4, 8, 12, 16],
+                            (8, False): [8, 16],
+                            (8, True): [2, 4, 8, 12, 16],
+                        }[size, draft]
+                        self.assertEqual(capture_bs, expected_bs)
+                        self.assertEqual(compile_bs, [])
+                        shared = GraphSharedOutput.create_for_model_runner(runner)
+                        self.assertIsNotNone(shared)
+                        self.assertEqual(shared.max_rows, expected_bs[-1] * width)
+                        self.assertIs(
+                            GraphSharedOutput.create_for_model_runner(runner), shared
+                        )
+                        logits = shared.get_logits_buffer(7, rows=width)
+                        self.assertEqual(tuple(logits.shape), (width, 7))
+                        if device == "cuda":
+                            graph = torch.cuda.CUDAGraph()
+                            with torch.cuda.graph(graph):
+                                logits.add_(1)
+                            torch.cuda.synchronize()
+                            logits.zero_()
+                            graph.replay()
+                            torch.cuda.synchronize()
+                            torch.testing.assert_close(logits, torch.ones_like(logits))
+                reset_context()
+
+    def test_resolved_pcp_reaches_real_graph_shared_output_planning(self):
+        self._check_runtime_graph_output_planning("cpu")
+
+    def test_pcp_dp1_keeps_local_scheduler_metadata_on_every_rank(self):
+        from sglang.srt.layers.dp_attention import compute_dp_attention_world_info
+        from sglang.srt.managers.scheduler_components.dp_attn import (
+            MLPSyncBatchInfo,
+            _update_gather_batch,
+            should_skip_scheduler_all_gather,
+        )
+        from sglang.srt.utils.common import require_mlp_tp_gather
+
+        for size in (2, 4, 8):
+            args = self.make_args(tp_size=size)
+            args.resolve_once()
+            publish(args, role="scheduler")
+            parallel = get_parallel()
+            for rank in range(size):
+                with self.subTest(size=size, rank=rank):
+                    self.assertEqual(
+                        compute_dp_attention_world_info(
+                            parallel.enable_dp_attention,
+                            rank,
+                            parallel.tp_size,
+                            parallel.dp_size,
+                            parallel.attn_cp_size,
+                        ),
+                        (0, 1, 0, 1),
+                    )
+            self.assertTrue(should_skip_scheduler_all_gather(parallel.dp_size))
+            for mode, tokens in (
+                (ForwardMode.DECODE, 3),
+                (ForwardMode.SPLIT_PREFILL, 16),
+            ):
+                with self.subTest(size=size, mode=mode):
+                    info = MLPSyncBatchInfo(
+                        dp_size=1,
+                        tp_size=parallel.attn_tp_size,
+                        cp_size=size,
+                        num_tokens=tokens,
+                        num_tokens_for_logprob=3,
+                        can_run_decode_cuda_graph=mode.is_decode(),
+                        can_run_prefill_cuda_graph=False,
+                        is_extend_in_batch=mode.is_extend(),
+                        local_can_run_tbo=False,
+                        local_forward_mode=mode.value,
+                    )
+                    info.finalize_local()
+                    batch = SimpleNamespace()
+                    _update_gather_batch(batch, info, require_mlp_tp_gather())
+                    self.assertEqual(batch.global_num_tokens, [tokens])
+                    self.assertEqual(batch.global_num_tokens_for_logprob, [3])
+                    self.assertEqual(batch.can_run_decode_cuda_graph, mode.is_decode())
+                    self.assertEqual(batch.is_extend_in_batch, mode.is_extend())
+            reset_context()
+
+    @unittest.skipUnless(torch.cuda.is_available(), "CUDA required for graph replay")
+    def test_resolved_pcp_graph_output_allocation_and_replay_on_cuda(self):
+        # CP sizes here are logical topology settings; this checks graph
+        # planning/storage/replay, not multi-GPU model attention or collectives.
+        self._check_runtime_graph_output_planning("cuda")
 
     def test_plain_tp_dp1_still_disables_dp_attention_and_dp_lm_head(self):
         for requested in (False, True):
