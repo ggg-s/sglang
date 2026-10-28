@@ -55,6 +55,8 @@ class Scheduler(_FakeScheduler):
         self.last_decode_result = None
         self.last_decode_processed = True
         self.prefill_submit_ns = 0
+        self.prefill_submit_samples_ns = []
+        self.decode_submit_timestamps_ns = []
         self.weight = torch.eye(256, device="cuda") * 0.5
         self.decode_input = torch.ones((32, 256), device="cuda")
         self.decode_output = torch.empty_like(self.decode_input)
@@ -119,9 +121,12 @@ class Scheduler(_FakeScheduler):
                 batch.hidden = torch.nn.functional.linear(batch.hidden, self.weight)
             self.prefill_calls += 1
             self.prefill_layer_count += count
-            self.prefill_submit_ns += time.perf_counter_ns() - start
+            submit_ns = time.perf_counter_ns() - start
+            self.prefill_submit_ns += submit_ns
+            self.prefill_submit_samples_ns.append(submit_ns)
             payload = batch.hidden
         else:
+            self.decode_submit_timestamps_ns.append(start)
             self.decode_count += 1
             self.decode_graph.replay()
             payload = self.decode_output
@@ -227,6 +232,13 @@ def run(mode, *, rows, layers, chunks, decode_steps, split_layers):
     torch.testing.assert_close(
         scheduler.decode_output, torch.full_like(scheduler.decode_output, 0.5**4)
     )
+    gaps_us = sorted(
+        (b - a) / 1000
+        for a, b in zip(
+            scheduler.decode_submit_timestamps_ns,
+            scheduler.decode_submit_timestamps_ns[1:],
+        )
+    )
     return dict(
         wall_ms=wall_ms,
         prefill_submit_ms=scheduler.prefill_submit_ns / 1e6,
@@ -234,6 +246,10 @@ def run(mode, *, rows, layers, chunks, decode_steps, split_layers):
         prefill_layers=scheduler.prefill_layer_count,
         decode_steps=scheduler.decode_count,
         scheduler_iterations=scheduler.iteration,
+        max_prefill_submit_ms=max(scheduler.prefill_submit_samples_ns) / 1e6,
+        decode_host_gap_p50_us=statistics.median(gaps_us),
+        decode_host_gap_p95_us=gaps_us[int(0.95 * (len(gaps_us) - 1))],
+        decode_host_gap_max_us=max(gaps_us),
     )
 
 
