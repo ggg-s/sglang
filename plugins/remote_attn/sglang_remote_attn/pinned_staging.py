@@ -1,8 +1,8 @@
 """Pinned staging and explicit copy streams for pre-layerwise Mooncake TCP.
 
 The native manager still builds the address plan, bounds batches and owns peer
-failure handling. The source adapter changes source addresses; receive_staging
-maps host destinations separately. Neither issues default-stream CUDA copies.
+failure handling. Only the source addresses change. No tensors are gathered on
+the compute stream and no default-stream CUDA copies are issued by this adapter.
 """
 
 from __future__ import annotations
@@ -64,31 +64,11 @@ class CudaPinnedSlot:
                 )
         self.stream = self.host = None
 
-    def copy_to_device(self, blocks):
-        """Consume a completed host payload; return only after GPU visibility."""
-        with self.torch.cuda.device(self.device):
-            offset = 0
-            for dst, length in blocks:
-                (err,) = self.cudart.cudaMemcpyAsync(
-                    dst,
-                    self.ptr + offset,
-                    length,
-                    self.cudart.cudaMemcpyKind.cudaMemcpyHostToDevice,
-                    self.raw_stream,
-                )
-                if int(err) != 0:
-                    raise RuntimeError(f"pre-layerwise H2D submission failed: {err}")
-                offset += length
-            self.done.record(self.stream)
-            # This waits on the receive worker, never the decode thread or
-            # device-wide default stream. ACK / Local must follow this fence.
-            self.done.synchronize()
-
 
 class PinnedKVStager:
     """Bounded staging storage owned by one rank's native engine.
 
-    P shares an instance across sends; D leases an instance per staged request.
+    P shares an instance across sends; receive staging uses the native ring.
 
     The slot lock covers D2H and the synchronous native send. A nonzero return
     or exception is NOT a completion proof: retain both registration and storage

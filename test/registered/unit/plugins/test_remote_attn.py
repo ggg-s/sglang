@@ -59,13 +59,6 @@ class _HostStagingSlot:
             ctypes.memmove(self.ptr + offset, src, size)
             offset += size
 
-    def copy_to_device(self, blocks):
-        self.h2d_blocks = blocks
-        offset = 0
-        for dst, size in blocks:
-            ctypes.memmove(dst, self.ptr + offset, size)
-            offset += size
-
     def close(self):
         self.closed = True
 
@@ -1933,6 +1926,8 @@ class TestRemoteAttn(CustomTestCase):
                     is_last_chunk=False,
                     kv_buffer_indices=(0, 1),
                     transfer_fn=transfer_fn,
+                    staging_chunk_idx=None,
+                    staging_layer_ids=None,
                     on_complete=lambda: events.append("proof"),
                 )
                 tasks = queue.Queue()
@@ -2027,12 +2022,6 @@ class TestRemoteAttn(CustomTestCase):
             ]
             self.assertEqual(stager.send("peer", blocks, ready_event=ready), 0)
             self.assertEqual(received, [b"efgh", b"abcd"])
-            destination = ctypes.create_string_buffer(8)
-            ptr = ctypes.addressof(destination)
-            stager.slot.copy_to_device([(ptr + 4, 4), (ptr, 4)])
-            # Event completion, not async submission, makes these bytes visible.
-            self.assertEqual(destination.raw, b"abcdefgh")
-            self.assertEqual(pending, [])
             self.assertTrue(stager.close())
         self.assertEqual(flags, [1, 1])
         self.assertEqual(destroyed, [17, 17])
@@ -2046,7 +2035,7 @@ class TestRemoteAttn(CustomTestCase):
         manager_cls = _source_class(
             "disaggregation/mooncake/conn.py",
             "MooncakeKVManager",
-            {"send_kvcache", "_send_kvcache_generic"},
+            {"send_kvcache", "_send_kvcache_generic", "send_layer_group_to_staging"},
         )
         group = _source_function(
             "disaggregation/common/utils.py", "group_concurrent_contiguous"
@@ -2058,6 +2047,7 @@ class TestRemoteAttn(CustomTestCase):
         flat.__globals__["StateType"] = SimpleNamespace(SWA="swa")
         manager_cls._send_kvcache_generic.__globals__.update(
             StateType=SimpleNamespace(SWA="swa", DSA="dsa"),
+            np=np,
             group_concurrent_contiguous=group,
             _uses_flat_entry_layout=flat,
             is_elided_entry=_source_function(
@@ -2144,75 +2134,52 @@ class TestRemoteAttn(CustomTestCase):
                         None,
                         transfer_fn=stager.send,
                     )
-                # Exercise the same native Batch=8 mapping through BOTH adapters.
-                from sglang_remote_attn.receive_staging import (
-                    HostDestination,
-                    ReceiveStaging,
+                # Route the same native Batch=8 plan into the existing ring,
+                # then execute the native scatter handler (both TP rank maps).
+                f = self._native_ring_fixture(rank=rank, pinned=True, capacity=136)
+                f.handler.kv_buffer_info.update(
+                    k_buffers=[t.reshape(32, 1, 2) for t in dst[:2]],
+                    v_buffers=[t.reshape(32, 1, 2) for t in dst[2:]],
                 )
-
-                pl = self.hooks.pre_layerwise
-                with tempfile.TemporaryDirectory() as directory:
-                    path = Path(directory)
-                    rx_manager = _host_staging_manager()
-                    rx_manager.kv_args = SimpleNamespace(
-                        kv_data_ptrs=[t.data_ptr() for t in dst],
-                        kv_item_lens=[2] * 4,
-                        kv_layer_ids=[],
+                f.handler.scheduler.req_to_token_pool.req_to_token = torch.from_numpy(
+                    dst_indices
+                ).reshape(1, -1)
+                target = SimpleNamespace(
+                    dst_kv_ptrs=[t.data_ptr() for t in dst],
+                    dst_kv_layer_ids=[],
+                    dst_kv_item_len=2,
+                    dst_attn_tp_size=2,
+                    staging_base_ptr=f.allocator.base_ptr,
+                    staging_total_size=136,
+                )
+                batches.clear()
+                for tensor in dst:
+                    tensor.fill_(255)
+                for index, selected in enumerate(((0, 2), (1, 3))):
+                    info = f.allocate(index, (index,), start=0, pages=17)
+                    chunk = SimpleNamespace(
+                        staging_layer_ids=(index,),
+                        kv_buffer_indices=selected,
+                        prefill_kv_indices=src_indices,
+                        transfer_fn=functools.partial(stager.send, ready_event=ready),
                     )
-                    rx = ReceiveStaging(
-                        rx_manager,
-                        rank,
-                        path,
-                        "native",
-                        dst_indices,
-                        2,
-                        3,
-                        slot_factory=_HostStagingSlot,
+                    rc = manager.send_layer_group_to_staging(
+                        SimpleNamespace(mooncake_session_id=f"peer-{rank}"),
+                        chunk,
+                        target,
+                        info[1],
+                        None,
                     )
-                    source = pl.Source(
-                        SimpleNamespace(
-                            config=pl.Config("remote", path, drain_timeout=3)
-                        ),
-                        SimpleNamespace(
-                            disagg_kv_sender=SimpleNamespace(kv_mgr=manager)
-                        ),
-                        path,
-                        "native",
-                        src_indices,
-                        slice(0, len(src_indices)),
-                        ((SimpleNamespace(mooncake_session_id=f"peer-{rank}"), None),),
-                        len(src_indices),
-                        stager=stager,
-                    )
-                    groups = pl.buffer_groups([0, 1, 0, 1], 2, 1)
-                    source.destination = HostDestination(source, groups)
-                    batches.clear()
-                    for tensor in dst:
-                        tensor.fill_(255)
-                    for layers, buffers in groups:
-                        rc = manager.send_kvcache(
-                            f"peer-{rank}",
-                            src_indices,
-                            [t.data_ptr() for t in dst],
-                            dst_indices,
-                            None,
-                            dst_attn_tp_size=2,
-                            kv_buffer_indices=buffers,
-                            transfer_fn=functools.partial(
-                                source.destination.transfer, layers, ready
-                            ),
-                        )
-                        self.assertEqual(rc, 0)
-                        source.complete(layers)
-                        # Sorted target runs merge across native batch boundaries.
-                        self.assertEqual(len(rx.storage.slot.h2d_blocks), 16)
-                    self.assertEqual(batches, [32, 32, 4] * 2)
-                    for i in range(4):
-                        expected = torch.full_like(dst[i], 255)
-                        expected[dst_indices] = src[i][src_indices]
-                        self.assertTrue(torch.equal(dst[i], expected))
-                    rx.close()
-                    self.assertFalse(rx_manager.registrations)
+                    self.assertEqual(rc, 0)
+                    f.handler.handle_chunk_arrived(7, index, 0, 17, "peer")
+                    f.events[-1].complete = True
+                    f.handler.advance_scatter(f.dr)
+                self.assertEqual(batches, [32, 32, 4] * 2)
+                for i in range(4):
+                    expected = torch.full_like(dst[i], 255)
+                    expected[dst_indices] = src[i][src_indices]
+                    self.assertTrue(torch.equal(dst[i], expected))
+                self.assertFalse(f.allocator.allocations)
                 self.assertTrue(stager.close())
                 self.assertFalse(manager.registrations)
 
@@ -2262,9 +2229,7 @@ class TestRemoteAttn(CustomTestCase):
                     stager.reserve(16)
                 pl = self.hooks.pre_layerwise
                 req = SimpleNamespace(
-                    _pre_layerwise_source=SimpleNamespace(
-                        stager=stager, error=None, destination=None
-                    )
+                    _pre_layerwise_source=SimpleNamespace(stager=stager, error=None)
                 )
                 with self.assertRaisesRegex(RuntimeError, "retaining source KV"):
                     pl.defer_release(req, lambda: self.fail("unsafe KV release"))
@@ -2330,81 +2295,200 @@ class TestRemoteAttn(CustomTestCase):
         self.assertEqual(payloads, [b"aaaa", b"bbbb"])
         self.assertTrue(stager.close())
 
-    def test_prelayer_receive_staging_gates_local_and_reuses_after_h2d(self):
-        """A completed network write cannot expose a layer or overwrite its slot."""
-        from sglang_remote_attn.pinned_staging import PinnedKVStager
-        from sglang_remote_attn.receive_staging import HostDestination, ReceiveStaging
+    def _native_ring_fixture(self, *, rank=0, pinned=True, capacity=24):
+        """Real allocator, wire allocation and scatter handler; CUDA is the boundary."""
+        import logging
+        import struct
 
+        module_path = "disaggregation/common/staging_buffer.py"
+        functions = {
+            name: _source_function(module_path, name)
+            for name in (
+                "compute_staging_layout",
+                "compute_head_slice_params",
+                "scatter_kv_head_slices",
+                "_scatter_staging_to_kv_torch",
+                "resolve_total_kv_heads",
+                "staging_grid_tokens",
+            )
+        }
+        for fn in functions.values():
+            fn.__globals__.update(functions, torch=torch)
+        functions["scatter_staging_to_kv"] = functions["_scatter_staging_to_kv_torch"]
+        stream_log, events, messages = [], [], []
+
+        class Event:
+            complete = False
+
+            def record(self, stream):
+                stream_log.append("event")
+
+            def query(self):
+                return self.complete
+
+        class Stream:
+            def wait_event(self, event):
+                stream_log.append("wait-row")
+
+            def synchronize(self):
+                for event in events:
+                    event.complete = True
+
+        stream = Stream()
+
+        class Buffer:
+            def __init__(self, size, device, gpu_id, custom=None, *, pin_memory=False):
+                self.device = torch.device("cpu")
+                self.size_bytes, self.pin_memory = size, pin_memory
+                self.buffer = torch.zeros(size, dtype=torch.uint8)
+                self.gpu_buffer = (
+                    torch.zeros_like(self.buffer) if pin_memory else self.buffer
+                )
+                self.data_ptr = self.buffer.data_ptr()
+
+        allocator_cls = _source_class(module_path, "StagingAllocator")
+        allocator_cls.__init__.__globals__.update(
+            StagingBuffer=Buffer,
+            threading=threading,
+            logger=logging.getLogger(__name__),
+            _device_ptr_type_str=lambda *args: "",
+        )
+        allocator = allocator_cls(capacity, "cuda", rank, pin_memory=pinned)
+        functions["StagingAllocator"] = allocator_cls
+        functions["scatter_staging_to_kv"] = functions["_scatter_staging_to_kv_torch"]
+        self.enterContext(
+            patch.dict(
+                sys.modules,
+                {
+                    "sglang.srt.disaggregation.common.staging_buffer": SimpleNamespace(
+                        **functions
+                    ),
+                },
+            )
+        )
+        handler_cls = _source_class(
+            "disaggregation/common/staging_handler.py", "DecodeStagingHandler"
+        )
+
+        def event(device):
+            result = Event()
+            events.append(result)
+            return result
+
+        handler_cls.__init__.__globals__.update(
+            torch=torch,
+            threading=threading,
+            logger=logging.getLogger(__name__),
+            time=time,
+            create_device_event=event,
+            create_device_stream=lambda device: stream,
+            device_stream_context=lambda stream: nullcontext(),
+        )
+        handler = handler_cls.__new__(handler_cls)
+        handler._scatter_lock = threading.RLock()
+        handler._room_to_decode_req, handler._room_to_receiver = {}, {}
+        handler._writer_counts, handler._wm_subscribers = {}, {}
+        handler.staging_allocator = allocator
+        handler.completion_timeout = 3
+        handler.decode_tp, handler.total_kv_heads, handler.tp_rank = 2, 2, rank
+        handler.device = torch.device("cuda", rank)
+        handler.gpu_id = rank
+        handler.device_module = SimpleNamespace(set_device=lambda device: None)
+        k = [torch.full((8, 1, 2), 255, dtype=torch.uint8) for _ in range(2)]
+        v = [torch.full_like(t, 255) for t in k]
+        handler.kv_buffer_info = dict(k_buffers=k, v_buffers=v, page_size=1)
+        kv_args = SimpleNamespace(
+            kv_item_lens=[2] * 4, page_size=1, engine_rank=rank, total_kv_head_num=2
+        )
+        manager = SimpleNamespace(
+            kv_args=kv_args,
+            pp_size=1,
+            attn_tp_size=2,
+            _staging_ctx=SimpleNamespace(room_receivers={}, room_bootstrap={}),
+        )
+        handler.kv_manager = manager
+        rows = torch.tensor([[6, 2, 4, 1]], dtype=torch.int64)
+        handler.scheduler = SimpleNamespace(
+            schedule_stream=stream, req_to_token_pool=SimpleNamespace(req_to_token=rows)
+        )
+        receiver = SimpleNamespace(
+            chunk_staging_infos=[],
+            chunk_staging_layers={},
+            prefill_info=SimpleNamespace(attn_tp_size=2, pp_size=1),
+            bootstrap_infos=[{"pp_rank": 0}],
+        )
+        receiver._connect_to_bootstrap_server = lambda bi: (
+            SimpleNamespace(send_multipart=lambda parts: messages.append(parts)),
+            threading.Lock(),
+        )
+        dr = SimpleNamespace(
+            req=SimpleNamespace(
+                bootstrap_room=7,
+                kv=SimpleNamespace(cache_protected_len=0, req_pool_idx=0),
+            ),
+            kv_receiver=receiver,
+        )
+        handler.register_decode_req(7, dr)
+        manager._staging_ctx.room_receivers[7] = receiver
+        manager._staging_ctx.room_bootstrap[7] = receiver.bootstrap_infos
+        handler.register_wm_subscriber(receiver, "peer")
+        request = _source_function(
+            "disaggregation/common/staging_handler.py", "handle_staging_req"
+        )
+        request.__globals__.update(struct=struct, logger=logging.getLogger(__name__))
+
+        def allocate(index, layers, start=1, pages=3):
+            request(
+                [
+                    b"STAGING_REQ",
+                    b"7",
+                    str(index).encode(),
+                    str(pages).encode(),
+                    b"peer",
+                    b"0",
+                    struct.pack(f"{len(layers)}Q", *layers),
+                    str(start).encode(),
+                ],
+                allocator,
+                kv_args,
+                2,
+                2,
+                handler.kv_buffer_info,
+                manager._staging_ctx.room_receivers,
+                manager._staging_ctx.room_bootstrap,
+            )
+            return receiver.chunk_staging_infos[index]
+
+        return SimpleNamespace(
+            allocator=allocator,
+            handler=handler,
+            manager=manager,
+            receiver=receiver,
+            dr=dr,
+            allocate=allocate,
+            events=events,
+            messages=messages,
+            k=k,
+            v=v,
+            rows=rows,
+            stream_log=stream_log,
+        )
+
+    def test_native_ring_scatter_event_gates_local_and_watermark(self):
+        """Network success and completed H2D cannot release a pending scatter slot."""
         pl = self.hooks.pre_layerwise
-        for rank, source_staging in ((0, False), (1, True)):
+        for rank, pinned in ((0, False), (1, True)):
             with (
-                self.subTest(rank=rank, source_staging=source_staging),
+                self.subTest(rank=rank, pinned=pinned),
                 tempfile.TemporaryDirectory() as directory,
             ):
-                path = Path(directory)
-                started, allow_copy = threading.Event(), threading.Event()
-
-                class Slot(_HostStagingSlot):
-                    def copy_to_device(self, blocks):
-                        started.set()
-                        if not allow_copy.wait(3):
-                            raise TimeoutError("test H2D fence")
-                        offset = 0
-                        for dst, n in blocks:
-                            ctypes.memmove(dst, self.ptr + offset, n)
-                            offset += n
-
-                destination = [
-                    ctypes.create_string_buffer(b"........") for _ in range(4)
-                ]
-                ptrs = [ctypes.addressof(b) for b in destination]
-                manager = _host_staging_manager()
-                manager.kv_args = SimpleNamespace(
-                    kv_data_ptrs=ptrs, kv_item_lens=[1] * 4, kv_layer_ids=[]
-                )
-                receiver = ReceiveStaging(
-                    manager,
-                    rank,
-                    path,
-                    "current",
-                    [6, 2, 4, 1],
-                    2,
-                    3,
-                    slot_factory=Slot,
-                )
-                self.addCleanup(allow_copy.set)
-                sender = _host_staging_manager()
-                calls = []
-
-                def transfer(session, blocks):
-                    calls.append(blocks)
-                    for src, dst, n in blocks:
-                        ctypes.memmove(dst, src, n)
-                    return 0
-
-                sender._transfer_data = transfer
-                stager = (
-                    PinnedKVStager(sender, rank, slot_factory=_HostStagingSlot)
-                    if source_staging
-                    else None
-                )
-                if stager:
-                    stager.reserve(4)
-                source = pl.Source(
-                    SimpleNamespace(config=pl.Config("remote", path, drain_timeout=3)),
-                    SimpleNamespace(disagg_kv_sender=SimpleNamespace(kv_mgr=sender)),
-                    path,
-                    "current",
-                    None,
-                    slice(1, 4),
-                    ((SimpleNamespace(mooncake_session_id="peer"), None),),
-                    4,
-                    stager=stager,
-                )
-                groups = pl.buffer_groups([0, 1, 0, 1], 2, 1)
-                adapter = source.destination = HostDestination(source, groups)
-                ready = threading.Event()
-                ready.set()
+                f = self._native_ring_fixture(rank=rank, pinned=pinned)
+                first = f.allocate(0, (0,))
+                second = f.allocate(1, (1,))
+                self.assertEqual((first[1], second[1]), (0, 12))
+                # Repeating native STAGING_REQ must not consume another slot.
+                self.assertEqual(f.allocate(0, (0,)), first)
+                self.assertEqual(len(f.allocator.allocations), 2)
                 state = SimpleNamespace(
                     events=[threading.Event(), threading.Event()],
                     layer_ready_at=[None, None],
@@ -2412,204 +2496,128 @@ class TestRemoteAttn(CustomTestCase):
                 )
                 target = pl.Target(
                     None,
-                    None,
-                    None,
-                    path,
+                    SimpleNamespace(staging_handler=f.handler),
+                    f.dr,
+                    Path(directory),
                     "current",
                     pl.LayerCoverage(4, 2),
                     state,
-                    receive_staging=receiver,
+                    native_staging=True,
                 )
-                payload = ctypes.create_string_buffer(b"abcXYZ")
-                expected = [b"........"] * 4
-                for group_index, (layers, buffers) in enumerate(groups):
-                    blocks = [
-                        (ctypes.addressof(payload) + j, ptrs[buffer] + token, 1)
-                        for j, (buffer, token) in enumerate(
-                            (b, t) for b in buffers for t in (2, 4, 1)
-                        )
-                    ]
-                    # Distinct native sub-batches accumulate into ONE group slot.
-                    for chunk in (blocks[:2], blocks[2:]):
-                        self.assertEqual(
-                            adapter.transfer(layers, ready, "peer", chunk), 0
-                        )
-                    self.assertTrue(
-                        all(
-                            adapter.ptr <= dst < adapter.ptr + adapter.capacity
-                            for call in calls
-                            for _, dst, _ in call
-                        )
-                    )
-                    errors = []
+                payload = torch.arange(12, dtype=torch.uint8)
+                f.allocator.buffer.buffer[:12].copy_(payload)
+                f.handler.handle_chunk_arrived(7, 0, 1, 3, "peer")
+                f.handler.submit_last_scatter_async(7)
+                target.refresh()
+                self.assertFalse(state.events[0].is_set())
+                self.assertFalse(f.handler.is_done(f.dr))
+                with patch.object(pl, "_poll_success", return_value=True):
+                    self.assertFalse(target.ready_to_finish())
+                self.assertEqual(f.allocator.get_watermark(), (0, 0))
+                self.assertFalse((Path(directory) / "layer-0.json").exists())
+                # Real native torch scatter writes exactly the selected K/V rows.
+                for buf, values in ((f.k[0], payload[:6]), (f.v[0], payload[6:])):
+                    expected = torch.full_like(buf, 255)
+                    expected[f.rows[0, 1:]] = values.reshape(3, 1, 2)
+                    self.assertTrue(torch.equal(buf, expected))
+                self.assertTrue(torch.all(f.k[1] == 255).item())
+                self.assertTrue(torch.all(f.v[1] == 255).item())
+                f.events[-1].complete = True
+                target.refresh()
+                self.assertTrue(state.events[0].is_set())
+                self.assertFalse(state.events[1].is_set())
+                self.assertEqual(f.allocator.get_watermark(), (0, 12))
+                self.assertFalse(f.handler.is_done(f.dr))
+                # The last group's arrival can follow native Success.
+                f.allocator.buffer.buffer[12:24].copy_(payload + 20)
+                f.handler.handle_chunk_arrived(7, 1, 1, 3, "peer")
+                target.refresh()
+                self.assertFalse(state.events[1].is_set())
+                f.events[-1].complete = True
+                target.refresh()
+                self.assertTrue(state.events[1].is_set())
+                self.assertTrue(f.handler.is_done(f.dr))
+                self.assertEqual(f.allocator.get_watermark(), (1, 0))
+                self.assertEqual(f.messages[-1], [b"WATERMARK", b"1", b"0", b"peer"])
+                self.assertIn("wait-row", f.stream_log)
 
-                    def complete():
-                        try:
-                            source.complete(layers)
-                        except Exception as exc:
-                            errors.append(exc)
+    def test_native_ring_wrap_waits_for_scatter_not_host_copy(self):
+        """Watermark reuse must preserve the old payload while scatter is pending."""
+        f = self._native_ring_fixture(capacity=12)
+        first, wrapped = f.allocate(0, (0,)), f.allocate(1, (1,))
+        self.assertEqual((first[1], first[2], wrapped[1], wrapped[2]), (0, 0, 0, 1))
+        ready = _source_function(
+            "disaggregation/common/staging_handler.py", "is_watermark_ready"
+        )
+        context = SimpleNamespace(
+            remote_watermarks={"peer": f.allocator.get_watermark()}
+        )
+        self.assertTrue(ready(context, "peer", first[2], first[3]))
+        self.assertFalse(ready(context, "peer", wrapped[2], wrapped[3]))
+        f.allocator.buffer.buffer.copy_(torch.arange(12, dtype=torch.uint8))
+        f.handler.handle_chunk_arrived(7, 0, 1, 3, "peer")
+        f.handler.advance_scatter(f.dr)
+        context.remote_watermarks["peer"] = f.allocator.get_watermark()
+        self.assertFalse(ready(context, "peer", wrapped[2], wrapped[3]))
+        f.events[-1].complete = True
+        f.handler.advance_scatter(f.dr)
+        context.remote_watermarks["peer"] = f.allocator.get_watermark()
+        self.assertTrue(ready(context, "peer", wrapped[2], wrapped[3]))
+        # Mismatched ranges cannot launch another scatter or retire its slot.
+        with self.assertRaisesRegex(ValueError, "does not match"):
+            f.handler.submit_chunk_scatter(7, 1, 0, 3)
+        self.assertIn(wrapped[0], f.allocator.allocations)
 
-                    completion = threading.Thread(target=complete)
-                    completion.start()
-                    self.assertTrue(started.wait(3))
-                    if group_index == 0:
-                        target.refresh()
-                        self.assertFalse(state.events[0].is_set())
-                        self.assertFalse((path / "rx-ack-0.json").exists())
-                        self.assertTrue(completion.is_alive())
-                        self.assertEqual([b.raw[:8] for b in destination], expected)
-                    allow_copy.set()
-                    completion.join(3)
-                    self.assertFalse(completion.is_alive())
-                    self.assertEqual(errors, [])
-                    target.refresh()
-                    self.assertTrue(state.events[group_index].is_set())
-                    # Prefix/middle-chunk token 6 and unrelated/decode rows stay intact.
-                    expected[buffers[0]] = b".ca.b..."
-                    expected[buffers[1]] = b".ZX.Y..."
-                    self.assertEqual([b.raw[:8] for b in destination], expected)
-                    self.assertEqual(adapter.offset, 0)
-                receiver.close()
-                receiver.close()
-                self.assertEqual(manager.registrations, {})
-                if stager:
-                    self.assertTrue(stager.close())
+    def test_native_ring_registers_host_storage_without_changing_gpu_control(self):
+        """Transport must register the host ring, while scatter keeps a GPU shadow."""
+        import logging
 
-    def test_prelayer_receive_staging_rejects_wrong_rows_and_retains_on_failure(self):
-        """Wrong generation, missing bytes or H2D failure cannot publish GPU-ready."""
-        from sglang_remote_attn.receive_staging import ReceiveStaging, _wait
+        buffer_cls = _source_class(
+            "disaggregation/common/staging_buffer.py", "StagingBuffer"
+        )
+        buffer_cls.__init__.__globals__.update(
+            torch=torch,
+            logger=logging.getLogger(__name__),
+            _STAGING_SUPPORTED_DEVICE_TYPES=("cuda", "xpu"),
+            _device_ptr_type_str=lambda *args: "",
+        )
+        empty = torch.empty
+        for pinned in (False, True):
+            allocations = []
 
-        pl = self.hooks.pre_layerwise
-        for failure in ("wrong-row", "missing-bytes", "copy", "stale-generation"):
+            def allocate(*args, **kwargs):
+                allocations.append(
+                    (kwargs.pop("device", None), kwargs.pop("pin_memory", False))
+                )
+                return empty(*args, **kwargs)
+
             with (
-                self.subTest(failure=failure),
-                tempfile.TemporaryDirectory() as directory,
+                patch.object(
+                    torch,
+                    "get_device_module",
+                    return_value=SimpleNamespace(set_device=lambda _: None),
+                ),
+                patch.object(torch, "empty", side_effect=allocate),
             ):
-                path = Path(directory)
-                dst = ctypes.create_string_buffer(b"........")
-                ptr = ctypes.addressof(dst)
-                manager = _host_staging_manager()
-                manager.kv_args = SimpleNamespace(
-                    kv_data_ptrs=[ptr, ptr + 4], kv_item_lens=[1, 1], kv_layer_ids=[]
-                )
+                buf = buffer_cls(64, "cuda", 1, pin_memory=pinned)
+            self.assertEqual(buf.get_ptr(), buf.buffer.data_ptr())
+            self.assertEqual(buf.get_ptr() != buf.gpu_buffer.data_ptr(), pinned)
+            self.assertEqual(allocations[0], (torch.device("cuda", 1), False))
+            self.assertEqual(len(allocations), 2 if pinned else 1)
+            if pinned:
+                self.assertEqual(allocations[1], (None, True))
 
-                class Slot(_HostStagingSlot):
-                    def copy_to_device(self, blocks):
-                        raise RuntimeError("injected H2D failure")
-
-                rx = ReceiveStaging(
-                    manager, 0, path, "current", [0, 1], 1, 0.1, slot_factory=Slot
-                )
-                pl.write_json(
-                    path / "rx-plan.json",
-                    dict(generation="current", start=1, end=2, groups=[[0]]),
-                )
-                _wait(path / "rx-slot.json", "current", 3)
-                blocks = [[ptr + 1, 1], [ptr + 5, 1]]
-                if failure == "wrong-row":
-                    blocks[0][0] = ptr + 2
-                if failure == "missing-bytes":
-                    blocks.pop()
-                pl.write_json(
-                    path / "rx-group-0.json",
-                    dict(
-                        generation="old"
-                        if failure == "stale-generation"
-                        else "current",
-                        layers=[0],
-                        blocks=blocks,
-                    ),
-                )
-                rx.thread.join(3)
-                self.assertFalse(rx.thread.is_alive())
-                self.assertIsNotNone(rx.error)
-                self.assertFalse((path / "rx-ack-0.json").exists())
-                self.assertEqual(dst.raw[:8], b"........")
-                with self.assertRaisesRegex(RuntimeError, "retaining KV"):
-                    pl.defer_release(
-                        SimpleNamespace(_pre_layerwise_receive=rx), lambda: None
-                    )
-                self.assertTrue(manager.registrations)
-                self.assertIn(rx.storage, manager.engine._pre_layerwise_staging_owners)
-
-    def test_prelayer_receive_ack_failure_never_publishes_layer_proof(self):
-        """Host-write success alone cannot authorize Local or source KV recycling."""
-        from sglang_remote_attn.receive_staging import HostDestination
-
-        pl = self.hooks.pre_layerwise
-        for failure in ("stale-ack", "failed-send", "missing-bytes", "wrong-session"):
-            with (
-                self.subTest(failure=failure),
-                tempfile.TemporaryDirectory() as directory,
-            ):
-                path = Path(directory)
-                pl.write_json(
-                    path / "rx-slot.json",
-                    dict(generation="current", ptr=100, capacity=2, groups=[[[10, 2]]]),
-                )
-                manager = SimpleNamespace(
-                    _transfer_data=lambda session, blocks: (
-                        -1 if failure == "failed-send" else 0
-                    )
-                )
-                source = pl.Source(
-                    SimpleNamespace(
-                        config=pl.Config("layerwise", path, drain_timeout=0.02)
-                    ),
-                    SimpleNamespace(disagg_kv_sender=SimpleNamespace(kv_mgr=manager)),
-                    path,
-                    "current",
-                    None,
-                    slice(0, 1),
-                    ((SimpleNamespace(mooncake_session_id="peer"), None),),
-                    1,
-                )
-                adapter = source.destination = HostDestination(source, [((0,), (0, 1))])
-                if failure == "wrong-session":
-                    with self.assertRaisesRegex(RuntimeError, "session changed"):
-                        adapter.transfer((0,), None, "other", [(1, 10, 2)])
-                else:
-                    adapter.transfer(
-                        (0,),
-                        None,
-                        "peer",
-                        [(1, 10, 1 if failure == "missing-bytes" else 2)],
-                    )
-                pl.write_json(
-                    path / "rx-ack-0.json", dict(generation="old", layers=[0])
-                )
-                with self.assertRaises((RuntimeError, TimeoutError, ValueError)):
-                    source.complete((0,))
-                self.assertFalse((path / "layer-0.json").exists())
-                self.assertTrue(adapter.poisoned)
-                with self.assertRaisesRegex(RuntimeError, "retaining source KV"):
-                    pl.defer_release(
-                        SimpleNamespace(_pre_layerwise_source=source), lambda: None
-                    )
-
-    def test_prelayer_receive_unused_offer_has_no_pinned_allocation(self):
-        """Ordinary PD / auto-group fallback must not leak a receive worker or slot."""
-        from sglang_remote_attn.receive_staging import ReceiveStaging
-
-        with tempfile.TemporaryDirectory() as directory:
-            manager = _host_staging_manager()
-            manager.kv_args = SimpleNamespace(
-                kv_data_ptrs=[10, 20], kv_item_lens=[1, 1], kv_layer_ids=[]
-            )
-            rx = ReceiveStaging(
-                manager,
-                0,
-                Path(directory),
-                "current",
-                [0],
-                1,
-                1,
-                slot_factory=lambda *args: self.fail("unused offer allocated memory"),
-            )
-            rx.close()
-            self.assertFalse(rx.thread.is_alive())
-            self.assertEqual(manager.registrations, {})
-            self.assertEqual(manager.engine._pre_layerwise_staging_owners, [])
+    def test_native_ring_group_identity_and_oversize_fail_closed(self):
+        f = self._native_ring_fixture(capacity=12)
+        f.allocate(0, (0,))
+        with self.assertRaisesRegex(ValueError, "identity changed"):
+            f.allocate(0, (1,))
+        with self.assertRaisesRegex(ValueError, "invalid"):
+            f.allocate(1, (2,))
+        oversized = f.allocate(2, (0, 1))
+        self.assertEqual(oversized[1], -2)
+        self.assertFalse(f.handler.submit_chunk_scatter(7, 2, 1, 3))
+        self.assertEqual(f.dr._staging_completed_layers, [])
 
     def test_prelayer_auto_grouping_uses_chunk_work_not_prompt_length(self):
         """Small tails keep Remote; long chunks use fewer, larger transfers."""

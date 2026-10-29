@@ -318,6 +318,8 @@ HOOKS = {
 # Thin adapters; layer-pipeline state is owned by the scheduler instance.
 HOOKS.update(
     {
+        "sglang.srt.disaggregation.common.staging_handler.init_staging_allocator": pre_layerwise.init_staging_allocator,
+        "sglang.srt.disaggregation.common.staging_handler.init_staging_buffers": pre_layerwise.init_staging_buffers,
         "sglang.srt.managers.scheduler.Scheduler.run_batch": pre_layerwise.run_batch,
         "sglang.srt.managers.scheduler.Scheduler.is_fully_idle": pre_layerwise.is_fully_idle,
         "sglang.srt.model_executor.model_runner.ModelRunner.forward": pre_layerwise.forward,

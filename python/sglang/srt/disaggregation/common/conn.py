@@ -2823,6 +2823,7 @@ class CommonKVReceiver(BaseKVReceiver):
             raise NotImplementedError("Host KV destinations are not supported")
 
         self.chunk_staging_infos = []
+        self.chunk_staging_layers = {}
         if (
             self.kv_mgr.enable_staging
             and self.kv_mgr._staging_ctx.allocator is not None

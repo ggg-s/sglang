@@ -159,6 +159,8 @@ class StagingBuffer:
         device: str,
         gpu_id: int,
         custom_mem_pool=None,
+        *,
+        pin_memory: bool = False,
     ):
         self.size_bytes = size_bytes
         if isinstance(device, str):
@@ -177,6 +179,9 @@ class StagingBuffer:
 
         self.device = device
         self.gpu_id = gpu_id
+        self.pin_memory = pin_memory
+        if pin_memory and device.type != "cuda":
+            raise ValueError("Pinned staging currently requires CUDA")
 
         if device.type not in _STAGING_SUPPORTED_DEVICE_TYPES:
             raise RuntimeError(
@@ -208,6 +213,12 @@ class StagingBuffer:
             self.buffer = torch.empty(size_bytes, dtype=torch.uint8, device=device)
             alloc_method = "default allocator"
 
+        # Keep a preallocated GPU shadow for scatter; the transport registers
+        # only the pinned ring. Both use identical offsets and watermark leases.
+        self.gpu_buffer = self.buffer
+        if pin_memory:
+            self.buffer = torch.empty(size_bytes, dtype=torch.uint8, pin_memory=True)
+            alloc_method = "pinned host + GPU scatter shadow"
         self.data_ptr = self.buffer.data_ptr()
 
         # Created on first gather; the decode-side allocator's buffer never
@@ -274,8 +285,12 @@ class StagingAllocator:
         device: str,
         gpu_id: int,
         custom_mem_pool=None,
+        *,
+        pin_memory: bool = False,
     ):
-        self.buffer = StagingBuffer(total_size_bytes, device, gpu_id, custom_mem_pool)
+        self.buffer = StagingBuffer(
+            total_size_bytes, device, gpu_id, custom_mem_pool, pin_memory=pin_memory
+        )
         self.total_size = total_size_bytes
         self.base_ptr = self.buffer.data_ptr
         self.head = 0

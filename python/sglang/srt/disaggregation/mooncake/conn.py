@@ -548,7 +548,8 @@ class MooncakeKVManager(StagingManagerMixin, CommonKVManager):
         }
 
     def _register_staging_memory(self, ptr: int, size: int) -> None:
-        self.engine.batch_register([ptr], [size])
+        if self.engine.batch_register([ptr], [size]) != 0:
+            raise RuntimeError("Failed to register native staging ring")
 
     def _init_staging_buffers(self, count: int):
         from sglang.srt.disaggregation.common.staging_handler import (
@@ -585,6 +586,68 @@ class MooncakeKVManager(StagingManagerMixin, CommonKVManager):
 
         return PrefillStagingStrategy(self, staging_buffer)
 
+    def request_layer_staging(self, room, index_slice, groups):
+        """Reserve final-chunk groups through the existing staging protocol.
+
+        Same-TP ordinary chunks bypass staging, so group ordinals own this
+        room's staging chunk ids. All requests precede CHUNK_READY / Success
+        on the same native notification socket.
+        """
+        for req in self.transfer_infos[room].values():
+            if req.is_dummy:
+                continue
+            na = NetworkAddress(req.endpoint, req.dst_port)
+            for index, (layers, _) in enumerate(groups):
+                self._send_multipart_locked(
+                    na.to_tcp(),
+                    [
+                        b"STAGING_REQ",
+                        str(room).encode("ascii"),
+                        str(index).encode("ascii"),
+                        str(index_slice.stop - index_slice.start).encode("ascii"),
+                        req.mooncake_session_id.encode("ascii"),
+                        str(self.pp_rank).encode("ascii"),
+                        struct.pack(f"{len(layers)}Q", *layers),
+                        str(index_slice.start).encode("ascii"),
+                    ],
+                    is_ipv6=na.is_ipv6,
+                )
+
+    def send_layer_group_to_staging(self, req, chunk, target_info, offset, executor):
+        """Use the native same-layout address planner with packed ring offsets.
+
+        Preserve source D2H adapters and native sub-batch limits. The compact
+        destination is [selected K layers, selected V layers], as scatter expects.
+        """
+        layers = chunk.staging_layer_ids
+        count = len(self.kv_args.kv_data_ptrs) // 2
+        selected = tuple(layers) + tuple(i + count for i in layers)
+        if (
+            self.pp_size != 1
+            or self.attn_tp_size != target_info.dst_attn_tp_size
+            or tuple(chunk.kv_buffer_indices) != selected
+        ):
+            raise ValueError("layer staging requires matching dense same-TP K/V pairs")
+        ptrs = list(target_info.dst_kv_ptrs)
+        cursor = target_info.staging_base_ptr + offset
+        for i in selected:
+            ptrs[i] = cursor
+            cursor += len(chunk.prefill_kv_indices) * self.kv_args.kv_item_lens[i]
+        if cursor > target_info.staging_base_ptr + target_info.staging_total_size:
+            return -1
+        return self.send_kvcache(
+            req.mooncake_session_id,
+            chunk.prefill_kv_indices,
+            ptrs,
+            np.arange(len(chunk.prefill_kv_indices), dtype=np.int32),
+            executor,
+            dst_layer_ids=target_info.dst_kv_layer_ids,
+            dst_attn_tp_size=target_info.dst_attn_tp_size,
+            dst_kv_item_len=target_info.dst_kv_item_len,
+            kv_buffer_indices=selected,
+            transfer_fn=chunk.transfer_fn,
+        )
+
     def _do_staging_transfer(
         self,
         staging_strategy,
@@ -602,10 +665,11 @@ class MooncakeKVManager(StagingManagerMixin, CommonKVManager):
         falling back to the slice path, which would leak the decode-side
         allocation. deferred=True means caller should re-enqueue and break.
         """
-        ready, chunk_idx, c_offset, _, _ = staging_strategy.check_ready(
+        ready, chunk_idx, c_offset, _, c_end = staging_strategy.check_ready(
             req,
             kv_chunk.index_slice.start,
             len(kv_chunk.prefill_kv_indices),
+            chunk_idx=kv_chunk.staging_chunk_idx,
         )
         if not ready:
             from sglang.srt.disaggregation.common.staging_buffer import StagingAllocator
@@ -627,13 +691,25 @@ class MooncakeKVManager(StagingManagerMixin, CommonKVManager):
             queue.put(kv_chunk)
             return (-1, True)
 
-        ret = staging_strategy.transfer(
-            req.mooncake_session_id,
-            kv_chunk.prefill_kv_indices,
-            target_info.staging_base_ptr + c_offset,
-            target_info.staging_total_size - c_offset,
-            target_info,
-        )
+        if kv_chunk.staging_chunk_idx is not None:
+            required = len(kv_chunk.prefill_kv_indices) * sum(
+                self.kv_args.kv_item_lens[i] for i in kv_chunk.kv_buffer_indices
+            )
+            if required != c_end - c_offset:
+                raise ValueError(
+                    "layer staging allocation size does not match sender layout"
+                )
+            ret = self.send_layer_group_to_staging(
+                req, kv_chunk, target_info, c_offset, executor
+            )
+        else:
+            ret = staging_strategy.transfer(
+                req.mooncake_session_id,
+                kv_chunk.prefill_kv_indices,
+                target_info.staging_base_ptr + c_offset,
+                target_info.staging_total_size - c_offset,
+                target_info,
+            )
         if ret == -1:
             # Doesn't fit the ring: fail this room (caller's ret != 0 path), do
             # not fall back to the slice path (leaks the decode-side allocation).
@@ -2667,7 +2743,10 @@ class MooncakeKVManager(StagingManagerMixin, CommonKVManager):
                         if kv_chunk.kv_buffer_indices is not None and (
                             skip_kv
                             or is_dcp_transfer
-                            or self.enable_staging
+                            or (
+                                self.enable_staging
+                                and kv_chunk.staging_chunk_idx is None
+                            )
                             or self.attn_tp_size
                             != target_rank_registration_info.dst_attn_tp_size
                         ):
@@ -2708,6 +2787,46 @@ class MooncakeKVManager(StagingManagerMixin, CommonKVManager):
                                 dst_tp_rank=target_rank_registration_info.dst_tp_rank,
                                 dst_attn_tp_size=target_rank_registration_info.dst_attn_tp_size,
                             )
+                        elif kv_chunk.staging_chunk_idx is not None:
+                            if staging_strategy is None:
+                                staging_strategy = self._try_create_staging_strategy(
+                                    staging_buffer
+                                )
+                            if (
+                                staging_strategy is None
+                                or not target_rank_registration_info.staging_base_ptr
+                            ):
+                                raise ValueError(
+                                    "layer group has no native staging destination"
+                                )
+                            ret, deferred = self._do_staging_transfer(
+                                staging_strategy,
+                                kv_chunk,
+                                req,
+                                target_rank_registration_info,
+                                chunked_dst_kv_indice,
+                                executor,
+                                queue,
+                            )
+                            if deferred:
+                                staging_deferred = True
+                                break
+                        elif (
+                            self.enable_staging
+                            and staging_buffer is None
+                            and self.attn_tp_size
+                            != target_rank_registration_info.dst_attn_tp_size
+                            and target_rank_registration_info.staging_base_ptr
+                            and not self.is_mla_backend
+                            and not self.is_hybrid_mla_backend
+                        ):
+                            # A same-TP-only adapter can omit gather buffers.
+                            # Do not silently fall back to direct writes when D
+                            # is waiting for staged heterogeneous-TP arrivals.
+                            logger.error(
+                                "Heterogeneous-TP staging requires a GPU gather buffer"
+                            )
+                            ret = -1
                         elif (
                             self.is_mla_backend
                             or self.is_hybrid_mla_backend
@@ -3129,6 +3248,8 @@ class MooncakeKVManager(StagingManagerMixin, CommonKVManager):
         kv_buffer_indices: Optional[tuple[int, ...]] = None,
         on_complete=None,
         transfer_fn=None,
+        staging_chunk_idx: Optional[int] = None,
+        staging_layer_ids: Optional[tuple[int, ...]] = None,
     ):
         assert self.disaggregation_mode == DisaggregationMode.PREFILL
         assert not is_last_chunk or (is_last_chunk and aux_index is not None)
@@ -3175,6 +3296,8 @@ class MooncakeKVManager(StagingManagerMixin, CommonKVManager):
                 kv_buffer_indices=kv_buffer_indices,
                 on_complete=on_complete,
                 transfer_fn=transfer_fn,
+                staging_chunk_idx=staging_chunk_idx,
+                staging_layer_ids=staging_layer_ids,
             )
         )
 

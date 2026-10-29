@@ -182,11 +182,14 @@ class Source:
     group_size: int = 0
     prefill_chunk_tokens: int | None = None
     stager: object = None
-    destination: object = None
+    native_staging: bool = False
+    recv_host_staging: bool = False
 
     def complete(self, layers):
-        if self.destination is not None:
-            self.destination.complete(layers)
+        if self.native_staging:
+            # Network completion is not GPU completion. The native receiver's
+            # scatter event, observed by Target.refresh, publishes readiness.
+            return
         # add_transfer_request shards a room onto one FIFO. Earlier ordinary
         # chunks have settled before this final-chunk subset runs. Thus this
         # proof covers [0, prefix_len), not merely the final chunk. Native
@@ -221,7 +224,8 @@ class Source:
                 "prefill_chunk_tokens": self.prefill_chunk_tokens,
                 "layer_group_size": self.group_size,
                 "host_staging": self.stager is not None,
-                "recv_host_staging": self.destination is not None,
+                "recv_host_staging": self.recv_host_staging,
+                "native_staging": self.native_staging,
                 "at": time.monotonic(),
             },
         )
@@ -337,11 +341,35 @@ class Target:
     coverage: LayerCoverage
     state: object = None
     closed: bool = False
-    receive_staging: object = None
+    native_staging: bool = False
 
     def refresh(self):
-        if self.receive_staging is not None:
-            self.receive_staging.check()
+        if self.native_staging:
+            handler = self.queue.staging_handler
+            handler.advance_scatter(self.decode_req)
+            if handler.is_failed(self.decode_req):
+                raise RuntimeError("native scatter failed; retaining destination KV")
+            for layers, start, pages in self.decode_req._staging_completed_layers:
+                if start + pages != self.coverage.prefix_len:
+                    raise RuntimeError(
+                        "native layer scatter does not cover final chunk"
+                    )
+                # Earlier same-TP ordinary chunks finished on the native sender
+                # FIFO before any final-group write. Their prefix is already local.
+                for layer in layers:
+                    if not self.coverage.ready(layer):
+                        self.coverage.complete(layer, 0, self.coverage.prefix_len)
+                        write_json(
+                            self.path / f"layer-{layer}.json",
+                            {
+                                "generation": self.generation,
+                                "layer": layer,
+                                "start": 0,
+                                "end": self.coverage.prefix_len,
+                                "at": time.monotonic(),
+                                "completion": "scatter",
+                            },
+                        )
         failure = read_json(self.path / "error.json")
         if failure and failure.get("generation") == self.generation:
             raise RuntimeError(f"pre-layerwise peer failed: {failure['error']}")
@@ -349,6 +377,9 @@ class Target:
             return
         for layer in range(self.coverage.layers):
             if self.coverage.ready(layer):
+                if not self.state.events[layer].is_set():
+                    self.state.layer_ready_at[layer] = time.monotonic()
+                    self.state.events[layer].set()
                 continue
             proof = read_json(self.path / f"layer-{layer}.json")
             if proof and proof.get("generation") == self.generation:
@@ -367,7 +398,7 @@ class Target:
             return
         receiver = self.decode_req.kv_receiver
         deadline = time.monotonic() + self.owner.config.drain_timeout
-        while not _poll_success(receiver):
+        while not self.ready_to_finish():
             self.refresh()
             if not wait:
                 return
@@ -379,7 +410,10 @@ class Target:
             self.coverage.ready(i) for i in range(self.coverage.layers)
         ):
             raise RuntimeError("canonical completion without all layer proofs")
-        self.close_staging()
+        if self.native_staging:
+            self.queue.staging_handler.unregister_decode_req(
+                self.decode_req.req.bootstrap_room
+            )
         # Called only between forwards or from release_kv_cache. No next step
         # can snapshot a Remote mask after the state is removed.
         _runtime()._drop_target_state_for(self.decode_req.req)
@@ -407,13 +441,14 @@ class Target:
         )
         self.closed = True
         self.decode_req.req._pre_layerwise_target = None
+        self.decode_req.req._pre_layerwise_native_target = None
 
-    def close_staging(self):
-        if self.receive_staging is not None:
-            self.receive_staging.close()
-            self.decode_req.req._pre_layerwise_receive = None
-            if self.receive_staging in self.owner.receivers:
-                self.owner.receivers.remove(self.receive_staging)
+    def ready_to_finish(self):
+        self.refresh()
+        return _poll_success(self.decode_req.kv_receiver) and (
+            not self.native_staging
+            or self.queue.staging_handler.is_done(self.decode_req)
+        )
 
 
 class Controller:
@@ -429,11 +464,18 @@ class Controller:
         self.batches = 0
         self.early_admissions = 0
         self.stager = None
-        self.receivers = []
 
     def validate(self):
+        from sglang.srt.environ import envs
         from sglang.srt.runtime_context import get_disagg, get_exec, get_memory
 
+        if (
+            self.config.recv_host_staging
+            and not envs.SGLANG_DISAGG_STAGING_BUFFER.get()
+        ):
+            raise ValueError(
+                "receive host staging requires SGLANG_DISAGG_STAGING_BUFFER=1"
+            )
         s = self.scheduler
         runner = s.tp_worker.model_runner
         graphs = get_exec().graph.cuda_graph_config
@@ -480,7 +522,7 @@ class Controller:
         if type(dr.kv_receiver) is not MooncakeKVReceiver or dr.is_rebootstrap:
             return None
         mgr = dr.kv_receiver.kv_mgr
-        if mgr.enable_staging or queue._is_host_destination(dr):
+        if queue._is_host_destination(dr):
             return None
         generation = secrets.token_hex(16)
         root = self.config.directory / str(int(dr.req.bootstrap_room)) / str(self.rank)
@@ -493,28 +535,16 @@ class Controller:
             generation,
             LayerCoverage(len(dr.req.origin_input_ids), self.layers),
         )
-        if self.config.recv_host_staging:
-            from .receive_staging import ReceiveStaging
-
-            # Capture the allocated prompt row before decode can append tokens.
-            indices = (
-                self.scheduler.req_to_token_pool.req_to_token[
-                    dr.req.kv.req_pool_idx, : target.coverage.prefix_len
-                ]
-                .to("cpu")
-                .tolist()
-            )
-            target.receive_staging = ReceiveStaging(
-                mgr,
-                self.scheduler.tp_worker.model_runner.gpu_id,
-                path,
-                generation,
-                indices,
-                self.layers,
-                self.config.drain_timeout,
-            )
-            dr.req._pre_layerwise_receive = target.receive_staging
-            self.receivers.append(target.receive_staging)
+        if mgr.enable_staging:
+            if not queue.staging_handler.is_staging_room(dr.req.bootstrap_room):
+                queue.staging_handler.register_decode_req(dr.req.bootstrap_room, dr)
+            dr.kv_receiver.require_staging = True
+            target.native_staging = True
+            dr.req._pre_layerwise_native_target = target
+            # An ordinary small request can already have concluded before its
+            # first offer. Registration must not lose that terminal notification.
+            if _poll_success(dr.kv_receiver):
+                queue.staging_handler.submit_last_scatter_async(dr.req.bootstrap_room)
         write_json(
             root / "offer.json",
             {
@@ -525,6 +555,7 @@ class Controller:
                 "layers": self.layers,
                 "mode": self.config.mode,
                 "recv_host_staging": self.config.recv_host_staging,
+                "native_staging": mgr.enable_staging,
             },
         )
         dr._pre_layerwise_offer = target
@@ -580,7 +611,8 @@ class Controller:
                     and len(peers) == 1
                     and not peers[0][0].is_dummy
                     and peers[0][1] is not None
-                    and not mgr.enable_staging
+                    and bool(offer.get("native_staging", False)) == mgr.enable_staging
+                    and (not mgr.enable_staging or peers[0][1].staging_base_ptr != 0)
                     and offer.get("session") == peers[0][0].mooncake_session_id
                     and offer.get("prefix_len") == len(req.origin_input_ids)
                     and offer.get("tp_size") == self.tp_size
@@ -678,6 +710,8 @@ class Controller:
                 group_size=group_size,
                 prefill_chunk_tokens=req.extend_len,
                 stager=stager,
+                native_staging=sender.kv_mgr.enable_staging,
+                recv_host_staging=offer.get("recv_host_staging", False),
             )
             sender._record_transfer_indices(indices, None)
             sender._transfer_start_time = (
@@ -686,14 +720,10 @@ class Controller:
             req._pre_layerwise_source = source
             req.start_send_idx = req.extend_end
             self.sources.append(source)
-            if offer.get("recv_host_staging", False):
-                from .receive_staging import HostDestination
-
-                try:
-                    source.destination = HostDestination(source, groups)
-                except Exception as exc:
-                    source.error = str(exc)
-                    raise
+            if source.native_staging:
+                sender.kv_mgr.request_layer_staging(
+                    sender.bootstrap_room, index_slice, groups
+                )
             jobs.append((source, groups))
         if jobs:
             self.batches += 1
@@ -706,7 +736,7 @@ class Controller:
                 transfer_tokens,
                 "fixed" if self.config.group_size else "auto",
                 self.config.host_staging,
-                sum(source.destination is not None for source, _ in jobs),
+                sum(source.native_staging for source, _ in jobs),
             )
         return jobs or None
 
@@ -740,16 +770,14 @@ class Controller:
                         kv_buffer_indices=groups[group_index][1],
                         on_complete=functools.partial(source.complete, layers),
                         transfer_fn=(
-                            functools.partial(
-                                source.destination.transfer, layers, event
-                            )
-                            if source.destination is not None
-                            else functools.partial(
-                                source.stager.send, ready_event=event
-                            )
+                            functools.partial(source.stager.send, ready_event=event)
                             if source.stager is not None
                             else None
                         ),
+                        staging_chunk_idx=group_index
+                        if source.native_staging
+                        else None,
+                        staging_layer_ids=layers if source.native_staging else None,
                         trace_ctx=sender.trace_ctx.copy_for_thread(),
                     )
             return result
@@ -761,8 +789,7 @@ class Controller:
         # prefix writes. Reap them before considering new admissions.
         targets = list(self.targets)
         finished = [
-            int(target.closed or _poll_success(target.decode_req.kv_receiver))
-            for target in targets
+            int(target.closed or target.ready_to_finish()) for target in targets
         ]
         for target, done in zip(targets, self.agree(finished)):
             if done:
@@ -792,7 +819,7 @@ class Controller:
                         ].item()
                     )
                     == int(dr.req.bootstrap_room)
-                    and not _poll_success(dr.kv_receiver)
+                    and not target.ready_to_finish()
                 ):
                     ready = data
             candidates.append(ready)
@@ -927,7 +954,7 @@ def pop_transferred(original, queue, rids_to_check=None):
     ordinary = original(queue, rids_to_check)
     for target in offered:
         if target is not None and any(req is target.decode_req.req for req in ordinary):
-            target.close_staging()
+            target.decode_req.req._pre_layerwise_native_target = None
             write_json(
                 target.path / "done.json",
                 {
@@ -944,7 +971,6 @@ def defer_release(req, release):
     if source is not None and (
         source.error is not None
         or (source.stager is not None and source.stager.poisoned)
-        or (source.destination is not None and source.destination.poisoned)
     ):
         raise RuntimeError("pre-layerwise staging is unsettled; retaining source KV")
     if source is not None and source.owner.config.mode == "remote":
@@ -955,13 +981,22 @@ def defer_release(req, release):
         if source.release is None:
             source.release = release
         return True
-    receive = getattr(req, "_pre_layerwise_receive", None)
-    if receive is not None:
-        receive.close()
-        req._pre_layerwise_receive = None
     target = getattr(req, "_pre_layerwise_target", None)
     if target is not None:
         target.finish(wait=True)
+    else:
+        native_target = getattr(req, "_pre_layerwise_native_target", None)
+        if native_target is not None:
+            # Before early admission, native queue cleanup still owns receiver
+            # and metadata teardown. Fence only; do not clear/free them twice.
+            deadline = time.monotonic() + native_target.owner.config.drain_timeout
+            while not native_target.ready_to_finish():
+                if time.monotonic() >= deadline:
+                    raise RuntimeError(
+                        "native staging did not drain; retaining destination KV"
+                    )
+                time.sleep(0.005)
+            req._pre_layerwise_native_target = None
     return False
 
 
@@ -969,9 +1004,6 @@ def poll(scheduler):
     controller = getattr(scheduler, "_pre_layerwise", None)
     if controller is not None:
         controller.poll_sources()
-        controller.receivers[:] = [
-            r for r in controller.receivers if not r.storage.closed
-        ]
 
 
 def is_fully_idle(original, scheduler, for_health_check=False, ignore_waiting=False):
@@ -1005,7 +1037,25 @@ def shutdown(scheduler):
             if time.monotonic() >= deadline:
                 raise RuntimeError("native PD writes remain active during shutdown")
             time.sleep(0.005)
-    for receive in controller.receivers:
-        receive.close()
     if controller.stager is not None and not controller.stager.close():
         raise RuntimeError("pre-layerwise staging remains quarantined during shutdown")
+
+
+def init_staging_allocator(
+    original, register_fn, kv_args, *, device_type, pin_memory=False
+):
+    config = Config.from_env()
+    if config is not None:
+        pin_memory = config.recv_host_staging
+    return original(
+        register_fn, kv_args, device_type=device_type, pin_memory=pin_memory
+    )
+
+
+def init_staging_buffers(original, *args, **kwargs):
+    if Config.from_env() is not None:
+        # This plugin supports only same-TP selected-buffer sends and has its
+        # own bounded D2H adapter. Do not allocate full-chunk GPU gather buffers
+        # per transfer worker for the unused heterogeneous-TP gather path.
+        return []
+    return original(*args, **kwargs)

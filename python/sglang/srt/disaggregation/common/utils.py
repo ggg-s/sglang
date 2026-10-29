@@ -43,6 +43,9 @@ class TransferKVChunk:
     # Optional selected-buffer transport adapter. Receives the native address
     # plan and must return only after its source storage is safe to reuse.
     transfer_fn: Optional[Callable] = None
+    # Explicit native staging allocation for a final-chunk layer group.
+    staging_chunk_idx: Optional[int] = None
+    staging_layer_ids: Optional[Tuple[int, ...]] = None
 
 
 def pack_list_of_buffers(buffers: List[bytes]) -> bytes:
