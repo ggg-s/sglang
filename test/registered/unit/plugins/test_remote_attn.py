@@ -6,6 +6,7 @@ loading Triton/CUDA just to exercise row ownership and token-map lifetimes.
 
 import ast
 import copy
+import ctypes
 import dataclasses
 import functools
 import gc
@@ -39,6 +40,43 @@ register_cpu_ci(est_time=8, suite="base-a-test-cpu")
 
 ROOT = Path(__file__).resolve().parents[4]
 PLUGIN = ROOT / "plugins" / "remote_attn"
+
+
+class _HostStagingSlot:
+    """CUDA-copy boundary stand-in; copy real bytes for address-plan tests."""
+
+    def __init__(self, capacity, device):
+        self.capacity = capacity
+        self.storage = ctypes.create_string_buffer(capacity)
+        self.ptr = ctypes.addressof(self.storage)
+        self.closed = False
+
+    def copy(self, blocks, ready_event):
+        if not ready_event.wait(3):
+            raise TimeoutError("KV producer did not finish")
+        offset = 0
+        for src, _, size in blocks:
+            ctypes.memmove(self.ptr + offset, src, size)
+            offset += size
+
+    def close(self):
+        self.closed = True
+
+
+def _host_staging_manager():
+    registered = {}
+
+    def register(ptr, size):
+        registered[ptr] = size
+
+    def deregister(ptr):
+        del registered[ptr]
+
+    return SimpleNamespace(
+        engine=SimpleNamespace(register=register, deregister=deregister),
+        _remote_attn_send_lock=threading.Lock(),
+        registrations=registered,
+    )
 
 
 def _source_class(relative, owner, members=None):
@@ -1814,7 +1852,13 @@ class TestRemoteAttn(CustomTestCase):
         manager_cls.transfer_worker.__globals__.update(
             time=time, logger=logging.getLogger(__name__), KVPoll=polls
         )
-        for outcome in ("success", "failed_peer", "cancelled", "short_destination"):
+        for outcome in (
+            "success",
+            "staged_success",
+            "failed_peer",
+            "cancelled",
+            "short_destination",
+        ):
             with self.subTest(outcome=outcome):
                 events = []
                 manager = manager_cls()
@@ -1862,12 +1906,14 @@ class TestRemoteAttn(CustomTestCase):
                 }
 
                 def send(session, *args, **kwargs):
+                    self.assertIs(kwargs["transfer_fn"], transfer_fn)
                     events.append(session)
                     if outcome == "cancelled":
                         manager.request_status.pop(7, None)
                     return 0
 
                 manager.send_kvcache = send
+                transfer_fn = object() if outcome == "staged_success" else None
                 chunk = SimpleNamespace(
                     room=7,
                     staging_counted=False,
@@ -1879,6 +1925,7 @@ class TestRemoteAttn(CustomTestCase):
                     index_slice=slice(0, 2),
                     is_last_chunk=False,
                     kv_buffer_indices=(0, 1),
+                    transfer_fn=transfer_fn,
                     on_complete=lambda: events.append("proof"),
                 )
                 tasks = queue.Queue()
@@ -1889,10 +1936,311 @@ class TestRemoteAttn(CustomTestCase):
                         manager.transfer_worker(tasks, None)
                 else:
                     manager.transfer_worker(tasks, None)
-                if outcome == "success":
+                if outcome in ("success", "staged_success"):
                     self.assertEqual(events, ["gpu-ready", "a", "b", "proof"])
                 else:
                     self.assertNotIn("proof", events)
+
+    def test_prelayer_cuda_slot_orders_private_copy_before_native_send(self):
+        """Exercise the real CUDA adapter with driver calls at the test boundary."""
+        from sglang_remote_attn.pinned_staging import PinnedKVStager
+
+        manager = _host_staging_manager()
+        ready = object()
+        pending, received, flags, destroyed, waited = [], [], [], [], []
+        make_empty = torch.empty
+        test = self
+
+        class Stream:
+            def wait_event(self, event):
+                test.assertIs(event, ready)
+                waited.append(event)
+
+            def synchronize(self):
+                test.assertEqual(pending, [])
+
+        stream = Stream()
+
+        class Event:
+            recorded = False
+
+            def record(self, actual):
+                test.assertIs(actual, stream)
+                self.recorded = True
+
+            def synchronize(self):
+                test.assertTrue(self.recorded)
+                for dst, src, size in pending:
+                    ctypes.memmove(dst, src, size)
+                pending.clear()
+
+        def memcpy(dst, src, size, kind, raw):
+            self.assertEqual((kind, raw), (2, 17))
+            self.assertEqual(waited[-1:], [ready])
+            pending.append((dst, src, size))
+            return (0,)
+
+        def empty(*args, **kwargs):
+            self.assertTrue(kwargs.pop("pin_memory"))
+            return make_empty(*args, **kwargs)
+
+        cudart = SimpleNamespace(
+            cudaStreamNonBlocking=1,
+            cudaStreamCreateWithFlags=lambda f: (flags.append(f) or 0, 17),
+            cudaStreamDestroy=lambda raw: (destroyed.append(raw) or 0,),
+            cudaMemcpyKind=SimpleNamespace(cudaMemcpyDeviceToHost=2),
+            cudaMemcpyAsync=memcpy,
+        )
+        with (
+            patch.dict(sys.modules, {"cuda.bindings": SimpleNamespace(runtime=cudart)}),
+            patch.object(torch, "empty", side_effect=empty),
+            patch.object(torch.cuda, "device", side_effect=lambda _: nullcontext()),
+            patch.object(torch.cuda, "ExternalStream", return_value=stream),
+            patch.object(torch.cuda, "Event", side_effect=Event),
+        ):
+            stager = PinnedKVStager(manager, 1)
+            stager.reserve(4)
+            stager.reserve(8)
+            self.assertEqual(len(manager.registrations), 1)
+
+            def transfer(session, blocks):
+                self.assertEqual(pending, [])
+                received.extend(ctypes.string_at(ptr, size) for ptr, _, size in blocks)
+                return 0
+
+            manager._transfer_data = transfer
+            data = ctypes.create_string_buffer(b"abcdefgh")
+            blocks = [
+                (ctypes.addressof(data) + 4, 100, 4),
+                (ctypes.addressof(data), 200, 4),
+            ]
+            self.assertEqual(stager.send("peer", blocks, ready_event=ready), 0)
+            self.assertEqual(received, [b"efgh", b"abcd"])
+            self.assertTrue(stager.close())
+        self.assertEqual(flags, [1, 1])
+        self.assertEqual(destroyed, [17, 17])
+        self.assertEqual(manager.registrations, {})
+
+    def test_prelayer_staging_preserves_native_mapping_and_batch_bound(self):
+        """Staging changes only source pointers, including scattered TP rows."""
+        import numpy as np
+        from sglang_remote_attn.pinned_staging import PinnedKVStager
+
+        manager_cls = _source_class(
+            "disaggregation/mooncake/conn.py",
+            "MooncakeKVManager",
+            {"send_kvcache", "_send_kvcache_generic"},
+        )
+        group = _source_function(
+            "disaggregation/common/utils.py", "group_concurrent_contiguous"
+        )
+        group.__globals__["np"] = np
+        flat = _source_function(
+            "disaggregation/mooncake/conn.py", "_uses_flat_entry_layout"
+        )
+        flat.__globals__["StateType"] = SimpleNamespace(SWA="swa")
+        manager_cls._send_kvcache_generic.__globals__.update(
+            StateType=SimpleNamespace(SWA="swa", DSA="dsa"),
+            group_concurrent_contiguous=group,
+            _uses_flat_entry_layout=flat,
+            is_elided_entry=_source_function(
+                "disaggregation/utils.py", "is_elided_entry"
+            ),
+        )
+        get_ptrs = _source_class(
+            "disaggregation/common/conn.py",
+            "CommonKVManager",
+            {"get_mla_kv_ptrs_with_pp"},
+        ).get_mla_kv_ptrs_with_pp
+        manager_cls.get_mla_kv_ptrs_with_pp = get_ptrs
+        src_indices = np.array(
+            [7, 2, 3, 15, 0, 21, 9, 4, 28, 29, 11, 5, 6, 13, 14, 8, 10], dtype=np.int32
+        )
+        dst_indices = np.array(
+            [1, 8, 9, 14, 3, 20, 4, 5, 26, 27, 12, 17, 18, 6, 7, 22, 23], dtype=np.int32
+        )
+        for rank in (0, 1):
+            with self.subTest(rank=rank):
+                manager = manager_cls()
+                manager.__dict__.update(_host_staging_manager().__dict__)
+                manager.is_mla_backend = manager.is_hybrid_mla_backend = False
+                manager.enable_custom_mem_pool = False
+                manager.max_transfer_batch_indices = 8
+                manager.pp_size, manager.attn_tp_size = 1, 2
+                manager._validate_envelope_kv_layout = lambda *args: None
+                src = [
+                    torch.arange(64, dtype=torch.uint8).reshape(32, 2)
+                    + rank * 70
+                    + i * 4
+                    for i in range(4)
+                ]
+                dst = [torch.full((32, 2), 255, dtype=torch.uint8) for _ in range(4)]
+                manager.kv_args = SimpleNamespace(
+                    kv_layer_ids=[],
+                    kv_data_ptrs=[t.data_ptr() for t in src],
+                    kv_item_lens=[2] * 4,
+                )
+                stager = PinnedKVStager(manager, rank, slot_factory=_HostStagingSlot)
+                stager.reserve(8 * 2 * 2)
+                ready = threading.Event()
+                ready.set()
+                batches = []
+
+                def transfer(session, blocks):
+                    self.assertEqual(session, f"peer-{rank}")
+                    with manager._remote_attn_send_lock:
+                        for source, target, size in blocks:
+                            self.assertTrue(
+                                stager.slot.ptr
+                                <= source
+                                < source + size
+                                <= stager.slot.ptr + stager.slot.capacity
+                            )
+                            ctypes.memmove(target, source, size)
+                        batches.append(sum(n for _, _, n in blocks))
+                    return 0
+
+                manager._transfer_data = transfer
+                rc = manager.send_kvcache(
+                    f"peer-{rank}",
+                    src_indices,
+                    [t.data_ptr() for t in dst],
+                    dst_indices,
+                    None,
+                    dst_attn_tp_size=2,
+                    kv_buffer_indices=(1, 3),
+                    transfer_fn=functools.partial(stager.send, ready_event=ready),
+                )
+                self.assertEqual(rc, 0)
+                self.assertEqual(batches, [32, 32, 4])
+                for i in range(4):
+                    expected = torch.full_like(dst[i], 255)
+                    if i in (1, 3):
+                        expected[dst_indices] = src[i][src_indices]
+                    self.assertTrue(torch.equal(dst[i], expected))
+                with self.assertRaisesRegex(ValueError, "subset"):
+                    manager.send_kvcache(
+                        "peer",
+                        src_indices,
+                        [],
+                        dst_indices,
+                        None,
+                        transfer_fn=stager.send,
+                    )
+                self.assertTrue(stager.close())
+                self.assertFalse(manager.registrations)
+
+    def test_prelayer_staging_quarantines_unknown_completion_and_unregister(self):
+        """A failed native call must never turn pinned storage into reusable memory."""
+        from sglang_remote_attn.pinned_staging import PinnedKVStager
+
+        for failure in ("register", "copy", "send", "send_exception", "unregister"):
+            with self.subTest(failure=failure):
+                manager = _host_staging_manager()
+                stager = PinnedKVStager(manager, 0, slot_factory=_HostStagingSlot)
+                ready = threading.Event()
+                ready.set()
+
+                def fail(*args):
+                    raise RuntimeError("injected native failure")
+
+                if failure == "register":
+                    manager.engine.register = fail
+                    with self.assertRaises(RuntimeError):
+                        stager.reserve(16)
+                else:
+                    stager.reserve(16)
+                    manager._transfer_data = (
+                        fail if failure == "send_exception" else lambda *args: -1
+                    )
+                    if failure == "copy":
+                        stager.slot.copy = fail
+                    if failure == "unregister":
+                        manager.engine.deregister = fail
+                        self.assertFalse(stager.close())
+                    else:
+                        data = ctypes.create_string_buffer(b"abcd")
+                        blocks = [(ctypes.addressof(data), 100, 4)]
+                        if failure == "send":
+                            self.assertEqual(
+                                stager.send("peer", blocks, ready_event=ready), -1
+                            )
+                        else:
+                            with self.assertRaises(RuntimeError):
+                                stager.send("peer", blocks, ready_event=ready)
+                slot = stager.slot
+                self.assertFalse(stager.close())
+                self.assertFalse(slot.closed)
+                self.assertIn(stager, manager.engine._pre_layerwise_staging_owners)
+                with self.assertRaisesRegex(RuntimeError, "quarantined"):
+                    stager.reserve(16)
+                pl = self.hooks.pre_layerwise
+                req = SimpleNamespace(
+                    _pre_layerwise_source=SimpleNamespace(stager=stager)
+                )
+                with self.assertRaisesRegex(RuntimeError, "retaining source KV"):
+                    pl.defer_release(req, lambda: self.fail("unsafe KV release"))
+
+    def test_prelayer_staging_serializes_slot_reuse_until_send_completes(self):
+        from sglang_remote_attn.pinned_staging import PinnedKVStager
+
+        manager = _host_staging_manager()
+        stager = PinnedKVStager(manager, 0, slot_factory=_HostStagingSlot)
+        stager.reserve(4)
+        entered, release, second_attempt = (threading.Event() for _ in range(3))
+        ready = threading.Event()
+        ready.set()
+        payloads, errors = [], []
+
+        class ObservedLock:
+            def __enter__(self):
+                if threading.current_thread().name == "second-stage":
+                    second_attempt.set()
+                stager_lock.acquire()
+
+            def __exit__(self, *args):
+                stager_lock.release()
+
+        stager_lock = stager.lock
+        stager.lock = ObservedLock()
+
+        def transfer(session, blocks):
+            entered.set()
+            if not release.wait(3):
+                raise TimeoutError("test send did not drain")
+            payloads.append(ctypes.string_at(blocks[0][0], 4))
+            return 0
+
+        manager._transfer_data = transfer
+        buffers = [ctypes.create_string_buffer(s) for s in (b"aaaa", b"bbbb")]
+
+        def send(index):
+            try:
+                stager.send(
+                    "peer",
+                    [(ctypes.addressof(buffers[index]), 100, 4)],
+                    ready_event=ready,
+                )
+            except Exception as exc:
+                errors.append(exc)
+
+        first = threading.Thread(target=send, args=(0,))
+        second = threading.Thread(target=send, args=(1,), name="second-stage")
+        try:
+            first.start()
+            self.assertTrue(entered.wait(3))
+            second.start()
+            self.assertTrue(second_attempt.wait(3))
+            self.assertEqual(ctypes.string_at(stager.slot.ptr, 4), b"aaaa")
+        finally:
+            release.set()
+            first.join(3)
+            if second.ident is not None:
+                second.join(3)
+        self.assertFalse(first.is_alive() or second.is_alive())
+        self.assertEqual(errors, [])
+        self.assertEqual(payloads, [b"aaaa", b"bbbb"])
+        self.assertTrue(stager.close())
 
     def test_prelayer_auto_grouping_uses_chunk_work_not_prompt_length(self):
         """Small tails keep Remote; long chunks use fewer, larger transfers."""
@@ -1904,6 +2252,13 @@ class TestRemoteAttn(CustomTestCase):
                 clear=True,
             ):
                 config = pl.Config.from_env()
+                self.assertFalse(config.host_staging)
+                with patch.dict(os.environ, {"MC_FORCE_TCP": "1"}):
+                    self.assertTrue(pl.Config.from_env().host_staging)
+                    with patch.dict(
+                        os.environ, {"HANDOFF_PRE_LAYERWISE_HOST_STAGING": "0"}
+                    ):
+                        self.assertFalse(pl.Config.from_env().host_staging)
             with self.subTest(mode=mode):
                 self.assertEqual(
                     config.select_group_size(36, 2048, 2048),

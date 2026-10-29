@@ -1028,6 +1028,7 @@ class MooncakeKVManager(StagingManagerMixin, CommonKVManager):
         dst_device_data_ptrs: Optional[set[int]] = None,
         dst_item_lens: list[int] | None = None,
         bootstrap_room: Optional[int] = None,
+        transfer_fn=None,
     ) -> int:
         """
         Generic KV cache transfer supporting both MHA and MLA architectures.
@@ -1189,15 +1190,16 @@ class MooncakeKVManager(StagingManagerMixin, CommonKVManager):
         # Worker function for processing a single layer
         def process_layer(src_ptr: int, dst_ptr: int, item_len: int) -> int:
             transfer_blocks = set_transfer_blocks(src_ptr, dst_ptr, item_len)
-            return self._transfer_data(mooncake_session_id, transfer_blocks)
+            return transfer(mooncake_session_id, transfer_blocks)
 
         # Worker function for processing all layers in a batch
         def process_layers(layers_params: List[Tuple[int, int, int]]) -> int:
             transfer_blocks = []
             for src_ptr, dst_ptr, item_len in layers_params:
                 transfer_blocks.extend(set_transfer_blocks(src_ptr, dst_ptr, item_len))
-            return self._transfer_data(mooncake_session_id, transfer_blocks)
+            return transfer(mooncake_session_id, transfer_blocks)
 
+        transfer = transfer_fn if transfer_fn is not None else self._transfer_data
         if (
             self.enable_custom_mem_pool
             and self.custom_mem_pool_type != "INTRA_NODE_NVLINK"
@@ -1244,7 +1246,7 @@ class MooncakeKVManager(StagingManagerMixin, CommonKVManager):
                         dst_addr = dst_ptr + int(decode_index[0]) * item_len
                         length = item_len * len(prefill_index)
                         transfer_blocks.append((src_addr, dst_addr, length))
-                return self._transfer_data(mooncake_session_id, transfer_blocks)
+                return transfer(mooncake_session_id, transfer_blocks)
 
             for start in range(
                 0,
@@ -1350,7 +1352,10 @@ class MooncakeKVManager(StagingManagerMixin, CommonKVManager):
         dst_kv_item_len: Optional[int] = None,
         dst_attn_tp_size: Optional[int] = None,
         kv_buffer_indices: Optional[tuple[int, ...]] = None,
+        transfer_fn=None,
     ):
+        if transfer_fn is not None and kv_buffer_indices is None:
+            raise ValueError("transfer adapter requires a layer-pipelined subset")
         self._validate_envelope_kv_layout(
             dst_kv_ptrs, dst_kv_item_len, dst_attn_tp_size
         )
@@ -1381,6 +1386,7 @@ class MooncakeKVManager(StagingManagerMixin, CommonKVManager):
                 dst_data_indices=dst_kv_indices,
                 executor=executor,
                 force_flat=True,
+                transfer_fn=transfer_fn,
             )
         dst_device_kv_ptrs = None
         if dst_device_kv_indices is not None:
@@ -2719,6 +2725,7 @@ class MooncakeKVManager(StagingManagerMixin, CommonKVManager):
                                 dst_kv_item_len=target_rank_registration_info.dst_kv_item_len,
                                 dst_attn_tp_size=target_rank_registration_info.dst_attn_tp_size,
                                 kv_buffer_indices=kv_chunk.kv_buffer_indices,
+                                transfer_fn=kv_chunk.transfer_fn,
                             )
                         elif (
                             self.enable_staging
@@ -3121,9 +3128,12 @@ class MooncakeKVManager(StagingManagerMixin, CommonKVManager):
         trace_ctx: Optional[Union[TraceReqContext, TraceNullContext]] = None,
         kv_buffer_indices: Optional[tuple[int, ...]] = None,
         on_complete=None,
+        transfer_fn=None,
     ):
         assert self.disaggregation_mode == DisaggregationMode.PREFILL
         assert not is_last_chunk or (is_last_chunk and aux_index is not None)
+        if transfer_fn is not None and kv_buffer_indices is None:
+            raise ValueError("transfer adapter requires a layer-pipelined subset")
 
         if (
             bootstrap_room not in self.request_status
@@ -3164,6 +3174,7 @@ class MooncakeKVManager(StagingManagerMixin, CommonKVManager):
                 indices_event=indices_event,
                 kv_buffer_indices=kv_buffer_indices,
                 on_complete=on_complete,
+                transfer_fn=transfer_fn,
             )
         )
 

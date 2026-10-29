@@ -46,6 +46,7 @@ class Config:
     directory: Path
     group_size: int = 0
     drain_timeout: float = 300.0
+    host_staging: bool = False
 
     @classmethod
     def from_env(cls):
@@ -66,7 +67,13 @@ class Config:
                 "layer group size must be nonnegative (0 = auto); "
                 "drain timeout must be positive"
             )
-        return cls(mode, Path(root).resolve(), group, timeout)
+        staging = os.environ.get(
+            "HANDOFF_PRE_LAYERWISE_HOST_STAGING",
+            "1" if os.environ.get("MC_FORCE_TCP") == "1" else "0",
+        )
+        if staging not in ("0", "1"):
+            raise ValueError("HANDOFF_PRE_LAYERWISE_HOST_STAGING must be 0 or 1")
+        return cls(mode, Path(root).resolve(), group, timeout, staging == "1")
 
     def select_group_size(self, layers, transfer_tokens, average_tokens):
         """Select layer groups from the scheduler's actual batch, never re-chunk it.
@@ -168,6 +175,7 @@ class Source:
     created_at: float = field(default_factory=time.monotonic)
     group_size: int = 0
     prefill_chunk_tokens: int | None = None
+    stager: object = None
 
     def complete(self, layers):
         # add_transfer_request shards a room onto one FIFO. Earlier ordinary
@@ -203,6 +211,7 @@ class Source:
                 "final_chunk_end": self.index_slice.stop,
                 "prefill_chunk_tokens": self.prefill_chunk_tokens,
                 "layer_group_size": self.group_size,
+                "host_staging": self.stager is not None,
                 "at": time.monotonic(),
             },
         )
@@ -398,6 +407,7 @@ class Controller:
         self.plan = None
         self.batches = 0
         self.early_admissions = 0
+        self.stager = None
 
     def validate(self):
         from sglang.srt.runtime_context import get_disagg, get_exec, get_memory
@@ -574,6 +584,32 @@ class Controller:
             ):
                 layer_ids = list(range(self.layers)) * 2
             groups = buffer_groups(layer_ids, self.layers, group_size)
+            stager = None
+            if self.config.host_staging:
+                from .pinned_staging import PinnedKVStager
+
+                if self.stager is None:
+                    self.stager = PinnedKVStager(
+                        sender.kv_mgr, s.tp_worker.model_runner.gpu_id
+                    )
+                stager = self.stager
+                if stager.manager is not sender.kv_mgr:
+                    raise RuntimeError("pre-layerwise native KV manager changed")
+                tokens = req.extend_end - req.start_send_idx
+                batch_limit = sender.kv_mgr.max_transfer_batch_indices
+                per_buffer = (
+                    sender.kv_mgr.enable_custom_mem_pool
+                    and sender.kv_mgr.custom_mem_pool_type != "INTRA_NODE_NVLINK"
+                )
+                if batch_limit > 0 and not per_buffer:
+                    tokens = min(tokens, batch_limit)
+                # The native custom-pool path may send one buffer at a time;
+                # reserving the whole bounded group also covers that path.
+                capacity = tokens * max(
+                    sum(sender.kv_mgr.kv_args.kv_item_lens[i] for i in buffers)
+                    for _, buffers in groups
+                )
+                stager.reserve(capacity)
             indices = (
                 s.req_to_token_pool.req_to_token[
                     req.kv.req_pool_idx, req.start_send_idx : req.extend_end
@@ -596,6 +632,7 @@ class Controller:
                 len(req.origin_input_ids),
                 group_size=group_size,
                 prefill_chunk_tokens=req.extend_len,
+                stager=stager,
             )
             sender._record_transfer_indices(indices, None)
             sender._transfer_start_time = (
@@ -609,12 +646,13 @@ class Controller:
             self.batches += 1
             logger.info(
                 "pre-layerwise batch=%s requests=%s group_size=%s "
-                "pipelined_tokens=%s policy=%s",
+                "pipelined_tokens=%s policy=%s host_staging=%s",
                 self.batches,
                 len(jobs),
                 group_size,
                 transfer_tokens,
                 "fixed" if self.config.group_size else "auto",
+                self.config.host_staging,
             )
         return jobs or None
 
@@ -647,6 +685,11 @@ class Controller:
                         wait_event=event,
                         kv_buffer_indices=groups[group_index][1],
                         on_complete=functools.partial(source.complete, layers),
+                        transfer_fn=(
+                            functools.partial(source.stager.send, ready_event=event)
+                            if source.stager is not None
+                            else None
+                        ),
                         trace_ctx=sender.trace_ctx.copy_for_thread(),
                     )
             return result
@@ -836,6 +879,8 @@ def pop_transferred(original, queue, rids_to_check=None):
 
 def defer_release(req, release):
     source = getattr(req, "_pre_layerwise_source", None)
+    if source is not None and source.stager is not None and source.stager.poisoned:
+        raise RuntimeError("pre-layerwise staging is unsettled; retaining source KV")
     if source is not None and source.owner.config.mode == "remote":
         if not source.finalized:
             raise RuntimeError(
@@ -887,3 +932,5 @@ def shutdown(scheduler):
             if time.monotonic() >= deadline:
                 raise RuntimeError("native PD writes remain active during shutdown")
             time.sleep(0.005)
+    if controller.stager is not None and not controller.stager.close():
+        raise RuntimeError("pre-layerwise staging remains quarantined during shutdown")

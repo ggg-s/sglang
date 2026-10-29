@@ -36,6 +36,11 @@ It inherits the model deployment's token chunking and selects layer groups from
 the scheduler's actual batch lengths. No separate chunk-size setting is needed.
 Small tails use native transfer in `layerwise` mode; `remote` keeps early decode
 admission with a single all-layer transfer group.
+With `MC_FORCE_TCP=1`, pre-layerwise groups stage source bytes through a private
+nonblocking CUDA stream and registered pinned host storage before native TE sends.
+This preserves native batching and the send lock; ordinary PD and Post-Remote
+transfers keep their existing paths. Set `HANDOFF_PRE_LAYERWISE_HOST_STAGING=0`
+for the GPU-pointer control. Failed/uncertain sends quarantine staging storage.
 The [functional parity checklist](FUNCTIONAL-PARITY.md) maps the supplied
 P0–P5.18 features to this port and distinguishes code coverage from deployment acceptance.
 

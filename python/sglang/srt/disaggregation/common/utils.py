@@ -40,6 +40,9 @@ class TransferKVChunk:
     kv_buffer_indices: Optional[Tuple[int, ...]] = None
     # Runs on the transfer worker only after every destination write succeeds.
     on_complete: Optional[Callable[[], None]] = None
+    # Optional selected-buffer transport adapter. Receives the native address
+    # plan and must return only after its source storage is safe to reuse.
+    transfer_fn: Optional[Callable] = None
 
 
 def pack_list_of_buffers(buffers: List[bytes]) -> bytes:
