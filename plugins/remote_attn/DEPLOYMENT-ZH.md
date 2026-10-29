@@ -249,8 +249,8 @@ Remote 的 offer/ready/done journal 仍然存在。网络发送成功或 H2D 完
 
 ### 冷态预热与流量准入
 
-`PinnedKVStager.reserve()` 新建并注册 slot 后，使用**同一 copy stream、同一已注册 pinned buffer**完成一次真实的 **1 字节 D2H** 并等待完成。
-源端使用私有 GPU scratch，不读取正在生成的 KV。slot 复用不重复预热，扩容会再做；异常会 quarantine，禁止复用。
+core 共享 slot 的 `reserve()` 新建并注册 slot 后，使用**同一 copy stream、同一已注册 pinned buffer**完成一次真实的 **最多 16 MiB D2H** 并等待完成。
+源端使用私有 GPU scratch，不读取正在生成的 KV。slot 复用不重复预热，扩容会再做；异常仅在确认流已排空后允许继续，否则 quarantine。
 
 这只预热首次拷贝初始化，不等于触碰整个 buffer，也不等于完整模型/网络/scatter 预热。
 `reserve()` 在请求准备阶段执行，若首次创建发生在第一条请求，其初始化耗时仍计入该请求。
@@ -406,3 +406,5 @@ journal 当前**不自动清理**。需要生产侧监控磁盘容量，归档�
 `test/manual/remote_attn/pre_layerwise_staging_probe.py --receive-staging --busy-device destination`
 验证实际 TE/H2D/scatter 字节与流依赖，但它不启动完整模型、不能替代服务验收，也不应在已接流量 GPU 上运行。
 完整探针参数、测试矩阵和指标解释见 [P5.19 说明](P5.19-PRE-LAYERWISE-ZH.md)。
+
+发送端已统一到 `CorePinnedStager`：普通 chunk 与层组共用每 rank 一块 128 MiB pinned slot，插件不再独立分配或注册缓冲区。slot 锁覆盖 D2H 和同步 TE 完成；原有 send lock 仍保留。`SGLANG_MOONCAKE_HOST_STAGING_ALL=1` 覆盖两条发送路径；该开关关闭时，`HANDOFF_PRE_LAYERWISE_HOST_STAGING` 只控制层组。GPU 指针对照需要两者都关闭。all-send 模式在启动发布 KV 张量表时 reserve/预热；仅层组模式在首个选中请求的 forward 前完成。

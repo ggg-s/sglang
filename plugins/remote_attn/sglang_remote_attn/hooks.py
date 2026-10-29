@@ -250,13 +250,13 @@ def _mooncake_init(original, manager, *args, **kwargs):
     return original(manager, *args, **kwargs)
 
 
-def _transfer(original, manager, mooncake_session_id, transfer_blocks):
+def _transfer(original, manager, mooncake_session_id, transfer_blocks, **kwargs):
     from sglang.srt.environ import envs
 
     if not transfer_blocks or not envs.SGLANG_MOONCAKE_SEND_LOCK.get():
-        return original(manager, mooncake_session_id, transfer_blocks)
+        return original(manager, mooncake_session_id, transfer_blocks, **kwargs)
     with manager._remote_attn_send_lock:
-        return original(manager, mooncake_session_id, transfer_blocks)
+        return original(manager, mooncake_session_id, transfer_blocks, **kwargs)
 
 
 def _publish_peer(original, manager, mooncake_session_id, decode_kv_args):

@@ -52,7 +52,7 @@ class _HostStagingSlot:
         self.closed = False
 
     def copy(self, blocks, ready_event):
-        if not ready_event.wait(3):
+        if ready_event is not None and not ready_event.wait(3):
             raise TimeoutError("KV producer did not finish")
         offset = 0
         for src, _, size in blocks:
@@ -2105,13 +2105,12 @@ class TestRemoteAttn(CustomTestCase):
         self.assertIsNone(stager.resolve(source.data_ptr() + 1, 4))
         self.assertIsNone(stager.resolve(source.data_ptr() + 16, 8))
         self.assertIsNone(stager.resolve(1, 4))
-        slot = dict(
-            host=torch.empty(8, dtype=torch.uint8),
-            poisoned=False,
-            device=0,
-            stream=SimpleNamespace(synchronize=lambda: None),
-        )
-        stager._slot = lambda device: slot
+        from sglang.srt.disaggregation.pinned_staging_buffer import PinnedKVStager
+
+        proxy = _host_staging_manager()
+        stager.buffer = PinnedKVStager(proxy, 0, slot_factory=_HostStagingSlot)
+        stager.buffer.reserve(8)
+        stager._reserve = lambda device: stager.buffer._check_live()
         destination = ctypes.create_string_buffer(24)
         dest = ctypes.addressof(destination)
         host = ctypes.create_string_buffer(b"host")
@@ -2144,10 +2143,36 @@ class TestRemoteAttn(CustomTestCase):
             ]
             self.assertEqual(stager.send(blocks, transfer), 0)
             self.assertEqual(batches, [blocks])  # Already staged sources stay batched.
+            manager_cls = _source_class(
+                "disaggregation/mooncake/conn.py",
+                "MooncakeKVManager",
+                {"_transfer_data", "ensure_host_stager"},
+            )
+            manager = manager_cls()
+            manager._core_stager = stager
+            manager.engine = SimpleNamespace(
+                batch_transfer_sync=lambda session, srcs, dsts, sizes: transfer(
+                    list(zip(srcs, dsts, sizes))
+                )
+            )
+            shared_slot = stager.buffer.slot
+            self.assertIs(manager.ensure_host_stager(), stager)
+            plan = [(source.data_ptr(), dest, 4)]
+            for all_sends, layer_send in ((False, False), (False, True), (True, False)):
+                manager._host_staging_all = all_sends
+                batches.clear()
+                self.assertEqual(
+                    manager._transfer_data("peer", plan, stage=layer_send), 0
+                )
+                expected = (
+                    shared_slot.ptr if all_sends or layer_send else source.data_ptr()
+                )
+                self.assertEqual(batches[0][0][0], expected)
+                self.assertIs(stager.buffer.slot, shared_slot)
             self.assertEqual(
                 stager.send([(source.data_ptr(), dest, 4)], lambda b: -1), -1
             )
-            self.assertTrue(slot["poisoned"])
+            self.assertTrue(stager.poisoned)
         stager.set_buffers([tensor], [source.data_ptr() + 4], [4])
         self.assertIsNone(stager.resolve(source.data_ptr() + 4, 4))
 
@@ -2190,7 +2215,7 @@ class TestRemoteAttn(CustomTestCase):
 
     def test_prelayer_cuda_slot_orders_private_copy_before_native_send(self):
         """Exercise the real CUDA adapter with driver calls at the test boundary."""
-        from sglang_remote_attn.pinned_staging import PinnedKVStager
+        from sglang.srt.disaggregation.pinned_staging_buffer import PinnedKVStager
 
         manager = _host_staging_manager()
         ready = object()
@@ -2288,7 +2313,8 @@ class TestRemoteAttn(CustomTestCase):
     def test_prelayer_staging_preserves_native_mapping_and_batch_bound(self):
         """Staging changes only source pointers, including scattered TP rows."""
         import numpy as np
-        from sglang_remote_attn.pinned_staging import PinnedKVStager
+
+        from sglang.srt.disaggregation.pinned_staging_buffer import PinnedKVStager
 
         manager_cls = _source_class(
             "disaggregation/mooncake/conn.py",
@@ -2443,7 +2469,7 @@ class TestRemoteAttn(CustomTestCase):
 
     def test_prelayer_staging_quarantines_unknown_completion_and_unregister(self):
         """A failed native call must never turn pinned storage into reusable memory."""
-        from sglang_remote_attn.pinned_staging import PinnedKVStager
+        from sglang.srt.disaggregation.pinned_staging_buffer import PinnedKVStager
 
         for failure in (
             "register",
@@ -2508,7 +2534,7 @@ class TestRemoteAttn(CustomTestCase):
                     pl.defer_release(req, lambda: self.fail("unsafe KV release"))
 
     def test_prelayer_staging_serializes_slot_reuse_until_send_completes(self):
-        from sglang_remote_attn.pinned_staging import PinnedKVStager
+        from sglang.srt.disaggregation.pinned_staging_buffer import PinnedKVStager
 
         manager = _host_staging_manager()
         stager = PinnedKVStager(manager, 0, slot_factory=_HostStagingSlot)

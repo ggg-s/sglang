@@ -38,14 +38,14 @@ Small tails use native transfer in `layerwise` mode; `remote` keeps early decode
 admission with a single all-layer transfer group.
 With `MC_FORCE_TCP=1`, pre-layerwise groups stage source bytes through a private
 nonblocking CUDA stream and registered pinned host storage before native TE sends.
-This preserves native batching and the send lock; ordinary PD and Post-Remote
-transfers keep their existing paths. Set `HANDOFF_PRE_LAYERWISE_HOST_STAGING=0`
-for the GPU-pointer control. Failed/uncertain sends quarantine staging storage.
+This preserves native batching and the send lock; ordinary PD is also staged when `SGLANG_MOONCAKE_HOST_STAGING_ALL=1`.
+Set both that flag and `HANDOFF_PRE_LAYERWISE_HOST_STAGING` to `0` for the
+GPU-pointer control. Failed/uncertain sends quarantine staging storage.
 Each newly registered sender slot performs a D2H warmup of up to 16 MiB (bounded by slot capacity) on its own copy
 stream before the layerwise forward; reusing the slot does not repeat warmup.
 This moves first-copy initialization out of group sends, but its cost still
 belongs to the first request if the slot is first reserved on that request.
-Layer-group task references (including CUDA events held by send callbacks) are
+Transfer task references (including their producer CUDA events) are
 released by a daemon reaper after the transfer worker finishes with the task.
 `HANDOFF_PL_RETIRE=async` is the default; `off` restores inline release and
 `keep64` retains the last 64 tasks on each worker for diagnostic comparison.
@@ -289,7 +289,7 @@ retry cleanup, compatibility and the remaining unprovable-completion boundary.
 
 Native chunk source staging is opt-in on P with
 `SGLANG_MOONCAKE_HOST_STAGING_ALL=1` (default off). It stages verified contiguous
-CUDA KV ranges in per-transfer-thread registered slabs of 128 MiB, after the
+CUDA KV ranges in one rank-owned registered slab of 128 MiB, after the
 worker waits for the producer event recorded at submission. Existing host
 sources bypass staging. Unknown addresses/layouts retain native transfer;
 MLA or unverified tensor/address tables are not accelerated by this switch.
@@ -297,3 +297,13 @@ Failed/uncertain staged sends quarantine their slab. Ordinary chunk events also
 use the bounded reference reaper. The receiver ring flags remain independent.
 Deployment scripts inherit the model's chunk default and allow 16 running requests;
 inspect server startup arguments for the resolved chunk size.
+
+Sender staging is shared: `CorePinnedStager` owns one rank-wide 128 MiB slot,
+using the common `disaggregation/pinned_staging_buffer.py` implementation for
+registration, private-stream D2H, warmup and quarantine. The plugin owns no
+pinned allocation and does not close the shared manager. Native teardown closes
+it only after transfer workers and executors stop. Slot ownership serializes
+D2H through synchronous TE completion even when the outer send lock is disabled.
+The all-send flag takes precedence over the layer-only flag. With all-send enabled,
+verified tensor publication reserves/warms the slot at startup; otherwise the
+plugin prepares it before the first selected layerwise forward.

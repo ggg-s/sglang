@@ -662,31 +662,12 @@ class Controller:
                 layer_ids = list(range(self.layers)) * 2
             groups = buffer_groups(layer_ids, self.layers, group_size)
             stager = None
-            if self.config.host_staging:
-                from .pinned_staging import PinnedKVStager
-
-                if self.stager is None:
-                    self.stager = PinnedKVStager(
-                        sender.kv_mgr, s.tp_worker.model_runner.gpu_id
-                    )
-                stager = self.stager
-                if stager.manager is not sender.kv_mgr:
-                    raise RuntimeError("pre-layerwise native KV manager changed")
-                tokens = req.extend_end - req.start_send_idx
-                batch_limit = sender.kv_mgr.max_transfer_batch_indices
-                per_buffer = (
-                    sender.kv_mgr.enable_custom_mem_pool
-                    and sender.kv_mgr.custom_mem_pool_type != "INTRA_NODE_NVLINK"
-                )
-                if batch_limit > 0 and not per_buffer:
-                    tokens = min(tokens, batch_limit)
-                # The native custom-pool path may send one buffer at a time;
-                # reserving the whole bounded group also covers that path.
-                capacity = tokens * max(
-                    sum(sender.kv_mgr.kv_args.kv_item_lens[i] for i in buffers)
-                    for _, buffers in groups
-                )
-                stager.reserve(capacity)
+            if self.config.host_staging or getattr(
+                sender.kv_mgr, "_host_staging_all", False
+            ):
+                stager = sender.kv_mgr.ensure_host_stager()
+                self.stager = stager
+                stager.reserve(s.tp_worker.model_runner.gpu_id)
             indices = (
                 s.req_to_token_pool.req_to_token[
                     req.kv.req_pool_idx, req.start_send_idx : req.extend_end
@@ -770,7 +751,7 @@ class Controller:
                         kv_buffer_indices=groups[group_index][1],
                         on_complete=functools.partial(source.complete, layers),
                         transfer_fn=(
-                            functools.partial(source.stager.send, ready_event=event)
+                            functools.partial(sender.kv_mgr._transfer_data, stage=True)
                             if source.stager is not None
                             else None
                         ),
@@ -1037,7 +1018,8 @@ def shutdown(scheduler):
             if time.monotonic() >= deadline:
                 raise RuntimeError("native PD writes remain active during shutdown")
             time.sleep(0.005)
-    if controller.stager is not None and not controller.stager.close():
+    # Native manager owns shared staging teardown after its workers drain.
+    if controller.stager is not None and controller.stager.poisoned:
         raise RuntimeError("pre-layerwise staging remains quarantined during shutdown")
 
 

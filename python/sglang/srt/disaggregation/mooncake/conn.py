@@ -362,15 +362,12 @@ class MooncakeKVManager(StagingManagerMixin, CommonKVManager):
                     "SGLANG_FAILED_SESSION_IDLE_TIMEOUT_S must be positive"
                 )
         self._core_stager = None
+        self._host_staging_all = envs.SGLANG_MOONCAKE_HOST_STAGING_ALL.get()
         if (
             self.disaggregation_mode == DisaggregationMode.PREFILL
-            and envs.SGLANG_MOONCAKE_HOST_STAGING_ALL.get()
+            and self._host_staging_all
         ):
-            from sglang.srt.disaggregation.mooncake.pinned_staging_core import (
-                CorePinnedStager,
-            )
-
-            self._core_stager = CorePinnedStager(self.engine)
+            self.ensure_host_stager()
         if self.disaggregation_mode == DisaggregationMode.PREFILL:
             self.session_failures = defaultdict(int)
             self.failed_sessions = set()
@@ -624,6 +621,8 @@ class MooncakeKVManager(StagingManagerMixin, CommonKVManager):
                 self.kv_args.kv_data_ptrs,
                 self.kv_args.kv_item_lens,
             )
+            if self._host_staging_all and self._core_stager.regions:
+                self._core_stager.reserve(self._core_stager.regions[0][3].device)
 
     def _register_staging_memory(self, ptr: int, size: int) -> None:
         if self.engine.batch_register([ptr], [size]) != 0:
@@ -966,7 +965,23 @@ class MooncakeKVManager(StagingManagerMixin, CommonKVManager):
             )
         return ret
 
-    def _transfer_data(self, mooncake_session_id, transfer_blocks):
+    def ensure_host_stager(self):
+        if self._core_stager is None:
+            from sglang.srt.disaggregation.mooncake.pinned_staging_core import (
+                CorePinnedStager,
+            )
+
+            self._core_stager = CorePinnedStager(self.engine)
+            tensors = getattr(self, "kv_buffer_tensors", None)
+            if tensors:
+                self._core_stager.set_buffers(
+                    list(tensors["k_buffers"]) + list(tensors["v_buffers"]),
+                    self.kv_args.kv_data_ptrs,
+                    self.kv_args.kv_item_lens,
+                )
+        return self._core_stager
+
+    def _transfer_data(self, mooncake_session_id, transfer_blocks, *, stage=False):
         if not transfer_blocks:
             return 0
 
@@ -976,7 +991,7 @@ class MooncakeKVManager(StagingManagerMixin, CommonKVManager):
                 mooncake_session_id, list(src_addrs), list(dst_addrs), list(lengths)
             )
 
-        if self._core_stager is not None:
+        if self._core_stager is not None and (self._host_staging_all or stage):
             return self._core_stager.send(transfer_blocks, transfer)
         return transfer(transfer_blocks)
 

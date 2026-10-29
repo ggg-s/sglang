@@ -61,7 +61,8 @@ class CudaPinnedSlot:
 
     def copy(self, blocks, ready_event):
         with self.torch.cuda.device(self.device):
-            self.stream.wait_event(ready_event)
+            if ready_event is not None:
+                self.stream.wait_event(ready_event)
             offset = 0
             for src, _dst, length in blocks:
                 (err,) = self.cudart.cudaMemcpyAsync(
@@ -146,13 +147,15 @@ class PinnedKVStager:
                 self.poisoned = True
                 raise
 
-    def send(self, session, blocks, *, ready_event):
+    def send(self, session, blocks, *, ready_event, already_ready=False):
         if not blocks:
             return 0
         with self.lock:
             self._check_live()
             blocks = [(int(src), int(dst), int(n)) for src, dst, n in blocks]
-            if ready_event is None or any(n <= 0 for _, _, n in blocks):
+            if (ready_event is None and not already_ready) or any(
+                n <= 0 for _, _, n in blocks
+            ):
                 raise ValueError("staged KV requires a ready event and positive blocks")
             if self.slot is None or sum(n for _, _, n in blocks) > self.slot.capacity:
                 raise RuntimeError("native KV batch exceeds reserved staging capacity")

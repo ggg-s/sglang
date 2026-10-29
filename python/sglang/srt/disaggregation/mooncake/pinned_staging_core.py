@@ -3,8 +3,11 @@
 import bisect
 import logging
 import threading
+from types import SimpleNamespace
 
 import torch
+
+from sglang.srt.disaggregation.pinned_staging_buffer import PinnedKVStager
 
 logger = logging.getLogger(__name__)
 
@@ -13,8 +16,8 @@ class CorePinnedStager:
     def __init__(self, engine, capacity=128 * 1024 * 1024):
         self.engine = engine
         self.capacity = capacity
-        self.local = threading.local()
-        self.slots = []
+        self.buffer = None
+        self.device = None
         self.lock = threading.Lock()
         self.regions = []
         self.starts = []
@@ -60,51 +63,57 @@ class CorePinnedStager:
             return None
         return tensor.view(torch.uint8).reshape(-1)[offset : offset + length]
 
-    def _slot(self, device):
-        slot = getattr(self.local, "slot", None)
-        if slot is None:
-            with torch.cuda.device(device):
-                slot = dict(
-                    host=torch.empty(self.capacity, dtype=torch.uint8, pin_memory=True),
-                    stream=torch.cuda.Stream(device=device),
-                    poisoned=True,
-                    device=device,
-                )
-            self.local.slot = slot
-            with self.lock:
-                self.slots.append(slot)
-            rc = self.engine.batch_register([slot["host"].data_ptr()], [self.capacity])
-            if rc != 0:
-                raise RuntimeError("Mooncake core pinned registration failed")
-            slot["poisoned"] = False
-        if slot["poisoned"] or slot["device"] != device:
-            raise RuntimeError(
-                "Mooncake core staging slot quarantined or device changed"
+    @property
+    def poisoned(self):
+        return self.buffer is not None and self.buffer.poisoned
+
+    def reserve(self, device):
+        """Prepare the single rank-owned slot before layerwise forward."""
+        with self.lock:
+            self._reserve(device)
+
+    def _reserve(self, device):
+        device = (
+            torch.device(device)
+            if not isinstance(device, int)
+            else torch.device("cuda", device)
+        )
+        if self.buffer is None:
+            proxy = SimpleNamespace(
+                engine=self.engine, _remote_attn_send_lock=threading.Lock()
             )
-        return slot
+            self.buffer = PinnedKVStager(proxy, device.index)
+            self.device = device
+        if self.device != device:
+            raise RuntimeError("Mooncake staging device changed")
+        self.buffer.reserve(self.capacity)
 
     def send(self, blocks, transfer):
-        # The transfer worker has synchronized the submission-time producer event.
-        resolved = [self.resolve(src, length) for src, _, length in blocks]
-        if all(t is None for t in resolved):
-            return transfer(blocks)
-        slot = None
-        pending = []
-        used = 0
-
-        def flush():
-            nonlocal used
-            if not pending:
-                return 0
-            slot["stream"].synchronize()
-            rc = transfer(list(pending))
-            if rc != 0:
-                slot["poisoned"] = True
-            pending.clear()
+        # Worker has waited for the producer event. Serial slot ownership covers
+        # D2H AND TE completion; ordinary chunks and layer groups share it.
+        with self.lock:
+            resolved = [self.resolve(src, length) for src, _, length in blocks]
+            if all(t is None for t in resolved):
+                return transfer(blocks)
+            pending = []
             used = 0
-            return rc
 
-        try:
+            def flush():
+                nonlocal used
+                if not pending:
+                    return 0
+                self.buffer.manager._transfer_data = lambda session, plan: transfer(
+                    plan
+                )
+                try:
+                    return self.buffer.send(
+                        None, pending, ready_event=None, already_ready=True
+                    )
+                finally:
+                    self.buffer.manager._transfer_data = None
+                    pending.clear()
+                    used = 0
+
             for (src, dst, length), tensor in zip(blocks, resolved):
                 if tensor is None:
                     rc = flush()
@@ -114,18 +123,11 @@ class CorePinnedStager:
                     if rc != 0:
                         return rc
                     continue
-                slot = self._slot(tensor.device)
+                self._reserve(tensor.device)
                 offset = 0
                 while offset < length:
                     n = min(length - offset, self.capacity - used)
-                    with (
-                        torch.cuda.device(slot["device"]),
-                        torch.cuda.stream(slot["stream"]),
-                    ):
-                        slot["host"][used : used + n].copy_(
-                            tensor[offset : offset + n], non_blocking=True
-                        )
-                    pending.append((slot["host"].data_ptr() + used, dst + offset, n))
+                    pending.append((src + offset, dst + offset, n))
                     offset += n
                     used += n
                     if used == self.capacity:
@@ -133,20 +135,11 @@ class CorePinnedStager:
                         if rc != 0:
                             return rc
             return flush()
-        except Exception:
-            if slot is not None:
-                slot["poisoned"] = True
-            raise
 
     def close(self):
-        # Called only after all transfer workers/executors have stopped.
-        for slot in self.slots:
-            if slot["poisoned"]:
-                continue
-            slot["stream"].synchronize()
-            if self.engine.batch_deregister([slot["host"].data_ptr()]) != 0:
-                slot["poisoned"] = True
-                continue
-            slot["host"] = None
-        if not any(s["poisoned"] for s in self.slots):
-            self.engine._core_staging_owners.remove(self)
+        with self.lock:
+            if self.buffer is not None and not self.buffer.close():
+                return False
+            if self in self.engine._core_staging_owners:
+                self.engine._core_staging_owners.remove(self)
+            return True

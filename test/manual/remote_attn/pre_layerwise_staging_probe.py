@@ -47,10 +47,10 @@ def main():
 
     import torch
     from mooncake.engine import TransferEngine
-    from sglang_remote_attn.pinned_staging import PinnedKVStager
 
     from sglang.srt.disaggregation.common.staging_buffer import StagingAllocator
     from sglang.srt.disaggregation.common.staging_handler import DecodeStagingHandler
+    from sglang.srt.disaggregation.mooncake.pinned_staging_core import CorePinnedStager
     from sglang.srt.distributed.device_communicators.mooncake_transfer_engine import (
         MooncakeTransferEngine,
     )
@@ -84,8 +84,16 @@ def main():
             )
 
     manager._transfer_data = transfer
-    stager = PinnedKVStager(manager, args.source_device)
-    stager.reserve(src.numel())
+    stager = CorePinnedStager(sender)
+    stager.set_buffers(
+        list(src.unbind()), [b.data_ptr() for b in src], [args.item_bytes] * len(src)
+    )
+    stager.reserve(args.source_device)
+
+    def staged_transfer(target, plan):
+        ready.synchronize()
+        return stager.send(plan, lambda blocks: transfer(target, blocks))
+
     ready, busy_done = torch.cuda.Event(), torch.cuda.Event()
     source_stream = torch.cuda.default_stream(args.source_device)
     busy_device = (
@@ -177,8 +185,8 @@ def main():
                         torch.cuda._sleep(args.busy_cycles)
                     busy_done.record(busy_stream)
                 start = time.perf_counter()
-                operation = stager.send if staged else transfer
-                kwargs = {"ready_event": ready} if staged else {}
+                operation = staged_transfer if staged else transfer
+                kwargs = {}
                 rc = executor.submit(operation, session, blocks, **kwargs).result()
                 if rc != 0:
                     raise RuntimeError(
