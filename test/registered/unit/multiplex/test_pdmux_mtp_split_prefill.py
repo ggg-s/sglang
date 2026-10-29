@@ -17,10 +17,72 @@ from sglang.srt.speculative.dflash_worker_v2 import DFlashWorkerV2
 from sglang.srt.speculative.eagle_worker_v2 import EAGLEWorkerV2
 from sglang.srt.speculative.spec_info import SpeculativeAlgorithm
 from sglang.srt.speculative.spec_tp_sync import SpecTpSync, SpecTpSyncSite
+from sglang.srt.speculative.spec_utils import commit_mamba_states_after_verify
 from sglang.test.ci.ci_register import register_cpu_ci
 from sglang.test.test_utils import CustomTestCase
 
 register_cpu_ci(est_time=5, suite="base-a-test-cpu")
+
+
+class TestPDMuxMTPVerifyCommit(CustomTestCase):
+    def test_verify_commits_decode_slots_while_prefill_metadata_is_live(self):
+        """Equal P/D batch sizes must not silently commit into prefill slots.
+
+        Unequal sizes reproduce the reported scatter length mismatch. Exercise
+        both PDMux modes and the ordinary scheduler with the same acceptance.
+        """
+        for mode in ("layer_split", "standard"):
+            for pdmux in (False, True):
+                for prefill_slots in ([0], [0, 1]):
+                    with self.subTest(mode=mode, pdmux=pdmux, slots=prefill_slots):
+                        states = torch.full((10,), -1)
+                        intermediate = torch.tensor([[10, 11, 12], [20, 21, 22]])
+
+                        def backend(slots):
+                            def commit(*, last_correct_step_indices, **kwargs):
+                                self.assertEqual(
+                                    len(slots), len(last_correct_step_indices)
+                                )
+                                states[slots] = intermediate[
+                                    torch.arange(len(slots)), last_correct_step_indices
+                                ]
+
+                            return SimpleNamespace(
+                                update_mamba_state_after_mtp_verify=commit
+                            )
+
+                        decode = backend([3, 7])
+                        runner = SimpleNamespace(
+                            attn_backend=backend(prefill_slots) if pdmux else decode,
+                            decode_attn_backend=decode,
+                            model=object(),
+                            model_config=object(),
+                            req_to_token_pool=SimpleNamespace(mamba_pool=None),
+                        )
+                        batch = SimpleNamespace(
+                            forward_mode=ForwardMode.DECODE,
+                            mamba_track_indices=None,
+                            req_pool_indices=torch.tensor([5, 8]),
+                        )
+                        with (
+                            get_context().override_server_args(
+                                enable_pdmux=pdmux, pdmux_prefill_mode=mode
+                            ),
+                            patch(
+                                "sglang.srt.speculative.spec_utils.mambaish_config",
+                                return_value={},
+                            ),
+                        ):
+                            commit_mamba_states_after_verify(
+                                SimpleNamespace(model_runner=runner),
+                                batch,
+                                accept_lens=torch.tensor([2, 3], dtype=torch.int32),
+                                accept_index=torch.tensor([[0, 1, -1], [3, 4, 5]]),
+                                draft_token_num=3,
+                            )
+                        expected = torch.full_like(states, -1)
+                        expected[3], expected[7] = 11, 22
+                        torch.testing.assert_close(states, expected)
 
 
 class TestPDMuxMTPSplitPrefill(CustomTestCase):

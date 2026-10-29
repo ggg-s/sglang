@@ -158,6 +158,7 @@ class TestPdmuxTPAdmission(unittest.TestCase):
         cfg = NS(
             pdmux_prefill_mode="layer_split",
             speculative_algorithm="DFLASH",
+            enable_prefill_cp=False,
             tp_size=2,
             enable_dp_attention=False,
             ep_size=1,
@@ -172,7 +173,7 @@ class TestPdmuxTPAdmission(unittest.TestCase):
         check["check_pdmux_overlap"](cfg)
 
     def test_plain_tp_and_hicache_are_admitted(self):
-        for algorithm in ("DFLASH", "DSPARK"):
+        for algorithm in (None, "DFLASH", "DSPARK", "EAGLE"):
             for size in (1, 2, 4, 8):
                 with self.subTest(algorithm=algorithm, tp_size=size):
                     self.check(
@@ -182,19 +183,17 @@ class TestPdmuxTPAdmission(unittest.TestCase):
                     )
 
     def test_standard_mode_accepts_the_same_plain_tp_algorithms(self):
-        for algorithm in ("DFLASH", "DSPARK"):
+        for algorithm in (None, "DFLASH", "DSPARK", "EAGLE"):
             self.check(pdmux_prefill_mode="standard", speculative_algorithm=algorithm)
 
     def test_other_prefill_modes_and_algorithms_still_fail(self):
-        for overrides in (
-            dict(pdmux_prefill_mode="unknown"),
-            dict(speculative_algorithm="EAGLE"),
+        for overrides, message in (
+            (dict(pdmux_prefill_mode="unknown"), "layer_split or standard prefill"),
+            (dict(speculative_algorithm="EAGLE3"), "supports no speculation"),
         ):
             with (
                 self.subTest(overrides=overrides),
-                self.assertRaisesRegex(
-                    AssertionError, "layer_split or standard prefill and DFLASH"
-                ),
+                self.assertRaisesRegex(AssertionError, message),
             ):
                 self.check(**overrides)
 
@@ -461,7 +460,6 @@ def _exercise_chunked_scheduler(rank, group, *, overlap):
 
 def _exercise_standard_scheduler(rank, group):
     import torch.distributed as dist
-
     from test_pdmux_standard_prefill import (
         _Batch,
         _FakeScheduler,

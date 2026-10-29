@@ -1,0 +1,141 @@
+{
+  "environment": {
+    "base_source_commit": "9f16562144d9d586df408943058bc147c85a8cff",
+    "model_path": "/root/rivermind-data/models/Qwen/Qwen3.6-35B-A3B-FP8",
+    "architectures": [
+      "Qwen3_5MoeForConditionalGeneration"
+    ],
+    "mtp_num_hidden_layers": 1,
+    "quant_method": "fp8",
+    "torch": "2.14.1+cu130",
+    "python": "3.12.13",
+    "gpu_name": "NVIDIA RTX 6000D",
+    "gpu_sms": 156,
+    "file_sha256": {
+      "/root/rivermind-data/models/Qwen/Qwen3.6-35B-A3B-FP8/config.json": "570ef7ea45a7e1d3de2b1d3c70c4ac3562d0e768acdc195778cb4f4d95025845",
+      "/root/rivermind-data/models/Qwen/Qwen3.6-35B-A3B-FP8/model.safetensors.index.json": "6f176f344e41d35b17af12904e33401da5ebff3b49fccb8bfa0185bc2d50f9d6",
+      "/root/pdmux-swe-20261029/shim/sitecustomize.py": "25beb19fcfe5c0c629c3d9ba9ad46e537e90c1aa1eb0c4e4dd85d51a993f8c3b",
+      "/root/pdmux-mtp-fix-20261029/spec_utils.fixed.py": "f2c1122647a201b7acf61a5ab6c8d7733ead9911fe941c15df524af7c6f0917b"
+    },
+    "python_executable": "/root/rivermind-data/envs/sglang/bin/python"
+  },
+  "before_fix": {
+    "variant": "layer_split_graphs",
+    "passed": false,
+    "error": "ConnectionError: ('Connection aborted.', RemoteDisconnected('Remote end closed connection without response'))",
+    "prefills_with_running_decode": 2,
+    "draft_graph_replay": true,
+    "scatter_length_mismatch": true
+  },
+  "unit_baseline": "4 PDMux subtests failed; 4 ordinary scheduler subtests passed",
+  "unit_fixed": "243 tests and 288 subtests passed",
+  "variants": [
+    {
+      "variant": "baseline",
+      "passed": true,
+      "requests": 32,
+      "output_tokens": 6656,
+      "workload_seconds": 11.939276034012437,
+      "prefills_with_running_decode": 8,
+      "draft_graph_replay": false,
+      "scatter_length_mismatch": false,
+      "evidence_subdir": "fixed-fixed",
+      "layout": "fixed 72/80 SM"
+    },
+    {
+      "variant": "layer_split_graphs",
+      "passed": true,
+      "requests": 32,
+      "output_tokens": 6656,
+      "workload_seconds": 11.137811802793294,
+      "prefills_with_running_decode": 8,
+      "draft_graph_replay": true,
+      "scatter_length_mismatch": false,
+      "baseline_token_matches": 8,
+      "serial_baseline_token_matches": 5,
+      "evidence_subdir": "fixed-fixed",
+      "layout": "fixed 72/80 SM"
+    },
+    {
+      "variant": "standard_graphs",
+      "passed": true,
+      "requests": 32,
+      "output_tokens": 6656,
+      "workload_seconds": 10.809511876897886,
+      "prefills_with_running_decode": 8,
+      "draft_graph_replay": true,
+      "scatter_length_mismatch": false,
+      "baseline_token_matches": 7,
+      "serial_baseline_token_matches": 5,
+      "evidence_subdir": "fixed-fixed",
+      "layout": "fixed 72/80 SM"
+    },
+    {
+      "variant": "layer_split_graphs",
+      "passed": true,
+      "requests": 32,
+      "output_tokens": 6656,
+      "workload_seconds": 10.648031146964058,
+      "prefills_with_running_decode": 8,
+      "draft_graph_replay": true,
+      "scatter_length_mismatch": false,
+      "evidence_subdir": "fixed-full",
+      "layout": "full SM"
+    },
+    {
+      "variant": "standard_graphs",
+      "passed": true,
+      "requests": 32,
+      "output_tokens": 6656,
+      "workload_seconds": 10.700589986983687,
+      "prefills_with_running_decode": 8,
+      "draft_graph_replay": true,
+      "scatter_length_mismatch": false,
+      "evidence_subdir": "fixed-full",
+      "layout": "full SM"
+    },
+    {
+      "variant": "baseline_eager",
+      "passed": true,
+      "requests": 32,
+      "output_tokens": 6656,
+      "workload_seconds": 54.42697009094991,
+      "prefills_with_running_decode": 8,
+      "draft_graph_replay": false,
+      "scatter_length_mismatch": false,
+      "evidence_subdir": "eager-real",
+      "layout": "baseline"
+    },
+    {
+      "variant": "layer_split_eager",
+      "passed": true,
+      "requests": 32,
+      "output_tokens": 6656,
+      "workload_seconds": 54.31140443496406,
+      "prefills_with_running_decode": 8,
+      "draft_graph_replay": false,
+      "scatter_length_mismatch": false,
+      "baseline_token_matches": 8,
+      "serial_baseline_token_matches": 5,
+      "evidence_subdir": "eager-real",
+      "layout": "full SM"
+    },
+    {
+      "variant": "standard_eager",
+      "passed": true,
+      "requests": 32,
+      "output_tokens": 6656,
+      "workload_seconds": 49.335799844004214,
+      "prefills_with_running_decode": 8,
+      "draft_graph_replay": false,
+      "scatter_length_mismatch": false,
+      "baseline_token_matches": 5,
+      "serial_baseline_token_matches": 5,
+      "evidence_subdir": "eager-real",
+      "layout": "full SM"
+    }
+  ],
+  "server_evidence_dir": "/root/pdmux-mtp-fix-20261029",
+  "token_parity_note": "FP8 greedy outputs are not all bitwise identical. Logit probe shows newline candidates with tied highest logits in PDMux versus 0.125-0.25 separation in the control; this is not a full token-parity acceptance.",
+  "validation_scope": "Runtime crash regression, live prefill/decode, graph/eager routing, repeated prefix reuse; no throughput/quality claim."
+}

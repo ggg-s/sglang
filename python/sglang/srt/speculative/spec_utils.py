@@ -48,6 +48,7 @@ from sglang.srt.mem_cache.allocation import (
 from sglang.srt.mem_cache.allocation import (
     assign_req_to_token_pool_func as assign_req_to_token_pool_func,
 )
+from sglang.srt.multiplex.pdmux_context import decode_lane_attn_backend
 from sglang.srt.runtime_context import (
     get_exec,
     get_spec,
@@ -1018,7 +1019,10 @@ def commit_mamba_states_after_verify(
         )
         return
 
-    attn_backend = model_runner.attn_backend
+    # Verify runs on the decode lane. The prefill backend may hold metadata
+    # for an in-flight batch with different request/state slots, even between
+    # layer-split segments; commit through the backend that ran verify.
+    attn_backend = decode_lane_attn_backend(model_runner)
 
     bs = accept_lens.shape[0]
     # `accept_lens` already includes the bonus token (drafts + 1 per req).

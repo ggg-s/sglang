@@ -4,6 +4,7 @@ from unittest.mock import MagicMock, patch
 import torch
 
 import sglang.srt
+from sglang.srt.runtime_context import get_context
 from sglang.test.ci.ci_register import register_cpu_ci
 from sglang.test.test_utils import CustomTestCase
 
@@ -94,6 +95,10 @@ class TestNgramLastCorrectStepIndices(CustomTestCase):
 
 
 class TestNgramMambaVerifyUpdate(CustomTestCase):
+    def setUp(self):
+        super().setUp()
+        self.enterContext(get_context().override_server_args(enable_pdmux=False))
+
     def _make_mock_target_worker(self):
         target_worker = MagicMock()
         target_worker.model_runner.model = MagicMock()
