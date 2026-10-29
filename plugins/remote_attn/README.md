@@ -41,6 +41,12 @@ nonblocking CUDA stream and registered pinned host storage before native TE send
 This preserves native batching and the send lock; ordinary PD and Post-Remote
 transfers keep their existing paths. Set `HANDOFF_PRE_LAYERWISE_HOST_STAGING=0`
 for the GPU-pointer control. Failed/uncertain sends quarantine staging storage.
+Set `HANDOFF_PRE_LAYERWISE_RECV_HOST_STAGING=1` on D to independently enable
+registered host destinations and private-stream H2D (default: off). Each layer
+group becomes Local only after its GPU-complete ACK. A request/rank owns one
+maximum-group-sized slot; native sub-batch limits remain unchanged. Failed or
+uncertain receives retain storage and KV. See the [P5.19 guide](P5.19-PRE-LAYERWISE-ZH.md)
+for memory costs, lifecycle details, and the receiver GPU probe.
 The [functional parity checklist](FUNCTIONAL-PARITY.md) maps the supplied
 P0–P5.18 features to this port and distinguishes code coverage from deployment acceptance.
 
@@ -116,7 +122,7 @@ PYTHONPATH=plugins/remote_attn python -m sglang_remote_attn.check --source-only
 
 ## Local validation
 
-- 36 CPU contract tests passed, using real CPU PyTorch tensors and source-loaded
+- 56 CPU contract tests passed, using real CPU PyTorch tensors and source-loaded
   upstream pool/KV methods. The local environment lacks the full SGLang model/eval
   dependencies, so its reduced test harness also source-loaded the repository's
   `CustomTestCase`; full installed-runtime import was not exercised locally.
@@ -126,7 +132,7 @@ PYTHONPATH=plugins/remote_attn python -m sglang_remote_attn.check --source-only
 - Transfer tests cover a three-buffer/one-slot ACK cycle, rank device selection,
   source staging reuse, receiver/source fences, unknown TE completion, RPC
   stream fences, incomplete-layer wakeups and teardown failures.
-- All 16 hook targets and their positional/keyword call shapes match this checkout.
+- All 21 hook targets and their positional/keyword call shapes match this checkout.
 - Python compilation, Ruff F checks, isort and formatting, shell syntax, wheel build and
   wheel entry-point metadata checks passed.
 - Launcher checks captured the real shell commands and environment without starting

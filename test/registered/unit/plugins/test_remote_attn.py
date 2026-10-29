@@ -59,6 +59,13 @@ class _HostStagingSlot:
             ctypes.memmove(self.ptr + offset, src, size)
             offset += size
 
+    def copy_to_device(self, blocks):
+        self.h2d_blocks = blocks
+        offset = 0
+        for dst, size in blocks:
+            ctypes.memmove(dst, self.ptr + offset, size)
+            offset += size
+
     def close(self):
         self.closed = True
 
@@ -1975,8 +1982,10 @@ class TestRemoteAttn(CustomTestCase):
                 pending.clear()
 
         def memcpy(dst, src, size, kind, raw):
-            self.assertEqual((kind, raw), (2, 17))
-            self.assertEqual(waited[-1:], [ready])
+            self.assertEqual(raw, 17)
+            self.assertIn(kind, (1, 2))
+            if kind == 2:
+                self.assertEqual(waited[-1:], [ready])
             pending.append((dst, src, size))
             return (0,)
 
@@ -1988,7 +1997,9 @@ class TestRemoteAttn(CustomTestCase):
             cudaStreamNonBlocking=1,
             cudaStreamCreateWithFlags=lambda f: (flags.append(f) or 0, 17),
             cudaStreamDestroy=lambda raw: (destroyed.append(raw) or 0,),
-            cudaMemcpyKind=SimpleNamespace(cudaMemcpyDeviceToHost=2),
+            cudaMemcpyKind=SimpleNamespace(
+                cudaMemcpyDeviceToHost=2, cudaMemcpyHostToDevice=1
+            ),
             cudaMemcpyAsync=memcpy,
         )
         with (
@@ -2016,6 +2027,12 @@ class TestRemoteAttn(CustomTestCase):
             ]
             self.assertEqual(stager.send("peer", blocks, ready_event=ready), 0)
             self.assertEqual(received, [b"efgh", b"abcd"])
+            destination = ctypes.create_string_buffer(8)
+            ptr = ctypes.addressof(destination)
+            stager.slot.copy_to_device([(ptr + 4, 4), (ptr, 4)])
+            # Event completion, not async submission, makes these bytes visible.
+            self.assertEqual(destination.raw, b"abcdefgh")
+            self.assertEqual(pending, [])
             self.assertTrue(stager.close())
         self.assertEqual(flags, [1, 1])
         self.assertEqual(destroyed, [17, 17])
@@ -2127,6 +2144,75 @@ class TestRemoteAttn(CustomTestCase):
                         None,
                         transfer_fn=stager.send,
                     )
+                # Exercise the same native Batch=8 mapping through BOTH adapters.
+                from sglang_remote_attn.receive_staging import (
+                    HostDestination,
+                    ReceiveStaging,
+                )
+
+                pl = self.hooks.pre_layerwise
+                with tempfile.TemporaryDirectory() as directory:
+                    path = Path(directory)
+                    rx_manager = _host_staging_manager()
+                    rx_manager.kv_args = SimpleNamespace(
+                        kv_data_ptrs=[t.data_ptr() for t in dst],
+                        kv_item_lens=[2] * 4,
+                        kv_layer_ids=[],
+                    )
+                    rx = ReceiveStaging(
+                        rx_manager,
+                        rank,
+                        path,
+                        "native",
+                        dst_indices,
+                        2,
+                        3,
+                        slot_factory=_HostStagingSlot,
+                    )
+                    source = pl.Source(
+                        SimpleNamespace(
+                            config=pl.Config("remote", path, drain_timeout=3)
+                        ),
+                        SimpleNamespace(
+                            disagg_kv_sender=SimpleNamespace(kv_mgr=manager)
+                        ),
+                        path,
+                        "native",
+                        src_indices,
+                        slice(0, len(src_indices)),
+                        ((SimpleNamespace(mooncake_session_id=f"peer-{rank}"), None),),
+                        len(src_indices),
+                        stager=stager,
+                    )
+                    groups = pl.buffer_groups([0, 1, 0, 1], 2, 1)
+                    source.destination = HostDestination(source, groups)
+                    batches.clear()
+                    for tensor in dst:
+                        tensor.fill_(255)
+                    for layers, buffers in groups:
+                        rc = manager.send_kvcache(
+                            f"peer-{rank}",
+                            src_indices,
+                            [t.data_ptr() for t in dst],
+                            dst_indices,
+                            None,
+                            dst_attn_tp_size=2,
+                            kv_buffer_indices=buffers,
+                            transfer_fn=functools.partial(
+                                source.destination.transfer, layers, ready
+                            ),
+                        )
+                        self.assertEqual(rc, 0)
+                        source.complete(layers)
+                        # Sorted target runs merge across native batch boundaries.
+                        self.assertEqual(len(rx.storage.slot.h2d_blocks), 16)
+                    self.assertEqual(batches, [32, 32, 4] * 2)
+                    for i in range(4):
+                        expected = torch.full_like(dst[i], 255)
+                        expected[dst_indices] = src[i][src_indices]
+                        self.assertTrue(torch.equal(dst[i], expected))
+                    rx.close()
+                    self.assertFalse(rx_manager.registrations)
                 self.assertTrue(stager.close())
                 self.assertFalse(manager.registrations)
 
@@ -2176,7 +2262,9 @@ class TestRemoteAttn(CustomTestCase):
                     stager.reserve(16)
                 pl = self.hooks.pre_layerwise
                 req = SimpleNamespace(
-                    _pre_layerwise_source=SimpleNamespace(stager=stager)
+                    _pre_layerwise_source=SimpleNamespace(
+                        stager=stager, error=None, destination=None
+                    )
                 )
                 with self.assertRaisesRegex(RuntimeError, "retaining source KV"):
                     pl.defer_release(req, lambda: self.fail("unsafe KV release"))
@@ -2242,6 +2330,287 @@ class TestRemoteAttn(CustomTestCase):
         self.assertEqual(payloads, [b"aaaa", b"bbbb"])
         self.assertTrue(stager.close())
 
+    def test_prelayer_receive_staging_gates_local_and_reuses_after_h2d(self):
+        """A completed network write cannot expose a layer or overwrite its slot."""
+        from sglang_remote_attn.pinned_staging import PinnedKVStager
+        from sglang_remote_attn.receive_staging import HostDestination, ReceiveStaging
+
+        pl = self.hooks.pre_layerwise
+        for rank, source_staging in ((0, False), (1, True)):
+            with (
+                self.subTest(rank=rank, source_staging=source_staging),
+                tempfile.TemporaryDirectory() as directory,
+            ):
+                path = Path(directory)
+                started, allow_copy = threading.Event(), threading.Event()
+
+                class Slot(_HostStagingSlot):
+                    def copy_to_device(self, blocks):
+                        started.set()
+                        if not allow_copy.wait(3):
+                            raise TimeoutError("test H2D fence")
+                        offset = 0
+                        for dst, n in blocks:
+                            ctypes.memmove(dst, self.ptr + offset, n)
+                            offset += n
+
+                destination = [
+                    ctypes.create_string_buffer(b"........") for _ in range(4)
+                ]
+                ptrs = [ctypes.addressof(b) for b in destination]
+                manager = _host_staging_manager()
+                manager.kv_args = SimpleNamespace(
+                    kv_data_ptrs=ptrs, kv_item_lens=[1] * 4, kv_layer_ids=[]
+                )
+                receiver = ReceiveStaging(
+                    manager,
+                    rank,
+                    path,
+                    "current",
+                    [6, 2, 4, 1],
+                    2,
+                    3,
+                    slot_factory=Slot,
+                )
+                self.addCleanup(allow_copy.set)
+                sender = _host_staging_manager()
+                calls = []
+
+                def transfer(session, blocks):
+                    calls.append(blocks)
+                    for src, dst, n in blocks:
+                        ctypes.memmove(dst, src, n)
+                    return 0
+
+                sender._transfer_data = transfer
+                stager = (
+                    PinnedKVStager(sender, rank, slot_factory=_HostStagingSlot)
+                    if source_staging
+                    else None
+                )
+                if stager:
+                    stager.reserve(4)
+                source = pl.Source(
+                    SimpleNamespace(config=pl.Config("remote", path, drain_timeout=3)),
+                    SimpleNamespace(disagg_kv_sender=SimpleNamespace(kv_mgr=sender)),
+                    path,
+                    "current",
+                    None,
+                    slice(1, 4),
+                    ((SimpleNamespace(mooncake_session_id="peer"), None),),
+                    4,
+                    stager=stager,
+                )
+                groups = pl.buffer_groups([0, 1, 0, 1], 2, 1)
+                adapter = source.destination = HostDestination(source, groups)
+                ready = threading.Event()
+                ready.set()
+                state = SimpleNamespace(
+                    events=[threading.Event(), threading.Event()],
+                    layer_ready_at=[None, None],
+                    import_done_at=None,
+                )
+                target = pl.Target(
+                    None,
+                    None,
+                    None,
+                    path,
+                    "current",
+                    pl.LayerCoverage(4, 2),
+                    state,
+                    receive_staging=receiver,
+                )
+                payload = ctypes.create_string_buffer(b"abcXYZ")
+                expected = [b"........"] * 4
+                for group_index, (layers, buffers) in enumerate(groups):
+                    blocks = [
+                        (ctypes.addressof(payload) + j, ptrs[buffer] + token, 1)
+                        for j, (buffer, token) in enumerate(
+                            (b, t) for b in buffers for t in (2, 4, 1)
+                        )
+                    ]
+                    # Distinct native sub-batches accumulate into ONE group slot.
+                    for chunk in (blocks[:2], blocks[2:]):
+                        self.assertEqual(
+                            adapter.transfer(layers, ready, "peer", chunk), 0
+                        )
+                    self.assertTrue(
+                        all(
+                            adapter.ptr <= dst < adapter.ptr + adapter.capacity
+                            for call in calls
+                            for _, dst, _ in call
+                        )
+                    )
+                    errors = []
+
+                    def complete():
+                        try:
+                            source.complete(layers)
+                        except Exception as exc:
+                            errors.append(exc)
+
+                    completion = threading.Thread(target=complete)
+                    completion.start()
+                    self.assertTrue(started.wait(3))
+                    if group_index == 0:
+                        target.refresh()
+                        self.assertFalse(state.events[0].is_set())
+                        self.assertFalse((path / "rx-ack-0.json").exists())
+                        self.assertTrue(completion.is_alive())
+                        self.assertEqual([b.raw[:8] for b in destination], expected)
+                    allow_copy.set()
+                    completion.join(3)
+                    self.assertFalse(completion.is_alive())
+                    self.assertEqual(errors, [])
+                    target.refresh()
+                    self.assertTrue(state.events[group_index].is_set())
+                    # Prefix/middle-chunk token 6 and unrelated/decode rows stay intact.
+                    expected[buffers[0]] = b".ca.b..."
+                    expected[buffers[1]] = b".ZX.Y..."
+                    self.assertEqual([b.raw[:8] for b in destination], expected)
+                    self.assertEqual(adapter.offset, 0)
+                receiver.close()
+                receiver.close()
+                self.assertEqual(manager.registrations, {})
+                if stager:
+                    self.assertTrue(stager.close())
+
+    def test_prelayer_receive_staging_rejects_wrong_rows_and_retains_on_failure(self):
+        """Wrong generation, missing bytes or H2D failure cannot publish GPU-ready."""
+        from sglang_remote_attn.receive_staging import ReceiveStaging, _wait
+
+        pl = self.hooks.pre_layerwise
+        for failure in ("wrong-row", "missing-bytes", "copy", "stale-generation"):
+            with (
+                self.subTest(failure=failure),
+                tempfile.TemporaryDirectory() as directory,
+            ):
+                path = Path(directory)
+                dst = ctypes.create_string_buffer(b"........")
+                ptr = ctypes.addressof(dst)
+                manager = _host_staging_manager()
+                manager.kv_args = SimpleNamespace(
+                    kv_data_ptrs=[ptr, ptr + 4], kv_item_lens=[1, 1], kv_layer_ids=[]
+                )
+
+                class Slot(_HostStagingSlot):
+                    def copy_to_device(self, blocks):
+                        raise RuntimeError("injected H2D failure")
+
+                rx = ReceiveStaging(
+                    manager, 0, path, "current", [0, 1], 1, 0.1, slot_factory=Slot
+                )
+                pl.write_json(
+                    path / "rx-plan.json",
+                    dict(generation="current", start=1, end=2, groups=[[0]]),
+                )
+                _wait(path / "rx-slot.json", "current", 3)
+                blocks = [[ptr + 1, 1], [ptr + 5, 1]]
+                if failure == "wrong-row":
+                    blocks[0][0] = ptr + 2
+                if failure == "missing-bytes":
+                    blocks.pop()
+                pl.write_json(
+                    path / "rx-group-0.json",
+                    dict(
+                        generation="old"
+                        if failure == "stale-generation"
+                        else "current",
+                        layers=[0],
+                        blocks=blocks,
+                    ),
+                )
+                rx.thread.join(3)
+                self.assertFalse(rx.thread.is_alive())
+                self.assertIsNotNone(rx.error)
+                self.assertFalse((path / "rx-ack-0.json").exists())
+                self.assertEqual(dst.raw[:8], b"........")
+                with self.assertRaisesRegex(RuntimeError, "retaining KV"):
+                    pl.defer_release(
+                        SimpleNamespace(_pre_layerwise_receive=rx), lambda: None
+                    )
+                self.assertTrue(manager.registrations)
+                self.assertIn(rx.storage, manager.engine._pre_layerwise_staging_owners)
+
+    def test_prelayer_receive_ack_failure_never_publishes_layer_proof(self):
+        """Host-write success alone cannot authorize Local or source KV recycling."""
+        from sglang_remote_attn.receive_staging import HostDestination
+
+        pl = self.hooks.pre_layerwise
+        for failure in ("stale-ack", "failed-send", "missing-bytes", "wrong-session"):
+            with (
+                self.subTest(failure=failure),
+                tempfile.TemporaryDirectory() as directory,
+            ):
+                path = Path(directory)
+                pl.write_json(
+                    path / "rx-slot.json",
+                    dict(generation="current", ptr=100, capacity=2, groups=[[[10, 2]]]),
+                )
+                manager = SimpleNamespace(
+                    _transfer_data=lambda session, blocks: (
+                        -1 if failure == "failed-send" else 0
+                    )
+                )
+                source = pl.Source(
+                    SimpleNamespace(
+                        config=pl.Config("layerwise", path, drain_timeout=0.02)
+                    ),
+                    SimpleNamespace(disagg_kv_sender=SimpleNamespace(kv_mgr=manager)),
+                    path,
+                    "current",
+                    None,
+                    slice(0, 1),
+                    ((SimpleNamespace(mooncake_session_id="peer"), None),),
+                    1,
+                )
+                adapter = source.destination = HostDestination(source, [((0,), (0, 1))])
+                if failure == "wrong-session":
+                    with self.assertRaisesRegex(RuntimeError, "session changed"):
+                        adapter.transfer((0,), None, "other", [(1, 10, 2)])
+                else:
+                    adapter.transfer(
+                        (0,),
+                        None,
+                        "peer",
+                        [(1, 10, 1 if failure == "missing-bytes" else 2)],
+                    )
+                pl.write_json(
+                    path / "rx-ack-0.json", dict(generation="old", layers=[0])
+                )
+                with self.assertRaises((RuntimeError, TimeoutError, ValueError)):
+                    source.complete((0,))
+                self.assertFalse((path / "layer-0.json").exists())
+                self.assertTrue(adapter.poisoned)
+                with self.assertRaisesRegex(RuntimeError, "retaining source KV"):
+                    pl.defer_release(
+                        SimpleNamespace(_pre_layerwise_source=source), lambda: None
+                    )
+
+    def test_prelayer_receive_unused_offer_has_no_pinned_allocation(self):
+        """Ordinary PD / auto-group fallback must not leak a receive worker or slot."""
+        from sglang_remote_attn.receive_staging import ReceiveStaging
+
+        with tempfile.TemporaryDirectory() as directory:
+            manager = _host_staging_manager()
+            manager.kv_args = SimpleNamespace(
+                kv_data_ptrs=[10, 20], kv_item_lens=[1, 1], kv_layer_ids=[]
+            )
+            rx = ReceiveStaging(
+                manager,
+                0,
+                Path(directory),
+                "current",
+                [0],
+                1,
+                1,
+                slot_factory=lambda *args: self.fail("unused offer allocated memory"),
+            )
+            rx.close()
+            self.assertFalse(rx.thread.is_alive())
+            self.assertEqual(manager.registrations, {})
+            self.assertEqual(manager.engine._pre_layerwise_staging_owners, [])
+
     def test_prelayer_auto_grouping_uses_chunk_work_not_prompt_length(self):
         """Small tails keep Remote; long chunks use fewer, larger transfers."""
         pl = self.hooks.pre_layerwise
@@ -2253,6 +2622,16 @@ class TestRemoteAttn(CustomTestCase):
             ):
                 config = pl.Config.from_env()
                 self.assertFalse(config.host_staging)
+                self.assertFalse(config.recv_host_staging)
+                with patch.dict(
+                    os.environ, {"HANDOFF_PRE_LAYERWISE_RECV_HOST_STAGING": "1"}
+                ):
+                    self.assertTrue(pl.Config.from_env().recv_host_staging)
+                with patch.dict(
+                    os.environ, {"HANDOFF_PRE_LAYERWISE_RECV_HOST_STAGING": "yes"}
+                ):
+                    with self.assertRaises(ValueError):
+                        pl.Config.from_env()
                 with patch.dict(os.environ, {"MC_FORCE_TCP": "1"}):
                     self.assertTrue(pl.Config.from_env().host_staging)
                     with patch.dict(

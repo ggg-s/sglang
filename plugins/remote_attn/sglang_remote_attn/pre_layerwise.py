@@ -47,6 +47,7 @@ class Config:
     group_size: int = 0
     drain_timeout: float = 300.0
     host_staging: bool = False
+    recv_host_staging: bool = False
 
     @classmethod
     def from_env(cls):
@@ -73,7 +74,12 @@ class Config:
         )
         if staging not in ("0", "1"):
             raise ValueError("HANDOFF_PRE_LAYERWISE_HOST_STAGING must be 0 or 1")
-        return cls(mode, Path(root).resolve(), group, timeout, staging == "1")
+        receive = os.environ.get("HANDOFF_PRE_LAYERWISE_RECV_HOST_STAGING", "0")
+        if receive not in ("0", "1"):
+            raise ValueError("HANDOFF_PRE_LAYERWISE_RECV_HOST_STAGING must be 0 or 1")
+        return cls(
+            mode, Path(root).resolve(), group, timeout, staging == "1", receive == "1"
+        )
 
     def select_group_size(self, layers, transfer_tokens, average_tokens):
         """Select layer groups from the scheduler's actual batch, never re-chunk it.
@@ -176,12 +182,15 @@ class Source:
     group_size: int = 0
     prefill_chunk_tokens: int | None = None
     stager: object = None
+    destination: object = None
 
     def complete(self, layers):
+        if self.destination is not None:
+            self.destination.complete(layers)
         # add_transfer_request shards a room onto one FIFO. Earlier ordinary
         # chunks have settled before this final-chunk subset runs. Thus this
-        # proof covers [0, prefix_len), not merely the final chunk. Staging,
-        # relayout and multi-destination fanout are explicitly disallowed.
+        # proof covers [0, prefix_len), not merely the final chunk. Native
+        # staging, relayout and multi-destination fanout remain disallowed.
         for layer in layers:
             write_json(
                 self.path / f"layer-{layer}.json",
@@ -212,6 +221,7 @@ class Source:
                 "prefill_chunk_tokens": self.prefill_chunk_tokens,
                 "layer_group_size": self.group_size,
                 "host_staging": self.stager is not None,
+                "recv_host_staging": self.destination is not None,
                 "at": time.monotonic(),
             },
         )
@@ -327,8 +337,11 @@ class Target:
     coverage: LayerCoverage
     state: object = None
     closed: bool = False
+    receive_staging: object = None
 
     def refresh(self):
+        if self.receive_staging is not None:
+            self.receive_staging.check()
         failure = read_json(self.path / "error.json")
         if failure and failure.get("generation") == self.generation:
             raise RuntimeError(f"pre-layerwise peer failed: {failure['error']}")
@@ -366,6 +379,7 @@ class Target:
             self.coverage.ready(i) for i in range(self.coverage.layers)
         ):
             raise RuntimeError("canonical completion without all layer proofs")
+        self.close_staging()
         # Called only between forwards or from release_kv_cache. No next step
         # can snapshot a Remote mask after the state is removed.
         _runtime()._drop_target_state_for(self.decode_req.req)
@@ -394,6 +408,13 @@ class Target:
         self.closed = True
         self.decode_req.req._pre_layerwise_target = None
 
+    def close_staging(self):
+        if self.receive_staging is not None:
+            self.receive_staging.close()
+            self.decode_req.req._pre_layerwise_receive = None
+            if self.receive_staging in self.owner.receivers:
+                self.owner.receivers.remove(self.receive_staging)
+
 
 class Controller:
     def __init__(self, scheduler, config):
@@ -408,6 +429,7 @@ class Controller:
         self.batches = 0
         self.early_admissions = 0
         self.stager = None
+        self.receivers = []
 
     def validate(self):
         from sglang.srt.runtime_context import get_disagg, get_exec, get_memory
@@ -471,6 +493,28 @@ class Controller:
             generation,
             LayerCoverage(len(dr.req.origin_input_ids), self.layers),
         )
+        if self.config.recv_host_staging:
+            from .receive_staging import ReceiveStaging
+
+            # Capture the allocated prompt row before decode can append tokens.
+            indices = (
+                self.scheduler.req_to_token_pool.req_to_token[
+                    dr.req.kv.req_pool_idx, : target.coverage.prefix_len
+                ]
+                .to("cpu")
+                .tolist()
+            )
+            target.receive_staging = ReceiveStaging(
+                mgr,
+                self.scheduler.tp_worker.model_runner.gpu_id,
+                path,
+                generation,
+                indices,
+                self.layers,
+                self.config.drain_timeout,
+            )
+            dr.req._pre_layerwise_receive = target.receive_staging
+            self.receivers.append(target.receive_staging)
         write_json(
             root / "offer.json",
             {
@@ -480,6 +524,7 @@ class Controller:
                 "tp_size": self.tp_size,
                 "layers": self.layers,
                 "mode": self.config.mode,
+                "recv_host_staging": self.config.recv_host_staging,
             },
         )
         dr._pre_layerwise_offer = target
@@ -641,18 +686,27 @@ class Controller:
             req._pre_layerwise_source = source
             req.start_send_idx = req.extend_end
             self.sources.append(source)
+            if offer.get("recv_host_staging", False):
+                from .receive_staging import HostDestination
+
+                try:
+                    source.destination = HostDestination(source, groups)
+                except Exception as exc:
+                    source.error = str(exc)
+                    raise
             jobs.append((source, groups))
         if jobs:
             self.batches += 1
             logger.info(
                 "pre-layerwise batch=%s requests=%s group_size=%s "
-                "pipelined_tokens=%s policy=%s host_staging=%s",
+                "pipelined_tokens=%s policy=%s host_staging=%s receive_staged_requests=%s",
                 self.batches,
                 len(jobs),
                 group_size,
                 transfer_tokens,
                 "fixed" if self.config.group_size else "auto",
                 self.config.host_staging,
+                sum(source.destination is not None for source, _ in jobs),
             )
         return jobs or None
 
@@ -686,7 +740,13 @@ class Controller:
                         kv_buffer_indices=groups[group_index][1],
                         on_complete=functools.partial(source.complete, layers),
                         transfer_fn=(
-                            functools.partial(source.stager.send, ready_event=event)
+                            functools.partial(
+                                source.destination.transfer, layers, event
+                            )
+                            if source.destination is not None
+                            else functools.partial(
+                                source.stager.send, ready_event=event
+                            )
                             if source.stager is not None
                             else None
                         ),
@@ -713,9 +773,10 @@ class Controller:
         offered = [self.offer(queue, dr) for dr in queue.queue]
         candidates = []
         for target in offered:
+            if target is not None:
+                target.refresh()
             ready = None
             if target is not None and self.config.mode == "remote":
-                target.refresh()
                 data = read_json(target.path / "ready.json")
                 dr = target.decode_req
                 allowed = rids_to_check is None or dr.req.rid in rids_to_check
@@ -866,6 +927,7 @@ def pop_transferred(original, queue, rids_to_check=None):
     ordinary = original(queue, rids_to_check)
     for target in offered:
         if target is not None and any(req is target.decode_req.req for req in ordinary):
+            target.close_staging()
             write_json(
                 target.path / "done.json",
                 {
@@ -879,7 +941,11 @@ def pop_transferred(original, queue, rids_to_check=None):
 
 def defer_release(req, release):
     source = getattr(req, "_pre_layerwise_source", None)
-    if source is not None and source.stager is not None and source.stager.poisoned:
+    if source is not None and (
+        source.error is not None
+        or (source.stager is not None and source.stager.poisoned)
+        or (source.destination is not None and source.destination.poisoned)
+    ):
         raise RuntimeError("pre-layerwise staging is unsettled; retaining source KV")
     if source is not None and source.owner.config.mode == "remote":
         if not source.finalized:
@@ -889,6 +955,10 @@ def defer_release(req, release):
         if source.release is None:
             source.release = release
         return True
+    receive = getattr(req, "_pre_layerwise_receive", None)
+    if receive is not None:
+        receive.close()
+        req._pre_layerwise_receive = None
     target = getattr(req, "_pre_layerwise_target", None)
     if target is not None:
         target.finish(wait=True)
@@ -899,6 +969,9 @@ def poll(scheduler):
     controller = getattr(scheduler, "_pre_layerwise", None)
     if controller is not None:
         controller.poll_sources()
+        controller.receivers[:] = [
+            r for r in controller.receivers if not r.storage.closed
+        ]
 
 
 def is_fully_idle(original, scheduler, for_health_check=False, ignore_waiting=False):
@@ -932,5 +1005,7 @@ def shutdown(scheduler):
             if time.monotonic() >= deadline:
                 raise RuntimeError("native PD writes remain active during shutdown")
             time.sleep(0.005)
+    for receive in controller.receivers:
+        receive.close()
     if controller.stager is not None and not controller.stager.close():
         raise RuntimeError("pre-layerwise staging remains quarantined during shutdown")
