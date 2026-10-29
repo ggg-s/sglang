@@ -1894,6 +1894,44 @@ class TestRemoteAttn(CustomTestCase):
                 else:
                     self.assertNotIn("proof", events)
 
+    def test_prelayer_auto_grouping_uses_chunk_work_not_prompt_length(self):
+        """Small tails keep Remote; long chunks use fewer, larger transfers."""
+        pl = self.hooks.pre_layerwise
+        for mode in ("layerwise", "remote"):
+            with patch.dict(
+                os.environ,
+                {"HANDOFF_PRE_LAYERWISE": mode, "HANDOFF_PD_DIR": "/tmp/unused"},
+                clear=True,
+            ):
+                config = pl.Config.from_env()
+            with self.subTest(mode=mode):
+                self.assertEqual(
+                    config.select_group_size(36, 2048, 2048),
+                    36 if mode == "remote" else 0,
+                )
+                # A large middle chunk must not make a tiny eligible tail
+                # cross the minimum pipelined-transfer threshold.
+                self.assertEqual(
+                    config.select_group_size(36, 2048, 32768),
+                    36 if mode == "remote" else 0,
+                )
+                sizes = [
+                    config.select_group_size(36, tokens, tokens)
+                    for tokens in (3072, 4096, 8192, 16384, 32768)
+                ]
+                self.assertEqual(sizes, sorted(sizes))
+                self.assertEqual(sizes[-1], 9)
+                # Every layer's K and V is still covered exactly once.
+                for size in sizes:
+                    groups = pl.buffer_groups(list(range(36)) * 2, 36, size)
+                    self.assertEqual(
+                        sorted(i for _, buffers in groups for i in buffers),
+                        list(range(72)),
+                    )
+                self.assertGreater(config.select_group_size(36, 4096, 2048), 0)
+                fixed = pl.Config(mode, Path("unused"), 4)
+                self.assertEqual(fixed.select_group_size(36, 2048, 2048), 4)
+
     def test_prelayer_chunk_tail_reserves_once_and_preserves_middle_chunks(self):
         pl = self.hooks.pre_layerwise
         sender_cls = _source_class(
@@ -1908,7 +1946,7 @@ class TestRemoteAttn(CustomTestCase):
                 dst_attn_tp_size=1,
                 requires_dcp_relayout=False,
                 dst_kv_layer_ids=[],
-                dst_kv_ptrs=[11, 22, 33, 44],
+                dst_kv_ptrs=list(range(100, 172)),
             )
             sender = sender_cls()
             sender.kv_mgr = SimpleNamespace(
@@ -1920,7 +1958,7 @@ class TestRemoteAttn(CustomTestCase):
                 enable_all_cp_ranks_for_transfer=False,
                 is_dummy_cp_rank=False,
                 kv_args=SimpleNamespace(
-                    kv_layer_ids=[], kv_data_ptrs=[1, 2, 3, 4], state_data_ptrs=[]
+                    kv_layer_ids=[], kv_data_ptrs=list(range(72)), state_data_ptrs=[]
                 ),
             )
             sender.curr_idx, sender.num_kv_indices = 4, 9
@@ -1931,6 +1969,7 @@ class TestRemoteAttn(CustomTestCase):
                 pending_bootstrap=False,
                 inflight_middle_chunks=1,
                 extend_end=9,
+                extend_len=5,
                 origin_input_ids=list(range(9)),
                 multimodal_inputs=None,
                 input_embeds=None,
@@ -1953,12 +1992,13 @@ class TestRemoteAttn(CustomTestCase):
             controller = pl.Controller.__new__(pl.Controller)
             controller.scheduler = SimpleNamespace(
                 disaggregation_mode="prefill",
+                chunked_prefill_size=32768,
                 req_to_token_pool=SimpleNamespace(
                     req_to_token=torch.arange(100, 109, dtype=torch.int32).reshape(1, 9)
                 ),
             )
             controller.config = pl.Config("remote", root, 1)
-            controller.rank, controller.tp_size, controller.layers = 0, 1, 2
+            controller.rank, controller.tp_size, controller.layers = 0, 1, 36
             controller.sources, controller.batches = [], 0
             pl.write_json(
                 root / "7/0/offer.json",
@@ -1967,7 +2007,7 @@ class TestRemoteAttn(CustomTestCase):
                     session="peer",
                     prefix_len=9,
                     tp_size=1,
-                    layers=2,
+                    layers=36,
                     mode="remote",
                 ),
             )
@@ -1985,11 +2025,33 @@ class TestRemoteAttn(CustomTestCase):
                 self.assertIsNone(controller.prepare(batch))
                 self.assertEqual(sender.curr_idx, 4)
                 req.inflight_middle_chunks = 0
+                # Deployment allows 32K, but this actual tail has five tokens.
+                # A skipped layerwise plan must leave native sending untouched.
+                offer_path = root / "7/0/offer.json"
+                offer = pl.read_json(offer_path)
+                offer["mode"] = "layerwise"
+                pl.write_json(offer_path, offer)
+                controller.config = pl.Config("layerwise", root)
+                batch.reqs.append(
+                    SimpleNamespace(pending_bootstrap=True, extend_len=32768)
+                )
+                self.assertIsNone(controller.prepare(batch))
+                self.assertEqual(sender.curr_idx, 4)
+                self.assertEqual(req.start_send_idx, 4)
+                self.assertEqual(controller.sources, [])
+                batch.reqs.pop()
+                offer["mode"] = "remote"
+                pl.write_json(offer_path, offer)
+                controller.config = pl.Config("remote", root)
                 jobs = controller.prepare(batch)
                 self.assertEqual(jobs[0][0].indices.tolist(), [104, 105, 106, 107, 108])
                 self.assertEqual(jobs[0][0].index_slice, slice(4, 9))
                 self.assertEqual(sender.curr_idx, 9)
                 self.assertEqual(req.start_send_idx, 9)
+                self.assertEqual(jobs[0][1], [(tuple(range(36)), tuple(range(72)))])
+                self.assertEqual(jobs[0][0].prefill_chunk_tokens, 5)
+                self.assertEqual(jobs[0][0].group_size, 36)
+                self.assertEqual(controller.scheduler.chunked_prefill_size, 32768)
                 self.assertIsNone(controller.prepare(batch))
                 self.assertEqual(len(controller.sources), 1)
                 self.assertEqual(sender.curr_idx, 9)

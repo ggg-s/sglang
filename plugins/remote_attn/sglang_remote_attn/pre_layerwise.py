@@ -44,7 +44,7 @@ def write_json(path, value):
 class Config:
     mode: str
     directory: Path
-    group_size: int = 4
+    group_size: int = 0
     drain_timeout: float = 300.0
 
     @classmethod
@@ -59,11 +59,30 @@ class Config:
             raise ValueError(
                 "HANDOFF_PD_DIR must name the same local directory on P and D"
             )
-        group = int(os.environ.get("HANDOFF_PRE_LAYERWISE_GROUP_SIZE", "4"))
+        group = int(os.environ.get("HANDOFF_PRE_LAYERWISE_GROUP_SIZE", "0"))
         timeout = float(os.environ.get("HANDOFF_PD_DRAIN_TIMEOUT_S", "300"))
-        if group <= 0 or timeout <= 0:
-            raise ValueError("layer group size and drain timeout must be positive")
+        if group < 0 or timeout <= 0:
+            raise ValueError(
+                "layer group size must be nonnegative (0 = auto); "
+                "drain timeout must be positive"
+            )
         return cls(mode, Path(root).resolve(), group, timeout)
+
+    def select_group_size(self, layers, transfer_tokens, average_tokens):
+        """Select layer groups from the scheduler's actual batch, never re-chunk it.
+
+        Follow #34905's default 3072-token threshold and 10-to-4 stage
+        heuristic. Remote keeps one whole-layer batch below the threshold:
+        skipping the adapter there would also disable early decode admission.
+        A positive override is retained for controlled layer-group experiments.
+        """
+        if self.group_size:
+            return min(layers, self.group_size)
+        if layers <= 4 or transfer_tokens < 3072:
+            return layers if self.mode == "remote" else 0
+        progress = min(1.0, max(0.0, (average_tokens - 3072) / (3 * 3072 - 3072)))
+        target_groups = max(4, round(10 - progress * (10 - 4)))
+        return max(1, layers // target_groups)
 
 
 @dataclass
@@ -147,6 +166,8 @@ class Source:
     finalized: bool = False
     released: bool = False
     created_at: float = field(default_factory=time.monotonic)
+    group_size: int = 0
+    prefill_chunk_tokens: int | None = None
 
     def complete(self, layers):
         # add_transfer_request shards a room onto one FIFO. Earlier ordinary
@@ -180,6 +201,8 @@ class Source:
                 "prefix_len": self.prefix_len,
                 "final_chunk_start": self.index_slice.start,
                 "final_chunk_end": self.index_slice.stop,
+                "prefill_chunk_tokens": self.prefill_chunk_tokens,
+                "layer_group_size": self.group_size,
                 "at": time.monotonic(),
             },
         )
@@ -521,6 +544,21 @@ class Controller:
                     candidate = (req, offer, root, peers)
             candidates.append(candidate)
         accepted = self.agree([int(c is not None) for c in candidates])
+        if not any(accepted):
+            return None
+        # Resolve the policy only after TP agrees on eligible requests. Middle
+        # chunks still contribute compute, but not the pipelined-token threshold.
+        transfer_tokens = sum(
+            req.extend_len for req, take in zip(batch.reqs, accepted) if take
+        )
+        group_size = self.config.select_group_size(
+            self.layers,
+            transfer_tokens,
+            sum(req.extend_len for req in batch.reqs) // len(batch.reqs),
+        )
+        if group_size == 0:
+            # Fall back before reserving indices or creating a source lease.
+            return None
         jobs = []
         for candidate, take in zip(candidates, accepted):
             if not take:
@@ -535,7 +573,7 @@ class Controller:
                 and len(sender.kv_mgr.kv_args.kv_data_ptrs) == 2 * self.layers
             ):
                 layer_ids = list(range(self.layers)) * 2
-            groups = buffer_groups(layer_ids, self.layers, self.config.group_size)
+            groups = buffer_groups(layer_ids, self.layers, group_size)
             indices = (
                 s.req_to_token_pool.req_to_token[
                     req.kv.req_pool_idx, req.start_send_idx : req.extend_end
@@ -556,6 +594,8 @@ class Controller:
                 index_slice,
                 peers,
                 len(req.origin_input_ids),
+                group_size=group_size,
+                prefill_chunk_tokens=req.extend_len,
             )
             sender._record_transfer_indices(indices, None)
             sender._transfer_start_time = (
@@ -568,10 +608,13 @@ class Controller:
         if jobs:
             self.batches += 1
             logger.info(
-                "pre-layerwise batch=%s requests=%s group_size=%s",
+                "pre-layerwise batch=%s requests=%s group_size=%s "
+                "pipelined_tokens=%s policy=%s",
                 self.batches,
                 len(jobs),
-                self.config.group_size,
+                group_size,
+                transfer_tokens,
+                "fixed" if self.config.group_size else "auto",
             )
         return jobs or None
 

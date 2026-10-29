@@ -42,6 +42,8 @@ def summarize(root):
                 "prefix_len": prefill["prefix_len"],
                 "final_chunk_tokens": prefill["final_chunk_end"]
                 - prefill["final_chunk_start"],
+                "prefill_chunk_tokens": prefill.get("prefill_chunk_tokens"),
+                "layer_group_size": prefill.get("layer_group_size"),
                 "completed": done is not None,
                 "released": matching("released.json") is not None,
                 "error": matching("error.json"),

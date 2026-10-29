@@ -32,6 +32,10 @@ with uncommitted changes; experiment commit `17261ca0` is the supplied
 The manifest records the input SHA256 values so this discrepancy stays visible.
 P5.19 now has an opt-in same-host pre-layerwise PD prototype; see the
 [implementation and experiment guide](P5.19-PRE-LAYERWISE-ZH.md). GPU E2E validation is pending.
+It inherits the model deployment's token chunking and selects layer groups from
+the scheduler's actual batch lengths. No separate chunk-size setting is needed.
+Small tails use native transfer in `layerwise` mode; `remote` keeps early decode
+admission with a single all-layer transfer group.
 The [functional parity checklist](FUNCTIONAL-PARITY.md) maps the supplied
 P0–P5.18 features to this port and distinguishes code coverage from deployment acceptance.
 
