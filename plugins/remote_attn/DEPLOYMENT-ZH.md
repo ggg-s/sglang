@@ -1,506 +1,408 @@
-# Remote-attn 内网部署手册
+# Remote-attn Progressive 生产接入手册
 
-本文对应 SGLang 的 `remote-attn` 分支，首次功能移植提交为 `a67ca2bb36`，部署应使用分支最新版本。
-后续内网反馈与修复见 [5090 等价性验证记录](validation/5090-intranet.md) 和
-[新提交复验与 KV 重复释放修复](validation/5090-new-commits.md)。
-默认部署沿用 handoff P0–P5.18：**单机 6 张 GPU，P / D0 / D1 各 TP2，Qwen3-8B，Mooncake TCP**。
-命令中的 `/workspace/sglang`、Python 和模型目录需要与内网机器实际路径一致。
+本文对应 `codex/remote-attn-pre-layerwise` 分支，运行时代码基线为
+`bf92a1ae42f7eba1038f380dddf4dee40e0afc4b`（2026-10-29）。发布时固定经过验收的完整 SHA、wheel 和配置，不能让生产实例自动追随分支 HEAD。
 
-代码已完成移植，已有 38 项 CPU 回归和此前 4060 上 10 项 CUDA/Mooncake/Remote RPC 检查。
-内网反馈确认 C1/C4 token 一致、故障矩阵及新提交下 TP2 稳定性 23/23；
-单独重启 D 后首请求的 session 失效窗口仍未解决，详见上述复验记录。
-4060 是单卡 8 GB 的验证环境，不能按本文默认配置同时部署三个 TP2 实例。
+目标路径是 **P Prefill 层组发送 → D 提前 Remote Decode → scatter 完成后逐层切 Local**。
+本手册给出接入现有生产 serving 的发布步骤；它不代表这份 SHA 已完成生产 GPU 验收。
+当前本地证据为 57 项 CPU 检查、23 个源码 hook 检查和格式检查通过。
+现场定位及修复实验支持继续验证，但不能替代这份构建在目标 GPU、模型和负载上的完整验收。
 
-## 1. 需要带入内网的代码
+旧 P→D0→D1、`cut/freeze/migrate` 和实验 gateway 的操作移至
+[历史 P5.18 部署手册](migration/P5.18-DEPLOYMENT-LEGACY-ZH.md)。
+当前 Progressive 使用原生 PD router；不向同一请求叠加 P5.18 迁移命令。
+实现细节与对照实验见 [P5.19 说明](P5.19-PRE-LAYERWISE-ZH.md)。
 
-携带整个 `remote-attn` checkout，或由该 checkout 构建的 SGLang wheel 加完整源码快照。
-只拷贝插件或旧版 `handoff_control.py` 不够：当前 main 的接口与原实验分支不同，
-本分支还包含核心环境变量声明，源码安装也可能需要 `rust/`、`proto/` 等构建输入。
+## 1. 接入边界与服务拓扑
 
-| 路径 | 用途 | 部署要求 |
+本次发布单元为一套 P/D pair 加 PD router。示例使用 Qwen3-8B、P TP2 + D TP2，共四张 GPU。
+
+| 组件 | 示例地址 / GPU | 职责 |
 | --- | --- | --- |
-| `python/` 及仓库构建输入 | 本分支 SGLang runtime | 安装本分支，不能替换成原实验 `3a869635c` 或任意 PyPI SGLang |
-| `python/sglang/srt/environ.py` | 声明 `SGLANG_MOONCAKE_SEND_LOCK` | 已在分支中，不要漏掉 |
-| `plugins/remote_attn/sglang_remote_attn/` | 渐进式 KV 传输、Remote attention、生命周期与 16 个 hook | 安装插件包 |
-| `plugins/remote_attn/pyproject.toml` | `sglang.srt.plugins` entry point | 与插件源码一起保留 |
-| `plugins/remote_attn/control_plane/p2d_driver.py` | 文件控制协议、TP 结果聚合 | 保留原包版本 |
-| `plugins/remote_attn/control_plane/p4_gateway.py` | SSE、请求提交、D2D drain、journal | 使用本分支的 C1 epoch 修复版 |
-| `plugins/remote_attn/deploy/` | 公共 env 和三个功能启动脚本 | 整个目录一起带入 |
-| `test/manual/remote_attn/cuda_handoff_probe.py` | 单 GPU CUDA/Mooncake 验证 | 建议带入做环境自检 |
-| `migration/`、`REVIEW.md`、`FUNCTIONAL-PARITY.md`、`validation/` | 原包来源、适配边界及证据 | 留作核对；不是运行时补丁 |
+| P | `127.0.0.1:31016`，GPU 0、1 | Prefill、KV 发送、Remote prefix attention |
+| D | `127.0.0.1:31017`，GPU 2、3 | Decode、接收 staging、逐层 Local 切换 |
+| Bootstrap | `127.0.0.1:35409` | 原生 PD 注册 |
+| PD router | `127.0.0.1:31000` | 现有业务入口后方的 PD 请求路由 |
+| 控制目录 | P/D 共用本机绝对路径 | generation/room/rank 隔离的 offer、ready、done 和诊断记录 |
 
-最后一行中的路径均相对于 `plugins/remote_attn/`。
-`migration/core_handoff_hooks.patch` 和 `migration/mooncake_session.patch` 是原实验参考文件，
-**不要再向当前分支 apply**。
+当前控制与 Remote RPC 使用 loopback，P/D 必须处于**同机、可互通 loopback 的网络环境**，并看到同一份本机目录。容器拆分时需要共享相同目录及兼容的网络 namespace；只挂共享存储不足以支持跨机。
+多套 pair 应各用独立端口、GPU、控制目录和 journal。业务流量通过现有鉴权/限流入口访问 router，内部控制与 RPC 端口不作为公网 API。
 
-## 2. Mooncake 对应代码与版本
+当前路径要求：
 
-不需要同步或修改 Mooncake 源码仓库，也没有新的 Mooncake C++ patch。
-两部分改动都在本分支：
+- `Qwen3ForCausalLM`、CUDA、dense NHD MHA、BF16/FP16 KV、page size 1。
+- P/D 相同 TP 宽度，PP=DP=CP=1；示例为 TP2，不能直接沿用异构 TP 拓扑。
+- 关闭 radix cache、scheduler overlap、Prefill 和 Decode CUDA graphs。只关闭 scheduler overlap，不关闭本功能的计算/传输重叠。
+- 原生 `mooncake_tcp`，P/D 均使用 `--disaggregation-decode-allocation-policy early`（代码默认）；不能使用 `prefill_complete`。
+- LoRA、MLA/混合/量化 KV、HiCache、speculative、统一 KV、PD multiplexing、live role switching 不在当前支持范围；原生 host KV destination 也不等于这里的 host staging ring。
 
-- 原生 P→D：`sglang_remote_attn/hooks.py` 包装 SGLang 的 Mooncake connector，提供发送锁和 peer 注册前 probe。
-- D0→D1：`sglang_remote_attn/handoff_control.py` 调用 wheel 的 `TransferEngine`，
-  管理 CPU 内存注册、同步/异步写入、完成等待、逐层通知、目标 slot ACK 和 CUDA stream。
+如果现有生产模型或拓扑不满足这些条件，需要先完成适配，不能仅添加环境变量上线。
+**保留模型部署自己的 token chunk 配置**；不新增 Pre-Layerwise chunk size。
+中间 token chunk 走原生整层发送，只有实际最终 token chunk 按层组发送。
+层分组默认 auto；不足 3072 个合格计算 token 时，`layerwise` 回退原生，`remote` 合为一组并保留提前解码。这种请求不应要求跨层重叠。
 
-| 项目 | 要求 |
+## 2. 发布制品与依赖
+
+需要同步部署本分支 SGLang 核心和插件，不能只覆盖 `handoff_control.py` 或复制插件到任意 PyPI SGLang 上。
+
+| 制品 | 要求 |
 | --- | --- |
-| Python | 插件要求 Python 3.12 或以上；原实验和 4060 验证使用 3.12 |
-| Mooncake 包 | `mooncake-transfer-engine-cuda13==0.3.13.post1` |
-| CUDA | 本文使用 CUDA 13 环境，GPU 驱动必须能运行所安装的 CUDA runtime |
-| Mooncake API | 必须有 `TransferEngine.send_probe`；缺失时插件拒绝启动 |
-| 传输方式 | 单机 TCP，`MC_FORCE_TCP=1`，SGLang backend 为 `mooncake_tcp` |
-| SGLang 依赖 | 以本分支 `python/pyproject.toml` 为准 |
+| SGLang runtime | 本次固定 SHA 的 `python/` 及完整构建输入；包含 Mooncake worker、原生 staging handler/ring 的修改 |
+| 插件 | 同一 SHA 的 `plugins/remote_attn/`，安装 `sglang_remote_attn:register` entry point |
+| PD router | 使用已验收的 `sglang-router` 构建；本仓库构建入口为 `sgl-model-gateway/bindings/python` |
+| Mooncake | 现场基线 `mooncake-transfer-engine-cuda13==0.3.13.post1`，必须提供 `TransferEngine.send_probe` |
+| Python / CUDA | Python 3.12+；现场基线 Python 3.12 / CUDA 13，驱动须兼容所装 runtime |
+| PyTorch / kernels | 当前 `python/pyproject.toml` 固定 `torch==2.14.1`、`sglang-kernel==0.4.10`、`flashinfer_python[cu13]==0.7.2`；`cuda-python>=13.0` |
+| 模型与配置 | 固定模型/tokenizer revision、原部署参数、环境变量、镜像/驱动/GPU 信息；随发布留档 |
 
-当前分支声明的核心依赖包括 `torch==2.14.1`、`flashinfer_python[cu13]==0.7.2`。
-2026-10-28 内网完整模型复验使用 `torch==2.14.1+cu130`、`torchvision==0.29.0+cu130`、
-`sglang-kernel==0.4.10`、FlashInfer `0.7.2`，已移除 `SKIP_SGL_KERNEL_VERSION_CHECK`。
-现场 kernel 0.4.9/0.4.10 配合 torch 2.13 曾发生 `CUDAErrorLogCapture` 符号错误；
-应使用上述配套组合并执行 `pip check`，不要用跳过版本检查掩盖 ABI 不兼容。
-4060 的轻量 probe 使用 PyTorch `2.13.0+cu130` / FlashInfer `0.6.18`，
-它验证了插件的实际 CUDA/TE 运算，**不是完整 SGLang 部署的依赖锁定文件**。
-不要把其简化环境直接当成已验收的模型服务器环境。
+不需要修改 Mooncake C++。发送私有流 D2H 和接收 host ring 使层组传输用 host 地址绕开 TCP 的 GPU null-stream 拷贝。
+不要用 `SKIP_SGL_KERNEL_VERSION_CHECK` 掩盖 ABI 不匹配，也不要同时安装多个提供 `mooncake` 模块的 wheel。
+历史 4060 轻量 probe 的依赖组合不是本版本完整模型服务的依赖锁。
 
-完成第 4 节的公共变量配置和安装后，启动前检查版本和 API。
-先导入 PyTorch，以加载 wheel 所需的 CUDA 动态库：
+### 构建与离线交付
+
+在匹配生产平台的 Linux / Python / CUDA 构建环境、独立 checkout 上操作。macOS wheel 不能交付 Linux。
+先把外部 `codex/remote-attn-pre-layerwise` 同步到内网镜像；下面从该镜像选取候选版本并立即冻结 SHA：
 
 ```bash
+cd /path/to/sglang-build
+git fetch origin codex/remote-attn-pre-layerwise
+export HANDOFF_REVISION=$(git rev-parse FETCH_HEAD)
+git switch --detach "$HANDOFF_REVISION"
+git status --short
+
+export HANDOFF_DELIVERY=/tmp/remote-attn-progressive-delivery
+mkdir -p "$HANDOFF_DELIVERY/wheelhouse"
+git rev-parse HEAD > "$HANDOFF_DELIVERY/REVISION"
+git archive --format=tar.gz \
+  --output="$HANDOFF_DELIVERY/sglang-source.tar.gz" HEAD
+python -m pip wheel --wheel-dir "$HANDOFF_DELIVERY/wheelhouse" \
+  ./python ./plugins/remote_attn ./sgl-model-gateway/bindings/python \
+  'mooncake-transfer-engine-cuda13==0.3.13.post1'
+cd "$HANDOFF_DELIVERY"
+sha256sum REVISION sglang-source.tar.gz wheelhouse/*.whl > SHA256SUMS
+```
+
+构建必须从干净 checkout 开始。wheelhouse 使用新目录，只含本次平台的一组制品；构建机需要完整 Rust/CUDA 等输入。
+`git archive` 不打包独立 submodule 内容，构建需要的输入须事先在构建机准备。
+另行交付模型、tokenizer 和 FlashInfer 所需 cache/离线输入。候选构建通过第 7 节后，才可作为正式 release。
+
+### 安装和核对加载来源
+
+在新 release 目录和独立 Python 环境安装；不覆盖正在接流量的进程环境。以下路径按现场替换：
+
+```bash
+export HANDOFF_DELIVERY=/path/to/remote-attn-progressive-delivery
+export SGLANG_ROOT=/workspace/sglang-progressive-release
+export HANDOFF_PYTHON=/opt/conda/envs/sglang-progressive/bin/python
+export HANDOFF_MODEL_PATH=/workspace/models/Qwen3-8B
+export HANDOFF_WHEELHOUSE="$HANDOFF_DELIVERY/wheelhouse"
+cd "$HANDOFF_DELIVERY"
+sha256sum -c SHA256SUMS
+mkdir -p "$SGLANG_ROOT"
+tar -xzf sglang-source.tar.gz -C "$SGLANG_ROOT"
+"$HANDOFF_PYTHON" -m pip install --no-index --find-links "$HANDOFF_WHEELHOUSE" \
+  "$HANDOFF_WHEELHOUSE"/sglang-*.whl \
+  "$HANDOFF_WHEELHOUSE"/sglang_remote_attn-*.whl \
+  "$HANDOFF_WHEELHOUSE"/sglang_router-*.whl \
+  'mooncake-transfer-engine-cuda13==0.3.13.post1'
+"$HANDOFF_PYTHON" -m pip check
+"$HANDOFF_PYTHON" -m pip freeze > "$HANDOFF_DELIVERY/installed-freeze.txt"
+
 "$HANDOFF_PYTHON" - <<'PY'
 import importlib.metadata as metadata
 import torch
-from mooncake.engine import TransferEngine
-
-print("torch:", torch.__version__)
-print("torch CUDA:", torch.version.cuda)
-print("torchvision:", metadata.version("torchvision"))
-print("sglang-kernel:", metadata.version("sglang-kernel"))
-print("CUDA available:", torch.cuda.is_available())
-print("GPU count:", torch.cuda.device_count())
-print("Mooncake:", metadata.version("mooncake-transfer-engine-cuda13"))
-print("send_probe:", callable(getattr(TransferEngine, "send_probe", None)))
-PY
-```
-
-期望 Mooncake 为 `0.3.13.post1`、`send_probe=True`、CUDA 可用。
-不要同时安装多个提供 `mooncake` 模块的不同 wheel；若环境已有其他 Mooncake 包，先在独立环境中确认包来源。
-
-## 3. 代码与依赖如何进入内网
-
-### 3.1 内网已有 Git / Python 包镜像
-
-在已配置内网 `origin` 的仓库执行：
-
-```bash
-cd /workspace/sglang
-git fetch origin
-git switch remote-attn
-git pull --ff-only
-git log -1 --oneline
-```
-
-内网仓库需要先同步外部 `remote-attn` 分支。
-不要切到旧实验分支 `feat/dsv4-pdmux-opt`，也不要把参考 patch 硬打到其他 main 上。
-
-### 3.2 完全离线：联网中转机准备交付包
-
-以下操作在与部署机架构、Python ABI 和 Linux 环境匹配的构建机执行，
-例如 Linux x86_64 / CPython 3.12 / CUDA 13。不能用 macOS wheel 替代 Linux wheel。
-构建机需要完整 CUDA、Rust 等本分支构建工具；建议复用已具备这些依赖的构建镜像。
-
-```bash
-cd /path/to/sglang
-git switch remote-attn
-
-export HANDOFF_DELIVERY=/tmp/remote-attn-delivery
-mkdir -p "$HANDOFF_DELIVERY/wheelhouse"
-
-git rev-parse HEAD > "$HANDOFF_DELIVERY/REVISION"
-git archive --format=tar.gz \
-  --output="$HANDOFF_DELIVERY/sglang-remote-attn.tar.gz" HEAD
-
-python -m pip wheel --wheel-dir "$HANDOFF_DELIVERY/wheelhouse" \
-  ./python ./plugins/remote_attn \
-  'mooncake-transfer-engine-cuda13==0.3.13.post1'
-
-cd "$HANDOFF_DELIVERY"
-sha256sum sglang-remote-attn.tar.gz wheelhouse/*.whl > SHA256SUMS
-```
-
-`wheelhouse` 应是本次交付专用目录，只放对应平台、对应分支的一组构建结果，避免混入旧 SGLang wheel。
-该步骤在联网机器上完成依赖解析与 wheel 构建；内网安装时不再现场编译 Rust 扩展。
-另行准备完整模型及 tokenizer 文件、CUDA/驱动环境，以及可能用到的 FlashInfer JIT/cache 输入。
-仅下载 Mooncake 一个 wheel 不代表其他依赖已经齐全。
-
-将交付目录和模型目录转入内网后：
-
-```bash
-cd /path/to/remote-attn-delivery
-sha256sum -c SHA256SUMS
-
-mkdir -p /workspace/sglang
-tar -xzf sglang-remote-attn.tar.gz -C /workspace/sglang
-```
-
-源码快照应解压到新目录，不覆盖正在使用的旧 checkout。
-Git archive 不包含独立 submodule checkout；若所选构建需要它们，应在构建机准备完整输入并产出 wheel。
-
-## 4. 配置公共路径并安装
-
-后续命令在同一个 Bash 终端执行；换终端需要重新导出这些变量。
-使用独立的 serving Python 环境，例如预先创建的 conda 环境：
-
-```bash
-export SGLANG_ROOT=/workspace/sglang
-export HANDOFF_PYTHON=/opt/conda/envs/sglang/bin/python
-export HANDOFF_MODEL_PATH=/workspace/models/Qwen3-8B
-export HANDOFF_CTL_ROOT=/workspace/handoff_ctl_p511
-export HANDOFF_RUN_DIR=/workspace/remote_attn_run
-
-mkdir -p "$HANDOFF_RUN_DIR" /workspace/handoff_state
-mkdir -p "$HANDOFF_CTL_ROOT"/{p,src,dst}
-cd "$SGLANG_ROOT"
-```
-
-有内网包镜像时，从本分支安装：
-
-```bash
-"$HANDOFF_PYTHON" -m pip install -e ./python
-"$HANDOFF_PYTHON" -m pip install --no-deps -e ./plugins/remote_attn
-"$HANDOFF_PYTHON" -m pip install 'mooncake-transfer-engine-cuda13==0.3.13.post1'
-"$HANDOFF_PYTHON" -m pip check
-```
-
-完全离线时，安装上一节构建的 wheel；与源码安装二选一：
-
-```bash
-export HANDOFF_WHEELHOUSE=/path/to/remote-attn-delivery/wheelhouse
-
-"$HANDOFF_PYTHON" -m pip install --no-index --find-links "$HANDOFF_WHEELHOUSE" \
-  "$HANDOFF_WHEELHOUSE"/sglang-*.whl \
-  "$HANDOFF_WHEELHOUSE"/sglang_remote_attn-0.1.0-*.whl \
-  'mooncake-transfer-engine-cuda13==0.3.13.post1'
-"$HANDOFF_PYTHON" -m pip check
-```
-
-wheel 安装后，修改 checkout 中的 Python 文件不会自动更新已安装包，需要重新构建/安装。
-不要从其他 wheel 源覆盖本分支 SGLang；用下面的输出核对实际加载路径：
-
-```bash
-"$HANDOFF_PYTHON" - <<'PY'
-import importlib.metadata as metadata
 import sglang
 import sglang_remote_attn
-
-print("sglang:", sglang.__file__)
-print("plugin:", sglang_remote_attn.__file__)
-for entry in metadata.entry_points(group="sglang.srt.plugins"):
-    print(entry.name, entry.value)
+import sglang_router
+from mooncake.engine import TransferEngine
+print("paths:", sglang.__file__, sglang_remote_attn.__file__, sglang_router.__file__)
+print("torch/CUDA:", torch.__version__, torch.version.cuda, torch.cuda.is_available())
+for name in ("sglang-kernel", "flashinfer_python", "cuda-python",
+             "mooncake-transfer-engine-cuda13", "sglang-router"):
+    print(name, metadata.version(name))
+print("send_probe:", callable(getattr(TransferEngine, "send_probe", None)))
+print("plugins:", list(metadata.entry_points(group="sglang.srt.plugins")))
 PY
-
 "$HANDOFF_PYTHON" -m sglang_remote_attn.check
 ```
 
-预检查应输出 `hooks: 16`、`send_probe: true`、`plugin: remote_attn`。
-它检查安装和 hook 接口，不会启动模型或证明 TP2 推理正确。
-无完整 GPU 依赖的机器只能执行源接口检查：
+当前 preflight 应输出 `hooks: 23`、`send_probe: true`、`plugin: remote_attn`。
+它只检查安装和接口，不会启动模型，也不会初始化服务进程中的 D2H slot。
+wheel 安装后改 checkout 文件不会更新运行代码，必须重新构建安装。
+开发联调可以使用 `pip install -e ./python` 和 `pip install --no-deps -e ./plugins/remote_attn`；正式实例使用已验收的不可变制品。
+
+## 3. Progressive 环境配置
+
+以下变量放进实际 P/D 服务的启动环境，每次变更配套重启 pair。示例是 Bash `export` 语法；若使用 systemd `EnvironmentFile`，转成无 `export` 的 `KEY=value`，并事先展开所有路径变量。`EnvironmentFile` 不执行 Bash 的 `$变量` 展开；也可由受管启动脚本加载 Bash 配置。
+`SGLANG_PLUGINS` 需保留已有其他插件项并添加 `remote_attn`；安装插件和设置 allowlist 后，每个角色还必须有自己的 `HANDOFF_CTL_DIR`。
+
+### P/D 共同配置
 
 ```bash
-PYTHONPATH=plugins/remote_attn "$HANDOFF_PYTHON" \
-  -m sglang_remote_attn.check --source-only --sglang-root "$SGLANG_ROOT"
+# 路径在两个进程中必须指向同一份本机目录；每次 pair 重启使用新实例目录。
+export HANDOFF_INSTANCE=/workspace/remote-attn/run-20261029-01
+export HANDOFF_CTL_ROOT="$HANDOFF_INSTANCE/control"
+export HANDOFF_PD_DIR="$HANDOFF_INSTANCE/journal"
+export HANDOFF_RUN_DIR="$HANDOFF_INSTANCE/logs"
+case ",${SGLANG_PLUGINS:-}," in
+  *,remote_attn,*) ;;
+  *) export SGLANG_PLUGINS="${SGLANG_PLUGINS:+${SGLANG_PLUGINS},}remote_attn" ;;
+esac
+export SGLANG_PLUGINS
+export HANDOFF_PRE_LAYERWISE=remote
+export HANDOFF_PRE_LAYERWISE_GROUP_SIZE=0
+export HANDOFF_PD_DRAIN_TIMEOUT_S=300
+export MC_FORCE_TCP=1
+export SGLANG_DISAGG_STAGING_BUFFER=1
+export SGLANG_DISAGG_STAGING_POOL_SIZE_MB=4096
+export SGLANG_MOONCAKE_SEND_LOCK=1
+# SGLANG_MOONCAKE_MAX_TRANSFER_BATCH_INDICES 沿用现有部署值，不在这里覆盖。
+export MC_TCP_MAX_QUEUED_TRANSFERS_PER_PEER=8192
+export MC_TCP_MAX_PENDING_ADMISSIONS_PER_PEER=8192
+export SGLANG_ENABLE_FAILED_SESSION_PROBE=1
+export SGLANG_FAILED_SESSION_PROBE_INTERVAL_S=1.0
+export SGLANG_ENABLE_STRICT_MEM_CHECK_DURING_IDLE=0
+export HANDOFF_PROFILE=0
+export HANDOFF_RPC_PROFILE=0
+mkdir -p "$HANDOFF_CTL_ROOT/p" "$HANDOFF_CTL_ROOT/src" \
+  "$HANDOFF_PD_DIR" "$HANDOFF_RUN_DIR" /workspace/handoff_state
 ```
 
-## 5. 控制面保留的固定路径
+`/workspace/handoff_state` 是 Remote runtime 仍使用的固定诊断目录；即使 profile 关闭，目标状态创建时也会建立该目录，服务账号必须有访问/创建权限。它不随 `HANDOFF_PD_DIR` 改变，容器需提供可写挂载。多实例诊断须区分文件归属，不能当作实例 journal 一起清空。
 
-控制面保留原协议和目录，网关增加了 C1 epoch 修复。下列配置不能只靠 server 的 env 自动覆盖：
+**发送 Batch 不限定为 8，也不要求与 token chunk 或请求并发相等。**
+`SGLANG_MOONCAKE_MAX_TRANSFER_BATCH_INDICES` 沿用现有部署值，插件不改写。未配置时，仓库 `deploy/common.sh` 使用 `2048`；直接启动原生服务、不经过该脚本时，代码默认 `0`（不按此上限拆分）。这两个默认来源必须区分，不能因为更换启动入口而悄悄改变有效值。
+正值限制每次同步批量传输的 KV 索引数。更小的值增加 TE 调用次数，更大的值或 `0` 可能增加 P staging 容量与单次传输时长；以目标环境的吞吐、尾延迟和内存预算选择。Batch=8 仅是此前实验的一种设置。正式配置记录有效值，调整时单独复测，不与 staging 开关一起改变。
+`HANDOFF_PD_DRAIN_TIMEOUT_S` 是清理等待上限，不是请求自动恢复机制；按业务最长请求和回收耗时调整。
 
-- 网关 tokenizer 的 `MODEL` 固定为 `/workspace/models/Qwen3-8B`。
-  本手册使用该目录；若换模型，需要同步适配控制面，不能只改 `HANDOFF_MODEL_PATH`。
-- journal 和部分 trace 固定写到 `/workspace/handoff_state`，需要可写且保留到实验结束。
-  `--out` 只改变网关输出文件，不会改变 journal 目录。
-- 网关保留了对 `/workspace/5090_handoff_m1` 的 Python import 搜索路径。
-  若该目录有旧 `p2d_driver.py`，可能优先加载旧驱动；确认其与当前 `control_plane/p2d_driver.py`
-  内容一致，或在独立部署环境中消除旧副本冲突，再启动网关。
-
-同一固定 state 目录不要同时运行多套独立实验。
-不要在进程存活、存在冻结请求或迁移未完成时清空控制文件、journal、reservation 或 lease。
-换模式重新做独立实验时，先正常结束并保存上一轮状态，再使用干净的独立实验环境。
-
-## 6. 启动 P、D0、D1
-
-| 实例 | 默认 GPU | HTTP 端口 | 控制目录 | 角色 |
-| --- | --- | --- | --- | --- |
-| P | 0、1 | 31016 | `$HANDOFF_CTL_ROOT/p` | Prefill |
-| D0 / src | 2、3 | 31017 | `$HANDOFF_CTL_ROOT/src` | 初始 Decode、迁移源 |
-| D1 / dst | 4、5 | 31018 | `$HANDOFF_CTL_ROOT/dst` | 迁移目标 |
-| Gateway | 无专用 GPU | 31080 | `$HANDOFF_CTL_ROOT` | 接收请求、SSE、迁移控制 |
-
-P/D 使用 bootstrap 端口 `35409`。当前 control/TE/RemoteHub 还使用 loopback 动态端口，
-因此所有角色必须处在能互通 `127.0.0.1` 和共享控制文件的同一部署环境中。
-不要直接把这些配置当作跨主机部署；容器若分开运行，也要相应解决网络 namespace 和目录共享。
+### P 角色
 
 ```bash
-cd "$SGLANG_ROOT"
-
-CUDA_VISIBLE_DEVICES=0,1 HANDOFF_CTL_DIR="$HANDOFF_CTL_ROOT/p" \
-  bash plugins/remote_attn/deploy/start_p511_p_tp2.sh \
-  > "$HANDOFF_RUN_DIR/p.log" 2>&1 &
-echo $! > "$HANDOFF_RUN_DIR/p.pid"
-
-CUDA_VISIBLE_DEVICES=2,3 HANDOFF_CTL_DIR="$HANDOFF_CTL_ROOT/src" \
-  bash plugins/remote_attn/deploy/start_p511_d0_tp2.sh \
-  > "$HANDOFF_RUN_DIR/d0.log" 2>&1 &
-echo $! > "$HANDOFF_RUN_DIR/d0.pid"
-
-CUDA_VISIBLE_DEVICES=4,5 HANDOFF_CTL_DIR="$HANDOFF_CTL_ROOT/dst" \
-  bash plugins/remote_attn/deploy/start_p511_d1_tp2.sh \
-  > "$HANDOFF_RUN_DIR/d1.log" 2>&1 &
-echo $! > "$HANDOFF_RUN_DIR/d1.pid"
+export HANDOFF_CTL_DIR="$HANDOFF_CTL_ROOT/p"
+export HANDOFF_PRE_LAYERWISE_HOST_STAGING=1
+export HANDOFF_PRE_LAYERWISE_RECV_HOST_STAGING=0
+export HANDOFF_PL_RETIRE=async
 ```
 
-脚本自动加入 `SGLANG_PLUGINS=remote_attn` allowlist，保留已有其他插件项，并先运行 preflight。
-真正启用 runtime hook 还要求该角色设置 `HANDOFF_CTL_DIR`；只安装插件不会改变普通 serving。
+### D 角色
 
-三个实例都使用 BF16、FlashInfer、page size 1、context length 40960、max-running-requests 8、
-chunked-prefill-size 2048；P 的静态显存比例为 0.85，D 为 0.75。
-显存不足时应根据模型和负载调整参数，不能假设任意 6 张 GPU 都能容纳原配置。
-可以在脚本后追加 CLI 参数，例如 `--context-length 8192`，但不能覆盖下面的兼容性约束。
+```bash
+export HANDOFF_CTL_DIR="$HANDOFF_CTL_ROOT/src"
+export HANDOFF_PRE_LAYERWISE_HOST_STAGING=0
+export HANDOFF_PRE_LAYERWISE_RECV_HOST_STAGING=1
+export HANDOFF_RETRACTION_BACKUP=none
+```
 
-必须保留：
+P/D 分别在自己的服务环境使用对应角色块，不能在同一 shell 顺序执行两个角色块后共用最终环境。
+D 的 `none` 沿用当前配置：内存压力下原生 retraction 会中止请求并返回 503，不表示有 CPU KV backup。
+发送端 host staging 默认在 `MC_FORCE_TCP=1` 时开启，但生产配置显式写出；接收 host staging **默认关闭**，必须显式开启。
+
+| 配置 | 代码默认 | 运行含义 |
+| --- | --- | --- |
+| `HANDOFF_PRE_LAYERWISE` | `off` | `remote` 提前 Decode；`layerwise` 仅重叠、等待完整 KV；`off` 回原生 PD |
+| `HANDOFF_PRE_LAYERWISE_GROUP_SIZE` | `0` | auto；正整数固定层组，不改变 token 分块 |
+| `HANDOFF_PRE_LAYERWISE_HOST_STAGING` | TCP 强制模式下 `1`，否则 `0` | P 私有流 D2H；`0` 为源 GPU 指针对照 |
+| `SGLANG_DISAGG_STAGING_BUFFER` | `0` | P/D 一致开启原生 ring 协议 |
+| `HANDOFF_PRE_LAYERWISE_RECV_HOST_STAGING` | `0` | D pinned host ring + GPU shadow；须同时启用原生 staging |
+| `SGLANG_DISAGG_STAGING_POOL_SIZE_MB` | `4096` | 每个 D rank 的 ring 容量，单位 MiB |
+| `HANDOFF_PL_RETIRE` | `async` | P 层组任务异步回收；`off` / `keep64` 仅用于诊断对照 |
+| `SGLANG_MOONCAKE_MAX_TRANSFER_BATCH_INDICES` | 原生 `0`；参考脚本 `2048` | 沿用部署值，正值限制一次同步 batch 的 KV 索引数；不限定为 8 |
+| 冷态 D2H 预热 | 新 slot 自动执行 | 无独立环境开关；首次注册和扩容后执行，复用不重复 |
+
+## 4. 内存、回收和冷态行为
+
+### 发送与接收顺序
 
 ```text
---tp 2
---page-size 1
---disable-radix-cache
---disable-cuda-graph
---disable-overlap-schedule
---disaggregation-transfer-backend mooncake_tcp
+层组 KV ready event
+  → P 专用非阻塞流 D2H → 等 D2H 完成 → TE 发送 host 地址
+  → D 原生 pinned host ring → 原生 CHUNK_READY
+  → 已有 scatter stream：异步 H2D 到 GPU shadow → scatter 写 KV pool
+  → scatter event 完成 → 允许该层 Local + watermark 释放 ring 区间
 ```
 
-三个角色 TP 宽度应相同。当前仅支持 dense NHD MHA FP16/BF16；
-PP/DP/CP/DCP、MLA/混合或量化 KV、HiCache、speculative decoding、mixed chunks、unified KV 和 live PD role switching 不在支持范围。
-禁用的是 scheduler overlap；插件自己的 KV 传输/计算重叠仍然启用。
+复用原生 `staging_base_ptr` 握手、`STAGING_REQ/RSP`、`CHUNK_READY` 和 watermark；没有自建 receive journal 握手或逐组 ACK。
+Remote 的 offer/ready/done journal 仍然存在。网络发送成功或 H2D 完成均不能单独作为切 Local 的依据。
+发送锁、session 和 pre-send probe 保留；普通中间 token chunk 和 Post-Remote 仍走原路径。
 
-## 7. 必须保留的环境变量
+### 内存预算
 
-`deploy/common.sh` 已设置以下默认值，正常使用启动脚本时不必重复手工导出：
+- 每个 D rank：host 模式固定占用 **R MiB pinned RAM + R MiB GPU shadow**，此外还有模型、KV pool、算子 workspace；GPU ring 对照只有 R MiB GPU ring。
+- 默认 R=4096，D TP2 合计额外 8 GiB pinned RAM，每张 D GPU 额外 4 GiB shadow。主机内存限额也必须包含 P staging 和其他进程。
+- P slot 按实际最大层组和原生发送 batch 上限预留；首次分配及扩容发生在 Prefill 前。普通同布局路径可按 `min(实际尾块 tokens, 正的 Batch 上限) × 本组各 K/V buffer 的每 token 字节数之和` 估算；实际容量以代码计划和分配为准。
+- D ring 需要容纳**完整一个层组**，不能只按 P 的单次小 batch 发送量估算。page size 1 时，单组字节数为 `实际最终 chunk tokens × 所选 K/V buffer 的 kv_item_lens 之和`，取每 rank 的本地布局。auto 在小尾块可能合成全层，须纳入最大值。
+- R 小于最大单组会失败，不能依赖无限重试或直接写 KV pool 回退；R 只容一组时也可能降低流水效果。按并发和 watermark 积压评估余量。
 
-```bash
-MC_FORCE_TCP=1
-SGLANG_MOONCAKE_MAX_TRANSFER_BATCH_INDICES=2048
-MC_TCP_MAX_QUEUED_TRANSFERS_PER_PEER=8192
-MC_TCP_MAX_PENDING_ADMISSIONS_PER_PEER=8192
-SGLANG_ENABLE_FAILED_SESSION_PROBE=1
-SGLANG_FAILED_SESSION_PROBE_INTERVAL_S=1.0
-SGLANG_ENABLE_STRICT_MEM_CHECK_DURING_IDLE=0
-SGLANG_MOONCAKE_SEND_LOCK=1
-HANDOFF_PROFILE=0
-HANDOFF_RPC_PROFILE=1
-HANDOFF_REMOTE_FALLBACK_MS=10000
-```
+原启动脚本的静态显存比例 P=0.85、D=0.75 是历史参考值，不能假设给 4 GiB shadow 留足空间。
+在目标 GPU 上先做启动、最长上下文和目标并发容量验证，再固定显存比例、R 和并发；本次接入不自动改 token chunk。
 
-D0 额外启用：
+### 层组引用延迟回收
 
-```bash
-HANDOFF_FAST_FREEZE=1
-HANDOFF_FAST_BUFFERS=2
-HANDOFF_FAST_COPY_STREAMS=2
-HANDOFF_FAST_ASYNC=1
-HANDOFF_REMOTE_HIGH_PRIORITY=1
-```
+`HANDOFF_PL_RETIRE=async` 在 worker 完成层组处理后把任务引用交给 daemon reaper，避免 `partial(..., ready_event=...)` 的最后引用在传输线程触发昂贵的 Event 析构。
+待 watermark 重新排队的任务仍归原队列所有，不提前回收；发送成功和失败路径保留原有完成判断。
 
-env 允许外部覆盖；有旧实验变量时，应先核对有效值，避免意外关闭 Fast Freeze、锁或 probe。
-D0/D1 默认 `HANDOFF_RETRACTION_BACKUP=none`，显式使用
-`--disaggregation-decode-retraction-backup none`。
-这与内网验证配置一致：原生 decode 因显存压力发生 retraction 时会返回 503，不保留 KV backup。
-该开关不关闭 handoff 的 host 传输缓冲区，也不能替代重复释放修复。
-可通过 `HANDOFF_RETRACTION_BACKUP=cpu_tensor` 或 `host_pool` 覆盖；这些覆盖配置需另做容量和故障验证。
+每个 transfer worker 的队列上限为 **64 个待回收任务，另有 1 个正在回收**。正常路径 `put_nowait`；满载时输出
+`Layer-group reference reaper full; waiting for capacity` 并背压等待。
+不能把“满则丢引用”当成绝不阻塞：那会在 worker 再次触发析构。持续出现该日志需检查回收积压，不能宣称所有负载下无等待。
+`keep64` 只保留最后 64 个任务，淘汰和退出时仍可能同步析构；`off` 恢复 inline release。这两项不是上线默认配置。
 
-尤其要检查旧 shell 中是否仍有 `SGLANG_MOONCAKE_MAX_TRANSFER_BATCH_INDICES=8`。
-旧实验 connector 不使用该开关，新 main 会按它拆成多次同步调用，32K 请求因此增加数千次往返。
-当前默认 `2048` 与 `--chunked-prefill-size 2048` 对齐；部署更新后要重启实例并核对有效值。
+### 冷态预热与流量准入
 
-```bash
-export SGLANG_MOONCAKE_MAX_TRANSFER_BATCH_INDICES=2048
-```
+`PinnedKVStager.reserve()` 新建并注册 slot 后，使用**同一 copy stream、同一已注册 pinned buffer**完成一次真实的 **1 字节 D2H** 并等待完成。
+源端使用私有 GPU scratch，不读取正在生成的 KV。slot 复用不重复预热，扩容会再做；异常会 quarantine，禁止复用。
 
-修改 chunk size 时，需要同步评估批次上限与 TE 队列容量；不能把任意更大的值直接视为已验证配置。
-公共脚本还提供 `LD_PRELOAD`、`LD_LIBRARY_PATH`、`LIBRARY_PATH` 默认路径；
-如内网 CUDA/libstdc++ 安装位置不同，在启动前导出正确值。
-现有 `LD_LIBRARY_PATH` 会整体保留，脚本不会自动给它补 CUDA 路径。
+这只预热首次拷贝初始化，不等于触碰整个 buffer，也不等于完整模型/网络/scatter 预热。
+`reserve()` 在请求准备阶段执行，若首次创建发生在第一条请求，其初始化耗时仍计入该请求。
+**进程启动、preflight、`/health` 成功不能证明业务请求的 staging 已热。**
+生产接流量前按第 6 节经 router 发送代表性请求，覆盖模型实际分块、最大层组和需要的 slot 容量；确保每个目标 pair/rank 实际走过 host staging 且完成回收。
+重启或换到新 pair 后重新预热；后续超出预热容量的请求仍可能引发扩容冷态成本。
 
-## 8. 就绪检查与网关启动
+## 5. 与现有服务启动流程对接
 
-等待模型完成加载，逐个检查：
+将第 3 节环境加入现有进程管理器的 P/D 启动配置，保留模型路径、token chunk 和已核准的其他模型参数。
+必须保留本路径约束：page size 1、同 TP、关闭 radix cache / CUDA graphs / overlap scheduler、`mooncake_tcp`、提前分配。
+命令行原本有冲突配置时须在 manifest 中消除，不能只叠加变量期待自动兼容。
+
+以下脚本用于与仓库参考 Qwen3-8B TP2 配置一致的首轮联调；脚本自带历史模型参数，并不是读取任意线上 manifest 的通用入口。
+**现有生产配置的 chunk 不同时，使用现有服务入口接入上述环境，不原样替换成这些脚本。**
+每个终端/服务先加载公共配置、路径和对应角色配置；交由 supervisor 管理前台进程、日志和退出状态：
 
 ```bash
-curl -f http://127.0.0.1:31016/health
-curl -f http://127.0.0.1:31017/health
-curl -f http://127.0.0.1:31018/health
-
-ls "$HANDOFF_CTL_ROOT"/{p,src,dst}/ready.*.json
-tail -n 40 "$HANDOFF_RUN_DIR/d0.log"
-tail -n 40 "$HANDOFF_RUN_DIR/d1.log"
-```
-
-每个角色应有 `ready.0.json`、`ready.1.json`，其中 `tp_size=2`。
-ready 文件不能替代 `/health`：旧文件可能来自上一轮，需要结合 pid、started_at 和当前进程确认。
-
-启动网关：
-
-```bash
+# P 服务：已加载 P 环境
 cd "$SGLANG_ROOT"
-
-HANDOFF_CTL_DIR="$HANDOFF_CTL_ROOT" \
-HANDOFF_PD_PREFILL_URL=http://127.0.0.1:31016 \
-HANDOFF_PD_BOOTSTRAP_HOST=127.0.0.1 \
-HANDOFF_PD_BOOTSTRAP_PORT=35409 \
-HANDOFF_ADMISSION_POLICY=decoupled \
-"$HANDOFF_PYTHON" -u plugins/remote_attn/control_plane/p4_gateway.py \
-  --port 31080 --out "$HANDOFF_RUN_DIR/gateway-events.jsonl" \
-  > "$HANDOFF_RUN_DIR/gateway.log" 2>&1 &
-echo $! > "$HANDOFF_RUN_DIR/gateway.pid"
-
-curl -f http://127.0.0.1:31080/v1/router/status
+CUDA_VISIBLE_DEVICES=0,1 bash plugins/remote_attn/deploy/start_p511_p_tp2.sh
 ```
 
-网关使用控制根目录，三个 SGLang 实例使用各自的 `p/src/dst` 子目录。
-`HANDOFF_PD_PREFILL_URL` 使新请求走真实 P→D 流程；漏设后不再是同一套严格 PD 实验。
-HTTP 返回 200 还需检查状态内容和日志，确认 worker 已就绪、没有遗留 drain/错误。
-
-## 9. 单请求迁移 smoke
-
-通过网关发送请求，D0 生成约 32 个输出 token 后自动尝试切到 D1：
-
 ```bash
-curl -N http://127.0.0.1:31080/v1/completions \
-  -H 'Content-Type: application/json' \
-  -d '{
-    "rid": "remote-demo-001",
-    "prompt": "请详细解释大语言模型推理中的 KV Cache 及其迁移过程。",
-    "max_new_tokens": 256,
-    "worker": "src",
-    "cut": 32,
-    "transfer": "remote"
-  }'
-```
-
-`rid` 每次用新的值，避免与 journal 中旧请求冲突；`cut` 是触发检查的输出 token 阈值，
-实际冻结点以调度器返回的状态为准。
-成功时 SSE 中先出现 `owner: src`，随后出现 `owner: dst`，并正常结束；核对 `seq` 不重复、不跳号及日志无错误。
-该实验网关返回 token ID/owner 等事件，不是标准 OpenAI 文本流或 chat API。
-
-| 请求中的 `transfer` | 行为 |
-| --- | --- |
-| `mooncake` | Copy：完整 KV 到达后继续 |
-| `layer` | Layer：按层等待 KV 到达 |
-| `remote` | Remote：未到达的 prefix 在源端计算，目标合并本地 tail；到达的层逐步转为 LOCAL |
-
-`remote` 配合 Fast Freeze，源端逐层 D2H/TE 与目标计算并行，目标完成 H2D 后再切 LOCAL。
-先分别验证三种模式，再做并发或长上下文实验；成功返回请求不等于已证明输出数值一致性。
-
-## 10. 将 D0 的运行中请求整体迁走
-
-这是独立于上节单请求自动切换的 drain 场景。
-先在一个终端创建长请求，将 `cut` 设得大于输出上限，避免先触发单请求自动迁移：
-
-```bash
-curl -N http://127.0.0.1:31080/v1/completions \
-  -H 'Content-Type: application/json' \
-  -d '{
-    "rid": "drain-demo-001",
-    "prompt": "请详细介绍分布式推理系统的调度、KV Cache 和容错。",
-    "max_new_tokens": 2048,
-    "worker": "src",
-    "cut": 1000000,
-    "transfer": "remote"
-  }'
-```
-
-看到 D0 输出后，在另一个已设置相同公共变量的终端执行：
-
-```bash
-curl -f http://127.0.0.1:31080/v1/drain \
-  -H 'Content-Type: application/json' \
-  -d '{"targets":["dst"],"mode":"d2d","transfer":"remote"}'
-
-curl -f http://127.0.0.1:31080/v1/drain/status
-```
-
-关注 `state`、`pending`、`failed`、`blocked_reason`、`last_error`、
-`source_safe_to_stop` 和 `source_clean_all_ranks`。
-没有运行中请求时，drain 不能证明实际发生过 KV 迁移。
-
-只有确认状态为 `SAFE_TO_STOP`，且源端所有 rank 已清理、没有待处理失败时，才停止 D0。
-`BLOCKED` 或控制请求超时不表示目标没有提交；不要据此强行释放源 KV。
-
-```bash
-# 仅在检查上述状态且本轮 D0 PID 仍匹配当前进程后执行。
-curl -f -X POST http://127.0.0.1:31080/v1/drain/stop
-kill -TERM "$(cat "$HANDOFF_RUN_DIR/d0.pid")"
-```
-
-`/v1/drain/stop` 只把控制面状态标记为 STOPPED，不会自动杀掉 D0。
-保留 P、D1、网关及其状态供后续请求使用，并检查客户端流仍能正确结束。
-重复 drain 是幂等的，旧 journal 中的终态可能被继续返回；它不是自动重置实验的接口。
-
-## 11. 部署验收与排错
-
-| 现象 | 检查 |
-| --- | --- |
-| 缺少 `SGLANG_MOONCAKE_SEND_LOCK` | 是否加载了本分支 SGLang，是否误装普通发行 wheel |
-| 找不到插件 entry point / hook 不齐 | 插件与 server 是否用同一个 Python，启动时是否启用插件和角色控制目录 |
-| 缺少 `send_probe` | 核对 Mooncake distribution、版本和实际导入路径，不能静默跳过 |
-| `libcudart.so.13` / libstdc++ 加载失败 | 核对 CUDA runtime、`LD_LIBRARY_PATH`、`LD_PRELOAD`；API 自检先导入 PyTorch |
-| FlashInfer 编译失败 | 检查 ninja、nvcc、CUDA_HOME 和缓存；4060 系统旧 nvcc 12.0 不能编译其 CUDA 13 配置 |
-| 网关模型/tokenizer 加载失败 | 原控制面固定模型目录是否完整，是否错把 server 模型 env 当作网关配置 |
-| 命令不执行 | 根目录和 `p/src/dst` 是否一致，每个 rank 是否活着，是否加载了旧 p2d_driver |
-| TP command diverged | 保存各 rank 的 result 和日志；引擎主动停止不一致调度，不能靠重发命令认定已自动恢复 |
-| `quarantined_transfers` 非空 | 完成凭据或 native unregister 尚未成功时保留；scheduler 会重试回收。不能确认远端完成或 GPU fence 失败时仍需故障恢复 |
-| Remote 本地缺层 / `remote downgrade` | 有可用 client 且未取消、GPU fence 安全时继续远端读缺失层；不能将错误唤醒当作 LOCAL-ready |
-| drain 长期 BLOCKED | 结合 target commit、epoch、fence、reservation、lease 和所有 rank 的事实排查，不能直接清 journal |
-
-内网至少完成以下验收，再判断适配可用于目标部署：
-
-1. P/D0/D1 的 health 和所有 rank ready；普通 PD 请求成功。
-2. Copy、Layer、Remote 的单请求及并发迁移，逐 token/logprob 对比不迁移参考；没有重复输出。
-3. 正常结束、取消、pre-commit abort、resume 后，row/token/reservation/lease/registration 的计数符合预期。
-4. 真正双 GPU TP2/NCCL，controller/D 重启和 session churn，检查各 rank 一致性及故障边界。
-5. GPU trace 检查实际业务下 D2H、TE、H2D 与 attention 的重叠和逐层 LOCAL；不能用单卡 probe 推断吞吐提升。
-
-可先在单卡环境执行已有 CUDA probe：
-
-```bash
+# D 服务：已加载 D 环境
 cd "$SGLANG_ROOT"
-PYTHONPATH=plugins/remote_attn "$HANDOFF_PYTHON" \
-  test/manual/remote_attn/cuda_handoff_probe.py \
-  --output "$HANDOFF_RUN_DIR/cuda-probe" --profile
+CUDA_VISIBLE_DEVICES=2,3 bash plugins/remote_attn/deploy/start_p511_d0_tp2.sh
 ```
 
-它包含 2 项 attention 比较、5 组实际 CUDA/Mooncake 传输、2 组缺层 Remote RPC 数值比较和 1 项取消 fence 检查，
-使用小型 KV storage fixture，不启动完整模型服务。与服务压测分开运行，避免争用 GPU。
+脚本自动合并插件 allowlist、执行 preflight；`common.sh` 的 Send Lock、probe、队列稳定性默认配置继续有效。
+不使用脚本时，服务环境也要显式提供这些设置。不要误把 D0 脚本中的 Fast Freeze 默认项当成本路径必须启动 D1 的信号。
 
-## 12. 当前功能边界和参考记录
+等待 P/D 加载完成，分别检查；超时应检查启动错误，不直接开放业务入口：
 
-当前适配范围为收到的 P0–P5.18 功能包；P5.19 pre-layerwise、TP Graph-on、跨主机、
-生产 router、通用 SSE 重连续传和自动扩缩容不作为本次交付能力。
-TP 命令一致性检查在分歧时停止引擎，不是跨 rank 原子回滚协议；故障路径可能保留内存直到进程退出。
+```bash
+curl --fail --max-time 30 http://127.0.0.1:31016/health
+curl --fail --max-time 30 http://127.0.0.1:31017/health
+ls "$HANDOFF_CTL_ROOT"/{p,src}/ready.*.json
+```
 
-**D 重启注意事项：**目前单独重启 D 后立即请求可能因旧 Mooncake session 返回 500，
-后台 probe 恢复只影响后续请求。维护时按内网规避方法配套重启 P 与 D，
-完成实际 KV 传输请求验证后再恢复流量；health 200 不等于传输链路已恢复。
-该窗口尚未修复，不要将 KV 重复释放修复解释为无损滚动重启支持。
+TP2 每个角色应有当前进程生成的 `ready.0.json` / `ready.1.json`，核对 PID、启动时间和 `tp_size`，不能只检查旧文件存在。
+P/D 使用相同发布制品与匹配开关；启动日志中的有效参数和配置快照要留档。
+然后启动内网 router，保持外部入口尚未导流：
 
-- [插件总览与安装边界](README.md)
-- [原包功能对应与来源差异](FUNCTIONAL-PARITY.md)
-- [复查问题与修复](REVIEW.md)
-- [4060 验证记录](validation/4060.md)
-- [4060 原始结构化结果](validation/4060-results.json)
-- [5090 内网等价性与故障反馈、修复说明](validation/5090-intranet.md)
+```bash
+"$HANDOFF_PYTHON" -m sglang_router.launch_router --pd-disaggregation \
+  --prefill http://127.0.0.1:31016 35409 \
+  --decode http://127.0.0.1:31017 --host 127.0.0.1 --port 31000
+```
 
-原实验 SGLang 基线为 `feat/dsv4-pdmux-opt@3a869635c` 的 dirty working tree，
-Mooncake 实验代码参考为 `pd-handoff-p518-stable@17261ca0`。
-实际收到的 runtime MD5 与原文档声明不同，详见功能对应表；本部署使用已适配的 `remote-attn` 分支，
-不依赖重新找到原 dirty tree 或重新应用迁移 patch。
+当前 P/D pair 不需要 `p4_gateway.py`、D1 或 `/v1/router/migrate`。
+业务可沿用已验证的标准接口经过原生 router 访问；第 6 节使用原生 `/generate` 做接入检查。
 
-C1 及 host 回收更新详见 [修复说明](validation/C1-RECLAIM.md)。升级时同时更新并重启网关与 P/D 实例，
-保留 journal；`HANDOFF_CTL_ROOT` 必须共享，新增 `p/src/dst/transfer-completion/` 用于已完成传输的回收凭据。
-不要在进程存活时删除未确认完成的凭据。
+## 6. 接流量前预热与就绪判定
+
+在业务入口未导流时，用同一 serving Python 通过 router 发送代表性请求。以下输入长度仅是请求样例，**不设置 token chunk**；按模型上下文上限调整，使输入加输出在部署限制内：
+
+```bash
+"$HANDOFF_PYTHON" - <<'PY'
+import json
+import os
+import time
+import urllib.request
+from transformers import AutoTokenizer
+
+tok = AutoTokenizer.from_pretrained(os.environ["HANDOFF_MODEL_PATH"])
+seed = tok.encode("Explain how a key value cache works. ", add_special_tokens=False)
+for length in (2048, 8192, 32768):
+    ids = (seed * ((length + len(seed) - 1) // len(seed)))[:length]
+    for repeat in range(2):
+        payload = {"input_ids": ids, "sampling_params": {
+            "temperature": 0, "max_new_tokens": 32, "ignore_eos": True}}
+        request = urllib.request.Request("http://127.0.0.1:31000/generate",
+            data=json.dumps(payload).encode(), headers={"Content-Type": "application/json"})
+        start = time.perf_counter()
+        with urllib.request.urlopen(request, timeout=600) as response:
+            result = json.load(response)
+        print(length, repeat, round(time.perf_counter() - start, 3),
+              result.get("meta_info", {}), flush=True)
+PY
+
+# 请求结束后继续等待后台回收；未回收时不应判定就绪。
+"$HANDOFF_PYTHON" "$SGLANG_ROOT/test/manual/remote_attn/pre_layerwise_report.py" \
+  "$HANDOFF_PD_DIR" > "$HANDOFF_RUN_DIR/warmup-report.json"
+```
+
+就绪条件必须同时满足：
+
+1. P/D 健康且加载的是固定 release；代表性请求经 router 正常完成，无重复响应、异常结束或不合理重试。
+2. report 中 `activated_shards > 0`，目标行的 `host_staging`、`native_staging`、`recv_host_staging` 均为 true；核对该 pair 的全部 TP rank。没有 activation 可能是 offer/配置不匹配造成原生回退，不算预热成功。
+3. 预热停止后 `released_shards == activated_shards`，无 `error`；结合服务请求状态确认没有普通 PD 请求遗留。report 只统计已激活路径，不能独立证明整个服务无在途请求。
+4. 不出现持续 reaper 满载、staging allocation 失败、quarantine、KV 重复释放或 session 错误；内存峰值在核准预算内。
+
+实际需要验证 Remote 或跨层重叠时，在具备相应窗口的受控请求上追加 `--require-remote` 或 `--require-overlap`。
+所有层提前到齐时没有 Remote 调用可以是正常结果，小尾块合组也不意味着故障；不要要求每一条预热请求都触发 Remote。
+单 pair 顺序预热只是最小门槛，正式接入前还需第 7 节的目标并发和故障验收。
+
+## 7. 灰度验收、观测和扩大流量
+
+先在隔离的候选 pair 上完成验收，再由现有入口按固定比例灰度导流；保留已验收基线 pair 和撤流通道。
+所有对照固定模型、输入/输出、采样、token chunk、层组策略、Batch、graphs、TP、profile 和内存参数。
+
+| 对照目的 | 配置变化（需 drain 后重启 pair） |
+| --- | --- |
+| 原生 PD 基线 | P/D `HANDOFF_PRE_LAYERWISE=off`、`SGLANG_DISAGG_STAGING_BUFFER=0`，D receive flag `0` |
+| 只比较提前 Decode | `remote` ↔ `layerwise`，发送/接收 host staging 和其他配置一致 |
+| 接收流依赖归因 | P/D staging 保持 `1`；D receive flag `1` ↔ `0`（GPU ring 对照） |
+| 发送 staging 归因 | 只切 P host staging `1` ↔ `0` |
+| 引用回收归因 | 只切 P `HANDOFF_PL_RETIRE=async` ↔ `off` / `keep64`；仅隔离测试 |
+| 冷态 / 热态 | 新 pair 首个请求单独统计，再统计完整预热后的请求；记录扩容事件 |
+
+正确性验收覆盖实际部署的长短输入、最终尾块、混合长度请求、目标并发、连续 ring 绕回、多轮复用、客户端取消与重启。
+用 temperature=0 的相同输入比较基线输出；若出现浮点路径差异，定位首个分歧并比对 logprob，不能直接把差异忽略。
+故障验收确认网络失败/超时不会发布 Local-ready，也不会提前释放仍可能被写入或被 Remote 读取的 KV。
+完整目标 GPU TP2 验收、吞吐/延迟 SLO 和容量结果须与 release SHA 一起保存。
+
+观测至少包含：
+
+- 业务 p50/p95/p99 TTFT、ITL、E2E、吞吐、错误/取消/超时率；按冷态与热态分开统计。
+- activation 比例、Remote 调用数、剩余 KV 时间、Remote Window、完成/回收差值；按 pair/rank 保留证据。
+- reaper 满载日志、staging/watermark 积压的诊断证据、session/probe 错误、quarantine、CPU 和主机/GPU 内存峰值。
+
+现有 `pre_layerwise_report.py` 汇总 journal，不是常驻监控服务，也没有自动上线/回滚动作；需接入现场已有日志/指标与发布系统。
+`observed_remote_window_ms` 受轮询影响，完成早于 Prefill finalize 是辅助证据；验证真实 GPU 重叠仍需 trace。
+启动样例关闭 RPC profiling；性能轮维持一致，归因 trace 单独运行。
+只有正确性通过、错误率和尾延迟满足现场 SLO、收益可重复且内存稳定时才扩大流量；不把单次 TTFT 改善当作上线结论。
+
+## 8. 撤流、故障处理与回退
+
+这些配置在进程启动时生效，不支持在在途请求上热切换。
+
+1. 从现有业务入口撤下整个候选 pair，停止新请求；先让已接收请求和 Remote RPC 结束。
+2. 确认原生 PD 无在途请求，并检查激活请求全部 released、无错误。不能仅依赖 router 健康状态或 TCP 连接断开判断可释放 KV。
+3. 正常 drain 后停止 router/P/D，保存 release、配置、日志、journal 和必要 trace。再修改模式或回退到上一套已验收制品，使用新实例目录并重新预热。
+4. 紧急情况下先将新请求切到健康基线 pair。若 timeout/quarantine 无法证明在途 DMA/RPC 已结束，保留故障现场并由现场流程终止相关 P/D 进程后重建整套 pair；不得在存活进程中强制 unregister、复用 KV 或清空 journal。
+
+完整功能回退须同时设置 P/D `HANDOFF_PRE_LAYERWISE=off`、`SGLANG_DISAGG_STAGING_BUFFER=0`、D `HANDOFF_PRE_LAYERWISE_RECV_HOST_STAGING=0`；只把 `remote` 改成 `layerwise` 仍保留新传输路径。
+只关闭接收 host flag 会保留 GPU ring 协议，属于性能对照，不是回退到原生直写基线。
+保留 Send Lock、pre-send probe 和已核准 Batch 等传输配置。
+
+历史现场发现过单独重启 D 后首请求的 session 失效窗口，见 [复验记录](validation/5090-new-commits.md)。
+本次修复没有提供跨版本滚动升级或透明故障恢复保证；新旧协议不混用，首轮按整个 pair 撤流升级。
+probe 可帮助识别失效 peer，但不是“任意重启都无损”的保证。
+
+journal 当前**不自动清理**。需要生产侧监控磁盘容量，归档只针对已停止且确认 drain 的实例目录；不对活跃实例目录做按时间粗删。
+退场等待期限需覆盖最长请求和回收时间，超时进入故障流程，不能当作安全回收证明。
+
+## 9. 发布检查记录
+
+每个正式 release 留存：完整 SHA / wheel 校验和 / 模型 revision；加载路径与依赖版本；P/D/router 的有效参数和环境；内存预算；首请求与预热后性能；目标并发正确性和取消/失败/重启结果；撤流回退演练；灰度批准的 SLO 与流量范围。
+
+当前代码的开发机验证限于 CPU 合约、源码 hook 和格式检查。可在空闲目标 GPU 上另跑
+`test/manual/remote_attn/pre_layerwise_staging_probe.py --receive-staging --busy-device destination`
+验证实际 TE/H2D/scatter 字节与流依赖，但它不启动完整模型、不能替代服务验收，也不应在已接流量 GPU 上运行。
+完整探针参数、测试矩阵和指标解释见 [P5.19 说明](P5.19-PRE-LAYERWISE-ZH.md)。

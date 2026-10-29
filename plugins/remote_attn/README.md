@@ -1,6 +1,6 @@
 # Remote attention / progressive KV handoff plugin
 
-中文部署入口：[内网部署手册](DEPLOYMENT-ZH.md)，包含交付清单、Mooncake 版本、离线准备、安装、启动和迁移验收。
+中文部署入口：[Progressive 生产接入手册](DEPLOYMENT-ZH.md)，对应 `codex/remote-attn-pre-layerwise`：固定发布制品、P/D 角色配置、双端 host staging、延迟回收、冷态预热、灰度验收与回退。旧 P5.18 D0→D1 实验部署保留在 [历史手册](migration/P5.18-DEPLOYMENT-LEGACY-ZH.md)。
 
 This ports the supplied P0–P5.18 experiment onto local `main` at
 `1335d372f0a58857422e40b89a097daa7d3bf86c`, using the existing
@@ -14,7 +14,7 @@ still need acceptance on the target deployment.
 
 - `sglang_remote_attn/handoff_control.py`: adapted runtime, including Copy, Layer,
   Remote, Fast Freeze/Resume, RemoteHub, progressive LOCAL, epochs, fences and leases.
-- `sglang_remote_attn/hooks.py`: 21 function-boundary hooks. No scheduler event
+- `sglang_remote_attn/hooks.py`: 23 function-boundary hooks. No scheduler event
   loop, graph runner, allocation function or Mooncake connector is copied/replaced.
 - `control_plane/p2d_driver.py`: original supplied driver. `p4_gateway.py` now
   carries a targeted C1 reservation/epoch fix; its protocol and fixed state paths
@@ -137,7 +137,7 @@ PYTHONPATH=plugins/remote_attn python -m sglang_remote_attn.check --source-only
 
 ## Local validation
 
-- 56 CPU contract tests passed, using real CPU PyTorch tensors and source-loaded
+- 57 CPU contract tests passed, using real CPU PyTorch tensors and source-loaded
   upstream pool/KV methods. The local environment lacks the full SGLang model/eval
   dependencies, so its reduced test harness also source-loaded the repository's
   `CustomTestCase`; full installed-runtime import was not exercised locally.
@@ -146,7 +146,9 @@ PYTHONPATH=plugins/remote_attn python -m sglang_remote_attn.check --source-only
   and scheduling divergence. It does not exercise CUDA or NCCL.
 - Transfer tests cover a three-buffer/one-slot ACK cycle, rank device selection,
   source staging reuse, receiver/source fences, unknown TE completion, RPC
-  stream fences, incomplete-layer wakeups and teardown failures.
+  stream fences, incomplete-layer wakeups and teardown failures. Layer-group
+  retirement tests cover blocking destructors and bounded reaper backpressure;
+  sender slot checks cover registration-before-warmup and reuse without rewarming.
 - All 23 hook targets and their positional/keyword call shapes match this checkout.
 - Python compilation, Ruff F checks, isort and formatting, shell syntax, wheel build and
   wheel entry-point metadata checks passed.
@@ -230,12 +232,14 @@ SGLANG_ENABLE_STRICT_MEM_CHECK_DURING_IDLE=0
 SGLANG_MOONCAKE_SEND_LOCK=1
 ```
 
-The native PD connector on this main actively splits index batches into
-synchronous TE calls. The former deployment value `8` introduced thousands
-of calls at 32K context. The default is now `2048`, matching the launchers'
-`--chunked-prefill-size 2048`. If changing chunk size, review the batch bound
-and transport queue limits together. An existing exported value still overrides
-the default; clear a stale `8` or explicitly export `2048` before restarting.
+The native PD connector splits index batches into synchronous TE calls when
+`SGLANG_MOONCAKE_MAX_TRANSFER_BATCH_INDICES` is positive. Progressive does not
+require a batch limit of `8`, or a limit equal to the model's token chunk size.
+Preserve the deployment's existing value. The reference launchers default to
+`2048` only when unset; direct native launches default to `0` (no splitting by
+this limit). Smaller batches add calls; larger batches may increase sender
+staging memory and per-call latency. Record the effective value and evaluate
+changes separately from the staging/retirement controls.
 
 Remote mode can keep serving a frozen prefix after a local import/drop error.
 Only H2D-completed layers become LOCAL; missing layers keep using Remote RPC.
