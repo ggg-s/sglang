@@ -41,6 +41,18 @@ nonblocking CUDA stream and registered pinned host storage before native TE send
 This preserves native batching and the send lock; ordinary PD and Post-Remote
 transfers keep their existing paths. Set `HANDOFF_PRE_LAYERWISE_HOST_STAGING=0`
 for the GPU-pointer control. Failed/uncertain sends quarantine staging storage.
+Each newly registered sender slot performs a one-byte D2H warmup on its own copy
+stream before the layerwise forward; reusing the slot does not repeat warmup.
+This moves first-copy initialization out of group sends, but its cost still
+belongs to the first request if the slot is first reserved on that request.
+Layer-group task references (including CUDA events held by send callbacks) are
+released by a daemon reaper after the transfer worker finishes with the task.
+`HANDOFF_PL_RETIRE=async` is the default; `off` restores inline release and
+`keep64` retains the last 64 tasks on each worker for diagnostic comparison.
+The async queue is bounded to 64 pending tasks per worker, plus one being reaped.
+If it fills, the worker logs and waits for capacity: dropping a reference on a
+full queue would run the same potentially blocking destructor on the worker.
+`keep64` can likewise block at eviction or shutdown and is not the production fix.
 Enable `SGLANG_DISAGG_STAGING_BUFFER=1` on P and D to reuse the native ring,
 registration, chunk-ready notifications and watermark flow control. On D,
 `HANDOFF_PRE_LAYERWISE_RECV_HOST_STAGING=1` changes the registered ring to pinned

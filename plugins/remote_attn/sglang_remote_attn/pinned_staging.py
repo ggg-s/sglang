@@ -36,6 +36,29 @@ class CudaPinnedSlot:
                 raise
         self.ptr = self.host.data_ptr()
 
+    def warmup(self):
+        """Prime the real registered destination and stream before group sends."""
+        with self.torch.cuda.device(self.device), self.torch.cuda.stream(self.stream):
+            # A private scratch byte avoids reading KV while a previous chunk
+            # might still be writing it. Keep it alive until the D2H completes.
+            source = self.torch.empty(
+                1, dtype=self.torch.uint8, device=f"cuda:{self.device}"
+            )
+            # Retain scratch even if a CUDA call raises or reports uncertainty.
+            self._warmup_source = source
+            (err,) = self.cudart.cudaMemcpyAsync(
+                self.ptr,
+                source.data_ptr(),
+                1,
+                self.cudart.cudaMemcpyKind.cudaMemcpyDeviceToHost,
+                self.raw_stream,
+            )
+            if int(err) != 0:
+                raise RuntimeError(f"pre-layerwise D2H warmup failed: {err}")
+            self.done.record(self.stream)
+            self.done.synchronize()
+            self._warmup_source = None
+
     def copy(self, blocks, ready_event):
         with self.torch.cuda.device(self.device):
             self.stream.wait_event(ready_event)
@@ -118,6 +141,7 @@ class PinnedKVStager:
                 self.registered = True
                 with self.manager._remote_attn_send_lock:
                     self.manager.engine.register(self.slot.ptr, self.slot.capacity)
+                self.slot.warmup()
             except Exception:
                 self.poisoned = True
                 raise

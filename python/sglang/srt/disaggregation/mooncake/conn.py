@@ -4,10 +4,11 @@ import concurrent.futures
 import dataclasses
 import logging
 import os
+import queue as queue_module
 import struct
 import threading
 import time
-from collections import defaultdict
+from collections import defaultdict, deque
 from typing import Dict, List, Optional, Set, Tuple, Union
 
 import numpy as np
@@ -86,6 +87,59 @@ FAILED_SESSION_RECOVERIES = Counter(
     "sglang:failed_session_recoveries_total",
     "Number of mooncake_session_ids un-blacklisted via probe.",
 )
+
+
+class _TransferReferenceReaper:
+    """Release layer-group CUDA references away from the transfer worker.
+
+    A completed event can still have an expensive destructor on some drivers.
+    Envelopes transfer ownership before enqueue; clearing them on the consumer
+    avoids a race where a fast consumer leaves the producer holding the last ref.
+    One instance belongs to one worker, with at most 64 queued envelopes plus
+    one being destroyed. Saturation applies explicit backpressure, never drops
+    the last reference on the producer or grows an unbounded overflow list.
+    """
+
+    def __init__(self):
+        self.mode = os.environ.get("HANDOFF_PL_RETIRE", "async")
+        if self.mode not in ("async", "off", "keep64"):
+            raise ValueError("HANDOFF_PL_RETIRE must be async, off, or keep64")
+        self.queue = queue_module.Queue(maxsize=64)
+        self.kept = deque(maxlen=64)
+        self.thread = None
+
+    def _run(self):
+        while True:
+            envelope = self.queue.get()
+            if envelope is None:
+                return
+            envelope.clear()
+
+    def submit(self, envelope):
+        if self.mode == "off":
+            envelope.clear()
+        elif self.mode == "keep64":
+            # Diagnostic only: eviction can destroy an event on this thread.
+            self.kept.append(envelope)
+        else:
+            if self.thread is None:
+                self.thread = threading.Thread(
+                    target=self._run, name="mooncake-reference-reaper", daemon=True
+                )
+                self.thread.start()
+            try:
+                self.queue.put_nowait(envelope)
+            except queue_module.Full:
+                logger.warning(
+                    "Layer-group reference reaper full; waiting for capacity"
+                )
+                self.queue.put(envelope)
+
+    def close(self):
+        if self.thread is not None:
+            # FIFO drains all references before exit, including after worker error.
+            self.queue.put(None)
+        self.kept.clear()
 
 
 @dataclasses.dataclass
@@ -2577,6 +2631,7 @@ class MooncakeKVManager(StagingManagerMixin, CommonKVManager):
         worker_index=0,
     ):
         staging_strategy = None
+        reference_reaper = None
         if self.enable_trace:
             trace_set_thread_info(
                 f"mooncake transfer worker {worker_index}",
@@ -2586,12 +2641,16 @@ class MooncakeKVManager(StagingManagerMixin, CommonKVManager):
 
         while True:
             kv_chunk: Optional[TransferKVChunk] = None
+            staging_deferred = False
+            worker_failed = False
             try:
                 kv_chunk = queue.get()
                 # teardown() pushes a None sentinel to unblock get() and stop
                 # the worker: FastQueue.get() blocks indefinitely, so checking
                 # _stopped alone can never wake a parked worker during a role switch.
                 if kv_chunk is None:
+                    if reference_reaper is not None:
+                        reference_reaper.close()
                     break
                 if self.enable_trace:
                     kv_chunk.trace_ctx.rebuild_thread_context()
@@ -2619,7 +2678,11 @@ class MooncakeKVManager(StagingManagerMixin, CommonKVManager):
                         and self.check_status(kv_chunk.room) != KVPoll.Failed
                     ):
                         kv_chunk.wait_event.synchronize()
-                    kv_chunk.wait_event = None
+                    # Layer-group events survive until deferred retirement below.
+                    # Clearing here would move their destructor onto this worker
+                    # when source host staging is disabled.
+                    if kv_chunk.kv_buffer_indices is None:
+                        kv_chunk.wait_event = None
                 if kv_chunk.indices_event is not None:
                     kv_chunk.indices_event.synchronize()
                     kv_chunk.indices_event = None
@@ -3030,12 +3093,26 @@ class MooncakeKVManager(StagingManagerMixin, CommonKVManager):
                     self._staging_outstanding.pop(kv_chunk.room, None)
 
             except Exception as e:
+                worker_failed = True
                 # NOTE(shangming): Remove this when we make sure the transfer thread is bug-free
                 if kv_chunk is not None:
                     self.poison_deferred_ack_room(kv_chunk.room)
                 raise RuntimeError(
                     f"Transfer thread failed because of {e}. Prefill instance with bootstrap_port={self.bootstrap_port} is dead."
                 )
+            finally:
+                if (
+                    kv_chunk is not None
+                    and kv_chunk.kv_buffer_indices is not None
+                    and not staging_deferred
+                ):
+                    if reference_reaper is None:
+                        reference_reaper = _TransferReferenceReaper()
+                    envelope = [kv_chunk]
+                    kv_chunk = None
+                    reference_reaper.submit(envelope)
+                if worker_failed and reference_reaper is not None:
+                    reference_reaper.close()
 
     def _handle_abort_notification(self, msg: List[bytes]) -> bool:
         if not msg or msg[0] != ABORT_TAG:

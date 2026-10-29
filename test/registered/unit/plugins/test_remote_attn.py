@@ -59,6 +59,9 @@ class _HostStagingSlot:
             ctypes.memmove(self.ptr + offset, src, size)
             offset += size
 
+    def warmup(self):
+        pass
+
     def close(self):
         self.closed = True
 
@@ -123,6 +126,21 @@ def _source_function(relative, name):
     namespace = {}
     exec(compile(ast.fix_missing_locations(module), str(path), "exec"), namespace)
     return namespace[name]
+
+
+def _reference_reaper_class():
+    import logging
+    from collections import deque
+
+    cls = _source_class("disaggregation/mooncake/conn.py", "_TransferReferenceReaper")
+    cls.__init__.__globals__.update(
+        os=os,
+        queue_module=queue,
+        deque=deque,
+        threading=threading,
+        logger=logging.getLogger(__name__),
+    )
+    return cls
 
 
 class TestRemoteAttn(CustomTestCase):
@@ -1841,7 +1859,9 @@ class TestRemoteAttn(CustomTestCase):
                     self.hooks._stream_output(emit, None, [req])
                 self.assertEqual(len(outputs), 1)
 
+    @patch.dict(os.environ, HANDOFF_PL_RETIRE="async")
     def test_prelayer_worker_proves_completion_only_after_all_writes(self):
+        """Slow event destruction must not run on the worker after native sends."""
         import logging
         from collections import defaultdict
 
@@ -1850,7 +1870,10 @@ class TestRemoteAttn(CustomTestCase):
         )
         polls = _source_class("disaggregation/base/conn.py", "KVPoll")
         manager_cls.transfer_worker.__globals__.update(
-            time=time, logger=logging.getLogger(__name__), KVPoll=polls
+            time=time,
+            logger=logging.getLogger(__name__),
+            KVPoll=polls,
+            _TransferReferenceReaper=_reference_reaper_class(),
         )
         for outcome in (
             "success",
@@ -1861,6 +1884,21 @@ class TestRemoteAttn(CustomTestCase):
         ):
             with self.subTest(outcome=outcome):
                 events = []
+                retirement_started = threading.Event()
+                retirement_release = threading.Event()
+                retirement_finished = threading.Event()
+                retirement_threads = []
+
+                class ReadyEvent:
+                    def synchronize(self):
+                        events.append("gpu-ready")
+
+                    def __del__(self):
+                        retirement_threads.append(threading.get_ident())
+                        retirement_started.set()
+                        retirement_release.wait(3)
+                        retirement_finished.set()
+
                 manager = manager_cls()
                 manager.enable_trace = manager.enable_staging = (
                     manager.enable_deferred_decode_kv_release
@@ -1906,42 +1944,128 @@ class TestRemoteAttn(CustomTestCase):
                 }
 
                 def send(session, *args, **kwargs):
-                    self.assertIs(kwargs["transfer_fn"], transfer_fn)
+                    if outcome == "staged_success":
+                        self.assertIsInstance(kwargs["transfer_fn"], functools.partial)
+                    else:
+                        self.assertIsNone(kwargs["transfer_fn"])
                     events.append(session)
                     if outcome == "cancelled":
                         manager.request_status.pop(7, None)
                     return 0
 
                 manager.send_kvcache = send
-                transfer_fn = object() if outcome == "staged_success" else None
                 chunk = SimpleNamespace(
                     room=7,
                     staging_counted=False,
-                    wait_event=SimpleNamespace(
-                        synchronize=lambda: events.append("gpu-ready")
+                    wait_event=(
+                        ReadyEvent()
+                        if outcome in ("success", "staged_success")
+                        else SimpleNamespace(
+                            synchronize=lambda: events.append("gpu-ready")
+                        )
                     ),
                     indices_event=None,
                     prefill_kv_indices=[1, 2],
                     index_slice=slice(0, 2),
                     is_last_chunk=False,
                     kv_buffer_indices=(0, 1),
-                    transfer_fn=transfer_fn,
+                    transfer_fn=None,
                     staging_chunk_idx=None,
                     staging_layer_ids=None,
                     on_complete=lambda: events.append("proof"),
                 )
+                if outcome == "staged_success":
+                    chunk.transfer_fn = functools.partial(
+                        lambda *, ready_event: None, ready_event=chunk.wait_event
+                    )
                 tasks = queue.Queue()
                 tasks.put(chunk)
+                del chunk
                 tasks.put(None)
-                if outcome == "short_destination":
-                    with self.assertRaisesRegex(RuntimeError, "does not cover"):
+                try:
+                    if outcome == "short_destination":
+                        with self.assertRaisesRegex(RuntimeError, "does not cover"):
+                            manager.transfer_worker(tasks, None)
+                    else:
                         manager.transfer_worker(tasks, None)
-                else:
-                    manager.transfer_worker(tasks, None)
+                    if outcome in ("success", "staged_success"):
+                        self.assertTrue(retirement_started.wait(3))
+                        self.assertNotEqual(retirement_threads, [threading.get_ident()])
+                        self.assertFalse(retirement_finished.is_set())
+                finally:
+                    retirement_release.set()
+                    if outcome in ("success", "staged_success"):
+                        self.assertTrue(retirement_finished.wait(3))
                 if outcome in ("success", "staged_success"):
                     self.assertEqual(events, ["gpu-ready", "a", "b", "proof"])
                 else:
                     self.assertNotIn("proof", events)
+
+    def test_prelayer_reaper_bounds_pending_destructors(self):
+        """A blocked destructor cannot create an unbounded overflow or inline free."""
+        cls = _reference_reaper_class()
+        started, release, saturated, submitted = (threading.Event() for _ in range(4))
+        freed = []
+
+        class SlowReference:
+            def __del__(self):
+                started.set()
+                release.wait(3)
+
+        class Reference:
+            def __del__(self):
+                freed.append(threading.get_ident())
+
+        with patch.dict(os.environ, HANDOFF_PL_RETIRE="async"):
+            reaper = cls()
+        reaper.submit([SlowReference()])
+        self.assertTrue(started.wait(3))
+        for _ in range(64):
+            reaper.submit([Reference()])
+        original_put_nowait = reaper.queue.put_nowait
+
+        def observe_full(envelope):
+            try:
+                original_put_nowait(envelope)
+            except queue.Full:
+                saturated.set()
+                raise
+
+        def producer():
+            reaper.submit([Reference()])
+            submitted.set()
+
+        producer_thread = threading.Thread(target=producer)
+        try:
+            with patch.object(reaper.queue, "put_nowait", side_effect=observe_full):
+                producer_thread.start()
+                self.assertTrue(saturated.wait(3))
+                self.assertFalse(submitted.is_set())
+                self.assertEqual(reaper.queue.qsize(), 64)
+                self.assertEqual(freed, [])
+                release.set()
+                producer_thread.join(3)
+        finally:
+            release.set()
+            producer_thread.join(3)
+            reaper.close()
+            reaper.thread.join(3)
+        self.assertTrue(submitted.is_set())
+        self.assertFalse(reaper.thread.is_alive())
+        self.assertEqual(freed, [reaper.thread.ident] * 65)
+        for mode in ("off", "keep64"):
+            with (
+                self.subTest(mode=mode),
+                patch.dict(os.environ, HANDOFF_PL_RETIRE=mode),
+            ):
+                freed.clear()
+                control = cls()
+                for _ in range(65):
+                    control.submit([Reference()])
+                self.assertIsNone(control.thread)
+                self.assertEqual(len(freed), 65 if mode == "off" else 1)
+                control.close()
+                self.assertEqual(freed, [threading.get_ident()] * 65)
 
     def test_prelayer_cuda_slot_orders_private_copy_before_native_send(self):
         """Exercise the real CUDA adapter with driver calls at the test boundary."""
@@ -1950,6 +2074,7 @@ class TestRemoteAttn(CustomTestCase):
         manager = _host_staging_manager()
         ready = object()
         pending, received, flags, destroyed, waited = [], [], [], [], []
+        warmups = []
         make_empty = torch.empty
         test = self
 
@@ -1979,13 +2104,20 @@ class TestRemoteAttn(CustomTestCase):
         def memcpy(dst, src, size, kind, raw):
             self.assertEqual(raw, 17)
             self.assertIn(kind, (1, 2))
-            if kind == 2:
+            if size == 1:
+                # Registration must precede the first real D2H to this slot.
+                self.assertIn(dst, manager.registrations)
+                warmups.append(dst)
+            elif kind == 2:
                 self.assertEqual(waited[-1:], [ready])
             pending.append((dst, src, size))
             return (0,)
 
         def empty(*args, **kwargs):
-            self.assertTrue(kwargs.pop("pin_memory"))
+            if "device" in kwargs:
+                self.assertEqual(kwargs.pop("device"), "cuda:1")
+            else:
+                self.assertTrue(kwargs.pop("pin_memory"))
             return make_empty(*args, **kwargs)
 
         cudart = SimpleNamespace(
@@ -2001,12 +2133,16 @@ class TestRemoteAttn(CustomTestCase):
             patch.dict(sys.modules, {"cuda.bindings": SimpleNamespace(runtime=cudart)}),
             patch.object(torch, "empty", side_effect=empty),
             patch.object(torch.cuda, "device", side_effect=lambda _: nullcontext()),
+            patch.object(torch.cuda, "stream", side_effect=lambda _: nullcontext()),
             patch.object(torch.cuda, "ExternalStream", return_value=stream),
             patch.object(torch.cuda, "Event", side_effect=Event),
         ):
             stager = PinnedKVStager(manager, 1)
             stager.reserve(4)
             stager.reserve(8)
+            stager.reserve(8)
+            self.assertEqual(len(warmups), 2)
+            self.assertEqual(pending, [])
             self.assertEqual(len(manager.registrations), 1)
 
             def transfer(session, blocks):
@@ -2187,7 +2323,14 @@ class TestRemoteAttn(CustomTestCase):
         """A failed native call must never turn pinned storage into reusable memory."""
         from sglang_remote_attn.pinned_staging import PinnedKVStager
 
-        for failure in ("register", "copy", "send", "send_exception", "unregister"):
+        for failure in (
+            "register",
+            "warmup",
+            "copy",
+            "send",
+            "send_exception",
+            "unregister",
+        ):
             with self.subTest(failure=failure):
                 manager = _host_staging_manager()
                 stager = PinnedKVStager(manager, 0, slot_factory=_HostStagingSlot)
@@ -2197,9 +2340,17 @@ class TestRemoteAttn(CustomTestCase):
                 def fail(*args):
                     raise RuntimeError("injected native failure")
 
-                if failure == "register":
-                    manager.engine.register = fail
-                    with self.assertRaises(RuntimeError):
+                if failure in ("register", "warmup"):
+                    if failure == "register":
+                        manager.engine.register = fail
+                    with (
+                        patch.object(
+                            _HostStagingSlot,
+                            "warmup",
+                            side_effect=fail if failure == "warmup" else None,
+                        ),
+                        self.assertRaises(RuntimeError),
+                    ):
                         stager.reserve(16)
                 else:
                     stager.reserve(16)
