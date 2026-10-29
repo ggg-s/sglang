@@ -541,9 +541,9 @@ def check_pdmux_overlap(cfg):
             "support prefill CP."
         )
     else:
-        assert cfg.speculative_algorithm in ("DFLASH", "DSPARK"), (
-            "PD-Multiplexing overlap schedule supports no speculation, DFLASH "
-            f"or DSPARK; got {cfg.speculative_algorithm}."
+        assert cfg.speculative_algorithm in ("DFLASH", "DSPARK", "EAGLE"), (
+            "PD-Multiplexing overlap schedule supports no speculation, DFLASH, "
+            f"DSPARK or EAGLE; got {cfg.speculative_algorithm}."
         )
     if cfg.tp_size > 1:
         prefill_cp = getattr(cfg, "enable_prefill_cp", False)

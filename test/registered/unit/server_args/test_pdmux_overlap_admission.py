@@ -52,10 +52,13 @@ class TestPdmuxOverlapAdmission(unittest.TestCase):
 
     def test_unsupported_speculative_algorithm_is_rejected(self):
         with self.assertRaises(AssertionError):
-            check_pdmux_overlap(make_cfg(speculative_algorithm="EAGLE"))
+            check_pdmux_overlap(make_cfg(speculative_algorithm="NGRAM"))
 
     def test_dflash_is_still_admitted(self):
         check_pdmux_overlap(make_cfg(speculative_algorithm="DFLASH"))
+
+    def test_eagle_mtp_is_admitted(self):
+        check_pdmux_overlap(make_cfg(speculative_algorithm="EAGLE"))
 
 
 if __name__ == "__main__":

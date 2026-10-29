@@ -34,6 +34,11 @@ class PDMuxConfig:
     # plain full-device streams, so the two SM sets deliberately overlap and the
     # manual_divisions decode_sm column is ignored.
     overlap_decode_full_sm: bool = False
+    # Both lanes run on plain full-device streams; decode uses a high-priority
+    # stream instead of a green-context SM partition. No SM cap is applied to
+    # prefill, so it keeps the full device while decode interleaves at layer
+    # boundaries.
+    prefill_full_sm: bool = False
 
 
 def is_pdmux_standard_prefill() -> bool:
@@ -99,6 +104,22 @@ def load_pdmux_config(config_path: str) -> PDMuxConfig:
             "exclusive partitions, which does not describe an overlapped one."
         )
 
+    prefill_full_sm = raw.get("prefill_full_sm", False)
+    if prefill_full_sm:
+        if overlap_decode_full_sm:
+            raise ValueError(
+                "prefill_full_sm and overlap_decode_full_sm are mutually exclusive."
+            )
+        if manual_divisions:
+            raise ValueError(
+                "prefill_full_sm does not partition SMs; omit manual_divisions."
+            )
+        if raw["sm_group_num"] != 3:
+            raise ValueError(
+                "prefill_full_sm uses one shared full-device group; "
+                "set sm_group_num: 3."
+            )
+
     split_forward_max_layers = raw.get("split_forward_max_layers", 0)
     if split_forward_max_layers < 0:
         raise ValueError("split_forward_max_layers must be >= 0")
@@ -110,6 +131,7 @@ def load_pdmux_config(config_path: str) -> PDMuxConfig:
         split_forward_max_layers=split_forward_max_layers,
         decode_bs_divisor=raw.get("decode_bs_divisor", 36),
         overlap_decode_full_sm=overlap_decode_full_sm,
+        prefill_full_sm=prefill_full_sm,
     )
 
 
@@ -181,7 +203,11 @@ def initialize_stream_groups(gpu_id: int, config: PDMuxConfig):
     device = torch.cuda.current_device()
     total_sm_count = spatial.get_sm_available(gpu_id)
     # (prefill_sm_count, decode_sm_count)
-    if config.manual_divisions:
+    if config.prefill_full_sm:
+        # No SM partition: both lanes see the whole device and the hardware
+        # scheduler interleaves them, with decode on the high-priority stream.
+        divisions = [(total_sm_count, total_sm_count)]
+    elif config.manual_divisions:
         divisions = [
             (prefill_sm, decode_sm)
             for prefill_sm, decode_sm, _ in config.manual_divisions
@@ -203,7 +229,7 @@ def initialize_stream_groups(gpu_id: int, config: PDMuxConfig):
                 )
         # Decode reaches every SM, so its column records the full device.
         divisions = [(prefill_sm, total_sm_count) for prefill_sm, _ in divisions]
-    else:
+    elif not config.prefill_full_sm:
         for prefill_sm, decode_sm in divisions:
             if prefill_sm + decode_sm > total_sm_count:
                 raise ValueError(
@@ -224,7 +250,11 @@ def initialize_stream_groups(gpu_id: int, config: PDMuxConfig):
         (torch.cuda.Stream(gpu_id), torch.cuda.Stream(gpu_id))
     )  # Normal stream for prefill
     for prefill_sm, decode_sm in divisions:
-        if config.overlap_decode_full_sm:
+        if config.prefill_full_sm:
+            STREAM_GROUPS.append(
+                (torch.cuda.Stream(gpu_id), torch.cuda.Stream(gpu_id, priority=-1))
+            )
+        elif config.overlap_decode_full_sm:
             # Only prefill is capped. Its green context is created as one half of
             # a pair; the complementary stream is dropped, which is safe because
             # the extension owns the green-context lifetime. Decode then runs on

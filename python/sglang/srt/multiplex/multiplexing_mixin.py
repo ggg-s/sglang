@@ -100,18 +100,27 @@ class SchedulerMultiplexMixin:
             self._temporal_last_decode_submit = 0.0
         self._temporal_prefill_done = None
         if self.pdmux_temporal_layers:
+            # Temporal mode runs both lanes on the full-device stream, so it has
+            # no SM partition to price in; the layer quantum is the only knob.
+            # DFlash and plain decoding both drive the same split-prefill and
+            # FutureMap paths, so both are admitted.
             if not (
                 torch.cuda.is_available()
                 and self.pdmux_temporal_layers > 0
                 and self.enable_overlap
                 and not self.pdmux_standard
-                and self.spec_algorithm.is_dflash()
+                and (self.spec_algorithm.is_dflash() or self.spec_algorithm.is_none())
                 and self.ps.tp_size == self.ps.pp_size == self.ps.attn_dp_size == 1
                 and envs.SGLANG_PDMUX_DECODE_READY.get() == "off"
             ):
                 raise ValueError(
-                    "Temporal PDMux requires positive layers, CUDA DFlash overlap, "
-                    "layer_split, TP=PP=DP=1 and decode-ready=off"
+                    "Temporal PDMux requires positive layers, CUDA overlap, "
+                    "layer_split, TP=PP=DP=1, DFlash or no speculation, and "
+                    "decode-ready=off"
+                )
+            if self.pdmux_temporal_adaptive and not self.spec_algorithm.is_dflash():
+                raise ValueError(
+                    "Adaptive temporal PDMux requires DFlash speculation."
                 )
         initialize_stream_groups(self.ps.gpu_id, self.pdmux_config)
         self.stream_groups = get_stream_groups()
