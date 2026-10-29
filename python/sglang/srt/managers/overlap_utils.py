@@ -703,8 +703,12 @@ class FutureMap:
             return
         self._maybe_init_forward_bufs(payload)
         self._maybe_init_dsa_topk_indices_buf(payload)
+        # The non-spec split-prefill merge relays CPU sampled tokens; spec
+        # payloads already live on the relay device, so the device move is a
+        # no-op for them.
         self.output_tokens_buf[indices] = payload.bonus_tokens.to(
-            self.output_tokens_buf.dtype
+            device=self.output_tokens_buf.device,
+            dtype=self.output_tokens_buf.dtype,
         )
         if self.need_topk:
             self.topk_p_buf[indices] = payload.topk_p.to(self.topk_p_buf.dtype)

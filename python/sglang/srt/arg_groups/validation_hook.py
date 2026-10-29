@@ -527,17 +527,24 @@ def check_pdmux_overlap(cfg):
     """Admit plain TP or DSV4 interleave PCP over the full TP group.
 
     Subgroup parallelism needs its own lane-specific communicators before it
-    can use the asynchronous speculative scheduler.
+    can use the asynchronous speculative scheduler. Without speculation the
+    decode relay uses the non-spec FutureMap path, which the PDMux loop drives
+    the same way, so it is admitted for plain TP (no prefill CP).
     """
     assert cfg.pdmux_prefill_mode in (
         "layer_split",
         "standard",
-    ) and cfg.speculative_algorithm in (
-        "DFLASH",
-        "DSPARK",
-    ), (
-        "PD-Multiplexing overlap schedule requires layer_split or standard prefill and DFLASH or DSPARK."
-    )
+    ), "PD-Multiplexing overlap schedule requires layer_split or standard prefill."
+    if cfg.speculative_algorithm is None:
+        assert not cfg.enable_prefill_cp, (
+            "PD-Multiplexing overlap schedule without speculation does not "
+            "support prefill CP."
+        )
+    else:
+        assert cfg.speculative_algorithm in ("DFLASH", "DSPARK"), (
+            "PD-Multiplexing overlap schedule supports no speculation, DFLASH "
+            f"or DSPARK; got {cfg.speculative_algorithm}."
+        )
     if cfg.tp_size > 1:
         prefill_cp = getattr(cfg, "enable_prefill_cp", False)
         if prefill_cp:
