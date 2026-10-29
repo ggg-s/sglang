@@ -7,7 +7,7 @@ exec "$HANDOFF_PYTHON" -m sglang.launch_server \
   --host 127.0.0.1 --port 31018 \
   --dtype bfloat16 --attention-backend flashinfer \
   --context-length 40960 --mem-fraction-static 0.75 \
-  --max-running-requests 8 --chunked-prefill-size 2048 \
+  --max-running-requests 16 \
   --disable-radix-cache --disable-cuda-graph --disable-overlap-schedule \
   --disaggregation-mode decode \
   --disaggregation-decode-retraction-backup "$HANDOFF_RETRACTION_BACKUP" \

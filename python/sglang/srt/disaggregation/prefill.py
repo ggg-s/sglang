@@ -366,7 +366,10 @@ class PrefillBootstrapQueue:
         )
         # Pass KV pool tensor refs to the manager for GPU gather (staging mode)
         if (
-            envs.SGLANG_DISAGG_STAGING_BUFFER.get()
+            (
+                envs.SGLANG_DISAGG_STAGING_BUFFER.get()
+                or envs.SGLANG_MOONCAKE_HOST_STAGING_ALL.get()
+            )
             and hasattr(kv_manager, "set_kv_buffer_tensors")
             and not self.is_mla_backend
         ):

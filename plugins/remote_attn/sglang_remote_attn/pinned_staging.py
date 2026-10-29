@@ -7,7 +7,10 @@ the compute stream and no default-stream CUDA copies are issued by this adapter.
 
 from __future__ import annotations
 
+import logging
 import threading
+
+logger = logging.getLogger(__name__)
 
 
 class CudaPinnedSlot:
@@ -38,25 +41,22 @@ class CudaPinnedSlot:
 
     def warmup(self):
         """Prime the real registered destination and stream before group sends."""
-        with self.torch.cuda.device(self.device), self.torch.cuda.stream(self.stream):
-            # A private scratch byte avoids reading KV while a previous chunk
-            # might still be writing it. Keep it alive until the D2H completes.
-            source = self.torch.empty(
-                1, dtype=self.torch.uint8, device=f"cuda:{self.device}"
-            )
-            # Retain scratch even if a CUDA call raises or reports uncertainty.
-            self._warmup_source = source
-            (err,) = self.cudart.cudaMemcpyAsync(
-                self.ptr,
-                source.data_ptr(),
-                1,
-                self.cudart.cudaMemcpyKind.cudaMemcpyDeviceToHost,
-                self.raw_stream,
-            )
-            if int(err) != 0:
-                raise RuntimeError(f"pre-layerwise D2H warmup failed: {err}")
-            self.done.record(self.stream)
-            self.done.synchronize()
+        with self.torch.cuda.device(self.device):
+            try:
+                size = min(self.capacity, 16 * 1024 * 1024)
+                source = self.torch.empty(
+                    size, dtype=self.torch.uint8, device=f"cuda:{self.device}"
+                )
+                self._warmup_source = source
+                ready = self.torch.cuda.Event()
+                ready.record(self.torch.cuda.current_stream())
+                self.copy([(source.data_ptr(), 0, size)], ready)
+            except Exception:
+                # Continue only if no copy can still reference this slot/scratch.
+                self.stream.synchronize()
+                logger.warning(
+                    "Pre-layerwise D2H warmup failed after drain", exc_info=True
+                )
             self._warmup_source = None
 
     def copy(self, blocks, ready_event):

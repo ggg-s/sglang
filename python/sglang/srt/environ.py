@@ -857,6 +857,7 @@ class Envs:
     SGLANG_MOONCAKE_MAX_TRANSFER_BATCH_INDICES = EnvInt(0)
     # Consumed by the optional remote_attn plugin to bound TCP lane admission.
     SGLANG_MOONCAKE_SEND_LOCK = EnvBool(True)
+    SGLANG_MOONCAKE_HOST_STAGING_ALL = EnvBool(False)
     ENABLE_ASCEND_TRANSFER_WITH_MOONCAKE = EnvBool(False)
     ASCEND_NPU_PHY_ID = EnvInt(-1)
     SGLANG_MOONCAKE_SEND_AUX_TCP = EnvBool(False)

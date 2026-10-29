@@ -895,8 +895,10 @@ class TestRemoteAttn(CustomTestCase):
                             preflight["args"], ["-m", "sglang_remote_attn.check"]
                         )
                         args = server["args"]
-                        chunk = int(args[args.index("--chunked-prefill-size") + 1])
-                        self.assertGreaterEqual(int(server["batch"]), chunk)
+                        self.assertNotIn("--chunked-prefill-size", args)
+                        self.assertEqual(
+                            args[args.index("--max-running-requests") + 1], "16"
+                        )
                         self.assertEqual(server["batch"], override or "2048")
                         backup_flag = "--disaggregation-decode-retraction-backup"
                         if role == "p":
@@ -1878,6 +1880,7 @@ class TestRemoteAttn(CustomTestCase):
         for outcome in (
             "success",
             "staged_success",
+            "native_staged",
             "failed_peer",
             "cancelled",
             "short_destination",
@@ -1900,6 +1903,7 @@ class TestRemoteAttn(CustomTestCase):
                         retirement_finished.set()
 
                 manager = manager_cls()
+                manager._core_stager = object() if outcome == "native_staged" else None
                 manager.enable_trace = manager.enable_staging = (
                     manager.enable_deferred_decode_kv_release
                 ) = False
@@ -1959,7 +1963,7 @@ class TestRemoteAttn(CustomTestCase):
                     staging_counted=False,
                     wait_event=(
                         ReadyEvent()
-                        if outcome in ("success", "staged_success")
+                        if outcome in ("success", "staged_success", "native_staged")
                         else SimpleNamespace(
                             synchronize=lambda: events.append("gpu-ready")
                         )
@@ -1968,7 +1972,7 @@ class TestRemoteAttn(CustomTestCase):
                     prefill_kv_indices=[1, 2],
                     index_slice=slice(0, 2),
                     is_last_chunk=False,
-                    kv_buffer_indices=(0, 1),
+                    kv_buffer_indices=None if outcome == "native_staged" else (0, 1),
                     transfer_fn=None,
                     staging_chunk_idx=None,
                     staging_layer_ids=None,
@@ -1988,15 +1992,15 @@ class TestRemoteAttn(CustomTestCase):
                             manager.transfer_worker(tasks, None)
                     else:
                         manager.transfer_worker(tasks, None)
-                    if outcome in ("success", "staged_success"):
+                    if outcome in ("success", "staged_success", "native_staged"):
                         self.assertTrue(retirement_started.wait(3))
                         self.assertNotEqual(retirement_threads, [threading.get_ident()])
                         self.assertFalse(retirement_finished.is_set())
                 finally:
                     retirement_release.set()
-                    if outcome in ("success", "staged_success"):
+                    if outcome in ("success", "staged_success", "native_staged"):
                         self.assertTrue(retirement_finished.wait(3))
-                if outcome in ("success", "staged_success"):
+                if outcome in ("success", "staged_success", "native_staged"):
                     self.assertEqual(events, ["gpu-ready", "a", "b", "proof"])
                 else:
                     self.assertNotIn("proof", events)
@@ -2067,6 +2071,123 @@ class TestRemoteAttn(CustomTestCase):
                 control.close()
                 self.assertEqual(freed, [threading.get_ident()] * 65)
 
+    def test_core_staging_preserves_bytes_bounds_and_host_batches(self):
+        spec = importlib.util.spec_from_file_location(
+            "core_staging_test",
+            ROOT / "python/sglang/srt/disaggregation/mooncake/pinned_staging_core.py",
+        )
+        module = importlib.util.module_from_spec(spec)
+        spec.loader.exec_module(module)
+        engine = SimpleNamespace()
+        stager = module.CorePinnedStager(engine, capacity=8)
+        source = torch.arange(20, dtype=torch.uint8)
+
+        class TensorBoundary:
+            device = SimpleNamespace(type="cuda")
+
+            def data_ptr(self):
+                return source.data_ptr()
+
+            def is_contiguous(self):
+                return True
+
+            def numel(self):
+                return source.numel()
+
+            def element_size(self):
+                return 1
+
+            def view(self, dtype):
+                return source.view(dtype)
+
+        tensor = TensorBoundary()
+        stager.set_buffers([tensor], [source.data_ptr()], [4])
+        self.assertIsNone(stager.resolve(source.data_ptr() + 1, 4))
+        self.assertIsNone(stager.resolve(source.data_ptr() + 16, 8))
+        self.assertIsNone(stager.resolve(1, 4))
+        slot = dict(
+            host=torch.empty(8, dtype=torch.uint8),
+            poisoned=False,
+            device=0,
+            stream=SimpleNamespace(synchronize=lambda: None),
+        )
+        stager._slot = lambda device: slot
+        destination = ctypes.create_string_buffer(24)
+        dest = ctypes.addressof(destination)
+        host = ctypes.create_string_buffer(b"host")
+        batches = []
+
+        def transfer(blocks):
+            batches.append(list(blocks))
+            for src, dst, n in blocks:
+                ctypes.memmove(dst, src, n)
+            return 0
+
+        with (
+            patch.object(torch.cuda, "device", side_effect=lambda _: nullcontext()),
+            patch.object(torch.cuda, "stream", side_effect=lambda _: nullcontext()),
+        ):
+            rc = stager.send(
+                [
+                    (source.data_ptr() + 4, dest, 16),
+                    (ctypes.addressof(host), dest + 16, 4),
+                ],
+                transfer,
+            )
+            self.assertEqual(rc, 0)
+            self.assertEqual(destination.raw[:20], bytes(range(4, 20)) + b"host")
+            self.assertEqual([sum(b[2] for b in batch) for batch in batches], [8, 8, 4])
+            batches.clear()
+            blocks = [
+                (ctypes.addressof(host), dest, 2),
+                (ctypes.addressof(host) + 2, dest + 2, 2),
+            ]
+            self.assertEqual(stager.send(blocks, transfer), 0)
+            self.assertEqual(batches, [blocks])  # Already staged sources stay batched.
+            self.assertEqual(
+                stager.send([(source.data_ptr(), dest, 4)], lambda b: -1), -1
+            )
+            self.assertTrue(slot["poisoned"])
+        stager.set_buffers([tensor], [source.data_ptr() + 4], [4])
+        self.assertIsNone(stager.resolve(source.data_ptr() + 4, 4))
+
+    def test_core_staging_records_readiness_at_enqueue(self):
+        manager_cls = _source_class(
+            "disaggregation/mooncake/conn.py",
+            "MooncakeKVManager",
+            {"add_transfer_request"},
+        )
+        method = manager_cls.add_transfer_request
+        method.__globals__.update(
+            DisaggregationMode=SimpleNamespace(PREFILL="p"),
+            KVPoll=SimpleNamespace(Failed="failed"),
+            TransferKVChunk=lambda **kw: SimpleNamespace(**kw),
+            TraceNullContext=lambda: None,
+        )
+        manager = manager_cls()
+        manager.disaggregation_mode = "p"
+        manager._core_stager = object()
+        manager.request_status = {1: "sending"}
+        manager.check_status = lambda room: "sending"
+        manager.transfer_infos = {1: {"host:10": object()}}
+        manager.transfer_queues = [queue.Queue()]
+        recorded = []
+        event = SimpleNamespace(
+            record=lambda stream: recorded.append((threading.get_ident(), stream))
+        )
+        with (
+            patch.object(torch.cuda, "Event", return_value=event),
+            patch.object(torch.cuda, "current_stream", return_value="producer"),
+        ):
+            manager.add_transfer_request(1, [0], slice(0, 1), False)
+            self.assertEqual(recorded, [(threading.get_ident(), "producer")])
+            self.assertIs(manager.transfer_queues[0].get().wait_event, event)
+            manager.add_transfer_request(1, [0], slice(0, 1), False, wait_event=event)
+            self.assertEqual(len(recorded), 1)
+            manager._core_stager = None
+            manager.add_transfer_request(1, [0], slice(0, 1), False)
+            self.assertEqual(len(recorded), 1)
+
     def test_prelayer_cuda_slot_orders_private_copy_before_native_send(self):
         """Exercise the real CUDA adapter with driver calls at the test boundary."""
         from sglang_remote_attn.pinned_staging import PinnedKVStager
@@ -2080,7 +2201,7 @@ class TestRemoteAttn(CustomTestCase):
 
         class Stream:
             def wait_event(self, event):
-                test.assertIs(event, ready)
+                test.assertTrue(event is ready or isinstance(event, Event))
                 waited.append(event)
 
             def synchronize(self):
@@ -2104,7 +2225,7 @@ class TestRemoteAttn(CustomTestCase):
         def memcpy(dst, src, size, kind, raw):
             self.assertEqual(raw, 17)
             self.assertIn(kind, (1, 2))
-            if size == 1:
+            if waited[-1] is not ready:
                 # Registration must precede the first real D2H to this slot.
                 self.assertIn(dst, manager.registrations)
                 warmups.append(dst)
@@ -2134,6 +2255,7 @@ class TestRemoteAttn(CustomTestCase):
             patch.object(torch, "empty", side_effect=empty),
             patch.object(torch.cuda, "device", side_effect=lambda _: nullcontext()),
             patch.object(torch.cuda, "stream", side_effect=lambda _: nullcontext()),
+            patch.object(torch.cuda, "current_stream", return_value=stream),
             patch.object(torch.cuda, "ExternalStream", return_value=stream),
             patch.object(torch.cuda, "Event", side_effect=Event),
         ):

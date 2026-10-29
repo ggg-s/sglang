@@ -41,7 +41,7 @@ nonblocking CUDA stream and registered pinned host storage before native TE send
 This preserves native batching and the send lock; ordinary PD and Post-Remote
 transfers keep their existing paths. Set `HANDOFF_PRE_LAYERWISE_HOST_STAGING=0`
 for the GPU-pointer control. Failed/uncertain sends quarantine staging storage.
-Each newly registered sender slot performs a one-byte D2H warmup on its own copy
+Each newly registered sender slot performs a D2H warmup of up to 16 MiB (bounded by slot capacity) on its own copy
 stream before the layerwise forward; reusing the slot does not repeat warmup.
 This moves first-copy initialization out of group sends, but its cost still
 belongs to the first request if the slot is first reserved on that request.
@@ -286,3 +286,14 @@ scaling, gateway SSE reconnect or P5.19 functionality.
 
 See [C1 and host-reclaim fixes](validation/C1-RECLAIM.md) for completion proof,
 retry cleanup, compatibility and the remaining unprovable-completion boundary.
+
+Native chunk source staging is opt-in on P with
+`SGLANG_MOONCAKE_HOST_STAGING_ALL=1` (default off). It stages verified contiguous
+CUDA KV ranges in per-transfer-thread registered slabs of 128 MiB, after the
+worker waits for the producer event recorded at submission. Existing host
+sources bypass staging. Unknown addresses/layouts retain native transfer;
+MLA or unverified tensor/address tables are not accelerated by this switch.
+Failed/uncertain staged sends quarantine their slab. Ordinary chunk events also
+use the bounded reference reaper. The receiver ring flags remain independent.
+Deployment scripts inherit the model's chunk default and allow 16 running requests;
+inspect server startup arguments for the resolved chunk size.

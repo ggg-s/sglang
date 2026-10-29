@@ -361,6 +361,16 @@ class MooncakeKVManager(StagingManagerMixin, CommonKVManager):
                 raise ValueError(
                     "SGLANG_FAILED_SESSION_IDLE_TIMEOUT_S must be positive"
                 )
+        self._core_stager = None
+        if (
+            self.disaggregation_mode == DisaggregationMode.PREFILL
+            and envs.SGLANG_MOONCAKE_HOST_STAGING_ALL.get()
+        ):
+            from sglang.srt.disaggregation.mooncake.pinned_staging_core import (
+                CorePinnedStager,
+            )
+
+            self._core_stager = CorePinnedStager(self.engine)
         if self.disaggregation_mode == DisaggregationMode.PREFILL:
             self.session_failures = defaultdict(int)
             self.failed_sessions = set()
@@ -528,12 +538,19 @@ class MooncakeKVManager(StagingManagerMixin, CommonKVManager):
                 executor.shutdown(wait=False)
             except Exception:
                 logger.exception("Failed to shutdown executor on teardown")
+        stopped_executors = getattr(self, "executors", [])
         self.executors = []
 
         # Join workers before touching their sockets: ZMQ sockets aren't
         # thread-safe, so don't close server_socket while a worker may poll it.
         for t in self._worker_threads:
             t.join(timeout=3.0)
+        if not any(t.is_alive() for t in self._worker_threads):
+            for executor in stopped_executors:
+                executor.shutdown(wait=True)
+            if self._core_stager is not None:
+                self._core_stager.close()
+                self._core_stager = None
         self._worker_threads = []
 
         # Drop the queues so their buffered tasks/senders are released too.
@@ -600,6 +617,13 @@ class MooncakeKVManager(StagingManagerMixin, CommonKVManager):
             "page_size": page_size,
             "slot_layer_ids": list(slot_layer_ids or []),
         }
+
+        if self._core_stager is not None:
+            self._core_stager.set_buffers(
+                list(k_buffers) + list(v_buffers),
+                self.kv_args.kv_data_ptrs,
+                self.kv_args.kv_item_lens,
+            )
 
     def _register_staging_memory(self, ptr: int, size: int) -> None:
         if self.engine.batch_register([ptr], [size]) != 0:
@@ -946,10 +970,15 @@ class MooncakeKVManager(StagingManagerMixin, CommonKVManager):
         if not transfer_blocks:
             return 0
 
-        src_addrs, dst_addrs, lengths = zip(*transfer_blocks)
-        return self.engine.batch_transfer_sync(
-            mooncake_session_id, list(src_addrs), list(dst_addrs), list(lengths)
-        )
+        def transfer(blocks):
+            src_addrs, dst_addrs, lengths = zip(*blocks)
+            return self.engine.batch_transfer_sync(
+                mooncake_session_id, list(src_addrs), list(dst_addrs), list(lengths)
+            )
+
+        if self._core_stager is not None:
+            return self._core_stager.send(transfer_blocks, transfer)
+        return transfer(transfer_blocks)
 
     def _state_stride_mismatch(
         self,
@@ -2681,7 +2710,10 @@ class MooncakeKVManager(StagingManagerMixin, CommonKVManager):
                     # Layer-group events survive until deferred retirement below.
                     # Clearing here would move their destructor onto this worker
                     # when source host staging is disabled.
-                    if kv_chunk.kv_buffer_indices is None:
+                    if (
+                        kv_chunk.kv_buffer_indices is None
+                        and getattr(self, "_core_stager", None) is None
+                    ):
                         kv_chunk.wait_event = None
                 if kv_chunk.indices_event is not None:
                     kv_chunk.indices_event.synchronize()
@@ -3103,7 +3135,10 @@ class MooncakeKVManager(StagingManagerMixin, CommonKVManager):
             finally:
                 if (
                     kv_chunk is not None
-                    and kv_chunk.kv_buffer_indices is not None
+                    and (
+                        kv_chunk.kv_buffer_indices is not None
+                        or getattr(self, "_core_stager", None) is not None
+                    )
                     and not staging_deferred
                 ):
                     if reference_reaper is None:
@@ -3357,6 +3392,10 @@ class MooncakeKVManager(StagingManagerMixin, CommonKVManager):
 
         if trace_ctx is None:
             trace_ctx = TraceNullContext()
+
+        if self._core_stager is not None and wait_event is None:
+            wait_event = torch.cuda.Event()
+            wait_event.record(torch.cuda.current_stream())
 
         self.transfer_queues[shard_idx].put(
             TransferKVChunk(
