@@ -296,6 +296,9 @@ The control plane still stores its journal under
 `/workspace/handoff_state`. Use separate state paths/containers when running
 multiple experiments; changing those control-plane paths is outside this port.
 
+For concurrent short traffic at a D0 drain boundary, preflight reservation and
+bounded target-loss behavior, see [gateway drain regressions](validation/GATEWAY-DRAIN.md).
+
 ## GPU acceptance still required
 
 1. Check `/health` on all three servers and `ready.<rank>.json` for both ranks

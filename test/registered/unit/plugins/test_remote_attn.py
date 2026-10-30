@@ -12,6 +12,7 @@ import functools
 import gc
 import importlib
 import importlib.util
+import io
 import json
 import os
 import pickle
@@ -2318,8 +2319,8 @@ class TestRemoteAttn(CustomTestCase):
                             "local-result",
                         )
 
-    def test_c1_cutover_reuses_drain_reservation_epoch(self):
-        """Pre-reserve and C1 cutover must reuse one allocation/epoch."""
+    @staticmethod
+    def _gateway_namespace():
         path = PLUGIN / "control_plane/p4_gateway.py"
         tree = ast.parse(path.read_text())
         nodes = [
@@ -2338,6 +2339,13 @@ class TestRemoteAttn(CustomTestCase):
             copy=copy,
             Path=Path,
             json=json,
+            ADMISSION_POLICY="decoupled",
+            PD_PREFILL_URL="",
+            WAVE_DEFAULT=True,
+            KILL_AT="",
+            DRAIN_KILL_AT="",
+            DRAIN_NOOP=False,
+            DRAIN_IMPORT_FAIL=False,
         )
         module = ast.Module(
             body=[
@@ -2349,6 +2357,529 @@ class TestRemoteAttn(CustomTestCase):
             type_ignores=[],
         )
         exec(compile(ast.fix_missing_locations(module), str(path), "exec"), namespace)
+        return namespace
+
+    def _gateway(self):
+        namespace = self._gateway_namespace()
+        gateway = namespace["Gateway"].__new__(namespace["Gateway"])
+        directory = tempfile.TemporaryDirectory()
+        self.addCleanup(directory.cleanup)
+        gateway.journal_path = Path(directory.name) / "journal.json"
+        gateway.out = Path(directory.name) / "metrics.jsonl"
+        gateway.proxy_dir = Path(directory.name) / "proxy"
+        gateway.lock = threading.Lock()
+        gateway.journal_lock = threading.Lock()
+        gateway.admission_lock = threading.Lock()
+        gateway.migration_lock = threading.RLock()
+        gateway.group_lock = threading.Lock()
+        gateway.groups = {}
+        gateway.active = {}
+        gateway.journal = {
+            "long": {
+                "rid": "long",
+                "drid": "dst-long",
+                "owner": "src",
+                "phase": "accepted",
+                "prompt_len": 32768,
+                "max_new": 128,
+                "finished": False,
+                "epoch": "src",
+            },
+        }
+        gateway.draining = False
+        gateway._facts_at = 0.0
+        gateway._src_facts = {"reqs": [{"rid": "long", "frozen": True}]}
+        gateway._dst_facts = {"reqs": []}
+        gateway._target_ok = True
+        gateway._target_fail_since = None
+        gateway._dst_fact_fails = 0
+        gateway._target_dbg_t = time.monotonic()
+        gateway._adopt_at = time.monotonic()
+        gateway._admit_pending = 0
+        gateway.drain_kv_baseline = 0
+        calls = []
+
+        def source_send(payload, **kwargs):
+            calls.append(("src", copy.deepcopy(payload)))
+            if payload["cmd"] == "status":
+                return copy.deepcopy(gateway._src_facts)
+            raise AssertionError(f"unexpected source RPC {payload}")
+
+        def target_send(payload, **kwargs):
+            calls.append(("dst", copy.deepcopy(payload)))
+            if payload["cmd"] == "status":
+                return {"reqs": [], "max_running": 8}
+            if payload["cmd"] == "reserve":
+                return {"errors": {}}
+            if payload["cmd"] == "admit_ordinary":
+                return {"admitted": True}
+            if payload["cmd"] in ("submit", "release", "capacity_cancel"):
+                return {}
+            raise AssertionError(f"unexpected target RPC {payload}")
+
+        gateway.src = SimpleNamespace(
+            send=source_send,
+            targets={},
+            completed_targets={},
+            transfer_stats={},
+        )
+        gateway.dst = SimpleNamespace(
+            send=target_send,
+            targets={},
+            completed_targets={},
+            wait_output=lambda *args: ([42], True, 0),
+        )
+        return gateway, namespace, calls
+
+    def test_gateway_drain_fences_before_migration_lock_with_short_traffic(self):
+        for arm in ("remote", "layer", "copy"):
+            with self.subTest(arm=arm):
+                gateway, namespace, calls = self._gateway()
+                waiting = threading.Event()
+                release = threading.Event()
+                admitted = threading.Event()
+                real_lock = threading.RLock()
+
+                class MigrationGate:
+                    def __enter__(self):
+                        waiting.set()
+                        if not release.wait(3):
+                            raise TimeoutError("test migration gate")
+                        real_lock.acquire()
+
+                    def __exit__(self, *args):
+                        real_lock.release()
+
+                gateway.migration_lock = MigrationGate()
+                errors = []
+                handlers = [SimpleNamespace(wfile=io.BytesIO()) for _ in range(8)]
+                original_send = gateway.dst.send
+                capacity_lock = threading.Lock()
+                tickets = set()
+                reserved = set()
+
+                def target(payload, **kwargs):
+                    with capacity_lock:
+                        cmd = payload["cmd"]
+                        if cmd == "reserve":
+                            self.assertEqual(tickets, set())
+                            reserved.update(item["rid"] for item in payload["items"])
+                        elif cmd == "admit_ordinary":
+                            admitted.set()
+                            self.assertIn("dst-long", reserved)
+                            if len(tickets | reserved) >= 8:
+                                return {"admitted": False, "reason": "slots"}
+                            tickets.add(payload["rid"])
+                        elif cmd == "release":
+                            tickets.discard(payload["rid"])
+                    return original_send(payload, **kwargs)
+
+                gateway.dst.send = target
+
+                def run(function, *args):
+                    try:
+                        function(*args)
+                    except Exception as exc:
+                        errors.append(exc)
+
+                drain_thread = threading.Thread(
+                    target=run, args=(gateway.start_drain, ["dst"], arm)
+                )
+                shorts = [
+                    threading.Thread(
+                        target=run,
+                        args=(
+                            gateway.stream,
+                            handler,
+                            {
+                                "rid": f"short-{i}",
+                                "prompt_ids": [1] * 256,
+                                "max_new_tokens": 1,
+                                "cut": 1000,
+                            },
+                        ),
+                    )
+                    for i, handler in enumerate(handlers)
+                ]
+                try:
+                    drain_thread.start()
+                    self.assertTrue(waiting.wait(3))
+                    self.assertTrue(
+                        gateway.journal_path.is_file(),
+                        "drain fence not persisted before migration lock",
+                    )
+                    durable = json.loads(gateway.journal_path.read_text())
+                    self.assertEqual(durable["__drain__"]["members"], ["long"])
+                    self.assertEqual(gateway.src_worker_state(), "DRAINING")
+                    duplicate = gateway.start_drain(["dst"], arm)
+                    self.assertEqual(
+                        duplicate["drain_id"], durable["__drain__"]["drain_id"]
+                    )
+                    self.assertTrue(gateway.admission_lock.acquire(blocking=False))
+                    gateway.admission_lock.release()
+                    for thread in shorts:
+                        thread.start()
+                    self.assertFalse(admitted.wait(0.05))
+                finally:
+                    release.set()
+                    for thread in [drain_thread, *shorts]:
+                        if thread.ident is not None:
+                            thread.join(3)
+                self.assertEqual(errors, [])
+                self.assertTrue(all(not t.is_alive() for t in [drain_thread, *shorts]))
+                self.assertEqual(gateway.journal["__drain__"]["members"], ["long"])
+                self.assertEqual(
+                    sum(role == "dst" and p["cmd"] == "submit" for role, p in calls), 8
+                )
+                self.assertFalse(any(role == "src" for role, p in calls))
+                for handler in handlers:
+                    self.assertIn(b'"token_id": 42', handler.wfile.getvalue())
+                    events = [
+                        json.loads(line[6:])
+                        for line in handler.wfile.getvalue().decode().splitlines()
+                        if line.startswith("data: {")
+                    ]
+                    self.assertTrue(all("error" not in event for event in events))
+                self.assertEqual(tickets, set())
+                # Continue the real gateway state machine through freeze,
+                # import, local-ready proof and source release. Only worker
+                # RPCs stand in for GPUs; no controller methods are replaced.
+                epoch = gateway.journal["__drain__"]["epoch"]
+                source_rows = [
+                    {
+                        "rid": "long",
+                        "output_len": 32,
+                        "kv_committed_len": 32799,
+                        "frozen": False,
+                    }
+                ]
+                target_states = []
+
+                def source_rpc(payload, **kwargs):
+                    cmd = payload["cmd"]
+                    if cmd in ("status", "status_lite"):
+                        return {"reqs": copy.deepcopy(source_rows)}
+                    if cmd == "freeze_all":
+                        self.assertEqual(payload["epoch"], epoch)
+                        source_rows[0]["frozen"] = True
+                        return {
+                            "results": [
+                                {
+                                    "rid": "long",
+                                    "output_len": 32,
+                                    "migration_epoch": epoch,
+                                    "transfer": {"token": "frozen-kv"},
+                                }
+                            ]
+                        }
+                    if cmd == "release":
+                        self.assertTrue(target_states[0]["local_ready"])
+                        source_rows.clear()
+                        return {"released": True}
+                    raise AssertionError(payload)
+
+                def target_rpc(payload, **kwargs):
+                    cmd = payload["cmd"]
+                    if cmd == "status":
+                        return {
+                            "reqs": [],
+                            "reserved": {"dst-long": {}},
+                            "target_states": copy.deepcopy(target_states),
+                        }
+                    if cmd == "import_wave":
+                        self.assertEqual(payload["items"][0]["epoch"], epoch)
+                        target_states.append(
+                            {
+                                "handoff_id": "long",
+                                "migration_epoch": epoch,
+                                "new_tokens": 1,
+                                "import_done_at": time.time(),
+                                "local_ready": True,
+                            }
+                        )
+                        return {}
+                    raise AssertionError(payload)
+
+                gateway.src.send = source_rpc
+                gateway.dst.send = target_rpc
+                for _ in range(3):
+                    gateway._facts_at = 0.0
+                    gateway._adopt_at = time.monotonic()
+                    gateway._reconcile_once()
+                final = gateway.drain_status()
+                self.assertEqual(final["state"], "SAFE_TO_STOP")
+                self.assertTrue(final["source_clean_all_ranks"])
+                self.assertTrue(gateway.journal["long"]["source_released"])
+
+    def test_gateway_admission_rechecks_fence_before_submit(self):
+        gateway, namespace, calls = self._gateway()
+        waiting = threading.Event()
+        proceed = threading.Event()
+        lock = threading.Lock()
+
+        class AdmissionGate:
+            def acquire(self, *args, **kwargs):
+                return lock.acquire(*args, **kwargs)
+
+            def release(self):
+                lock.release()
+
+            def __enter__(self):
+                if threading.current_thread().name == "short-race":
+                    waiting.set()
+                    if not proceed.wait(3):
+                        raise TimeoutError("test admission gate")
+                lock.acquire()
+
+            def __exit__(self, *args):
+                lock.release()
+
+        gateway.admission_lock = AdmissionGate()
+        handler = SimpleNamespace(wfile=io.BytesIO())
+        errors = []
+
+        def short():
+            try:
+                gateway.stream(
+                    handler,
+                    {
+                        "rid": "short",
+                        "prompt_ids": [1],
+                        "max_new_tokens": 1,
+                        "cut": 1000,
+                    },
+                )
+            except Exception as exc:
+                errors.append(exc)
+
+        thread = threading.Thread(target=short, name="short-race")
+        try:
+            thread.start()
+            self.assertTrue(waiting.wait(3))
+            self.assertEqual(calls, [])  # early admission chose source, no ticket
+            gateway.start_drain(["dst"])
+        finally:
+            proceed.set()
+            thread.join(3)
+        self.assertFalse(thread.is_alive())
+        self.assertEqual(errors, [])
+        self.assertFalse(any(role == "src" for role, p in calls))
+        target_commands = [p["cmd"] for role, p in calls]
+        self.assertLess(
+            target_commands.index("reserve"), target_commands.index("admit_ordinary")
+        )
+        submit = next(p for role, p in calls if p["cmd"] == "submit")
+        self.assertEqual(submit["capacity_ticket"], "dst-short")
+        self.assertIn(b'"token_id": 42', handler.wfile.getvalue())
+
+    def test_gateway_preflight_restart_reserves_outside_admission_lock(self):
+        gateway, namespace, calls = self._gateway()
+        gateway.start_drain(["dst"])
+        drain = gateway.journal["__drain__"]
+        epoch = drain["epoch"]
+        # Crash after reserve RPC, before preflight completion was persisted.
+        drain.update(preflight_pending=True, state="RECONCILING")
+        gateway._drain_persist(drain)
+        reserved = threading.Event()
+        finish = threading.Event()
+        original = gateway.dst.send
+        errors = []
+
+        def target(payload, **kwargs):
+            if payload["cmd"] == "reserve":
+                reserved.set()
+                if not finish.wait(3):
+                    raise TimeoutError("test reserve gate")
+            return original(payload, **kwargs)
+
+        def reconcile():
+            try:
+                gateway._reconcile_once()
+            except Exception as exc:
+                errors.append(exc)
+
+        gateway.dst.send = target
+        thread = threading.Thread(target=reconcile)
+        try:
+            thread.start()
+            self.assertTrue(reserved.wait(3))
+            self.assertTrue(gateway.admission_lock.acquire(blocking=False))
+            gateway.admission_lock.release()
+            status = gateway.start_drain(["dst"])
+            self.assertTrue(status["preflight_pending"])
+            self.assertEqual(status["worker_state"], "DRAINING")
+        finally:
+            finish.set()
+            thread.join(3)
+        self.assertFalse(thread.is_alive())
+        self.assertEqual(errors, [])
+        reserves = [p for role, p in calls if p["cmd"] == "reserve"]
+        self.assertEqual(len(reserves), 2)
+        self.assertTrue(all(p["epoch"] == epoch for p in reserves))
+        self.assertEqual(reserves[0]["items"], reserves[1]["items"])
+        self.assertFalse(gateway.drain_status()["preflight_pending"])
+        self.assertFalse(any(p["cmd"] == "freeze_many" for role, p in calls))
+
+    def test_gateway_old_rollback_cannot_overwrite_new_drain_fence(self):
+        gateway, namespace, calls = self._gateway()
+        old = {"drain_id": "old", "state": "ROLLED_BACK", "members": ["long"]}
+        gateway._drain_persist(old)
+        snapshot, entries = gateway._drain_snapshot()
+        new = gateway.start_drain(["dst"])
+        self.assertNotEqual(new["drain_id"], "old")
+        entries["long"].update(owner="src", drain_member=False)
+        gateway._drain_persist(snapshot, entries)  # late old reconcile write
+        status = gateway.drain_status()
+        self.assertEqual(status["drain_id"], new["drain_id"])
+        self.assertEqual(status["state"], "REQUESTED")
+        self.assertEqual(status["worker_state"], "DRAINING")
+        self.assertTrue(gateway.journal["long"]["drain_member"])
+        durable = json.loads(gateway.journal_path.read_text())
+        self.assertEqual(durable["__drain__"]["drain_id"], new["drain_id"])
+
+    def test_gateway_active_stream_failure_keeps_migration_resources_fenced(self):
+        gateway, namespace, calls = self._gateway()
+        handler = SimpleNamespace(wfile=io.BytesIO())
+
+        def submit(payload, **kwargs):
+            calls.append(("src", copy.deepcopy(payload)))
+            self.assertEqual(payload["cmd"], "submit")
+            # A drain reaches an unsafe terminal outcome while this already
+            # admitted source stream is live. The stream must exit with error,
+            # without release/abort/resume or a successful finished marker.
+            gateway.journal["__drain__"] = {
+                "state": "FAILED_UNSAFE",
+                "members": [payload["rid"]],
+            }
+            gateway._target_ok = False
+            gateway._target_fail_since = time.monotonic() - 31
+            return {}
+
+        gateway.src.send = submit
+        gateway.stream(
+            handler, {"rid": "live-long", "prompt_ids": [1], "max_new_tokens": 128}
+        )
+        self.assertIn(b"target_unreachable_timeout", handler.wfile.getvalue())
+        self.assertIn(b"[DONE]", handler.wfile.getvalue())
+        self.assertFalse(gateway.journal["live-long"]["finished"])
+        self.assertEqual([p["cmd"] for role, p in calls], ["submit"])
+        self.assertNotIn("live-long", gateway.active)
+
+    def test_gateway_capacity_failure_reopens_only_before_freeze(self):
+        gateway, namespace, calls = self._gateway()
+        original = gateway.dst.send
+
+        def full(payload, **kwargs):
+            if payload["cmd"] == "status":
+                return {
+                    "tp_rank_results": [
+                        {"max_running": 8, "reqs": [None] * n} for n in (2, 8)
+                    ]
+                }
+            return original(payload, **kwargs)
+
+        gateway.dst.send = full
+        with patch.dict(os.environ, {"HANDOFF_DRAIN_SLOT_WAIT_S": "0"}):
+            status = gateway.start_drain(["dst"])
+        self.assertEqual(status["state"], "ROLLED_BACK")
+        self.assertEqual(gateway.src_worker_state(), "READY")
+        self.assertFalse(gateway.draining)
+        self.assertFalse(status["preflight_pending"])
+        self.assertIn("load=8 + members=1", status["failed_reason"])
+        self.assertFalse(any(p["cmd"] in ("freeze", "reserve") for role, p in calls))
+        self.assertTrue(status["terminal"])
+
+    def test_gateway_target_loss_after_import_has_bounded_fenced_failure(self):
+        gateway, namespace, calls = self._gateway()
+        gateway.start_drain(["dst"])
+        drain = gateway.journal["__drain__"]
+        drain["state"] = "BLOCKED"
+        drain["wave"]["phase"] = "imported"
+        gateway.journal["long"].update(phase="imported", epoch=drain["epoch"])
+        gateway._target_ok = False
+        gateway._target_fail_since = time.monotonic() - 31
+        gateway._dst_fact_fails = 2
+        gateway._facts_at = 0.0
+        calls.clear()
+
+        def offline(payload, **kwargs):
+            calls.append(("dst", copy.deepcopy(payload)))
+            raise ConnectionError("D1 disappeared after import")
+
+        gateway.dst.send = offline
+        gateway._reconcile_once()
+        status = gateway.drain_status()
+        self.assertEqual(status["state"], "FAILED_UNSAFE")
+        self.assertTrue(status["terminal"])
+        self.assertTrue(status["requires_intervention"])
+        self.assertFalse(status["source_safe_to_stop"])
+        self.assertEqual(status["failure_evidence"]["wave"]["phase"], "imported")
+        self.assertEqual(gateway.src_worker_state(), "DRAINING")
+        self.assertEqual(gateway.stop_drain()["error"], "not_safe_to_stop")
+        self.assertTrue(all(p["cmd"] == "status" for role, p in calls))
+        self.assertNotEqual(gateway.journal["long"].get("phase"), "done")
+        self.assertFalse(gateway.journal["long"].get("source_released"))
+        calls.clear()
+        gateway._reconcile_once()  # terminal: no RPC storm or automatic rollback
+        self.assertEqual(calls, [])
+        handler = SimpleNamespace(
+            wfile=io.BytesIO(),
+            send_response=lambda *a: None,
+            send_header=lambda *a: None,
+            end_headers=lambda: None,
+        )
+        gateway.attach(handler, "long", -1)
+        self.assertIn(b"target_unreachable_timeout", handler.wfile.getvalue())
+        self.assertIn(b"[DONE]", handler.wfile.getvalue())
+        self.assertEqual(calls, [])  # reconnect cannot resume, abort or release
+        with self.assertRaisesRegex(RuntimeError, "drain_failed_unsafe"):
+            gateway._cutover(
+                None,
+                namespace["RequestState"]("long", 32768, 128, 32),
+                "remote",
+                "none",
+            )
+        self.assertEqual(calls, [])
+        self.assertFalse(gateway.journal["long"]["finished"])
+        self.assertEqual(
+            gateway._target_ticket_wait(64, "dst-short")["error"], "drain_failed_unsafe"
+        )
+        persisted = json.loads(gateway.journal_path.read_text())
+        restarted, _, _ = self._gateway()
+        restarted.journal = persisted
+        self.assertEqual(restarted.src_worker_state(), "DRAINING")
+        restarted._reconcile_once()
+        self.assertEqual(restarted.drain_status()["state"], "FAILED_UNSAFE")
+
+    def test_gateway_target_timeout_preserves_preimport_rollback_and_transient_recovery(
+        self,
+    ):
+        gateway, namespace, calls = self._gateway()
+        gateway.start_drain(["dst"])
+        drain, entries = gateway._drain_snapshot()
+        gateway._target_ok = False
+        gateway._target_fail_since = time.monotonic() - 3
+        drain["wave"]["phase"] = "imported"
+        entries["long"]["phase"] = "imported"
+        self.assertFalse(gateway._precommit_rollback_safe(drain, entries))
+        self.assertFalse(gateway._fail_drain_target(drain, entries))
+        gateway._refresh_facts(force=True)  # peer returns before timeout
+        self.assertTrue(gateway._target_ok)
+        self.assertIsNone(gateway._target_fail_since)
+        self.assertFalse(gateway._fail_drain_target(drain, entries))
+        gateway._target_ok = False
+        gateway._target_fail_since = time.monotonic() - 31
+        drain["wave"]["phase"] = "idle"
+        entries["long"]["phase"] = "accepted"
+        self.assertTrue(gateway._precommit_rollback_safe(drain, entries))
+        self.assertFalse(gateway._fail_drain_target(drain, entries))
+        drain["mode"] = "natural"
+        entries["long"]["phase"] = "imported"
+        self.assertFalse(gateway._fail_drain_target(drain, entries))
+
+    def test_c1_cutover_reuses_drain_reservation_epoch(self):
+        """Pre-reserve and C1 cutover must reuse one allocation/epoch."""
+        namespace = self._gateway_namespace()
         gateway = namespace["Gateway"].__new__(namespace["Gateway"])
         gateway.migration_lock = threading.RLock()
         gateway.journal_lock = threading.Lock()
@@ -2412,8 +2943,8 @@ class TestRemoteAttn(CustomTestCase):
                 }
             )
             self.assertIn(st.drid, rejected["errors"])
-            # Drain must wait for an already-started cutover before taking its
-            # snapshot, while ordinary admission remains available.
+            # Drain fences admission before waiting for the already-started
+            # cutover. Backend preparation stays in migration lock order.
             frozen = threading.Event()
             continue_freeze = threading.Event()
             drain_waiting = threading.Event()
@@ -2469,8 +3000,15 @@ class TestRemoteAttn(CustomTestCase):
             try:
                 threads[0].start()
                 self.assertTrue(frozen.wait(timeout=3))
+                gateway.journal.pop("__drain__")
+                gateway.active = {st.rid: st}
+                gateway._facts_at = 0.0
+                gateway._src_facts = {}
+                gateway._maybe_drain_kill = lambda stage: None
                 threads[1].start()
                 self.assertTrue(drain_waiting.wait(timeout=3))
+                self.assertEqual(gateway.src_worker_state(), "DRAINING")
+                self.assertTrue(gateway.journal["__drain__"]["preflight_pending"])
                 self.assertTrue(gateway.admission_lock.acquire(blocking=False))
                 gateway.admission_lock.release()
                 self.assertEqual(order, [])

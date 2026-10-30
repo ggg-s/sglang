@@ -306,9 +306,14 @@ class RequestState:
 def _serialize_migration(function):
     @functools.wraps(function)
     def call(self, *args, **kwargs):
-        # Keep drain snapshot/pre-reserve and legacy cutovers in one order.
-        # Admission remains unlocked while a cutover performs backend I/O.
+        # Fence admission before waiting for this lock (start_drain). A legacy
+        # cutover that wins the lock next must finish preflight before freeze.
         with self.migration_lock:
+            if function.__name__ != "_prepare_drain":
+                self._prepare_drain()
+                drain, _ = self._drain_snapshot()
+                if drain and drain.get("state") == "FAILED_UNSAFE":
+                    raise RuntimeError("drain_failed_unsafe")
             return function(self, *args, **kwargs)
     return call
 
@@ -344,7 +349,7 @@ class Gateway:
             self.journal = {}
         _drain = self.journal.get("__drain__")
         if isinstance(_drain, dict):
-            self.draining = True
+            self.draining = _drain.get("state") in self.DRAIN_LIVE + ("BLOCKED",)
             self.drain_targets = list(_drain.get("targets") or ["dst"])
             started = float(_drain.get("created_at", time.time()))
             self.drain_started_t = time.monotonic() - max(
@@ -1974,7 +1979,7 @@ class Gateway:
         )
         st.drid = str(entry.get("drid") or f"dst-{st.rid}")
         st.transfer = entry.get("transfer") or "remote"
-        st.prefix_len = int(entry.get("prefix_len", 0))
+        st.prefix_len = int(entry.get("prefix_len") or 0)
         st.freeze_epoch = entry.get("epoch")
         st.owner = entry.get("owner", "src")
         st.owner_epoch = entry.get("epoch", "src")
@@ -1984,7 +1989,8 @@ class Gateway:
     # P5.4-B2: journal-driven drain state machine.
     #
     #   REQUESTED -> DRAINING -> PREPARING -> MIGRATING -> RECONCILING
-    #             -> SAFE_TO_STOP -> STOPPED        (BLOCKED = unsafe)
+    #             -> SAFE_TO_STOP -> STOPPED
+    #             -> BLOCKED -> FAILED_UNSAFE (deadline, ownership still fenced)
     #
     # Each step first persists its intent, then runs idempotent Source/Target
     # commands, then records the result.  A controller killed at any point can
@@ -1996,6 +2002,7 @@ class Gateway:
     DRAIN_LIVE = ("REQUESTED", "DRAINING", "PREPARING", "MIGRATING",
                   "RECONCILING")
     DRAIN_DONE = ("SAFE_TO_STOP", "STOPPED")
+    DRAIN_FENCED = DRAIN_LIVE + DRAIN_DONE + ("BLOCKED", "FAILED_UNSAFE")
     _MIG_FIELDS = (
         "owner", "phase", "prefix_len", "epoch", "freeze_transfer",
         "freeze_transfers", "tp_size",
@@ -2010,6 +2017,11 @@ class Gateway:
     def _drain_persist(self, d, entries=None):
         with self.journal_lock:
             cur = self.journal.get("__drain__")
+            if (isinstance(cur, dict)
+                    and cur.get("drain_id") != d.get("drain_id")):
+                # A prior rollback's reconcile tick may still be in flight
+                # when a new drain publishes its fence. Never overwrite it.
+                return
             if isinstance(cur, dict):
                 cur.update(d)
             else:
@@ -2043,7 +2055,7 @@ class Gateway:
             d = copy.deepcopy(raw) if isinstance(raw, dict) else None
         if d:
             state = d.get("state")
-            if state in self.DRAIN_LIVE or state == "BLOCKED":
+            if state in self.DRAIN_LIVE or state in ("BLOCKED", "FAILED_UNSAFE"):
                 return "DRAINING"
             if state in self.DRAIN_DONE:
                 return "SAFE_TO_STOP"
@@ -2233,6 +2245,11 @@ class Gateway:
                 and src_state == "READY"
             ):
                 return None
+            if d and d.get("preflight_pending"):
+                time.sleep(0.01)
+                continue
+            if d and d.get("state") == "FAILED_UNSAFE":
+                return {"error": "drain_failed_unsafe", "rid": rid}
             epoch = str((d or {}).get("epoch") or "")
             try:
                 rv = role.send(
@@ -2282,6 +2299,12 @@ class Gateway:
         )
         last = None
         while time.monotonic() < deadline:
+            d, _ = self._drain_snapshot()
+            if d and d.get("preflight_pending"):
+                time.sleep(0.01)
+                continue
+            if d and d.get("state") == "FAILED_UNSAFE":
+                return {"error": "drain_failed_unsafe", "rid": target_rid}
             try:
                 rv = self.dst.send(
                     {"cmd": "admit_ordinary", "rid": target_rid,
@@ -2386,6 +2409,8 @@ class Gateway:
         if not force and now - self._facts_at < 0.5:
             return
         self._facts_at = now
+        if "reqs" in self._dst_facts:
+            self._last_target_facts = copy.deepcopy(self._dst_facts)
         # The role poller already probes status every few ms; during a worker
         # outage its error flag is authoritative and lets us fail over
         # immediately instead of queueing another status RPC behind it.
@@ -2637,7 +2662,10 @@ class Gateway:
                 return
             e["owner"] = "src"
             if sr.get("frozen"):
-                e["phase"] = "frozen"
+                # Source still being frozen cannot erase a persisted import
+                # intent: an unreachable target may already have committed.
+                if e.get("phase") not in ("importing", "imported", "committed"):
+                    e["phase"] = "frozen"
             elif sr.get("finished"):
                 e["phase"] = "done"
                 e.setdefault("outcome", "drained")
@@ -3444,7 +3472,7 @@ class Gateway:
             if waiting:
                 d["state"] = "DRAINING"
                 return
-            epoch = uuid.uuid4().hex
+            epoch = str(d.get("reserved_epoch") or d.get("epoch") or uuid.uuid4().hex)
             wave.update({"phase": "freezing", "epoch": epoch,
                          "members": list(ready)})
             d["state"] = "PREPARING"
@@ -3601,6 +3629,66 @@ class Gateway:
         ):
             d["state"] = "RECONCILING"
 
+    def _target_outage_expired(self):
+        limit = max(1.0, float(os.environ.get("HANDOFF_DRAIN_TARGET_TIMEOUT_S", "30")))
+        since = self._target_fail_since
+        return bool(
+            not self._target_ok and since is not None and time.monotonic() - since >= limit
+        )
+
+    def _fail_drain_target(self, d, entries):
+        if (
+            d.get("state") in self.DRAIN_DONE
+            or d.get("mode") == "natural"
+            or not self._target_outage_expired()
+        ):
+            return False
+        unresolved = [entries.get(r) or {} for r in d.get("members") or []]
+        if not any(
+            e.get("phase") != "done"
+            and not e.get("finished")
+            and (
+                e.get("phase") in ("importing", "imported", "committed")
+                or (d.get("wave") or {}).get("phase") in ("importing", "imported")
+                or e.get("owner") == "dst"
+                or e.get("needs_cancel")
+            )
+            for e in unresolved
+        ):
+            return False
+        # A pre-import rollback is handled first. After import, an absent
+        # response is NOT proof the peer has aborted or stopped reading KV.
+        d["state"] = "FAILED_UNSAFE"
+        d["failed_reason"] = "target_unreachable_timeout"
+        d["failed_at"] = time.time()
+        d["blocked_reason"] = "ownership_unconfirmed"
+        d["failure_evidence"] = {
+            "captured_at": time.time(),
+            "target_down_s": round(time.monotonic() - self._target_fail_since, 3),
+            "wave": copy.deepcopy(d.get("wave")),
+            "source": copy.deepcopy(self._src_facts),
+            "target": copy.deepcopy(self._dst_facts),
+            "target_last_healthy": copy.deepcopy(getattr(self, "_last_target_facts", {})),
+            "members": {r: copy.deepcopy(entries.get(r)) for r in d.get("members") or []},
+        }
+        self.draining = False  # terminal; durable admission/ownership fence remains
+        self._drain_persist(d, entries)
+        print(
+            f"[gw] drain FAILED_UNSAFE id={d.get('drain_id')} "
+            "reason=target_unreachable_timeout; retained ownership and KV",
+            flush=True,
+        )
+        return True
+
+    def _stream_drain_error(self, st):
+        with self.journal_lock:
+            d = self.journal.get("__drain__") or {}
+            member = st.rid in (d.get("members") or [])
+            failed = d.get("state") == "FAILED_UNSAFE"
+        if (member and failed) or (st.owner == "dst" and self._target_outage_expired()):
+            return "target_unreachable_timeout"
+        return None
+
     def _reconcile_loop(self):
         while True:
             # A live drain is latency-critical: every reconcile tick can sit
@@ -3615,12 +3703,17 @@ class Gateway:
 
     def _reconcile_once(self):
         d, entries = self._drain_snapshot()
+        if d and d.get("state") in ("STOPPED", "FAILED_UNSAFE"):
+            return
         now = time.monotonic()
         if now - self._adopt_at > 1.0:
             self._adopt_at = now
             self._adopt_proxy_requests()
             d, entries = self._drain_snapshot()
-        if not d or d.get("state") == "STOPPED":
+        if not d or d.get("state") in ("STOPPED", "FAILED_UNSAFE"):
+            return
+        if d.get("preflight_pending"):
+            self._prepare_drain()
             return
         self._cleanup_drain_reservations(d)
         if d.get("state") == "ROLLED_BACK":
@@ -3676,6 +3769,8 @@ class Gateway:
             # every KV, so reopen D0 instead of blocking all new traffic.
             self._rollback_target(d, entries)
             self._drain_persist(d, entries)
+            return
+        if self._fail_drain_target(d, entries):
             return
         blocked = []
         for rid in members:
@@ -3836,9 +3931,7 @@ class Gateway:
         )
         return True
 
-    @_serialize_migration
-    def start_drain(self, targets: list[str], mode: str = "d2d",
-                    transfer: str = ""):
+    def start_drain(self, targets: list[str], mode: str = "d2d", transfer: str = ""):
         # Arm aliases are accepted at the API boundary; ``mode`` stays the
         # drain policy (d2d/natural) while ``transfer`` selects the data path.
         mode = str(mode or "d2d")
@@ -3854,157 +3947,184 @@ class Gateway:
             mode = "d2d"
         if mode == "natural":
             arm = ""
-        # Duplicate/concurrent drain calls are serialized: exactly one entity
-        # is created, and no admission can interleave between the "is this
-        # worker still READY" decision and the member snapshot below.
-        self.admission_lock.acquire()
-        try:
+        # Linearization point shared with stream admission: publish the fence
+        # and snapshot BEFORE waiting for a prior cutover or any backend RPC.
+        with self.admission_lock:
             with self.journal_lock:
                 raw = self.journal.get("__drain__")
                 existing = copy.deepcopy(raw) if isinstance(raw, dict) else None
-            if existing is not None and existing.get("state") in (
-                self.DRAIN_LIVE + self.DRAIN_DONE + ("BLOCKED",)
-            ):
-                # Idempotent: a duplicate drain never creates a second entity.
-                return self.drain_status()
-            members = []
-            with self.journal_lock:
-                for rid, e in self.journal.items():
-                    if rid == "__drain__" or not isinstance(e, dict):
-                        continue
-                    if e.get("finished") or e.get("owner", "src") != "src":
-                        continue
-                    members.append(rid)
-            for rid, st in self.active.items():
-                if (
-                    st.owner == "src"
-                    and st.sent < st.max_new
-                    and rid not in members
-                ):
-                    members.append(rid)
-            reserve_tokens = 0
-            if mode != "natural":
-                for rid in members:
-                    e = self.journal.get(rid) or {}
-                    reserve_tokens += (
-                        int(e.get("prompt_len") or 0)
-                        + int(e.get("max_new") or 0)
-                        + 64
-                    )
-            drain_epoch = uuid.uuid4().hex
-            drain = {
-                "drain_id": uuid.uuid4().hex,
-                "wave_id": uuid.uuid4().hex,
-                "epoch": drain_epoch,
-                "state": "REQUESTED",
-                "members": members,
-                "targets": list(targets or ["dst"]),
-                "created_at": time.time(),
-                "mode": mode,
-                "transfer": arm,
-                "reserve_tokens": reserve_tokens,
-                "wave": {
-                    "phase": "idle", "members": [],
+            if existing is not None and existing.get("state") in self.DRAIN_FENCED:
+                duplicate = True
+            else:
+                duplicate = False
+                members = []
+                with self.journal_lock:
+                    for rid, e in self.journal.items():
+                        if rid == "__drain__" or not isinstance(e, dict):
+                            continue
+                        if e.get("finished") or e.get("owner", "src") != "src":
+                            continue
+                        members.append(rid)
+                for rid, st in self.active.items():
+                    if st.owner == "src" and st.sent < st.max_new and rid not in members:
+                        members.append(rid)
+                reserve_tokens = 0
+                if mode != "natural":
+                    for rid in members:
+                        e = self.journal.get(rid) or {}
+                        reserve_tokens += (
+                            int(e.get("prompt_len") or 0) + int(e.get("max_new") or 0) + 64
+                        )
+                drain_epoch = uuid.uuid4().hex
+                drain = {
+                    "drain_id": uuid.uuid4().hex,
+                    "wave_id": uuid.uuid4().hex,
                     "epoch": drain_epoch,
-                },
-            }
-            # Drain-wide slot gate: reject the whole drain before freezing
-            # anything if the target cannot hold all members on top of its
-            # current load.  This is the safe isolation for extreme capacity
-            # contention (no target import request is ever created).
-            if mode != "natural" and members:
-                try:
-                    st_now = self.dst.send({"cmd": "status"}, timeout=4)
-                    tps = st_now.get("tp_rank_results") or [st_now]
-                    max_run = min(
-                        int(x.get("max_running") or 0) for x in tps
-                    )
-                    load = max(len(x.get("reqs") or []) for x in tps)
-                except Exception as exc:
-                    max_run, load = 0, 0
-                    print(f"[gw] drain slot gate skipped: {exc!r}",
-                          flush=True)
-                # Consecutive C4 runs can start while the previous run's
-                # target requests are in their final cleanup.  Give those
-                # rows a bounded window to disappear before rejecting the
-                # whole drain; this is not a capacity failure.  Ten seconds
-                # covers the previous wave's 5 s short-churn cleanup.
-                if max_run and load + len(members) > max_run:
-                    wait_s = float(os.environ.get(
-                        "HANDOFF_DRAIN_SLOT_WAIT_S", "10"
-                    ))
-                    deadline = time.monotonic() + max(0.0, wait_s)
-                    while (
-                        time.monotonic() < deadline
-                        and max_run
-                        and load + len(members) > max_run
-                    ):
-                        time.sleep(0.1)
-                        try:
-                            st_now = self.dst.send(
-                                {"cmd": "status"}, timeout=2
-                            )
-                            tps = st_now.get("tp_rank_results") or [st_now]
-                            max_run = min(
-                                int(x.get("max_running") or 0)
-                                for x in tps
-                            )
-                            load = max(
-                                len(x.get("reqs") or []) for x in tps
-                            )
-                        except Exception:
-                            break
-                    print(
-                        f"[gw] drain slot gate after wait "
-                        f"load={load} members={len(members)} "
-                        f"max_run={max_run}",
-                        flush=True,
-                    )
-                if max_run and load + len(members) > max_run:
-                    drain["state"] = "ROLLED_BACK"
-                    drain["failed_reason"] = (
-                        f"capacity_slots load={load} + "
-                        f"members={len(members)} > max_running={max_run}"
-                    )
-                    drain["reserve_tokens"] = 0
-                    with self.journal_lock:
-                        self.journal["__drain__"] = drain
-                    self._drain_persist(drain)
-                    print(
-                        f"[gw] drain rejected before freeze: "
-                        f"{drain['failed_reason']}", flush=True,
-                    )
-                    return self.drain_status()
-            if mode != "natural" and members:
-                if not self._pre_reserve_drain(drain, members):
-                    with self.journal_lock:
-                        self.journal["__drain__"] = drain
-                    self._drain_persist(drain)
-                    return self.drain_status()
-            self.draining = True
-            self.drain_started_t = time.monotonic()
-            self.drain_targets = drain["targets"]
-            with self.journal_lock:
-                self.journal["__drain__"] = drain
-                for rid in members:
-                    e = self.journal.get(rid)
-                    if isinstance(e, dict):
-                        e["drain_id"] = drain["drain_id"]
-                        e["wave_id"] = drain["wave_id"]
-                        e["drain_epoch"] = drain["epoch"]
-                        e["drain_member"] = True
-            # Persist before any RPC: a status timeout must not leave a drain
-            # that exists only in memory (new clients would get 503 forever).
-            self._drain_persist(drain)
-        finally:
-            self.admission_lock.release()
-        try:
-            s = self.src.send({"cmd": "status"}, timeout=10)
-            self.drain_kv_baseline = int(s.get("kv_available", 0))
-        except Exception:
-            self.drain_kv_baseline = 0
-        self._maybe_drain_kill("created")
+                    "state": "REQUESTED",
+                    "preflight_pending": True,
+                    "admission_fenced_at": time.time(),
+                    "members": members,
+                    "targets": list(targets or ["dst"]),
+                    "created_at": time.time(),
+                    "mode": mode,
+                    "transfer": arm,
+                    "reserve_tokens": reserve_tokens,
+                    "wave": {
+                        "phase": "idle",
+                        "members": [],
+                        "epoch": drain_epoch,
+                    },
+                }
+                self.draining = True
+                self.drain_started_t = time.monotonic()
+                self.drain_targets = drain["targets"]
+                with self.journal_lock:
+                    self.journal["__drain__"] = drain
+                self._drain_persist(drain)
+        if not duplicate:
+            self._prepare_drain()
+            self._maybe_drain_kill("created")
         return self.drain_status()
+
+    def _finish_drain_preflight(self, drain):
+        drain["preflight_pending"] = False
+        drain["preflight_finished_at"] = time.time()
+        drain["preflight_ms"] = round(
+            (time.time() - drain["admission_fenced_at"]) * 1000, 1
+        )
+        with self.admission_lock:
+            self.draining = drain.get("state") != "ROLLED_BACK"
+            if not self.draining:
+                drain.setdefault("rolled_back_at", time.time())
+            self._drain_persist(drain)
+        print(
+            f"[gw] drain preflight state={drain['state']} "
+            f"members={len(drain['members'])} ms={drain['preflight_ms']}",
+            flush=True,
+        )
+
+    @_serialize_migration
+    def _prepare_drain(self):
+        # Idempotent after restart and serialized with every legacy cutover.
+        drain, entries = self._drain_snapshot()
+        if not drain or not drain.get("preflight_pending"):
+            return
+        mode = drain.get("mode") or "d2d"
+        # A cutover already in progress at the fence may have finished while
+        # we waited. It now owns its target reservation; do not reserve twice.
+        members = [
+            rid
+            for rid in drain["members"]
+            if not (entries.get(rid) or {}).get("finished")
+            and (entries.get(rid) or {}).get("owner", "src") == "src"
+        ]
+        drain["members"] = members
+        drain["preflight_started_at"] = time.time()
+        self._drain_persist(drain)
+        gate_started = time.monotonic()
+        # Drain-wide slot gate: reject the whole drain before freezing
+        # anything if the target cannot hold all members on top of its
+        # current load.  This is the safe isolation for extreme capacity
+        # contention (no target import request is ever created).
+        if mode != "natural" and members:
+            try:
+                st_now = self.dst.send({"cmd": "status"}, timeout=4)
+                tps = st_now.get("tp_rank_results") or [st_now]
+                max_run = min(int(x.get("max_running") or 0) for x in tps)
+                load = max(len(x.get("reqs") or []) for x in tps)
+            except Exception as exc:
+                max_run, load = 0, 0
+                print(f"[gw] drain slot gate skipped: {exc!r}", flush=True)
+            # Consecutive C4 runs can start while the previous run's
+            # target requests are in their final cleanup.  Give those
+            # rows a bounded window to disappear before rejecting the
+            # whole drain; this is not a capacity failure.  Ten seconds
+            # covers the previous wave's 5 s short-churn cleanup.
+            if max_run and load + len(members) > max_run:
+                wait_s = float(os.environ.get("HANDOFF_DRAIN_SLOT_WAIT_S", "10"))
+                deadline = time.monotonic() + max(0.0, wait_s)
+                while (
+                    time.monotonic() < deadline
+                    and max_run
+                    and load + len(members) > max_run
+                ):
+                    time.sleep(0.1)
+                    try:
+                        st_now = self.dst.send({"cmd": "status"}, timeout=2)
+                        tps = st_now.get("tp_rank_results") or [st_now]
+                        max_run = min(int(x.get("max_running") or 0) for x in tps)
+                        load = max(len(x.get("reqs") or []) for x in tps)
+                    except Exception:
+                        break
+                print(
+                    f"[gw] drain slot gate after wait "
+                    f"load={load} members={len(members)} "
+                    f"max_run={max_run}",
+                    flush=True,
+                )
+            drain["slot_gate"] = {
+                "load": load,
+                "members": len(members),
+                "max_running": max_run,
+                "checked_at": time.time(),
+                "elapsed_ms": round((time.monotonic() - gate_started) * 1000, 1),
+            }
+            if max_run and load + len(members) > max_run:
+                drain["state"] = "ROLLED_BACK"
+                drain["failed_reason"] = (
+                    f"capacity_slots load={load} + "
+                    f"members={len(members)} > max_running={max_run}"
+                )
+                drain["reserve_tokens"] = 0
+                self._finish_drain_preflight(drain)
+                print(
+                    f"[gw] drain rejected before freeze: {drain['failed_reason']}",
+                    flush=True,
+                )
+                return
+        drain["slot_gate"] = {
+            "load": load if mode != "natural" and members else 0,
+            "members": len(members),
+            "max_running": max_run if mode != "natural" and members else 0,
+            "checked_at": time.time(),
+            "elapsed_ms": round((time.monotonic() - gate_started) * 1000, 1),
+        }
+        if mode != "natural" and members:
+            if not self._pre_reserve_drain(drain, members):
+                self._finish_drain_preflight(drain)
+                return
+        with self.journal_lock:
+            for rid in members:
+                e = self.journal.get(rid)
+                if isinstance(e, dict):
+                    e["drain_id"] = drain["drain_id"]
+                    e["wave_id"] = drain["wave_id"]
+                    e["drain_epoch"] = drain["epoch"]
+                    e["drain_member"] = True
+        self.drain_kv_baseline = int(
+            getattr(self, "_src_facts", {}).get("kv_available") or 0
+        )
+        self._finish_drain_preflight(drain)
 
     def stop_drain(self):
         d, entries = self._drain_snapshot()
@@ -4044,12 +4164,18 @@ class Gateway:
         recovery_ms = None
         if restart:
             recovery_ms = ((reconciled or now) - float(restart)) * 1000.0
-        try:
-            s = self.src.send({"cmd": "status"}, timeout=4)
-            src_kv = int(s.get("kv_available", -1))
-        except Exception:
-            src_kv = -1
+        src_kv = int(self._src_facts.get("kv_available", -1))
         return {
+            "terminal": d.get("state") in self.DRAIN_DONE + ("ROLLED_BACK", "FAILED_UNSAFE"),
+            "requires_intervention": d.get("state") == "FAILED_UNSAFE",
+            "admission_fenced_at": d.get("admission_fenced_at"),
+            "preflight_pending": bool(d.get("preflight_pending")),
+            "preflight_ms": d.get("preflight_ms"),
+            "preflight_started_at": d.get("preflight_started_at"),
+            "preflight_finished_at": d.get("preflight_finished_at"),
+            "failed_at": d.get("failed_at"),
+            "slot_gate": d.get("slot_gate"),
+            "failure_evidence": d.get("failure_evidence"),
             "draining": d.get("state") in self.DRAIN_LIVE,
             "state": d.get("state"),
             "drain_id": d.get("drain_id"),
@@ -4217,6 +4343,13 @@ class Gateway:
         st._j_done = bool(entry.get("finished") or st._j_phase == "done")
         st._j_state = None
         while True:
+            drain_error = self._stream_drain_error(st)
+            if drain_error:
+                st.error = drain_error
+                self._send_event(handler, st, {"error": drain_error})
+                handler.wfile.write(b"data: [DONE]\n\n")
+                handler.wfile.flush()
+                return
             now = time.monotonic()
             if now - jt > 0.25:
                 jt = now
@@ -4390,18 +4523,111 @@ class Gateway:
             ticket_info.get("epoch", "")
             if isinstance(ticket_info, dict) else ""
         )
-        if not capacity_ticket and forced_hint != "src":
-            # The hold policy returns None after SAFE; natural mode also
-            # routes new traffic to D1.  Always take a target ticket before
-            # submit so a full target queues instead of erroring the SSE.
-            d_now, _ = self._drain_snapshot()
-            src_now = self.src_worker_state()
-            need_target = (
-                forced_hint == "dst"
-                or bool(d_now and d_now.get("state") in self.DRAIN_LIVE)
-                or src_now != "READY"
-            )
-            if need_target:
+        while True:
+            with self.admission_lock:
+                # Recheck under the SAME lock as the drain fence. A drain can
+                # start after _admission_capacity_wait returned no ticket.
+                use_dst = forced_hint == "dst" or (
+                    forced_hint != "src" and self.src_worker_state() != "READY"
+                )
+                if use_dst and not capacity_ticket and self.dst_worker_state() == "READY":
+                    need_ticket = True
+                else:
+                    need_ticket = False
+                    forced = forced_hint
+                    src_state = self.src_worker_state()
+                    dst_state = self.dst_worker_state()
+                    if rid in self.active:
+                        # A retry must not create a second source/target submission
+                        # under one rid; the proxy reattaches completed streams via
+                        # GET /v1/attach instead of re-posting.
+                        self._json_response(handler, 409, {
+                            "error": "duplicate_rid", "rid": rid,
+                        })
+                        return
+                    if forced == "src" and src_state != "READY":
+                        if capacity_ticket:
+                            self._cancel_capacity_ticket(capacity_ticket)
+                        self._json_response(handler, 503, {
+                            "error": "worker_not_ready", "worker": "src",
+                            "state": src_state,
+                        })
+                        return
+                    use_dst = forced == "dst" or (
+                        forced != "src" and src_state != "READY"
+                    )
+                    if use_dst and dst_state != "READY":
+                        if capacity_ticket:
+                            self._cancel_capacity_ticket(capacity_ticket)
+                        self._json_response(handler, 503, {
+                            "error": "no_ready_worker",
+                            "src": src_state, "dst": dst_state,
+                        })
+                        return
+                    if not use_dst and src_state != "READY":
+                        if capacity_ticket:
+                            self._cancel_capacity_ticket(capacity_ticket)
+                        self._json_response(handler, 503, {
+                            "error": "no_ready_worker",
+                            "src": src_state, "dst": dst_state,
+                        })
+                        return
+                    if capacity_ticket and not use_dst:
+                        self._cancel_capacity_ticket(capacity_ticket)
+                        capacity_ticket = None
+                    st = RequestState(rid, len(prompt_ids), max_new, cut)
+                    st.group = body.get("group")
+                    if st.group:
+                        st.group = f"{st.group}:{body.get('run_id', '')}"
+                    st.group_size = int(body.get("group_size", 1))
+                    st.wave = bool(body.get("wave", WAVE_DEFAULT))
+                    st.wave_freeze = str(body.get("wave_freeze", "each"))
+                    st._capacity_ticket = capacity_ticket
+                    st._capacity_epoch = capacity_epoch
+                    with self.journal_lock:
+                        admission_drain = dict(self.journal.get("__drain__") or {})
+                    admission = {
+                        "admitted_at": time.time(),
+                        "admission_worker": "dst" if use_dst else "src",
+                        "admission_drain_id": admission_drain.get("drain_id"),
+                        "admission_drain_state": admission_drain.get("state"),
+                    }
+                    if use_dst:
+                        # Direct-to-D1 admission: no handoff, journal owner is the
+                        # target from the first token so attach/recovery need no
+                        # migration state.
+                        st.drid = str(body.get("drid") or f"dst-{rid}")
+                        st.owner = "dst"
+                        st.owner_epoch = "direct"
+                        st.transfer = "direct"
+                        self._journal_update(
+                            st, force=True, phase="direct", owner="dst",
+                            epoch="direct", direct=True, max_new=max_new, cut=cut,
+                            transfer="direct", prompt_len=len(prompt_ids),
+                            finished=False, **admission,
+                        )
+                    else:
+                        self._journal_update(
+                            st, force=True, phase="accepted", max_new=max_new, cut=cut,
+                            transfer=transfer, prompt_len=len(prompt_ids),
+                            finished=False, **admission,
+                        )
+                    self.active[st.rid] = st
+                    if use_dst:
+                        st._admit_need = need
+                        self._admit_pending += need
+                    if st.group:
+                        # Register every member up front so a failed wave can abort
+                        # members that have not reached their cut yet.
+                        with self.group_lock:
+                            g = self.groups.setdefault(
+                                st.group,
+                                {"members": [], "expected": st.group_size,
+                                 "started": False, "all": [], "aborted": None},
+                            )
+                            g.setdefault("all", []).append(st)
+                    break
+            if need_ticket:
                 ti = self._target_ticket_wait(need, target_rid)
                 if ti.get("error"):
                     self._json_response(handler, 503, {
@@ -4412,91 +4638,6 @@ class Gateway:
                     return
                 capacity_ticket = ti.get("ticket")
                 capacity_epoch = ti.get("epoch", "")
-        with self.admission_lock:
-            forced = forced_hint
-            src_state = self.src_worker_state()
-            dst_state = self.dst_worker_state()
-            if rid in self.active:
-                # A retry must not create a second source/target submission
-                # under one rid; the proxy reattaches completed streams via
-                # GET /v1/attach instead of re-posting.
-                self._json_response(handler, 409, {
-                    "error": "duplicate_rid", "rid": rid,
-                })
-                return
-            if forced == "src" and src_state != "READY":
-                if capacity_ticket:
-                    self._cancel_capacity_ticket(capacity_ticket)
-                self._json_response(handler, 503, {
-                    "error": "worker_not_ready", "worker": "src",
-                    "state": src_state,
-                })
-                return
-            use_dst = forced == "dst" or (
-                forced != "src" and src_state != "READY"
-            )
-            if use_dst and dst_state != "READY":
-                if capacity_ticket:
-                    self._cancel_capacity_ticket(capacity_ticket)
-                self._json_response(handler, 503, {
-                    "error": "no_ready_worker",
-                    "src": src_state, "dst": dst_state,
-                })
-                return
-            if not use_dst and src_state != "READY":
-                if capacity_ticket:
-                    self._cancel_capacity_ticket(capacity_ticket)
-                self._json_response(handler, 503, {
-                    "error": "no_ready_worker",
-                    "src": src_state, "dst": dst_state,
-                })
-                return
-            if capacity_ticket and not use_dst:
-                self._cancel_capacity_ticket(capacity_ticket)
-                capacity_ticket = None
-            st = RequestState(rid, len(prompt_ids), max_new, cut)
-            st.group = body.get("group")
-            if st.group:
-                st.group = f"{st.group}:{body.get('run_id', '')}"
-            st.group_size = int(body.get("group_size", 1))
-            st.wave = bool(body.get("wave", WAVE_DEFAULT))
-            st.wave_freeze = str(body.get("wave_freeze", "each"))
-            st._capacity_ticket = capacity_ticket
-            st._capacity_epoch = capacity_epoch
-            if use_dst:
-                # Direct-to-D1 admission: no handoff, journal owner is the
-                # target from the first token so attach/recovery need no
-                # migration state.
-                st.drid = str(body.get("drid") or f"dst-{rid}")
-                st.owner = "dst"
-                st.owner_epoch = "direct"
-                st.transfer = "direct"
-                self._journal_update(
-                    st, force=True, phase="direct", owner="dst",
-                    epoch="direct", direct=True, max_new=max_new, cut=cut,
-                    transfer="direct", prompt_len=len(prompt_ids),
-                    finished=False,
-                )
-            else:
-                self._journal_update(
-                    st, force=True, phase="accepted", max_new=max_new, cut=cut,
-                    transfer=transfer, prompt_len=len(prompt_ids),
-                    finished=False,
-                )
-            self.active[st.rid] = st
-            if use_dst:
-                st._admit_need = need
-                self._admit_pending += need
-            if st.group:
-                # Register every member up front so a failed wave can abort
-                # members that have not reached their cut yet.
-                with self.group_lock:
-                    g = self.groups.setdefault(
-                        st.group,
-                        {"members": [], "expected": st.group_size,
-                         "started": False, "all": [], "aborted": None},
-                    )
-                    g.setdefault("all", []).append(st)
 
         handler.wfile.write(
             b"HTTP/1.1 200 OK\r\n"
@@ -4561,6 +4702,10 @@ class Gateway:
             cut_done = False
             last_keepalive = time.monotonic()
             while st.sent < max_new:
+                drain_error = self._stream_drain_error(st)
+                if drain_error:
+                    st.drain_failed = True
+                    raise RuntimeError(drain_error)
                 if (
                     getattr(st, "drain_requested", False)
                     and st.owner == "src"
@@ -4688,6 +4833,8 @@ class Gateway:
             st.error = repr(exc)
             try:
                 self._send_event(handler, st, {"error": st.error, "metrics": self._metrics(st)})
+                handler.wfile.write(b"data: [DONE]\n\n")
+                handler.wfile.flush()
             except Exception:
                 pass
         finally:
@@ -4698,11 +4845,11 @@ class Gateway:
                 jstate = draw.get("state") if isinstance(draw, dict) else None
             drain_live = jstate in (
                 "REQUESTED", "DRAINING", "PREPARING", "MIGRATING",
-                "RECONCILING", "BLOCKED",
+                "RECONCILING", "BLOCKED", "FAILED_UNSAFE",
             )
             # A direct-to-D1 request never touches the source; release only
             # its target-side tracking, independent of any drain.
-            if jrec.get("direct"):
+            if jrec.get("direct") and self._target_ok:
                 try:
                     self.dst.send(
                         {"cmd": "release", "rid": st.drid}, timeout=60
@@ -4712,7 +4859,7 @@ class Gateway:
             # During a live drain the reconcile loop owns every migration
             # decision: aborting an in-flight import or freeing a frozen
             # source KV here would race the wave.
-            elif not drain_live:
+            elif not jrec.get("direct") and not drain_live:
                 # Release the source first: it is local and must not be held
                 # behind a dead target's RPC timeout.  Only touch the target
                 # when it is reachable (target failure leaves nothing to free).
