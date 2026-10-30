@@ -61,6 +61,13 @@ def summarize(root):
                 "error": matching("error.json"),
                 "early_admission": bool(admitted),
                 "remote_calls": done.get("remote_calls", 0) if done else None,
+                "scheduler_overlap": done.get("scheduler_overlap", False)
+                if done
+                else False,
+                "overlap_forwards": done.get("overlap_forwards") if done else None,
+                "gpu_proven_forwards": done.get("gpu_proven_forwards")
+                if done
+                else None,
                 "ready_layers_at_admission": admitted["ready_layers"]
                 if admitted
                 else None,
@@ -132,6 +139,7 @@ def main():
     parser.add_argument("--require-remote", action="store_true")
     parser.add_argument("--require-overlap", action="store_true")
     parser.add_argument("--require-p-radix", action="store_true")
+    parser.add_argument("--require-d-overlap", action="store_true")
     args = parser.parse_args()
     report = summarize(args.journal)
     print(json.dumps(report, indent=2))
@@ -150,6 +158,21 @@ def main():
         or report["p_radix_closed_shards"] != report["activated_shards"]
     ):
         raise SystemExit("P radix lease missing or not closed on every activated shard")
+    if args.require_d_overlap:
+        early = [r for r in report["rows"] if r["early_admission"]]
+        if (
+            not early
+            or any(
+                not r["scheduler_overlap"]
+                or r["overlap_forwards"] is None
+                or r["overlap_forwards"] != r["gpu_proven_forwards"]
+                for r in early
+            )
+            or not any((r["overlap_forwards"] or 0) > 0 for r in early)
+        ):
+            raise SystemExit(
+                "D overlap missing, no decode forward exercised, or GPU completion unproven"
+            )
     if args.require_remote and not any(
         (r["remote_calls"] or 0) > 0 for r in report["rows"]
     ):

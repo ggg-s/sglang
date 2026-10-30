@@ -82,7 +82,7 @@ def _host_staging_manager():
     )
 
 
-def _source_class(relative, owner, members=None):
+def _source_class(relative, owner, members=None, *, strip_method_decorators=False):
     path = ROOT / "python" / "sglang" / "srt" / relative
     tree = ast.parse(path.read_text())
     node = next(n for n in tree.body if isinstance(n, ast.ClassDef) and n.name == owner)
@@ -90,6 +90,10 @@ def _source_class(relative, owner, members=None):
     node.keywords = []
     if members is not None:
         node.body = [n for n in node.body if getattr(n, "name", None) in members]
+    if strip_method_decorators:
+        for method in node.body:
+            if isinstance(method, ast.FunctionDef):
+                method.decorator_list = []
     module = ast.Module(
         body=[
             ast.ImportFrom(
@@ -1056,6 +1060,439 @@ class TestRemoteAttn(CustomTestCase):
             ],
         )
 
+    def _overlap_target(self, directory, req=None):
+        from sglang_remote_attn.decode_overlap import DecodeOverlap
+
+        pl = self.hooks.pre_layerwise
+        controller = pl.Controller.__new__(pl.Controller)
+        controller.tp_size, controller.rank = 1, 0
+        controller.graph_fast_path = True
+        controller.config = pl.Config("remote", Path(directory))
+        controller.scheduler = SimpleNamespace(enable_overlap=True)
+        controller.decode_overlap = DecodeOverlap(controller)
+        controller.scheduler._pre_layerwise = controller
+        freed = []
+        req = req or SimpleNamespace()
+        receiver = SimpleNamespace(done=False, clear=lambda: freed.append("receiver"))
+        receiver.poll = lambda: 4 if receiver.done else 2
+        target = pl.Target(
+            controller,
+            SimpleNamespace(
+                metadata_buffers=SimpleNamespace(bootstrap_room=torch.ones((1, 1))),
+                req_to_metadata_buffer_idx_allocator=SimpleNamespace(free=freed.append),
+            ),
+            SimpleNamespace(req=req, kv_receiver=receiver, metadata_buffer_index=0),
+            Path(directory) / "target",
+            "g",
+            pl.LayerCoverage(2, 1),
+        )
+        req._pre_layerwise_target = target
+        controller.targets = [target]
+        patcher = patch.dict(
+            sys.modules,
+            {
+                "sglang.srt.disaggregation.base.conn": SimpleNamespace(
+                    KVPoll=SimpleNamespace(Success=4, Failed=0)
+                )
+            },
+        )
+        patcher.start()
+        self.addCleanup(patcher.stop)
+        return controller, target, freed
+
+    def test_decode_overlap_native_loop_serializes_remote_and_restores_local(self):
+        """Native PD loop must drain before Remote launches, then pipeline Local again."""
+        from collections import deque
+
+        from sglang_remote_attn.decode_overlap import disable_overlap
+
+        native = _source_class(
+            "disaggregation/decode.py",
+            "SchedulerDisaggregationDecodeMixin",
+            {"event_loop_overlap_disagg_decode"},
+        )
+        native.event_loop_overlap_disagg_decode.__wrapped__.__globals__["deque"] = deque
+        predicate = _source_class(
+            "managers/scheduler.py", "Scheduler", {"is_disable_overlap_for_batch"}
+        ).is_disable_overlap_for_batch
+        predicate.__globals__["envs"] = SimpleNamespace(
+            SGLANG_DISABLE_CONSECUTIVE_PREFILL_OVERLAP=SimpleNamespace(
+                get=lambda: False
+            )
+        )
+        with tempfile.TemporaryDirectory() as directory:
+            controller, target, freed = self._overlap_target(directory)
+            controller.targets = []
+            scheduler = native()
+            controller.scheduler = scheduler
+            scheduler._pre_layerwise = controller
+            scheduler.gracefully_exit = scheduler._engine_paused = False
+            scheduler.require_mlp_sync = False
+            scheduler.running_batch = None
+            scheduler.disagg_decode_prealloc_queue = SimpleNamespace(
+                prefetch_prefill_dp_rank_queries=lambda: None
+            )
+            scheduler.ngram_embedding_manager = SimpleNamespace(
+                prepare_for_forward=lambda b, **kw: b
+            )
+            scheduler.chunked_req, scheduler.is_generation = None, True
+            events, launches, processed = {}, [], []
+            iteration = -1
+
+            def batch(name):
+                b = SimpleNamespace(
+                    name=name,
+                    reqs=[target.decode_req.req],
+                    spec_algorithm=SimpleNamespace(is_none=lambda: True),
+                    forward_mode=SimpleNamespace(
+                        is_prebuilt=lambda: False, is_extend=lambda: False
+                    ),
+                )
+                b.copy = lambda: b
+                return b
+
+            batches = [
+                batch("local-0"),
+                batch("remote-1"),
+                batch("remote-2"),
+                None,
+                batch("local-3"),
+                batch("local-4"),
+                None,
+            ]
+
+            def ingest():
+                nonlocal iteration
+                iteration += 1
+                if iteration == 1:
+                    controller.targets.append(target)
+                if iteration == 3:
+                    target.decode_req.kv_receiver.done = True
+                if iteration == len(batches) - 1:
+                    scheduler.gracefully_exit = True
+
+            def launch(scheduler, b):
+                launches.append(
+                    (b.name, [name for name, e in events.items() if not e.done])
+                )
+                event = SimpleNamespace(done=False)
+                event.query = lambda: event.done
+                event.synchronize = lambda: setattr(event, "done", True)
+                events[b.name] = event
+                return SimpleNamespace(copy_done=event, delay_sample_func=None)
+
+            def process(b, result):
+                result.copy_done.synchronize()  # Device boundary of native result processing.
+                processed.append(b.name)
+
+            scheduler.ingest_requests = ingest
+            scheduler.process_decode_queue = controller.retire_targets
+            scheduler.get_next_disagg_decode_batch_to_run = lambda **kw: (
+                SimpleNamespace(running_batch=None, batch_to_run=batches[iteration])
+            )
+            scheduler.is_disable_overlap_for_batch = lambda b, last_batch: (
+                disable_overlap(predicate, scheduler, b, last_batch)
+            )
+            scheduler.run_batch = lambda b: self.hooks.pre_layerwise.run_batch(
+                launch, scheduler, b
+            )
+            scheduler.process_batch_result = process
+            scheduler.launch_batch_sample_if_needed = lambda *a: None
+            scheduler._apply_war_barrier = lambda: None  # GPU stream boundary.
+            scheduler.on_idle = lambda: None
+            scheduler.event_loop_overlap_disagg_decode()
+            self.assertEqual(
+                launches,
+                [
+                    ("local-0", []),
+                    ("remote-1", []),
+                    ("remote-2", []),
+                    ("local-3", []),
+                    ("local-4", ["local-3"]),
+                ],
+            )
+            self.assertEqual(processed, [b.name for b in batches if b])
+            self.assertEqual(controller.targets, [])
+            self.assertEqual(freed, ["receiver", 0])
+            self.assertEqual(target.gpu_proven_forwards, 2)
+            self.assertEqual(target.forward_count, 2)
+            # Empty Local never reaches result-proof or collective work.
+            with (
+                patch(
+                    "sglang_remote_attn.decode_overlap.BatchProof.ready",
+                    side_effect=AssertionError("Local proof query"),
+                ),
+                patch.object(
+                    torch.distributed,
+                    "all_reduce",
+                    side_effect=AssertionError("Local vote"),
+                ),
+            ):
+                for _ in range(16):
+                    controller.retire_targets()
+                    self.assertFalse(
+                        disable_overlap(predicate, scheduler, batches[4], batches[5])
+                    )
+                    scheduler.run_batch(batches[4])
+
+    def test_decode_overlap_defers_native_kv_free_until_gpu_and_io_drained(self):
+        f = self._radix()
+        f.cache.disable = True  # D retains native disabled-radix release.
+        req, _ = f.request([2, 3], "decode")
+        with tempfile.TemporaryDirectory() as directory:
+            controller, target, freed = self._overlap_target(directory, req)
+            gpu = SimpleNamespace(done=False)
+            gpu.query = lambda: gpu.done
+            result = SimpleNamespace(copy_done=gpu, delay_sample_func=None)
+            batch = SimpleNamespace(
+                reqs=[req], forward_mode=SimpleNamespace(is_prebuilt=lambda: False)
+            )
+            self.hooks.pre_layerwise.run_batch(
+                lambda *a: result, controller.scheduler, batch
+            )
+            self.hooks._release_kv(f.release_kv_cache, req, f.cache, checkpoint=False)
+            self.hooks._release_kv(f.release_kv_cache, req, f.cache, checkpoint=False)
+            controller.retire_targets()
+            self.assertEqual(f.allocator.available_size(), 30)
+            target.decode_req.kv_receiver.done = True
+            controller.retire_targets()  # Native writes are complete; GPU is not.
+            self.assertEqual(freed, [])
+            self.assertEqual(f.allocator.available_size(), 30)
+            gpu.done = True
+            from sglang_remote_attn.decode_overlap import reap
+
+            # The native queue can return early while retractions need memory.
+            # Reap before that gate so a held KV free can make progress.
+            process_queue = _source_class(
+                "disaggregation/decode.py",
+                "SchedulerDisaggregationDecodeMixin",
+                {"process_decode_queue"},
+                strip_method_decorators=True,
+            ).process_decode_queue
+            process_queue.__globals__["get_disagg"] = lambda: SimpleNamespace(
+                disaggregation_decode_enable_offload_kvcache=False
+            )
+            scheduler = controller.scheduler
+            scheduler.enable_decode_hicache = False
+            scheduler.waiting_queue = []
+            scheduler.disagg_decode_prealloc_queue = SimpleNamespace(
+                resume_retracted_reqs=lambda: [], retracted_queue=[object()]
+            )
+            queue = SimpleNamespace(scheduler=scheduler)
+            scheduler.disagg_decode_transfer_queue = SimpleNamespace(
+                resolve_deferred_releases=lambda: reap(lambda q: None, queue)
+            )
+            process_queue(scheduler)
+            controller.retire_targets()
+            self.assertEqual(freed, ["receiver", 0])
+            self.assertEqual(f.allocator.available_size(), 32)
+            self.assertEqual(len(set(f.allocator.free_pages.tolist())), 32)
+            self.assertTrue(req.kv.is_kv_released)
+
+    def test_decode_overlap_completion_rejects_empty_events_and_copy_errors(self):
+        from sglang_remote_attn.decode_overlap import BatchProof
+
+        # A new CUDA event can query True before delayed sampling records it.
+        result = SimpleNamespace(
+            delay_sample_func=object(), copy_done=SimpleNamespace(query=lambda: True)
+        )
+        proof = BatchProof(result)
+        self.assertFalse(proof.ready())
+        result.delay_sample_func = None
+        result.copy_done = None
+        with self.assertRaisesRegex(RuntimeError, "no GPU completion"):
+            proof.ready()
+        copy_done = _source_class("managers/async_d2h_copy_worker.py", "HostCopyDone")
+        copy_done.__init__.__globals__["threading"] = threading
+        result.copy_done = copy_done()
+        self.assertFalse(proof.ready())
+        result.copy_done.set_done(error=ValueError("copy failed"))
+        with self.assertRaisesRegex(RuntimeError, "copy failed"):
+            proof.ready()
+        with self.assertRaisesRegex(RuntimeError, "unproven"):
+            BatchProof().ready()
+
+    def test_decode_overlap_failed_forward_retains_target_and_pending_release(self):
+        with tempfile.TemporaryDirectory() as directory:
+            controller, target, freed = self._overlap_target(directory)
+            req = target.decode_req.req
+            native_prebuilt = _source_class(
+                "disaggregation/decode.py",
+                "SchedulerDisaggregationDecodeMixin",
+                {"_run_batch_prebuilt"},
+            )._run_batch_prebuilt
+            native_prebuilt.__globals__["GenerationBatchResult"] = _source_class(
+                "managers/utils.py", "GenerationBatchResult"
+            )
+            prebuilt = SimpleNamespace(
+                reqs=[req],
+                inner_idle_batch=None,
+                forward_mode=SimpleNamespace(is_prebuilt=lambda: True),
+            )
+            result = self.hooks.pre_layerwise.run_batch(
+                native_prebuilt, controller.scheduler, prebuilt
+            )
+            self.assertIsNone(result.copy_done)
+            self.assertEqual(target.forward_proofs, [])
+            batch = SimpleNamespace(
+                reqs=[req], forward_mode=SimpleNamespace(is_prebuilt=lambda: False)
+            )
+
+            def fail(*args):
+                raise RuntimeError("partial forward")
+
+            with self.assertRaisesRegex(RuntimeError, "partial forward"):
+                self.hooks.pre_layerwise.run_batch(fail, controller.scheduler, batch)
+            self.assertTrue(
+                self.hooks.pre_layerwise.defer_release(req, lambda: freed.append("KV"))
+            )
+            target.decode_req.kv_receiver.done = True
+            with self.assertRaisesRegex(RuntimeError, "unproven"):
+                controller.retire_targets()
+            self.assertEqual(freed, [])
+            self.assertEqual(controller.targets, [target])
+            self.assertFalse(target.closed)
+
+    def test_decode_overlap_failed_native_release_never_retries_allocator_mutation(
+        self,
+    ):
+        f = self._radix()
+        f.cache.disable = True
+        req, _ = f.request([2, 3], "failed-release")
+        with tempfile.TemporaryDirectory() as directory:
+            controller, target, _ = self._overlap_target(directory, req)
+            target.decode_req.kv_receiver.done = True
+
+            def partial_release():
+                f.release_kv_cache(req, f.cache, checkpoint=False)
+                raise RuntimeError("native release completion unknown")
+
+            self.assertTrue(
+                self.hooks.pre_layerwise.defer_release(req, partial_release)
+            )
+            with self.assertRaisesRegex(RuntimeError, "completion unknown"):
+                controller.retire_targets()
+            with self.assertRaisesRegex(RuntimeError, "refusing retirement retry"):
+                controller.retire_targets()
+            self.assertEqual(f.allocator.available_size(), 32)
+            self.assertEqual(len(set(f.allocator.free_pages.tolist())), 32)
+            self.assertEqual(controller.targets, [target])
+            self.assertTrue((target.path / "error.json").exists())
+
+    def test_decode_overlap_retraction_drains_before_native_backup_and_reset(self):
+        from sglang_remote_attn.decode_overlap import before_retract
+
+        f = self._radix()
+        f.cache.disable = True
+        req, _ = f.request([2, 3], "retract")
+        req.finished = lambda: False
+        req.input_embeds, req.retraction_count = None, 0
+        native_reset = _source_class(
+            "managers/schedule_batch.py", "Req", {"reset_for_retract"}
+        ).reset_for_retract
+        req.reset_for_retract = lambda: native_reset(req)
+        native_release = _source_function("managers/schedule_batch.py", "release_req")
+        with tempfile.TemporaryDirectory() as directory:
+            controller, target, _ = self._overlap_target(directory, req)
+            ready = SimpleNamespace(done=False)
+            result = SimpleNamespace(
+                copy_done=SimpleNamespace(query=lambda: ready.done),
+                delay_sample_func=None,
+            )
+            batch = SimpleNamespace(
+                reqs=[req], forward_mode=SimpleNamespace(is_prebuilt=lambda: False)
+            )
+            self.hooks.pre_layerwise.run_batch(
+                lambda *a: result, controller.scheduler, batch
+            )
+            # Timeout must leave the native backup/reset untouched and preserve KV.
+            controller.config = dataclasses.replace(controller.config, drain_timeout=0)
+            with self.assertRaisesRegex(RuntimeError, "did not drain"):
+                before_retract(lambda **kw: self.fail("unsafe native backup"), req=req)
+            self.assertEqual(req.retraction_count, 0)
+            self.assertTrue(req.kv.holds_kv)
+            controller.config = dataclasses.replace(controller.config, drain_timeout=1)
+            receiver = target.decode_req.kv_receiver
+
+            def device_progress(_):
+                ready.done = receiver.done = True
+
+            backed_up = []
+
+            def backup(*args):
+                self.assertTrue(target.closed)
+                self.assertTrue(ready.done)
+                backed_up.append(req.kv.req_pool_idx)
+                return True
+
+            native_release.__globals__.update(
+                get_disagg=lambda: SimpleNamespace(
+                    disaggregation_mode="decode",
+                    disaggregation_decode_retraction_backup="host_pool",
+                ),
+                backup_kv_cache=backup,
+                release_kv_cache=lambda req, cache, **kw: self.hooks._release_kv(
+                    f.release_kv_cache, req, cache, **kw
+                ),
+                evict_from_tree_cache=lambda cache, n: cache.evict(
+                    f.EvictParams(num_tokens=n)
+                ),
+                envs=SimpleNamespace(
+                    SGLANG_RETRACT_DECODE_STEPS=SimpleNamespace(get=lambda: 1)
+                ),
+            )
+            with patch.object(
+                self.hooks.pre_layerwise.time, "sleep", side_effect=device_progress
+            ):
+                self.assertTrue(
+                    before_retract(
+                        native_release,
+                        req=req,
+                        remaing_req_count=1,
+                        req_to_token_pool=f.cache.req_to_token_pool,
+                        token_to_kv_pool_allocator=f.allocator,
+                        tree_cache=f.cache,
+                        hisparse_coordinator=None,
+                    )
+                )
+            self.assertEqual(len(backed_up), 1)
+            self.assertEqual(req.retraction_count, 1)
+            self.assertTrue(req.is_retracted)
+            self.assertFalse(req.kv.holds_kv)
+            self.assertEqual(f.allocator.available_size(), 32)
+
+    def test_decode_overlap_finished_overshoot_keeps_remote_state_until_retirement(
+        self,
+    ):
+        """A prepared overshoot must not use incomplete local KV after Req finishes."""
+        closed = []
+        owner = SimpleNamespace(decode_overlap=object())
+        target = SimpleNamespace(owner=owner, closed=False)
+        req = SimpleNamespace(
+            finished=lambda: True,
+            kv=SimpleNamespace(req_pool_idx=0),
+            _pre_layerwise_target=target,
+        )
+        state = SimpleNamespace(
+            req=req,
+            req_pool_idx=0,
+            _admitted=True,
+            close=lambda: closed.append("closed"),
+        )
+        with (
+            patch.object(self.runtime, "_TARGET_STATES", [state]),
+            patch.object(self.runtime, "_snapshot_state", return_value=None),
+        ):
+            self.assertEqual(self.runtime._bind_and_select_states([0]), [state])
+            self.assertEqual(closed, [])
+            req.kv.req_pool_idx = 1
+            with self.assertRaisesRegex(RuntimeError, "row changed"):
+                self.runtime._bind_and_select_states([1])
+            req.kv.req_pool_idx = 0
+            target.closed = True
+            self.assertEqual(self.runtime._bind_and_select_states([0]), [])
+            self.assertEqual(closed, ["closed"])
+
     def test_progressive_graph_lease_skips_per_forward_collectives(self):
         """TP-agreed leases, including locally complete ones, own the eager window."""
         controller = SimpleNamespace(graph_fast_path=True, targets=[])
@@ -1138,6 +1575,21 @@ class TestRemoteAttn(CustomTestCase):
         sentinel = {self.runtime._HANDOFF_CTL_KEY: True, "data": {"cmd": "import"}}
         with patch.object(self.hooks, "_runtime", return_value=runtime):
             self.hooks._process_requests(lambda *a: None, scheduler, [sentinel])
+            controller.decode_overlap = object()
+            controller.graph_fast_path = True
+            for command in ("import", "reset", "release", "abort_import"):
+                with (
+                    self.subTest(command=command),
+                    self.assertRaisesRegex(
+                        RuntimeError, "native progressive admissions only"
+                    ),
+                ):
+                    message = {
+                        self.runtime._HANDOFF_CTL_KEY: True,
+                        "data": {"cmd": command},
+                    }
+                    self.hooks._process_requests(lambda *a: None, scheduler, [message])
+            self.assertTrue(controller.graph_fast_path)
 
     def _segmented_graph_fixture(self):
         sg = self.hooks.segmented_graph
@@ -1470,7 +1922,25 @@ class TestRemoteAttn(CustomTestCase):
                             ):
                                 self.hooks.validate_config()
             schedule.disable_overlap_schedule = False
-            with self.assertRaisesRegex(RuntimeError, "disable-overlap-schedule"):
+            memory.disable_radix_cache = True
+            for mode in ("remote", "layerwise", "off"):
+                for role in ("prefill", "decode"):
+                    with (
+                        self.subTest(mode=mode, role=role),
+                        patch.dict(os.environ, {"HANDOFF_PRE_LAYERWISE": mode}),
+                    ):
+                        disagg.disaggregation_mode = role
+                        if role == "decode" and mode != "off":
+                            self.hooks.validate_config()
+                        else:
+                            with self.assertRaisesRegex(
+                                RuntimeError, "disable-overlap-schedule"
+                            ):
+                                self.hooks.validate_config()
+            execution = context.get_exec()
+            execution.overlap.enable_two_batch_overlap = True
+            context.get_exec = lambda: execution
+            with self.assertRaisesRegex(RuntimeError, "two-batch overlap"):
                 self.hooks.validate_config()
 
     def test_fast_and_cpu_snapshot_wire_layouts(self):
@@ -2272,6 +2742,17 @@ class TestRemoteAttn(CustomTestCase):
         )
         self.assertTrue(rows[0]["leases"]["mismatch_rejected"])
         self.assertTrue(rows[0]["leases"]["cache_mismatch_rejected"])
+        self.assertTrue(rows[0]["leases"]["overlap_mismatch_rejected"])
+        self.assertEqual(rows[0]["d_overlap"], rows[1]["d_overlap"])
+        self.assertEqual(
+            rows[0]["d_overlap"]["snapshots"],
+            [[1, 0, True], [1, 0, True], [0, 1, True]],
+        )
+        self.assertEqual(rows[0]["d_overlap"]["steady"], [False] * 32)
+        self.assertTrue(rows[0]["d_overlap"]["native_restriction"])
+        self.assertTrue(rows[0]["d_overlap"]["reentry"])
+        self.assertEqual(rows[0]["d_overlap"]["gpu_proven"], 1)
+        self.assertEqual(rows[0]["d_overlap"]["retraction"], [True, 1])
         self.assertTrue(rows[0]["leases"]["existing_state_fallback"])
         self.assertGreater(rows[0]["leases"]["boundary_reductions"], 0)
         self.assertEqual(rows[0]["leases"]["freed"], [0, 1, 2])
@@ -4182,6 +4663,14 @@ class TestRemoteAttn(CustomTestCase):
     def test_prelayer_preflight_rejects_incomplete_core_keywords(self):
         """A valid hook target must not hide missing progressive call arguments."""
         cases = (
+            (
+                "sglang.srt.managers.utils.GenerationBatchResult.copy_to_cpu",
+                "return_hidden_states",
+            ),
+            (
+                "sglang.srt.managers.scheduler.Scheduler.is_disable_overlap_for_batch",
+                "last_batch",
+            ),
             ("sglang.srt.mem_cache.radix_cache.RadixCache.checkpoint", "up_to"),
             (
                 "sglang.srt.mem_cache.unified_radix_cache.UnifiedRadixCache.checkpoint",
@@ -4249,6 +4738,12 @@ class TestRemoteAttn(CustomTestCase):
     def test_prelayer_preflight_rejects_missing_task_state_and_environment(self):
         """Mixed core files must fail before a worker accesses absent fields."""
         cases = (
+            ("sglang.srt.managers.utils.GenerationBatchResult", "delay_sample_func"),
+            ("sglang.srt.managers.scheduler.Scheduler.run_batch", "copy_done"),
+            (
+                "sglang.srt.managers.async_d2h_copy_worker.HostCopyDone.__init__",
+                "error",
+            ),
             ("sglang.srt.disaggregation.common.utils.TransferKVChunk", "on_complete"),
             (
                 "sglang.srt.disaggregation.common.utils.TransferKVChunk",

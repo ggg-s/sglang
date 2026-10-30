@@ -6,7 +6,7 @@
 依赖、容量和完整验收见 [部署手册](DEPLOYMENT-ZH.md)。
 
 当前范围是同机 Qwen3 dense NHD MHA BF16/FP16、同 TP、PP=DP=CP=1、page size 1、
-early allocation、mooncake_tcp。P 可开启设备内 dense FULL radix cache；D 仍关闭 radix cache，两端仍关闭 overlap scheduler。
+early allocation、mooncake_tcp。P 可开启设备内 dense FULL radix cache；D 仍关闭 radix cache。P 关闭 scheduler overlap；D 支持 Remote 串行、全部 Local 后恢复原生 overlap。
 CUDA graphs 沿用原生 full decode 配置：D 的 Remote 阶段对 batch 1/2/4 使用分段图，
 其他 batch 为 eager；完成 GPU scatter 并经 TP 一致回收后恢复原生 full graph。
 P 普通 prefill 保留原生 graph，最终 chunk 的分层 prefill 和 P 端 Remote RPC 仍为 eager。
@@ -27,7 +27,7 @@ python -m sglang_remote_attn.check
 python -c 'import sglang_router; print(sglang_router.__file__)'
 ```
 
-安装态预检应输出 `hooks: 24`、`core_interfaces: 61`、`send_probe: true`。
+安装态预检应输出 `hooks: 27`、`core_interfaces: 67`、`send_probe: true`。
 它检查实际加载的接口：保留 receiver 的 metadata commit、选层发送与完成回调、
 staging 分组、host copy、缓存 checkpoint/lock/finish、字段初始化及 typed env 声明；插件注册时也会执行同样的
 核心检查，避免直接启动 P/D 绕过预检。`**kwargs` 不能替代显式参数。
@@ -124,7 +124,7 @@ python -m sglang.launch_server \
   --host 127.0.0.1 --port 31017 \
   --tp-size 2 --page-size 1 \
   --chunked-prefill-size "$ONLINE_CHUNK" \
-  --disable-radix-cache --disable-overlap-schedule \
+  --disable-radix-cache \
   --disaggregation-mode decode \
   --disaggregation-transfer-backend mooncake_tcp \
   --disaggregation-decode-allocation-policy early \
@@ -275,11 +275,57 @@ python /workspace/sglang/test/manual/remote_attn/pre_layerwise_report.py \
 `deferred_cache_checkpoints`。这证明锁已接入、命中存在且正常回收；不代替 GPU
 正确性验证。单独比较 P cache off/on：相同 input_ids、greedy 输出应一致，测
 TTFT、输入计算 token 数、吞吐和 P KV 占用高水位；加并发、淘汰压力和取消请求，
-确认回收后容量恢复。D 保留 `--disable-radix-cache`，两端保留
-`--disable-overlap-schedule`。
+确认回收后容量恢复。D 保留 `--disable-radix-cache`；P 保留
+`--disable-overlap-schedule`，D 按下节开启 scheduler overlap。
 
 P 的共享前缀持有独立读锁；当前最终块的私有尾部在所有 TP rank 的传输及 RPC
 读取排空前不做 checkpoint/去重/释放。正常完成后走原生 checkpoint/release，
 再释放独立读锁；取消请求不把未完成的尾部写进缓存。租约超时或释放状态不明时
 保留页并报错，不能把该轮计入性能结果。延迟发布尾部会增加短时 KV 占用，也可能
 让同时到达的相同尾部重复计算，需在目标负载下量化。
+
+### D scheduler overlap：Remote 串行，Local 恢复原生
+
+上面的 D 命令已去掉 `--disable-overlap-schedule`，P 保留该参数。
+不用增加插件环境变量，不改线上 optimistic、token chunk、传输 Batch 或 SMG。
+`two_batch_overlap` 继续关闭；D radix cache 仍关闭。需要对照时在 D 加回
+`--disable-overlap-schedule` 并重启，使用新的 journal 目录。
+
+D 的 Remote 阶段在原生 `is_disable_overlap_for_batch` 边界先处理上一批结果，
+继续使用 Remote 分段 graph；所有层已 Local 后，还需等待参与过的 native
+`copy_done` 完成并经过 TP 退休投票，再恢复 full graph 和原生 overlap。
+Local 稳态不新增 GPU event、event 查询、CPU all_reduce 或 synchronize。
+这表示保留原生自身的同步与限制，并不表示删除 SGL 原本的同步。
+
+正常退出 Remote 时各 D rank 日志应依次出现：
+
+```text
+[remote-attn-overlap] D enabled: Remote serial, Local native
+[remote-attn-overlap] policy=remote-serial
+[remote-attn-overlap] policy=local-boundary
+[remote-attn-overlap] policy=local-native
+```
+
+初始已 Local 可以直接出现 `local-native`。新 Remote 请求到来时重新进入
+`remote-serial`；有任何活跃 Remote 租约时整个 D 批次保守串行，包含其中的
+Local 请求。每次退休之后才恢复原生 overlap，避免只按某个 rank 的层完成状态
+切换调度。只看到 full graph replay 不能单独证明 scheduler overlap 已恢复。
+
+```bash
+python /workspace/sglang/test/manual/remote_attn/pre_layerwise_report.py \
+  /workspace/remote-attn/run-001/journal --require-remote --require-d-overlap
+```
+
+对所有 early-admitted shard，报告应有 `scheduler_overlap=true`、
+`overlap_forwards == gpu_proven_forwards`；至少有一个 shard 的 forward 数大于 0。
+`max_new_tokens=1` 可能只有 PREBUILT 首 token，不足以验证 decode GPU 完成证明。
+确认上述日志后，用 GPU trace 核对 Local 阶段下一批 forward 与上一批结果处理的
+重叠，再用同一请求集对比 D overlap off/on 的输出 token、TTFT、ITL 和吞吐。
+
+GPU 完成证明复用 SGL 的结果事件，覆盖 forward、采样、future-map 发布及 D2H。
+延迟采样尚未提交时，即使未 record 的 CUDA event 查询返回 true 也不会退休；
+异步拷贝错误、部分 forward 失败或 drain 超时保留资源并报错。取消请求的 KV
+release 延后到 TP 一致退休；retraction 在原生备份和 Req reset 前排空相关租约，
+并保留 native 的 retraction 流程。D overlap 仅保留手工只读状态诊断；手工 import/resume/reset/release 等状态变更不在支持范围内。
+
+本地测试与验证限制见 [D overlap 验证记录](validation/D-SCHEDULER-OVERLAP.md)。

@@ -7,7 +7,7 @@ import pkgutil
 import threading
 import time
 
-from . import pre_layerwise, segmented_graph, source_cache
+from . import decode_overlap, pre_layerwise, segmented_graph, source_cache
 
 logger = logging.getLogger(__name__)
 
@@ -73,11 +73,15 @@ def validate_config():
         or parallel.attn_dp_enabled
     ):
         raise RuntimeError("remote_attn supports plain TP, without PP/DP/CP/DCP")
-    if (
-        not schedule.disable_overlap_schedule
-        or get_exec().overlap.enable_two_batch_overlap
+    if get_exec().overlap.enable_two_batch_overlap:
+        raise RuntimeError("remote_attn does not support two-batch overlap")
+    if not schedule.disable_overlap_schedule and (
+        get_disagg().disaggregation_mode != "decode"
+        or os.environ.get("HANDOFF_PRE_LAYERWISE", "off") not in ("remote", "layerwise")
     ):
-        raise RuntimeError("remote_attn freeze requires --disable-overlap-schedule")
+        raise RuntimeError(
+            "remote_attn requires --disable-overlap-schedule except progressive D"
+        )
     if not memory.disable_radix_cache and (
         get_disagg().disaggregation_mode != "prefill"
         or os.environ.get("HANDOFF_PRE_LAYERWISE", "off") not in ("remote", "layerwise")
@@ -132,6 +136,19 @@ def _process_requests(original, scheduler, recv_reqs):
     result = original(scheduler, requests)
     for control in controls:
         controller = getattr(scheduler, "_pre_layerwise", None)
+        if getattr(controller, "decode_overlap", None) is not None and control.get(
+            "cmd"
+        ) not in {
+            "status",
+            "status_lite",
+            "pd_queues",
+            "debug_queue",
+            "kv_ledger",
+        }:
+            # Legacy reset/release/import can bypass the native GPU/TP leases.
+            raise RuntimeError(
+                "D overlap accepts native progressive admissions only; manual state mutations are unsupported"
+            )
         if controller is not None and control.get("cmd") in {
             "import",
             "import_many",
@@ -369,6 +386,7 @@ HOOKS = {
     "sglang.srt.managers.scheduler_components.request_receiver.SchedulerRequestReceiver._broadcast_reqs_across_ranks": _broadcast,
     "sglang.srt.managers.schedule_batch.Req.init_next_round_input": _init_round,
     "sglang.srt.managers.schedule_batch.Req.reset_for_retract": _reset_retracted,
+    "sglang.srt.managers.schedule_batch.release_req": decode_overlap.before_retract,
     "sglang.srt.mem_cache.allocation._prefix_kv_indices": _prefix_indices,
     "sglang.srt.mem_cache.allocation.alloc_for_extend": _alloc_extend,
     "sglang.srt.mem_cache.common.release_kv_cache": _release_kv,
@@ -387,10 +405,12 @@ HOOKS.update(
         "sglang.srt.disaggregation.common.staging_handler.init_staging_allocator": pre_layerwise.init_staging_allocator,
         "sglang.srt.disaggregation.common.staging_handler.init_staging_buffers": pre_layerwise.init_staging_buffers,
         "sglang.srt.managers.scheduler.Scheduler.run_batch": pre_layerwise.run_batch,
+        "sglang.srt.managers.scheduler.Scheduler.is_disable_overlap_for_batch": decode_overlap.disable_overlap,
         "sglang.srt.managers.scheduler.Scheduler.is_fully_idle": pre_layerwise.is_fully_idle,
         "sglang.srt.model_executor.model_runner.ModelRunner.forward": pre_layerwise.forward,
         "sglang.srt.disaggregation.prefill.SchedulerDisaggregationPrefillMixin.send_kv_chunk": pre_layerwise.send_chunk,
         "sglang.srt.disaggregation.decode.DecodeTransferQueue.pop_transferred": pre_layerwise.pop_transferred,
+        "sglang.srt.disaggregation.decode.DecodeTransferQueue.resolve_deferred_releases": decode_overlap.reap,
     }
 )
 

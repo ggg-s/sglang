@@ -5912,7 +5912,16 @@ def _bind_and_select_states(req_pool_indices) -> list:
     selected = []
     for st in list(_TARGET_STATES):
         req = getattr(st, "req", None)
-        if req is not None and req.finished():
+        target = getattr(req, "_pre_layerwise_target", None)
+        leased = (
+            target is not None
+            and getattr(target.owner, "decode_overlap", None) is not None
+            and not target.closed
+        )
+        # Overlap may have already prepared an overshoot decode before the
+        # previous result marks this Req finished. It still needs Remote KV.
+        # Only the TP retirement path may prune its state or close its client.
+        if req is not None and req.finished() and not leased:
             _snapshot_state(st)
             try:
                 _TARGET_STATES.remove(st)
@@ -5926,6 +5935,8 @@ def _bind_and_select_states(req_pool_indices) -> list:
         if req is not None:
             cur = req.kv.req_pool_idx
             was = bool(getattr(st, "_admitted", False))
+            if leased and (cur is None or (was and int(cur) != st.req_pool_idx)):
+                raise RuntimeError("leased D request row changed before TP retirement")
             if cur is None:
                 if was:
                     # Previously admitted, now freed/retracted: the imported

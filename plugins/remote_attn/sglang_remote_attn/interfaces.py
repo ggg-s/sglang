@@ -103,9 +103,22 @@ CORE_CALLS = {
         "lock": inspect.Parameter.empty
     },
     "sglang.srt.mem_cache.unified_radix_cache.UnifiedRadixCache.reset": {},
+    "sglang.srt.managers.scheduler.Scheduler.is_disable_overlap_for_batch": {
+        "batch": inspect.Parameter.empty,
+        "last_batch": inspect.Parameter.empty,
+    },
+    "sglang.srt.managers.utils.GenerationBatchResult.copy_to_cpu": {
+        "return_logprob": inspect.Parameter.empty,
+        "return_hidden_states": True,
+    },
+    "sglang.srt.managers.async_d2h_copy_worker.HostCopyDone.query": {},
 }
 CORE_PROPERTIES = (DISAGG + "mooncake.pinned_staging_core.CorePinnedStager.poisoned",)
 CORE_FIELDS = {
+    "sglang.srt.managers.utils.GenerationBatchResult": (
+        "copy_done",
+        "delay_sample_func",
+    ),
     "sglang.srt.mem_cache.base_prefix_cache.CacheRequestHandle": ("rid", "attempt_id"),
     "sglang.srt.mem_cache.base_prefix_cache.TreeLock": ("node", "receipt"),
     DISAGG + "common.utils.TransferKVChunk": (
@@ -119,6 +132,14 @@ CORE_FIELDS = {
 # Instance fields cannot be inspected by constructing the real GPU owners.
 # Inspect their initialization declarations in the actual loaded Python sources.
 CORE_STATE = {
+    "sglang.srt.managers.async_d2h_copy_worker.HostCopyDone.__init__": (
+        "self",
+        ("error",),
+    ),
+    "sglang.srt.managers.scheduler.Scheduler.run_batch": (
+        "batch_result",
+        ("copy_done",),
+    ),
     "sglang.srt.managers.schedule_batch.Req.__init__": (
         "self",
         ("cache_request_handle", "last_node", "lock"),

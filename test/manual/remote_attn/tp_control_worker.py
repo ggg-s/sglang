@@ -146,6 +146,13 @@ def progressive_graph_leases(args, context):
         except RuntimeError:
             cache_mismatch_rejected = True
         del scheduler.tree_cache
+        scheduler.enable_overlap = bool(args.rank)
+        try:
+            controller.validate_graphs()
+            overlap_mismatch_rejected = False
+        except RuntimeError:
+            overlap_mismatch_rejected = True
+        scheduler.enable_overlap = True
         controller.validate_graphs()
 
         def sample():
@@ -201,9 +208,142 @@ def progressive_graph_leases(args, context):
         "snapshots": snapshots,
         "mismatch_rejected": mismatch_rejected,
         "cache_mismatch_rejected": cache_mismatch_rejected,
+        "overlap_mismatch_rejected": overlap_mismatch_rejected,
         "existing_state_fallback": existing_state_fallback,
         "boundary_reductions": reductions,
         "freed": freed,
+    }
+
+
+def decode_overlap_lifetimes(args):
+    """GPU-ready and cancellation skew must not retire only one TP shard."""
+    import torch
+    from sglang_remote_attn.decode_overlap import (
+        DecodeOverlap,
+        before_retract,
+        disable_overlap,
+    )
+    from sglang_remote_attn.pre_layerwise import (
+        Config,
+        Controller,
+        LayerCoverage,
+        Target,
+        defer_release,
+        run_batch,
+    )
+
+    controller = Controller.__new__(Controller)
+    controller.config = Config("remote", Path(args.output).with_suffix(".overlap"))
+    controller.tp_size, controller.rank, controller.graph_fast_path = 2, args.rank, True
+    scheduler = SimpleNamespace(
+        attn_tp_cpu_group=dist.group.WORLD,
+        enable_overlap=True,
+        _pre_layerwise=controller,
+    )
+    controller.scheduler = scheduler
+    controller.decode_overlap = DecodeOverlap(controller)
+    freed = []
+    req = SimpleNamespace()
+    receiver = SimpleNamespace(poll=lambda: 4, clear=lambda: None)
+    target = Target(
+        controller,
+        SimpleNamespace(
+            metadata_buffers=SimpleNamespace(bootstrap_room=torch.ones((1, 1))),
+            req_to_metadata_buffer_idx_allocator=SimpleNamespace(free=lambda i: None),
+        ),
+        SimpleNamespace(req=req, kv_receiver=receiver, metadata_buffer_index=0),
+        controller.config.directory,
+        "overlap",
+        LayerCoverage(2, 1),
+    )
+    req._pre_layerwise_target = target
+    controller.targets = [target]
+    batch = SimpleNamespace(
+        reqs=[req], forward_mode=SimpleNamespace(is_prebuilt=lambda: False)
+    )
+    # Simulate CUDA's never-recorded-event query semantics at the device boundary.
+    result = SimpleNamespace(
+        copy_done=SimpleNamespace(query=lambda: True),
+        delay_sample_func=object() if args.rank == 1 else None,
+    )
+    run_batch(lambda *a: result, scheduler, batch)
+    snapshots = []
+    with patch.dict(
+        sys.modules,
+        {
+            "sglang.srt.disaggregation.base.conn": SimpleNamespace(
+                KVPoll=SimpleNamespace(Success=4, Failed=0)
+            )
+        },
+    ):
+        for step in range(3):
+            if step == 1:
+                result.delay_sample_func = None
+            if (step == 1 and args.rank == 0) or (step == 2 and args.rank == 1):
+                defer_release(req, lambda: freed.append("KV"))
+            controller.retire_targets()
+            serial = disable_overlap(lambda *a: False, scheduler, batch, batch)
+            snapshots.append([len(controller.targets), len(freed), serial])
+        # Local decode must never poll a GPU proof or join a plugin collective.
+        with patch.object(
+            dist, "all_reduce", side_effect=AssertionError("Local overlap vote")
+        ):
+            steady = []
+            for _ in range(32):
+                controller.retire_targets()
+                steady.append(
+                    disable_overlap(lambda *a: False, scheduler, batch, batch)
+                )
+                run_batch(lambda *a: result, scheduler, batch)
+            native_restriction = disable_overlap(
+                lambda *a: True, scheduler, batch, batch
+            )
+        # A TP-native retraction boundary must drain the slower GPU before
+        # its original backup/reset is called on either rank.
+        req2 = SimpleNamespace()
+        target2 = Target(
+            controller,
+            target.queue,
+            SimpleNamespace(
+                req=req2,
+                kv_receiver=SimpleNamespace(poll=lambda: 4, clear=lambda: None),
+                metadata_buffer_index=0,
+            ),
+            controller.config.directory / "retract",
+            "retract",
+            LayerCoverage(2, 1),
+        )
+        req2._pre_layerwise_target = target2
+        controller.targets = [target2]
+        polls = 0
+
+        def gpu_ready():
+            nonlocal polls
+            polls += 1
+            return polls >= (3 if args.rank == 1 else 1)
+
+        result2 = SimpleNamespace(
+            copy_done=SimpleNamespace(query=gpu_ready), delay_sample_func=None
+        )
+        batch2 = SimpleNamespace(
+            reqs=[req2], forward_mode=SimpleNamespace(is_prebuilt=lambda: False)
+        )
+        run_batch(lambda *a: result2, scheduler, batch2)
+        # A new admission revokes Local without a per-step control vote.
+        reentry = disable_overlap(lambda *a: False, scheduler, batch2, batch)
+
+        def native_backup(*, req):
+            assert target2.closed and not controller.targets
+            return [target2.closed, target2.gpu_proven_forwards]
+
+        retraction = before_retract(native_backup, req=req2)
+    return {
+        "snapshots": snapshots,
+        "steady": steady,
+        "native_restriction": native_restriction,
+        "reentry": reentry,
+        "gpu_proven": target.gpu_proven_forwards,
+        "retraction": retraction,
     }
 
 
@@ -415,6 +555,7 @@ def main():
                     )
                     row.append(hooks._decode_graph(lambda *a: True, runner, batch))
                 routing.append(row)
+        overlap_lifetimes = decode_overlap_lifetimes(args)
         Path(args.output).write_text(
             json.dumps(
                 {
@@ -425,6 +566,7 @@ def main():
                     "p_radix_pins": pin_counts,
                     "graphs": graphs,
                     "leases": leases,
+                    "d_overlap": overlap_lifetimes,
                     "segmented_startup": startup,
                     "segmented_routing": routing,
                 }

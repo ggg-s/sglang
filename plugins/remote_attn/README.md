@@ -18,7 +18,7 @@ still need acceptance on the target deployment.
 
 - `sglang_remote_attn/handoff_control.py`: adapted runtime, including Copy, Layer,
   Remote, Fast Freeze/Resume, RemoteHub, progressive LOCAL, epochs, fences and leases.
-- `sglang_remote_attn/hooks.py`: 24 function-boundary hooks. No scheduler event
+- `sglang_remote_attn/hooks.py`: 27 function-boundary hooks. No scheduler event
   loop, graph runner, allocation function or Mooncake connector is copied/replaced.
 - `control_plane/p2d_driver.py`: original supplied driver. `p4_gateway.py` now
   carries a targeted C1 reservation/epoch fix; its protocol and fixed state paths
@@ -96,7 +96,10 @@ by default; the P5.19 adapter is enabled only through the plugin and its explici
 
 The initial port targets the supplied single-host Qwen3-8B setup: CUDA,
 plain TP (including TP2, with the same TP width across roles), dense NHD MHA KV in BF16/FP16, page size 1,
-D radix cache disabled, and scheduler overlap disabled on both roles.
+D radix cache disabled, and P scheduler overlap disabled.
+D may use native scheduler overlap: Remote batches serialize at the native
+per-batch gate, then Local resumes native overlap after TP-agreed retirement
+with native result completion proofs. Two-batch overlap remains unsupported.
 Progressive P supports device-only dense FULL radix caching through plugin read
 leases: cached prefixes stay pinned and final-tail checkpoint/dedup/release waits
 for native transfer and Remote readers to drain across TP. Ordinary requests keep
@@ -124,7 +127,7 @@ HiCache, hybrid/MLA/quantized KV pools and live PD role switching. These layouts
 need their own transfer/state-lifetime adapters. Rejecting them avoids silently
 running the dense KV protocol against an incompatible pool.
 
-Disabling scheduler overlap does **not** disable this feature's transfer/compute
+Disabling P scheduler overlap does **not** disable this feature's transfer/compute
 overlap: Fast Freeze stages KV on copy streams while Remote attention serves
 layers still on the source, then each completed layer switches to LOCAL.
 
@@ -334,3 +337,10 @@ D2H through synchronous TE completion even when the outer send lock is disabled.
 The all-send flag takes precedence over the layer-only flag. With all-send enabled,
 verified tensor publication reserves/warms the slot at startup; otherwise the
 plugin prepares it before the first selected layerwise forward.
+
+
+D overlap reuses native `copy_done`, including delayed sampling and async-copy
+failure handling. Pending GPU forwards and queued KV releases retire together
+across TP. Prepared overshoots retain Remote state even after their Req finishes;
+retraction drains before native KV backup/reset. Stable Local adds no plugin GPU
+event, completion query, collective or fence. See [local verification and limits](validation/D-SCHEDULER-OVERLAP.md).

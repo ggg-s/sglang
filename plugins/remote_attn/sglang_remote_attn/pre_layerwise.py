@@ -364,6 +364,23 @@ class Target:
     state: object = None
     closed: bool = False
     native_staging: bool = False
+    forward_proofs: list = field(default_factory=list)
+    forward_count: int = 0
+    gpu_proven_forwards: int = 0
+    release: object = None
+    release_failed: bool = False
+
+    def gpu_ready(self):
+        if self.release_failed:
+            raise RuntimeError("D target release failed; refusing retirement retry")
+        pending = []
+        for proof in self.forward_proofs:
+            if proof.ready():
+                self.gpu_proven_forwards += 1
+            else:
+                pending.append(proof)
+        self.forward_proofs = pending
+        return not pending
 
     def refresh(self):
         if self.native_staging:
@@ -416,6 +433,8 @@ class Target:
                 self.state.import_done_at = time.monotonic()
 
     def finish(self, *, wait):
+        if self.release_failed:
+            raise RuntimeError("D target release failed; refusing retirement retry")
         if self.closed:
             return
         receiver = self.decode_req.kv_receiver
@@ -436,8 +455,8 @@ class Target:
             self.queue.staging_handler.unregister_decode_req(
                 self.decode_req.req.bootstrap_room
             )
-        # Called only between forwards or from release_kv_cache. No next step
-        # can snapshot a Remote mask after the state is removed.
+        # In overlap mode native copy_done proves all participating forwards,
+        # including sampling/publication, have drained. Retirement is TP-voted.
         _runtime()._drop_target_state_for(self.decode_req.req)
         receiver.clear()
         self.decode_req.kv_receiver = None
@@ -450,6 +469,11 @@ class Target:
                 "generation": self.generation,
                 "at": time.monotonic(),
                 "early_admission": self.state is not None,
+                "gpu_proven_forwards": self.gpu_proven_forwards,
+                "overlap_forwards": self.forward_count,
+                "scheduler_overlap": getattr(self.owner, "decode_overlap", None)
+                is not None,
+                "deferred_kv_release": self.release is not None,
                 "remote_calls": self.state.remote_calls
                 if self.state is not None
                 else 0,
@@ -464,12 +488,31 @@ class Target:
         self.closed = True
         self.decode_req.req._pre_layerwise_target = None
         self.decode_req.req._pre_layerwise_native_target = None
+        release, self.release = self.release, None
+        if release is not None:
+            try:
+                release()
+            except BaseException:
+                self.release_failed = True
+                write_json(
+                    self.path / "error.json",
+                    {
+                        "generation": self.generation,
+                        "error": "deferred native KV release failed; retaining target",
+                    },
+                )
+                raise
 
     def ready_to_finish(self):
         self.refresh()
-        return _poll_success(self.decode_req.kv_receiver) and (
-            not self.native_staging
-            or self.queue.staging_handler.is_done(self.decode_req)
+        gpu_ready = self.gpu_ready()
+        return (
+            gpu_ready
+            and _poll_success(self.decode_req.kv_receiver)
+            and (
+                not self.native_staging
+                or self.queue.staging_handler.is_done(self.decode_req)
+            )
         )
 
 
@@ -487,6 +530,7 @@ class Controller:
         self.early_admissions = 0
         self.stager = None
         self.cache_guard = None
+        self.decode_overlap = None
         # Enabled only after graph configuration/capture manifests agree at
         # startup. Membership of targets is then changed only by TP votes.
         self.graph_fast_path = False
@@ -518,6 +562,7 @@ class Controller:
             manifest(runner.decode_cuda_graph_runner),
             manifest(runner.prefill_cuda_graph_runner),
             cache_signature(getattr(self.scheduler, "tree_cache", None)),
+            bool(getattr(self.scheduler, "enable_overlap", False)),
         )
         clean = not _runtime().has_target_states()
         if self.tp_size > 1:
@@ -834,19 +879,47 @@ class Controller:
         finally:
             fb.forward_mode = old_mode
 
-    def early_targets(self, queue, rids_to_check):
-        # Retired receivers are not in queue.queue but still own metadata and
-        # prefix writes. Reap them before considering new admissions.
+    def retire_targets(self):
+        if not self.targets:
+            return
         targets = list(self.targets)
         finished = [
             int(target.closed or target.ready_to_finish()) for target in targets
         ]
-        for target, done in zip(targets, self.agree(finished)):
-            if done:
+        # Cancellation/result processing may reach ranks at different times.
+        # Retire only if all ranks have queued release, or none has: no rank
+        # may free a row while its peer retains the corresponding request.
+        n = len(targets)
+        release = [int(target.release is not None) for target in targets]
+        votes = self.agree(finished + release + [1 - value for value in release])
+        for i, target in enumerate(targets):
+            if votes[i] and (votes[n + i] or votes[2 * n + i]):
                 target.finish(wait=False)
                 self.targets.remove(target)
             else:
                 target.refresh()
+
+    def drain_targets(self, required=None):
+        def pending():
+            if required is None:
+                return bool(self.targets)
+            return any(target is required for target in self.targets)
+
+        deadline = time.monotonic() + self.config.drain_timeout
+        while pending():
+            self.retire_targets()
+            if pending():
+                if time.monotonic() >= deadline:
+                    raise RuntimeError(
+                        "D GPU/PD lifetime did not drain; retaining target KV"
+                    )
+                time.sleep(0.005)
+
+    def early_targets(self, queue, rids_to_check):
+        # Retired receivers are not in queue.queue but still own metadata and
+        # prefix writes. Reap them before considering new admissions.
+        if getattr(self, "decode_overlap", None) is None:
+            self.retire_targets()
         offered = [self.offer(queue, dr) for dr in queue.queue]
         candidates = []
         for target in offered:
@@ -972,6 +1045,9 @@ def initialize(scheduler):
     from .source_cache import install
 
     controller.cache_guard = install(scheduler.tree_cache)
+    from .decode_overlap import install as install_overlap
+
+    controller.decode_overlap = install_overlap(controller)
     scheduler._pre_layerwise = controller
     scheduler.tp_worker.model_runner._pre_layerwise = controller
 
@@ -980,6 +1056,9 @@ def run_batch(original, scheduler, batch, *args, **kwargs):
     controller = getattr(scheduler, "_pre_layerwise", None)
     if controller is None:
         return original(scheduler, batch, *args, **kwargs)
+    overlap = getattr(controller, "decode_overlap", None)
+    if overlap is not None:
+        return overlap.run_batch(original, scheduler, batch, *args, **kwargs)
     if getattr(controller, "cache_guard", None) is not None:
         # Native cached-prefix sends must precede final-tail reservation. The
         # repeated call inside Scheduler.run_batch is then a native no-op.
@@ -1050,6 +1129,13 @@ def defer_release(req, release, *, checkpoint=None):
         return True
     target = getattr(req, "_pre_layerwise_target", None)
     if target is not None:
+        if getattr(target.owner, "decode_overlap", None) is not None:
+            # A rank-local release/abort cannot retire a TP-shared graph lease.
+            # Retire through the queue reaper only after native IO + GPU proofs
+            # agree, then invoke the native free exactly once.
+            if target.release is None:
+                target.release = release
+            return True
         target.finish(wait=True)
     else:
         native_target = getattr(req, "_pre_layerwise_native_target", None)
@@ -1092,8 +1178,11 @@ def shutdown(scheduler):
     controller = getattr(scheduler, "_pre_layerwise", None)
     if controller is None:
         return
-    for target in controller.targets:
-        target.finish(wait=True)
+    if getattr(controller, "decode_overlap", None) is not None:
+        controller.drain_targets()
+    else:
+        for target in controller.targets:
+            target.finish(wait=True)
     for source in controller.sources:
         if source.thread is not None:
             source.thread.join(timeout=controller.config.drain_timeout)
