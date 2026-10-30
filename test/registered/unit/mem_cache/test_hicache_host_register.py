@@ -1,4 +1,5 @@
 import ctypes
+import enum
 import gc
 import os
 import unittest
@@ -29,6 +30,7 @@ from sglang.srt.mem_cache.pool_host.mha import (
     MHATokenToKOnlyPoolHost,
 )
 from sglang.test.ci.ci_register import register_cpu_ci
+from sglang.test.test_utils import CustomTestCase
 
 register_cpu_ci(est_time=10, suite="base-a-test-cpu")
 
@@ -48,7 +50,15 @@ class _FakeBuffer:
         return 1
 
 
+class _FakeCudaError(enum.IntEnum):
+    SUCCESS = 0
+    INVALID_VALUE = 1
+    MEMORY_ALLOCATION = 2
+
+
 class _FakeCudart:
+    cudaError = _FakeCudaError
+
     def __init__(self, fail_on_registration: int | None = None):
         self.registrations = []
         self.unregistrations = []
@@ -64,11 +74,13 @@ class _FakeCudart:
         self.unregistrations.append(ptr)
         return 0
 
-    def cudaGetErrorString(self, rc: int) -> str:
+    def cudaGetErrorString(self, rc: _FakeCudaError) -> str:
+        if not isinstance(rc, self.cudaError):
+            raise TypeError("cudaGetErrorString requires cudaError, not int")
         return "injected error"
 
 
-class TestHiCacheHostRegister(unittest.TestCase):
+class TestHiCacheHostRegister(CustomTestCase):
     def _hip_non_userptr(self):
         return (
             mock.patch.object(host_common, "_is_hip", True),
@@ -432,7 +444,9 @@ class TestHiCacheHostRegister(unittest.TestCase):
                 return_value=1,
             ),
             mock.patch.object(torch.cuda, "cudart", return_value=cudart),
-            self.assertRaisesRegex(RuntimeError, "offset=1073741824"),
+            self.assertRaisesRegex(
+                RuntimeError, r"rc=1, injected error.*offset=1073741824"
+            ),
         ):
             _cuda_host_register(buffer, registration_granularity_bytes=gib)
 
@@ -441,6 +455,50 @@ class TestHiCacheHostRegister(unittest.TestCase):
             [(base, gib, 0), (base + gib, gib, 0)],
         )
         self.assertEqual(cudart.unregistrations, [base])
+
+    def test_error_lookup_failure_preserves_registration_error_and_rollback_ranges(
+        self,
+    ):
+        """A broken diagnostic binding must not mask registration or lose rollback leases."""
+        gib = 1024**3
+        base = 0x10000000
+        buffer = _FakeBuffer(base, 2 * gib)
+        cudart = _FakeCudart(fail_on_registration=2)
+
+        def unregister(ptr):
+            cudart.unregistrations.append(ptr)
+            return 2
+
+        with (
+            mock.patch.object(
+                envs.SGLANG_HICACHE_HOST_REGISTER_CHUNK_GB, "get", return_value=1
+            ),
+            mock.patch.object(torch.cuda, "cudart", return_value=cudart),
+            mock.patch.object(cudart, "cudaHostUnregister", side_effect=unregister),
+            mock.patch.object(
+                cudart, "cudaGetErrorString", side_effect=TypeError("broken binding")
+            ),
+            self.assertLogs(host_common.logger, level="WARNING") as warnings,
+            self.assertRaisesRegex(
+                RuntimeError, r"cudaHostRegister failed .*rc=1,.*offset=1073741824"
+            ),
+        ):
+            _cuda_host_register(buffer, registration_granularity_bytes=gib)
+
+        self.assertEqual(cudart.unregistrations, [base])
+        self.assertIn("rc=2", warnings.output[0])
+        self.assertIn("registration rollback", warnings.output[0])
+        self.assertEqual(
+            getattr(buffer, host_common._CUDA_HOST_REGISTERED_RANGES_ATTR),
+            [(base, gib)],
+        )
+        # A later successful unregister must still find the retained base.
+        with mock.patch.object(torch.cuda, "cudart", return_value=cudart):
+            _cuda_host_unregister(buffer)
+        self.assertEqual(cudart.unregistrations, [base, base])
+        self.assertEqual(
+            getattr(buffer, host_common._CUDA_HOST_REGISTERED_RANGES_ATTR), []
+        )
 
     def test_missing_copy_granularity_preserves_single_registration(self):
         gib = 1024**3

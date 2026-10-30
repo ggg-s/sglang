@@ -48,6 +48,8 @@ P/D 使用各自已有的 serving 环境。将线上实际值设置为以下 she
 终端分别执行公共环境块。这里不提供 chunk 或 optimistic 的新默认值：
 
 ```bash
+# 受影响的 Linux x86_64 镜像：优先加载系统 libstdc++，保留其他已有 preload。
+export LD_PRELOAD="/usr/lib/x86_64-linux-gnu/libstdc++.so.6${LD_PRELOAD:+:$LD_PRELOAD}"
 export MODEL_PATH=/workspace/models/Qwen3-8B
 
 : "${ONLINE_CHUNK:?请先设置线上 chunked-prefill-size 原值}"
@@ -62,6 +64,13 @@ export HANDOFF_PD_DIR=/workspace/remote-attn/run-001/journal
 export MC_FORCE_TCP=1
 export SGLANG_DISAGG_STAGING_BUFFER=1
 ```
+
+现场 Linux x86_64 镜像的 A/B 已确认：直接启动时必须优先加载上述系统
+`libstdc++.so.6`。当 venv/conda 的旧 libstdc++ 与当前 torch/CUDA 绑定构建的 ABI
+不匹配时，可能导致 `cudaHostRegister` 失败或错误绑定异常；仓库 `deploy/common.sh`
+已有 preload，裸 `launch_server` 不会自动继承。这里将系统库置于已有 preload
+之前；其他镜像按实际兼容库路径配置，`LD_LIBRARY_PATH` 保留已验证的 CUDA 配置。
+这属于进程动态库环境适配，不改变 optimistic prefill、chunk、SEND_LOCK 或 FAST 参数。
 
 每次 pair 重启都换新的 `run-001` 路径，P/D 的 HANDOFF_PD_DIR 指向同一份实际
 目录。该目录交换 offer、ready、done，KV 仍走 Mooncake。角色各自的 CTL_DIR

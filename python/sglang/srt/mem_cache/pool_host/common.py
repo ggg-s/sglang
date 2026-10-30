@@ -140,6 +140,15 @@ def get_allocator_type() -> str:
     return backend or "default"
 
 
+def _cuda_error_description(cudart, rc: int) -> str:
+    # PyTorch's cudart binding requires its cudaError enum, not an int.
+    # Diagnostics must never mask the original rc or interrupt rollback.
+    try:
+        return cudart.cudaGetErrorString(cudart.cudaError(rc))
+    except Exception:
+        return "CUDA error description unavailable"
+
+
 def _cuda_host_register(
     buffer: torch.Tensor, registration_granularity_bytes: int | None = None
 ) -> None:
@@ -179,7 +188,7 @@ def _cuda_host_register(
             if rc != 0:
                 raise RuntimeError(
                     f"cudaHostRegister failed (rc={rc}, "
-                    f"{cudart.cudaGetErrorString(rc)}) at offset={offset} size={size} "
+                    f"{_cuda_error_description(cudart, rc)}) at offset={offset} size={size} "
                     f"(total={total}, chunk_limit={chunk_bytes}); host buffer is not "
                     f"pinned and device transfers may silently return stale data."
                 )
@@ -211,7 +220,7 @@ def _cuda_host_unregister_ranges(
                 "cudaHostUnregister failed during %s (rc=%d, %s) for ptr=%#x size=%d",
                 operation,
                 rc,
-                cudart.cudaGetErrorString(rc),
+                _cuda_error_description(cudart, rc),
                 ptr,
                 size,
             )

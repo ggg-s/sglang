@@ -62,6 +62,7 @@ PYTHONPATH=plugins/remote_attn python -m sglang_remote_attn.check \
   --source-only --sglang-root .
 
 # P、D 各自执行，保持已有其他插件项。
+export LD_PRELOAD="/usr/lib/x86_64-linux-gnu/libstdc++.so.6${LD_PRELOAD:+:$LD_PRELOAD}"
 case ",${SGLANG_PLUGINS:-}," in
   *,remote_attn,*) ;;
   *) export SGLANG_PLUGINS="${SGLANG_PLUGINS:+${SGLANG_PLUGINS},}remote_attn" ;;
@@ -71,6 +72,13 @@ export HANDOFF_PRE_LAYERWISE=layerwise
 export HANDOFF_PRE_LAYERWISE_HOST_STAGING=0
 export HANDOFF_PRE_LAYERWISE_RECV_HOST_STAGING=0
 ```
+
+现场 Linux x86_64 镜像的 A/B 已确认：直接启动时必须优先加载上述系统
+`libstdc++.so.6`。当 venv/conda 的旧 libstdc++ 与当前 torch/CUDA 绑定构建的 ABI
+不匹配时，可能导致 `cudaHostRegister` 失败或错误绑定异常；仓库 `deploy/common.sh`
+已有 preload，裸 `launch_server` 不会自动继承。这里将系统库置于已有 preload
+之前；其他镜像按实际兼容库路径配置，`LD_LIBRARY_PATH` 保留已验证的 CUDA 配置。
+这属于进程动态库环境适配，不改变 optimistic prefill、chunk、SEND_LOCK 或 FAST 参数。
 
 P 终端（`P_NATIVE_ARGS` 沿用原生线上参数，不能带 speculative 参数）：
 

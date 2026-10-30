@@ -149,6 +149,8 @@ wheel 安装后改 checkout 文件不会更新运行代码，必须重新构建�
 ### P/D 共同配置
 
 ```bash
+# 受影响的 Linux x86_64 镜像：优先加载系统 libstdc++，保留其他已有 preload。
+export LD_PRELOAD="/usr/lib/x86_64-linux-gnu/libstdc++.so.6${LD_PRELOAD:+:$LD_PRELOAD}"
 # 路径在两个进程中必须指向同一份本机目录；每次 pair 重启使用新实例目录。
 export HANDOFF_INSTANCE=/workspace/remote-attn/run-20261029-01
 export HANDOFF_CTL_ROOT="$HANDOFF_INSTANCE/control"
@@ -177,6 +179,13 @@ export HANDOFF_RPC_PROFILE=0
 mkdir -p "$HANDOFF_CTL_ROOT/p" "$HANDOFF_CTL_ROOT/src" \
   "$HANDOFF_PD_DIR" "$HANDOFF_RUN_DIR" /workspace/handoff_state
 ```
+
+现场 Linux x86_64 镜像的 A/B 已确认：直接启动时必须优先加载上述系统
+`libstdc++.so.6`。当 venv/conda 的旧 libstdc++ 与当前 torch/CUDA 绑定构建的 ABI
+不匹配时，可能导致 `cudaHostRegister` 失败或错误绑定异常；仓库 `deploy/common.sh`
+已有 preload，裸 `launch_server` 不会自动继承。这里将系统库置于已有 preload
+之前；其他镜像按实际兼容库路径配置，`LD_LIBRARY_PATH` 保留已验证的 CUDA 配置。
+这属于进程动态库环境适配，不改变 optimistic prefill、chunk、SEND_LOCK 或 FAST 参数。
 
 `/workspace/handoff_state` 是 Remote runtime 仍使用的固定诊断目录；即使 profile 关闭，目标状态创建时也会建立该目录，服务账号必须有访问/创建权限。它不随 `HANDOFF_PD_DIR` 改变，容器需提供可写挂载。多实例诊断须区分文件归属，不能当作实例 journal 一起清空。
 
