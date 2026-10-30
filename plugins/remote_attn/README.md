@@ -1,5 +1,8 @@
 # Remote attention / progressive KV handoff plugin
 
+DSV4.1 Flash 纯文本 layerwise：[原生 PD 接入与本地验证](DSV41-LAYERWISE-ZH.md)。
+复用原生 global KV / state 传输，关闭 DSpark；不支持 DSV4.1 Remote attention。
+
 单 pair 最小接入：[原生 SMG + P/D 启动说明](SINGLE-PAIR-ZH.md)。直接使用现有
 P/D/SMG 命令及插件环境，保留线上 optimistic prefill、token chunk 和传输 Batch；
 不需要 JSON 配置或启动包装器。CUDA graphs 的 TP 一致性适配也在插件内，继续依赖下述核心扩展。
@@ -18,7 +21,7 @@ still need acceptance on the target deployment.
 
 - `sglang_remote_attn/handoff_control.py`: adapted runtime, including Copy, Layer,
   Remote, Fast Freeze/Resume, RemoteHub, progressive LOCAL, epochs, fences and leases.
-- `sglang_remote_attn/hooks.py`: 29 function-boundary hooks. No scheduler event
+- `sglang_remote_attn/hooks.py`: 30 function-boundary hooks. No scheduler event
   loop, graph runner, allocation function or Mooncake connector is copied/replaced.
 - `control_plane/p2d_driver.py`: original supplied driver. `p4_gateway.py` now
   carries a targeted C1 reservation/epoch fix; its protocol and fixed state paths

@@ -8,6 +8,7 @@ import ast
 import copy
 import ctypes
 import dataclasses
+import enum
 import functools
 import gc
 import importlib
@@ -37,7 +38,7 @@ import torch
 from sglang.test.ci.ci_register import register_cpu_ci
 from sglang.test.test_utils import CustomTestCase
 
-register_cpu_ci(est_time=12, suite="base-a-test-cpu")
+register_cpu_ci(est_time=16, suite="base-a-test-cpu")
 
 ROOT = Path(__file__).resolve().parents[4]
 PLUGIN = ROOT / "plugins" / "remote_attn"
@@ -5226,6 +5227,714 @@ class TestRemoteAttn(CustomTestCase):
                 self.assertGreater(config.select_group_size(36, 4096, 2048), 0)
                 fixed = pl.Config(mode, Path("unused"), 4)
                 self.assertEqual(fixed.select_group_size(36, 2048, 2048), 4)
+
+    def _dsv41_fixture(self, length=33):
+        """Real native page/state planners with CPU tensors at the GPU boundary."""
+        import numpy as np
+
+        ds = self.hooks.dsv41_layerwise
+        native_types = _source_class("disaggregation/base/conn.py", "StateType")
+        state_type = enum.Enum(
+            "StateType",
+            {k: v for k, v in vars(native_types).items() if not k.startswith("_")},
+        )
+        pool_cls = _source_class(
+            "mem_cache/deepseek_v4_memory_pool.py",
+            "DeepSeekV4TokenToKVPool",
+            {
+                "get_contiguous_buf_infos",
+                "get_state_buf_infos",
+                "get_request_state_buf_infos",
+                "request_state_transfer_indices",
+            },
+        )
+        index_cls = _source_class(
+            "mem_cache/deepseek_v4_memory_pool.py",
+            "DeepSeekV4IndexerPool",
+            {"contiguous_page_row_buffers"},
+        )
+        carry_cls = _source_class(
+            "mem_cache/deepseek_v4_compress_state.py",
+            "CompressStatePool",
+            {"transfer_indices"},
+        )
+        carry_cls.transfer_indices.__globals__["np"] = np
+        pool = pool_cls()
+        pool._unified_kv = pool._unified_kv_fp8 = pool.uniform_fp8 = False
+        pool.page_size = pool.swa_page_size = 8
+        pool._stage_start, pool._stage_end = 0, 40
+        pool.compression_ratios = [0] * 2 + [2] * 18 + [1] * 20
+        pool.sources_by_ratio = {2: [2, 8, 14], 1: [20]}
+        pool.kv_pools, pool.index_pools = {}, {}
+        for ratio, sources in pool.sources_by_ratio.items():
+            pool.kv_pools[ratio] = SimpleNamespace(
+                kv_buffer=[
+                    torch.arange(128, dtype=torch.uint8).reshape(8, 16) + i
+                    for i in sources
+                ],
+                kv_layout=SimpleNamespace(value="v41_fp4"),
+            )
+            index = index_cls()
+            index.page_size, index.index_k_page8 = 2, False
+            index.index_k_with_scale_buffer = None
+            index_rows = 8 * pool.page_size // ratio // index.page_size
+            index.index_k_payload_buffer = [
+                torch.full((index_rows, 4), i + 31, dtype=torch.uint8) for i in sources
+            ]
+            index.index_k_scale_buffer = [
+                torch.full((index_rows, 1), i + 71, dtype=torch.uint8) for i in sources
+            ]
+            pool.index_pools[ratio] = index
+        pool.request_window = None
+        pool.swa_kv_pool = SimpleNamespace(
+            page_size=8, kv_buffer=[torch.full((8, 8), 23, dtype=torch.uint8)]
+        )
+        pool.compress_state_pools = []
+        pool.indexer_compress_state_pools = []
+        for _ in range(3):
+            carry = carry_cls()
+            carry.ratio, carry.online, carry.ring_size, carry.request_scoped = (
+                2,
+                False,
+                2,
+                True,
+            )
+            carry.kv_score_buffer = SimpleNamespace(
+                kv_score=torch.full((4, 4), 19, dtype=torch.uint8)
+            )
+            pool.compress_state_pools.append(carry)
+        config = SimpleNamespace(
+            model_type="deepseek_v41",
+            num_hidden_layers=40,
+            compress_ratios=pool.compression_ratios,
+            kv_source_layer_ids=[2, 8, 14, 20],
+            index_source_layer_ids=[2, 8, 14, 20, 24, 28, 32, 36],
+            candidate_source_layer_id=20,
+        )
+        ptrs, lens, item_lens = pool.get_contiguous_buf_infos()
+        swa = pool.get_state_buf_infos()
+        carry = pool.get_request_state_buf_infos()
+        kv_args = SimpleNamespace(
+            kv_data_ptrs=ptrs,
+            kv_data_lens=lens,
+            kv_item_lens=item_lens,
+            kv_layer_ids=[],
+            num_draft_entries=0,
+            state_types=[state_type.SWA, state_type.DSV4_REQUEST_STATE],
+            state_data_ptrs=[swa[0], carry[0]],
+            state_item_lens=[swa[2], carry[2]],
+        )
+        destination = [torch.zeros(n, dtype=torch.uint8) for n in lens]
+        target_states = [
+            [torch.zeros_like(t) for t in pool.swa_kv_pool.kv_buffer],
+            [torch.zeros(16, dtype=torch.uint8) for _ in range(3)],
+        ]
+        registration = SimpleNamespace(
+            dst_kv_ptrs=[t.data_ptr() for t in destination],
+            dst_kv_layer_ids=[],
+            dst_attn_tp_size=1,
+            requires_dcp_relayout=False,
+        )
+        peer = SimpleNamespace(
+            is_dummy=False, mooncake_session_id="peer:1", dst_device_kv_indices=None
+        )
+        manager_cls = _source_class(
+            "disaggregation/mooncake/conn.py",
+            "MooncakeKVManager",
+            {"_send_kvcache_generic", "send_kvcache"},
+        )
+        group = _source_function(
+            "disaggregation/common/utils.py", "group_concurrent_contiguous"
+        )
+        group.__globals__["np"] = np
+        flat = _source_function(
+            "disaggregation/mooncake/conn.py", "_uses_flat_entry_layout"
+        )
+        flat.__globals__["StateType"] = state_type
+        manager_cls._send_kvcache_generic.__globals__.update(
+            np=np,
+            StateType=state_type,
+            group_concurrent_contiguous=group,
+            _uses_flat_entry_layout=flat,
+            get_memory=lambda: SimpleNamespace(enable_unified_memory=False),
+            is_elided_entry=_source_function(
+                "disaggregation/utils.py", "is_elided_entry"
+            ),
+        )
+        manager_cls.get_mla_kv_ptrs_with_pp = _source_class(
+            "disaggregation/common/conn.py",
+            "CommonKVManager",
+            {"get_mla_kv_ptrs_with_pp"},
+        ).get_mla_kv_ptrs_with_pp
+        manager = manager_cls()
+        manager.kv_args, manager.attn_tp_size, manager.pp_size = kv_args, 1, 1
+        manager.is_mla_backend = manager.is_hybrid_mla_backend = True
+        manager.enable_custom_mem_pool = manager.enable_staging = False
+        manager.kv_shard_size = 1
+        manager.enable_all_cp_ranks_for_transfer = manager.is_dummy_cp_rank = False
+        manager.max_transfer_batch_indices = 2
+        manager.transfer_infos = {7: {"peer:1": peer}}
+        manager.decode_kv_args_table = {"peer:1": registration}
+        manager._validate_envelope_kv_layout = lambda *a: None
+        manager.prepare_send_state_indices = lambda state: state
+        transfers = []
+
+        def copy_blocks(session, blocks):
+            transfers.append(list(blocks))
+            src_spans = list(zip(kv_args.kv_data_ptrs, kv_args.kv_data_lens))
+            src_spans += list(zip(swa[0], swa[1])) + list(zip(carry[0], carry[1]))
+            dst_spans = [(t.data_ptr(), t.nbytes) for t in destination]
+            dst_spans += [
+                (t.data_ptr(), t.nbytes)
+                for component in target_states
+                for t in component
+            ]
+            for src, dst, size in blocks:
+                self.assertTrue(
+                    any(p <= src and src + size <= p + n for p, n in src_spans)
+                )
+                self.assertTrue(
+                    any(p <= dst and dst + size <= p + n for p, n in dst_spans)
+                )
+                ctypes.memmove(dst, src, size)
+            return 0
+
+        manager._transfer_data = copy_blocks
+        tasks = queue.Queue()
+        manager.add_transfer_request = lambda room, indices, index_slice, last, **kw: (
+            tasks.put(
+                SimpleNamespace(
+                    indices=indices, index_slice=index_slice, last=last, **kw
+                )
+            )
+        )
+        sender_cls = _source_class(
+            "disaggregation/common/conn.py",
+            "CommonKVSender",
+            {
+                "_prepare_send_indices",
+                "send",
+                "_record_transfer_indices",
+                "should_send_kv_chunk",
+            },
+        )
+        polls = SimpleNamespace(
+            Success="success", Failed="failed", Transferring="transferring"
+        )
+        sender_cls.send.__globals__.update(KVPoll=polls, time=time)
+        sender = sender_cls()
+        sender.kv_mgr, sender.bootstrap_room, sender.curr_idx = manager, 7, 0
+        sender.num_kv_indices = (length + 7) // 8
+        sender._transfer_num_kv_indices = sender._transfer_num_state_indices = 0
+        sender._transfer_start_time = sender._early_send_wait_event = (
+            sender.conclude_state
+        ) = None
+        sender.trace_ctx = SimpleNamespace(copy_for_thread=lambda: None)
+        sender.aux_index = 0
+        sender.get_max_transfer_tokens = lambda: None
+        native_status = [polls.Transferring]
+        sender.poll = lambda: native_status[0]
+        req = SimpleNamespace(
+            disagg_kv_sender=sender,
+            pending_bootstrap=False,
+            inflight_middle_chunks=0,
+            extend_end=16,
+            extend_len=16,
+            origin_input_ids=list(range(length)),
+            multimodal_inputs=None,
+            input_embeds=None,
+            bootstrap_room=7,
+            start_send_idx=0,
+            disagg_decode_prefix_len=0,
+            kv=SimpleNamespace(req_pool_idx=0, is_kv_released=False),
+        )
+        scheduler_cls = _source_class(
+            "disaggregation/prefill.py",
+            "SchedulerDisaggregationPrefillMixin",
+            {"send_kv_chunk", "_send_kv_chunk"},
+        )
+        kv_to_page = _source_function("mem_cache/common.py", "kv_to_page_indices")
+        kv_to_page.__globals__.update(torch=torch, np=np)
+        scheduler_cls._send_kv_chunk.__globals__.update(
+            StateType=state_type,
+            _is_npu=False,
+            np=np,
+            torch=torch,
+            kv_to_page_indices=kv_to_page,
+        )
+        scheduler = scheduler_cls()
+        scheduler.kv_checksum_computer = None
+        scheduler.enable_staging = scheduler.enable_pdmux = False
+        scheduler.sliding_window_size = 128
+        scheduler.chunked_prefill_size = 16
+        scheduler.disagg_prefill_pending_chunk_rids = set()
+        scheduler.disagg_decode_prealloc_queue = SimpleNamespace(kv_manager=manager)
+        scheduler.disaggregation_mode = "prefill"
+        scheduler.req_to_token_pool = SimpleNamespace(
+            req_to_token=(torch.arange(length, dtype=torch.int32) + 8).reshape(1, -1)
+        )
+        scheduler.token_to_kv_pool_allocator = SimpleNamespace(
+            page_size=8,
+            get_kvcache=lambda: pool,
+            translate_kv_indices_for_transfer=lambda x: x,
+            translate_swa_indices_for_transfer=lambda x: x,
+        )
+        scheduler.disagg_prefill_bootstrap_queue = SimpleNamespace(kv_manager=manager)
+        metadata = []
+        scheduler.disagg_metadata_buffers = SimpleNamespace(
+            set_buf=lambda r: metadata.append(r.rid)
+        )
+        req.rid = "dsv-long"
+        layers = torch.nn.ModuleList([torch.nn.Identity() for _ in range(40)])
+        model = SimpleNamespace(layers=layers, decoder_replay_tail=object())
+        runner = SimpleNamespace(
+            model=SimpleNamespace(model=model),
+            model_config=SimpleNamespace(hf_config=config, num_hidden_layers=40),
+            lora_manager=None,
+        )
+        scheduler.tp_worker = SimpleNamespace(model_runner=runner)
+        context = SimpleNamespace(
+            get_parallel=lambda: SimpleNamespace(tp_rank=0, tp_size=1),
+            get_disagg=lambda: SimpleNamespace(
+                language_model_only=True,
+                disaggregation_decode_allocation_policy="immediate",
+            ),
+            get_spec=lambda: SimpleNamespace(speculative_algorithm=None),
+            get_exec=lambda: SimpleNamespace(
+                graph=SimpleNamespace(enable_torch_compile=False)
+            ),
+            get_memory=lambda: SimpleNamespace(
+                disable_radix_cache=True,
+                enable_unified_memory=False,
+                enable_hierarchical_cache=False,
+            ),
+        )
+        root = tempfile.TemporaryDirectory()
+        self.addCleanup(root.cleanup)
+        with patch.dict(sys.modules, {"sglang.srt.runtime_context": context}):
+            controller = ds.DSV41Controller(
+                scheduler,
+                self.hooks.pre_layerwise.Config("layerwise", Path(root.name), 1),
+            )
+            # Enum boundary: production uses DisaggregationMode.PREFILL.value.
+            scheduler.disaggregation_mode = SimpleNamespace(value="prefill")
+            controller.validate()
+            scheduler.disaggregation_mode = "prefill"
+        scheduler._pre_layerwise = runner._pre_layerwise = controller
+        self.addCleanup(
+            lambda: [handle.remove() for handle in controller._layer_handles]
+        )
+        schema = ds.manifest(pool, kv_args, config)
+        self.hooks.pre_layerwise.write_json(
+            Path(root.name) / "7/0/offer.json",
+            {
+                "generation": "attempt-1",
+                "session": "peer:1",
+                "dsv41": schema,
+                "mode": "layerwise",
+                "tp_size": 1,
+                "prefix_len": length,
+            },
+        )
+        batch = SimpleNamespace(
+            reqs=[req],
+            forward_mode=SimpleNamespace(
+                is_extend=lambda: True,
+                is_split_prefill=lambda: False,
+                is_mixed=lambda: False,
+            ),
+            is_prefill_only=False,
+            return_hidden_states=False,
+            input_embeds=None,
+            replace_embeds=None,
+        )
+        modules = {
+            "sglang.srt.disaggregation.mooncake.conn": SimpleNamespace(
+                MooncakeKVSender=sender_cls
+            ),
+            "sglang.srt.disaggregation.utils": SimpleNamespace(
+                DisaggregationMode=SimpleNamespace(PREFILL="prefill")
+            ),
+            "sglang.srt.disaggregation.base.conn": SimpleNamespace(KVPoll=polls),
+        }
+        return SimpleNamespace(
+            ds=ds,
+            controller=controller,
+            sender=sender,
+            scheduler=scheduler,
+            pool=pool,
+            schema=schema,
+            req=req,
+            batch=batch,
+            manager=manager,
+            tasks=tasks,
+            runner=runner,
+            modules=modules,
+            destination=destination,
+            states=target_states,
+            native_status=native_status,
+            polls=polls,
+            metadata=metadata,
+            transfers=transfers,
+            registration=registration,
+            context=context,
+            native_send=scheduler_cls.send_kv_chunk,
+        )
+
+    def test_dsv41_native_manifest_maps_shared_kv_and_fp4_scales_once(self):
+        f = self._dsv41_fixture()
+        groups = f.ds.resource_groups(f.schema, 1)
+        self.assertEqual([p for p, _ in groups], [2, 8, 14, 20])
+        self.assertEqual(
+            sorted(i for _, entries in groups for i in entries), list(range(12))
+        )
+        self.assertEqual([e[2] for e in f.schema["entries"]].count(20), 3)
+        self.assertEqual(f.schema["state_types"], ["SWA", "DSV4_REQUEST_STATE"])
+        # Native index-page tiling yields 8/2/2 * payload/scale bytes at ratio 2.
+        self.assertEqual([e[-1] for e in f.schema["entries"]][3:9], [8, 8, 8, 2, 2, 2])
+        swa = f.pool.swa_kv_pool
+        f.pool.request_window = SimpleNamespace(state=swa)
+        f.pool.swa_kv_pool = None
+        self.assertEqual(
+            f.ds.manifest(f.pool, f.manager.kv_args, f.runner.model_config.hf_config),
+            f.schema,
+        )
+        f.pool.request_window, f.pool.swa_kv_pool = None, swa
+        f.manager.kv_args.kv_item_lens[0] += 1
+        with self.assertRaisesRegex(ValueError, "native PD buffers"):
+            f.ds.manifest(f.pool, f.manager.kv_args, f.runner.model_config.hf_config)
+
+    def test_dsv41_layerwise_preserves_native_chunks_final_states_and_gpu_fences(self):
+        """Odd final page needs ratio-2 carry; no D admission before native states/aux."""
+        import numpy as np
+
+        f = self._dsv41_fixture()
+        pl = self.hooks.pre_layerwise
+        with patch.dict(sys.modules, f.modules):
+            # The original middle chunk still sends every native global entry.
+            f.native_send(f.scheduler, f.req, last_chunk=False)
+            middle = f.tasks.get_nowait()
+            self.assertFalse(middle.last)
+            self.assertEqual(middle.indices.tolist(), [1, 2])
+            dst_pages = np.array([5, 6, 1, 2, 3], dtype=np.int32)
+            f.ds.send_selected(
+                type(f.manager).send_kvcache,
+                f.manager,
+                "peer:1",
+                middle.indices,
+                f.registration.dst_kv_ptrs,
+                dst_pages[middle.index_slice],
+                None,
+                dst_attn_tp_size=1,
+            )
+            f.req.extend_end, f.req.extend_len = 33, 17
+            jobs = f.controller.prepare(f.batch)
+            self.assertEqual(f.sender.curr_idx, 5)
+            self.assertEqual(f.req.start_send_idx, 33)
+            self.assertEqual(jobs[0].indices.tolist(), [3, 4, 5])
+            f.controller.plan = jobs
+            events = []
+
+            class GPUEvent:
+                def __init__(self):
+                    self.done = threading.Event()
+                    events.append(self)
+
+                def record(self, stream):
+                    pass
+
+                def synchronize(self):
+                    if not self.done.wait(3):
+                        raise TimeoutError("test GPU proof")
+
+            model = f.runner.model.model
+            saved_tail = model.decoder_replay_tail
+            trace = []
+
+            def compute(runner, batch):
+                self.assertIsNone(model.decoder_replay_tail)
+                for i, layer in enumerate(model.layers):
+                    layer(torch.zeros(1))
+                    trace.append((i, f.tasks.qsize()))
+                return "native-output"
+
+            with (
+                patch.object(torch.cuda, "Event", GPUEvent),
+                patch.object(torch.cuda, "current_stream", lambda: None),
+            ):
+                self.assertEqual(
+                    f.controller.forward(compute, f.runner, f.batch), "native-output"
+                )
+            self.assertIs(model.decoder_replay_tail, saved_tail)
+            self.assertGreater(trace[2][1], 0)
+            pl.send_chunk(f.native_send, f.scheduler, f.req, last_chunk=True)
+            source = jobs[0]
+            self.assertFalse(source.poll())
+            freed = []
+            self.assertTrue(pl.defer_release(f.req, lambda: freed.append(True)))
+            self.assertEqual(freed, [])
+            envelopes = [f.tasks.get_nowait() for _ in range(f.tasks.qsize())]
+            self.assertEqual(len(envelopes), 5)
+            self.assertTrue(envelopes[-1].last)
+            self.assertEqual(envelopes[-1].indices.size, 0)
+            # Native last-chunk state planner carries an odd ratio-2 half-pair.
+            self.assertEqual(envelopes[-1].state_indices[1].tolist(), [0])
+            dst_pages = np.array([5, 6, 1, 2, 3], dtype=np.int32)
+            completed = threading.Event()
+            errors = []
+
+            def transfer():
+                try:
+                    for task in envelopes:
+                        if getattr(task, "wait_event", None) is not None:
+                            task.wait_event.synchronize()
+                        if task.indices.size:
+                            f.ds.send_selected(
+                                None,
+                                f.manager,
+                                "peer:1",
+                                task.indices,
+                                f.registration.dst_kv_ptrs,
+                                dst_pages[task.index_slice],
+                                None,
+                                dst_attn_tp_size=1,
+                                kv_buffer_indices=task.kv_buffer_indices,
+                            )
+                            task.on_complete()
+                        if task.last:
+                            for src_ptrs, dst, sizes, indices in zip(
+                                f.manager.kv_args.state_data_ptrs,
+                                f.states,
+                                f.manager.kv_args.state_item_lens,
+                                task.state_indices,
+                            ):
+                                f.manager._send_kvcache_generic(
+                                    "peer:1",
+                                    src_ptrs,
+                                    [t.data_ptr() for t in dst],
+                                    sizes,
+                                    indices,
+                                    indices,
+                                    None,
+                                    force_flat=True,
+                                )
+                            f.native_status[0] = f.polls.Success
+                    completed.set()
+                except BaseException as exc:
+                    errors.append(exc)
+                    completed.set()
+
+            thread = threading.Thread(target=transfer)
+            try:
+                thread.start()
+                self.assertFalse(completed.wait(0.05))
+                self.assertTrue(
+                    all(
+                        not t[stride : 4 * stride].any()
+                        for t, stride in zip(
+                            f.destination, f.manager.kv_args.kv_item_lens
+                        )
+                    )
+                )
+                self.assertFalse(source.poll())
+                # A request flag alone cannot bypass native state completion.
+                f.req.kv.is_kv_released = True
+                with patch.dict(
+                    sys.modules,
+                    {
+                        "sglang.srt.managers.schedule_batch": SimpleNamespace(
+                            FINISH_LENGTH=object
+                        )
+                    },
+                ):
+                    f.controller.poll_sources()
+                self.assertEqual(freed, [])
+                self.assertEqual(f.controller.sources, [source])
+            finally:
+                for event in events:
+                    event.done.set()
+                thread.join(3)
+            self.assertFalse(thread.is_alive())
+            self.assertEqual(errors, [])
+            self.assertTrue(source.poll())
+            self.assertEqual(len(source.completed), 12)
+            for pointer, stride, dst in zip(
+                f.manager.kv_args.kv_data_ptrs,
+                f.manager.kv_args.kv_item_lens,
+                f.destination,
+            ):
+                for src_page, dst_page in zip([1, 2, 3, 4, 5], [5, 6, 1, 2, 3]):
+                    self.assertEqual(
+                        bytes(dst[dst_page * stride : (dst_page + 1) * stride]),
+                        ctypes.string_at(pointer + src_page * stride, stride),
+                    )
+            self.assertTrue(all(t.any() for t in f.states[1]))
+            self.assertEqual(f.metadata, ["dsv-long"])
+            self.assertEqual(f.scheduler.chunked_prefill_size, 16)
+            source.retire()
+            self.assertEqual(freed, [True])
+            self.assertTrue(source.released)
+
+    def test_dsv41_mismatched_peer_and_ineligible_rows_leave_native_cursors_untouched(
+        self,
+    ):
+        f = self._dsv41_fixture()
+        with patch.dict(sys.modules, f.modules):
+            f.req.extend_end, f.req.extend_len = 33, 33
+            path = f.controller.config.directory / "7/0/offer.json"
+            offer = self.hooks.pre_layerwise.read_json(path)
+            offer["dsv41"]["entries"][0][-1] += 1
+            self.hooks.pre_layerwise.write_json(path, offer)
+            self.assertIsNone(f.controller.prepare(f.batch))
+            self.assertEqual((f.sender.curr_idx, f.req.start_send_idx), (0, 0))
+            offer["dsv41"] = f.schema
+            self.hooks.pre_layerwise.write_json(path, offer)
+            f.req.multimodal_inputs = object()
+            self.assertIsNone(f.controller.prepare(f.batch))
+            self.assertEqual((f.sender.curr_idx, f.req.start_send_idx), (0, 0))
+            f.req.multimodal_inputs = None
+            f.manager.kv_shard_size = 2
+            self.assertIsNone(f.controller.prepare(f.batch))
+            self.assertEqual((f.sender.curr_idx, f.req.start_send_idx), (0, 0))
+            f.manager.kv_shard_size = 1
+            f.controller.agree = lambda flags: [
+                0
+            ]  # another TP rank cannot take this row
+            self.assertIsNone(f.controller.prepare(f.batch))
+            self.assertEqual(f.controller.sources, [])
+            self.assertEqual((f.sender.curr_idx, f.req.start_send_idx), (0, 0))
+
+    def test_dsv41_even_prefix_omits_carry_and_changed_registration_rejects_writes(
+        self,
+    ):
+        import numpy as np
+
+        f = self._dsv41_fixture(length=32)
+        with patch.dict(sys.modules, f.modules):
+            f.req.extend_end = 32
+            f.native_send(f.scheduler, f.req, last_chunk=True)
+            final = f.tasks.get_nowait()
+            self.assertEqual(final.state_indices[1].size, 0)
+        f.manager._dsv41_layerwise_schema = f.schema
+        bad = list(f.registration.dst_kv_ptrs)
+        bad[0] += 1
+        with self.assertRaisesRegex(ValueError, "peer/layout changed"):
+            f.ds.send_selected(
+                None,
+                f.manager,
+                "peer:1",
+                np.array([1]),
+                bad,
+                np.array([1]),
+                None,
+                dst_attn_tp_size=1,
+                kv_buffer_indices=(0,),
+            )
+        self.assertEqual(f.transfers, [])
+        with self.assertRaisesRegex(RuntimeError, "finalization"):
+            source = f.ds.DSV41Source(
+                f.controller,
+                f.req,
+                Path("unused"),
+                "g",
+                None,
+                None,
+                (),
+                32,
+                groups=((2, (0,)),),
+            )
+            source.finalize_native(
+                f.native_send, f.scheduler, f.req, last_chunk=True, end_idx=None
+            )
+
+    def test_dsv41_startup_rejects_remote_multimodal_speculation_and_unsafe_storage(
+        self,
+    ):
+        f = self._dsv41_fixture()
+        with patch.dict(sys.modules, {"sglang.srt.runtime_context": f.context}):
+            f.controller.config = dataclasses.replace(
+                f.controller.config, mode="remote"
+            )
+            with self.assertRaisesRegex(ValueError, "layerwise only"):
+                f.controller.validate()
+            f.controller.config = dataclasses.replace(
+                f.controller.config, mode="layerwise"
+            )
+            for method, value, reason in (
+                (
+                    "get_disagg",
+                    SimpleNamespace(language_model_only=False),
+                    "language-model-only",
+                ),
+                (
+                    "get_spec",
+                    SimpleNamespace(speculative_algorithm="DSPARK"),
+                    "speculation disabled",
+                ),
+                (
+                    "get_memory",
+                    SimpleNamespace(disable_radix_cache=False),
+                    "disable-radix-cache",
+                ),
+            ):
+                with patch.object(f.context, method, lambda: value):
+                    with self.assertRaisesRegex(ValueError, reason):
+                        f.controller.validate()
+        f.pool.uniform_fp8 = True
+        with self.assertRaisesRegex(ValueError, "non-unified FlashMLA"):
+            f.ds.manifest(f.pool, f.manager.kv_args, f.runner.model_config.hf_config)
+
+    def test_dsv41_prefill_export_bypasses_graph_but_native_decode_keeps_graph(self):
+        f = self._dsv41_fixture()
+        f.controller.graph_fast_path = True
+        runner = SimpleNamespace(model_runner=f.runner)
+        with patch.dict(sys.modules, {"sglang.srt.runtime_context": f.context}):
+            f.controller.plan = [object()]
+            self.assertFalse(
+                self.hooks._prefill_graph(lambda *a: True, runner, f.batch)
+            )
+            f.controller.plan = None
+            f.controller.executing = [object()]
+            self.assertFalse(
+                self.hooks._prefill_graph(lambda *a: True, runner, f.batch)
+            )
+            f.controller.executing = None
+            with patch.object(
+                self.runtime,
+                "has_remote_work",
+                side_effect=AssertionError("no legacy graph vote"),
+            ):
+                self.assertTrue(
+                    self.hooks._decode_graph(lambda *a: True, runner, f.batch)
+                )
+                self.assertFalse(
+                    self.hooks._decode_graph(lambda *a: False, runner, f.batch)
+                )
+                self.assertTrue(
+                    self.hooks._prefill_graph(lambda *a: True, runner, f.batch)
+                )
+
+    def test_dsv41_forward_failure_retains_source_and_restores_native_model_state(self):
+        f = self._dsv41_fixture()
+        with patch.dict(sys.modules, f.modules):
+            f.req.extend_end, f.req.extend_len = 33, 33
+            jobs = f.controller.prepare(f.batch)
+            f.controller.plan = jobs
+            tail = f.runner.model.model.decoder_replay_tail
+
+            def fail(*args):
+                raise RuntimeError("kernel launch failed")
+
+            with self.assertRaisesRegex(RuntimeError, "kernel launch failed"):
+                f.controller.forward(fail, f.runner, f.batch)
+            self.assertIs(f.runner.model.model.decoder_replay_tail, tail)
+            self.assertIsNone(f.controller.executing)
+            with self.assertRaisesRegex(RuntimeError, "retaining source KV"):
+                self.hooks.pre_layerwise.defer_release(
+                    f.req, lambda: self.fail("unsafe release")
+                )
+            self.assertFalse(f.req.kv.is_kv_released)
+            self.assertFalse(jobs[0].finalized)
 
     def test_prelayer_chunk_tail_reserves_once_and_preserves_middle_chunks(self):
         pl = self.hooks.pre_layerwise

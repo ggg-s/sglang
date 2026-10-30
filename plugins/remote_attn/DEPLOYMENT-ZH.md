@@ -1,5 +1,8 @@
 # Remote-attn Progressive 生产接入手册
 
+DSV4.1 Flash 的纯文本 layerwise 路径见 [专用接入说明](DSV41-LAYERWISE-ZH.md)；
+下文的 Qwen3/MHA 参数和 Remote 限制适用于原有路径。
+
 本文对应 `codex/remote-attn-pre-layerwise` 分支，运行时代码基线为
 `5b6e2f7ef554e71634352284d55c201989e35b29`（2026-10-29）；预检与原生命令文档于
 2026-10-30 更新。发布时固定经过验收的完整 SHA、wheel 和配置，不能让生产实例自动追随分支 HEAD。

@@ -1033,6 +1033,7 @@ class Controller:
             if (
                 self.config.mode == "layerwise"
                 and src.cache_lease is None
+                and not getattr(src, "defer_native_release", False)
                 and src.finalized
                 and src.req.kv.is_kv_released
             ):
@@ -1050,15 +1051,19 @@ def initialize(scheduler):
     config = Config.from_env()
     if config is None:
         return
-    controller = Controller(scheduler, config)
+    from .dsv41_layerwise import DSV41Controller, is_dsv41
+
+    cls = DSV41Controller if is_dsv41(scheduler.tp_worker.model_runner) else Controller
+    controller = cls(scheduler, config)
     controller.validate()
     controller.validate_graphs()
     from .source_cache import install
 
-    controller.cache_guard = install(scheduler.tree_cache)
-    from .decode_overlap import install as install_overlap
+    if not getattr(controller, "dsv41_layerwise", False):
+        controller.cache_guard = install(scheduler.tree_cache)
+        from .decode_overlap import install as install_overlap
 
-    controller.decode_overlap = install_overlap(controller)
+        controller.decode_overlap = install_overlap(controller)
     scheduler._pre_layerwise = controller
     scheduler.tp_worker.model_runner._pre_layerwise = controller
 
@@ -1093,6 +1098,10 @@ def send_chunk(original, scheduler, req, last_chunk=False, end_idx=None):
     source = getattr(req, "_pre_layerwise_source", None)
     if source is None or not last_chunk:
         return original(scheduler, req, last_chunk=last_chunk, end_idx=end_idx)
+    if hasattr(source, "finalize_native"):
+        return source.finalize_native(
+            original, scheduler, req, last_chunk=last_chunk, end_idx=end_idx
+        )
     source.finalize()
 
 
@@ -1125,7 +1134,9 @@ def defer_release(req, release, *, checkpoint=None):
         raise RuntimeError("pre-layerwise staging is unsettled; retaining source KV")
     lease = getattr(source, "cache_lease", None)
     if source is not None and (
-        source.owner.config.mode == "remote" or lease is not None
+        source.owner.config.mode == "remote"
+        or lease is not None
+        or getattr(source, "defer_native_release", False)
     ):
         if lease is not None:
             lease.check()
@@ -1207,6 +1218,8 @@ def shutdown(scheduler):
             if time.monotonic() >= deadline:
                 raise RuntimeError("native PD writes remain active during shutdown")
             time.sleep(0.005)
+    for handle in getattr(controller, "_layer_handles", ()):
+        handle.remove()
     # Native manager owns shared staging teardown after its workers drain.
     if controller.stager is not None and controller.stager.poisoned:
         raise RuntimeError("pre-layerwise staging remains quarantined during shutdown")

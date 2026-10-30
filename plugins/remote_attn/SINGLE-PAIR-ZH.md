@@ -1,5 +1,8 @@
 # 原生 SMG + 单 pair P/D 接入
 
+DSV4.1 Flash 的纯文本 layerwise 路径见 [专用接入说明](DSV41-LAYERWISE-ZH.md)；
+下文的 Qwen3/MHA 参数和 Remote 限制适用于原有路径。
+
 使用原生 `sglang.launch_server` 和 SMG PD router，不使用 JSON 配置或启动包装器。
 新增能力通过 P/D 的 `remote_attn` 插件启用；SMG 无需设置插件环境变量。
 核心和插件必须来自同一份包含 progressive 扩展的构建，不能只安装插件。

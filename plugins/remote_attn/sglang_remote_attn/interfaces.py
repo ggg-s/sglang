@@ -26,7 +26,18 @@ CORE_CALLS = {
         "staging_layer_ids": None,
     },
     MANAGER + "send_kvcache": {"kv_buffer_indices": None, "transfer_fn": None},
-    MANAGER + "_send_kvcache_generic": {"transfer_fn": None},
+    MANAGER + "_send_kvcache_generic": {"transfer_fn": None, "force_flat": False},
+    DISAGG + "prefill.SchedulerDisaggregationPrefillMixin.send_kv_chunk": {
+        "last_chunk": False,
+        "end_idx": None,
+    },
+    DISAGG + "common.conn.CommonKVSender._prepare_send_indices": {
+        "state_indices": None
+    },
+    "sglang.srt.mem_cache.deepseek_v4_memory_pool.DeepSeekV4TokenToKVPool.get_contiguous_buf_infos": {},
+    "sglang.srt.mem_cache.deepseek_v4_memory_pool.DeepSeekV4TokenToKVPool.get_state_buf_infos": {},
+    "sglang.srt.mem_cache.deepseek_v4_memory_pool.DeepSeekV4TokenToKVPool.get_request_state_buf_infos": {},
+    "sglang.srt.mem_cache.deepseek_v4_memory_pool.DeepSeekV4TokenToKVPool.request_state_transfer_indices": {},
     MANAGER + "_transfer_data": {"stage": False},
     MANAGER + "request_layer_staging": {},
     MANAGER + "send_layer_group_to_staging": {},

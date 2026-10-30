@@ -7,7 +7,13 @@ import pkgutil
 import threading
 import time
 
-from . import decode_overlap, pre_layerwise, segmented_graph, source_cache
+from . import (
+    decode_overlap,
+    dsv41_layerwise,
+    pre_layerwise,
+    segmented_graph,
+    source_cache,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -33,8 +39,19 @@ def _scheduler_init(original, scheduler, *args, **kwargs):
     pool = scheduler.token_to_kv_pool_allocator.get_kvcache()
     import torch
 
+    runner = scheduler.tp_worker.model_runner
+    if dsv41_layerwise.is_dsv41(runner):
+        from sglang.srt.mem_cache.deepseek_v4_memory_pool import DeepSeekV4TokenToKVPool
+
+        if type(pool) is not DeepSeekV4TokenToKVPool:
+            raise RuntimeError("DSV4.1 layerwise requires the native DSV4 KV pool")
+        pre_layerwise.initialize(scheduler)
+        return
+    from sglang.srt.runtime_context import get_schedule
+
     if (
-        type(pool) is not MHATokenToKVPool
+        get_schedule().page_size != 1
+        or type(pool) is not MHATokenToKVPool
         or pool.kv_cache_layout != "nhd"
         or pool.dtype not in (torch.bfloat16, torch.float16)
     ):
@@ -91,7 +108,12 @@ def validate_config():
         )
     if memory.enable_unified_memory or memory.enable_hierarchical_cache:
         raise RuntimeError("remote_attn does not yet support unified KV or HiCache")
-    if schedule.page_size != 1 or schedule.enable_mixed_chunk:
+    # Paged DSV4.1 layerwise is validated against the concrete pool after init.
+    # Dense MHA still checks page_size=1 in _scheduler_init.
+    if schedule.enable_mixed_chunk or (
+        schedule.page_size != 1
+        and os.environ.get("HANDOFF_PRE_LAYERWISE", "off") != "layerwise"
+    ):
         raise RuntimeError("remote_attn requires --page-size 1 without mixed chunks")
     if get_spec().speculative_algorithm is not None:
         raise RuntimeError("remote_attn does not yet support speculative decoding")
@@ -145,6 +167,16 @@ def _process_requests(original, scheduler, recv_reqs):
         overlap.retirement.arm(intent)
     for control in controls:
         controller = getattr(scheduler, "_pre_layerwise", None)
+        if getattr(controller, "dsv41_layerwise", False) and control.get("cmd") not in {
+            "status",
+            "status_lite",
+            "pd_queues",
+            "debug_queue",
+            "kv_ledger",
+        }:
+            raise RuntimeError(
+                "DSV4.1 layerwise supports native PD only; no manual migration/Remote"
+            )
         if getattr(controller, "decode_overlap", None) is not None and control.get(
             "cmd"
         ) not in {
@@ -170,7 +202,10 @@ def _process_requests(original, scheduler, recv_reqs):
             # execution, even if a command fails before installing a shard.
             controller.graph_fast_path = False
         runtime.execute_handoff_control(scheduler, control)
-    runtime.maybe_handle_handoff_control(scheduler)
+    if not getattr(
+        getattr(scheduler, "_pre_layerwise", None), "dsv41_layerwise", False
+    ):
+        runtime.maybe_handle_handoff_control(scheduler)
     from .pre_layerwise import poll
 
     poll(scheduler)
@@ -285,6 +320,13 @@ def _graph_decision(original, runner, forward_batch, kind):
 
     parallel = get_parallel()
     controller = getattr(getattr(runner, "model_runner", None), "_pre_layerwise", None)
+    if (
+        kind == "prefill"
+        and getattr(controller, "dsv41_layerwise", False)
+        and (controller.plan is not None or controller.executing is not None)
+    ):
+        # prepare agreed the batch across TP before any rank reaches this guard.
+        return False
     if controller is not None and controller.graph_fast_path:
         # early_targets admits/removes leases only after TP agreement. Keep
         # even a locally complete lease eager until its slowest peer retires.
@@ -405,6 +447,7 @@ HOOKS = {
     "sglang.srt.model_executor.runner.prefill_cuda_graph_runner.PrefillCudaGraphRunner.can_run_graph": _prefill_graph,
     "sglang.srt.disaggregation.mooncake.conn.MooncakeKVManager.__init__": _mooncake_init,
     "sglang.srt.disaggregation.mooncake.conn.MooncakeKVManager._transfer_data": _transfer,
+    "sglang.srt.disaggregation.mooncake.conn.MooncakeKVManager.send_kvcache": dsv41_layerwise.send_selected,
     "sglang.srt.disaggregation.mooncake.conn.MooncakeKVManager._publish_peer_registration": _publish_peer,
 }
 
