@@ -481,6 +481,13 @@ def decode_overlap_lifetimes(args):
             fourth, _, io4 = target(4)
             fifth, _, io5 = target(5)
             io4.done = io5.done = True
+            # Coalescing requires both ranks' READY frames to be available
+            # before leader intake. Without this channel boundary the leader
+            # can legitimately propose target 4 while rank 1 is still posting
+            # target 5, giving two safe commands instead of the expected one.
+            with patch.object(protocol.mailbox, "receive", return_value=[]):
+                controller.retire_targets()
+            dist.barrier()
             for _ in range(8):
                 cycle()
                 if not controller.targets:
