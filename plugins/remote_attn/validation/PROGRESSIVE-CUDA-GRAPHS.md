@@ -1,6 +1,7 @@
 # Progressive CUDA graphs 适配与验证
 
-2026-10-30，基于 `ba7b2891296b`，目标分支 `codex/remote-attn-pre-layerwise`。
+2026-10-30，初版基于 `ba7b2891296b`，Local 稳态优化基于 `ae4e4b92fa`，
+目标分支 `codex/remote-attn-pre-layerwise`。
 
 ## 行为与改动范围
 
@@ -10,22 +11,28 @@ SGL 或 SMG 核心改动，也没有新增环境变量、启动包装器或 grap
 
 - 删除两个启动预检中“必须关闭 graphs”的限制，保留 radix cache、overlap scheduler、
   模型、KV layout、并行拓扑等原有约束。
-- Decode/Prefill `can_run_graph` 先计算原生 eligibility，再对 eligibility、Local readiness
-  做一次 TP CPU-group MIN all-reduce。没有 target 的 rank、原生不满足 capture 范围的
-  rank 也必须投票；TP1 不发 collective。
-- 任何 rank 存在缺层、失败或 aborted target，整组走 eager。Layerwise 等待也受保护，
-  防止 graph 绕过 Python 的逐层等待。检查范围为该进程全部 target states，较 batch
-  局部判断保守，因此其他活跃 Remote 请求也会暂时阻止本批 graph。
-- 全部 rank 的 target 层都完成 GPU 可读证明，且原生 eligibility 均为 true，恢复原生
-  replay。无需清除 target 对象或重新 capture；新 Remote 请求会再次使整批 eager。
-  `HANDOFF_GRAPH_DISABLE_ANY_STATE=1` 是保留的实验覆盖，验收默认路径时应清除。
+- 启动时一次 TP `all_gather_object` 检查 resolved graph 配置、两个 runner 的类型、实际
+  capture buckets 和 max-bs。不一致时全组拒绝启动；任一 rank 已有旧 target 时全组
+  使用保守路径。检查成功才启用 progressive fast path。
+- Progressive 复用 `Controller.early_targets` 已有的 TP 准入/退休投票。只有统一准入
+  才添加接收租约；只有最慢 shard 的 GPU scatter 与原生传输全部完成、统一完成资源
+  回收后才删除租约。即使本 rank 已经 Local 或已经关闭，也保留租约到全组同意。
+- `can_run_graph` 只检查一致的租约集合：非空就 eager，空则交回原生 eligibility。
+  不再扫描本地逐层事件或每步 all-reduce；新请求准入在下一次 forward 前重新阻止 graph。
+  其他请求持有租约时，已 Local 的 batch 也保守地 eager。
+- Local 恢复需要等统一回收，可能比最后一层刚可读稍晚。无需重新 capture；Native TP
+  的输入/配置一致性约束继续适用，不再逐步检测 native eligibility 的 rank 间差异。
+- 旧手动 import/resume 控制会在广播后的执行边界全组撤销 fast path，进程后续继续
+  对 native eligibility 和 target readiness 逐 forward 做 MIN 投票。Wrapper 安装也校验
+  target 所有权，防止未受 progressive 生命周期管理的 state 绕过保护。Layerwise 等待、
+  失败唤醒和 `HANDOFF_GRAPH_DISABLE_ANY_STATE=1` 的保守语义在旧路径中继续保留。
 - P 最终 chunk 由已有 `SPLIT_PREFILL` 路径执行，仍为 eager；普通中间 chunk 保留原生
   graph dispatch、chunk 发送及 optimistic prefill 配置。P 提供 RPC 的计算路径不变。
 - 原生 graph runner 仍负责 capture buckets、padding、加载 live batch 和实际 replay。
   插件只记录 verdict 变化；`graph-eligible` 日志本身不代表实际执行了 replay。
 
-TP>1 每次 eligibility 检查增加一次 CPU collective，Local 稳态也包含这个成本。
-没有性能收益数据，不能以恢复 graph eligibility 直接推断净收益。
+Progressive graph 判断不增加 collective，Local 稳态只增加少量 Python 检查；Remote 期间
+已有的完成轮询投票仍然存在，不能称为整个生命周期仅同步两次。尚无 GPU 性能收益数据。
 
 ## 本地证据
 
@@ -34,14 +41,17 @@ TP>1 每次 eligibility 检查增加一次 CPU collective，Local 稳态也包�
 
 | 检查 | 结果 |
 | --- | --- |
-| 完整 `test/registered/unit/plugins/test_remote_attn.py` | 66 项通过，最终轮 8.020 秒 |
-| 真实双进程 Gloo fixture | 两种 runner 的九阶段结果均为 `T,F,F,T,F,T,F,F,T`，两个 rank 一致 |
+| 完整 `test/registered/unit/plugins/test_remote_attn.py` | 68 项通过，最终轮 3.877 秒 |
+| 旧路径真实双进程 Gloo fixture | 两种 runner 的九阶段结果均为 `T,F,F,T,F,T,F,F,T`，两个 rank 一致 |
+| Progressive 实际准入/回收双进程 Gloo | 八阶段租约数 `0,1,2,1,1,0,1,0`，各阶段连续 16 轮 Decode/Prefill 判断均一致，forward 新增 all-reduce 为 0 |
+| 启动一致性 | capture buckets 不同则两 rank 均拒绝；只有一个 rank 预存 target 也使两 rank 均进入保守路径 |
 | 原生 `ModelRunner._forward_raw` 源加载分支 | Remote→Local→新 Remote 对 Decode/Prefill 均为 eager→graph→eager；split-prefill 不走 graph |
 | GPU scatter 完成边界的 CPU 合约 | host 接收及未完成 scatter 不可 Local；全部 scatter 完成后可 Local |
 | 预修复函数回放 | 三个选定用例失败：layer 等待被绕过、Prefill graph 不恢复、TP graph 启动被拒绝 |
+| 稳态优化预修复回放 | `ae4e4b92fa` 对新增两个用例失败：仍扫描/投票、未受管 state 与 import 控制未撤销 fast path |
 | 源码预检 | 23 hooks、40 项核心接口/状态检查通过 |
 
-预修复回放将 `ba7b2891296b` 的相关函数加载进同一测试 fixture，保持测试和其余依赖
+预修复回放分别将上述基线的相关函数加载进同一测试 fixture，保持测试和其余依赖
 不变。当前版本的启动用例同时确认 graph-on 可用且 overlap 限制继续生效。
 
 在完整 serving Python 环境可直接运行：

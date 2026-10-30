@@ -268,7 +268,8 @@ core 共享 slot 的 `reserve()` 新建并注册 slot 后，使用**同一 copy 
 
 将第 3 节环境加入现有进程管理器的 P/D 启动配置，保留模型路径、token chunk 和已核准的其他模型参数。
 必须保留本路径约束：page size 1、同 TP、关闭 radix cache / overlap scheduler、`mooncake_tcp`、提前分配。
-graphs 沿用原生配置；各 TP rank 的判定由插件 CPU-group 投票统一。
+graphs 沿用原生配置；Progressive 复用准入/回收的 TP 投票维护统一接收租约，租约清空后
+恢复原生 graph 判断，正常 Local decode 不新增 collective。旧手动 import 保留逐步投票。
 启动及 eager→graph 验证见[单 pair 说明](SINGLE-PAIR-ZH.md#验证-eager--graph-恢复)，
 本地测试范围见[适配记录](validation/PROGRESSIVE-CUDA-GRAPHS.md)。
 命令行原本有冲突配置时须在 manifest 中消除，不能只叠加变量期待自动兼容。

@@ -125,6 +125,18 @@ def _process_requests(original, scheduler, recv_reqs):
     requests, controls = runtime.split_handoff_controls(recv_reqs)
     result = original(scheduler, requests)
     for control in controls:
+        controller = getattr(scheduler, "_pre_layerwise", None)
+        if controller is not None and control.get("cmd") in {
+            "import",
+            "import_many",
+            "import_wave",
+            "resume",
+            "resume_many_decode",
+            "admit_decode",
+        }:
+            # Controls were broadcast to the whole TP group. Revoke before
+            # execution, even if a command fails before installing a shard.
+            controller.graph_fast_path = False
         runtime.execute_handoff_control(scheduler, control)
     runtime.maybe_handle_handoff_control(scheduler)
     from .pre_layerwise import poll
@@ -234,15 +246,23 @@ def _graph_decision(original, runner, forward_batch, kind):
     from .tp import agree_graph
 
     parallel = get_parallel()
-    # Do not short circuit on local readiness or native eligibility. Even the
-    # fastest shard (or one with no remaining state) must join the same vote.
-    eligible = bool(original(runner, forward_batch))
-    can_replay, all_local = agree_graph(
-        eligible,
-        not _runtime().has_remote_work(),
-        group=parallel.tp_group.cpu_group if parallel.tp_size > 1 else None,
-        world_size=parallel.tp_size,
-    )
+    controller = getattr(getattr(runner, "model_runner", None), "_pre_layerwise", None)
+    if controller is not None and controller.graph_fast_path:
+        # early_targets admits/removes leases only after TP agreement. Keep
+        # even a locally complete lease eager until its slowest peer retires.
+        # The empty set is a shared Local certificate, not a rank-local guess.
+        all_local = not controller.targets
+        can_replay = all_local and bool(original(runner, forward_batch))
+    else:
+        # Legacy/manual imports have no progressive lease certificate. Every
+        # rank must still join this conservative per-forward vote.
+        eligible = bool(original(runner, forward_batch))
+        can_replay, all_local = agree_graph(
+            eligible,
+            not _runtime().has_remote_work(),
+            group=parallel.tp_group.cpu_group if parallel.tp_size > 1 else None,
+            world_size=parallel.tp_size,
+        )
     verdict = (can_replay, all_local)
     if getattr(runner, "_remote_attn_graph_verdict", None) != verdict:
         runner._remote_attn_graph_verdict = verdict

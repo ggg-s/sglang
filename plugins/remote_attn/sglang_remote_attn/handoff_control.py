@@ -7618,6 +7618,19 @@ def _install_attention_wrappers(scheduler, state):
 
     from sglang.srt.layers.radix_attention import RadixAttention
 
+    controller = getattr(scheduler, "_pre_layerwise", None)
+    if controller is not None:
+        target = getattr(getattr(state, "req", None), "_pre_layerwise_target", None)
+        if (
+            target is None
+            or target.owner is not controller
+            or target.state is not state
+        ):
+            # A legacy/manual import can progress independently of the
+            # progressive TP lifetime votes. Permanently fall back to the
+            # conservative graph vote for this engine (all command ranks
+            # install their state before the next model forward).
+            controller.graph_fast_path = False
     if state not in _TARGET_STATES:
         _TARGET_STATES.append(state)
     if PROFILE:

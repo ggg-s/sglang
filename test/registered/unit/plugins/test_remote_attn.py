@@ -600,6 +600,89 @@ class TestRemoteAttn(CustomTestCase):
             ],
         )
 
+    def test_progressive_graph_lease_skips_per_forward_collectives(self):
+        """TP-agreed leases, including locally complete ones, own the eager window."""
+        controller = SimpleNamespace(graph_fast_path=True, targets=[])
+        runner = SimpleNamespace(
+            model_runner=SimpleNamespace(_pre_layerwise=controller)
+        )
+        context = SimpleNamespace(
+            get_parallel=lambda: SimpleNamespace(
+                tp_size=2, tp_rank=0, tp_group=SimpleNamespace(cpu_group=None)
+            )
+        )
+        with (
+            patch.dict(sys.modules, {"sglang.srt.runtime_context": context}),
+            patch.object(
+                torch.distributed,
+                "all_reduce",
+                side_effect=AssertionError("unexpected per-forward vote"),
+            ),
+            patch.object(
+                self.runtime,
+                "has_remote_work",
+                side_effect=AssertionError(
+                    "rank-local readiness is not a shared certificate"
+                ),
+            ),
+        ):
+            for hook in (self.hooks._decode_graph, self.hooks._prefill_graph):
+                for _ in range(16):
+                    self.assertTrue(hook(lambda *a: True, runner, None))
+                controller.targets.append(SimpleNamespace(closed=True))
+                self.assertFalse(hook(lambda *a: True, runner, None))
+                # A local close cannot lift the lease before TP retirement.
+                controller.targets.clear()
+                self.assertTrue(hook(lambda *a: True, runner, None))
+                self.assertFalse(hook(lambda *a: False, runner, None))
+
+    def test_unmanaged_import_revokes_progressive_graph_fast_path(self):
+        """Manual imports cannot silently bypass the progressive lease protocol."""
+        for owned in (True, False):
+            with self.subTest(owned=owned):
+                controller = SimpleNamespace(graph_fast_path=True, targets=[])
+                model = SimpleNamespace(modules=lambda: [])
+                runner = SimpleNamespace(_pre_layerwise=controller, model=model)
+                scheduler = SimpleNamespace(
+                    _pre_layerwise=controller,
+                    tp_worker=SimpleNamespace(model_runner=runner),
+                )
+                state = SimpleNamespace(req=SimpleNamespace())
+                if owned:
+                    state.req._pre_layerwise_target = SimpleNamespace(
+                        owner=controller, state=state
+                    )
+                with (
+                    patch.dict(
+                        sys.modules,
+                        {
+                            "sglang.srt.layers.radix_attention": SimpleNamespace(
+                                RadixAttention=type("RadixAttention", (), {})
+                            )
+                        },
+                    ),
+                    patch.object(self.runtime, "_TARGET_STATES", []),
+                    patch.object(self.runtime, "_FB_CACHE", {}),
+                    patch.object(self.runtime, "PROFILE", False),
+                ):
+                    self.runtime._install_attention_wrappers(scheduler, state)
+                    self.assertEqual(controller.graph_fast_path, owned)
+                    self.assertEqual(self.runtime._TARGET_STATES, [state])
+        # Broadcast control revokes on every rank before a shard might fail
+        # early, rather than relying on that shard reaching wrapper install.
+        controller.graph_fast_path = True
+        controller.poll_sources = lambda: None
+        runtime = SimpleNamespace(
+            split_handoff_controls=self.runtime.split_handoff_controls,
+            execute_handoff_control=lambda *a: self.assertFalse(
+                controller.graph_fast_path
+            ),
+            maybe_handle_handoff_control=lambda *a: None,
+        )
+        sentinel = {self.runtime._HANDOFF_CTL_KEY: True, "data": {"cmd": "import"}}
+        with patch.object(self.hooks, "_runtime", return_value=runtime):
+            self.hooks._process_requests(lambda *a: None, scheduler, [sentinel])
+
     def test_failed_import_cannot_become_local_or_replayable(self):
         event = threading.Event()
         event.set()  # the receiver wakes waiters when transport fails
@@ -1472,6 +1555,17 @@ class TestRemoteAttn(CustomTestCase):
         # A ready/no-state shard, a missing layer, a native shape rejection,
         # and failure wakeups must all lead to the same branch on both ranks.
         self.assertEqual(rows[0]["graphs"], rows[1]["graphs"])
+        self.assertEqual(rows[0]["leases"], rows[1]["leases"])
+        self.assertTrue(rows[0]["leases"]["mismatch_rejected"])
+        self.assertTrue(rows[0]["leases"]["existing_state_fallback"])
+        self.assertGreater(rows[0]["leases"]["boundary_reductions"], 0)
+        self.assertEqual(rows[0]["leases"]["freed"], [0, 1, 2])
+        for snapshot, count in zip(
+            rows[0]["leases"]["snapshots"], (0, 1, 2, 1, 1, 0, 1, 0)
+        ):
+            self.assertEqual(snapshot["leases"], count)
+            self.assertEqual(snapshot["verdicts"], [[count == 0, count == 0]] * 16)
+            self.assertEqual(snapshot["forward_reductions"], 0)
         self.assertEqual(
             rows[0]["graphs"],
             [

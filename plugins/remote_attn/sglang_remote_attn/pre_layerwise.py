@@ -17,7 +17,7 @@ import os
 import secrets
 import threading
 import time
-from dataclasses import dataclass, field
+from dataclasses import asdict, dataclass, field
 from pathlib import Path
 
 logger = logging.getLogger(__name__)
@@ -464,6 +464,45 @@ class Controller:
         self.batches = 0
         self.early_admissions = 0
         self.stager = None
+        # Enabled only after graph configuration/capture manifests agree at
+        # startup. Membership of targets is then changed only by TP votes.
+        self.graph_fast_path = False
+
+    def validate_graphs(self):
+        from sglang.srt.runtime_context import get_exec
+
+        self.graph_fast_path = False
+        runner = self.scheduler.tp_worker.model_runner
+
+        def manifest(graph_runner):
+            if graph_runner is None:
+                return None
+            return (
+                type(graph_runner).__module__,
+                type(graph_runner).__qualname__,
+                tuple(getattr(graph_runner, "capture_bs", []) or []),
+                tuple(getattr(graph_runner, "capture_num_tokens", []) or []),
+                getattr(graph_runner, "max_bs", None),
+            )
+
+        signature = (
+            asdict(get_exec().graph.cuda_graph_config),
+            manifest(runner.decode_cuda_graph_runner),
+            manifest(runner.prefill_cuda_graph_runner),
+        )
+        clean = not _runtime().has_target_states()
+        if self.tp_size > 1:
+            import torch.distributed as dist
+
+            reports = [None] * self.tp_size
+            dist.all_gather_object(
+                reports, (signature, clean), group=self.scheduler.attn_tp_cpu_group
+            )
+            if any(item[0] != reports[0][0] for item in reports):
+                raise RuntimeError("remote_attn TP graph config/captures differ")
+            clean = all(item[1] for item in reports)
+        # An existing legacy import has no TP-agreed progressive lifetime.
+        self.graph_fast_path = clean
 
     def validate(self):
         from sglang.srt.environ import envs
@@ -893,6 +932,7 @@ def initialize(scheduler):
         return
     controller = Controller(scheduler, config)
     controller.validate()
+    controller.validate_graphs()
     scheduler._pre_layerwise = controller
     scheduler.tp_worker.model_runner._pre_layerwise = controller
 

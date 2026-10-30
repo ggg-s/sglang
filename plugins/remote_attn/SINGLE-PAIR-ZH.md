@@ -7,8 +7,8 @@
 
 当前范围是同机 Qwen3 dense NHD MHA BF16/FP16、同 TP、PP=DP=CP=1、page size 1、
 early allocation、mooncake_tcp，并关闭 radix cache、overlap scheduler。
-CUDA graphs 可以沿用原生配置：D 仍有未就绪层时全 TP eager，全部 Local 且满足
-原生 graph 条件后恢复 replay；P 最终 chunk 的分层 prefill 仍为 eager。
+CUDA graphs 可以沿用原生配置：D 持有提前准入请求的接收租约时全 TP eager，全部
+完成 GPU scatter 并经 TP 一致回收后恢复原生 graph 判断；P 最终 chunk 的分层 prefill 仍为 eager。
 容器中的 P/D 必须共享同一份本机目录及可互通的 loopback 网络。
 以下 TP2 示例使用 GPU 0、1 做 P，GPU 2、3 做 D；线上其他模型、显存和并发参数
 继续保留，但与这些限制冲突的能力需要先适配。
@@ -205,14 +205,21 @@ A'→layerwise 同时包含 staging 改变；layerwise→remote 还包含提前�
 通过 SMG 发足够长的输出请求，让同一请求覆盖 Remote 和 Local 两个阶段：
 
 1. 全部 D rank 都应出现 `[remote-attn-graph] kind=decode ... path=eager all_local=False`。
-2. 最慢 shard 的所有层完成 GPU scatter 后，各 rank 应出现
+2. 最慢 shard 的所有层完成 GPU scatter、原生传输完成且接收租约统一回收后，各 rank 应出现
    `path=graph-eligible all_local=True`；紧接着的 `Decode graph replay:` 才是实际 replay 证据。
    `all_local=True` 但 shape 不在原生 capture 范围时仍为 eager，符合预期。
 3. 配合 report 的各 shard `remote_calls > 0` 和 GPU trace，确认 Remote 阶段没有 replay、
    Local 后有 replay。再加入一个未导完的新请求，确认混合 batch 整批回到 eager，完成后再次恢复。
 
-TP>1 每次 graph eligibility 检查增加一次 CPU-group MIN all-reduce，包含没有 target state
-和原生 graph 判定失败的 rank；不能用 rank 本地短路省略。测量时保留这个成本，
+Progressive 使用已有提前准入/回收的 TP 投票维护相同的接收租约集合。非空期间全组
+eager，集合统一变空后恢复原生 graph 判断；graph 判断本身不再增加 collective，
+正常 Local decode 也不扫描逐层事件。Remote 期间已有的传输完成轮询同步仍然保留，
+不能称为整个生命周期只同步两次。启动时额外做一次配置/capture manifest 一致性检查。
+相较于所有层刚就绪就恢复，等待原生完成与统一回收可能多保留一段 eager 时间。
+
+各 TP rank 的原生输入、配置与 capture 范围仍须一致。Local 阶段沿用原生 eligibility，
+不再逐步检测原生 predicate 的 rank 间差异。旧手动迁移/import 命令会在全组撤销此
+fast path，该进程后续改用逐 forward 的保守投票；普通 status 查询不撤销。
 对比同一模型/请求/线上 chunk 和 optimistic 配置下 graph 开关两组的输出、ITL、吞吐。
 CPU 已验证状态机和真实双进程一致性；GPU 上的数值与实际 graph replay 仍须执行本节验收。
 实现及本地证据见 [CUDA graphs 适配记录](validation/PROGRESSIVE-CUDA-GRAPHS.md)。

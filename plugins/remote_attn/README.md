@@ -81,7 +81,7 @@ P0–P5.18 features to this port and distinguishes code coverage from deployment
 | Decode-style resume | Preserve `Req.kv` and its allocated row; set committed and allocated KV lengths; use the current `process_prebuilt(future_map)` API |
 | KV release / retraction | Fence target receiver writes before upstream frees KV; handle imports aborted before row admission |
 | Normal SSE output | Filter `_handoff_req` out of the regular output streamer; gateway/status retains output ownership |
-| CUDA graphs | TP MIN vote on native eligibility and GPU-local readiness for decode/prefill; Remote/layer waits stay eager, all-Local restores native replay; stamp decode graph step metadata at `execute` |
+| CUDA graphs | Progressive TP-agreed receiver leases gate eager/replay without a per-forward collective; legacy imports retain conservative TP votes; stamp decode graph step metadata at `execute` |
 | Mooncake | Create the send mutex before constructor threads start; serialize process-wide transport batches; probe changed peers before upstream registration publication |
 
 Main's existing `prefill_decode_interval` implements P5.10. The old scheduler
@@ -97,10 +97,13 @@ by default; the P5.19 adapter is enabled only through the plugin and its explici
 The initial port targets the supplied single-host Qwen3-8B setup: CUDA,
 plain TP (including TP2, with the same TP width across roles), dense NHD MHA KV in BF16/FP16, page size 1,
 radix cache disabled, and scheduler overlap disabled. Native CUDA graphs may
-remain enabled: each eligibility check reduces native eligibility and local
-KV readiness over the TP CPU group, even on ranks without target state.
-Remote or pending layerwise waits force eager execution on every rank;
-all-Local batches regain native replay eligibility without recapture.
+remain enabled. Progressive uses its existing TP admission/retirement votes
+to keep identical receiver leases: a live lease forces eager on every rank;
+once all leases retire, native replay eligibility resumes without recapture
+or an added per-forward collective. Startup checks graph configuration and
+capture manifests across ranks. Native TP input/config consistency remains
+required; legacy/manual imports revoke this fast path and retain the
+conservative per-forward native-eligibility/readiness vote.
 The final layer-split prefill stays eager; ordinary prefill retains its native
 graph dispatch. The older functional experiment launchers still disable graphs.
 See [graph adaptation and validation](validation/PROGRESSIVE-CUDA-GRAPHS.md).

@@ -4,6 +4,7 @@ import argparse
 import json
 import sys
 import threading
+from dataclasses import make_dataclass
 from datetime import timedelta
 from pathlib import Path
 from types import SimpleNamespace
@@ -11,6 +12,191 @@ from unittest.mock import patch
 
 import torch.distributed as dist
 from sglang_remote_attn.tp import agree_control_result, inject_control
+
+
+def progressive_graph_leases(args, context):
+    """Real admission/retirement votes with transport and model boundaries on CPU."""
+    import torch
+    from sglang_remote_attn import handoff_control as runtime
+    from sglang_remote_attn import hooks
+    from sglang_remote_attn.pre_layerwise import (
+        Config,
+        Controller,
+        LayerCoverage,
+        Target,
+        write_json,
+    )
+
+    root = Path(args.output).with_suffix(".leases")
+    config = make_dataclass("GraphConfig", [("decode", str), ("prefill", str)])(
+        "full", "breakable"
+    )
+    context.get_exec = lambda: SimpleNamespace(
+        graph=SimpleNamespace(cuda_graph_config=config)
+    )
+    model_runner = SimpleNamespace(model=SimpleNamespace(modules=lambda: []))
+    decode = SimpleNamespace(model_runner=model_runner, capture_bs=[1, 2, 4], max_bs=4)
+    prefill = SimpleNamespace(
+        model_runner=model_runner, capture_num_tokens=[4, 8], max_bs=4
+    )
+    model_runner.decode_cuda_graph_runner, model_runner.prefill_cuda_graph_runner = (
+        decode,
+        prefill,
+    )
+    scheduler = SimpleNamespace(
+        attn_tp_cpu_group=dist.group.WORLD,
+        tp_worker=SimpleNamespace(model_runner=model_runner),
+    )
+    controller = Controller.__new__(Controller)
+    controller.scheduler, controller.tp_size, controller.rank = scheduler, 2, args.rank
+    controller.layers, controller.early_admissions, controller.targets = 1, 0, []
+    controller.config = Config("remote", root)
+    scheduler._pre_layerwise = model_runner._pre_layerwise = controller
+    freed = []
+    queue = SimpleNamespace(
+        queue=[],
+        metadata_buffers=SimpleNamespace(bootstrap_room=torch.full((3, 1), 7)),
+        req_to_metadata_buffer_idx_allocator=SimpleNamespace(free=freed.append),
+        _commit_transfer_to_req=lambda *a, **kw: None,
+    )
+
+    def offer(index):
+        req = SimpleNamespace(
+            rid=str(index),
+            bootstrap_room=7,
+            output_ids=[],
+            kv=SimpleNamespace(req_pool_idx=index),
+            finished=lambda: False,
+        )
+        receiver = SimpleNamespace(status=2, clear=lambda: None)
+        receiver.poll = lambda: receiver.status
+        dr = SimpleNamespace(req=req, kv_receiver=receiver, metadata_buffer_index=index)
+        target = Target(
+            controller, queue, dr, root / str(index), str(index), LayerCoverage(2, 1)
+        )
+        dr._pre_layerwise_offer = target
+        queue.queue.append(dr)
+        return target
+
+    def ready(target):
+        write_json(
+            target.path / "ready.json",
+            {
+                "generation": target.generation,
+                "prefix_len": 2,
+                "service": {"handoff_id": target.generation},
+            },
+        )
+
+    def complete(target):
+        target.decode_req.kv_receiver.status = 4
+        write_json(
+            target.path / "layer-0.json",
+            {"generation": target.generation, "layer": 0, "start": 0, "end": 2},
+        )
+
+    reductions = 0
+    actual_reduce = dist.all_reduce
+
+    def counted_reduce(*a, **kw):
+        nonlocal reductions
+        reductions += 1
+        return actual_reduce(*a, **kw)
+
+    snapshots = []
+    with (
+        patch.dict(
+            sys.modules,
+            {
+                "sglang.srt.runtime_context": context,
+                "sglang.srt.disaggregation.base.conn": SimpleNamespace(
+                    KVPoll=SimpleNamespace(Success=4, Failed=0)
+                ),
+                "sglang.srt.layers.radix_attention": SimpleNamespace(
+                    RadixAttention=type("RadixAttention", (), {})
+                ),
+            },
+        ),
+        patch.object(runtime, "Path", return_value=root),
+        patch.object(runtime, "PROFILE", False),
+        patch.object(runtime, "RPC_PROFILE", False),
+        patch.object(runtime, "_TARGET_STATES", []),
+        patch.object(dist, "all_reduce", counted_reduce),
+    ):
+        controller.validate_graphs()
+        with patch.object(
+            runtime, "_TARGET_STATES", [object()] if args.rank == 0 else []
+        ):
+            controller.validate_graphs()
+            existing_state_fallback = not controller.graph_fast_path
+        # The same capture mismatch must fail startup on *both* ranks.
+        if args.rank == 1:
+            decode.capture_bs.append(8)
+        try:
+            controller.validate_graphs()
+            mismatch_rejected = False
+        except RuntimeError:
+            mismatch_rejected = True
+        if args.rank == 1:
+            decode.capture_bs.pop()
+        controller.validate_graphs()
+
+        def sample():
+            before = reductions
+            verdicts = []
+            # Include a Local steady-state burst, not just one lucky step.
+            for _ in range(16):
+                verdicts.append(
+                    [
+                        hooks._decode_graph(lambda *a: True, decode, None),
+                        hooks._prefill_graph(lambda *a: True, prefill, None),
+                    ]
+                )
+            snapshots.append(
+                {
+                    "leases": len(controller.targets),
+                    "verdicts": verdicts,
+                    "forward_reductions": reductions - before,
+                }
+            )
+
+        a = offer(0)
+        if args.rank == 0:
+            ready(a)
+        controller.early_targets(queue, None)  # One rank ready: neither admits.
+        sample()
+        ready(a)
+        controller.early_targets(queue, None)
+        sample()
+        b = offer(1)
+        ready(b)
+        controller.early_targets(queue, None)
+        sample()
+        complete(a)
+        controller.early_targets(queue, None)
+        sample()  # A retired; B still prevents replay.
+        if args.rank == 0:
+            complete(b)
+        controller.early_targets(queue, None)
+        sample()  # The fast shard must keep B's lease.
+        if args.rank == 1:
+            complete(b)
+        controller.early_targets(queue, None)
+        sample()
+        c = offer(2)
+        ready(c)
+        controller.early_targets(queue, None)
+        sample()  # A new admission revokes Local before the next forward.
+        complete(c)
+        controller.early_targets(queue, None)
+        sample()
+    return {
+        "snapshots": snapshots,
+        "mismatch_rejected": mismatch_rejected,
+        "existing_state_fallback": existing_state_fallback,
+        "boundary_reductions": reductions,
+        "freed": freed,
+    }
 
 
 def main():
@@ -149,6 +335,7 @@ def main():
                             hooks._prefill_graph(lambda *a: eligible, prefill, None),
                         ]
                     )
+        leases = progressive_graph_leases(args, context)
         Path(args.output).write_text(
             json.dumps(
                 {
@@ -157,6 +344,7 @@ def main():
                     "outcomes": outcomes,
                     "retirements": retirements,
                     "graphs": graphs,
+                    "leases": leases,
                 }
             )
         )
