@@ -11,6 +11,7 @@ from . import (
     decode_overlap,
     dsv41_layerwise,
     pre_layerwise,
+    prefill_overlap,
     segmented_graph,
     source_cache,
 )
@@ -47,8 +48,13 @@ def _scheduler_init(original, scheduler, *args, **kwargs):
             raise RuntimeError("DSV4.1 layerwise requires the native DSV4 KV pool")
         pre_layerwise.initialize(scheduler)
         return
-    from sglang.srt.runtime_context import get_schedule
+    from sglang.srt.runtime_context import get_disagg, get_schedule
 
+    if (
+        get_disagg().disaggregation_mode == "prefill"
+        and not get_schedule().disable_overlap_schedule
+    ):
+        raise RuntimeError("P overlap is supported only for DSV4.1 layerwise")
     if (
         get_schedule().page_size != 1
         or type(pool) is not MHATokenToKVPool
@@ -93,11 +99,18 @@ def validate_config():
     if get_exec().overlap.enable_two_batch_overlap:
         raise RuntimeError("remote_attn does not support two-batch overlap")
     if not schedule.disable_overlap_schedule and (
-        get_disagg().disaggregation_mode != "decode"
-        or os.environ.get("HANDOFF_PRE_LAYERWISE", "off") not in ("remote", "layerwise")
+        not (
+            get_disagg().disaggregation_mode == "prefill"
+            and os.environ.get("HANDOFF_PRE_LAYERWISE", "off") == "layerwise"
+        )
+        and (
+            get_disagg().disaggregation_mode != "decode"
+            or os.environ.get("HANDOFF_PRE_LAYERWISE", "off")
+            not in ("remote", "layerwise")
+        )
     ):
         raise RuntimeError(
-            "remote_attn requires --disable-overlap-schedule except progressive D"
+            "remote_attn requires --disable-overlap-schedule except progressive D or DSV4.1 layerwise P"
         )
     if not memory.disable_radix_cache and (
         get_disagg().disaggregation_mode != "prefill"
@@ -158,9 +171,15 @@ def _process_requests(original, scheduler, recv_reqs):
 
     requests, intents = split_controls(recv_reqs)
     requests, controls = runtime.split_handoff_controls(requests)
-    result = original(scheduler, requests)
     controller = getattr(scheduler, "_pre_layerwise", None)
+    p_overlap = getattr(controller, "prefill_overlap", None)
+    if p_overlap is not None:
+        for intent in intents:
+            p_overlap.retirement.arm(intent)
+    result = original(scheduler, requests)
     for intent in intents:
+        if p_overlap is not None:
+            continue
         overlap = getattr(controller, "decode_overlap", None)
         if overlap is None:
             raise RuntimeError("ordered retirement requires progressive D overlap")
@@ -247,6 +266,9 @@ def _alloc_extend(original, batch):
 
 
 def _reset_retracted(original, req):
+    lease = getattr(req, "_dsv41_p_lease", None)
+    if lease is not None:
+        lease.overlap.drain(req)
     result = original(req)
     req.handoff_prefix_indices = None
     req._handoff_prefix_indices = None
@@ -323,7 +345,19 @@ def _graph_decision(original, runner, forward_batch, kind):
     if (
         kind == "prefill"
         and getattr(controller, "dsv41_layerwise", False)
-        and (controller.plan is not None or controller.executing is not None)
+        and (
+            controller.plan is not None
+            or controller.executing is not None
+            or bool(
+                getattr(
+                    getattr(
+                        getattr(controller, "prefill_overlap", None), "current", None
+                    ),
+                    "jobs",
+                    [],
+                )
+            )
+        )
     ):
         # prepare agreed the batch across TP before any rank reaches this guard.
         return False
@@ -448,6 +482,10 @@ HOOKS = {
     "sglang.srt.disaggregation.mooncake.conn.MooncakeKVManager.__init__": _mooncake_init,
     "sglang.srt.disaggregation.mooncake.conn.MooncakeKVManager._transfer_data": _transfer,
     "sglang.srt.disaggregation.mooncake.conn.MooncakeKVManager.send_kvcache": dsv41_layerwise.send_selected,
+    "sglang.srt.disaggregation.mooncake.conn.MooncakeKVManager.add_transfer_request": prefill_overlap.track_transfer,
+    "sglang.srt.models.deepseek_v4_replay_tail.DecoderReplayTail.plan": prefill_overlap.tail_plan,
+    "sglang.srt.disaggregation.prefill.SchedulerDisaggregationPrefillMixin.clear_pending_chunk_send": prefill_overlap.before_mutation,
+    "sglang.srt.disaggregation.prefill.SchedulerDisaggregationPrefillMixin.optimistic_release_and_requeue": prefill_overlap.before_mutation,
     "sglang.srt.disaggregation.mooncake.conn.MooncakeKVManager._publish_peer_registration": _publish_peer,
 }
 
@@ -458,7 +496,7 @@ HOOKS.update(
         "sglang.srt.disaggregation.common.staging_handler.init_staging_buffers": pre_layerwise.init_staging_buffers,
         "sglang.srt.managers.scheduler.Scheduler.run_batch": pre_layerwise.run_batch,
         "sglang.srt.managers.scheduler.Scheduler.process_batch_result": decode_overlap.after_result,
-        "sglang.srt.managers.scheduler.Scheduler.launch_batch_sample_if_needed": decode_overlap.after_result,
+        "sglang.srt.managers.scheduler.Scheduler.launch_batch_sample_if_needed": prefill_overlap.after_sample,
         "sglang.srt.managers.scheduler.Scheduler.is_disable_overlap_for_batch": decode_overlap.disable_overlap,
         "sglang.srt.managers.scheduler.Scheduler.is_fully_idle": pre_layerwise.is_fully_idle,
         "sglang.srt.model_executor.model_runner.ModelRunner.forward": pre_layerwise.forward,

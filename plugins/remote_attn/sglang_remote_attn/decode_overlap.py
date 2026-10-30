@@ -121,6 +121,11 @@ def reap(original, queue, *args, **kwargs):
 
 
 def before_retract(original, *, req, **kwargs):
+    source = getattr(req, "_dsv41_p_lease", None)
+    if source is not None:
+        # Native release_req may back up source KV before release_kv_cache;
+        # waiting at the allocator alone would be too late.
+        source.overlap.drain(req)
     target = getattr(req, "_pre_layerwise_target", None)
     if target is not None and getattr(target.owner, "decode_overlap", None) is not None:
         # Native release_req backs up the KV BEFORE release_kv_cache, then resets
@@ -135,6 +140,13 @@ def before_retract(original, *, req, **kwargs):
 
 
 def after_result(original, scheduler, *args, **kwargs):
+    p_overlap = getattr(
+        getattr(scheduler, "_pre_layerwise", None), "prefill_overlap", None
+    )
+    if p_overlap is not None:
+        from .prefill_overlap import after_result as process_result
+
+        return process_result(original, scheduler, *args, **kwargs)
     result = original(scheduler, *args, **kwargs)
     controller = getattr(scheduler, "_pre_layerwise", None)
     overlap = getattr(controller, "decode_overlap", None)

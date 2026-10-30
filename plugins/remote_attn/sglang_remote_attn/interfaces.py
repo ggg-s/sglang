@@ -19,6 +19,7 @@ CORE_CALLS = {
     },
     MANAGER + "add_transfer_request": {
         "wait_event": None,
+        "indices_event": None,
         "kv_buffer_indices": None,
         "on_complete": None,
         "transfer_fn": None,
@@ -130,6 +131,20 @@ CORE_CALLS = {
     "sglang.srt.managers.scheduler.Scheduler.launch_batch_sample_if_needed": {
         "batch_result": inspect.Parameter.empty,
         "cur_batch": inspect.Parameter.empty,
+    },
+    "sglang.srt.models.deepseek_v4_replay_tail.DecoderReplayTail.plan": {
+        "forward_batch": inspect.Parameter.empty,
+        "num_tokens": inspect.Parameter.empty,
+        "tail_in_graph": inspect.Parameter.empty,
+        "late_dp_counts": inspect.Parameter.empty,
+    },
+    DISAGG + "common.conn.CommonKVSender.send": {"indices_event": None},
+    DISAGG
+    + "prefill.SchedulerDisaggregationPrefillMixin.optimistic_release_and_requeue": {
+        "req": inspect.Parameter.empty
+    },
+    DISAGG + "prefill.SchedulerDisaggregationPrefillMixin.clear_pending_chunk_send": {
+        "req": inspect.Parameter.empty
     },
 }
 CORE_PROPERTIES = (DISAGG + "mooncake.pinned_staging_core.CorePinnedStager.poisoned",)

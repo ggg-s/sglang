@@ -133,7 +133,7 @@ PY
 "$HANDOFF_PYTHON" -m sglang_remote_attn.check
 ```
 
-当前 preflight 应输出 `hooks: 29`、`core_interfaces: 70`、`send_probe: true`、
+当前 preflight 应输出 `hooks: 34`、`core_interfaces: 80`、`send_probe: true`、
 `plugin: remote_attn`。核心接口检查同时覆盖 metadata receiver 保留、选层发送、
 staging/host copy、任务与状态字段和 typed env；安装态检查实际加载模块，源码模式
 检查所选 checkout。直接启动服务的插件注册也执行核心检查。

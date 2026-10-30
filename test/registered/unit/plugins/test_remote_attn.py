@@ -2135,7 +2135,9 @@ class TestRemoteAttn(CustomTestCase):
                         patch.dict(os.environ, {"HANDOFF_PRE_LAYERWISE": mode}),
                     ):
                         disagg.disaggregation_mode = role
-                        if role == "decode" and mode != "off":
+                        if (role == "decode" and mode != "off") or (
+                            role == "prefill" and mode == "layerwise"
+                        ):
                             self.hooks.validate_config()
                         else:
                             with self.assertRaisesRegex(
@@ -3498,6 +3500,11 @@ class TestRemoteAttn(CustomTestCase):
         self.assertTrue(rows[0]["d_overlap"]["notice_retry_ok"])
         self.assertEqual(rows[0]["d_overlap"]["registered"], 0)
         self.assertEqual(rows[0]["d_overlap"]["gpu_proven"], 1)
+        self.assertEqual(rows[0]["p_overlap"], rows[1]["p_overlap"])
+        self.assertEqual(
+            rows[0]["p_overlap"],
+            dict(votes=[5, 5], freed=[1, 2], commits=2, registered=0, local_votes=0),
+        )
         self.assertTrue(rows[0]["leases"]["existing_state_fallback"])
         self.assertGreater(rows[0]["leases"]["boundary_reductions"], 0)
         self.assertEqual(rows[0]["leases"]["freed"], [0, 1, 2])
@@ -5580,6 +5587,381 @@ class TestRemoteAttn(CustomTestCase):
             context=context,
             native_send=scheduler_cls.send_kv_chunk,
         )
+
+    def _dsv41_overlap_fixture(self):
+        from sglang_remote_attn import prefill_overlap as po
+
+        f = self._dsv41_fixture()
+        f.po = po
+        f.controller.prefill_overlap = po.PrefillOverlap(f.controller)
+        self.addCleanup(f.controller.prefill_overlap.retirement.close)
+        f.overlap = f.controller.prefill_overlap
+        f.manager._dsv41_p_overlap = f.overlap
+        add = f.manager.add_transfer_request
+        f.manager.add_transfer_request = lambda *a, **kw: po.track_transfer(
+            lambda manager, *args, **kwargs: add(*args, **kwargs), f.manager, *a, **kw
+        )
+        f.scheduler.send_kv_chunk = lambda req, **kw: (
+            self.hooks.pre_layerwise.send_chunk(f.native_send, f.scheduler, req, **kw)
+        )
+        f.batch.forward_mode.is_prebuilt = lambda: False
+        f.batch.copy = lambda: copy.copy(f.batch)
+        f.runner.model.model._dsv41_p_overlap = f.overlap
+        return f
+
+    def test_dsv41_overlap_interleaves_middle_final_and_other_batch_without_cursor_replay(
+        self,
+    ):
+        f = self._dsv41_overlap_fixture()
+        events = []
+
+        class GPUEvent:
+            def __init__(self):
+                self.done = False
+                events.append(self)
+
+            def record(self, stream):
+                pass
+
+            def query(self):
+                return self.done
+
+        def indices(raw, page):
+            event = GPUEvent()
+            return (raw[::page] // page).numpy().copy(), event, (raw, event)
+
+        def forward(runner, batch):
+            for layer in runner.model.model.layers:
+                layer(torch.zeros(1))
+            return None
+
+        def launch(scheduler, batch):
+            f.controller.forward(forward, f.runner, batch)
+            return SimpleNamespace(delay_sample_func=lambda: None, copy_done=GPUEvent())
+
+        with (
+            patch.dict(sys.modules, f.modules),
+            patch.object(torch.cuda, "Event", GPUEvent),
+            patch.object(torch.cuda, "current_stream", lambda: None),
+            patch.object(f.po, "page_indices", indices),
+        ):
+            # Native A-middle sends immediately; A's result remains unprocessed.
+            a = f.overlap.run_batch(launch, f.scheduler, f.batch)
+            lease = f.req._dsv41_p_lease
+            self.assertEqual((f.req.start_send_idx, f.sender.curr_idx), (16, 2))
+            self.assertEqual(f.tasks.qsize(), 1)
+            # Launch another row before processing A, as the native overlap loop does.
+            req_b = copy.copy(f.req)
+            req_b.kv = SimpleNamespace(req_pool_idx=1)
+            req_b._dsv41_p_lease = None
+            req_b.disagg_kv_sender = copy.copy(f.sender)
+            req_b.disagg_kv_sender.bootstrap_room = req_b.bootstrap_room = 8
+            req_b.rid = "other-row"
+            f.batch.reqs = [req_b]  # no matching offer: ordinary native launch
+            b = f.overlap.run_batch(launch, f.scheduler, f.batch)
+            self.assertFalse(hasattr(b, "_dsv41_p_plan"))
+            self.assertIs(a._dsv41_p_plan.chunks[0].req, f.req)
+            self.assertIs(a._dsv41_p_plan.batch.reqs[0], f.req)
+            f.batch.reqs = [f.req]
+            f.req.extend_end, f.req.extend_len = 33, 17
+            final = f.overlap.run_batch(launch, f.scheduler, f.batch)
+            self.assertIsNot(a._dsv41_p_plan, final._dsv41_p_plan)
+            self.assertIs(f.req._dsv41_p_lease, lease)
+            self.assertEqual(len(lease.plans), 2)
+            self.assertEqual((f.req.start_send_idx, f.sender.curr_idx), (33, 5))
+            before = f.tasks.qsize()
+            f.po.after_result(
+                lambda s, batch, result: s.send_kv_chunk(
+                    f.req, last_chunk=False, end_idx=16
+                ),
+                f.scheduler,
+                a._dsv41_p_plan.batch,
+                a,
+            )
+            self.assertEqual(f.tasks.qsize(), before)  # no duplicate middle
+            f.po.after_result(
+                lambda s, batch, result: s.send_kv_chunk(f.req, last_chunk=True),
+                f.scheduler,
+                final._dsv41_p_plan.batch,
+                final,
+            )
+            envelopes = [f.tasks.get_nowait() for _ in range(f.tasks.qsize())]
+            self.assertEqual(len(envelopes), 6)  # middle + 4 producers + final states
+            self.assertEqual(envelopes[0].indices.tolist(), [1, 2])
+            self.assertTrue(
+                all(t.indices.tolist() == [3, 4, 5] for t in envelopes[1:-1])
+            )
+            self.assertEqual(envelopes[-1].state_indices[1].tolist(), [0])
+            self.assertEqual(envelopes[-1].indices.size, 0)
+            self.assertEqual(f.sender._transfer_num_kv_indices, 5)
+            freed = []
+            self.assertTrue(f.overlap.defer_release(f.req, lambda: freed.append("A")))
+            # A ready sender alone is insufficient while CUDA/IO proofs lag.
+            f.native_status[0] = f.polls.Success
+            self.assertFalse(lease.ready_to_finish())
+            for event in events:
+                event.done = True
+            self.assertFalse(
+                lease.ready_to_finish()
+            )  # deferred sampling event unrecorded
+            a.delay_sample_func = final.delay_sample_func = None
+            self.assertFalse(lease.ready_to_finish())  # queued tasks, not just inflight
+            for task in envelopes:
+                task.on_complete()
+            self.assertTrue(lease.ready_to_finish())
+            for _ in range(20):
+                f.overlap.poll()
+            self.assertEqual(f.overlap.retirement.final_votes, 0)
+            command = f.overlap.retirement.poll_command()
+            f.overlap.retirement.arm(command)
+            f.overlap.retirement.finalize()
+            self.assertEqual(freed, ["A"])
+            self.assertEqual(f.overlap.retirement.final_votes, 1)
+            self.assertIsNone(f.req._pre_layerwise_source)
+            self.assertIsNone(f.req._dsv41_p_lease)
+            self.assertFalse(f.overlap.leases)
+            f.po.after_result(lambda *a: None, f.scheduler, f.batch, b)
+            b.delay_sample_func = None
+            f.overlap.poll()
+            self.assertFalse(f.overlap.plans)
+
+    def test_dsv41_overlap_two_final_batches_keep_producers_and_result_owners_separate(
+        self,
+    ):
+        f = self._dsv41_overlap_fixture()
+        f.scheduler.req_to_token_pool.req_to_token = (
+            f.scheduler.req_to_token_pool.req_to_token.repeat(2, 1)
+        )
+        f.req.extend_end, f.req.extend_len = 33, 33
+        other = copy.copy(f.req)
+        other.kv = SimpleNamespace(req_pool_idx=1, is_kv_released=False)
+        other.rid, other.bootstrap_room = "other-final", 8
+        other.disagg_kv_sender = copy.copy(f.sender)
+        other.disagg_kv_sender.bootstrap_room = 8
+        f.manager.transfer_infos[8] = f.manager.transfer_infos[7]
+        pl = self.hooks.pre_layerwise
+        offer = pl.read_json(f.controller.config.directory / "7/0/offer.json")
+        pl.write_json(
+            f.controller.config.directory / "8/0/offer.json",
+            dict(offer, generation="attempt-B"),
+        )
+        model = f.runner.model.model
+        saved_tail = model.decoder_replay_tail
+        trace = []
+
+        class Event:
+            def record(self, stream):
+                pass
+
+            def query(self):
+                return True
+
+        def index(raw, page):
+            return (raw[::page] // page).numpy().copy(), Event(), (raw,)
+
+        def compute(runner, batch):
+            self.assertIs(model.decoder_replay_tail, saved_tail)
+            self.assertEqual(
+                f.po.tail_plan(
+                    lambda *a, **kw: (True, None), SimpleNamespace(_model=model)
+                ),
+                (False, None),
+            )
+            for layer in model.layers:
+                layer(torch.zeros(1))
+            trace.append([s.req.rid for s in f.overlap.current.jobs])
+
+        def launch(scheduler, batch):
+            f.controller.forward(compute, f.runner, batch)
+            return SimpleNamespace(delay_sample_func=None, copy_done=Event())
+
+        with (
+            patch.dict(sys.modules, f.modules),
+            patch.object(torch.cuda, "Event", Event),
+            patch.object(torch.cuda, "current_stream", lambda: None),
+            patch.object(f.po, "page_indices", index),
+        ):
+            first = f.overlap.run_batch(launch, f.scheduler, f.batch)
+            a = first._dsv41_p_plan
+            f.batch.reqs = [other]
+            second = f.overlap.run_batch(launch, f.scheduler, f.batch)
+            b = second._dsv41_p_plan
+            self.assertEqual(trace, [["dsv-long"], ["other-final"]])
+            self.assertIs(a.jobs[0].req, f.req)
+            self.assertIs(b.jobs[0].req, other)
+            self.assertEqual(f.tasks.qsize(), 8)
+            freed = []
+            for req, result, plan in ((f.req, first, a), (other, second, b)):
+                f.po.after_result(
+                    lambda scheduler, batch, result: scheduler.send_kv_chunk(
+                        req, last_chunk=True
+                    ),
+                    f.scheduler,
+                    plan.batch,
+                    result,
+                )
+                f.overlap.defer_release(req, lambda req=req: freed.append(req.rid))
+            for _ in range(f.tasks.qsize()):
+                f.tasks.get_nowait().on_complete()
+            f.native_status[0] = f.polls.Success
+            f.overlap.poll()
+            f.overlap.retirement.arm(f.overlap.retirement.poll_command())
+            f.overlap.retirement.finalize()
+            self.assertEqual(freed, ["dsv-long", "other-final"])
+            self.assertFalse(f.overlap.leases)
+            self.assertEqual(
+                f.po.tail_plan(
+                    lambda *a, **kw: (True, None), SimpleNamespace(_model=model)
+                ),
+                (True, None),
+            )
+            f.overlap.poll()
+            self.assertFalse(f.overlap.plans)
+
+    def test_dsv41_overlap_retraction_and_reset_fence_before_native_mutation(self):
+        from sglang_remote_attn.decode_overlap import before_retract
+
+        f = self._dsv41_overlap_fixture()
+        for hook in (
+            lambda original, req: before_retract(original, req=req),
+            lambda original, req: self.hooks._reset_retracted(original, req),
+            lambda original, req: f.po.before_mutation(
+                lambda scheduler, req: original(req), f.scheduler, req
+            ),
+        ):
+            with self.subTest(hook=hook):
+                chunk = f.po.Chunk(f.req, f.sender, None, 0, 0, 16, False)
+                lease = f.po.SourceLease(
+                    f.overlap, chunk, f.overlap.retirement.last_admission + 1, "attempt"
+                )
+                plan = f.po.LaunchPlan(1, f.batch, (chunk,), [], [])
+                event = SimpleNamespace(query=lambda: True)
+                plan.forward_done = event
+                plan.proof.result = SimpleNamespace(
+                    delay_sample_func=None, copy_done=event
+                )
+                lease.plans.append(plan)
+                f.req._dsv41_p_lease = lease
+                f.overlap.leases.append(lease)
+                f.overlap.by_room[7] = lease
+                f.overlap.retirement.register(lease)
+
+                def mutate(*args, **kwargs):
+                    self.assertTrue(lease.closed)
+                    self.assertIsNone(f.req._dsv41_p_lease)
+                    return "native"
+
+                self.assertEqual(hook(mutate, f.req), "native")
+                self.assertFalse(f.overlap.leases)
+        # A bypassed reset/row reuse is detected rather than freeing the new owner.
+        lease.chunk.req.kv.req_pool_idx = 2
+        with self.assertRaisesRegex(RuntimeError, "attempt/row changed"):
+            lease.check()
+
+    def test_dsv41_overlap_cancel_inherits_queued_native_work_and_fences_before_reset(
+        self,
+    ):
+        f = self._dsv41_overlap_fixture()
+        done = SimpleNamespace(query=lambda: False)
+        # A native prefix may be queued before plugin admission. Its ledger must survive.
+        f.manager.add_transfer_request(7, [], slice(0, 0), False)
+        task = f.tasks.get_nowait()
+        ledger = f.overlap.ledgers[7]
+        chunk = f.po.Chunk(f.req, f.sender, None, 0, 0, 16, False)
+        lease = f.po.SourceLease(f.overlap, chunk, 1, "attempt-1", ledger=ledger)
+        result = SimpleNamespace(delay_sample_func=lambda: None, copy_done=None)
+        plan = f.po.LaunchPlan(1, f.batch, (chunk,), [], [])
+        plan.proof.result, plan.forward_done = result, done
+        lease.plans.append(plan)
+        f.req._dsv41_p_lease = lease
+        f.overlap.leases.append(lease)
+        f.overlap.by_room[7] = lease
+        f.overlap.retirement.register(lease)
+        reset = []
+        lease.cancelling = True
+        self.assertFalse(lease.ready_to_finish())
+        done.query = lambda: True
+        self.assertFalse(lease.ready_to_finish())  # KVPoll.Failed is not an IO fence
+        f.native_status[0] = f.polls.Failed
+        task.on_complete()
+        # Cancellation need not submit delayed sampling; it never reads source KV.
+        f.po.before_mutation(lambda *a: reset.append(True), f.scheduler, f.req)
+        self.assertEqual(reset, [True])
+        self.assertTrue(lease.closed)
+        self.assertFalse(f.overlap.leases)
+        self.assertIsNotNone(result.delay_sample_func)
+
+    def test_dsv41_overlap_failed_gpu_or_transfer_retains_lease(self):
+        f = self._dsv41_overlap_fixture()
+        chunk = f.po.Chunk(f.req, f.sender, None, 0, 0, 16, False)
+        lease = f.po.SourceLease(f.overlap, chunk, 1, "attempt-1")
+        plan = f.po.LaunchPlan(1, f.batch, (chunk,), [], [])
+        plan.proof.result = SimpleNamespace(
+            delay_sample_func=None,
+            copy_done=SimpleNamespace(
+                query=lambda: True, error=ValueError("copy failed")
+            ),
+        )
+        plan.forward_done = SimpleNamespace(query=lambda: True)
+        lease.plans.append(plan)
+        f.overlap.leases.append(lease)
+        f.overlap.by_room[7] = lease
+        f.overlap.retirement.register(lease)
+        f.req._dsv41_p_lease = lease
+        with self.assertRaisesRegex(RuntimeError, "copy failed"):
+            lease.gpu_ready()
+        plan.error = "partial forward"
+        with self.assertRaisesRegex(RuntimeError, "retaining KV"):
+            lease.gpu_ready()
+        self.assertFalse(lease.closed)
+        plan.error = None
+
+        def failed(*args, **kwargs):
+            raise OSError("queue failed")
+
+        with self.assertRaises(OSError):
+            f.po.track_transfer(failed, f.manager, 7, [], slice(0, 0), False)
+        with self.assertRaisesRegex(RuntimeError, "retaining KV"):
+            f.overlap.drain(f.req)
+        self.assertIs(f.req._dsv41_p_lease, lease)
+        self.assertFalse(lease.closed)
+
+    def test_dsv41_overlap_release_failure_cannot_retry_allocator_callback(self):
+        f = self._dsv41_overlap_fixture()
+        chunk = f.po.Chunk(f.req, f.sender, None, 0, 0, 16, False)
+        lease = f.po.SourceLease(f.overlap, chunk, 1, "attempt")
+        lease.cancelling = True
+        calls = []
+
+        def failed_release():
+            calls.append(True)
+            raise OSError("allocator partially changed")
+
+        lease.release = failed_release
+        with self.assertRaises(OSError):
+            lease.finish()
+        with self.assertRaisesRegex(RuntimeError, "retaining KV"):
+            lease.finish()
+        self.assertEqual(calls, [True])
+        self.assertFalse(lease.closed)
+
+    def test_dsv41_overlap_long_prompt_short_final_tail_uses_prompt_policy(self):
+        f = self._dsv41_overlap_fixture()
+        selected = []
+        f.req.origin_input_ids = list(range(32768))
+        f.req.extend_end, f.req.extend_len = 32768, 17
+        chunk = f.po.Chunk(f.req, f.sender, None, 0, 32751, 32768, True)
+        plan = f.po.LaunchPlan(1, f.batch, (chunk,), [None], [1])
+        with patch.object(
+            type(f.controller.config),
+            "select_group_size",
+            lambda self, layers, tokens, chunk: selected.append((tokens, chunk)) or 0,
+        ):
+            self.assertIsNone(f.controller.prepare(f.batch, plan=plan))
+        self.assertEqual(selected, [(32768, 17)])
+        auto = dataclasses.replace(f.controller.config, group_size=0)
+        self.assertGreater(auto.select_group_size(40, selected[0][0], 17), 0)
+        self.assertEqual(auto.select_group_size(40, 17, 17), 0)
 
     def test_dsv41_native_manifest_maps_shared_kv_and_fp4_scales_once(self):
         f = self._dsv41_fixture()

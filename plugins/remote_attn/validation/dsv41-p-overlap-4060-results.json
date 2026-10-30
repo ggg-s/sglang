@@ -1,0 +1,39 @@
+{
+  "device": "NVIDIA GeForce RTX 4060 Laptop GPU",
+  "torch": "2.13.0+cu130",
+  "cuda": "13.0",
+  "pending_indices_observed": true,
+  "pinned_indices_equal": true,
+  "launch_plans": 3,
+  "io_callbacks": 3,
+  "releases": [
+    "normal",
+    "cancel"
+  ],
+  "final_votes": 2,
+  "empty_poll_votes": 0,
+  "cancel_with_unsubmitted_sampling": true,
+  "no_post_release_write": true,
+  "source_sha256": {
+    "prefill_overlap_cuda_probe.py": "1a3f4695a6792ffec338238a3665a9d98e1845bceddc0a11ae3cbd7d46979588",
+    "__init__.py": "f64e878600a7775c62cd79063dbd94d92ccfd6513909f6fed3a221758ebe067f",
+    "check.py": "a7e23c69b57df34ec943df1aad40e4a4e11171fc30cb0f7fcb8ee9072bada438",
+    "compat.py": "8772dd8af6143737b0ccbd53a3a88cc441259e9cadb374e66547abe8b420a971",
+    "decode_overlap.py": "a697a43698065c8d8df0c09246c291ccc26b9d2495d114d3656b26ab6f0c95c1",
+    "dsv41_layerwise.py": "2f12bcf4637111d48d383e55937af24be60be2030f1b698c30383f44134d257f",
+    "handoff_control.py": "797319385d0956b8f57454e234e7ce36444008b5ab20b607fb35ec783a5bb402",
+    "hooks.py": "e5d310e4c4088455e91a7d016252f90e7ab1f41d92fbebbe6d2d469bdcb863a2",
+    "interfaces.py": "28c7cc6225a64df4efe024b71d25727360d17bb86493d07813e703f92aa9e73f",
+    "pre_layerwise.py": "8cb33bec3601140d59441632f1fd1495acd0ef7cb65b7e3f616ce7fb9396b4e0",
+    "prefill_overlap.py": "221b039c930483747f7327eb977ebfef48cbecdae73dd007e62f5cee4618adaa",
+    "retirement.py": "a5dec5c9061273cf847c4a7a8e1f63edb0c7e57ae23ebbd309ed427ca97fbf1e",
+    "segmented_graph.py": "f061c51f66ecfa8b4501bf4108299170f505d16297725f00db23ee36c383308d",
+    "source_cache.py": "9809811defb8ab2612eefbfb961ae0be721aa7da937e7c40c76df046cbcc76d9",
+    "tp.py": "766b5028a3a08a801c2891580e406a40f1868d7d21cde8ef46be1d76b86b059c"
+  },
+  "limitations": [
+    "No DSV4.1 model load or token accuracy/performance measurement",
+    "IO callback fixture; no Mooncake TE or SMG",
+    "TP1 CUDA; real TP2 Gloo is covered separately on CPU"
+  ]
+}

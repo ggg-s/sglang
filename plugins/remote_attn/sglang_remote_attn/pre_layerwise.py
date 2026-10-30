@@ -1057,6 +1057,14 @@ def initialize(scheduler):
     controller = cls(scheduler, config)
     controller.validate()
     controller.validate_graphs()
+    controller.prefill_overlap = None
+    if (
+        getattr(controller, "dsv41_layerwise", False)
+        and scheduler.disaggregation_mode.value == "prefill"
+    ):
+        from .prefill_overlap import install as install_prefill_overlap
+
+        controller.prefill_overlap = install_prefill_overlap(controller)
     from .source_cache import install
 
     if not getattr(controller, "dsv41_layerwise", False):
@@ -1072,7 +1080,9 @@ def run_batch(original, scheduler, batch, *args, **kwargs):
     controller = getattr(scheduler, "_pre_layerwise", None)
     if controller is None:
         return original(scheduler, batch, *args, **kwargs)
-    overlap = getattr(controller, "decode_overlap", None)
+    overlap = getattr(controller, "prefill_overlap", None) or getattr(
+        controller, "decode_overlap", None
+    )
     if overlap is not None:
         return overlap.run_batch(original, scheduler, batch, *args, **kwargs)
     if getattr(controller, "cache_guard", None) is not None:
@@ -1095,6 +1105,13 @@ def forward(original, runner, fb, *args, **kwargs):
 
 
 def send_chunk(original, scheduler, req, last_chunk=False, end_idx=None):
+    overlap = getattr(
+        getattr(scheduler, "_pre_layerwise", None), "prefill_overlap", None
+    )
+    if overlap is not None:
+        return overlap.send_chunk(
+            original, scheduler, req, last_chunk=last_chunk, end_idx=end_idx
+        )
     source = getattr(req, "_pre_layerwise_source", None)
     if source is None or not last_chunk:
         return original(scheduler, req, last_chunk=last_chunk, end_idx=end_idx)
@@ -1126,6 +1143,9 @@ def pop_transferred(original, queue, rids_to_check=None):
 
 
 def defer_release(req, release, *, checkpoint=None):
+    lease = getattr(req, "_dsv41_p_lease", None)
+    if lease is not None:
+        return lease.overlap.defer_release(req, release)
     source = getattr(req, "_pre_layerwise_source", None)
     if source is not None and (
         source.error is not None
@@ -1177,7 +1197,10 @@ def defer_release(req, release, *, checkpoint=None):
 
 def poll(scheduler):
     controller = getattr(scheduler, "_pre_layerwise", None)
-    if controller is not None and getattr(controller, "sources", None):
+    overlap = getattr(controller, "prefill_overlap", None)
+    if overlap is not None:
+        overlap.poll()
+    elif controller is not None and getattr(controller, "sources", None):
         controller.poll_sources()
 
 
@@ -1186,7 +1209,11 @@ def is_fully_idle(original, scheduler, for_health_check=False, ignore_waiting=Fa
     if (
         not for_health_check
         and controller is not None
-        and (controller.sources or controller.targets)
+        and (
+            controller.sources
+            or controller.targets
+            or bool(getattr(getattr(controller, "prefill_overlap", None), "leases", []))
+        )
     ):
         # Native queues no longer contain early-admitted/leased requests.
         # Prevent idle flush/reset and false leak checks while they own pages.
@@ -1200,6 +1227,8 @@ def shutdown(scheduler):
     controller = getattr(scheduler, "_pre_layerwise", None)
     if controller is None:
         return
+    if getattr(controller, "prefill_overlap", None) is not None:
+        controller.prefill_overlap.close()
     if getattr(controller, "decode_overlap", None) is not None:
         try:
             controller.drain_targets()

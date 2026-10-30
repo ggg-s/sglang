@@ -194,6 +194,8 @@ class DSV41Source(Source):
     submitted: set = field(default_factory=set)
     completed: set = field(default_factory=set)
     defer_native_release: bool = True
+    indices_event: object = None
+    indices_keepalive: object = None
 
     def complete_group(self, producer, indices):
         self.completed.update(indices)
@@ -220,6 +222,7 @@ class DSV41Source(Source):
                 self.index_slice,
                 False,
                 wait_event=event,
+                indices_event=self.indices_event,
                 kv_buffer_indices=indices,
                 on_complete=functools.partial(self.complete_group, boundary, indices),
                 trace_ctx=sender.trace_ctx.copy_for_thread(),
@@ -349,7 +352,7 @@ class DSV41Controller(Controller):
             write_json(target.path.parent / "offer.json", offer)
         return target
 
-    def prepare(self, batch):
+    def candidates(self, batch, *, allow_middle=False):
         from sglang.srt.disaggregation.mooncake.conn import MooncakeKVSender
         from sglang.srt.disaggregation.utils import DisaggregationMode
 
@@ -364,20 +367,30 @@ class DSV41Controller(Controller):
             or batch.input_embeds is not None
             or batch.replace_embeds is not None
         ):
-            return None
+            return [None] * len(batch.reqs)
         candidates = []
         for req in batch.reqs:
             candidate = None
             sender = getattr(req, "disagg_kv_sender", None)
+            lease = getattr(req, "_dsv41_p_lease", None)
             if (
                 type(sender) is MooncakeKVSender
                 and not req.pending_bootstrap
                 and not getattr(req, "session_id", None)
-                and req.inflight_middle_chunks <= 0
-                and req.extend_end == len(req.origin_input_ids)
+                and (allow_middle or req.inflight_middle_chunks <= 0)
+                and (allow_middle or req.extend_end == len(req.origin_input_ids))
                 and req.multimodal_inputs is None
                 and req.input_embeds is None
                 and getattr(req, "_pre_layerwise_source", None) is None
+                and not getattr(
+                    getattr(req, "_dsv41_p_lease", None), "cancelling", False
+                )
+                and (
+                    not allow_middle
+                    or self.config.select_group_size(
+                        self.layers, len(req.origin_input_ids), req.extend_len
+                    )
+                )
             ):
                 mgr = sender.kv_mgr
                 root = (
@@ -394,6 +407,7 @@ class DSV41Controller(Controller):
                 page = schema["page_size"]
                 if (
                     offer
+                    and (lease is None or offer.get("generation") == lease.generation)
                     and offer.get("dsv41") == schema
                     and offer.get("mode") == "layerwise"
                     and offer.get("tp_size") == self.tp_size
@@ -415,15 +429,40 @@ class DSV41Controller(Controller):
                     and 0 <= req.start_send_idx < req.extend_end
                     and req.start_send_idx % page == 0
                     and sender.curr_idx == req.start_send_idx // page
-                    and sender.num_kv_indices == (req.extend_end + page - 1) // page
+                    and sender.num_kv_indices
+                    == (len(req.origin_input_ids) + page - 1) // page
                 ):
                     candidate = req, sender, root, offer, peers, schema
             candidates.append(candidate)
-        accepted = self.agree([int(c is not None) for c in candidates])
+        return candidates
+
+    def prepare(self, batch, *, plan=None):
+        s = self.scheduler
+        if plan is None:
+            candidates = self.candidates(batch)
+            accepted = self.agree([int(c is not None) for c in candidates])
+        else:
+            candidates = plan.candidates
+            accepted = [
+                int(take and chunk.final)
+                for take, chunk in zip(plan.accepted, plan.chunks)
+            ]
         tokens = sum(req.extend_len for req, take in zip(batch.reqs, accepted) if take)
         group_size = self.config.select_group_size(
             self.layers,
-            tokens,
+            max(
+                tokens,
+                max(
+                    (
+                        len(req.origin_input_ids)
+                        for req, take in zip(batch.reqs, accepted)
+                        if take
+                    ),
+                    default=0,
+                ),
+            )
+            if plan is not None
+            else tokens,
             sum(req.extend_len for req in batch.reqs) // len(batch.reqs),
         )
         if not group_size:
@@ -434,17 +473,30 @@ class DSV41Controller(Controller):
                 continue
             req, sender, root, offer, peers, schema = candidate
             page = schema["page_size"]
-            indices = (
-                (
+            indices_event = keepalive = None
+            if plan is not None:
+                from .prefill_overlap import page_indices
+
+                indices, indices_event, keepalive = page_indices(
                     s.req_to_token_pool.req_to_token[
-                        req.kv.req_pool_idx, req.start_send_idx : req.extend_end : page
-                    ]
-                    // page
+                        req.kv.req_pool_idx, req.start_send_idx : req.extend_end
+                    ],
+                    page,
                 )
-                .to("cpu")
-                .numpy()
-                .copy()
-            )
+                plan.indices_refs.append(keepalive)
+            else:
+                indices = (
+                    (
+                        s.req_to_token_pool.req_to_token[
+                            req.kv.req_pool_idx,
+                            req.start_send_idx : req.extend_end : page,
+                        ]
+                        // page
+                    )
+                    .to("cpu")
+                    .numpy()
+                    .copy()
+                )
             indices, index_slice, last, skip = sender._prepare_send_indices(indices)
             if skip or not last or len(indices) != index_slice.stop - index_slice.start:
                 raise RuntimeError("unexpected DSV4.1 page reservation")
@@ -461,6 +513,8 @@ class DSV41Controller(Controller):
                 group_size=group_size,
                 prefill_chunk_tokens=req.extend_len,
                 groups=groups,
+                indices_event=indices_event,
+                indices_keepalive=keepalive,
             )
             sender.kv_mgr._dsv41_layerwise_schema = schema
             sender._record_transfer_indices(indices, None)
@@ -483,9 +537,12 @@ class DSV41Controller(Controller):
         return jobs or None
 
     def _after_layer(self, layer_id, module, args, result):
-        if self.executing is None or not any(
+        overlap = getattr(self, "prefill_overlap", None)
+        plan = overlap.current if overlap is not None else None
+        jobs = plan.jobs if plan is not None else self.executing
+        if jobs is None or not any(
             boundary <= layer_id and boundary not in source.submitted
-            for source in self.executing
+            for source in jobs
             for boundary, _ in source.groups
         ):
             return
@@ -493,10 +550,13 @@ class DSV41Controller(Controller):
 
         event = torch.cuda.Event()
         event.record(torch.cuda.current_stream())
-        for source in self.executing:
+        for source in jobs:
             source.enqueue(layer_id, event)
 
     def forward(self, original, runner, fb, *args, **kwargs):
+        overlap = getattr(self, "prefill_overlap", None)
+        if overlap is not None:
+            return overlap.forward(original, runner, fb, *args, **kwargs)
         if self.plan is None:
             return original(runner, fb, *args, **kwargs)
         import torch

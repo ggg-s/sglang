@@ -515,6 +515,107 @@ def decode_overlap_lifetimes(args):
         protocol.close()
 
 
+def prefill_overlap_lifetimes(args):
+    """P source adapter over real Gloo, asymmetric GPU/IO and rank generations."""
+    from sglang_remote_attn.pre_layerwise import Config, Controller
+    from sglang_remote_attn.prefill_overlap import (
+        Chunk,
+        LaunchPlan,
+        PrefillOverlap,
+        SourceLease,
+    )
+    from sglang_remote_attn.retirement import split_controls
+
+    controller = Controller.__new__(Controller)
+    controller.scheduler = SimpleNamespace(attn_tp_cpu_group=dist.group.WORLD)
+    controller.rank, controller.tp_size, controller.sources = args.rank, 2, []
+    controller.config = Config("layerwise", Path(args.output), drain_timeout=3)
+    overlap = PrefillOverlap(controller)
+    protocol = overlap.retirement
+    votes, freed = [], []
+    actual = dist.all_reduce
+
+    def counted(tensor, *a, **kw):
+        votes.append(tensor.numel())
+        return actual(tensor, *a, **kw)
+
+    def admit(index):
+        req = SimpleNamespace(
+            rid=str(index),
+            bootstrap_room=index,
+            cache_request_handle=(index, 0),
+            kv=SimpleNamespace(req_pool_idx=index),
+        )
+        req.disagg_kv_sender = SimpleNamespace(poll=lambda: 4)
+        chunk = Chunk(req, req.disagg_kv_sender, (index, 0), index, 0, 16, True)
+        lease = SourceLease(overlap, chunk, index, f"{index}-rank-{args.rank}")
+        event = SimpleNamespace(query=lambda: args.rank == 0)
+        plan = LaunchPlan(index, None, (chunk,), [], [])
+        plan.proof.result = SimpleNamespace(delay_sample_func=None, copy_done=event)
+        plan.forward_done = event
+        lease.plans.append(plan)
+        lease.finalized = True
+        lease.release = lambda: freed.append(index)
+        req._dsv41_p_lease = lease
+        overlap.leases.append(lease)
+        overlap.by_room[index] = lease
+        protocol.register(lease)
+        return lease, event
+
+    try:
+        with (
+            patch.dict(
+                sys.modules,
+                {
+                    "sglang.srt.disaggregation.base.conn": SimpleNamespace(
+                        KVPoll=SimpleNamespace(Success=4, Failed=0)
+                    )
+                },
+            ),
+            patch.object(dist, "all_reduce", counted),
+        ):
+            lease, event = admit(1)
+            for _ in range(16):
+                overlap.poll()
+            dist.barrier()
+            values = [protocol.inject([]) if args.rank == 0 else None]
+            dist.broadcast_object_list(values, src=0)
+            _, commands = split_controls(values[0])
+            assert not commands and not votes  # slow rank has no GPU proof
+            event.query = lambda: True
+            overlap.poll()
+            dist.barrier()
+            values = [protocol.inject([]) if args.rank == 0 else None]
+            dist.broadcast_object_list(values, src=0)
+            _, commands = split_controls(values[0])
+            assert len(commands) == 1
+            protocol.arm(commands[0])
+            protocol.finalize()
+            assert freed == [1]
+            second, event = admit(2)
+            second.plans[0].proof.result.delay_sample_func = lambda: None
+            # Explicit cancellation/retry boundary uses forward_done, not an
+            # unrecorded copy_done from delayed sampling. Wait for slow GPU.
+            timer = threading.Timer(0.04, lambda: setattr(event, "query", lambda: True))
+            timer.start()
+            overlap.drain(second.chunk.req)
+            timer.join()
+            before = len(votes)
+            for _ in range(32):
+                overlap.poll()
+                protocol.inject([])
+            assert len(votes) == before
+            return dict(
+                votes=votes,
+                freed=freed,
+                commits=protocol.commits,
+                registered=len(protocol.registered),
+                local_votes=len(votes) - before,
+            )
+    finally:
+        protocol.close()
+
+
 def main():
     parser = argparse.ArgumentParser()
     parser.add_argument("rank", type=int)
@@ -724,6 +825,7 @@ def main():
                     row.append(hooks._decode_graph(lambda *a: True, runner, batch))
                 routing.append(row)
         overlap_lifetimes = decode_overlap_lifetimes(args)
+        p_overlap = prefill_overlap_lifetimes(args)
         Path(args.output).write_text(
             json.dumps(
                 {
@@ -735,6 +837,7 @@ def main():
                     "graphs": graphs,
                     "leases": leases,
                     "d_overlap": overlap_lifetimes,
+                    "p_overlap": p_overlap,
                     "segmented_startup": startup,
                     "segmented_routing": routing,
                 }
