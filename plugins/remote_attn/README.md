@@ -96,7 +96,11 @@ by default; the P5.19 adapter is enabled only through the plugin and its explici
 
 The initial port targets the supplied single-host Qwen3-8B setup: CUDA,
 plain TP (including TP2, with the same TP width across roles), dense NHD MHA KV in BF16/FP16, page size 1,
-radix cache disabled, and scheduler overlap disabled. Native CUDA graphs may
+D radix cache disabled, and scheduler overlap disabled on both roles.
+Progressive P supports device-only dense FULL radix caching through plugin read
+leases: cached prefixes stay pinned and final-tail checkpoint/dedup/release waits
+for native transfer and Remote readers to drain across TP. Ordinary requests keep
+the native cache path. HiCache, external linkers and session refs remain gated. Native CUDA graphs may
 remain enabled. Progressive uses its existing TP admission/retirement votes
 to keep identical receiver leases: a live lease selects D-only Remote segmented
 graphs for exact batch 1/2/4, with attention/RPC/merge outside graphs; other

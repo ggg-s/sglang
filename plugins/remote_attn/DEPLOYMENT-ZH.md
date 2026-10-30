@@ -35,7 +35,7 @@ optimistic prefill、chunk 和 Batch，不需要 JSON 配置或启动包装器�
 
 - `Qwen3ForCausalLM`、CUDA、dense NHD MHA、BF16/FP16 KV、page size 1。
 - P/D 相同 TP 宽度，PP=DP=CP=1；示例为 TP2，不能直接沿用异构 TP 拓扑。
-- 关闭 radix cache、scheduler overlap；保留原生 full decode graphs，capture buckets 包含 1/2/4。D Remote batch 1/2/4 使用分段图，attention/RPC/merge 在图外；未覆盖的 Remote batch 为 eager，统一回收后恢复 full graph。最终 chunk 的分层 prefill 仍 eager。只关闭 scheduler overlap，不关闭本功能的计算/传输重叠。
+- P 可开启设备内 FULL radix cache，D 关闭 radix cache；两端关闭 scheduler overlap；保留原生 full decode graphs，capture buckets 包含 1/2/4。D Remote batch 1/2/4 使用分段图，attention/RPC/merge 在图外；未覆盖的 Remote batch 为 eager，统一回收后恢复 full graph。最终 chunk 的分层 prefill 仍 eager。只关闭 scheduler overlap，不关闭本功能的计算/传输重叠。
 - 原生 `mooncake_tcp`，P/D 均使用 `--disaggregation-decode-allocation-policy early`（代码默认）；不能使用 `prefill_complete`。
 - LoRA、MLA/混合/量化 KV、HiCache、speculative、统一 KV、PD multiplexing、live role switching 不在当前支持范围；原生 host KV destination 也不等于这里的 host staging ring。
 
@@ -267,7 +267,7 @@ core 共享 slot 的 `reserve()` 新建并注册 slot 后，使用**同一 copy 
 ## 5. 与现有服务启动流程对接
 
 将第 3 节环境加入现有进程管理器的 P/D 启动配置，保留模型路径、token chunk 和已核准的其他模型参数。
-必须保留本路径约束：page size 1、同 TP、关闭 radix cache / overlap scheduler、`mooncake_tcp`、提前分配。
+必须保留本路径约束：page size 1、同 TP、D 关闭 radix cache、两端关闭 overlap scheduler，P 设备内 FULL radix 读租约见 [原生接入](SINGLE-PAIR-ZH.md)、`mooncake_tcp`、提前分配。
 graphs 沿用原生配置；Progressive 复用准入/回收的 TP 投票维护统一接收租约，租约清空后
 恢复原生 graph 判断，正常 Local decode 不新增 collective。旧手动 import 保留逐步投票。
 Remote 租约期间，D 对 batch 1/2/4 选择插件分段图，其他 batch 为 eager；

@@ -184,6 +184,7 @@ class Source:
     stager: object = None
     native_staging: bool = False
     recv_host_staging: bool = False
+    cache_lease: object = None
 
     def complete(self, layers):
         if self.native_staging:
@@ -226,6 +227,10 @@ class Source:
                 "host_staging": self.stager is not None,
                 "recv_host_staging": self.recv_host_staging,
                 "native_staging": self.native_staging,
+                "p_radix_read_lease": self.cache_lease is not None,
+                "cached_prefix_tokens": self.cache_lease.cached_tokens
+                if self.cache_lease is not None
+                else 0,
                 "at": time.monotonic(),
             },
         )
@@ -320,14 +325,31 @@ class Source:
             self.thread.join(timeout=self.owner.config.drain_timeout)
             if self.thread.is_alive():
                 raise RuntimeError("metadata writer did not drain")
-        release, self.release = self.release, None
+        release = self.release
+        if self.cache_lease is not None:
+            self.cache_lease.check()
+            if release is None:
+                raise RuntimeError("P radix source has no deferred release")
         if release is not None:
-            release()
+            if self.cache_lease is not None:
+                self.cache_lease.retire(release)
+            else:
+                release()
+        self.release = None
         self.req._pre_layerwise_source = None
         self.released = True
         write_json(
             self.path / "released.json",
-            {"generation": self.generation, "at": time.monotonic()},
+            {
+                "generation": self.generation,
+                "at": time.monotonic(),
+                "p_radix_lease_closed": self.cache_lease.closed
+                if self.cache_lease is not None
+                else None,
+                "deferred_cache_checkpoints": self.cache_lease.checkpoints
+                if self.cache_lease is not None
+                else 0,
+            },
         )
 
 
@@ -464,12 +486,15 @@ class Controller:
         self.batches = 0
         self.early_admissions = 0
         self.stager = None
+        self.cache_guard = None
         # Enabled only after graph configuration/capture manifests agree at
         # startup. Membership of targets is then changed only by TP votes.
         self.graph_fast_path = False
 
     def validate_graphs(self):
         from sglang.srt.runtime_context import get_exec
+
+        from .source_cache import cache_signature
 
         self.graph_fast_path = False
         runner = self.scheduler.tp_worker.model_runner
@@ -492,6 +517,7 @@ class Controller:
             asdict(get_exec().graph.cuda_graph_config),
             manifest(runner.decode_cuda_graph_runner),
             manifest(runner.prefill_cuda_graph_runner),
+            cache_signature(getattr(self.scheduler, "tree_cache", None)),
         )
         clean = not _runtime().has_target_states()
         if self.tp_size > 1:
@@ -502,7 +528,9 @@ class Controller:
                 reports, (signature, clean), group=self.scheduler.attn_tp_cpu_group
             )
             if any(item[0] != reports[0][0] for item in reports):
-                raise RuntimeError("remote_attn TP graph config/captures differ")
+                raise RuntimeError(
+                    "remote_attn TP graph/cache config or captures differ"
+                )
             clean = all(item[1] for item in reports)
         # An existing legacy import has no TP-agreed progressive lifetime.
         self.graph_fast_path = clean
@@ -625,6 +653,7 @@ class Controller:
             sender = getattr(req, "disagg_kv_sender", None)
             if (
                 not req.pending_bootstrap
+                and getattr(req, "session_id", None) is None
                 and req.inflight_middle_chunks <= 0
                 and req.extend_end == len(req.origin_input_ids)
                 and req.multimodal_inputs is None
@@ -730,6 +759,9 @@ class Controller:
                 stager=stager,
                 native_staging=sender.kv_mgr.enable_staging,
                 recv_host_staging=offer.get("recv_host_staging", False),
+                cache_lease=self.cache_guard.hold(req)
+                if getattr(self, "cache_guard", None) is not None
+                else None,
             )
             sender._record_transfer_indices(indices, None)
             sender._transfer_start_time = (
@@ -916,6 +948,7 @@ class Controller:
             complete = src.poll()
             if (
                 self.config.mode == "layerwise"
+                and src.cache_lease is None
                 and src.finalized
                 and src.req.kv.is_kv_released
             ):
@@ -936,6 +969,9 @@ def initialize(scheduler):
     controller = Controller(scheduler, config)
     controller.validate()
     controller.validate_graphs()
+    from .source_cache import install
+
+    controller.cache_guard = install(scheduler.tree_cache)
     scheduler._pre_layerwise = controller
     scheduler.tp_worker.model_runner._pre_layerwise = controller
 
@@ -944,6 +980,11 @@ def run_batch(original, scheduler, batch, *args, **kwargs):
     controller = getattr(scheduler, "_pre_layerwise", None)
     if controller is None:
         return original(scheduler, batch, *args, **kwargs)
+    if getattr(controller, "cache_guard", None) is not None:
+        # Native cached-prefix sends must precede final-tail reservation. The
+        # repeated call inside Scheduler.run_batch is then a native no-op.
+        for req in batch.reqs:
+            scheduler.maybe_send_cached_prefix_chunk(req)
     controller.plan = controller.prepare(batch)
     try:
         return original(scheduler, batch, *args, **kwargs)
@@ -985,14 +1026,21 @@ def pop_transferred(original, queue, rids_to_check=None):
     return ordinary + admitted
 
 
-def defer_release(req, release):
+def defer_release(req, release, *, checkpoint=None):
     source = getattr(req, "_pre_layerwise_source", None)
     if source is not None and (
         source.error is not None
         or (source.stager is not None and source.stager.poisoned)
     ):
         raise RuntimeError("pre-layerwise staging is unsettled; retaining source KV")
-    if source is not None and source.owner.config.mode == "remote":
+    lease = getattr(source, "cache_lease", None)
+    if source is not None and (
+        source.owner.config.mode == "remote" or lease is not None
+    ):
+        if lease is not None:
+            lease.check()
+        if lease is not None and checkpoint is False:
+            lease.abort = True
         if not source.finalized:
             raise RuntimeError(
                 "cannot recycle a failed Prefill with layer writes in flight"

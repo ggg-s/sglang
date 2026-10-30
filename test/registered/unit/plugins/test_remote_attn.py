@@ -226,6 +226,462 @@ class TestRemoteAttn(CustomTestCase):
         )
         return req
 
+    def _radix(self):
+        """Execute native tree, locks, allocator and release; omit GPU imports/events."""
+        import heapq
+        import logging
+        from abc import abstractmethod
+        from collections import defaultdict
+        from enum import Enum, auto
+        from typing import NamedTuple
+
+        ns = dict(
+            __name__=__name__,
+            torch=torch,
+            dataclasses=dataclasses,
+            array=array,
+            Enum=Enum,
+            auto=auto,
+            NamedTuple=NamedTuple,
+            abstractmethod=abstractmethod,
+            heapq=heapq,
+            sys=sys,
+            time=time,
+            defaultdict=defaultdict,
+            logger=logging.getLogger(__name__),
+        )
+
+        def load(relative, names=None):
+            path = ROOT / "python/sglang/srt" / relative
+            nodes = [
+                n
+                for n in ast.parse(path.read_text()).body
+                if isinstance(n, (ast.ClassDef, ast.FunctionDef))
+                and (names is None or n.name in names)
+            ]
+            for node in nodes:
+                if node.name == "BasePrefixCache":
+                    node.bases = []
+            module = ast.Module(
+                body=[
+                    ast.ImportFrom(
+                        module="__future__",
+                        names=[ast.alias(name="annotations")],
+                        level=0,
+                    ),
+                    *nodes,
+                ],
+                type_ignores=[],
+            )
+            exec(compile(ast.fix_missing_locations(module), str(path), "exec"), ns)
+
+        load("mem_cache/unified_cache/component_type.py")
+        load(
+            "mem_cache/base_prefix_cache.py",
+            {
+                "CacheRequestHandle",
+                "CacheRequestOutcome",
+                "MatchPrefixParams",
+                "InsertParams",
+                "InsertResult",
+                "EvictParams",
+                "EvictResult",
+                "IncLockRefResult",
+                "DecLockRefParams",
+                "DecLockRefResult",
+                "TreeLock",
+                "MatchResult",
+                "BasePrefixCache",
+            },
+        )
+        ns["EvictionStrategy"] = object
+        load("mem_cache/evict_policy.py", {"LRUStrategy"})
+        load("mem_cache/utils.py", {"split_node_hash_value"})
+        load("mem_cache/radix_cache.py")
+        load(
+            "mem_cache/common.py",
+            {
+                "release_kv_cache",
+                "coalesce_ranges",
+                "free_kv_row_segments",
+                "_release_overallocated_kv_indices",
+            },
+        )
+        ns.update(
+            get_spec=lambda: SimpleNamespace(speculative_algorithm=None),
+            get_serving=lambda: SimpleNamespace(strip_thinking_cache=False),
+        )
+        allocator = self._allocator()
+        allocator.page_size = 1
+        base = _source_class(
+            "mem_cache/allocator/base.py",
+            "BaseTokenToKVPoolAllocator",
+            {"free_segment", "free_segments", "_page_disjoint"},
+        )
+        for name in ("free_segment", "free_segments", "_page_disjoint"):
+            setattr(type(allocator), name, getattr(base, name))
+        cache = ns["RadixCache"].__new__(ns["RadixCache"])
+        cache.disable, cache.page_size, cache.is_eagle = False, 1, False
+        cache.device = "cpu"
+        cache.req_to_token_pool = self._pool(8)
+        cache.token_to_kv_pool_allocator = allocator
+        cache.eviction_strategy = ns["LRUStrategy"]()
+        cache.evictable_leaves = set()
+        # Event publication is an external boundary, not tree behavior.
+        cache.kv_events = SimpleNamespace(
+            record_all_cleared=lambda: None,
+            record_store=lambda *a: None,
+            record_remove=lambda *a: None,
+        )
+        cache.reset()
+        common = SimpleNamespace(
+            coalesce_ranges=ns["coalesce_ranges"],
+            free_kv_row_segments=ns["free_kv_row_segments"],
+        )
+        patcher = patch.dict(sys.modules, {"sglang.srt.mem_cache.common": common})
+        patcher.start()
+        self.addCleanup(patcher.stop)
+
+        def request(tokens, rid):
+            req = self._req()
+            req.rid, req.cache_request_handle = rid, ns["CacheRequestHandle"](rid, 0)
+            req.origin_input_ids, req.output_ids = array("q", tokens), array("q")
+            req.extra_key, req.cache_salt, req.priority = None, None, 0
+            req.skip_radix_cache_insert = False
+            req.finished = lambda: True
+            req.owned_kv_len = lambda: len(tokens)
+            req.finished_len = None
+            req.refresh_fill_ids()
+            matched = cache.match_prefix(
+                ns["MatchPrefixParams"](ns["RadixKey"](array("q", tokens)))
+            )
+            req.last_node = matched.last_device_node
+            req.lock = cache.lock(req.last_node)
+            req.kv.cache_protected_len = matched.device_prefix_len
+            cache.req_to_token_pool.alloc([req])
+            indices = torch.cat(
+                (
+                    cache.path_device_indices(req.last_node),
+                    allocator.alloc(len(tokens) - matched.device_prefix_len),
+                )
+            )
+            cache.req_to_token_pool.write(
+                (req.kv.req_pool_idx, slice(0, len(tokens))), indices
+            )
+            req.kv.kv_committed_len = req.kv.kv_allocated_len = len(tokens)
+            return req, indices.clone()
+
+        return SimpleNamespace(cache=cache, allocator=allocator, request=request, **ns)
+
+    def test_p_radix_read_pin_survives_tree_split_and_eviction(self):
+        from sglang_remote_attn.source_cache import CacheGuard
+
+        f = self._radix()
+        prefix, _ = f.request([1, 2, 3], "warm")
+        f.release_kv_cache(prefix, f.cache, checkpoint=True)
+        req, indices = f.request([1, 2, 3, 4, 5], "source")
+        guard = CacheGuard(f.cache)
+        lease = guard.hold(req)
+        f.cache.unlock(req.lock)
+        req.lock = None  # Independent read pin outlives native request pin.
+        f.cache.match_prefix(f.MatchPrefixParams(f.RadixKey(array("q", [1, 2]))))
+        f.cache.evict(f.EvictParams(num_tokens=32))
+        self.assertEqual(f.allocator.available_size(), 27)
+        self.assertEqual(
+            f.cache.path_device_indices(req.last_node).tolist(), indices[:3].tolist()
+        )
+        lease.retire(lambda: f.release_kv_cache(req, f.cache, checkpoint=False))
+        f.cache.evict(f.EvictParams(num_tokens=32))
+        self.assertEqual(f.allocator.available_size(), 32)
+        self.assertEqual(len(set(f.allocator.free_pages.tolist())), 32)
+        self.assertTrue(lease.closed)
+        self.assertEqual(guard.leases, {})
+
+    def test_p_radix_checkpoint_waits_for_native_and_rpc_readers_then_dedups(self):
+        from sglang_remote_attn.source_cache import CacheGuard, checkpoint_allowed
+
+        f = self._radix()
+        warm, _ = f.request([1, 2], "warm")
+        f.release_kv_cache(warm, f.cache, checkpoint=True)
+        req, original = f.request([1, 2, 3, 4], "source")
+        lease = CacheGuard(f.cache).hold(req)
+        pl = self.hooks.pre_layerwise
+        with tempfile.TemporaryDirectory() as directory:
+            status = SimpleNamespace(done=False)
+            req.disagg_kv_sender = status
+            source = pl.Source(
+                SimpleNamespace(
+                    config=pl.Config("remote", Path(directory)), scheduler=object()
+                ),
+                req,
+                Path(directory),
+                "g",
+                original.numpy(),
+                slice(0, 4),
+                (),
+                4,
+                finalized=True,
+                cache_lease=lease,
+            )
+            req._pre_layerwise_source = source
+            registry = self.runtime.HandoffRegistry()
+            ctx = registry.register(
+                "cache-reader",
+                req,
+                1,
+                4,
+                4,
+                "token",
+                on_release=lambda _: source.remote_closed.set(),
+            )
+            registry.acquire("cache-reader", ctx.owner_epoch)
+            source.service = dict(handoff_id="cache-reader", epoch=ctx.owner_epoch)
+            # Native final-prefill checkpoint must not publish/free the source suffix.
+            f.cache.checkpoint(req, up_to=4)
+            other, canonical = f.request([1, 2, 3, 4], "concurrent")
+            self.assertNotEqual(canonical[2:].tolist(), original[2:].tolist())
+            self.assertEqual(lease.checkpoints, 1)
+            f.release_kv_cache(other, f.cache, checkpoint=True)
+            release = lambda: f.release_kv_cache(
+                req, f.cache, checkpoint=checkpoint_allowed(req, True)
+            )
+            self.assertTrue(pl.defer_release(req, release, checkpoint=True))
+            f.cache.finish(req.cache_request_handle, f.CacheRequestOutcome.SUCCESS)
+            pl.write_json(source.path / "done.json", {"generation": "g"})
+            with (
+                patch.object(
+                    pl, "_poll_success", side_effect=lambda sender: sender.done
+                ),
+                patch.object(
+                    self.runtime,
+                    "get_remote_hub",
+                    return_value=SimpleNamespace(registry=registry),
+                ),
+            ):
+                self.assertFalse(source.poll())
+                registry.release_ref("cache-reader", ctx.owner_epoch)
+                self.assertFalse(source.poll())
+                f.cache.evict(f.EvictParams(num_tokens=32))
+                self.assertEqual(
+                    f.cache.req_to_token_pool.req_to_token[
+                        req.kv.req_pool_idx, :4
+                    ].tolist(),
+                    original.tolist(),
+                )
+                self.assertTrue(
+                    set(original.tolist()).isdisjoint(f.allocator.free_pages.tolist())
+                )
+                status.done = True
+                self.assertTrue(source.poll())
+                source.retire()
+                source.retire()
+            hit = f.cache.match_prefix(
+                f.MatchPrefixParams(f.RadixKey(array("q", [1, 2, 3, 4])))
+            )
+            self.assertEqual(hit.device_prefix_len, 4)
+            self.assertTrue(req.kv.is_kv_released)
+            self.assertTrue(lease.closed)
+            self.assertEqual(f.cache.protected_size_, 0)
+            f.cache.evict(f.EvictParams(num_tokens=32))
+            self.assertEqual(f.allocator.available_size(), 32)
+            self.assertEqual(len(set(f.allocator.free_pages.tolist())), 32)
+
+    def test_p_radix_abort_and_failed_release_keep_ownership_safe(self):
+        from sglang_remote_attn.source_cache import CacheGuard, checkpoint_allowed
+
+        for fail in (False, True):
+            with self.subTest(fail=fail):
+                f = self._radix()
+                req, indices = f.request([9, 8, 7], "abort")
+                guard = CacheGuard(f.cache)
+                lease = guard.hold(req)
+                req._pre_layerwise_source = SimpleNamespace(cache_lease=lease)
+                f.cache.finish(req.cache_request_handle, f.CacheRequestOutcome.ABORT)
+                f.cache.finish(req.cache_request_handle, f.CacheRequestOutcome.SUCCESS)
+                self.assertFalse(checkpoint_allowed(req, True))
+                with self.assertRaisesRegex(RuntimeError, "cannot reset"):
+                    f.cache.reset()
+                if fail:
+
+                    def release():
+                        raise RuntimeError("release failed")
+
+                    with self.assertRaisesRegex(RuntimeError, "release failed"):
+                        lease.retire(release)
+                    with self.assertRaisesRegex(RuntimeError, "no longer usable"):
+                        lease.retire(release)
+                    self.assertEqual(f.allocator.available_size(), 29)
+                    self.assertEqual(len(guard.leases), 1)
+                else:
+                    lease.retire(
+                        lambda: f.release_kv_cache(
+                            req, f.cache, checkpoint=checkpoint_allowed(req, True)
+                        )
+                    )
+                    self.assertEqual(f.cache.total_size(), 0)
+                    self.assertEqual(f.allocator.available_size(), 32)
+                    f.cache.reset()
+
+    def test_p_radix_attempt_change_cannot_bypass_guard(self):
+        from sglang_remote_attn.source_cache import CacheGuard
+
+        f = self._radix()
+        req, _ = f.request([1, 3], "retry")
+        guard = CacheGuard(f.cache)
+        guard.hold(req)
+        req.cache_request_handle = f.CacheRequestHandle("retry", 1)
+        with self.assertRaisesRegex(RuntimeError, "changed attempt"):
+            f.cache.checkpoint(req, up_to=2)
+        with self.assertRaisesRegex(RuntimeError, "already has"):
+            guard.hold(req)
+        self.assertEqual(f.allocator.available_size(), 30)
+
+    def test_p_radix_layerwise_release_also_waits_for_transfer(self):
+        from sglang_remote_attn.source_cache import CacheGuard
+
+        f = self._radix()
+        req, _ = f.request([2, 4], "layerwise")
+        lease = CacheGuard(f.cache).hold(req)
+        pl = self.hooks.pre_layerwise
+        with tempfile.TemporaryDirectory() as directory:
+            req.disagg_kv_sender = SimpleNamespace(send=lambda *a: None)
+            source = pl.Source(
+                SimpleNamespace(
+                    config=pl.Config("layerwise", Path(directory)),
+                    scheduler=SimpleNamespace(
+                        disagg_metadata_buffers=SimpleNamespace(set_buf=lambda r: None)
+                    ),
+                ),
+                req,
+                Path(directory) / "7/0/g",
+                "g",
+                [],
+                slice(0, 2),
+                (),
+                2,
+                cache_lease=lease,
+            )
+            req._pre_layerwise_source = source
+            source.finalize()
+            self.hooks._release_kv(f.release_kv_cache, req, f.cache, checkpoint=True)
+            self.assertIsNotNone(source.release)
+            self.assertEqual(f.allocator.available_size(), 30)
+            # A late cancellation must override the already stored checkpoint=True.
+            self.hooks._release_kv(f.release_kv_cache, req, f.cache, checkpoint=False)
+            source.retire()
+            self.assertEqual(f.cache.total_size(), 0)
+            self.assertEqual(f.allocator.available_size(), 32)
+            spec = importlib.util.spec_from_file_location(
+                "pd_report", ROOT / "test/manual/remote_attn/pre_layerwise_report.py"
+            )
+            report = importlib.util.module_from_spec(spec)
+            spec.loader.exec_module(report)
+            result = report.summarize(Path(directory))
+            self.assertEqual(result["p_radix_leased_shards"], 1)
+            self.assertEqual(result["p_radix_closed_shards"], 1)
+            self.assertEqual(result["rows"][0]["cached_prefix_tokens"], 0)
+
+    def test_p_radix_install_checks_backend_and_disabled_passthrough(self):
+        from sglang_remote_attn.source_cache import install
+
+        f = self._radix()
+        unified = type("UnifiedRadixCache", (), {})
+        with patch.dict(
+            sys.modules,
+            {
+                "sglang.srt.mem_cache.radix_cache": SimpleNamespace(
+                    RadixCache=f.RadixCache
+                ),
+                "sglang.srt.mem_cache.unified_radix_cache": SimpleNamespace(
+                    UnifiedRadixCache=unified
+                ),
+                "sglang.srt.mem_cache.unified_cache.component_type": SimpleNamespace(
+                    ComponentType=f.ComponentType
+                ),
+            },
+        ):
+            self.assertIsNone(install(SimpleNamespace(disable=True)))
+            self.assertIs(install(f.cache), install(f.cache))
+            with self.assertRaisesRegex(ValueError, "built-in dense"):
+                install(SimpleNamespace(disable=False))
+            for field, value in (
+                ("tree_components", (f.ComponentType.FULL, f.ComponentType.SWA)),
+                ("cache_controller", object()),
+                ("linker", object()),
+                ("enable_session_radix_cache", True),
+            ):
+                cache = unified()
+                cache.disable, cache.tree_components = False, (f.ComponentType.FULL,)
+                cache.cache_controller = cache.linker = None
+                cache.enable_session_radix_cache = False
+                setattr(cache, field, value)
+                with (
+                    self.subTest(field=field),
+                    self.assertRaisesRegex(ValueError, "device-only FULL"),
+                ):
+                    install(cache)
+
+    def test_p_radix_native_prefix_send_precedes_final_reservation(self):
+        pl = self.hooks.pre_layerwise
+        native = _source_class(
+            "disaggregation/prefill.py",
+            "SchedulerDisaggregationPrefillMixin",
+            {"maybe_send_cached_prefix_chunk", "_send_kv_chunk"},
+        )
+        kv_pages = _source_function("mem_cache/common.py", "kv_to_page_indices")
+        native.maybe_send_cached_prefix_chunk.__globals__.update(
+            envs=SimpleNamespace(
+                SGLANG_DISAGG_PREFILL_EARLY_SEND_CACHED_PREFIX=SimpleNamespace(
+                    get=lambda: True
+                )
+            ),
+            kv_to_page_indices=kv_pages,
+        )
+        scheduler = native()
+        scheduler.enable_staging = scheduler.enable_overlap = False
+        scheduler.disagg_prefill_pending_chunk_rids = set()
+        scheduler.token_to_kv_pool_allocator = SimpleNamespace(
+            page_size=1, translate_kv_indices_for_transfer=lambda t: t
+        )
+        scheduler.req_to_token_pool = SimpleNamespace(
+            req_to_token=torch.tensor([[11, 12, 13, 14]])
+        )
+        scheduler.send_kv_chunk = scheduler._send_kv_chunk
+        sent = []
+        req = SimpleNamespace(
+            rid="cached",
+            pending_bootstrap=False,
+            prefix_len=2,
+            host_hit_length=0,
+            start_send_idx=0,
+            extend_end=4,
+            origin_input_ids=[1, 2, 3, 4],
+            kv=SimpleNamespace(req_pool_idx=0),
+            disagg_kv_sender=SimpleNamespace(
+                get_max_transfer_tokens=lambda: None,
+                should_send_kv_chunk=lambda n, last: n > 0,
+                send=lambda pages, state, **kw: sent.append(pages.tolist()),
+            ),
+        )
+        reserved = []
+
+        def prepare(batch):
+            reserved.append((req.start_send_idx, sent[:]))
+            req.start_send_idx = 4
+
+        scheduler._pre_layerwise = SimpleNamespace(
+            cache_guard=object(), prepare=prepare
+        )
+
+        def run(scheduler, batch):
+            scheduler.maybe_send_cached_prefix_chunk(
+                req
+            )  # Native run_batch repeats it.
+
+        pl.run_batch(run, scheduler, SimpleNamespace(reqs=[req]))
+        self.assertEqual(reserved, [(2, [[11, 12]])])
+        self.assertEqual(sent, [[11, 12]])
+
     def test_decode_admission_keeps_row_and_kv_ownership(self):
         """Replacing Req.kv after pool.alloc silently loses the newly bound row."""
         pool = self._pool()
@@ -962,6 +1418,7 @@ class TestRemoteAttn(CustomTestCase):
             ),
             get_spec=lambda: SimpleNamespace(speculative_algorithm=None),
             get_disagg=lambda: SimpleNamespace(
+                disaggregation_mode="prefill",
                 enable_pd_role_switch=False,
                 disaggregation_decode_allocation_policy="early",
             ),
@@ -993,6 +1450,25 @@ class TestRemoteAttn(CustomTestCase):
             self.hooks.validate_config()
             controller.validate()
             self.assertTrue(controller.config.directory.is_dir())
+            memory = context.get_memory()
+            memory.disable_radix_cache = False
+            context.get_memory = lambda: memory
+            disagg = context.get_disagg()
+            context.get_disagg = lambda: disagg
+            for mode in ("remote", "layerwise", "off"):
+                for role in ("prefill", "decode"):
+                    with (
+                        self.subTest(mode=mode, role=role),
+                        patch.dict(os.environ, {"HANDOFF_PRE_LAYERWISE": mode}),
+                    ):
+                        disagg.disaggregation_mode = role
+                        if role == "prefill" and mode != "off":
+                            self.hooks.validate_config()
+                        else:
+                            with self.assertRaisesRegex(
+                                RuntimeError, "disable-radix-cache"
+                            ):
+                                self.hooks.validate_config()
             schedule.disable_overlap_schedule = False
             with self.assertRaisesRegex(RuntimeError, "disable-overlap-schedule"):
                 self.hooks.validate_config()
@@ -1780,6 +2256,8 @@ class TestRemoteAttn(CustomTestCase):
         self.assertEqual(rows[1]["polls"], [])
         self.assertEqual(rows[0]["retirements"], [[], ["a"], ["a", "b"]])
         self.assertEqual(rows[0]["retirements"], rows[1]["retirements"])
+        self.assertEqual(rows[0]["p_radix_pins"], [2, 1, 0])
+        self.assertEqual(rows[0]["p_radix_pins"], rows[1]["p_radix_pins"])
         self.assertEqual(rows[0]["outcomes"], rows[1]["outcomes"])
         # A ready/no-state shard, a missing layer, a native shape rejection,
         # and failure wakeups must all lead to the same branch on both ranks.
@@ -1793,6 +2271,7 @@ class TestRemoteAttn(CustomTestCase):
             [[True] * 5, [True, True, False, True, False]] * 2,
         )
         self.assertTrue(rows[0]["leases"]["mismatch_rejected"])
+        self.assertTrue(rows[0]["leases"]["cache_mismatch_rejected"])
         self.assertTrue(rows[0]["leases"]["existing_state_fallback"])
         self.assertGreater(rows[0]["leases"]["boundary_reductions"], 0)
         self.assertEqual(rows[0]["leases"]["freed"], [0, 1, 2])
@@ -3634,7 +4113,21 @@ class TestRemoteAttn(CustomTestCase):
                 offer["mode"] = "remote"
                 pl.write_json(offer_path, offer)
                 controller.config = pl.Config("remote", root)
+                from sglang_remote_attn.source_cache import CacheGuard
+
+                cache_fixture = self._radix()
+                req.cache_request_handle = cache_fixture.CacheRequestHandle("final", 0)
+                req.kv.cache_protected_len = 0
+                req.last_node = cache_fixture.cache.root_node
+                req.lock = cache_fixture.cache.lock(req.last_node)
+                controller.cache_guard = CacheGuard(cache_fixture.cache)
+                req.session_id = "native-session"
+                self.assertIsNone(controller.prepare(batch))
+                self.assertEqual(controller.cache_guard.leases, {})
+                req.session_id = None
                 jobs = controller.prepare(batch)
+                self.assertIs(jobs[0][0].cache_lease.req, req)
+                self.assertEqual(len(controller.cache_guard.leases), 1)
                 self.assertEqual(jobs[0][0].indices.tolist(), [104, 105, 106, 107, 108])
                 self.assertEqual(jobs[0][0].index_slice, slice(4, 9))
                 self.assertEqual(sender.curr_idx, 9)
@@ -3689,6 +4182,12 @@ class TestRemoteAttn(CustomTestCase):
     def test_prelayer_preflight_rejects_incomplete_core_keywords(self):
         """A valid hook target must not hide missing progressive call arguments."""
         cases = (
+            ("sglang.srt.mem_cache.radix_cache.RadixCache.checkpoint", "up_to"),
+            (
+                "sglang.srt.mem_cache.unified_radix_cache.UnifiedRadixCache.checkpoint",
+                "up_to",
+            ),
+            ("sglang.srt.mem_cache.base_prefix_cache.BasePrefixCache.finish", "handle"),
             ("decode.DecodeTransferQueue._commit_transfer_to_req", "keep_receiver"),
             (
                 "mooncake.conn.MooncakeKVManager.add_transfer_request",

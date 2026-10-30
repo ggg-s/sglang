@@ -6,7 +6,7 @@
 依赖、容量和完整验收见 [部署手册](DEPLOYMENT-ZH.md)。
 
 当前范围是同机 Qwen3 dense NHD MHA BF16/FP16、同 TP、PP=DP=CP=1、page size 1、
-early allocation、mooncake_tcp，并关闭 radix cache、overlap scheduler。
+early allocation、mooncake_tcp。P 可开启设备内 dense FULL radix cache；D 仍关闭 radix cache，两端仍关闭 overlap scheduler。
 CUDA graphs 沿用原生 full decode 配置：D 的 Remote 阶段对 batch 1/2/4 使用分段图，
 其他 batch 为 eager；完成 GPU scatter 并经 TP 一致回收后恢复原生 full graph。
 P 普通 prefill 保留原生 graph，最终 chunk 的分层 prefill 和 P 端 Remote RPC 仍为 eager。
@@ -27,9 +27,9 @@ python -m sglang_remote_attn.check
 python -c 'import sglang_router; print(sglang_router.__file__)'
 ```
 
-安装态预检应输出 `hooks: 24`、`core_interfaces: 47`、`send_probe: true`。
+安装态预检应输出 `hooks: 24`、`core_interfaces: 61`、`send_probe: true`。
 它检查实际加载的接口：保留 receiver 的 metadata commit、选层发送与完成回调、
-staging 分组、host copy、字段初始化及 typed env 声明；插件注册时也会执行同样的
+staging 分组、host copy、缓存 checkpoint/lock/finish、字段初始化及 typed env 声明；插件注册时也会执行同样的
 核心检查，避免直接启动 P/D 绕过预检。`**kwargs` 不能替代显式参数。
 检查失败会给出具体缺失接口；检查通过不等于模型已启动或 GPU 验收通过。
 
@@ -90,7 +90,7 @@ python -m sglang.launch_server \
   --tp-size 2 --page-size 1 \
   --chunked-prefill-size "$ONLINE_CHUNK" \
   --optimistic-prefill-attempts "$ONLINE_OPTIMISTIC" \
-  --disable-radix-cache --disable-overlap-schedule \
+  --disable-overlap-schedule \
   --disaggregation-mode prefill \
   --disaggregation-transfer-backend mooncake_tcp \
   --disaggregation-decode-allocation-policy early \
@@ -99,6 +99,12 @@ python -m sglang.launch_server \
 
 将线上原有上下文长度、显存比例、dtype、attention backend 和并发等参数继续放入
 同一条命令，避免依赖不同入口的隐式默认。以上只列出与接入相关的参数。
+
+P 的启动命令删除 `--disable-radix-cache` 即可启用，无需新增插件环境变量。
+支持原生 `RadixCache` 和默认 `UnifiedRadixCache` 的设备内 FULL 组件；不支持
+HiCache、外部 KV linker、session refs 或混合组件缓存。Session 请求走原生 PD。
+普通请求与中间 chunk 保留原生缓存和 optimistic prefill 行为；只有已经激活分层
+最终块的请求会延迟 checkpoint 和回收。关闭 P 缓存仍可作为原来的对照组。
 
 ## 4. D 原生启动命令
 
@@ -251,3 +257,29 @@ PYTHONPATH=plugins/remote_attn python -m sglang_remote_attn.check --source-only 
 ```
 
 CPU 合约和接口预检不代表目标 GPU 的完整服务、输出正确性或性能验收。
+
+### 验证 P radix 命中与读租约回收
+
+先用相同长输入执行预热，等待该请求在 journal 中出现 `released.json`，再提交
+共享前缀的请求。保留线上 optimistic、chunk、传输 Batch 和 D 配置；使用已有
+长输入请求集，避免改变输入分布。不要在源租约仍活跃时测刚生成尾部的命中，
+因为这段 KV 要在 Remote 和原生传输完成后才交给缓存树。
+
+```bash
+python /workspace/sglang/test/manual/remote_attn/pre_layerwise_report.py \
+  /workspace/remote-attn/run-001/journal --require-remote --require-p-radix
+```
+
+报告中 `p_radix_leased_shards`、`p_radix_closed_shards` 应与 `activated_shards`
+相等；预热后的请求应有 `cached_prefix_tokens > 0`（各 rank 都检查），并记录
+`deferred_cache_checkpoints`。这证明锁已接入、命中存在且正常回收；不代替 GPU
+正确性验证。单独比较 P cache off/on：相同 input_ids、greedy 输出应一致，测
+TTFT、输入计算 token 数、吞吐和 P KV 占用高水位；加并发、淘汰压力和取消请求，
+确认回收后容量恢复。D 保留 `--disable-radix-cache`，两端保留
+`--disable-overlap-schedule`。
+
+P 的共享前缀持有独立读锁；当前最终块的私有尾部在所有 TP rank 的传输及 RPC
+读取排空前不做 checkpoint/去重/释放。正常完成后走原生 checkpoint/release，
+再释放独立读锁；取消请求不把未完成的尾部写进缓存。租约超时或释放状态不明时
+保留页并报错，不能把该轮计入性能结果。延迟发布尾部会增加短时 KV 占用，也可能
+让同时到达的相同尾部重复计算，需在目标负载下量化。

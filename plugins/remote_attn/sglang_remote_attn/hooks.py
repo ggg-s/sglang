@@ -2,11 +2,12 @@
 
 import inspect
 import logging
+import os
 import pkgutil
 import threading
 import time
 
-from . import pre_layerwise, segmented_graph
+from . import pre_layerwise, segmented_graph, source_cache
 
 logger = logging.getLogger(__name__)
 
@@ -77,8 +78,13 @@ def validate_config():
         or get_exec().overlap.enable_two_batch_overlap
     ):
         raise RuntimeError("remote_attn freeze requires --disable-overlap-schedule")
-    if not memory.disable_radix_cache:
-        raise RuntimeError("remote_attn requires --disable-radix-cache")
+    if not memory.disable_radix_cache and (
+        get_disagg().disaggregation_mode != "prefill"
+        or os.environ.get("HANDOFF_PRE_LAYERWISE", "off") not in ("remote", "layerwise")
+    ):
+        raise RuntimeError(
+            "remote_attn requires --disable-radix-cache except progressive P"
+        )
     if memory.enable_unified_memory or memory.enable_hierarchical_cache:
         raise RuntimeError("remote_attn does not yet support unified KV or HiCache")
     if schedule.page_size != 1 or schedule.enable_mixed_chunk:
@@ -189,7 +195,13 @@ def _reset_retracted(original, req):
 def _release_kv(original, req, tree_cache, *, checkpoint):
     from .pre_layerwise import defer_release
 
-    if defer_release(req, lambda: original(req, tree_cache, checkpoint=checkpoint)):
+    if defer_release(
+        req,
+        lambda: original(
+            req, tree_cache, checkpoint=source_cache.checkpoint_allowed(req, checkpoint)
+        ),
+        checkpoint=checkpoint,
+    ):
         return
     runtime = _runtime()
     runtime.stop_target_receivers(req)

@@ -29,6 +29,7 @@ def summarize(root):
         admitted = matching("admitted.json")
         done = matching("done.json")
         ready = matching("ready.json")
+        released = matching("released.json")
         layers = [matching(p.name) for p in path.glob("layer-*.json")]
         times = [p["at"] for p in layers if p]
         first_layer = min(times) if times else None
@@ -48,7 +49,15 @@ def summarize(root):
                 "recv_host_staging": prefill.get("recv_host_staging", False),
                 "native_staging": prefill.get("native_staging", False),
                 "completed": done is not None,
-                "released": matching("released.json") is not None,
+                "released": released is not None,
+                "p_radix_read_lease": prefill.get("p_radix_read_lease", False),
+                "cached_prefix_tokens": prefill.get("cached_prefix_tokens", 0),
+                "p_radix_lease_closed": released.get("p_radix_lease_closed")
+                if released
+                else None,
+                "deferred_cache_checkpoints": released.get("deferred_cache_checkpoints")
+                if released
+                else None,
                 "error": matching("error.json"),
                 "early_admission": bool(admitted),
                 "remote_calls": done.get("remote_calls", 0) if done else None,
@@ -109,6 +118,9 @@ def summarize(root):
         "early_admitted_shards": sum(r["early_admission"] for r in rows),
         "completed_shards": sum(r["completed"] for r in rows),
         "released_shards": sum(r["released"] for r in rows),
+        "p_radix_leased_shards": sum(r["p_radix_read_lease"] for r in rows),
+        "p_radix_closed_shards": sum(r["p_radix_lease_closed"] is True for r in rows),
+        "p_cached_prefix_shards": sum(r["cached_prefix_tokens"] > 0 for r in rows),
         "metrics": metrics,
         "rows": rows,
     }
@@ -119,6 +131,7 @@ def main():
     parser.add_argument("journal", type=Path)
     parser.add_argument("--require-remote", action="store_true")
     parser.add_argument("--require-overlap", action="store_true")
+    parser.add_argument("--require-p-radix", action="store_true")
     args = parser.parse_args()
     report = summarize(args.journal)
     print(json.dumps(report, indent=2))
@@ -132,6 +145,11 @@ def main():
         raise SystemExit(
             "Incomplete or failed run: do not treat as a performance result"
         )
+    if args.require_p_radix and (
+        report["p_radix_leased_shards"] != report["activated_shards"]
+        or report["p_radix_closed_shards"] != report["activated_shards"]
+    ):
+        raise SystemExit("P radix lease missing or not closed on every activated shard")
     if args.require_remote and not any(
         (r["remote_calls"] or 0) > 0 for r in report["rows"]
     ):

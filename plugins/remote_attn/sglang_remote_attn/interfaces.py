@@ -75,20 +75,58 @@ CORE_CALLS = {
     "sglang.srt.model_executor.runner_backend.breakable_cuda_graph_backend.BreakableCudaGraphBackend.capture_session": {
         "stream": inspect.Parameter.empty
     },
+    "sglang.srt.mem_cache.base_prefix_cache.BasePrefixCache.lock": {
+        "node": inspect.Parameter.empty
+    },
+    "sglang.srt.mem_cache.base_prefix_cache.BasePrefixCache.unlock": {
+        "lock": inspect.Parameter.empty
+    },
+    "sglang.srt.mem_cache.base_prefix_cache.BasePrefixCache.finish": {
+        "handle": inspect.Parameter.empty,
+        "outcome": inspect.Parameter.empty,
+    },
+    "sglang.srt.mem_cache.radix_cache.RadixCache.checkpoint": {
+        "up_to": inspect.Parameter.empty
+    },
+    "sglang.srt.mem_cache.radix_cache.RadixCache.reset": {},
+    DISAGG
+    + "prefill.SchedulerDisaggregationPrefillMixin.maybe_send_cached_prefix_chunk": {
+        "req": inspect.Parameter.empty
+    },
+    "sglang.srt.mem_cache.unified_radix_cache.UnifiedRadixCache.checkpoint": {
+        "up_to": inspect.Parameter.empty
+    },
+    "sglang.srt.mem_cache.unified_radix_cache.UnifiedRadixCache.lock": {
+        "node_id": inspect.Parameter.empty
+    },
+    "sglang.srt.mem_cache.unified_radix_cache.UnifiedRadixCache.unlock": {
+        "lock": inspect.Parameter.empty
+    },
+    "sglang.srt.mem_cache.unified_radix_cache.UnifiedRadixCache.reset": {},
 }
 CORE_PROPERTIES = (DISAGG + "mooncake.pinned_staging_core.CorePinnedStager.poisoned",)
 CORE_FIELDS = {
+    "sglang.srt.mem_cache.base_prefix_cache.CacheRequestHandle": ("rid", "attempt_id"),
+    "sglang.srt.mem_cache.base_prefix_cache.TreeLock": ("node", "receipt"),
     DISAGG + "common.utils.TransferKVChunk": (
         "kv_buffer_indices",
         "on_complete",
         "transfer_fn",
         "staging_chunk_idx",
         "staging_layer_ids",
-    )
+    ),
 }
 # Instance fields cannot be inspected by constructing the real GPU owners.
 # Inspect their initialization declarations in the actual loaded Python sources.
 CORE_STATE = {
+    "sglang.srt.managers.schedule_batch.Req.__init__": (
+        "self",
+        ("cache_request_handle", "last_node", "lock"),
+    ),
+    "sglang.srt.mem_cache.unified_radix_cache.UnifiedRadixCache.__init__": (
+        "self",
+        ("tree_components", "cache_controller", "linker", "enable_session_radix_cache"),
+    ),
     "sglang.srt.model_executor.runner_backend.full_cuda_graph_backend.FullCudaGraphBackend.__init__": (
         "self",
         ("_pool",),

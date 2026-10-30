@@ -139,6 +139,13 @@ def progressive_graph_leases(args, context):
             mismatch_rejected = True
         if args.rank == 1:
             decode.capture_bs.pop()
+        scheduler.tree_cache = SimpleNamespace(disable=bool(args.rank))
+        try:
+            controller.validate_graphs()
+            cache_mismatch_rejected = False
+        except RuntimeError:
+            cache_mismatch_rejected = True
+        del scheduler.tree_cache
         controller.validate_graphs()
 
         def sample():
@@ -193,6 +200,7 @@ def progressive_graph_leases(args, context):
     return {
         "snapshots": snapshots,
         "mismatch_rejected": mismatch_rejected,
+        "cache_mismatch_rejected": cache_mismatch_rejected,
         "existing_state_fallback": existing_state_fallback,
         "boundary_reductions": reductions,
         "freed": freed,
@@ -257,10 +265,27 @@ def main():
         controller.config = Config("remote", Path(args.output).with_suffix(".journal"))
         controller.scheduler = SimpleNamespace(attn_tp_cpu_group=dist.group.WORLD)
         controller.tp_size = 2
+        from sglang_remote_attn.source_cache import CacheGuard
+
         released = []
+        pins = set()
+        cache = SimpleNamespace(
+            checkpoint=lambda *a, **kw: None,
+            finish=lambda *a: None,
+            reset=lambda: None,
+            lock=lambda node: pins.add(node) or node,
+            unlock=pins.remove,
+        )
+        guard = CacheGuard(cache)
         sources = []
         for name in ("a", "b"):
-            req = SimpleNamespace(disagg_kv_sender=SimpleNamespace(poll=lambda: 4))
+            req = SimpleNamespace(
+                disagg_kv_sender=SimpleNamespace(poll=lambda: 4),
+                cache_request_handle=name,
+                lock=name,
+                last_node=name,
+                kv=SimpleNamespace(cache_protected_len=1),
+            )
             source = Source(
                 controller,
                 req,
@@ -273,11 +298,13 @@ def main():
                 responded=True,
                 finalized=True,
                 release=lambda name=name: released.append(name),
+                cache_lease=guard.hold(req),
             )
             req._pre_layerwise_source = source
             sources.append(source)
         controller.sources = list(sources)
         retirements = []
+        pin_counts = []
         with patch.dict(
             sys.modules,
             {
@@ -296,6 +323,7 @@ def main():
                     sources[1].remote_closed.set()
                 controller.poll_sources()
                 retirements.append(list(released))
+                pin_counts.append(len(pins))
         # Exercise the actual plugin can_run_graph hooks over real Gloo. The
         # native predicate is rank-local too, so it must participate in the vote.
         from sglang_remote_attn import handoff_control as runtime
@@ -394,6 +422,7 @@ def main():
                     "polls": polls,
                     "outcomes": outcomes,
                     "retirements": retirements,
+                    "p_radix_pins": pin_counts,
                     "graphs": graphs,
                     "leases": leases,
                     "segmented_startup": startup,
