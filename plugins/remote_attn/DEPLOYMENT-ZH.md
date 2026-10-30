@@ -35,7 +35,7 @@ optimistic prefill、chunk 和 Batch，不需要 JSON 配置或启动包装器�
 
 - `Qwen3ForCausalLM`、CUDA、dense NHD MHA、BF16/FP16 KV、page size 1。
 - P/D 相同 TP 宽度，PP=DP=CP=1；示例为 TP2，不能直接沿用异构 TP 拓扑。
-- 关闭 radix cache、scheduler overlap、Prefill 和 Decode CUDA graphs。只关闭 scheduler overlap，不关闭本功能的计算/传输重叠。
+- 关闭 radix cache、scheduler overlap；CUDA graphs 可保留原生配置。Remote/未完成的 layerwise 等待期间全 TP eager，全部 Local 且原生条件允许后恢复 graph；最终 chunk 的分层 prefill 仍 eager。只关闭 scheduler overlap，不关闭本功能的计算/传输重叠。
 - 原生 `mooncake_tcp`，P/D 均使用 `--disaggregation-decode-allocation-policy early`（代码默认）；不能使用 `prefill_complete`。
 - LoRA、MLA/混合/量化 KV、HiCache、speculative、统一 KV、PD multiplexing、live role switching 不在当前支持范围；原生 host KV destination 也不等于这里的 host staging ring。
 
@@ -267,7 +267,10 @@ core 共享 slot 的 `reserve()` 新建并注册 slot 后，使用**同一 copy 
 ## 5. 与现有服务启动流程对接
 
 将第 3 节环境加入现有进程管理器的 P/D 启动配置，保留模型路径、token chunk 和已核准的其他模型参数。
-必须保留本路径约束：page size 1、同 TP、关闭 radix cache / CUDA graphs / overlap scheduler、`mooncake_tcp`、提前分配。
+必须保留本路径约束：page size 1、同 TP、关闭 radix cache / overlap scheduler、`mooncake_tcp`、提前分配。
+graphs 沿用原生配置；各 TP rank 的判定由插件 CPU-group 投票统一。
+启动及 eager→graph 验证见[单 pair 说明](SINGLE-PAIR-ZH.md#验证-eager--graph-恢复)，
+本地测试范围见[适配记录](validation/PROGRESSIVE-CUDA-GRAPHS.md)。
 命令行原本有冲突配置时须在 manifest 中消除，不能只叠加变量期待自动兼容。
 
 以下脚本用于与仓库参考 Qwen3-8B TP2 配置一致的首轮联调；脚本自带历史模型参数，并不是读取任意线上 manifest 的通用入口。

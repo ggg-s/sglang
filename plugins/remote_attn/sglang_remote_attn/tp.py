@@ -1,4 +1,22 @@
-"""CPU-group agreement before a control command can change TP scheduling."""
+"""CPU-group agreement for control mutations and graph/eager dispatch."""
+
+
+def agree_graph(eligible, all_local, *, group, world_size):
+    """Replay only if every shard is eligible and its prefix is GPU-readable.
+
+    Always enter this collective, including ranks with no target states and
+    ranks rejected by the native graph runner. A rank-local short circuit here
+    can send peers into different model collective sequences.
+    """
+    if world_size == 1:
+        return bool(eligible and all_local), bool(all_local)
+    import torch
+    import torch.distributed as dist
+
+    votes = torch.tensor([eligible, all_local], dtype=torch.int32, device="cpu")
+    dist.all_reduce(votes, op=dist.ReduceOp.MIN, group=group)
+    eligible, all_local = votes.tolist()
+    return bool(eligible and all_local), bool(all_local)
 
 
 def inject_control(recv_reqs, *, leader, poll):

@@ -6072,15 +6072,16 @@ def has_target_states() -> bool:
 
 
 def has_remote_work() -> bool:
-    """True while any target state still has unimported (remote) layers."""
+    """True while replay would bypass an import wait, RPC, or failure check."""
     if os.environ.get("HANDOFF_GRAPH_DISABLE_ANY_STATE", "0") == "1":
         return bool(_TARGET_STATES)
     for st in _TARGET_STATES:
         if st.error is not None or st.aborted:
             return True
-        if getattr(st, "mode", None) == "remote":
-            if any(not e.is_set() for e in st.events):
-                return True
+        # Layerwise mode also needs Python to wait for the missing KV. Graph
+        # replay bypasses that wait just as it bypasses Remote attention RPCs.
+        if any(not e.is_set() for e in st.events):
+            return True
     return False
 
 

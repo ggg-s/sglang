@@ -6,7 +6,9 @@
 依赖、容量和完整验收见 [部署手册](DEPLOYMENT-ZH.md)。
 
 当前范围是同机 Qwen3 dense NHD MHA BF16/FP16、同 TP、PP=DP=CP=1、page size 1、
-early allocation、mooncake_tcp，并关闭 radix cache、CUDA graphs、overlap scheduler。
+early allocation、mooncake_tcp，并关闭 radix cache、overlap scheduler。
+CUDA graphs 可以沿用原生配置：D 仍有未就绪层时全 TP eager，全部 Local 且满足
+原生 graph 条件后恢复 replay；P 最终 chunk 的分层 prefill 仍为 eager。
 容器中的 P/D 必须共享同一份本机目录及可互通的 loopback 网络。
 以下 TP2 示例使用 GPU 0、1 做 P，GPU 2、3 做 D；线上其他模型、显存和并发参数
 继续保留，但与这些限制冲突的能力需要先适配。
@@ -87,7 +89,7 @@ python -m sglang.launch_server \
   --tp-size 2 --page-size 1 \
   --chunked-prefill-size "$ONLINE_CHUNK" \
   --optimistic-prefill-attempts "$ONLINE_OPTIMISTIC" \
-  --disable-radix-cache --disable-cuda-graph --disable-overlap-schedule \
+  --disable-radix-cache --disable-overlap-schedule \
   --disaggregation-mode prefill \
   --disaggregation-transfer-backend mooncake_tcp \
   --disaggregation-decode-allocation-policy early \
@@ -115,7 +117,7 @@ python -m sglang.launch_server \
   --host 127.0.0.1 --port 31017 \
   --tp-size 2 --page-size 1 \
   --chunked-prefill-size "$ONLINE_CHUNK" \
-  --disable-radix-cache --disable-cuda-graph --disable-overlap-schedule \
+  --disable-radix-cache --disable-overlap-schedule \
   --disaggregation-mode decode \
   --disaggregation-transfer-backend mooncake_tcp \
   --disaggregation-decode-allocation-policy early \
@@ -125,6 +127,12 @@ python -m sglang.launch_server \
 D 的其他线上参数同样保留。默认每个 D rank 需要 4 GiB pinned host ring 加
 4 GiB GPU shadow，此外还有模型、KV 和 workspace；显存比例须留出空间。
 目录 `/workspace/handoff_state` 是现有 runtime 固定诊断路径，服务账户需要可写。
+
+两端保留线上原生 graph backend、capture buckets/max-bs 配置；同一角色各 TP rank
+必须一致。插件不新增 graph 环境变量，不强制扩大 capture 范围，也不重新 capture。
+若原命令明确关闭了 graph，需先移除关闭配置；本分支原生 CLI 使用
+`--cuda-graph-backend-decode full` / `--cuda-graph-backend-prefill breakable` 等逐阶段参数，
+也可沿用线上 `--cuda-graph-config`。该原生参数不属于启动包装器。
 
 ## 5. 原生 SMG 启动
 
@@ -188,6 +196,26 @@ auto 在合格最终块计算量不足 3072 tokens 时，remote 会合成一组�
 记录 TTFT、第二个实际 token、前若干 token 间隔、E2E、吞吐和错误率。
 A'→layerwise 同时包含 staging 改变；layerwise→remote 还包含提前元数据和响应，
 需要据此归因。SSE 条目不一定对应单个 token。
+
+### 验证 eager → graph 恢复
+
+诊断轮在 D 启动前设置已有的 `SGLANG_LOG_DECODE_GRAPH_KEY=1`，并保存各 rank 日志。
+该开关逐次记录实际 decode replay，正式性能轮关闭。清除旧实验的
+`HANDOFF_GRAPH_DISABLE_ANY_STATE=1` 覆盖，确认启动日志已完成 graph capture。
+通过 SMG 发足够长的输出请求，让同一请求覆盖 Remote 和 Local 两个阶段：
+
+1. 全部 D rank 都应出现 `[remote-attn-graph] kind=decode ... path=eager all_local=False`。
+2. 最慢 shard 的所有层完成 GPU scatter 后，各 rank 应出现
+   `path=graph-eligible all_local=True`；紧接着的 `Decode graph replay:` 才是实际 replay 证据。
+   `all_local=True` 但 shape 不在原生 capture 范围时仍为 eager，符合预期。
+3. 配合 report 的各 shard `remote_calls > 0` 和 GPU trace，确认 Remote 阶段没有 replay、
+   Local 后有 replay。再加入一个未导完的新请求，确认混合 batch 整批回到 eager，完成后再次恢复。
+
+TP>1 每次 graph eligibility 检查增加一次 CPU-group MIN all-reduce，包含没有 target state
+和原生 graph 判定失败的 rank；不能用 rank 本地短路省略。测量时保留这个成本，
+对比同一模型/请求/线上 chunk 和 optimistic 配置下 graph 开关两组的输出、ITL、吞吐。
+CPU 已验证状态机和真实双进程一致性；GPU 上的数值与实际 graph replay 仍须执行本节验收。
+实现及本地证据见 [CUDA graphs 适配记录](validation/PROGRESSIVE-CUDA-GRAPHS.md)。
 
 ## 7. 撤流与本地检查
 

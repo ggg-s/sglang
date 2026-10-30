@@ -87,13 +87,6 @@ def validate_config():
         raise RuntimeError("remote_attn does not yet support speculative decoding")
     if get_disagg().enable_pd_role_switch:
         raise RuntimeError("remote_attn does not yet support live PD role switching")
-    graph = get_exec().graph.cuda_graph_config
-    if parallel.tp_size > 1 and (
-        graph.decode.backend != "disabled" or graph.prefill.backend != "disabled"
-    ):
-        raise RuntimeError(
-            "remote_attn TP requires --disable-cuda-graph until replay decisions are synchronized"
-        )
     if not callable(getattr(TransferEngine, "send_probe", None)):
         raise RuntimeError("remote_attn requires Mooncake TransferEngine.send_probe")
 
@@ -228,15 +221,40 @@ def _stream_output(original, streamer, reqs, *args, **kwargs):
 
 
 def _decode_graph(original, runner, forward_batch):
-    if _runtime().has_remote_work():
-        return False
-    return original(runner, forward_batch)
+    return _graph_decision(original, runner, forward_batch, "decode")
 
 
 def _prefill_graph(original, runner, forward_batch):
-    if _runtime().has_target_states():
-        return False
-    return original(runner, forward_batch)
+    return _graph_decision(original, runner, forward_batch, "prefill")
+
+
+def _graph_decision(original, runner, forward_batch, kind):
+    from sglang.srt.runtime_context import get_parallel
+
+    from .tp import agree_graph
+
+    parallel = get_parallel()
+    # Do not short circuit on local readiness or native eligibility. Even the
+    # fastest shard (or one with no remaining state) must join the same vote.
+    eligible = bool(original(runner, forward_batch))
+    can_replay, all_local = agree_graph(
+        eligible,
+        not _runtime().has_remote_work(),
+        group=parallel.tp_group.cpu_group if parallel.tp_size > 1 else None,
+        world_size=parallel.tp_size,
+    )
+    verdict = (can_replay, all_local)
+    if getattr(runner, "_remote_attn_graph_verdict", None) != verdict:
+        runner._remote_attn_graph_verdict = verdict
+        logger.info(
+            "[remote-attn-graph] kind=%s rank=%s tp=%s path=%s all_local=%s",
+            kind,
+            parallel.tp_rank,
+            parallel.tp_size,
+            "graph-eligible" if can_replay else "eager",
+            all_local,
+        )
+    return can_replay
 
 
 def _graph_execute(original, runner, forward_batch, *args, **kwargs):

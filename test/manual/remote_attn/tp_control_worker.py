@@ -3,6 +3,7 @@
 import argparse
 import json
 import sys
+import threading
 from datetime import timedelta
 from pathlib import Path
 from types import SimpleNamespace
@@ -109,6 +110,45 @@ def main():
                     sources[1].remote_closed.set()
                 controller.poll_sources()
                 retirements.append(list(released))
+        # Exercise the actual plugin can_run_graph hooks over real Gloo. The
+        # native predicate is rank-local too, so it must participate in the vote.
+        from sglang_remote_attn import handoff_control as runtime
+        from sglang_remote_attn import hooks
+
+        context = SimpleNamespace(
+            get_parallel=lambda: SimpleNamespace(
+                tp_size=2,
+                tp_rank=args.rank,
+                tp_group=SimpleNamespace(cpu_group=dist.group.WORLD),
+            )
+        )
+        event = threading.Event()
+        state = SimpleNamespace(
+            mode="remote", events=[event], error=None, aborted=False
+        )
+        decode, prefill = SimpleNamespace(), SimpleNamespace()
+        graphs = []
+        with patch.dict(sys.modules, {"sglang.srt.runtime_context": context}):
+            for step in range(9):
+                # Start Local, then admit only rank 1's target, then give both
+                # ranks a target with rank 0 already ready. Later only rank 0
+                # sees a newly admitted incomplete target.
+                states = [state] if step in (1, 2, 3, 4, 5, 6, 7) else []
+                if (step == 1 and args.rank == 0) or (step == 6 and args.rank == 1):
+                    states = []
+                if (step >= 3 and step != 6) or (step == 2 and args.rank == 0):
+                    event.set()
+                else:
+                    event.clear()
+                state.error = "failed import" if step == 7 and args.rank == 1 else None
+                eligible = not (step == 4 and args.rank == 1)
+                with patch.object(runtime, "_TARGET_STATES", states):
+                    graphs.append(
+                        [
+                            hooks._decode_graph(lambda *a: eligible, decode, None),
+                            hooks._prefill_graph(lambda *a: eligible, prefill, None),
+                        ]
+                    )
         Path(args.output).write_text(
             json.dumps(
                 {
@@ -116,6 +156,7 @@ def main():
                     "polls": polls,
                     "outcomes": outcomes,
                     "retirements": retirements,
+                    "graphs": graphs,
                 }
             )
         )

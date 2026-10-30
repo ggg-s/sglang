@@ -2,7 +2,7 @@
 
 单 pair 最小接入：[原生 SMG + P/D 启动说明](SINGLE-PAIR-ZH.md)。直接使用现有
 P/D/SMG 命令及插件环境，保留线上 optimistic prefill、token chunk 和传输 Batch；
-不需要 JSON 配置或启动包装器。本次接入仅修改插件预检与文档，继续依赖下述核心扩展。
+不需要 JSON 配置或启动包装器。CUDA graphs 的 TP 一致性适配也在插件内，继续依赖下述核心扩展。
 
 中文部署入口：[Progressive 生产接入手册](DEPLOYMENT-ZH.md)，对应 `codex/remote-attn-pre-layerwise`：固定发布制品、P/D 角色配置、双端 host staging、延迟回收、冷态预热、灰度验收与回退。旧 P5.18 D0→D1 实验部署保留在 [历史手册](migration/P5.18-DEPLOYMENT-LEGACY-ZH.md)。
 
@@ -81,7 +81,7 @@ P0–P5.18 features to this port and distinguishes code coverage from deployment
 | Decode-style resume | Preserve `Req.kv` and its allocated row; set committed and allocated KV lengths; use the current `process_prebuilt(future_map)` API |
 | KV release / retraction | Fence target receiver writes before upstream frees KV; handle imports aborted before row admission |
 | Normal SSE output | Filter `_handoff_req` out of the regular output streamer; gateway/status retains output ownership |
-| CUDA graphs | Gate decode replay on remote work, prefill replay on target states; stamp graph step metadata at `execute` |
+| CUDA graphs | TP MIN vote on native eligibility and GPU-local readiness for decode/prefill; Remote/layer waits stay eager, all-Local restores native replay; stamp decode graph step metadata at `execute` |
 | Mooncake | Create the send mutex before constructor threads start; serialize process-wide transport batches; probe changed peers before upstream registration publication |
 
 Main's existing `prefill_decode_interval` implements P5.10. The old scheduler
@@ -96,11 +96,14 @@ by default; the P5.19 adapter is enabled only through the plugin and its explici
 
 The initial port targets the supplied single-host Qwen3-8B setup: CUDA,
 plain TP (including TP2, with the same TP width across roles), dense NHD MHA KV in BF16/FP16, page size 1,
-radix cache disabled, and scheduler overlap disabled. The functional launchers
-also disable CUDA graphs and select FlashInfer, as in the original experiment.
-For TP > 1, disabling both prefill and decode CUDA graphs is mandatory and
-checked at startup: rank-local transfer progress cannot choose graph versus
-eager execution consistently without a separate replay agreement protocol.
+radix cache disabled, and scheduler overlap disabled. Native CUDA graphs may
+remain enabled: each eligibility check reduces native eligibility and local
+KV readiness over the TP CPU group, even on ranks without target state.
+Remote or pending layerwise waits force eager execution on every rank;
+all-Local batches regain native replay eligibility without recapture.
+The final layer-split prefill stays eager; ordinary prefill retains its native
+graph dispatch. The older functional experiment launchers still disable graphs.
+See [graph adaptation and validation](validation/PROGRESSIVE-CUDA-GRAPHS.md).
 
 The plugin rejects PP/DP/CP/DCP, speculative decoding, mixed chunks, unified KV,
 HiCache, hybrid/MLA/quantized KV pools and live PD role switching. These layouts
@@ -287,8 +290,8 @@ multiple experiments; changing those control-plane paths is outside this port.
 4. Exercise pre-commit rollback and both controller/decode restarts. Confirm a
    restarted D peer is probed before its first chunk.
 5. Profile Remote to confirm KV transfer overlaps attention and layers become
-   LOCAL progressively. TP graph-on support first needs a synchronized replay
-   decision protocol; the current plugin rejects that configuration.
+   LOCAL progressively. With graphs enabled, verify TP-wide eager execution
+   during Remote and actual native graph replay after all shards become Local.
 
 The source module's original local test/control surface and authentication
 assumptions are retained. This port does not add a production router, automatic

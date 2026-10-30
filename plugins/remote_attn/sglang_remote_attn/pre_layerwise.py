@@ -467,7 +467,7 @@ class Controller:
 
     def validate(self):
         from sglang.srt.environ import envs
-        from sglang.srt.runtime_context import get_disagg, get_exec, get_memory
+        from sglang.srt.runtime_context import get_disagg, get_memory
 
         if (
             self.config.recv_host_staging
@@ -478,11 +478,6 @@ class Controller:
             )
         s = self.scheduler
         runner = s.tp_worker.model_runner
-        graphs = get_exec().graph.cuda_graph_config
-        if graphs.prefill.backend != "disabled" or graphs.decode.backend != "disabled":
-            raise ValueError(
-                "pre-layerwise requires both CUDA graphs disabled, including TP1"
-            )
         if type(runner.model).__name__ != "Qwen3ForCausalLM":
             raise ValueError("pre-layerwise first supports Qwen3ForCausalLM only")
         if runner.lora_manager is not None:

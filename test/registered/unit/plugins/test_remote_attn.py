@@ -459,17 +459,146 @@ class TestRemoteAttn(CustomTestCase):
         self.assertEqual(emitted, ["ordinary"])
 
     def test_graph_guards_reenable_only_after_remote_layers_finish(self):
+        """Replay must not skip layer waits, and completion must restore both runners."""
+        context = SimpleNamespace(
+            get_parallel=lambda: SimpleNamespace(tp_size=1, tp_rank=0)
+        )
+        for mode in ("remote", "layer"):
+            for hook in (self.hooks._decode_graph, self.hooks._prefill_graph):
+                with self.subTest(mode=mode, hook=hook.__name__):
+                    events = [threading.Event(), threading.Event()]
+                    state = SimpleNamespace(
+                        mode=mode, events=events, error=None, aborted=False
+                    )
+                    runner = SimpleNamespace()
+                    with (
+                        patch.object(self.runtime, "_TARGET_STATES", [state]),
+                        patch.dict(
+                            sys.modules, {"sglang.srt.runtime_context": context}
+                        ),
+                    ):
+                        self.assertFalse(hook(lambda *a: True, runner, None))
+                        events[0].set()
+                        self.assertFalse(hook(lambda *a: True, runner, None))
+                        events[1].set()
+                        self.assertTrue(hook(lambda *a: True, runner, None))
+                        # Completion does not override the native shape limits.
+                        self.assertFalse(hook(lambda *a: False, runner, None))
+                        state.error = "failed after waking waiters"
+                        self.assertFalse(hook(lambda *a: True, runner, None))
+                        state.error, state.aborted = None, True
+                        self.assertFalse(hook(lambda *a: True, runner, None))
+                    with (
+                        patch.object(self.runtime, "_TARGET_STATES", []),
+                        patch.dict(
+                            sys.modules, {"sglang.srt.runtime_context": context}
+                        ),
+                    ):
+                        self.assertTrue(hook(lambda *a: True, runner, None))
+
+    def test_graph_dispatch_recovers_without_recapture_and_split_prefill_stays_eager(
+        self,
+    ):
+        """Exercise the native dispatch: Remote->Local->new Remote, with one runner."""
+        from enum import IntEnum, auto
+
+        tree = ast.parse(
+            (
+                ROOT / "python/sglang/srt/model_executor/forward_batch_info.py"
+            ).read_text()
+        )
+        node = next(n for n in tree.body if getattr(n, "name", None) == "ForwardMode")
+        namespace = {"IntEnum": IntEnum, "auto": auto}
+        exec(
+            compile(ast.Module(body=[node], type_ignores=[]), "<ForwardMode>", "exec"),
+            namespace,
+        )
+        mode = namespace["ForwardMode"]
+        cls = _source_class(
+            "model_executor/model_runner.py", "ModelRunner", {"_forward_raw"}
+        )
+        cls._forward_raw.__globals__.update(
+            has_forward_context=lambda: False,
+            forward_context=lambda *a, **kw: nullcontext(),
+            ForwardContext=SimpleNamespace,
+            get_model=lambda: SimpleNamespace(override=lambda **kw: nullcontext()),
+            get_global_dwdp_manager=lambda: None,
+            EagerRunner=type("EagerRunner", (), {}),
+            ModelRunnerOutput=SimpleNamespace,
+            _prefill_cuda_graph_allows_context_parallel=lambda *a: True,
+            device_timer_ctx=lambda *a: nullcontext(),
+        )
+        paths = []
+
+        def execute(path):
+            def run(*a, **kw):
+                paths.append(path)
+                return "output"
+
+            return run
+
+        decode, prefill = SimpleNamespace(), SimpleNamespace()
+        decode.can_run_graph = lambda fb: self.hooks._decode_graph(
+            lambda *a: True, decode, fb
+        )
+        prefill.can_run_graph = lambda fb: self.hooks._prefill_graph(
+            lambda *a: True, prefill, fb
+        )
+        decode.execute, prefill.execute = (
+            execute("decode-graph"),
+            execute("prefill-graph"),
+        )
+        runner = cls()
+        runner.model = SimpleNamespace(shared_experts_config=None)
+        runner.attn_backend = runner.device_timer = runner.hisparse_coordinator = None
+        runner.device = "cuda"
+        runner.decode_cuda_graph_runner, runner.prefill_cuda_graph_runner = (
+            decode,
+            prefill,
+        )
+        runner.eager_runner = SimpleNamespace(execute=execute("eager"))
+        runner._prepare_eager_forward_batch = lambda fb: None
+        runner._maybe_execute_deferred_mamba_cow_and_clear = lambda fb: None
+        runner._extend_forward_kwargs = lambda *a: {}
+        runner.forward_split_prefill = execute("split-eager")
+        fb = SimpleNamespace(global_num_tokens_cpu=None, token_indices_to_pool=None)
+        context = SimpleNamespace(
+            get_parallel=lambda: SimpleNamespace(tp_size=1, tp_rank=0)
+        )
         event = threading.Event()
         state = SimpleNamespace(
             mode="remote", events=[event], error=None, aborted=False
         )
-        with patch.object(self.runtime, "_TARGET_STATES", [state]):
-            self.assertFalse(self.hooks._decode_graph(lambda *a: True, None, None))
-            self.assertFalse(self.hooks._prefill_graph(lambda *a: True, None, None))
-
+        with (
+            patch.object(self.runtime, "_TARGET_STATES", [state]),
+            patch.dict(sys.modules, {"sglang.srt.runtime_context": context}),
+        ):
+            for forward_mode in (mode.DECODE, mode.EXTEND):
+                fb.forward_mode = forward_mode
+                for complete in (False, True, False):
+                    if complete:
+                        event.set()
+                    else:
+                        event.clear()
+                    result = runner._forward_raw(fb, None)
+                    self.assertEqual(result.can_run_graph, complete)
+                    self.assertEqual(result.logits_output, "output")
             event.set()
-            self.assertTrue(self.hooks._decode_graph(lambda *a: True, None, None))
-            self.assertFalse(self.hooks._prefill_graph(lambda *a: True, None, None))
+            fb.forward_mode = mode.SPLIT_PREFILL
+            result = runner._forward_raw(fb, None, split_forward_count=2)
+            self.assertFalse(result.can_run_graph)
+        self.assertEqual(
+            paths,
+            [
+                "eager",
+                "decode-graph",
+                "eager",
+                "eager",
+                "prefill-graph",
+                "eager",
+                "split-eager",
+            ],
+        )
 
     def test_failed_import_cannot_become_local_or_replayable(self):
         event = threading.Event()
@@ -484,6 +613,77 @@ class TestRemoteAttn(CustomTestCase):
             self.assertTrue(self.runtime.has_remote_work())
             with self.assertRaisesRegex(RuntimeError, "broken pipe"):
                 self.runtime._handoff_attention_forward(None, None, None, None, None)
+
+    def test_progressive_startup_accepts_graphs_without_relaxing_other_constraints(
+        self,
+    ):
+        """Graph-enabled TP must pass both startup validators; overlap remains gated."""
+        pl = self.hooks.pre_layerwise
+        parallel = SimpleNamespace(
+            tp_size=2,
+            pp_size=1,
+            dp_size=1,
+            attn_cp_size=1,
+            dcp_enabled=False,
+            attn_dp_enabled=False,
+        )
+        schedule = SimpleNamespace(
+            disable_overlap_schedule=True, page_size=1, enable_mixed_chunk=False
+        )
+        context = SimpleNamespace(
+            get_parallel=lambda: parallel,
+            get_device=lambda: SimpleNamespace(device="cuda"),
+            get_schedule=lambda: schedule,
+            get_memory=lambda: SimpleNamespace(
+                disable_radix_cache=True,
+                enable_unified_memory=False,
+                enable_hierarchical_cache=False,
+            ),
+            get_exec=lambda: SimpleNamespace(
+                overlap=SimpleNamespace(enable_two_batch_overlap=False),
+                graph=SimpleNamespace(
+                    cuda_graph_config=SimpleNamespace(
+                        decode=SimpleNamespace(backend="full"),
+                        prefill=SimpleNamespace(backend="breakable"),
+                    )
+                ),
+            ),
+            get_spec=lambda: SimpleNamespace(speculative_algorithm=None),
+            get_disagg=lambda: SimpleNamespace(
+                enable_pd_role_switch=False,
+                disaggregation_decode_allocation_policy="early",
+            ),
+        )
+        model = type(
+            "Qwen3ForCausalLM", (), {"forward_split_prefill": lambda *a: None}
+        )()
+        controller = pl.Controller.__new__(pl.Controller)
+        controller.scheduler = SimpleNamespace(
+            tp_worker=SimpleNamespace(
+                model_runner=SimpleNamespace(model=model, lora_manager=None)
+            ),
+            kv_checksum_computer=None,
+            enable_pdmux=False,
+        )
+        with (
+            tempfile.TemporaryDirectory() as directory,
+            patch.dict(
+                sys.modules,
+                {
+                    "sglang.srt.runtime_context": context,
+                    "mooncake.engine": SimpleNamespace(
+                        TransferEngine=SimpleNamespace(send_probe=lambda: None)
+                    ),
+                },
+            ),
+        ):
+            controller.config = pl.Config("remote", Path(directory) / "journal")
+            self.hooks.validate_config()
+            controller.validate()
+            self.assertTrue(controller.config.directory.is_dir())
+            schedule.disable_overlap_schedule = False
+            with self.assertRaisesRegex(RuntimeError, "disable-overlap-schedule"):
+                self.hooks.validate_config()
 
     def test_fast_and_cpu_snapshot_wire_layouts(self):
         key = torch.empty(3, 2, 4, dtype=torch.bfloat16)
@@ -1269,6 +1469,16 @@ class TestRemoteAttn(CustomTestCase):
         self.assertEqual(rows[0]["retirements"], [[], ["a"], ["a", "b"]])
         self.assertEqual(rows[0]["retirements"], rows[1]["retirements"])
         self.assertEqual(rows[0]["outcomes"], rows[1]["outcomes"])
+        # A ready/no-state shard, a missing layer, a native shape rejection,
+        # and failure wakeups must all lead to the same branch on both ranks.
+        self.assertEqual(rows[0]["graphs"], rows[1]["graphs"])
+        self.assertEqual(
+            rows[0]["graphs"],
+            [
+                [value, value]
+                for value in (True, False, False, True, False, True, False, False, True)
+            ],
+        )
         self.assertEqual(
             [r["fatal"] for r in rows[0]["outcomes"]], [False, True, True, False]
         )
@@ -2793,6 +3003,9 @@ class TestRemoteAttn(CustomTestCase):
                     events=[threading.Event(), threading.Event()],
                     layer_ready_at=[None, None],
                     import_done_at=None,
+                    mode="remote",
+                    error=None,
+                    aborted=False,
                 )
                 target = pl.Target(
                     None,
@@ -2810,6 +3023,8 @@ class TestRemoteAttn(CustomTestCase):
                 f.handler.submit_last_scatter_async(7)
                 target.refresh()
                 self.assertFalse(state.events[0].is_set())
+                with patch.object(self.runtime, "_TARGET_STATES", [state]):
+                    self.assertTrue(self.runtime.has_remote_work())
                 self.assertFalse(f.handler.is_done(f.dr))
                 with patch.object(pl, "_poll_success", return_value=True):
                     self.assertFalse(target.ready_to_finish())
@@ -2826,6 +3041,8 @@ class TestRemoteAttn(CustomTestCase):
                 target.refresh()
                 self.assertTrue(state.events[0].is_set())
                 self.assertFalse(state.events[1].is_set())
+                with patch.object(self.runtime, "_TARGET_STATES", [state]):
+                    self.assertTrue(self.runtime.has_remote_work())
                 self.assertEqual(f.allocator.get_watermark(), (0, 12))
                 self.assertFalse(f.handler.is_done(f.dr))
                 # The last group's arrival can follow native Success.
@@ -2836,6 +3053,8 @@ class TestRemoteAttn(CustomTestCase):
                 f.events[-1].complete = True
                 target.refresh()
                 self.assertTrue(state.events[1].is_set())
+                with patch.object(self.runtime, "_TARGET_STATES", [state]):
+                    self.assertFalse(self.runtime.has_remote_work())
                 self.assertTrue(f.handler.is_done(f.dr))
                 self.assertEqual(f.allocator.get_watermark(), (1, 0))
                 self.assertEqual(f.messages[-1], [b"WATERMARK", b"1", b"0", b"peer"])
