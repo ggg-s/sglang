@@ -36,7 +36,7 @@ import torch
 from sglang.test.ci.ci_register import register_cpu_ci
 from sglang.test.test_utils import CustomTestCase
 
-register_cpu_ci(est_time=8, suite="base-a-test-cpu")
+register_cpu_ci(est_time=12, suite="base-a-test-cpu")
 
 ROOT = Path(__file__).resolve().parents[4]
 PLUGIN = ROOT / "plugins" / "remote_attn"
@@ -161,6 +161,7 @@ class TestRemoteAttn(CustomTestCase):
         cls.runtime = importlib.import_module("sglang_remote_attn.handoff_control")
         cls.compat = importlib.import_module("sglang_remote_attn.compat")
         cls.check = importlib.import_module("sglang_remote_attn.check")
+        cls.interfaces = importlib.import_module("sglang_remote_attn.interfaces")
         cls.Kv = _source_class("managers/schedule_batch.py", "ReqKvInfo")
         cls.Pool = _source_class(
             "mem_cache/memory_pool.py",
@@ -3115,6 +3116,233 @@ class TestRemoteAttn(CustomTestCase):
 
     def test_hook_targets_match_current_main(self):
         self.check.check_sources(ROOT)
+
+    def _preflight_checkout(self, root):
+        api = self.interfaces
+        targets = (
+            list(self.hooks.HOOKS)
+            + list(api.CORE_CALLS)
+            + list(api.CORE_FIELDS)
+            + list(api.CORE_PROPERTIES)
+            + list(api.CORE_STATE)
+            + ["sglang.srt.environ.Envs"]
+        )
+        paths = set()
+        for target in targets:
+            resolver = api.SourceAPI(ROOT)
+            resolver.resolve(target)
+            paths.update(resolver.cache)
+        for path in paths:
+            destination = root / path.relative_to(ROOT)
+            destination.parent.mkdir(parents=True, exist_ok=True)
+            destination.write_text(path.read_text())
+
+    def test_prelayer_preflight_rejects_incomplete_core_keywords(self):
+        """A valid hook target must not hide missing progressive call arguments."""
+        cases = (
+            ("decode.DecodeTransferQueue._commit_transfer_to_req", "keep_receiver"),
+            (
+                "mooncake.conn.MooncakeKVManager.add_transfer_request",
+                "kv_buffer_indices",
+            ),
+            ("mooncake.conn.MooncakeKVManager.add_transfer_request", "on_complete"),
+            ("mooncake.conn.MooncakeKVManager.add_transfer_request", "transfer_fn"),
+            (
+                "mooncake.conn.MooncakeKVManager.add_transfer_request",
+                "staging_chunk_idx",
+            ),
+            (
+                "mooncake.conn.MooncakeKVManager.add_transfer_request",
+                "staging_layer_ids",
+            ),
+            ("mooncake.conn.MooncakeKVManager._transfer_data", "stage"),
+            ("common.staging_handler.init_staging_allocator", "pin_memory"),
+            (
+                "common.staging_handler.DecodeStagingHandler._scatter_region",
+                "layer_ids",
+            ),
+            (
+                "common.staging_handler.DecodeStagingHandler._scatter_region",
+                "staging_bytes",
+            ),
+            ("common.staging_handler.PrefillStagingStrategy.check_ready", "chunk_idx"),
+        )
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            self._preflight_checkout(root)
+            for relative, keyword in cases:
+                with self.subTest(interface=relative, keyword=keyword):
+                    resolver = self.interfaces.SourceAPI(root)
+                    node = resolver.resolve("sglang.srt.disaggregation." + relative)
+                    path, tree = next(iter(resolver.cache.items()))
+                    original = path.read_text()
+                    for arg in node.args.args + node.args.kwonlyargs:
+                        if arg.arg == keyword:
+                            arg.arg = "removed_" + keyword
+                    path.write_text(ast.unparse(tree))
+                    try:
+                        with self.assertRaisesRegex(RuntimeError, keyword):
+                            self.check.check_sources(root)
+                    finally:
+                        path.write_text(original)
+
+    def test_prelayer_preflight_rejects_missing_task_state_and_environment(self):
+        """Mixed core files must fail before a worker accesses absent fields."""
+        cases = (
+            ("sglang.srt.disaggregation.common.utils.TransferKVChunk", "on_complete"),
+            (
+                "sglang.srt.disaggregation.common.utils.TransferKVChunk",
+                "staging_layer_ids",
+            ),
+            (
+                "sglang.srt.disaggregation.common.conn.CommonKVReceiver.send_metadata",
+                "chunk_staging_layers",
+            ),
+            (
+                "sglang.srt.disaggregation.common.staging_handler.DecodeStagingHandler.register_decode_req",
+                "_staging_completed_layers",
+            ),
+            (
+                "sglang.srt.disaggregation.common.staging_buffer.StagingBuffer.__init__",
+                "gpu_buffer",
+            ),
+            ("sglang.srt.environ.Envs", "SGLANG_MOONCAKE_HOST_STAGING_ALL"),
+        )
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            self._preflight_checkout(root)
+            for target, field in cases:
+                with self.subTest(interface=target, field=field):
+                    resolver = self.interfaces.SourceAPI(root)
+                    node = resolver.resolve(target)
+                    path, tree = next(iter(resolver.cache.items()))
+                    original = path.read_text()
+                    for child in ast.walk(node):
+                        if isinstance(child, ast.Name) and child.id == field:
+                            child.id = "removed_" + field
+                        elif isinstance(child, ast.Attribute) and child.attr == field:
+                            child.attr = "removed_" + field
+                    path.write_text(ast.unparse(tree))
+                    try:
+                        with self.assertRaisesRegex(RuntimeError, field):
+                            self.check.check_sources(root)
+                    finally:
+                        path.write_text(original)
+
+    def test_prelayer_preflight_rejects_missing_staging_module(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            self._preflight_checkout(root)
+            module = (
+                root
+                / "python/sglang/srt/disaggregation/mooncake/pinned_staging_core.py"
+            )
+            module.unlink()
+            with self.assertRaisesRegex(RuntimeError, "pinned_staging_core"):
+                self.check.check_sources(root)
+
+    def test_prelayer_runtime_preflight_requires_explicit_retention_contract(self):
+        """Installed checks must reject **kwargs and changed native defaults."""
+
+        def discards_flag(self, request, **kwargs):
+            pass
+
+        def changes_native_default(self, request, *, keep_receiver=True):
+            pass
+
+        def positional_only(self, request, keep_receiver=False, /, **kwargs):
+            pass
+
+        for function in (discards_flag, changes_native_default, positional_only):
+            with self.subTest(function=function.__name__):
+                with self.assertRaisesRegex(RuntimeError, "keep_receiver"):
+                    self.check.check_runtime_interfaces(resolve=lambda target: function)
+
+    def test_prelayer_runtime_preflight_checks_loaded_fields_and_state(self):
+        """Checking a good checkout must not mask an incompatible loaded module."""
+        from sglang.srt.environ import envs
+
+        api = self.interfaces
+        source = api.SourceAPI(ROOT)
+        loaded = {}
+        for target in dict.fromkeys(
+            [*api.CORE_CALLS, *api.CORE_STATE, *api.CORE_PROPERTIES]
+        ):
+            resolver = api.SourceAPI(ROOT)
+            node = copy.deepcopy(resolver.resolve(target))
+            path = next(iter(resolver.cache))
+            node.decorator_list = []
+            node.body = [ast.Pass()]
+            # Keep call signatures without evaluating imports or constructing owners.
+            for defaults in (node.args.defaults, node.args.kw_defaults):
+                for index, value in enumerate(defaults):
+                    if value is not None:
+                        try:
+                            ast.literal_eval(value)
+                        except (ValueError, TypeError):
+                            defaults[index] = ast.Constant(None)
+            module = ast.Module(
+                body=[
+                    ast.ImportFrom(
+                        module="__future__",
+                        names=[ast.alias(name="annotations")],
+                        level=0,
+                    ),
+                    node,
+                ],
+                type_ignores=[],
+            )
+            namespace = {}
+            exec(
+                compile(ast.fix_missing_locations(module), str(path), "exec"), namespace
+            )
+            loaded[target] = (
+                property(namespace[node.name])
+                if target in api.CORE_PROPERTIES
+                else namespace[node.name]
+            )
+        for target in api.CORE_FIELDS:
+            loaded[target] = dataclasses.make_dataclass(
+                "LoadedTask",
+                [
+                    (name, object, None)
+                    for name in api.declared_fields(source.resolve(target))
+                ],
+            )
+        loaded["sglang.srt.environ.envs"] = envs
+        self.check.check_runtime_interfaces(resolve=loaded.__getitem__)
+
+        task = "sglang.srt.disaggregation.common.utils.TransferKVChunk"
+        original = loaded[task]
+        loaded[task] = dataclasses.make_dataclass(
+            "OldTask",
+            [
+                (field.name, object, None)
+                for field in dataclasses.fields(original)
+                if field.name != "on_complete"
+            ],
+        )
+        with self.assertRaisesRegex(RuntimeError, "on_complete"):
+            self.check.check_runtime_interfaces(resolve=loaded.__getitem__)
+        loaded[task] = original
+
+        def discards_ready_event(self, session, blocks, **ready_event):
+            pass
+
+        target = "sglang.srt.disaggregation.pinned_staging_buffer.PinnedKVStager.send"
+        original = loaded[target]
+        loaded[target] = discards_ready_event
+        with self.assertRaisesRegex(RuntimeError, "ready_event"):
+            self.check.check_runtime_interfaces(resolve=loaded.__getitem__)
+        loaded[target] = original
+
+        def missing_scatter_state(self, room, decode_req):
+            pass
+
+        target = "sglang.srt.disaggregation.common.staging_handler.DecodeStagingHandler.register_decode_req"
+        loaded[target] = missing_scatter_state
+        with self.assertRaisesRegex(RuntimeError, "_staging_layer_events"):
+            self.check.check_runtime_interfaces(resolve=loaded.__getitem__)
 
 
 if __name__ == "__main__":

@@ -333,9 +333,12 @@ def register_hooks():
     from sglang.srt.environ import envs
     from sglang.srt.plugins.hook_registry import HookRegistry, HookType
 
+    from .interfaces import check_runtime_interfaces
+
     # Resolve and signature-check the whole set before changing any target.
     # SGLang logs plugin failures, so the Scheduler init hook also verifies
     # that the loader actually applied every registration before serving.
+    check_runtime_interfaces()
     envs.SGLANG_MOONCAKE_SEND_LOCK.get()
     for target, hook in HOOKS.items():
         function = pkgutil.resolve_name(target)

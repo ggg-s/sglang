@@ -1,5 +1,9 @@
 # Remote attention / progressive KV handoff plugin
 
+单 pair 最小接入：[原生 SMG + P/D 启动说明](SINGLE-PAIR-ZH.md)。直接使用现有
+P/D/SMG 命令及插件环境，保留线上 optimistic prefill、token chunk 和传输 Batch；
+不需要 JSON 配置或启动包装器。本次接入仅修改插件预检与文档，继续依赖下述核心扩展。
+
 中文部署入口：[Progressive 生产接入手册](DEPLOYMENT-ZH.md)，对应 `codex/remote-attn-pre-layerwise`：固定发布制品、P/D 角色配置、双端 host staging、延迟回收、冷态预热、灰度验收与回退。旧 P5.18 D0→D1 实验部署保留在 [历史手册](migration/P5.18-DEPLOYMENT-LEGACY-ZH.md)。
 
 This ports the supplied P0–P5.18 experiment onto local `main` at
@@ -123,11 +127,14 @@ python -m pip install --no-deps -e ./plugins/remote_attn
 python -m sglang_remote_attn.check
 ```
 
-Preflight checks entry-point installation, all 16 target interfaces, the env
-declaration and Mooncake's `send_probe`. It does not start a server or validate
-GPU transfer correctness. With an explicitly enabled plugin, registration errors
-or missing hooks stop startup. Ordinary package installation without
-`HANDOFF_CTL_DIR` registers no hooks.
+Preflight checks entry-point installation, all 23 hook targets, progressive core
+interfaces and Mooncake's `send_probe`. Core checks include explicit keyword
+parameters/defaults, transfer task fields, staging state initialization and typed
+environment declarations. Installed preflight resolves the loaded modules rather
+than a checkout; plugin registration repeats these checks before registering hooks.
+Source-only checks validate the selected checkout with the same contract list.
+These checks do not start a server or validate GPU transfer correctness. Ordinary
+package installation without `HANDOFF_CTL_DIR` registers no hooks.
 
 For interface checks on a machine without CUDA/Mooncake:
 
@@ -137,7 +144,8 @@ PYTHONPATH=plugins/remote_attn python -m sglang_remote_attn.check --source-only
 
 ## Local validation
 
-- 57 CPU contract tests passed, using real CPU PyTorch tensors and source-loaded
+- 64 CPU contract tests passed on 2026-10-30, including progressive core preflight
+  rejection cases and real two-process Gloo agreement, using CPU PyTorch tensors and source-loaded
   upstream pool/KV methods. The local environment lacks the full SGLang model/eval
   dependencies, so its reduced test harness also source-loaded the repository's
   `CustomTestCase`; full installed-runtime import was not exercised locally.
@@ -149,7 +157,9 @@ PYTHONPATH=plugins/remote_attn python -m sglang_remote_attn.check --source-only
   stream fences, incomplete-layer wakeups and teardown failures. Layer-group
   retirement tests cover blocking destructors and bounded reaper backpressure;
   sender slot checks cover registration-before-warmup and reuse without rewarming.
-- All 23 hook targets and their positional/keyword call shapes match this checkout.
+- All 23 hook targets and 40 progressive core interface/state checks match this
+  checkout. The unpatched original base is now rejected for missing `keep_receiver`;
+  hook count alone is no longer accepted as evidence of core compatibility.
 - Python compilation, Ruff F checks, isort and formatting, shell syntax, wheel build and
   wheel entry-point metadata checks passed.
 - Launcher checks captured the real shell commands and environment without starting

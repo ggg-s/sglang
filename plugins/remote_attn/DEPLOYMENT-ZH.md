@@ -1,17 +1,20 @@
 # Remote-attn Progressive 生产接入手册
 
 本文对应 `codex/remote-attn-pre-layerwise` 分支，运行时代码基线为
-`bf92a1ae42f7eba1038f380dddf4dee40e0afc4b`（2026-10-29）。发布时固定经过验收的完整 SHA、wheel 和配置，不能让生产实例自动追随分支 HEAD。
+`5b6e2f7ef554e71634352284d55c201989e35b29`（2026-10-29）；预检与原生命令文档于
+2026-10-30 更新。发布时固定经过验收的完整 SHA、wheel 和配置，不能让生产实例自动追随分支 HEAD。
 
 目标路径是 **P Prefill 层组发送 → D 提前 Remote Decode → scatter 完成后逐层切 Local**。
 本手册给出接入现有生产 serving 的发布步骤；它不代表这份 SHA 已完成生产 GPU 验收。
-当前本地证据为 57 项 CPU 检查、23 个源码 hook 检查和格式检查通过。
+当前本地证据为 64 项 CPU 检查、23 个源码 hook 和 40 项核心接口/状态检查通过。
 现场定位及修复实验支持继续验证，但不能替代这份构建在目标 GPU、模型和负载上的完整验收。
 
 旧 P→D0→D1、`cut/freeze/migrate` 和实验 gateway 的操作移至
 [历史 P5.18 部署手册](migration/P5.18-DEPLOYMENT-LEGACY-ZH.md)。
 当前 Progressive 使用原生 PD router；不向同一请求叠加 P5.18 迁移命令。
 实现细节与对照实验见 [P5.19 说明](P5.19-PRE-LAYERWISE-ZH.md)。
+单 pair 直接启动命令见 [原生 SMG + P/D 接入](SINGLE-PAIR-ZH.md)，保留线上
+optimistic prefill、chunk 和 Batch，不需要 JSON 配置或启动包装器。
 
 ## 1. 接入边界与服务拓扑
 
@@ -127,7 +130,10 @@ PY
 "$HANDOFF_PYTHON" -m sglang_remote_attn.check
 ```
 
-当前 preflight 应输出 `hooks: 23`、`send_probe: true`、`plugin: remote_attn`。
+当前 preflight 应输出 `hooks: 23`、正数 `core_interfaces`、`send_probe: true`、
+`plugin: remote_attn`。核心接口检查同时覆盖 metadata receiver 保留、选层发送、
+staging/host copy、任务与状态字段和 typed env；安装态检查实际加载模块，源码模式
+检查所选 checkout。直接启动服务的插件注册也执行核心检查。
 它只检查安装和接口，不会启动模型，也不会初始化服务进程中的 D2H slot。
 wheel 安装后改 checkout 文件不会更新运行代码，必须重新构建安装。
 开发联调可以使用 `pip install -e ./python` 和 `pip install --no-deps -e ./plugins/remote_attn`；正式实例使用已验收的不可变制品。

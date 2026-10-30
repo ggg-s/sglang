@@ -9,9 +9,10 @@ import pkgutil
 from pathlib import Path
 
 from .hooks import HOOKS
+from .interfaces import check_runtime_interfaces, check_source_interfaces
 
 
-def check_sources(root):
+def check_source_hooks(root):
     """Check the target API without importing CUDA/model dependencies."""
     checked = []
     for target, hook in HOOKS.items():
@@ -38,6 +39,12 @@ def check_sources(root):
     return checked
 
 
+def check_sources(root):
+    """Keep the hook API compatible while rejecting incomplete core builds."""
+    check_source_interfaces(root)
+    return check_source_hooks(root)
+
+
 def main():
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--source-only", action="store_true")
@@ -46,8 +53,17 @@ def main():
     )
     args = parser.parse_args()
     if args.source_only:
-        checked = check_sources(args.sglang_root)
-        print(json.dumps({"source_hooks": len(checked), "root": str(args.sglang_root)}))
+        core = check_source_interfaces(args.sglang_root)
+        checked = check_source_hooks(args.sglang_root)
+        print(
+            json.dumps(
+                {
+                    "source_hooks": len(checked),
+                    "core_interfaces": len(core),
+                    "root": str(args.sglang_root),
+                }
+            )
+        )
         return
 
     # CUDA wheels may rely on the runtime libraries that PyTorch preloads.
@@ -67,6 +83,7 @@ def main():
         )
     if not callable(getattr(TransferEngine, "send_probe", None)):
         raise RuntimeError("Mooncake TransferEngine.send_probe is required")
+    core = check_runtime_interfaces()
     envs.SGLANG_MOONCAKE_SEND_LOCK.get()
     for target in HOOKS:
         pkgutil.resolve_name(target)
@@ -79,6 +96,7 @@ def main():
         json.dumps(
             {
                 "hooks": len(HOOKS),
+                "core_interfaces": len(core),
                 "send_probe": True,
                 "plugin": "remote_attn",
                 "torch": torch.__version__,
