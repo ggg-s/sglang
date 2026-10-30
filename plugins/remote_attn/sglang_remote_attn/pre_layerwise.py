@@ -369,6 +369,7 @@ class Target:
     gpu_proven_forwards: int = 0
     release: object = None
     release_failed: bool = False
+    admission_id: int = 0
 
     def gpu_ready(self):
         if self.release_failed:
@@ -503,17 +504,15 @@ class Target:
                 )
                 raise
 
-    def ready_to_finish(self):
+    def transport_ready(self):
         self.refresh()
-        gpu_ready = self.gpu_ready()
-        return (
-            gpu_ready
-            and _poll_success(self.decode_req.kv_receiver)
-            and (
-                not self.native_staging
-                or self.queue.staging_handler.is_done(self.decode_req)
-            )
+        return _poll_success(self.decode_req.kv_receiver) and (
+            not self.native_staging
+            or self.queue.staging_handler.is_done(self.decode_req)
         )
+
+    def ready_to_finish(self):
+        return self.gpu_ready() and self.transport_ready()
 
 
 class Controller:
@@ -882,6 +881,10 @@ class Controller:
     def retire_targets(self):
         if not self.targets:
             return
+        overlap = getattr(self, "decode_overlap", None)
+        if overlap is not None:
+            overlap.retirement.observe()
+            return
         targets = list(self.targets)
         finished = [
             int(target.closed or target.ready_to_finish()) for target in targets
@@ -900,6 +903,11 @@ class Controller:
                 target.refresh()
 
     def drain_targets(self, required=None):
+        overlap = getattr(self, "decode_overlap", None)
+        if overlap is not None:
+            overlap.retirement.drain(required)
+            return
+
         def pending():
             if required is None:
                 return bool(self.targets)
@@ -976,6 +984,9 @@ class Controller:
             target.refresh()
             dr.req._pre_layerwise_target = target
             _runtime()._install_attention_wrappers(self.scheduler, state)
+            target.admission_id = self.early_admissions + 1
+            if getattr(self, "decode_overlap", None) is not None:
+                self.decode_overlap.retirement.register(target)
             self.targets.append(target)
             removed.add(id(dr))
             admitted.append(dr.req)
@@ -1155,7 +1166,7 @@ def defer_release(req, release, *, checkpoint=None):
 
 def poll(scheduler):
     controller = getattr(scheduler, "_pre_layerwise", None)
-    if controller is not None:
+    if controller is not None and getattr(controller, "sources", None):
         controller.poll_sources()
 
 
@@ -1179,7 +1190,10 @@ def shutdown(scheduler):
     if controller is None:
         return
     if getattr(controller, "decode_overlap", None) is not None:
-        controller.drain_targets()
+        try:
+            controller.drain_targets()
+        finally:
+            controller.decode_overlap.retirement.close()
     else:
         for target in controller.targets:
             target.finish(wait=True)

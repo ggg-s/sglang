@@ -27,7 +27,7 @@ python -m sglang_remote_attn.check
 python -c 'import sglang_router; print(sglang_router.__file__)'
 ```
 
-安装态预检应输出 `hooks: 27`、`core_interfaces: 67`、`send_probe: true`。
+安装态预检应输出 `hooks: 29`、`core_interfaces: 70`、`send_probe: true`。
 它检查实际加载的接口：保留 receiver 的 metadata commit、选层发送与完成回调、
 staging 分组、host copy、缓存 checkpoint/lock/finish、字段初始化及 typed env 声明；插件注册时也会执行同样的
 核心检查，避免直接启动 P/D 绕过预检。`**kwargs` 不能替代显式参数。
@@ -329,3 +329,27 @@ release 延后到 TP 一致退休；retraction 在原生备份和 Req reset 前�
 并保留 native 的 retraction 流程。D overlap 仅保留手工只读状态诊断；手工 import/resume/reset/release 等状态变更不在支持范围内。
 
 本地测试与验证限制见 [D overlap 验证记录](validation/D-SCHEDULER-OVERLAP.md)。
+
+
+### D 有序退休：Remote 不再逐轮投票
+
+D overlap 启用时，普通回收检查只更新本地 GPU/传输证明。状态变化通过同机 Unix
+数据报通知 TP rank 0；只有协调 rank 发出的有序切换意图才进入最终共识。
+切换意图附带在原生请求广播中，原生 receiver 字段及请求/本地 abort 保留；没有
+新增逐步广播。各 rank 在上一批结果处理后、下一批启动前处理同一序号的意图。
+空闲轮次也有提交入口，内存压力不会阻塞已完成请求的回收。
+
+通知只是候选：带启动 epoch、共同 admission 序号、各 rank 的传输 generation
+及通知版本。重复/旧通知不能回退状态；现场仍重查 GPU 证明和 release 一致性。
+失效时保持 Remote，等待新状态通知，不反复轮询投票。retraction/shutdown 在原生
+TP 对称边界显式广播 drain 命令后本地等待，再做一次最终投票，不再每次等待都
+all_reduce。P 端及原生准入/计算同步保持原有协议；D overlap 关闭的对照路径保留。
+
+无需新环境变量。该通知通道要求 D 的 TP 进程同机且能共享 `/tmp`；默认同服务内
+启动的 TP workers 满足此条件。socket 按启动 epoch 隔离，退出时关闭并清理。
+这是现有同机单 pair 范围，不扩展多机 TP。
+
+诊断时各 D rank 的 `[remote-attn-retire] committed seq=...` 应按同一序号出现。
+`retry after state change` 表示一次未获准的切换尝试，资源仍保留；稳定 Remote
+无新状态时不应不断产生新尝试。具体本地证据见
+[事件驱动退休验证](validation/ORDERED-RETIREMENT.md)。

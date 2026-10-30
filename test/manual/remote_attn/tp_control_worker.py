@@ -216,8 +216,12 @@ def progressive_graph_leases(args, context):
 
 
 def decode_overlap_lifetimes(args):
-    """GPU-ready and cancellation skew must not retire only one TP shard."""
+    """Real native broadcast + local UDS notices, with no polling retirement vote."""
+    import ast
+    import dataclasses
+
     import torch
+    from sglang_remote_attn import hooks
     from sglang_remote_attn.decode_overlap import (
         DecodeOverlap,
         before_retract,
@@ -231,10 +235,14 @@ def decode_overlap_lifetimes(args):
         defer_release,
         run_batch,
     )
+    from sglang_remote_attn.retirement import split_controls, wrap_receiver
 
     controller = Controller.__new__(Controller)
-    controller.config = Config("remote", Path(args.output).with_suffix(".overlap"))
+    controller.config = Config(
+        "remote", Path(args.output).with_suffix(".ordered"), drain_timeout=5
+    )
     controller.tp_size, controller.rank, controller.graph_fast_path = 2, args.rank, True
+    controller.targets, controller.sources = [], []
     scheduler = SimpleNamespace(
         attn_tp_cpu_group=dist.group.WORLD,
         enable_overlap=True,
@@ -242,109 +250,262 @@ def decode_overlap_lifetimes(args):
     )
     controller.scheduler = scheduler
     controller.decode_overlap = DecodeOverlap(controller)
-    freed = []
-    req = SimpleNamespace()
-    receiver = SimpleNamespace(poll=lambda: 4, clear=lambda: None)
-    target = Target(
-        controller,
-        SimpleNamespace(
-            metadata_buffers=SimpleNamespace(bootstrap_room=torch.ones((1, 1))),
-            req_to_metadata_buffer_idx_allocator=SimpleNamespace(free=lambda i: None),
+    protocol = controller.decode_overlap.retirement
+    root = Path(__file__).resolve().parents[3]
+    path = root / "python/sglang/srt/managers/scheduler_components/request_receiver.py"
+    tree = ast.parse(path.read_text())
+    node = next(
+        n
+        for n in tree.body
+        if isinstance(n, ast.ClassDef) and n.name == "SchedulerRequestReceiver"
+    )
+    node.body = [
+        n
+        for n in node.body
+        if isinstance(n, ast.AnnAssign)
+        or getattr(n, "name", None) == "_broadcast_reqs_across_ranks"
+    ]
+
+    def broadcast(obj, rank, group, src=0):
+        values = [obj]
+        dist.broadcast_object_list(values, src=src, group=group)
+        return values[0]
+
+    parallel = SimpleNamespace(
+        attn_dp_enabled=False,
+        tp_size=2,
+        tp_group=SimpleNamespace(
+            rank=args.rank, cpu_group=dist.group.WORLD, ranks=[0, 1]
         ),
-        SimpleNamespace(req=req, kv_receiver=receiver, metadata_buffer_index=0),
-        controller.config.directory,
-        "overlap",
-        LayerCoverage(2, 1),
     )
-    req._pre_layerwise_target = target
-    controller.targets = [target]
-    batch = SimpleNamespace(
-        reqs=[req], forward_mode=SimpleNamespace(is_prebuilt=lambda: False)
+    ns = dict(
+        __name__=__name__,
+        dataclass=dataclasses.dataclass,
+        get_parallel=lambda: parallel,
+        broadcast_pyobj=broadcast,
     )
-    # Simulate CUDA's never-recorded-event query semantics at the device boundary.
-    result = SimpleNamespace(
-        copy_done=SimpleNamespace(query=lambda: True),
-        delay_sample_func=object() if args.rank == 1 else None,
-    )
-    run_batch(lambda *a: result, scheduler, batch)
-    snapshots = []
-    with patch.dict(
-        sys.modules,
-        {
-            "sglang.srt.disaggregation.base.conn": SimpleNamespace(
-                KVPoll=SimpleNamespace(Success=4, Failed=0)
-            )
-        },
-    ):
-        for step in range(3):
-            if step == 1:
-                result.delay_sample_func = None
-            if (step == 1 and args.rank == 0) or (step == 2 and args.rank == 1):
-                defer_release(req, lambda: freed.append("KV"))
-            controller.retire_targets()
-            serial = disable_overlap(lambda *a: False, scheduler, batch, batch)
-            snapshots.append([len(controller.targets), len(freed), serial])
-        # Local decode must never poll a GPU proof or join a plugin collective.
-        with patch.object(
-            dist, "all_reduce", side_effect=AssertionError("Local overlap vote")
-        ):
-            steady = []
-            for _ in range(32):
-                controller.retire_targets()
-                steady.append(
-                    disable_overlap(lambda *a: False, scheduler, batch, batch)
+    exec(
+        compile(
+            ast.fix_missing_locations(
+                ast.Module(
+                    body=[
+                        ast.ImportFrom(
+                            module="__future__",
+                            names=[ast.alias(name="annotations")],
+                            level=0,
+                        ),
+                        node,
+                    ],
+                    type_ignores=[],
                 )
-                run_batch(lambda *a: result, scheduler, batch)
-            native_restriction = disable_overlap(
-                lambda *a: True, scheduler, batch, batch
-            )
-        # A TP-native retraction boundary must drain the slower GPU before
-        # its original backup/reset is called on either rank.
-        req2 = SimpleNamespace()
-        target2 = Target(
-            controller,
-            target.queue,
-            SimpleNamespace(
-                req=req2,
-                kv_receiver=SimpleNamespace(poll=lambda: 4, clear=lambda: None),
-                metadata_buffer_index=0,
             ),
-            controller.config.directory / "retract",
-            "retract",
+            str(path),
+            "exec",
+        ),
+        ns,
+    )
+    base = ns["SchedulerRequestReceiver"](
+        **{f.name: None for f in dataclasses.fields(ns["SchedulerRequestReceiver"])}
+    )
+    receiver = wrap_receiver(base, protocol)
+    freed, vote_order, commands = [], [], []
+    notice_attempts = []
+    native_send = protocol.mailbox.send
+
+    def send_with_backpressure(notice):
+        if args.rank == 1:
+            notice_attempts.append(notice["version"])
+            if len(notice_attempts) == 1:
+                return False
+        return native_send(notice)
+
+    native_reduce = dist.all_reduce
+
+    def counted_reduce(tensor, *a, **kw):
+        vote_order.append([protocol.last_seq + 1, tensor.numel()])
+        return native_reduce(tensor, *a, **kw)
+
+    def target(index):
+        req = SimpleNamespace(rid=f"req-{index}")
+        io = SimpleNamespace(done=False, clear=lambda: None)
+        io.poll = lambda: 4 if io.done else 2
+        value = Target(
+            controller,
+            SimpleNamespace(
+                metadata_buffers=SimpleNamespace(bootstrap_room=torch.ones((1, 1))),
+                req_to_metadata_buffer_idx_allocator=SimpleNamespace(
+                    free=lambda i: None
+                ),
+            ),
+            SimpleNamespace(req=req, kv_receiver=io, metadata_buffer_index=0),
+            controller.config.directory / str(index),
+            f"g-{index}-rank{args.rank}",
             LayerCoverage(2, 1),
+            admission_id=index,
         )
-        req2._pre_layerwise_target = target2
-        controller.targets = [target2]
-        polls = 0
+        req._pre_layerwise_target = value
+        controller.targets.append(value)
+        protocol.register(value)
+        return value, req, io
 
-        def gpu_ready():
-            nonlocal polls
-            polls += 1
-            return polls >= (3 if args.rank == 1 else 1)
-
-        result2 = SimpleNamespace(
-            copy_done=SimpleNamespace(query=gpu_ready), delay_sample_func=None
+    def cycle(*, finish=True):
+        controller.retire_targets()  # Local checks/notifications only.
+        messages = receiver._broadcast_reqs_across_ranks(
+            ["native-request"] if args.rank == 0 else None
         )
-        batch2 = SimpleNamespace(
-            reqs=[req2], forward_mode=SimpleNamespace(is_prebuilt=lambda: False)
-        )
-        run_batch(lambda *a: result2, scheduler, batch2)
-        # A new admission revokes Local without a per-step control vote.
-        reentry = disable_overlap(lambda *a: False, scheduler, batch2, batch)
+        ordinary, intents = split_controls(messages)
+        assert ordinary == ["native-request"]
+        for command in intents:
+            commands.append(command["seq"])
+        # Exercise the real input hook: internal intents do not pass through
+        # generic handoff controls (which have a separate all-gather contract).
+        hooks._process_requests(lambda scheduler, requests: None, scheduler, messages)
+        if finish:
+            protocol.finalize()
+        return bool(intents)
 
-        def native_backup(*, req):
-            assert target2.closed and not controller.targets
-            return [target2.closed, target2.gpu_proven_forwards]
-
-        retraction = before_retract(native_backup, req=req2)
-    return {
-        "snapshots": snapshots,
-        "steady": steady,
-        "native_restriction": native_restriction,
-        "reentry": reentry,
-        "gpu_proven": target.gpu_proven_forwards,
-        "retraction": retraction,
+    imports = {
+        "sglang.srt.disaggregation.base.conn": SimpleNamespace(
+            KVPoll=SimpleNamespace(Success=4, Failed=0)
+        ),
+        "sglang.srt.managers.schedule_batch": SimpleNamespace(FINISH_LENGTH=None),
     }
+    try:
+        with (
+            patch.dict(sys.modules, imports),
+            patch.object(dist, "all_reduce", counted_reduce),
+            patch.object(protocol.mailbox, "send", side_effect=send_with_backpressure),
+        ):
+            first, req, io = target(1)
+            batch = SimpleNamespace(
+                reqs=[req], forward_mode=SimpleNamespace(is_prebuilt=lambda: False)
+            )
+            result = SimpleNamespace(
+                copy_done=SimpleNamespace(query=lambda: True),
+                delay_sample_func=object() if args.rank == 1 else None,
+            )
+            run_batch(lambda *a: result, scheduler, batch)
+            for _ in range(24):
+                cycle()
+            assert not vote_order and not commands
+            io.done = args.rank == 0
+            for _ in range(8):
+                cycle()
+            assert not vote_order  # One IO-ready rank cannot schedule a vote.
+            io.done = True
+            if args.rank == 0:
+                defer_release(req, lambda: freed.append("KV"))
+            for _ in range(8):
+                cycle()
+            assert not vote_order  # Release-class mismatch also blocks proposals.
+            if args.rank == 1:
+                defer_release(req, lambda: freed.append("KV"))
+            for _ in range(8):
+                if cycle(finish=False):
+                    break
+            else:
+                raise AssertionError("missing ordered intent")
+            assert len(controller.targets) == 1 and not vote_order
+            # Stale READY: rank 1 still has an unrecorded deferred-sampling event.
+            protocol.finalize()
+            assert protocol.retries == 1 and not freed
+            for _ in range(16):
+                cycle()
+            assert (
+                len(vote_order) == 1
+            )  # No retry storm while GPU readiness is unchanged.
+            result.delay_sample_func = None
+            for _ in range(8):
+                cycle()
+                if not controller.targets:
+                    break
+            else:
+                raise AssertionError("target did not retire")
+            assert freed == ["KV"] and protocol.commits == 1
+            with (
+                patch.object(
+                    dist,
+                    "all_reduce",
+                    side_effect=AssertionError("Local retirement collective"),
+                ),
+                patch.object(
+                    protocol.mailbox,
+                    "receive",
+                    side_effect=AssertionError("Local mailbox polling"),
+                ),
+                patch.object(
+                    protocol.mailbox,
+                    "send",
+                    side_effect=AssertionError("Local notification"),
+                ),
+            ):
+                for _ in range(32):
+                    cycle()
+                    assert disable_overlap(
+                        lambda *a: False, scheduler, batch, batch
+                    ) in (True, False)
+                    run_batch(lambda *a: result, scheduler, batch)
+            second, req2, io2 = target(2)
+            io2.done = True
+            polls = 0
+
+            def gpu_ready():
+                nonlocal polls
+                polls += 1
+                return polls >= (3 if args.rank == 1 else 1)
+
+            result2 = SimpleNamespace(
+                copy_done=SimpleNamespace(query=gpu_ready), delay_sample_func=None
+            )
+            batch2 = SimpleNamespace(
+                reqs=[req2], forward_mode=SimpleNamespace(is_prebuilt=lambda: False)
+            )
+            run_batch(lambda *a: result2, scheduler, batch2)
+            reentry = disable_overlap(lambda *a: False, scheduler, batch2, batch)
+
+            def backup(*, req):
+                assert req._pre_layerwise_target is None
+                return True
+
+            assert before_retract(backup, req=req2)
+            # A normal intent already armed at intake must be consumed before
+            # the nested retraction boundary can reserve another command seq.
+            third, req3, io3 = target(3)
+            io3.done = True
+            for _ in range(8):
+                if cycle(finish=False):
+                    break
+            else:
+                raise AssertionError("missing pending intent for retraction")
+            assert before_retract(backup, req=req3)
+            fourth, _, io4 = target(4)
+            fifth, _, io5 = target(5)
+            io4.done = io5.done = True
+            for _ in range(8):
+                cycle()
+                if not controller.targets:
+                    break
+            else:
+                raise AssertionError("coalesced targets did not retire")
+            if args.rank == 1:
+                assert (
+                    len(notice_attempts) >= 2
+                    and notice_attempts[0] == notice_attempts[1]
+                )
+            return {
+                "vote_order": vote_order,
+                "commands": commands,
+                "freed": freed,
+                "retries": protocol.retries,
+                "commits": protocol.commits,
+                "last_seq": protocol.last_seq,
+                "reentry": reentry,
+                "gpu_proven": first.gpu_proven_forwards,
+                "notice_retry_ok": True,
+                "registered": len(protocol.registered),
+            }
+    finally:
+        protocol.close()
 
 
 def main():

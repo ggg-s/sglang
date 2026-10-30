@@ -132,8 +132,17 @@ def _broadcast(original, receiver, recv_reqs, local_reqs=None):
 
 def _process_requests(original, scheduler, recv_reqs):
     runtime = _runtime()
-    requests, controls = runtime.split_handoff_controls(recv_reqs)
+    from .retirement import split_controls
+
+    requests, intents = split_controls(recv_reqs)
+    requests, controls = runtime.split_handoff_controls(requests)
     result = original(scheduler, requests)
+    controller = getattr(scheduler, "_pre_layerwise", None)
+    for intent in intents:
+        overlap = getattr(controller, "decode_overlap", None)
+        if overlap is None:
+            raise RuntimeError("ordered retirement requires progressive D overlap")
+        overlap.retirement.arm(intent)
     for control in controls:
         controller = getattr(scheduler, "_pre_layerwise", None)
         if getattr(controller, "decode_overlap", None) is not None and control.get(
@@ -405,6 +414,8 @@ HOOKS.update(
         "sglang.srt.disaggregation.common.staging_handler.init_staging_allocator": pre_layerwise.init_staging_allocator,
         "sglang.srt.disaggregation.common.staging_handler.init_staging_buffers": pre_layerwise.init_staging_buffers,
         "sglang.srt.managers.scheduler.Scheduler.run_batch": pre_layerwise.run_batch,
+        "sglang.srt.managers.scheduler.Scheduler.process_batch_result": decode_overlap.after_result,
+        "sglang.srt.managers.scheduler.Scheduler.launch_batch_sample_if_needed": decode_overlap.after_result,
         "sglang.srt.managers.scheduler.Scheduler.is_disable_overlap_for_batch": decode_overlap.disable_overlap,
         "sglang.srt.managers.scheduler.Scheduler.is_fully_idle": pre_layerwise.is_fully_idle,
         "sglang.srt.model_executor.model_runner.ModelRunner.forward": pre_layerwise.forward,

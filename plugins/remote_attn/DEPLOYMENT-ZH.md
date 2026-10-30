@@ -130,7 +130,7 @@ PY
 "$HANDOFF_PYTHON" -m sglang_remote_attn.check
 ```
 
-当前 preflight 应输出 `hooks: 27`、`core_interfaces: 67`、`send_probe: true`、
+当前 preflight 应输出 `hooks: 29`、`core_interfaces: 70`、`send_probe: true`、
 `plugin: remote_attn`。核心接口检查同时覆盖 metadata receiver 保留、选层发送、
 staging/host copy、任务与状态字段和 typed env；安装态检查实际加载模块，源码模式
 检查所选 checkout。直接启动服务的插件注册也执行核心检查。
@@ -421,3 +421,9 @@ journal 当前**不自动清理**。需要生产侧监控磁盘容量，归档�
 完整探针参数、测试矩阵和指标解释见 [P5.19 说明](P5.19-PRE-LAYERWISE-ZH.md)。
 
 发送端已统一到 `CorePinnedStager`：普通 chunk 与层组共用每 rank 一块 128 MiB pinned slot，插件不再独立分配或注册缓冲区。slot 锁覆盖 D2H 和同步 TE 完成；原有 send lock 仍保留。`SGLANG_MOONCAKE_HOST_STAGING_ALL=1` 覆盖两条发送路径；该开关关闭时，`HANDOFF_PRE_LAYERWISE_HOST_STAGING` 只控制层组。GPU 指针对照需要两者都关闭。all-send 模式在启动发布 KV 张量表时 reserve/预热；仅层组模式在首个选中请求的 forward 前完成。
+
+
+D overlap 的退休已改为事件驱动：Remote 普通轮次不再做退休 all_reduce，切换意图
+复用原生请求广播，GPU/释放证明在有序命令下最终确认。D TP workers 需同机共享
+`/tmp`。启动命令不增加环境变量，细节和本地验证见
+[有序退休](validation/ORDERED-RETIREMENT.md)。

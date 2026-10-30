@@ -112,9 +112,23 @@ CORE_CALLS = {
         "return_hidden_states": True,
     },
     "sglang.srt.managers.async_d2h_copy_worker.HostCopyDone.query": {},
+    "sglang.srt.managers.scheduler.Scheduler.process_batch_result": {
+        "batch": inspect.Parameter.empty,
+        "result": inspect.Parameter.empty,
+    },
+    "sglang.srt.managers.scheduler.Scheduler.launch_batch_sample_if_needed": {
+        "batch_result": inspect.Parameter.empty,
+        "cur_batch": inspect.Parameter.empty,
+    },
 }
 CORE_PROPERTIES = (DISAGG + "mooncake.pinned_staging_core.CorePinnedStager.poisoned",)
 CORE_FIELDS = {
+    "sglang.srt.managers.scheduler_components.request_receiver.SchedulerRequestReceiver": (
+        "get_last_batch",
+        "recv_from_tokenizer",
+        "recv_from_rpc",
+        "max_recv_per_poll",
+    ),
     "sglang.srt.managers.utils.GenerationBatchResult": (
         "copy_done",
         "delay_sample_func",

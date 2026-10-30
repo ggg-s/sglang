@@ -36,12 +36,15 @@ class DecodeOverlap:
         self.controller = controller
         self.exit_boundary = False
         self.last_policy = None
+        from .retirement import Retirement
+
+        self.retirement = Retirement(controller)
         logger.info("[remote-attn-overlap] D enabled: Remote serial, Local native")
 
     def serial(self):
         if not self.controller.graph_fast_path:
             raise RuntimeError("D overlap requires TP-agreed progressive lifetimes")
-        if self.controller.targets:
+        if self.controller.targets or self.retirement.pending is not None:
             self.exit_boundary = True
             policy = "remote-serial"
             serial = True
@@ -59,6 +62,7 @@ class DecodeOverlap:
         return serial
 
     def run_batch(self, original, scheduler, batch, *args, **kwargs):
+        self.retirement.finalize()
         if not self.controller.graph_fast_path:
             raise RuntimeError("D overlap requires TP-agreed progressive lifetimes")
         # PREBUILT carries P's sampled token; it has no model forward/copy_done.
@@ -85,7 +89,17 @@ def install(controller):
         return None
     if not controller.graph_fast_path:
         raise RuntimeError("D overlap cannot start with unmanaged handoff states")
-    return DecodeOverlap(controller)
+    overlap = DecodeOverlap(controller)
+    from .retirement import wrap_receiver
+
+    try:
+        controller.scheduler.request_receiver = wrap_receiver(
+            controller.scheduler.request_receiver, overlap.retirement
+        )
+    except BaseException:
+        overlap.retirement.close()
+        raise
+    return overlap
 
 
 def disable_overlap(original, scheduler, batch, last_batch):
@@ -100,8 +114,8 @@ def disable_overlap(original, scheduler, batch, last_batch):
 def reap(original, queue, *args, **kwargs):
     controller = getattr(queue.scheduler, "_pre_layerwise", None)
     if getattr(controller, "decode_overlap", None) is not None:
-        # Native process_decode_queue calls this before retraction/memory-pressure
-        # and polling gates. A deferred plugin free must not starve behind them.
+        # Before retraction/polling gates, refresh local proofs and publish
+        # state-edge notices only. This never enters a retirement collective.
         controller.retire_targets()
     return original(queue, *args, **kwargs)
 
@@ -113,4 +127,20 @@ def before_retract(original, *, req, **kwargs):
         # the Req. Both operations need the fully Local prefix and drained GPU.
         # This TP-symmetric native retraction boundary must retire the lease first.
         target.owner.drain_targets(required=target)
+        kv = getattr(req, "kv", None)
+        if kv is not None and not kv.holds_kv:
+            # Cancellation may have queued native free before this boundary.
+            return False
     return original(req=req, **kwargs)
+
+
+def after_result(original, scheduler, *args, **kwargs):
+    result = original(scheduler, *args, **kwargs)
+    controller = getattr(scheduler, "_pre_layerwise", None)
+    overlap = getattr(controller, "decode_overlap", None)
+    if overlap is not None:
+        # Remote's native serial gate has consumed the previous result before
+        # the next launch. Empty/idle iterations reach the sample hook as well.
+        overlap.retirement.observe()
+        overlap.retirement.finalize()
+    return result

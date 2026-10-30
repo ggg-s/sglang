@@ -18,7 +18,7 @@ still need acceptance on the target deployment.
 
 - `sglang_remote_attn/handoff_control.py`: adapted runtime, including Copy, Layer,
   Remote, Fast Freeze/Resume, RemoteHub, progressive LOCAL, epochs, fences and leases.
-- `sglang_remote_attn/hooks.py`: 27 function-boundary hooks. No scheduler event
+- `sglang_remote_attn/hooks.py`: 29 function-boundary hooks. No scheduler event
   loop, graph runner, allocation function or Mooncake connector is copied/replaced.
 - `control_plane/p2d_driver.py`: original supplied driver. `p4_gateway.py` now
   carries a targeted C1 reservation/epoch fix; its protocol and fixed state paths
@@ -344,3 +344,11 @@ failure handling. Pending GPU forwards and queued KV releases retire together
 across TP. Prepared overshoots retain Remote state even after their Req finishes;
 retraction drains before native KV backup/reset. Stable Local adds no plugin GPU
 event, completion query, collective or fence. See [local verification and limits](validation/D-SCHEDULER-OVERLAP.md).
+
+
+D overlap retirement is event-driven: local Unix datagram notices nominate a
+transition, the existing request broadcast orders its intent, and one final TP
+vote rechecks current GPU/IO and release state. There is no retirement collective
+in ordinary Remote polling. Retraction/shutdown use explicit ordered drain
+commands. D TP workers must share the same host and `/tmp`; P and native admission
+synchronization are unchanged. See [verification](validation/ORDERED-RETIREMENT.md).

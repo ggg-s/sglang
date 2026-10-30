@@ -6,6 +6,11 @@ is consumed at the Local boundary; stable Local resumes the native predicate and
 full CUDA graph bank. Mixed Remote/Local batches conservatively serialize while
 any progressive target lease remains. No SMG or SGL core files changed.
 
+The subsequent [ordered retirement change](ORDERED-RETIREMENT.md) replaces the
+per-loop retirement reduction described below with notifications and ordered
+transition commands. The counts below are historical evidence for the first
+scheduler-overlap adaptation.
+
 ## Completion and ownership
 
 - Attach a batch proof before launching each forward involving a progressive

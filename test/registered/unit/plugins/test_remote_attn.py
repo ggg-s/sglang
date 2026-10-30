@@ -1071,8 +1071,9 @@ class TestRemoteAttn(CustomTestCase):
         controller.scheduler = SimpleNamespace(enable_overlap=True)
         controller.decode_overlap = DecodeOverlap(controller)
         controller.scheduler._pre_layerwise = controller
+        self.addCleanup(controller.decode_overlap.retirement.close)
         freed = []
-        req = req or SimpleNamespace()
+        req = req or SimpleNamespace(rid="overlap")
         receiver = SimpleNamespace(done=False, clear=lambda: freed.append("receiver"))
         receiver.poll = lambda: 4 if receiver.done else 2
         target = pl.Target(
@@ -1085,7 +1086,9 @@ class TestRemoteAttn(CustomTestCase):
             Path(directory) / "target",
             "g",
             pl.LayerCoverage(2, 1),
+            admission_id=1,
         )
+        controller.decode_overlap.retirement.register(target)
         req._pre_layerwise_target = target
         controller.targets = [target]
         patcher = patch.dict(
@@ -1099,6 +1102,199 @@ class TestRemoteAttn(CustomTestCase):
         patcher.start()
         self.addCleanup(patcher.stop)
         return controller, target, freed
+
+    def _retire_step(self, controller, *, finalize=True):
+        controller.retire_targets()
+        protocol = controller.decode_overlap.retirement
+        command = protocol.poll_command()
+        if command is not None:
+            protocol.arm(command)
+        if finalize:
+            protocol.finalize()
+        return command
+
+    def test_ordered_retirement_preserves_native_receiver_and_waits_for_command(self):
+        from sglang_remote_attn.decode_overlap import after_result
+        from sglang_remote_attn.retirement import split_controls, wrap_receiver
+
+        native = _source_class(
+            "managers/scheduler_components/request_receiver.py",
+            "SchedulerRequestReceiver",
+            strip_method_decorators=True,
+        )
+        native._broadcast_reqs_across_ranks.__globals__["get_parallel"] = lambda: (
+            SimpleNamespace(attn_dp_enabled=False, tp_size=1)
+        )
+        values = {f.name: None for f in dataclasses.fields(native)}
+        values["max_recv_per_poll"] = 17
+        values["get_last_batch"] = lambda: "native batch"
+        receiver = native(**values)
+        with tempfile.TemporaryDirectory() as directory:
+            controller, target, freed = self._overlap_target(directory)
+            protocol = controller.decode_overlap.retirement
+            target.decode_req.kv_receiver.done = True
+            for _ in range(32):
+                controller.retire_targets()
+            self.assertEqual(protocol.final_votes, 0)
+            self.assertEqual(freed, [])
+            wrapped = wrap_receiver(receiver, protocol)
+            for field in dataclasses.fields(native):
+                self.assertIs(
+                    getattr(wrapped, field.name), getattr(receiver, field.name)
+                )
+            messages = wrapped._broadcast_reqs_across_ranks(
+                ["request"], ["local-abort"]
+            )
+            ordinary, commands = split_controls(messages)
+            self.assertEqual(ordinary, ["request", "local-abort"])
+            self.assertEqual(len(commands), 1)
+            with patch.object(
+                self.runtime, "maybe_handle_handoff_control", return_value=None
+            ):
+                result = self.hooks._process_requests(
+                    lambda scheduler, reqs: reqs, controller.scheduler, messages
+                )
+            self.assertEqual(result, ordinary)
+            self.assertFalse(target.closed)  # Intake arms; it does not enter a vote.
+            after_result(lambda *a: None, controller.scheduler, None, None)
+            self.assertTrue(target.closed)
+            self.assertEqual(freed, ["receiver", 0])
+            self.assertEqual(protocol.final_votes, 1)
+            self.assertEqual(protocol.last_seq, 1)
+
+    def test_ordered_retirement_rechecks_gpu_and_avoids_retry_polling(self):
+        with tempfile.TemporaryDirectory() as directory:
+            controller, target, freed = self._overlap_target(directory)
+            protocol = controller.decode_overlap.retirement
+            target.decode_req.kv_receiver.done = True
+            controller.retire_targets()
+            command = protocol.poll_command()
+            # A later forward invalidates the earlier advisory GPU snapshot.
+            gpu = SimpleNamespace(done=False)
+            result = SimpleNamespace(
+                copy_done=SimpleNamespace(query=lambda: gpu.done),
+                delay_sample_func=None,
+            )
+            batch = SimpleNamespace(
+                reqs=[target.decode_req.req],
+                forward_mode=SimpleNamespace(is_prebuilt=lambda: False),
+            )
+            self.hooks.pre_layerwise.run_batch(
+                lambda *a: result, controller.scheduler, batch
+            )
+            protocol.arm(command)
+            protocol.finalize()
+            self.assertEqual(protocol.retries, 1)
+            self.assertEqual(freed, [])
+            for _ in range(32):
+                self._retire_step(controller)
+            self.assertEqual(protocol.final_votes, 1)
+            gpu.done = True
+            self._retire_step(controller)
+            self.assertEqual(protocol.final_votes, 2)
+            self.assertEqual(protocol.commits, 1)
+            self.assertEqual(target.gpu_proven_forwards, 1)
+            self.assertEqual(freed, ["receiver", 0])
+
+    def test_ordered_retirement_cancel_during_pending_retraction_does_not_free_twice(
+        self,
+    ):
+        from sglang_remote_attn.decode_overlap import before_retract
+
+        f = self._radix()
+        f.cache.disable = True
+        req, _ = f.request([2, 3], "cancel-retract")
+        with tempfile.TemporaryDirectory() as directory:
+            controller, target, freed = self._overlap_target(directory, req)
+            protocol = controller.decode_overlap.retirement
+            target.decode_req.kv_receiver.done = True
+            controller.retire_targets()
+            command = protocol.poll_command()  # Snapshot says no queued release.
+            self.hooks._release_kv(f.release_kv_cache, req, f.cache, checkpoint=False)
+            protocol.arm(command)
+            self.assertFalse(
+                before_retract(
+                    lambda **kw: self.fail("backup after cancellation free"), req=req
+                )
+            )
+            self.assertEqual(protocol.last_seq, 1)
+            self.assertEqual(protocol.final_votes, 1)
+            self.assertEqual(freed, ["receiver", 0])
+            self.assertEqual(f.allocator.available_size(), 32)
+            self.assertEqual(len(set(f.allocator.free_pages.tolist())), 32)
+
+    def test_ordered_retirement_rejects_stale_identity_and_out_of_order_commands(self):
+        for corruption in ("epoch", "seq", "generation", "admission", "duplicates"):
+            with (
+                self.subTest(corruption=corruption),
+                tempfile.TemporaryDirectory() as directory,
+            ):
+                controller, target, freed = self._overlap_target(directory)
+                protocol = controller.decode_overlap.retirement
+                target.decode_req.kv_receiver.done = True
+                controller.retire_targets()
+                command = protocol.poll_command()
+                if corruption == "epoch":
+                    command["epoch"] = "old-run"
+                elif corruption == "seq":
+                    command["seq"] += 1
+                elif corruption == "generation":
+                    command["targets"][0]["generations"][0] = "old-generation"
+                elif corruption == "admission":
+                    target.admission_id += 1
+                else:
+                    command["targets"].append(copy.deepcopy(command["targets"][0]))
+                protocol.arm(command)
+                with self.assertRaisesRegex(RuntimeError, "validation"):
+                    protocol.finalize()
+                self.assertFalse(target.closed)
+                self.assertEqual(freed, [])
+                self.assertEqual(protocol.final_votes, 1)
+        with tempfile.TemporaryDirectory() as directory:
+            controller, target, freed = self._overlap_target(directory)
+            protocol = controller.decode_overlap.retirement
+            target.decode_req.kv_receiver.done = True
+            command = self._retire_step(controller)
+            protocol.arm(command)
+            with self.assertRaisesRegex(RuntimeError, "validation"):
+                protocol.finalize()
+            self.assertEqual(freed, ["receiver", 0])
+            self.assertEqual(protocol.last_seq, 1)
+
+    def test_ordered_retirement_notifications_cannot_regress_or_retire_resources(self):
+        with tempfile.TemporaryDirectory() as directory:
+            controller, target, freed = self._overlap_target(directory)
+            protocol = controller.decode_overlap.retirement
+            target.decode_req.kv_receiver.done = True
+            controller.retire_targets()
+            old = copy.deepcopy(protocol.reports[1][0])
+            newer = {**old, "release": True, "version": old["version"] + 1}
+            protocol._accept(newer)
+            protocol._accept(old)
+            protocol._accept({**newer, "epoch": "old-run", "version": 999})
+            protocol._accept(
+                {**newer, "identity": {**newer["identity"], "id": 99}, "version": 999}
+            )
+            self.assertEqual(protocol.reports[1][0], newer)
+            self.assertEqual(protocol.final_votes, 0)
+            self.assertEqual(freed, [])
+            self.assertFalse(target.closed)
+
+    def test_ordered_retirement_local_mailbox_lifecycle(self):
+        from sglang_remote_attn.retirement import Mailbox
+
+        epoch = uuid.uuid4().hex
+        receiver, sender = Mailbox(epoch, 0), Mailbox(epoch, 1)
+        self.addCleanup(receiver.close)
+        self.addCleanup(sender.close)
+        notice = {"epoch": epoch, "rank": 1, "version": 1}
+        self.assertTrue(sender.send(notice))
+        self.assertEqual(list(receiver.receive()), [notice])
+        with self.assertRaisesRegex(RuntimeError, "mailbox limit"):
+            sender.send({"data": "x" * 65536})
+        receiver.close()
+        self.assertFalse(receiver.path.exists())
+        self.assertFalse(sender.send(notice))  # Startup/restart absence is retryable.
 
     def test_decode_overlap_native_loop_serializes_remote_and_restores_local(self):
         """Native PD loop must drain before Remote launches, then pipeline Local again."""
@@ -1168,6 +1364,7 @@ class TestRemoteAttn(CustomTestCase):
                     controller.targets.append(target)
                 if iteration == 3:
                     target.decode_req.kv_receiver.done = True
+                self._retire_step(controller, finalize=False)
                 if iteration == len(batches) - 1:
                     scheduler.gracefully_exit = True
 
@@ -1196,8 +1393,14 @@ class TestRemoteAttn(CustomTestCase):
             scheduler.run_batch = lambda b: self.hooks.pre_layerwise.run_batch(
                 launch, scheduler, b
             )
-            scheduler.process_batch_result = process
-            scheduler.launch_batch_sample_if_needed = lambda *a: None
+            from sglang_remote_attn.decode_overlap import after_result
+
+            scheduler.process_batch_result = lambda *args: after_result(
+                lambda scheduler, *a: process(*a), scheduler, *args
+            )
+            scheduler.launch_batch_sample_if_needed = lambda *args: after_result(
+                lambda *a: None, scheduler, *args
+            )
             scheduler._apply_war_barrier = lambda: None  # GPU stream boundary.
             scheduler.on_idle = lambda: None
             scheduler.event_loop_overlap_disagg_decode()
@@ -1252,10 +1455,10 @@ class TestRemoteAttn(CustomTestCase):
             )
             self.hooks._release_kv(f.release_kv_cache, req, f.cache, checkpoint=False)
             self.hooks._release_kv(f.release_kv_cache, req, f.cache, checkpoint=False)
-            controller.retire_targets()
+            self._retire_step(controller)
             self.assertEqual(f.allocator.available_size(), 30)
             target.decode_req.kv_receiver.done = True
-            controller.retire_targets()  # Native writes are complete; GPU is not.
+            self._retire_step(controller)  # Native writes are complete; GPU is not.
             self.assertEqual(freed, [])
             self.assertEqual(f.allocator.available_size(), 30)
             gpu.done = True
@@ -1283,7 +1486,7 @@ class TestRemoteAttn(CustomTestCase):
                 resolve_deferred_releases=lambda: reap(lambda q: None, queue)
             )
             process_queue(scheduler)
-            controller.retire_targets()
+            self._retire_step(controller)
             self.assertEqual(freed, ["receiver", 0])
             self.assertEqual(f.allocator.available_size(), 32)
             self.assertEqual(len(set(f.allocator.free_pages.tolist())), 32)
@@ -1347,8 +1550,8 @@ class TestRemoteAttn(CustomTestCase):
                 self.hooks.pre_layerwise.defer_release(req, lambda: freed.append("KV"))
             )
             target.decode_req.kv_receiver.done = True
-            with self.assertRaisesRegex(RuntimeError, "unproven"):
-                controller.retire_targets()
+            with self.assertRaisesRegex(RuntimeError, "validation"):
+                self._retire_step(controller)
             self.assertEqual(freed, [])
             self.assertEqual(controller.targets, [target])
             self.assertFalse(target.closed)
@@ -1371,9 +1574,9 @@ class TestRemoteAttn(CustomTestCase):
                 self.hooks.pre_layerwise.defer_release(req, partial_release)
             )
             with self.assertRaisesRegex(RuntimeError, "completion unknown"):
-                controller.retire_targets()
-            with self.assertRaisesRegex(RuntimeError, "refusing retirement retry"):
-                controller.retire_targets()
+                self._retire_step(controller)
+            with self.assertRaisesRegex(RuntimeError, "validation"):
+                self._retire_step(controller)
             self.assertEqual(f.allocator.available_size(), 32)
             self.assertEqual(len(set(f.allocator.free_pages.tolist())), 32)
             self.assertEqual(controller.targets, [target])
@@ -1407,7 +1610,7 @@ class TestRemoteAttn(CustomTestCase):
             )
             # Timeout must leave the native backup/reset untouched and preserve KV.
             controller.config = dataclasses.replace(controller.config, drain_timeout=0)
-            with self.assertRaisesRegex(RuntimeError, "did not drain"):
+            with self.assertRaisesRegex(RuntimeError, "validation"):
                 before_retract(lambda **kw: self.fail("unsafe native backup"), req=req)
             self.assertEqual(req.retraction_count, 0)
             self.assertTrue(req.kv.holds_kv)
@@ -2745,14 +2948,17 @@ class TestRemoteAttn(CustomTestCase):
         self.assertTrue(rows[0]["leases"]["overlap_mismatch_rejected"])
         self.assertEqual(rows[0]["d_overlap"], rows[1]["d_overlap"])
         self.assertEqual(
-            rows[0]["d_overlap"]["snapshots"],
-            [[1, 0, True], [1, 0, True], [0, 1, True]],
+            rows[0]["d_overlap"]["vote_order"], [[1, 5], [2, 5], [3, 5], [4, 5], [5, 8]]
         )
-        self.assertEqual(rows[0]["d_overlap"]["steady"], [False] * 32)
-        self.assertTrue(rows[0]["d_overlap"]["native_restriction"])
+        self.assertEqual(rows[0]["d_overlap"]["commands"], [1, 2, 4, 5])
+        self.assertEqual(rows[0]["d_overlap"]["freed"], ["KV"])
+        self.assertEqual(rows[0]["d_overlap"]["retries"], 1)
+        self.assertEqual(rows[0]["d_overlap"]["commits"], 4)
+        self.assertEqual(rows[0]["d_overlap"]["last_seq"], 5)
         self.assertTrue(rows[0]["d_overlap"]["reentry"])
+        self.assertTrue(rows[0]["d_overlap"]["notice_retry_ok"])
+        self.assertEqual(rows[0]["d_overlap"]["registered"], 0)
         self.assertEqual(rows[0]["d_overlap"]["gpu_proven"], 1)
-        self.assertEqual(rows[0]["d_overlap"]["retraction"], [True, 1])
         self.assertTrue(rows[0]["leases"]["existing_state_fallback"])
         self.assertGreater(rows[0]["leases"]["boundary_reductions"], 0)
         self.assertEqual(rows[0]["leases"]["freed"], [0, 1, 2])
