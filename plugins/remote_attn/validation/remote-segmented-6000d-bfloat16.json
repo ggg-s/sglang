@@ -1,0 +1,27 @@
+{
+  "device": "NVIDIA RTX 6000D",
+  "torch": "2.12.1+cu130",
+  "dtype": "torch.bfloat16",
+  "layers": 3,
+  "remote_segments": {
+    "4": 4,
+    "2": 4,
+    "1": 4
+  },
+  "replays": {
+    "remote": 12,
+    "full": 4
+  },
+  "rpc_calls": 22,
+  "capture_rpc_calls": 0,
+  "max_allocated_bytes": 67142144,
+  "strong_ref_boundary": true,
+  "source_sha256": {
+    "plugins/remote_attn/sglang_remote_attn/segmented_graph.py": "f061c51f66ecfa8b4501bf4108299170f505d16297725f00db23ee36c383308d",
+    "test/manual/remote_attn/segmented_graph_probe.py": "2f0a14bb954b4e6e2bb41178f96e4ba21d863aa4bd3d354e05c8fd13556f8930",
+    "python/sglang/srt/model_executor/runner_backend/full_cuda_graph_backend.py": "4cdf861b6dbf61d2875598602c77855df06910784fcec43c89fc132cc99bf217",
+    "python/sglang/srt/model_executor/runner_backend/breakable_cuda_graph_backend.py": "2c598110d6c8d3556fbce50c0f57b9afe98fd85b4ff3012c15e6714aa4d519d8",
+    "python/sglang/srt/model_executor/runner_backend_utils/breakable_cuda_graph/breakable_cuda_graph.py": "596adf3e0e806e3f6a1964582a33f1c655254e3ba3939824e71a156543c76d51"
+  },
+  "scope": "real CUDA; source-loaded native backends; toy attention/RPC; TP1; no pool borrowing/precarving"
+}

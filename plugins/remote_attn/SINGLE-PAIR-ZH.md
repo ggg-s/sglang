@@ -7,8 +7,9 @@
 
 当前范围是同机 Qwen3 dense NHD MHA BF16/FP16、同 TP、PP=DP=CP=1、page size 1、
 early allocation、mooncake_tcp，并关闭 radix cache、overlap scheduler。
-CUDA graphs 可以沿用原生配置：D 持有提前准入请求的接收租约时全 TP eager，全部
-完成 GPU scatter 并经 TP 一致回收后恢复原生 graph 判断；P 最终 chunk 的分层 prefill 仍为 eager。
+CUDA graphs 沿用原生 full decode 配置：D 的 Remote 阶段对 batch 1/2/4 使用分段图，
+其他 batch 为 eager；完成 GPU scatter 并经 TP 一致回收后恢复原生 full graph。
+P 普通 prefill 保留原生 graph，最终 chunk 的分层 prefill 和 P 端 Remote RPC 仍为 eager。
 容器中的 P/D 必须共享同一份本机目录及可互通的 loopback 网络。
 以下 TP2 示例使用 GPU 0、1 做 P，GPU 2、3 做 D；线上其他模型、显存和并发参数
 继续保留，但与这些限制冲突的能力需要先适配。
@@ -26,7 +27,7 @@ python -m sglang_remote_attn.check
 python -c 'import sglang_router; print(sglang_router.__file__)'
 ```
 
-安装态预检应输出 `hooks: 23`、`core_interfaces` 正数、`send_probe: true`。
+安装态预检应输出 `hooks: 24`、`core_interfaces: 47`、`send_probe: true`。
 它检查实际加载的接口：保留 receiver 的 metadata commit、选层发送与完成回调、
 staging 分组、host copy、字段初始化及 typed env 声明；插件注册时也会执行同样的
 核心检查，避免直接启动 P/D 绕过预检。`**kwargs` 不能替代显式参数。
@@ -129,10 +130,18 @@ D 的其他线上参数同样保留。默认每个 D rank 需要 4 GiB pinned ho
 目录 `/workspace/handoff_state` 是现有 runtime 固定诊断路径，服务账户需要可写。
 
 两端保留线上原生 graph backend、capture buckets/max-bs 配置；同一角色各 TP rank
-必须一致。插件不新增 graph 环境变量，不强制扩大 capture 范围，也不重新 capture。
+必须一致。插件不要求新增环境变量，不强制扩大原生 capture 范围；分段图在启动时额外捕获，服务中不重新 capture。
 若原命令明确关闭了 graph，需先移除关闭配置；本分支原生 CLI 使用
 `--cuda-graph-backend-decode full` / `--cuda-graph-backend-prefill breakable` 等逐阶段参数，
 也可沿用线上 `--cuda-graph-config`。该原生参数不属于启动包装器。
+
+当前 Remote 分段功能默认开启，D 必须使用 `--cuda-graph-backend-decode full`，
+原生实际 capture buckets 须包含 1、2、4，最大运行请求数至少为 4。
+沿用线上完整桶列表；需要时补入这三个值，不要把线上列表替换为仅 1/2/4。
+若线上 `--cuda-graph-config` 已设置 decode backend，以其中的 full 配置为准。
+分段功能需要 `cuda-python`，暂不支持 torch.compile、debug-eager、memory saver 或自定义 full backend。
+只在 D 设置 `HANDOFF_REMOTE_SEGMENTED_GRAPH=0` 并重启，可恢复“Remote eager、Local full”对照；
+不设置或设置为 `1` 时，在现有 remote 模式下启用分段图。P 无需增加环境变量。
 
 ## 5. 原生 SMG 启动
 
@@ -204,15 +213,18 @@ A'→layerwise 同时包含 staging 改变；layerwise→remote 还包含提前�
 `HANDOFF_GRAPH_DISABLE_ANY_STATE=1` 覆盖，确认启动日志已完成 graph capture。
 通过 SMG 发足够长的输出请求，让同一请求覆盖 Remote 和 Local 两个阶段：
 
-1. 全部 D rank 都应出现 `[remote-attn-graph] kind=decode ... path=eager all_local=False`。
+1. 启动时各 D rank 应有 `captured remote batch=1/2/4 attention_breaks=层数`。
+   Remote batch 1/2/4 应出现 `path=remote-segmented all_local=False`，实际执行日志为
+   `[remote-attn-graph] replay bank=remote batch=...`；未覆盖 batch 出现 `path=eager`。
 2. 最慢 shard 的所有层完成 GPU scatter、原生传输完成且接收租约统一回收后，各 rank 应出现
-   `path=graph-eligible all_local=True`；紧接着的 `Decode graph replay:` 才是实际 replay 证据。
+   `path=graph-eligible all_local=True`；实际执行日志应为 `replay bank=full`。
    `all_local=True` 但 shape 不在原生 capture 范围时仍为 eager，符合预期。
-3. 配合 report 的各 shard `remote_calls > 0` 和 GPU trace，确认 Remote 阶段没有 replay、
-   Local 后有 replay。再加入一个未导完的新请求，确认混合 batch 整批回到 eager，完成后再次恢复。
+3. 配合 report 的各 shard `remote_calls > 0` 和 GPU trace，确认 segment replay 之间有
+   图外 attention/RPC/merge，Local 后为 full replay。再加入未导完的新请求，确认重新
+   进入 segmented 或未覆盖 shape 的 eager，完成后再次恢复 full。
 
 Progressive 使用已有提前准入/回收的 TP 投票维护相同的接收租约集合。非空期间全组
-eager，集合统一变空后恢复原生 graph 判断；graph 判断本身不再增加 collective，
+segmented/eager，集合统一变空后恢复原生 full graph 判断；graph 判断本身不再增加 collective，
 正常 Local decode 也不扫描逐层事件。Remote 期间已有的传输完成轮询同步仍然保留，
 不能称为整个生命周期只同步两次。启动时额外做一次配置/capture manifest 一致性检查。
 相较于所有层刚就绪就恢复，等待原生完成与统一回收可能多保留一段 eager 时间。
@@ -223,6 +235,7 @@ fast path，该进程后续改用逐 forward 的保守投票；普通 status 查
 对比同一模型/请求/线上 chunk 和 optimistic 配置下 graph 开关两组的输出、ITL、吞吐。
 CPU 已验证状态机和真实双进程一致性；GPU 上的数值与实际 graph replay 仍须执行本节验收。
 实现及本地证据见 [CUDA graphs 适配记录](validation/PROGRESSIVE-CUDA-GRAPHS.md)。
+分段图的 GPU 探针与验证范围见 [Remote 分段验证](validation/REMOTE-SEGMENTED-GRAPHS.md)。
 
 ## 7. 撤流与本地检查
 

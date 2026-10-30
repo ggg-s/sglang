@@ -6,7 +6,7 @@ import pkgutil
 import threading
 import time
 
-from . import pre_layerwise
+from . import pre_layerwise, segmented_graph
 
 logger = logging.getLogger(__name__)
 
@@ -252,7 +252,16 @@ def _graph_decision(original, runner, forward_batch, kind):
         # even a locally complete lease eager until its slowest peer retires.
         # The empty set is a shared Local certificate, not a rank-local guess.
         all_local = not controller.targets
-        can_replay = all_local and bool(original(runner, forward_batch))
+        backend = getattr(runner, "backend", None)
+        remote_graph = (
+            not all_local
+            and kind == "decode"
+            and isinstance(backend, segmented_graph.RemoteGraphBackend)
+            and backend.supports_remote(forward_batch)
+        )
+        can_replay = (all_local or remote_graph) and bool(
+            original(runner, forward_batch)
+        )
     else:
         # Legacy/manual imports have no progressive lease certificate. Every
         # rank must still join this conservative per-forward vote.
@@ -271,7 +280,9 @@ def _graph_decision(original, runner, forward_batch, kind):
             kind,
             parallel.tp_rank,
             parallel.tp_size,
-            "graph-eligible" if can_replay else "eager",
+            ("graph-eligible" if all_local else "remote-segmented")
+            if can_replay
+            else "eager",
             all_local,
         )
     return can_replay
@@ -279,6 +290,10 @@ def _graph_decision(original, runner, forward_batch, kind):
 
 def _graph_execute(original, runner, forward_batch, *args, **kwargs):
     _runtime().graph_step_begin(forward_batch)
+    backend = getattr(runner, "backend", None)
+    if isinstance(backend, segmented_graph.RemoteGraphBackend):
+        with backend.execution(forward_batch):
+            return original(runner, forward_batch, *args, **kwargs)
     return original(runner, forward_batch, *args, **kwargs)
 
 
@@ -335,6 +350,7 @@ def _publish_peer(original, manager, mooncake_session_id, decode_kv_args):
 
 
 HOOKS = {
+    "sglang.srt.model_executor.runner_backend.utils.resolve_decode_backend": segmented_graph.resolve_backend,
     "sglang.srt.managers.scheduler.Scheduler.__init__": _scheduler_init,
     "sglang.srt.managers.scheduler.Scheduler.run_event_loop": _event_loop,
     "sglang.srt.managers.scheduler.Scheduler.process_input_requests": _process_requests,

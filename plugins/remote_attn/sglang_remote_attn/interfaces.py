@@ -59,6 +59,22 @@ CORE_CALLS = {
     DISAGG + "pinned_staging_buffer.CudaPinnedSlot.warmup": {},
     DISAGG + "pinned_staging_buffer.CudaPinnedSlot.copy": {},
     DISAGG + "pinned_staging_buffer.CudaPinnedSlot.close": {},
+    "sglang.srt.model_executor.runner_backend_utils.breakable_cuda_graph.breakable_cuda_graph.eager_on_graph": {
+        "capture_stub": None,
+        "enable": None,
+    },
+    "sglang.srt.model_executor.runner_backend_utils.breakable_cuda_graph.breakable_cuda_graph.is_capturing": {},
+    "sglang.srt.model_executor.runner_backend.full_cuda_graph_backend.FullCudaGraphBackend.capture_one": {
+        "capture_inputs": None,
+        "post_warmup_hook": None,
+    },
+    "sglang.srt.model_executor.runner_backend.breakable_cuda_graph_backend.BreakableCudaGraphBackend.capture_one": {
+        "capture_inputs": None,
+        "post_warmup_hook": None,
+    },
+    "sglang.srt.model_executor.runner_backend.breakable_cuda_graph_backend.BreakableCudaGraphBackend.capture_session": {
+        "stream": inspect.Parameter.empty
+    },
 }
 CORE_PROPERTIES = (DISAGG + "mooncake.pinned_staging_core.CorePinnedStager.poisoned",)
 CORE_FIELDS = {
@@ -73,6 +89,14 @@ CORE_FIELDS = {
 # Instance fields cannot be inspected by constructing the real GPU owners.
 # Inspect their initialization declarations in the actual loaded Python sources.
 CORE_STATE = {
+    "sglang.srt.model_executor.runner_backend.full_cuda_graph_backend.FullCudaGraphBackend.__init__": (
+        "self",
+        ("_pool",),
+    ),
+    "sglang.srt.model_executor.runner_backend.breakable_cuda_graph_backend.BreakableCudaGraphBackend.__init__": (
+        "self",
+        ("_pool",),
+    ),
     MANAGER + "__init__": ("self", ("_core_stager", "_host_staging_all")),
     DISAGG + "common.conn.CommonKVReceiver.send_metadata": (
         "self",

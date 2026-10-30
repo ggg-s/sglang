@@ -683,6 +683,235 @@ class TestRemoteAttn(CustomTestCase):
         with patch.object(self.hooks, "_runtime", return_value=runtime):
             self.hooks._process_requests(lambda *a: None, scheduler, [sentinel])
 
+    def _segmented_graph_fixture(self):
+        sg = self.hooks.segmented_graph
+        trace = []
+        controller = SimpleNamespace(graph_fast_path=True, targets=[])
+
+        class Event:
+            broken = False
+
+            def record(self, stream):
+                if self.broken:
+                    raise RuntimeError("event record failed")
+                trace.append("record")
+
+            def synchronize(self):
+                trace.append("sync")
+
+        class Attention:
+            def __init__(self, index):
+                self.layer_id, self.tp_q_head_num, self.v_head_dim = index, 1, 4
+
+            def forward(self, q, k, v, batch, **kw):
+                return q * 2
+
+        modules = [Attention(0), Attention(1)]
+        mr = SimpleNamespace(
+            _pre_layerwise=controller,
+            model_config=SimpleNamespace(num_hidden_layers=2),
+            model=SimpleNamespace(modules=lambda: modules),
+        )
+        runner = SimpleNamespace(
+            model_runner=mr,
+            device_module=SimpleNamespace(Event=Event, current_stream=lambda: "stream"),
+        )
+
+        class Bank:
+            def __init__(self, name):
+                self.name, self.keys, self.outputs, self.capturing = name, {}, {}, False
+
+            def capture_session(self, stream):
+                return nullcontext()
+
+            def capture_one(self, key, fn, *a):
+                self.capturing = True
+                try:
+                    self.outputs[key.size] = fn()
+                    self.keys[key.size] = key
+                finally:
+                    self.capturing = False
+
+            def can_run(self, batch, key):
+                return self.keys.get(key.size) == key
+
+            def replay_session(self):
+                return nullcontext()
+
+            def replay(self, key, batch):
+                if self.name == "remote":
+                    q = torch.ones(batch.batch_size, 4)
+                    for module in modules:
+                        q = backend._attention(module, q, q, q, save_kv_cache=True)
+                    self.outputs[key.size].copy_(q)
+                return self.outputs[key.size]
+
+            def cleanup(self):
+                trace.append("clean_" + self.name)
+
+        full, remote = Bank("full"), Bank("remote")
+        backend = sg.RemoteGraphBackend(
+            runner,
+            full,
+            remote,
+            lambda fn: fn,
+            lambda: remote.capturing,
+            lambda: trace.append("restore"),
+        )
+        mr._remote_segmented_backend = backend
+        with patch.dict(
+            sys.modules,
+            {
+                "sglang.srt.layers.radix_attention": SimpleNamespace(
+                    RadixAttention=Attention
+                )
+            },
+        ):
+            sg.install_attention(mr)
+        runner.backend = backend
+
+        def batch(size, marker=0):
+            return SimpleNamespace(
+                batch_size=size,
+                input_ids=torch.zeros(size, dtype=torch.int64),
+                input_embeds=None,
+                replace_embeds=None,
+                forward_mode=SimpleNamespace(is_decode=lambda: True),
+                marker=marker,
+            )
+
+        def attention(module, q, k, v, live, **kwargs):
+            trace.append(("rpc", live.marker, module.layer_id))
+            return q + live.marker
+
+        runtime = SimpleNamespace(
+            has_target_states=lambda: bool(controller.targets),
+            _row_meta=lambda fb: {"states": []},
+            _handoff_attention_forward=attention,
+        )
+        with (
+            patch.object(sg, "_runtime", return_value=runtime),
+            backend.capture_session("stream"),
+        ):
+            for size in (8, 4, 2, 1):
+                captured = batch(size, -100)
+
+                def forward():
+                    q = torch.ones(captured.batch_size, 4)
+                    for module in modules:
+                        q = module.forward(q, q, q, captured)
+                    return q
+
+                key = SimpleNamespace(
+                    size=size,
+                    stream_idx=None,
+                    variant_label=None,
+                    attention_variant=None,
+                )
+                backend.capture_one(key, forward)
+        return SimpleNamespace(
+            backend=backend,
+            controller=controller,
+            runner=runner,
+            full=full,
+            remote=remote,
+            trace=trace,
+            batch=batch,
+            runtime=runtime,
+        )
+
+    def test_remote_segments_capture_only_three_buckets_and_use_live_requests(self):
+        """Captured dummy requests must never leak into a later RPC callback."""
+        f = self._segmented_graph_fixture()
+        b = f.backend
+        self.assertEqual(sorted(f.full.keys), [1, 2, 4, 8])
+        self.assertEqual(sorted(f.remote.keys), [1, 2, 4])
+        self.assertEqual(b.manifest(), ((1, (0, 1)), (2, (0, 1)), (4, (0, 1))))
+        self.assertIsNone(b.capture_batch)
+        self.assertFalse(any(isinstance(item, tuple) for item in f.trace))
+        f.controller.targets.append(object())
+        sg = self.hooks.segmented_graph
+        with (
+            patch.object(sg, "_runtime", return_value=f.runtime),
+            patch.dict(
+                sys.modules,
+                {
+                    "sglang.srt.runtime_context": SimpleNamespace(
+                        get_parallel=lambda: SimpleNamespace(tp_size=1, tp_rank=0)
+                    )
+                },
+            ),
+        ):
+            for size in (1, 2, 4):
+                ptr = f.remote.outputs[size].data_ptr()
+                for marker in (3, 7):
+                    live = f.batch(size, marker)
+                    self.assertTrue(
+                        self.hooks._decode_graph(lambda *a: True, f.runner, live)
+                    )
+                    with b.execution(live), b.replay_session():
+                        output = b.replay(f.remote.keys[size], live)
+                    self.assertEqual(output.data_ptr(), ptr)
+                    self.assertTrue(
+                        torch.equal(output, torch.full((size, 4), 1 + marker * 2))
+                    )
+            for size in (3, 8):
+                self.assertFalse(b.supports_remote(f.batch(size)))
+                self.assertFalse(
+                    self.hooks._decode_graph(lambda *a: True, f.runner, f.batch(size))
+                )
+                with self.assertRaisesRegex(RuntimeError, "fall back"):
+                    with b.execution(f.batch(size)):
+                        self.fail("unsupported batch entered a graph")
+                self.assertIsNone(b.active_batch)
+                self.assertFalse(b.use_remote)
+            f.controller.targets.clear()
+            before = len(f.trace)
+            live = f.batch(4, 999)
+            self.assertTrue(self.hooks._decode_graph(lambda *a: True, f.runner, live))
+            with b.execution(live), b.replay_session():
+                output = b.replay(f.full.keys[4], live)
+            self.assertTrue(torch.equal(output, torch.full((4, 4), 4.0)))
+            self.assertEqual(
+                len(f.trace), before
+            )  # No RPC or event on Local full replay.
+        b.cleanup()
+        self.assertEqual(f.trace[-3:], ["sync", "clean_remote", "clean_full"])
+        self.assertEqual(b.replays, {"remote": 6, "full": 1})
+
+    def test_remote_segments_fail_without_retry_and_retain_unfenced_banks(self):
+        """An RPC/event failure cannot restart the token or free queued segment storage."""
+        f = self._segmented_graph_fixture()
+        f.controller.targets.append(object())
+        calls = []
+
+        def broken(module, q, *a, **kw):
+            calls.append(module.layer_id)
+            raise RuntimeError("RPC failed")
+
+        f.runtime._handoff_attention_forward = broken
+        with patch.object(
+            self.hooks.segmented_graph, "_runtime", return_value=f.runtime
+        ):
+            with self.assertRaisesRegex(RuntimeError, "RPC failed"):
+                live = f.batch(1)
+                with f.backend.execution(live), f.backend.replay_session():
+                    f.backend.replay(f.remote.keys[1], live)
+            self.assertEqual(calls, [0])
+            self.assertIsNone(f.backend.active_batch)
+            self.assertFalse(f.backend.use_remote)
+            self.assertEqual(f.backend.replays["remote"], 0)
+            f.backend.done.broken = True
+            with self.assertRaisesRegex(RuntimeError, "event record failed"):
+                with f.backend.execution(f.batch(1)):
+                    pass
+        with self.assertRaisesRegex(RuntimeError, "retaining graph banks"):
+            f.backend.cleanup()
+        self.assertFalse(f.backend.closed)
+        self.assertFalse(
+            any(isinstance(item, str) and item.startswith("clean_") for item in f.trace)
+        )
+
     def test_failed_import_cannot_become_local_or_replayable(self):
         event = threading.Event()
         event.set()  # the receiver wakes waiters when transport fails
@@ -1556,6 +1785,13 @@ class TestRemoteAttn(CustomTestCase):
         # and failure wakeups must all lead to the same branch on both ranks.
         self.assertEqual(rows[0]["graphs"], rows[1]["graphs"])
         self.assertEqual(rows[0]["leases"], rows[1]["leases"])
+        self.assertEqual(rows[0]["segmented_startup"], [True, False, False])
+        self.assertEqual(rows[0]["segmented_startup"], rows[1]["segmented_startup"])
+        self.assertEqual(rows[0]["segmented_routing"], rows[1]["segmented_routing"])
+        self.assertEqual(
+            rows[0]["segmented_routing"],
+            [[True] * 5, [True, True, False, True, False]] * 2,
+        )
         self.assertTrue(rows[0]["leases"]["mismatch_rejected"])
         self.assertTrue(rows[0]["leases"]["existing_state_fallback"])
         self.assertGreater(rows[0]["leases"]["boundary_reductions"], 0)
@@ -3479,6 +3715,14 @@ class TestRemoteAttn(CustomTestCase):
                 "staging_bytes",
             ),
             ("common.staging_handler.PrefillStagingStrategy.check_ready", "chunk_idx"),
+            (
+                "sglang.srt.model_executor.runner_backend_utils.breakable_cuda_graph.breakable_cuda_graph.eager_on_graph",
+                "capture_stub",
+            ),
+            (
+                "sglang.srt.model_executor.runner_backend.breakable_cuda_graph_backend.BreakableCudaGraphBackend.capture_one",
+                "post_warmup_hook",
+            ),
         )
         with tempfile.TemporaryDirectory() as directory:
             root = Path(directory)
@@ -3486,7 +3730,11 @@ class TestRemoteAttn(CustomTestCase):
             for relative, keyword in cases:
                 with self.subTest(interface=relative, keyword=keyword):
                     resolver = self.interfaces.SourceAPI(root)
-                    node = resolver.resolve("sglang.srt.disaggregation." + relative)
+                    node = resolver.resolve(
+                        relative
+                        if relative.startswith("sglang.")
+                        else "sglang.srt.disaggregation." + relative
+                    )
                     path, tree = next(iter(resolver.cache.items()))
                     original = path.read_text()
                     for arg in node.args.args + node.args.kwonlyargs:
@@ -3520,6 +3768,14 @@ class TestRemoteAttn(CustomTestCase):
                 "gpu_buffer",
             ),
             ("sglang.srt.environ.Envs", "SGLANG_MOONCAKE_HOST_STAGING_ALL"),
+            (
+                "sglang.srt.model_executor.runner_backend.full_cuda_graph_backend.FullCudaGraphBackend.__init__",
+                "_pool",
+            ),
+            (
+                "sglang.srt.model_executor.runner_backend.breakable_cuda_graph_backend.BreakableCudaGraphBackend.__init__",
+                "_pool",
+            ),
         )
         with tempfile.TemporaryDirectory() as directory:
             root = Path(directory)

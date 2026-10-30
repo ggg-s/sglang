@@ -483,6 +483,9 @@ class Controller:
                 tuple(getattr(graph_runner, "capture_bs", []) or []),
                 tuple(getattr(graph_runner, "capture_num_tokens", []) or []),
                 getattr(graph_runner, "max_bs", None),
+                getattr(
+                    getattr(graph_runner, "backend", None), "manifest", lambda: None
+                )(),
             )
 
         signature = (

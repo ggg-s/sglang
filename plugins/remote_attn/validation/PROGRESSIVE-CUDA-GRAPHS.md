@@ -1,5 +1,9 @@
 # Progressive CUDA graphs 适配与验证
 
+本页记录 Remote eager → Local full 及 Local 稳态优化的验证。
+最新 D 端 batch 1/2/4 Remote 分段图实现与 GPU 探针见
+[Remote 分段验证](REMOTE-SEGMENTED-GRAPHS.md)；该路径取代下文的 Remote eager 默认行为。
+
 2026-10-30，初版基于 `ba7b2891296b`，Local 稳态优化基于 `ae4e4b92fa`，
 目标分支 `codex/remote-attn-pre-layerwise`。
 

@@ -336,6 +336,57 @@ def main():
                         ]
                     )
         leases = progressive_graph_leases(args, context)
+        from sglang_remote_attn.segmented_graph import (
+            RemoteGraphBackend,
+            agree_capture_settings,
+        )
+
+        startup = []
+        for scenario in ("same", "flag-mismatch", "bucket-mismatch"):
+            report = (
+                not (scenario == "flag-mismatch" and args.rank == 1),
+                (1, 2)
+                if scenario == "bucket-mismatch" and args.rank == 1
+                else (1, 2, 4),
+            )
+            try:
+                agree_capture_settings(report, group=dist.group.WORLD, world_size=2)
+                startup.append(True)
+            except RuntimeError:
+                startup.append(False)
+        controller = SimpleNamespace(graph_fast_path=True, targets=[])
+        runner = SimpleNamespace(
+            model_runner=SimpleNamespace(_pre_layerwise=controller)
+        )
+        backend = RemoteGraphBackend.__new__(RemoteGraphBackend)
+        backend.runner, backend.remote_keys = (
+            runner,
+            {size: SimpleNamespace(size=size) for size in (1, 2, 4)},
+        )
+        backend.remote = SimpleNamespace(can_run=lambda *a: True)
+        runner.backend = backend
+        routing = []
+        import torch
+
+        with (
+            patch.dict(sys.modules, {"sglang.srt.runtime_context": context}),
+            patch.object(
+                dist, "all_reduce", side_effect=AssertionError("per-forward graph vote")
+            ),
+        ):
+            for remote_active in (False, True, False, True):
+                controller.targets = [object()] if remote_active else []
+                row = []
+                for size in (1, 2, 3, 4, 8):
+                    batch = SimpleNamespace(
+                        batch_size=size,
+                        input_ids=torch.zeros(size, dtype=torch.int64),
+                        input_embeds=None,
+                        replace_embeds=None,
+                        forward_mode=SimpleNamespace(is_decode=lambda: True),
+                    )
+                    row.append(hooks._decode_graph(lambda *a: True, runner, batch))
+                routing.append(row)
         Path(args.output).write_text(
             json.dumps(
                 {
@@ -345,6 +396,8 @@ def main():
                     "retirements": retirements,
                     "graphs": graphs,
                     "leases": leases,
+                    "segmented_startup": startup,
+                    "segmented_routing": routing,
                 }
             )
         )
