@@ -1,4 +1,4 @@
-# DSV4.1 Flash：原生 PD 的 layerwise 接入
+# DSV4.1 Flash：原生 PD 的 layerwise 与 eager Remote 接入
 
 此路径只用于同机单 P/D pair、纯文本、相同 TP、PP=DP=CP=1、Mooncake、
 DSpark/其他投机解码关闭，不启用 KV cache sharding。使用原生 SMG 和 `sglang.launch_server`，没有 JSON
@@ -25,12 +25,16 @@ DSpark/其他投机解码关闭，不启用 KV cache sharding。使用原生 SMG
 - 最终仍调用原生 `send_kv_chunk(last_chunk=True)`，发送空 global KV 尾部、原生 SWA、
   压缩续接状态和 metadata。ratio-2 的奇数前缀携带 pending half-pair，偶数前缀
   沿用原生空 carry 索引。**只传 global KV 不代表 D 可以开始 decode。**
-- D 继续等待原生 receiver Success。没有 early metadata、Remote attention 或
-  提前接纳。原生 sender 完成、所有 TP rank 同意后，才执行 P 延迟释放。
+- layerwise 下 D 继续等待原生 receiver Success。Remote 最小闭环也等待全量 PD，
+  再执行一轮稀疏 RPC；无 early metadata 或提前接纳。P 还须等待远端 reader
+  完成及 TP 退休共识，才执行延迟释放。
 
 一个模型层的完成标记只表示其 global 资源传输结束，不代表所有共享消费者和
 原生状态都已就绪。失败不使用请求的 released 标志推断写入完成；保留资源并报错。
 本次不提供跨故障自动恢复协议。
+
+`HANDOFF_PRE_LAYERWISE=remote` 现支持**原生 PD 完成后的首轮 D decode eager 稀疏 RPC**；
+归属、启动和限制见 [Remote 最小闭环](DSV41-REMOTE-EAGER-ZH.md)。本版不提前接纳 D。
 
 ## P 端 host staging
 
@@ -111,8 +115,8 @@ H2D event 与原生 receiver/metadata 的完成证明。
   overlap 模式通过本次 launch 的 plan 绕过内嵌 decoder tail graph，不临时改写
   模型的 tail 对象；普通 P forward 不改图配置。关闭 P overlap 的对照仍保留原串行路径。
   P 不使用 torch.compile，不能让编译图跳过 Python 完成通知。
-- `HANDOFF_PRE_LAYERWISE=remote` 对 DSV4.1 拒绝启动；Remote sparse attention、
-  DSV4.1 Remote 分段图和 D0→D1 迁移不在本次支持范围。
+- `HANDOFF_PRE_LAYERWISE=remote` 支持 post-PD 首轮 eager sparse attention。
+  传输未完成时提前 decode、逐资源 progressive 切换、Remote 分段图和 D0→D1 迁移尚未适配。
 - 支持 P send 和 D receive host staging；不使用原生 MHA staging 开关、uniform-FP8 TRTLLM 或 unified KV。
   不能照搬 Qwen 示例的 `--page-size 1`；沿用原生 DSV4.1 支持的页布局。
 
@@ -301,8 +305,8 @@ SMG/SGL 核心、原生采样、future map 和 optimistic/chunk/batch 配置未�
 非整页 final chunk、奇偶 carry、GPU event 未完成不得写入/释放、布局不匹配和
 TP 不同意时游标不变、P eager / D native graph、错误时保留源分配。
 
-当前共有 32 项 DSV4.1 专项测试，完整 130 项本地插件测试通过，包含真实双进程
-Gloo；源码预检覆盖 39 个 hook、88 个核心接口。新增覆盖两批 final 交错、同请求
+当前共有 38 项 DSV4.1 专项测试，完整 136 项本地插件测试通过，包含真实双进程
+Gloo；源码预检覆盖 40 个 hook、88 个核心接口。新增覆盖两批 final 交错、同请求
 middle→final、队列任务继承、延迟采样、失败保留、重试/retraction/reset 栅栏、长
 prompt 短尾块策略。TP2 用例验证不同 rank 的 generation 和 GPU 就绪时序，
 最终正常/取消各一次共识，稳定轮询不产生额外退休投票。新增证书 TP2 用例

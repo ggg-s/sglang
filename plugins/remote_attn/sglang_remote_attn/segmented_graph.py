@@ -269,6 +269,18 @@ def install_attention(model_runner):
 def resolve_backend(original, runner):
     from sglang.srt.runtime_context import get_disagg, get_exec, get_parallel
 
+    if (
+        getattr(
+            getattr(
+                getattr(runner.model_runner, "model_config", None), "hf_config", None
+            ),
+            "model_type",
+            None,
+        )
+        == "deepseek_v41"
+    ):
+        # This first sparse RPC closure deliberately uses eager Remote decode.
+        return original(runner)
     parallel = get_parallel()
     option = os.environ.get("HANDOFF_REMOTE_SEGMENTED_GRAPH", "1")
     settings = (

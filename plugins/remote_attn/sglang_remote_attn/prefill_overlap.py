@@ -130,6 +130,13 @@ class SourceLease:
             _poll_success(self.chunk.sender)
         with self.ledger.lock:
             outstanding = bool(self.ledger.pending)
+        if self.source is not None and getattr(
+            getattr(self.source, "owner", None), "dsv41_remote", False
+        ):
+            from .dsv41_remote import source_ready
+
+            if not source_ready(self.source):
+                return False
         if self.cancelling:
             # Cancellation is fenced BEFORE native abort/clear. Every issued
             # envelope must have its successful completion callback, not merely

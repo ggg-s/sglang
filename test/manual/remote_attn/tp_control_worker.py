@@ -124,6 +124,16 @@ def progressive_graph_leases(args, context):
         patch.object(dist, "all_reduce", counted_reduce),
     ):
         controller.validate_graphs()
+        previous = controller.config
+        controller.dsv41_layerwise = True
+        controller.config = Config("remote" if args.rank == 0 else "layerwise", root)
+        try:
+            controller.validate_graphs()
+            sparse_mode_mismatch_rejected = False
+        except RuntimeError:
+            sparse_mode_mismatch_rejected = True
+        controller.config = previous
+        del controller.dsv41_layerwise
         with patch.object(
             runtime, "_TARGET_STATES", [object()] if args.rank == 0 else []
         ):
@@ -207,6 +217,7 @@ def progressive_graph_leases(args, context):
     return {
         "snapshots": snapshots,
         "mismatch_rejected": mismatch_rejected,
+        "sparse_mode_mismatch_rejected": sparse_mode_mismatch_rejected,
         "cache_mismatch_rejected": cache_mismatch_rejected,
         "overlap_mismatch_rejected": overlap_mismatch_rejected,
         "existing_state_fallback": existing_state_fallback,
@@ -1153,6 +1164,158 @@ def receive_staging_consensus(args):
     return dict(polls=polls, native_collective_shapes=shapes)
 
 
+def sparse_remote_lifetimes(args):
+    """Shared post-PD eager window and one TP retirement after last P reader."""
+    from sglang_remote_attn import handoff_control as rt
+    from sglang_remote_attn import hooks
+    from sglang_remote_attn.dsv41_layerwise import DSV41Source
+    from sglang_remote_attn.pre_layerwise import Config, Controller, write_json
+    from sglang_remote_attn.prefill_overlap import SourceLease
+    from sglang_remote_attn.retirement import Retirement
+    from sglang_remote_attn.source_cache import CacheGuard
+
+    owner = Controller.__new__(Controller)
+    owner.rank, owner.tp_size, owner.dsv41_remote = args.rank, 2, True
+    owner.scheduler = SimpleNamespace(attn_tp_cpu_group=dist.group.WORLD)
+    owner.config = Config("remote", Path(args.output).with_suffix(".sparse"))
+    registry = rt.HandoffRegistry()
+    owner.scheduler._handoff_hub = SimpleNamespace(registry=registry)
+    req = SimpleNamespace(
+        rid="sparse",
+        bootstrap_room=705,
+        cache_request_handle="attempt",
+        lock=object(),
+        last_node="cache",
+        kv=SimpleNamespace(req_pool_idx=0, cache_protected_len=8),
+        disagg_kv_sender=SimpleNamespace(poll=lambda: 4, kv_mgr=SimpleNamespace()),
+    )
+    pins = set()
+    cache = SimpleNamespace(
+        lock=lambda node: pins.add(node) or node,
+        unlock=pins.remove,
+        checkpoint=lambda *a, **kw: None,
+        finish=lambda *a: None,
+        reset=lambda: None,
+    )
+    guard = CacheGuard(cache)
+    source = DSV41Source(
+        owner,
+        req,
+        owner.config.directory,
+        f"g{args.rank}",
+        None,
+        None,
+        (),
+        33,
+        finalized=True,
+        cache_lease=guard.hold(req),
+    )
+    req._pre_layerwise_source = source
+    ctx = registry.register(
+        "sparse",
+        req,
+        0,
+        33,
+        33,
+        "token",
+        on_release=lambda ctx: source.remote_closed.set(),
+    )
+    source.service = dict(handoff_id="sparse", epoch=ctx.owner_epoch)
+    if args.rank == 1:
+        registry.acquire("sparse", ctx.owner_epoch)
+    write_json(source.path / "remote-done.json", dict(generation=source.generation))
+    freed = []
+    chunk = SimpleNamespace(req=req, sender=req.disagg_kv_sender, check=lambda: None)
+    overlap = SimpleNamespace(
+        controller=SimpleNamespace(sources=[source]),
+        by_room={705: None},
+        ledgers={},
+        admission=SimpleNamespace(retired=lambda req: None),
+    )
+    lease = SourceLease(
+        overlap,
+        chunk,
+        1,
+        source.generation,
+        source=source,
+        finalized=True,
+        cache_lease=source.cache_lease,
+        release=lambda: freed.append(705),
+    )
+    owner.targets = [lease]
+    protocol = Retirement(owner)
+    protocol.register(lease)
+    d = SimpleNamespace(
+        dsv41_remote=True,
+        dsv41_layerwise=True,
+        remote_targets={0: True},
+        targets=[],
+        plan=None,
+        executing=None,
+        graph_fast_path=True,
+    )
+    runner = SimpleNamespace(model_runner=SimpleNamespace(_pre_layerwise=d))
+    votes = []
+    actual = dist.all_reduce
+
+    def counted(tensor, *a, **kw):
+        votes.append(tensor.numel())
+        return actual(tensor, *a, **kw)
+
+    try:
+        with (
+            patch.dict(
+                sys.modules,
+                {
+                    "sglang.srt.runtime_context": SimpleNamespace(
+                        get_parallel=lambda: SimpleNamespace(
+                            tp_size=2,
+                            tp_rank=args.rank,
+                            tp_group=SimpleNamespace(cpu_group=dist.group.WORLD),
+                        )
+                    ),
+                    "sglang.srt.disaggregation.base.conn": SimpleNamespace(
+                        KVPoll=SimpleNamespace(Success=4, Failed=0)
+                    ),
+                },
+            ),
+            patch.object(dist, "all_reduce", counted),
+        ):
+            for _ in range(32):
+                assert not hooks._decode_graph(lambda *a: True, runner, None)
+                protocol.observe()
+                assert protocol.poll_command() is None
+            assert not votes and pins and not freed
+            dist.barrier()  # Test phase boundary: rank 1 is still a live reader.
+            if args.rank == 1:
+                registry.release_ref("sparse", ctx.owner_epoch)
+            command = None
+            for _ in range(64):
+                protocol.observe()
+                message = [protocol.poll_command()]
+                dist.broadcast_object_list(message, src=0)
+                if message[0] is not None:
+                    command = message[0]
+                    break
+            assert command is not None
+            protocol.arm(command)
+            protocol.finalize()
+            assert votes == [5] and freed == [705] and not pins
+            d.remote_targets.clear()
+            for _ in range(32):
+                assert hooks._decode_graph(lambda *a: True, runner, None)
+            assert votes == [5]
+            return dict(
+                stable_remote_votes=0,
+                final_vote_shapes=votes,
+                freed=freed,
+                local_graph_votes=0,
+                pins_closed=True,
+            )
+    finally:
+        protocol.close()
+
+
 def main():
     parser = argparse.ArgumentParser()
     parser.add_argument("rank", type=int)
@@ -1367,6 +1530,7 @@ def main():
         p_cached_certificates = prefill_certificate_lifetimes(args, prefix_cache=True)
         p_staging_failure = prefill_staging_failure(args)
         d_receive_staging = receive_staging_consensus(args)
+        sparse_remote = sparse_remote_lifetimes(args)
         Path(args.output).write_text(
             json.dumps(
                 {
@@ -1383,6 +1547,7 @@ def main():
                     "p_cached_certificates": p_cached_certificates,
                     "p_staging_failure": p_staging_failure,
                     "d_receive_staging": d_receive_staging,
+                    "sparse_remote": sparse_remote,
                     "segmented_startup": startup,
                     "segmented_routing": routing,
                 }

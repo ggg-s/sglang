@@ -562,6 +562,9 @@ class Controller:
             manifest(runner.prefill_cuda_graph_runner),
             cache_signature(getattr(self.scheduler, "tree_cache", None)),
             bool(getattr(self.scheduler, "enable_overlap", False)),
+            (self.config.mode, self.config.host_staging, self.config.recv_host_staging)
+            if getattr(self, "dsv41_layerwise", False)
+            else None,
         )
         clean = not _runtime().has_target_states()
         if self.tp_size > 1:
@@ -1145,6 +1148,9 @@ def pop_transferred(original, queue, rids_to_check=None):
 
 
 def defer_release(req, release, *, checkpoint=None):
+    from .dsv41_remote import release as release_remote
+
+    release_remote(req)
     lease = getattr(req, "_dsv41_p_lease", None)
     if lease is not None:
         return lease.overlap.defer_release(req, release)

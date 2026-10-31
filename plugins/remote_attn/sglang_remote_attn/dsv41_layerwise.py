@@ -2,7 +2,8 @@
 
 Only immutable, compressed global KV/index-K page entries are pipelined. SWA
 and compression carry state retain the native last-chunk path and D admission
-barrier. No sparse Remote attention or model/scheduler loop is implemented here.
+barrier. The optional first post-PD eager sparse read closure is delegated to
+dsv41_remote; early sparse admission and model/scheduler loops are not copied.
 """
 
 import functools
@@ -10,7 +11,7 @@ import logging
 import time
 from dataclasses import dataclass, field
 
-from . import dsv41_receive, dsv41_staging
+from . import dsv41_receive, dsv41_remote, dsv41_staging
 from .pre_layerwise import Controller, Source, read_json, write_json
 
 logger = logging.getLogger(__name__)
@@ -242,6 +243,8 @@ class DSV41Source(Source):
     def finalize_native(self, original, scheduler, req, *, last_chunk, end_idx):
         if self.finalized or len(self.submitted) != len(self.groups):
             raise RuntimeError("incomplete or duplicate DSV4.1 layerwise finalization")
+        if self.owner.dsv41_remote:
+            dsv41_remote.register(self)
         try:
             # req.start_send_idx and sender.curr_idx already cover these global
             # pages. Native finalization sends an empty KV tail AND every native
@@ -251,7 +254,8 @@ class DSV41Source(Source):
             self.error = repr(exc)
             raise
         self.finalized = True
-        self.remote_closed.set()
+        if not self.owner.dsv41_remote:
+            self.remote_closed.set()
         write_json(
             self.path / "prefill.json",
             {
@@ -276,6 +280,18 @@ class DSV41Source(Source):
         )
         return result
 
+    def poll(self):
+        if not self.owner.dsv41_remote:
+            return super().poll()
+        from .pre_layerwise import _poll_success
+
+        ready = dsv41_remote.source_ready(self)
+        return (
+            _poll_success(self.req.disagg_kv_sender)
+            and self.release is not None
+            and ready
+        )
+
 
 class DSV41Controller(Controller):
     dsv41_layerwise = True
@@ -289,10 +305,11 @@ class DSV41Controller(Controller):
         )
 
         s = self.scheduler
-        if self.config.mode != "layerwise":
-            raise ValueError(
-                "DSV4.1 supports HANDOFF_PRE_LAYERWISE=layerwise only; no Remote"
-            )
+        self.dsv41_remote = self.config.mode == "remote"
+        if not hasattr(self, "remote_targets"):
+            self.remote_targets = {}
+        if self.config.mode not in ("layerwise", "remote"):
+            raise ValueError("DSV4.1 requires layerwise or post-PD eager remote mode")
         if not get_disagg().language_model_only:
             raise ValueError("DSV4.1 layerwise requires --language-model-only")
         if get_spec().speculative_algorithm is not None:
@@ -350,6 +367,9 @@ class DSV41Controller(Controller):
                 "DSV4.1 staging requires P send / D receive roles; native MHA staging must be disabled"
             )
         self._schema(manager)  # reject unsupported storage before serving
+        if self.dsv41_remote:
+            dsv41_remote.validate(self, runner, role)
+
         if role == "prefill" and (
             self.config.host_staging or getattr(manager, "_host_staging_all", False)
         ):
@@ -383,6 +403,12 @@ class DSV41Controller(Controller):
         if target is not None:
             offer = read_json(target.path.parent / "offer.json")
             offer["dsv41"] = self._schema(dr.kv_receiver.kv_mgr)
+            offer["mode"] = self.config.mode
+            offer["remote_boundary"] = (
+                "first-post-PD-decode" if self.dsv41_remote else None
+            )
+            if self.dsv41_remote:
+                dr.req._dsv41_remote_offer = target.path, target.generation
             offer["staging_wire"] = (
                 dsv41_receive.WIRE if self.config.recv_host_staging else None
             )
@@ -459,7 +485,7 @@ class DSV41Controller(Controller):
                     offer
                     and (lease is None or offer.get("generation") == lease.generation)
                     and offer.get("dsv41") == schema
-                    and offer.get("mode") == "layerwise"
+                    and offer.get("mode") == self.config.mode
                     and offer.get("tp_size") == self.tp_size
                     and offer.get("prefix_len") == len(req.origin_input_ids)
                     and len(peers) == 1
@@ -629,6 +655,8 @@ class DSV41Controller(Controller):
             source.enqueue(layer_id, event)
 
     def forward(self, original, runner, fb, *args, **kwargs):
+        if self.dsv41_remote and self.scheduler.disaggregation_mode.value == "decode":
+            return dsv41_remote.forward(self, original, runner, fb, *args, **kwargs)
         overlap = getattr(self, "prefill_overlap", None)
         if overlap is not None:
             return overlap.forward(original, runner, fb, *args, **kwargs)

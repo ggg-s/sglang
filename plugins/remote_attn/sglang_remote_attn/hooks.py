@@ -11,6 +11,7 @@ from . import (
     decode_overlap,
     dsv41_layerwise,
     dsv41_receive,
+    dsv41_remote,
     pre_layerwise,
     prefill_overlap,
     segmented_graph,
@@ -55,7 +56,7 @@ def _scheduler_init(original, scheduler, *args, **kwargs):
         get_disagg().disaggregation_mode == "prefill"
         and not get_schedule().disable_overlap_schedule
     ):
-        raise RuntimeError("P overlap is supported only for DSV4.1 layerwise")
+        raise RuntimeError("P overlap is supported only for the DSV4.1 PD adapter")
     if (
         get_schedule().page_size != 1
         or type(pool) is not MHATokenToKVPool
@@ -102,7 +103,8 @@ def validate_config():
     if not schedule.disable_overlap_schedule and (
         not (
             get_disagg().disaggregation_mode == "prefill"
-            and os.environ.get("HANDOFF_PRE_LAYERWISE", "off") == "layerwise"
+            and os.environ.get("HANDOFF_PRE_LAYERWISE", "off")
+            in ("layerwise", "remote")
         )
         and (
             get_disagg().disaggregation_mode != "decode"
@@ -111,7 +113,7 @@ def validate_config():
         )
     ):
         raise RuntimeError(
-            "remote_attn requires --disable-overlap-schedule except progressive D or DSV4.1 layerwise P"
+            "remote_attn requires --disable-overlap-schedule except progressive D or DSV4.1 PD P"
         )
     if not memory.disable_radix_cache and (
         get_disagg().disaggregation_mode != "prefill"
@@ -126,7 +128,8 @@ def validate_config():
     # Dense MHA still checks page_size=1 in _scheduler_init.
     if schedule.enable_mixed_chunk or (
         schedule.page_size != 1
-        and os.environ.get("HANDOFF_PRE_LAYERWISE", "off") != "layerwise"
+        and os.environ.get("HANDOFF_PRE_LAYERWISE", "off")
+        not in ("layerwise", "remote")
     ):
         raise RuntimeError("remote_attn requires --page-size 1 without mixed chunks")
     if get_spec().speculative_algorithm is not None:
@@ -204,7 +207,7 @@ def _process_requests(original, scheduler, recv_reqs):
             "kv_ledger",
         }:
             raise RuntimeError(
-                "DSV4.1 layerwise supports native PD only; no manual migration/Remote"
+                "DSV4.1 supports native PD only; no manual migration/dense-MHA Remote commands"
             )
         if getattr(controller, "decode_overlap", None) is not None and control.get(
             "cmd"
@@ -276,6 +279,7 @@ def _alloc_extend(original, batch):
 
 
 def _reset_retracted(original, req):
+    dsv41_remote.release(req, "retraction")
     lease = getattr(req, "_dsv41_p_lease", None)
     if lease is not None:
         lease.overlap.drain(req)
@@ -375,6 +379,8 @@ def _graph_decision(original, runner, forward_batch, kind):
     ):
         # prepare agreed the batch across TP before any rank reaches this guard.
         return False
+    if getattr(controller, "dsv41_remote", False) and controller.remote_targets:
+        return False  # Native PD TP commit owns the first eager decode window.
     if controller is not None and controller.graph_fast_path:
         # early_targets admits/removes leases only after TP agreement. Keep
         # even a locally complete lease eager until its slowest peer retires.
@@ -491,6 +497,7 @@ def _publish_peer_now(original, manager, mooncake_session_id, decode_kv_args):
 
 
 HOOKS = {
+    "sglang.srt.disaggregation.decode.DecodeTransferQueue._commit_transfer_to_req": dsv41_remote.commit,
     "sglang.srt.disaggregation.common.staging_handler.StagingManagerMixin._handle_staging_req": dsv41_receive.allocate,
     "sglang.srt.disaggregation.common.staging_handler.DecodeStagingHandler._scatter_region": dsv41_receive.scatter,
     "sglang.srt.disaggregation.mooncake.conn.MooncakeKVManager._try_create_staging_strategy": dsv41_receive.strategy,

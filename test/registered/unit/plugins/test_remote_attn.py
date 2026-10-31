@@ -2136,7 +2136,7 @@ class TestRemoteAttn(CustomTestCase):
                     ):
                         disagg.disaggregation_mode = role
                         if (role == "decode" and mode != "off") or (
-                            role == "prefill" and mode == "layerwise"
+                            role == "prefill" and mode in ("layerwise", "remote")
                         ):
                             self.hooks.validate_config()
                         else:
@@ -3485,6 +3485,7 @@ class TestRemoteAttn(CustomTestCase):
             [[True] * 5, [True, True, False, True, False]] * 2,
         )
         self.assertTrue(rows[0]["leases"]["mismatch_rejected"])
+        self.assertTrue(rows[0]["leases"]["sparse_mode_mismatch_rejected"])
         self.assertTrue(rows[0]["leases"]["cache_mismatch_rejected"])
         self.assertTrue(rows[0]["leases"]["overlap_mismatch_rejected"])
         self.assertEqual(rows[0]["d_overlap"], rows[1]["d_overlap"])
@@ -3504,6 +3505,17 @@ class TestRemoteAttn(CustomTestCase):
         self.assertEqual(
             rows[0]["p_overlap"],
             dict(votes=[5, 5], freed=[1, 2], commits=2, registered=0, local_votes=0),
+        )
+        self.assertEqual(rows[0]["sparse_remote"], rows[1]["sparse_remote"])
+        self.assertEqual(
+            rows[0]["sparse_remote"],
+            dict(
+                stable_remote_votes=0,
+                final_vote_shapes=[5],
+                freed=[705],
+                local_graph_votes=0,
+                pins_closed=True,
+            ),
         )
         self.assertEqual(rows[0]["d_receive_staging"], rows[1]["d_receive_staging"])
         self.assertEqual(
@@ -7038,6 +7050,372 @@ class TestRemoteAttn(CustomTestCase):
                 json.loads((source.path / "prefill.json").read_text())["host_staging"]
             )
 
+    def _dsv41_remote_support(self):
+        spec = importlib.util.spec_from_file_location(
+            "dsv41_remote_probe_support",
+            ROOT / "test/manual/remote_attn/dsv41_remote_probe_support.py",
+        )
+        module = importlib.util.module_from_spec(spec)
+        spec.loader.exec_module(module)
+        return module
+
+    def test_dsv41_remote_does_not_enable_qwen_prefill_overlap(self):
+        f = self._dsv41_fixture()
+        f.runner.model_config.hf_config.model_type = "qwen3"
+        schedule = SimpleNamespace(
+            disable_overlap_schedule=False, enable_mixed_chunk=False, page_size=1
+        )
+        disagg = SimpleNamespace(
+            disaggregation_mode="prefill", enable_pd_role_switch=False
+        )
+        context = SimpleNamespace(
+            get_parallel=lambda: SimpleNamespace(
+                pp_size=1,
+                dp_size=1,
+                attn_cp_size=1,
+                dcp_enabled=False,
+                attn_dp_enabled=False,
+            ),
+            get_memory=f.context.get_memory,
+            get_device=lambda: SimpleNamespace(device="cuda"),
+            get_schedule=lambda: schedule,
+            get_disagg=lambda: disagg,
+            get_spec=f.context.get_spec,
+            get_exec=lambda: SimpleNamespace(
+                overlap=SimpleNamespace(enable_two_batch_overlap=False)
+            ),
+        )
+        modules = {
+            "sglang.srt.runtime_context": context,
+            "sglang.srt.plugins.hook_registry": SimpleNamespace(
+                HookRegistry=SimpleNamespace(_patched=set(self.hooks.HOOKS))
+            ),
+            "sglang.srt.mem_cache.memory_pool": SimpleNamespace(
+                MHATokenToKVPool=object
+            ),
+            "mooncake.engine": SimpleNamespace(
+                TransferEngine=SimpleNamespace(send_probe=lambda: 0)
+            ),
+        }
+        with (
+            patch.dict(sys.modules, modules),
+            patch.dict(os.environ, {"HANDOFF_PRE_LAYERWISE": "remote"}),
+        ):
+            with self.assertRaisesRegex(RuntimeError, "P overlap is supported only"):
+                self.hooks._scheduler_init(lambda *a, **kw: None, f.scheduler)
+
+    def test_dsv41_remote_startup_preserves_overlap_and_binds_only_native_backend(self):
+        f = self._dsv41_fixture()
+        layout = self._dsv41_remote_support().fixture(ROOT, "cpu").layout
+        f.pool.kv_layout = layout.V41
+        for handle in f.controller._layer_handles:
+            handle.remove()
+        f.controller.config = dataclasses.replace(f.controller.config, mode="remote")
+        f.scheduler.disaggregation_mode = SimpleNamespace(value="prefill")
+        f.scheduler.enable_overlap = True
+        with patch.dict(sys.modules, {"sglang.srt.runtime_context": f.context}):
+            f.controller.validate()
+        self.assertTrue(f.controller.dsv41_remote)
+        self.assertTrue(f.scheduler.enable_overlap)
+        for handle in f.controller._layer_handles:
+            handle.remove()
+
+        class NativeBackendBoundary:
+            is_dsv41 = True
+            trtllm_attn = mega_attn = False
+
+            def _forward_attention(
+                self,
+                q,
+                k,
+                v,
+                layer,
+                forward_batch,
+                compress_ratio,
+                save_kv_cache=True,
+                attn_sink=None,
+                cos_sin_cache=None,
+                **kwargs,
+            ):
+                return "native-local-compute"
+
+        backend = NativeBackendBoundary()
+        f.runner.attn_backend = f.runner.decode_attn_backend = backend
+        f.runner.decode_attn_backend_group = [backend]
+        f.scheduler.disaggregation_mode = SimpleNamespace(value="decode")
+        with patch.dict(sys.modules, {"sglang.srt.runtime_context": f.context}):
+            f.controller.validate()
+        self.assertIs(backend._dsv41_remote, f.controller)
+        self.assertEqual(
+            backend._forward_attention(
+                None,
+                None,
+                None,
+                None,
+                SimpleNamespace(forward_mode=SimpleNamespace(is_decode=lambda: True)),
+                0,
+            ),
+            "native-local-compute",
+        )
+        first = backend._forward_attention
+        with patch.dict(sys.modules, {"sglang.srt.runtime_context": f.context}):
+            f.controller.validate()
+        self.assertIs(first, backend._forward_attention)
+        backend.mega_attn = True
+        with patch.dict(sys.modules, {"sglang.srt.runtime_context": f.context}):
+            with self.assertRaisesRegex(ValueError, "without mega"):
+                f.controller.validate()
+
+    def test_dsv41_remote_reads_native_fp4_fp8_layouts_byte_exact(self):
+        from sglang_remote_attn.dsv41_sparse_math import read_slots
+
+        support = self._dsv41_remote_support()
+        f = support.fixture(ROOT, "cpu")
+        slots = torch.tensor([7, 1, 19, 0, 7], dtype=torch.int64)
+        for layout in (
+            f.layout.V41,
+            f.layout.V41_NEW,
+            f.layout.V41_FP4,
+            f.layout.V41_FP4_NEW,
+        ):
+            with self.subTest(layout=layout.value):
+                raw = support.encoded(layout.encoding, 5, 4, "cpu")
+                oracle = (
+                    f.oracle.dequantize_k_cache_v41_fp4
+                    if layout.is_fp4
+                    else f.oracle.dequantize_k_cache_v41
+                )
+                expected = oracle(raw, 4).reshape(-1, 512)[slots]
+                if layout.is_interleaved:
+                    raw = f.oracle.interleave_pages(
+                        raw, 4, layout.data_bytes, layout.scale_bytes
+                    )
+                got = read_slots(raw, slots, 4, layout)
+                self.assertTrue(
+                    torch.equal(got.view(torch.int16), expected.view(torch.int16))
+                )
+                with self.assertRaisesRegex(ValueError, "outside"):
+                    read_slots(raw, torch.tensor([20]), 4, layout)
+                self.assertEqual(
+                    read_slots(
+                        raw, torch.tensor([], dtype=torch.int64), 4, layout
+                    ).shape,
+                    (0, 512),
+                )
+
+    def test_dsv41_remote_sparse_split_matches_union_and_keeps_odd_carry_local(self):
+        from sglang_remote_attn import dsv41_sparse_math as math
+
+        support = self._dsv41_remote_support()
+        f = support.fixture(ROOT, "cpu")
+        calls = []
+        originals = [t.clone() for t in f.p_swa] + [
+            p.kv_buffer[0].clone() for p in f.p_pool.kv_pools.values()
+        ]
+        index = f.core.c2_sparse_page_indices.clone()
+        carry = torch.arange(512, dtype=torch.float32)
+        before = carry.clone()
+
+        def rpc(query, positions, layer, ratio, scale):
+            calls.append((positions, f.p_pool.source_layer_of(layer)))
+            cpp = f.page // ratio
+            ids = torch.tensor([f.p_pages[p // cpp] * cpp + p % cpp for p in positions])
+            keys = math.read_slots(
+                f.p_pool.get_extra_key_buffer(layer), ids, cpp, f.layout.V41_FP4
+            )
+            return math.partial(query, keys, scale)
+
+        f.controller.remote_targets[0] = SimpleNamespace(prefix_len=33, call=rpc)
+        q, kv = f.query, torch.zeros(1, 512)
+        got = f.remote.attention(
+            None,
+            f.backend,
+            q,
+            kv,
+            kv,
+            SimpleNamespace(layer_id=3),
+            f.fb,
+            2,
+            attn_sink=f.sink,
+        )
+        swa = math.read_slots(
+            f.d_pool.get_swa_key_buffer_radix(3),
+            torch.tensor([13, 14]),
+            8,
+            f.layout.V41,
+        )
+        selected = index[0, :4]
+        extra = math.read_slots(
+            f.d_pool.get_extra_key_buffer(3), selected, 4, f.layout.V41_FP4
+        )
+        expected = math.partial(q[0], torch.cat((swa, extra)), 512**-0.5, f.sink)[0].to(
+            q.dtype
+        )
+        torch.testing.assert_close(got[0], expected, atol=0.015625, rtol=0.01)
+        self.assertEqual(calls, [([0, 15, 15], 2)])  # Consumer 3 reads source 2.
+        self.assertEqual(f.stores, [3])
+        self.assertTrue(torch.equal(index, f.core.c2_sparse_page_indices))
+        self.assertTrue(torch.equal(carry, before))
+        current = f.p_swa + [p.kv_buffer[0] for p in f.p_pool.kv_pools.values()]
+        self.assertTrue(all(torch.equal(a, b) for a, b in zip(originals, current)))
+        self.assertEqual(
+            math.partition([28, 7, 24, -1], f.d_pages, 33, 8, 2), ([0, 15], [24])
+        )
+        # Mixed decode keeps ordinary rows bit-identical to native output and
+        # must not store SWA twice while replacing only the Remote row.
+        f.fb.req_pool_indices = torch.tensor([0, 1])
+        f.fb.seq_lens = torch.tensor([34, 34])
+        f.controller.scheduler.req_to_token_pool.req_to_token = f.d_row.repeat(2, 1)
+        f.core.swa_page_indices = f.core.swa_page_indices.repeat(2, 1)
+        f.core.swa_topk_lengths = f.core.swa_topk_lengths.repeat(2)
+        f.core.c2_sparse_page_indices = f.core.c2_sparse_page_indices.repeat(2, 1)
+        f.core.c2_sparse_topk_lengths = f.core.c2_sparse_topk_lengths.repeat(2)
+        native = torch.arange(2048).reshape(2, 2, 512).to(q.dtype)
+        f.stores.clear()
+
+        def native_compute(backend, query, k, v, layer, fb, ratio, **kwargs):
+            backend.store_cache(layer.layer_id, k, fb)
+            return native
+
+        mixed = f.remote.attention(
+            native_compute,
+            f.backend,
+            q.repeat(2, 1, 1),
+            kv,
+            kv,
+            SimpleNamespace(layer_id=3),
+            f.fb,
+            2,
+            attn_sink=f.sink,
+        )
+        self.assertTrue(torch.equal(mixed[1], native[1]))
+        torch.testing.assert_close(mixed[0], expected, atol=0.015625, rtol=0.01)
+        self.assertEqual(f.stores, [3])
+        self.assertEqual(math.partition([24], f.d_pages, 34, 8, 2), ([16], []))
+        with self.assertRaisesRegex(ValueError, "belong"):
+            math.partition([0], f.d_pages, 33, 8, 2)
+        empty = math.partial(q[0], torch.empty(0, 512), 512**-0.5)
+        merged = math.merge(math.partial(q[0], swa, 512**-0.5, f.sink), empty)
+        torch.testing.assert_close(
+            merged, math.partial(q[0], swa, 512**-0.5, f.sink)[0]
+        )
+
+    def test_dsv41_remote_registry_tombstone_holds_cache_until_last_gpu_reader(self):
+        from sglang_remote_attn import dsv41_remote as remote
+        from sglang_remote_attn.source_cache import CacheGuard
+
+        registry = self.runtime.HandoffRegistry()
+        with tempfile.TemporaryDirectory() as directory:
+            req = SimpleNamespace(
+                cache_request_handle="attempt-1",
+                lock="request-pin",
+                last_node="node",
+                kv=SimpleNamespace(cache_protected_len=8, req_pool_idx=0),
+            )
+            pins = set()
+            cache = SimpleNamespace(
+                checkpoint=lambda *a, **kw: None,
+                finish=lambda *a: None,
+                reset=lambda: None,
+                lock=lambda node: pins.add(node) or node,
+                unlock=pins.remove,
+            )
+            guard = CacheGuard(cache)
+            source = SimpleNamespace(
+                error=None,
+                req=req,
+                cache_lease=guard.hold(req),
+                remote_closed=threading.Event(),
+                path=Path(directory),
+                generation="g",
+                owner=SimpleNamespace(scheduler=None),
+            )
+            ctx = registry.register(
+                "sparse",
+                req,
+                0,
+                33,
+                33,
+                "token",
+                on_release=lambda ctx: source.remote_closed.set(),
+            )
+            source.service = dict(handoff_id="sparse", epoch=ctx.owner_epoch)
+            with patch.object(
+                self.runtime,
+                "get_remote_hub",
+                return_value=SimpleNamespace(registry=registry),
+            ):
+                self.assertFalse(remote.source_ready(source))
+                self.assertIs(registry.acquire("sparse", ctx.owner_epoch), ctx)
+                self.hooks.pre_layerwise.write_json(
+                    source.path / "remote-done.json", dict(generation="stale")
+                )
+                self.assertFalse(remote.source_ready(source))
+                self.assertFalse(ctx.closed)
+                self.hooks.pre_layerwise.write_json(
+                    source.path / "remote-done.json", dict(generation="g")
+                )
+                self.assertFalse(remote.source_ready(source))
+                self.assertIsNone(registry.acquire("sparse", ctx.owner_epoch))
+                self.assertEqual(pins, {"node"})
+                registry.release_ref("sparse", ctx.owner_epoch)
+                self.assertTrue(remote.source_ready(source))
+                self.assertEqual(pins, {"node"})  # TP/native release still required.
+                source.cache_lease.retire(lambda: None)
+                self.assertFalse(pins)
+                req._handoff_transfer_unsafe = True
+                with self.assertRaisesRegex(RuntimeError, "GPU read fence"):
+                    remote.source_ready(source)
+
+    def test_dsv41_remote_post_pd_commit_one_decode_then_native_graph(self):
+        from sglang_remote_attn import dsv41_remote as remote
+
+        self.enterContext(
+            patch.dict(
+                sys.modules,
+                {
+                    "sglang.srt.runtime_context": SimpleNamespace(
+                        get_parallel=lambda: SimpleNamespace(tp_size=1, tp_rank=0)
+                    )
+                },
+            )
+        )
+        f = self._dsv41_remote_support().fixture(ROOT, "cpu")
+        f.controller.graph_fast_path = True
+        f.controller.plan = f.controller.executing = None
+        f.controller.dsv41_layerwise = True
+        with tempfile.TemporaryDirectory() as directory:
+            path = Path(directory)
+            offer = SimpleNamespace(path=path, generation="g")
+            dr = SimpleNamespace(req=f.req, _pre_layerwise_offer=offer)
+            queue = SimpleNamespace(
+                scheduler=SimpleNamespace(_pre_layerwise=f.controller)
+            )
+            self.hooks.pre_layerwise.write_json(
+                path / "remote-service.json",
+                dict(generation="g", prefix_len=33, route={}),
+            )
+            remote.commit(lambda *a, **kw: None, queue, dr)
+            target = f.req._dsv41_remote
+            f.req.kv.req_pool_idx = 99
+            with self.assertRaisesRegex(RuntimeError, "attempt/row changed"):
+                target.call(f.query[0], [0], 3, 2, 0.01)
+            f.req.kv.req_pool_idx = 0
+            runner = SimpleNamespace(
+                model_runner=SimpleNamespace(_pre_layerwise=f.controller)
+            )
+            self.assertFalse(self.hooks._decode_graph(lambda *a: True, runner, f.fb))
+            self.assertEqual(
+                remote.forward(f.controller, lambda *a: "native-result", None, f.fb),
+                "native-result",
+            )
+            self.assertTrue(target.closed)
+            self.assertFalse(f.controller.remote_targets)
+            self.assertTrue(self.hooks._decode_graph(lambda *a: True, runner, f.fb))
+            result = json.loads((path / "remote-done.json").read_text())
+            self.assertEqual(result["reason"], "first-post-PD-eager-decode-complete")
+            self.assertEqual(result["generation"], "g")
+
     def _dsv41_receive_fixture(self, *, capacity=128):
         import struct
 
@@ -7465,15 +7843,13 @@ class TestRemoteAttn(CustomTestCase):
         with self.assertRaisesRegex(RuntimeError, "retaining KV and pinned slot"):
             lease.transport_ready()
 
-    def test_dsv41_startup_rejects_remote_multimodal_speculation_and_unsafe_storage(
+    def test_dsv41_startup_rejects_invalid_mode_multimodal_speculation_and_unsafe_storage(
         self,
     ):
         f = self._dsv41_fixture()
         with patch.dict(sys.modules, {"sglang.srt.runtime_context": f.context}):
-            f.controller.config = dataclasses.replace(
-                f.controller.config, mode="remote"
-            )
-            with self.assertRaisesRegex(ValueError, "layerwise only"):
+            f.controller.config = dataclasses.replace(f.controller.config, mode="off")
+            with self.assertRaisesRegex(ValueError, "layerwise or"):
                 f.controller.validate()
             f.controller.config = dataclasses.replace(
                 f.controller.config, mode="layerwise"
