@@ -613,7 +613,352 @@ def prefill_overlap_lifetimes(args):
                 local_votes=len(votes) - before,
             )
     finally:
+        overlap.admission.close()
         protocol.close()
+
+
+def prefill_certificate_lifetimes(args):
+    """Real TP2: cached chunks, asymmetric bootstrap, lost notice, revoke/retire."""
+    import ast
+    import copy
+
+    import torch
+    from sglang_remote_attn import hooks
+    from sglang_remote_attn import prefill_admission as admission
+    from sglang_remote_attn import prefill_overlap as po
+    from sglang_remote_attn.pre_layerwise import Config, Controller, write_json
+    from sglang_remote_attn.retirement import CONTROL as RETIRE
+
+    controller = Controller.__new__(Controller)
+    controller.rank, controller.tp_size = args.rank, 2
+    controller.sources, controller.layers, controller.dsv41_layerwise = [], 2, True
+    controller.config = Config(
+        "layerwise", Path(args.output).with_suffix(".certificates"), 1, drain_timeout=3
+    )
+    scheduler = controller.scheduler = SimpleNamespace(
+        attn_tp_cpu_group=dist.group.WORLD, _pre_layerwise=controller
+    )
+    overlap = controller.prefill_overlap = po.PrefillOverlap(controller)
+    manager = SimpleNamespace(
+        transfer_infos={}, decode_kv_args_table={}, _dsv41_p_overlap=overlap
+    )
+    old_registration = SimpleNamespace(dst_kv_ptrs=[11, 21], dst_kv_item_len=8)
+    manager.decode_kv_args_table["peer:1"] = old_registration
+    peer = SimpleNamespace(mooncake_session_id="peer:1", is_dummy=False)
+    tasks, frees, aborts, votes = [], [], [], []
+    original_reduce = dist.all_reduce
+    events = []
+
+    class Event:
+        def __init__(self):
+            self.done = True
+            events.append(self)
+
+        def record(self, stream):
+            pass
+
+        def query(self):
+            return self.done
+
+    def counted(tensor, *a, **kw):
+        votes.append(tensor.numel())
+        return original_reduce(tensor, *a, **kw)
+
+    def make_req(room, pending=False):
+        req = SimpleNamespace(
+            rid=str(room),
+            bootstrap_room=room,
+            cache_request_handle=SimpleNamespace(attempt_id=0),
+            retraction_count=0,
+            kv=SimpleNamespace(req_pool_idx=room),
+            start_send_idx=0,
+            extend_end=8,
+            extend_len=8,
+            pending_bootstrap=pending,
+            origin_input_ids=list(range(1025)),
+            return_logprob=False,
+        )
+        req.disagg_kv_sender = SimpleNamespace(
+            kv_mgr=manager, poll=lambda: 4, curr_idx=0
+        )
+
+        def abort():
+            assert manager.decode_kv_args_table["peer:1"] is old_registration
+            aborts.append(room)
+
+        req.disagg_kv_sender.abort = abort
+        manager.transfer_infos[room] = {"peer:1": copy.copy(peer)}
+        root = controller.config.directory / str(room) / str(args.rank)
+        offer = dict(generation=f"{room}-rank-{args.rank}", prefix_len=1025)
+        write_json(root / "offer.json", offer)
+        req.offer = (root, offer)
+        return req
+
+    def candidates(batch, **kwargs):
+        return [
+            (req, req.disagg_kv_sender, *req.offer, ((peer, old_registration),), {})
+            if not req.pending_bootstrap
+            else None
+            for req in batch.reqs
+        ]
+
+    controller.candidates = candidates
+    controller.prepare = lambda *a, **kw: []
+    batch = SimpleNamespace(
+        reqs=[],
+        forward_mode=SimpleNamespace(
+            is_extend=lambda: True,
+            is_prebuilt=lambda: False,
+            is_split_prefill=lambda: False,
+            is_mixed=lambda: False,
+        ),
+        is_prefill_only=False,
+        return_hidden_states=False,
+        input_embeds=None,
+        replace_embeds=None,
+    )
+    batch.copy = lambda: copy.copy(batch)
+
+    def add(manager, room, indices, span, last, **kwargs):
+        tasks.append((room, kwargs["on_complete"]))
+
+    def send(scheduler, req, *, last_chunk, end_idx=None):
+        po.track_transfer(add, manager, req.bootstrap_room, [], slice(0, 0), last_chunk)
+        req.start_send_idx = req.extend_end
+        req.disagg_kv_sender.curr_idx = req.start_send_idx // 8
+
+    scheduler.send_kv_chunk = lambda req, **kw: overlap.send_chunk(
+        send, scheduler, req, end_idx=kw.pop("end_idx", None), **kw
+    )
+
+    def launch(scheduler, batch):
+        overlap.forward(lambda *a: None, None, batch)
+        return SimpleNamespace(delay_sample_func=None, copy_done=Event())
+
+    def run(reqs):
+        batch.reqs = reqs
+        result = overlap.run_batch(launch, scheduler, batch)
+        po.after_result(lambda *a: None, scheduler, batch, result)
+        return result
+
+    def receive(payload, original=lambda *a: None):
+        hooks._process_requests(original, scheduler, payload)
+
+    def pump():
+        overlap.poll()
+        dist.barrier()
+        values = [overlap.inject([]) if args.rank == 0 else None]
+        dist.broadcast_object_list(values, src=0)
+        receive(values[0])
+        return values[0]
+
+    def complete(room=None):
+        for task in list(tasks):
+            if room is None or task[0] == room:
+                task[1]()
+                tasks.remove(task)
+
+    def freed(req):
+        lease = req._dsv41_p_lease
+
+        def release():
+            assert not lease.ledger.pending and lease.gpu_ready()
+            frees.append(req.bootstrap_room)
+
+        overlap.defer_release(req, release)
+
+    # Real native abort metadata function; only the finish-reason class is a boundary.
+    root = Path(__file__).resolve().parents[3]
+    tree = ast.parse((root / "python/sglang/srt/disaggregation/utils.py").read_text())
+    node = next(n for n in tree.body if getattr(n, "name", None) == "prepare_abort")
+    ns = {}
+    exec(
+        compile(
+            ast.fix_missing_locations(
+                ast.Module(
+                    body=[
+                        ast.ImportFrom(
+                            module="__future__",
+                            names=[ast.alias(name="annotations")],
+                            level=0,
+                        ),
+                        node,
+                    ],
+                    type_ignores=[],
+                )
+            ),
+            "<native-prepare-abort>",
+            "exec",
+        ),
+        ns,
+    )
+    modules = {
+        "sglang.srt.disaggregation.utils": SimpleNamespace(
+            prepare_abort=ns["prepare_abort"]
+        ),
+        "sglang.srt.managers.schedule_batch": SimpleNamespace(
+            FINISH_ABORT=lambda message, status: SimpleNamespace(message=message)
+        ),
+        "sglang.srt.disaggregation.base.conn": SimpleNamespace(
+            KVPoll=SimpleNamespace(Success=4, Failed=0)
+        ),
+    }
+    lost = [False]
+    actual_send = overlap.admission.mailbox.send
+
+    def lose_first(notice):
+        if args.rank == 1 and not lost[0]:
+            lost[0] = True
+            return (
+                True  # accepted by send boundary but deliberately lost before receive
+            )
+        return actual_send(notice)
+
+    overlap.admission.mailbox.send = lose_first
+    try:
+        with (
+            patch.dict(sys.modules, modules),
+            patch.object(torch.cuda, "Event", Event),
+            patch.object(torch.cuda, "current_stream", lambda: None),
+            patch.object(dist, "all_reduce", counted),
+        ):
+            a = make_req(101)
+            run([a])
+            freed(a)
+            pump()
+            pump()  # ACK loss must resend, without a revalidation collective
+            assert a._dsv41_p_certificate.acked >= 1 or args.rank == 0
+            before = len(votes)
+            for end in range(16, 520, 8):
+                a.extend_end = end
+                run([a])
+                pump()
+            stable_votes = len(votes) - before
+            assert stable_votes == 0
+            b = make_req(102, pending=True)
+            a.extend_end += 8
+            run([a, b])
+            before = len(votes)
+            for _ in range(4):
+                run([a, b])
+                pump()
+            assert len(votes) == before
+            if args.rank == 0:
+                b.pending_bootstrap = False
+            pump()
+            assert len(votes) == before  # one ready shard cannot activate
+            b.pending_bootstrap = False
+            pump()
+            assert b._dsv41_p_certificate.active
+            run([b])
+            freed(b)
+            c = make_req(103)
+            c.extend_end = len(c.origin_input_ids)
+            run([c])
+            scheduler.send_kv_chunk(c, last_chunk=True)
+            freed(c)
+            complete(103)
+            overlap.poll()
+            dist.barrier()
+            saved = [overlap.inject([]) if args.rank == 0 else None]
+            dist.broadcast_object_list(saved, src=0)
+            assert any(RETIRE in item for item in saved[0])
+            # While retirement is in flight, a registration replacement may
+            # notify, but cannot issue a second unordered collective command.
+            replacement = SimpleNamespace(dst_kv_ptrs=[31, 41], dst_kv_item_len=8)
+            if args.rank == 1:
+                guard = overlap.admission.guard(manager)
+                guard.publish(
+                    "peer:1",
+                    replacement,
+                    lambda: manager.decode_kv_args_table.__setitem__(
+                        "peer:1", replacement
+                    ),
+                )
+            payload = pump()
+            assert not any(
+                admission.CONTROL in item and item[admission.CONTROL].get("command")
+                for item in payload or []
+            )
+            # A native cancellation in the same intake consumes the older
+            # retirement before its own drain, on both TP ranks.
+            for req in (a, b):
+                req._dsv41_p_lease.plans[-1].forward_done.done = False
+
+            def finish():
+                for event in events:
+                    event.done = True
+                complete()
+
+            timer = threading.Timer(0.02 + args.rank * 0.03, finish)
+            timer.start()
+            try:
+                receive(
+                    saved[0],
+                    lambda *unused: po.before_mutation(
+                        lambda scheduler, req: req.disagg_kv_sender.abort(),
+                        scheduler,
+                        a,
+                    ),
+                )
+            finally:
+                timer.join()
+            assert frees == [103, 101], (frees, votes)
+            pump()
+            assert aborts == [101, 102]
+            assert frees == [103, 101, 102]
+            assert b.finished_reason.message == "PD admission qualification changed"
+            assert not overlap.leases and not overlap.admission.records
+            assert not overlap.admission.guard(manager).pins
+            assert manager.decode_kv_args_table["peer:1"] is (
+                replacement if args.rank == 1 else old_registration
+            )
+            before = len(votes)
+            for _ in range(16):
+                pump()
+            assert len(votes) == before
+            empty_votes = len(votes) - before
+            d = make_req(104, pending=True)
+            run([d])
+            d.pending_bootstrap = False
+            cert = d._dsv41_p_certificate
+            envelope = dict(
+                epoch=overlap.admission.epoch,
+                acks=[],
+                command=dict(
+                    epoch=overlap.admission.epoch,
+                    seq=overlap.admission.last_seq + 1,
+                    entries=[
+                        dict(key=list(cert.key), version=cert.version, revoke=False)
+                    ],
+                ),
+            )
+            if args.rank == 1:
+                cert.version += (
+                    1  # corrupted/stale local state must vote, never return early
+                )
+            rejected = False
+            try:
+                receive([{admission.CONTROL: envelope}])
+            except RuntimeError as exc:
+                rejected = "validation failed" in str(exc)
+            assert rejected and not cert.active
+            return dict(
+                votes=votes,
+                stable_chunks=63,
+                stable_votes=stable_votes,
+                frees=frees,
+                aborts=aborts,
+                admission_checks=overlap.admission.checks,
+                revalidations=overlap.admission.revalidations,
+                revocations=overlap.admission.revocations,
+                ack_loss_recovered=True,
+                stale_version_rejected=True,
+                empty_votes=empty_votes,
+            )
+    finally:
+        overlap.admission.close()
+        overlap.retirement.close()
 
 
 def main():
@@ -826,6 +1171,7 @@ def main():
                 routing.append(row)
         overlap_lifetimes = decode_overlap_lifetimes(args)
         p_overlap = prefill_overlap_lifetimes(args)
+        p_certificates = prefill_certificate_lifetimes(args)
         Path(args.output).write_text(
             json.dumps(
                 {
@@ -838,6 +1184,7 @@ def main():
                     "leases": leases,
                     "d_overlap": overlap_lifetimes,
                     "p_overlap": p_overlap,
+                    "p_certificates": p_certificates,
                     "segmented_startup": startup,
                     "segmented_routing": routing,
                 }

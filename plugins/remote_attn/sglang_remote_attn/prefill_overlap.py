@@ -158,6 +158,7 @@ class SourceLease:
             plan.indices_refs.clear()
         self.plans.clear()
         self.closed = True
+        self.overlap.admission.retired(req)
 
 
 class SourceOwner:
@@ -181,6 +182,9 @@ class PrefillOverlap:
         self.plans = {}
         self.sequence = self.admissions = 0
         self.retirement = Retirement(SourceOwner(self))
+        from .prefill_admission import Admission
+
+        self.admission = Admission(self)
         logger.info(
             "[dsv41-p-overlap] enabled: native two-forward loop, launch-owned plans"
         )
@@ -192,8 +196,8 @@ class PrefillOverlap:
     def run_batch(self, original, scheduler, batch, *args, **kwargs):
         if not batch.forward_mode.is_extend() or batch.forward_mode.is_prebuilt():
             return original(scheduler, batch, *args, **kwargs)
-        candidates = self.controller.candidates(batch, allow_middle=True)
-        accepted = self.controller.agree([int(c is not None) for c in candidates])
+        self.finalize_control()
+        candidates, accepted = self.admission.select(batch)
         if not any(accepted) and not any(
             getattr(req, "_dsv41_p_lease", None) is not None for req in batch.reqs
         ):
@@ -332,7 +336,29 @@ class PrefillOverlap:
     def poll(self):
         # No all_reduce, no mailbox polling on a stable empty engine.
         self.retirement.observe()
+        self.admission.observe()
         self.reap_plans()
+
+    def inject(self, requests):
+        from .prefill_admission import CONTROL
+
+        retirement = self.retirement
+        envelope = self.admission.proposal(
+            allow_command=(retirement.inflight is None and retirement.pending is None)
+        )
+        if (
+            (envelope is None or envelope.get("command") is None)
+            and self.admission.inflight is None
+            and self.admission.pending is None
+        ):
+            requests = retirement.inject(requests)
+        if envelope is not None:
+            requests = [*(requests or []), {CONTROL: envelope}]
+        return requests
+
+    def finalize_control(self, *, wait=False):
+        self.admission.finalize()
+        self.retirement.finalize(wait=wait)
 
     def reap_plans(self):
         for seq, plan in list(self.plans.items()):
@@ -350,10 +376,16 @@ class PrefillOverlap:
                     self.plans.pop(seq, None)
 
     def drain(self, req=None):
+        self.finalize_control(wait=True)
         selected = [t for t in self.leases if req is None or t.chunk.req is req]
         for lease in selected:
             lease.cancelling = True
-        self.retirement.drain(selected[0] if req is not None and selected else None)
+        if req is None:
+            self.retirement.drain()
+        elif selected:
+            self.retirement.drain(selected[0])
+        if req is not None:
+            self.admission.retired(req)
         self.reap_plans()
 
     def close(self):
@@ -361,6 +393,7 @@ class PrefillOverlap:
             self.drain()
         finally:
             self.retirement.close()
+            self.admission.close()
 
 
 class CompletedProof:
@@ -376,9 +409,10 @@ def install(controller):
         return None
     overlap = PrefillOverlap(controller)
     controller.scheduler.request_receiver = wrap_receiver(
-        controller.scheduler.request_receiver, overlap.retirement
+        controller.scheduler.request_receiver, overlap
     )
     manager = controller.scheduler.disagg_prefill_bootstrap_queue.kv_manager
+    overlap.admission.guard(manager)
     manager._dsv41_p_overlap = overlap
     controller.scheduler.tp_worker.model_runner.model.model._dsv41_p_overlap = overlap
     return overlap
@@ -495,7 +529,7 @@ def after_sample(original, scheduler, *args, **kwargs):
         return decode_after_result(original, scheduler, *args, **kwargs)
     value = original(scheduler, *args, **kwargs)
     overlap.poll()
-    overlap.retirement.finalize()
+    overlap.finalize_control()
     return value
 
 
@@ -503,6 +537,10 @@ def before_mutation(original, scheduler, req, *args, **kwargs):
     lease = getattr(req, "_dsv41_p_lease", None)
     if lease is not None:
         lease.overlap.drain(req)
+    else:
+        cert = getattr(req, "_dsv41_p_certificate", None)
+        if cert is not None:
+            cert.admission.overlap.drain(req)
     return original(scheduler, req, *args, **kwargs)
 
 

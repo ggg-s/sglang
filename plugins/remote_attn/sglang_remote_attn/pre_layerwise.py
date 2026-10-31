@@ -1146,6 +1146,9 @@ def defer_release(req, release, *, checkpoint=None):
     lease = getattr(req, "_dsv41_p_lease", None)
     if lease is not None:
         return lease.overlap.defer_release(req, release)
+    cert = getattr(req, "_dsv41_p_certificate", None)
+    if cert is not None:
+        cert.admission.retired(req)
     source = getattr(req, "_pre_layerwise_source", None)
     if source is not None and (
         source.error is not None

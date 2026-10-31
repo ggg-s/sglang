@@ -170,13 +170,22 @@ def _process_requests(original, scheduler, recv_reqs):
     from .retirement import split_controls
 
     requests, intents = split_controls(recv_reqs)
+    from .prefill_admission import split_controls as split_admissions
+
+    requests, admissions = split_admissions(requests)
     requests, controls = runtime.split_handoff_controls(requests)
     controller = getattr(scheduler, "_pre_layerwise", None)
     p_overlap = getattr(controller, "prefill_overlap", None)
     if p_overlap is not None:
+        for envelope in admissions:
+            p_overlap.admission.arm(envelope)
         for intent in intents:
             p_overlap.retirement.arm(intent)
+    elif admissions:
+        raise RuntimeError("P admission command requires DSV4.1 P overlap")
     result = original(scheduler, requests)
+    if p_overlap is not None:
+        p_overlap.finalize_control()
     for intent in intents:
         if p_overlap is not None:
             continue
@@ -269,6 +278,10 @@ def _reset_retracted(original, req):
     lease = getattr(req, "_dsv41_p_lease", None)
     if lease is not None:
         lease.overlap.drain(req)
+    else:
+        cert = getattr(req, "_dsv41_p_certificate", None)
+        if cert is not None:
+            cert.admission.overlap.drain(req)
     result = original(req)
     req.handoff_prefix_indices = None
     req._handoff_prefix_indices = None
@@ -427,6 +440,19 @@ def _transfer(original, manager, mooncake_session_id, transfer_blocks, **kwargs)
 
 
 def _publish_peer(original, manager, mooncake_session_id, decode_kv_args):
+    guard = getattr(manager, "_dsv41_admission_guard", None)
+    if guard is not None:
+        return guard.publish(
+            mooncake_session_id,
+            decode_kv_args,
+            lambda: _publish_peer_now(
+                original, manager, mooncake_session_id, decode_kv_args
+            ),
+        )
+    return _publish_peer_now(original, manager, mooncake_session_id, decode_kv_args)
+
+
+def _publish_peer_now(original, manager, mooncake_session_id, decode_kv_args):
     # Coordinate registration and sends on the same process-wide mutex.
     # Preserve upstream's validation, blacklist and publication ordering.
     with manager._remote_attn_send_lock:

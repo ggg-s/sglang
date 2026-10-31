@@ -129,8 +129,8 @@ SMG 使用原有 PD router 命令，不加载插件环境。先通过原生 `/he
   不能用 Failed 状态或仅记录在执行任务的计数器证明结束。
 - GPU/IO 线程只更新本地事件/账本；scheduler 发就绪状态边沿通知。rank 0 经原生
   request broadcast 注入有序命令，所有 TP rank 才进入同形状最终 all_reduce，并一起释放。
-  空闲或状态未变化时没有新增退休 collective；启动校验、批次接纳投票和原生
-  continuous-input-polling 自身的 collective 保留。
+  空闲或状态未变化时没有新增退休 collective；接管投票也改为下面的 TP 证书，
+  原生 continuous-input-polling 自身的 collective 保留。
 - 取消、optimistic retry、retraction 和 reset 在原生 abort/备份/释放/换 attempt 前
   进入同一有序 drain，先消费先前 intent，再等每个 rank 的 GPU/IO 证明。取消时
   forward event 已覆盖所有源 KV 读者，延迟采样仅读 logits，无需强行提前采样，
@@ -140,9 +140,47 @@ SMG 使用原有 PD router 命令，不加载插件环境。先通过原生 `/he
 SMG、SGL scheduler loop、future map、采样和原生结果队列没有修改；D 的原生
 overlap/full graph 路径保持不变。P radix cache 和 DSpark 仍关闭。
 
+## TP 接管证书与资格变化
+
+P overlap 不再为每个 chunk batch 重新执行接管 all_reduce。每个请求 attempt 的
+证书只由 TP 一致的事件更新，和保护实际 GPU/IO 的 SourceLease 分开：
+
+- 首次检查：按原生共享 batch 的新请求顺序合并一次 CPU all_reduce。接受与否
+  都缓存。证书身份包含 rid、room、cache attempt、retraction count 和 TP 一致的
+  birth ordinal，防止复用 rid/room 时旧通知误命中新请求。
+- 稳定 middle→final：复用同一证书和已验证 manifest/peer 快照，继续建立每批
+  独立 plan；没有逐 chunk 接管投票，也不逐 chunk 重建完整 manifest。
+- 尚未 bootstrap 的否定结果不会逐 chunk 重投。bootstrap/offer/注册状态变化
+  产生本地通知；rank 0 收齐 ready 后经原生请求广播发有序重确认命令。每 rank
+  都按命令列出的固定顺序重新验证并投票，不能因本地不合格而跳过 collective。
+- 通知有 epoch、资格版本和 revision；丢失时重传至收到原生广播 ACK，ACK 自身
+  不产生新的 collective。相同资格版本/状态不反复投票。
+- 注册表在服务开始前装上插件 guard。已接管期间固定 room 的 TransferInfo 和
+  session 注册；新的 peer 注册及 room 更新先延迟，发送 worker 继续读取旧视图。
+  新证书不能越过待应用的冲突注册更新。
+- offer generation、session/布局、bootstrap 等资格失效时，任何 rank 都只发
+  撤销通知，不独自切原生/graph。所有 rank 收到同一撤销命令后先投票，再完成
+  已有 GPU/IO 的 TP drain，使用旧注册通知原生 abort，最后应用延迟注册。
+  已经发送部分 KV 的 attempt 会终止，不能拿剩余 KV 拼到新的 destination。
+- 接管和退休共用插件调度入口，最多一条有 collective 的异步命令在途。原生
+  取消、retry/retraction/reset 先消费已有命令再 drain；没有租约的否定请求不会
+  意外 drain 其他请求。资格版本不一致时全部 rank 共同拒绝，保留资源。
+
+| 边界 | 新增接管同步 |
+|---|---|
+| 新 attempt 首次检查 | 一次，可合并同批多个新请求 |
+| 稳定 middle→final / 未变化的否定证书 | 0 |
+| 有序重确认或撤销 | 每条命令一次；撤销另有既有 TP drain 共识 |
+| 空闲或等待 GPU/IO | 0 |
+
+仍有本地状态检查、event query、入队账本和通知处理；这里的 0 指新增 TP 接管
+collective，不代表零 CPU 开销，也不删除模型计算/原生 scheduler 的 collective。
+SMG/SGL 核心、原生采样、future map 和 optimistic/chunk/batch 配置未修改。
+
 ## 路径确认与本地证据
 
-启用 P overlap 时，先确认 P 启动日志含 `[dsv41-p-overlap] enabled`。
+启用 P overlap 时，先确认 P 启动日志含 `[dsv41-p-overlap] enabled` 和
+`[dsv41-p-admission] enabled`。
 一次实际参与适配的请求应有：
 
 1. P 日志 `[dsv41-layerwise] batch=... requests=... group_size=... final_chunk_tokens=...`。
@@ -162,13 +200,15 @@ overlap/full graph 路径保持不变。P radix cache 和 DSpark 仍关闭。
 非整页 final chunk、奇偶 carry、GPU event 未完成不得写入/释放、布局不匹配和
 TP 不同意时游标不变、P eager / D native graph、错误时保留源分配。
 
-当前共有 14 项 DSV4.1 专项测试，完整 112 项本地插件测试通过，包含真实双进程
-Gloo；源码预检覆盖 34 个 hook、80 个核心接口。新增覆盖两批 final 交错、同请求
+当前共有 19 项 DSV4.1 专项测试，完整 117 项本地插件测试通过，包含真实双进程
+Gloo；源码预检覆盖 34 个 hook、83 个核心接口。新增覆盖两批 final 交错、同请求
 middle→final、队列任务继承、延迟采样、失败保留、重试/retraction/reset 栅栏、长
 prompt 短尾块策略。TP2 用例验证不同 rank 的 generation 和 GPU 就绪时序，
-最终正常/取消各一次共识，稳定轮询不产生额外退休投票。
+最终正常/取消各一次共识，稳定轮询不产生额外退休投票。新增证书 TP2 用例
+验证连续 63 个稳定 chunk 接管投票为 0，bootstrap 重确认、通知丢失重传、注册
+撤销/退休/取消交错及单 rank 资格版本错误均保持一致的 collective 调用序列。
 
-RTX4060 小型真实 CUDA 验证及边界见 [验证记录](validation/dsv41-p-overlap-4060.md)。
+RTX4060 小型真实 CUDA 验证及边界见 [证书验证记录](validation/dsv41-p-certificates-4060.md)。
 未加载 DSV4.1 模型，尚未测 token/logprob 一致性或收益。模型 GPU 验收需对
 插件 off/layerwise 使用同一 revision 和原生 optimistic/chunk 配置，比较 token/
 logprob、TTFT、P 完成到 D 接管间隙、吞吐和资源回收；再覆盖 bootstrap 延迟、

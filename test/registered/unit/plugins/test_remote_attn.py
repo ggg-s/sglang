@@ -3505,6 +3505,15 @@ class TestRemoteAttn(CustomTestCase):
             rows[0]["p_overlap"],
             dict(votes=[5, 5], freed=[1, 2], commits=2, registered=0, local_votes=0),
         )
+        self.assertEqual(rows[0]["p_certificates"], rows[1]["p_certificates"])
+        self.assertEqual(
+            rows[0]["p_certificates"]["votes"], [2, 2, 2, 2, 5, 5, 2, 5, 2, 2]
+        )
+        self.assertEqual(rows[0]["p_certificates"]["stable_votes"], 0)
+        self.assertEqual(rows[0]["p_certificates"]["empty_votes"], 0)
+        self.assertEqual(rows[0]["p_certificates"]["frees"], [103, 101, 102])
+        self.assertEqual(rows[0]["p_certificates"]["revocations"], 1)
+        self.assertTrue(rows[0]["p_certificates"]["ack_loss_recovered"])
         self.assertTrue(rows[0]["leases"]["existing_state_fallback"])
         self.assertGreater(rows[0]["leases"]["boundary_reductions"], 0)
         self.assertEqual(rows[0]["leases"]["freed"], [0, 1, 2])
@@ -5609,6 +5618,202 @@ class TestRemoteAttn(CustomTestCase):
         f.runner.model.model._dsv41_p_overlap = f.overlap
         return f
 
+    def test_dsv41_certificate_stable_chunks_and_final_reuse_one_tp_decision(self):
+        f = self._dsv41_overlap_fixture()
+        votes = []
+        original = f.controller.agree
+        f.controller.agree = lambda flags: votes.append(list(flags)) or original(flags)
+        # SourceOwner was constructed before the counter; count admission only.
+        with patch.dict(sys.modules, f.modules):
+            for end in (8, 16, 24, 32, 33):
+                f.req.extend_end = end
+                candidates, accepted = f.overlap.admission.select(f.batch)
+                self.assertEqual(accepted, [1])
+                self.assertIs(candidates[0][0], f.req)
+                if end != 33:
+                    f.req.start_send_idx, f.sender.curr_idx = end, end // 8
+                f.overlap.poll()
+                # ACK-only traffic must never become a revalidation vote.
+                for message in f.overlap.inject([]) or []:
+                    from sglang_remote_attn.prefill_admission import CONTROL
+
+                    if CONTROL in message:
+                        f.overlap.admission.arm(message[CONTROL])
+                f.overlap.finalize_control()
+            self.assertEqual(votes, [[1, 1]])
+            self.assertEqual(f.overlap.admission.checks, 1)
+            self.assertEqual(f.overlap.admission.revalidations, 0)
+            self.assertFalse(hasattr(f.req._dsv41_p_certificate.batch, "input_ids"))
+            # TP-symmetric native retry/reset clears the old attempt's pins.
+            self.hooks._reset_retracted(
+                lambda req: setattr(req, "retraction_count", 1), f.req
+            )
+            f.req.start_send_idx, f.sender.curr_idx = 0, 0
+            f.overlap.admission.select(f.batch)
+            self.assertEqual(len(votes), 2)
+            self.assertEqual(len(f.overlap.admission.records), 1)
+
+    def test_dsv41_certificate_negative_cache_revalidates_only_after_bootstrap_edge(
+        self,
+    ):
+        f = self._dsv41_overlap_fixture()
+        f.req.pending_bootstrap = True
+        votes = []
+        original = f.controller.agree
+        f.controller.agree = lambda flags: votes.append(list(flags)) or original(flags)
+        with patch.dict(sys.modules, f.modules):
+            for _ in range(8):
+                self.assertEqual(f.overlap.admission.select(f.batch)[1], [0])
+                f.overlap.poll()
+                self.hooks._process_requests(
+                    lambda *a: None, f.scheduler, f.overlap.inject([])
+                )
+            self.assertEqual(votes, [[1, 0]])
+            f.req.pending_bootstrap = False
+            f.overlap.poll()
+            command = f.overlap.inject([])
+            self.assertIsNotNone(command)
+            self.hooks._process_requests(lambda *a: None, f.scheduler, command)
+            self.assertEqual(f.overlap.admission.select(f.batch)[1], [1])
+            for _ in range(16):
+                f.overlap.poll()
+                self.hooks._process_requests(
+                    lambda *a: None, f.scheduler, f.overlap.inject([])
+                )
+            self.assertEqual(len(votes), 2)
+            self.assertEqual(f.overlap.admission.revalidations, 1)
+
+    def test_dsv41_certificate_old_notice_cannot_revoke_reused_rid_and_room(self):
+        f = self._dsv41_overlap_fixture()
+        with patch.dict(sys.modules, f.modules):
+            f.overlap.admission.select(f.batch)
+            f.overlap.admission.observe()
+            old = f.req._dsv41_p_certificate
+            delayed = dict(old.notice, revoke=True, revision=old.revision + 1)
+            f.overlap.admission.retired(f.req)
+            fresh = copy.copy(f.req)
+            fresh._dsv41_p_certificate = None
+            f.batch.reqs = [fresh]
+            f.overlap.admission.select(f.batch)
+            new = fresh._dsv41_p_certificate
+            self.assertEqual(old.logical_key, new.logical_key)
+            self.assertNotEqual(old.key, new.key)
+            f.overlap.admission.accept(delayed)
+            self.assertIsNone(f.overlap.admission.proposal(allow_command=True))
+            self.assertTrue(new.active)
+
+    def test_dsv41_negative_certificate_reset_does_not_drain_another_request(self):
+        f = self._dsv41_overlap_fixture()
+        with patch.dict(sys.modules, f.modules):
+            f.overlap.admission.select(f.batch)
+            chunk = f.po.Chunk(f.req, f.sender, None, 0, 0, 16, False)
+            active = f.po.SourceLease(f.overlap, chunk, 1, "attempt-1")
+            active.plans.append(f.po.LaunchPlan(1, f.batch, (chunk,), [], []))
+            f.req._dsv41_p_lease = active
+            f.overlap.leases.append(active)
+            f.overlap.by_room[7] = active
+            f.overlap.retirement.register(active)
+            other = copy.copy(f.req)
+            other._dsv41_p_lease = other._dsv41_p_certificate = None
+            other.pending_bootstrap = True
+            other.rid, other.bootstrap_room = "waiting", 8
+            f.batch.reqs = [other]
+            self.assertEqual(f.overlap.admission.select(f.batch)[1], [0])
+            mutated = []
+            f.po.before_mutation(lambda *a: mutated.append(True), f.scheduler, other)
+            self.assertEqual(mutated, [True])
+            self.assertFalse(active.closed)
+            self.assertFalse(active.cancelling)
+            self.assertEqual(f.overlap.retirement.final_votes, 0)
+            self.assertTrue(other._dsv41_p_certificate.done)
+
+    def test_dsv41_certificate_pins_native_registration_until_ordered_gpu_io_revoke(
+        self,
+    ):
+        f = self._dsv41_overlap_fixture()
+        f.req.return_logprob = False
+        native_abort = _source_function("disaggregation/utils.py", "prepare_abort")
+        abort_reason = _source_class("managers/schedule_batch.py", "FINISH_ABORT")
+        f.modules["sglang.srt.disaggregation.utils"].prepare_abort = native_abort
+        f.modules["sglang.srt.managers.schedule_batch"] = SimpleNamespace(
+            FINISH_ABORT=abort_reason
+        )
+        f.manager._remote_attn_send_lock = threading.Lock()
+        f.manager.engine = SimpleNamespace(send_probe=lambda *a: 0)
+        native_publish = _source_class(
+            "disaggregation/mooncake/conn.py",
+            "MooncakeKVManager",
+            {"_publish_peer_registration"},
+        )._publish_peer_registration
+        f.manager.session_lock = threading.Lock()
+        f.manager._validate_peer_state_layout = lambda *a: (True, None)
+        f.manager._unblacklist_session = lambda *a: None
+        f.manager.state_layout_rejections = {}
+        f.manager.state_strides_validated = set()
+        trace = []
+        with patch.dict(sys.modules, f.modules):
+            f.overlap.admission.select(f.batch)
+            cert = f.req._dsv41_p_certificate
+            chunk = f.po.Chunk(f.req, f.sender, None, 0, 0, 16, False)
+            lease = f.po.SourceLease(f.overlap, chunk, 1, "attempt-1")
+            event = SimpleNamespace(query=lambda: False)
+            plan = f.po.LaunchPlan(1, f.batch, (chunk,), [], [])
+            plan.forward_done = event
+            plan.proof.result = SimpleNamespace(
+                delay_sample_func=lambda: None, copy_done=None
+            )
+            lease.plans.append(plan)
+            marker = object()
+            lease.ledger.pending.add(marker)
+            f.req._dsv41_p_lease = lease
+            f.overlap.leases.append(lease)
+            f.overlap.by_room[7] = lease
+            f.overlap.retirement.register(lease)
+            old = f.manager.decode_kv_args_table["peer:1"]
+            new = copy.copy(old)
+            new.dst_kv_ptrs = [p + 8 for p in old.dst_kv_ptrs]
+            self.hooks._publish_peer(native_publish, f.manager, "peer:1", new)
+            self.assertIs(f.manager.decode_kv_args_table["peer:1"], old)
+            peer = f.manager.transfer_infos[7]["peer:1"]
+            replacement = copy.copy(peer)
+            replacement.is_dummy = True
+            f.manager.transfer_infos[7]["peer:1"] = replacement
+            self.assertIs(f.manager.transfer_infos[7]["peer:1"], peer)
+
+            def abort():
+                self.assertTrue(lease.closed)
+                self.assertFalse(lease.ledger.pending)
+                self.assertIs(f.manager.decode_kv_args_table["peer:1"], old)
+                trace.append("abort-old-registration")
+
+            f.sender.abort = abort
+            f.scheduler.chunked_req = f.req
+
+            def finish_io():
+                event.query = lambda: True
+                with lease.ledger.lock:
+                    lease.ledger.pending.remove(marker)
+
+            timer = threading.Timer(0.04, finish_io)
+            timer.start()
+            try:
+                f.overlap.poll()
+                self.hooks._process_requests(
+                    lambda *a: None, f.scheduler, f.overlap.inject([])
+                )
+            finally:
+                timer.join()
+            self.assertEqual(trace, ["abort-old-registration"])
+            self.assertIs(f.manager.decode_kv_args_table["peer:1"], new)
+            self.assertIs(f.manager.transfer_infos[7]["peer:1"], replacement)
+            self.assertEqual(f.req.finished_reason.to_json()["type"], "abort")
+            self.assertIs(f.scheduler._pending_chunked_abort_req, f.req)
+            self.assertTrue(cert.done)
+            self.assertEqual(f.overlap.admission.revocations, 1)
+            self.assertFalse(f.overlap.leases)
+            self.assertFalse(f.overlap.admission.guards[id(f.manager)].pins)
+            self.assertEqual(f.overlap.admission.select(f.batch)[1], [0])
+
     def test_dsv41_overlap_interleaves_middle_final_and_other_batch_without_cursor_replay(
         self,
     ):
@@ -5652,6 +5857,7 @@ class TestRemoteAttn(CustomTestCase):
             self.assertEqual(f.tasks.qsize(), 1)
             # Launch another row before processing A, as the native overlap loop does.
             req_b = copy.copy(f.req)
+            req_b._dsv41_p_certificate = None
             req_b.kv = SimpleNamespace(req_pool_idx=1)
             req_b._dsv41_p_lease = None
             req_b.disagg_kv_sender = copy.copy(f.sender)

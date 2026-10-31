@@ -27,6 +27,11 @@ CORE_CALLS = {
         "staging_layer_ids": None,
     },
     MANAGER + "send_kvcache": {"kv_buffer_indices": None, "transfer_fn": None},
+    MANAGER + "_publish_peer_registration": {
+        "mooncake_session_id": inspect.Parameter.empty,
+        "decode_kv_args": inspect.Parameter.empty,
+    },
+    DISAGG + "utils.prepare_abort": {"status_code": None},
     MANAGER + "_send_kvcache_generic": {"transfer_fn": None, "force_flat": False},
     DISAGG + "prefill.SchedulerDisaggregationPrefillMixin.send_kv_chunk": {
         "last_chunk": False,
@@ -182,7 +187,7 @@ CORE_STATE = {
     ),
     "sglang.srt.managers.schedule_batch.Req.__init__": (
         "self",
-        ("cache_request_handle", "last_node", "lock"),
+        ("cache_request_handle", "last_node", "lock", "retraction_count"),
     ),
     "sglang.srt.mem_cache.unified_radix_cache.UnifiedRadixCache.__init__": (
         "self",
@@ -197,6 +202,10 @@ CORE_STATE = {
         ("_pool",),
     ),
     MANAGER + "__init__": ("self", ("_core_stager", "_host_staging_all")),
+    DISAGG + "common.conn.CommonKVManager.__init__": (
+        "self",
+        ("transfer_infos", "decode_kv_args_table"),
+    ),
     DISAGG + "common.conn.CommonKVReceiver.send_metadata": (
         "self",
         ("chunk_staging_layers",),

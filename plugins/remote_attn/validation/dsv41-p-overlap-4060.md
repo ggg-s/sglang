@@ -1,5 +1,8 @@
 # DSV4.1 P overlap：本地与 RTX4060 验证
 
+本页保留 `b891fd39d5` 的 P overlap 历史基线；最新 TP 证书验证见
+[新记录](dsv41-p-certificates-4060.md)。当前 probe 已扩展为证书用例，复现旧基线请 checkout 上述提交。
+
 验证日期：2026-10-31。只修改插件、预检、文档和测试，没有修改 SMG/SGL 核心。
 实现说明与原生启动命令见 [接入文档](../DSV41-LAYERWISE-ZH.md)。
 

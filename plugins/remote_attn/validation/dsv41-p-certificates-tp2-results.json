@@ -1,0 +1,68 @@
+{
+  "backend": "Gloo CPU",
+  "ranks": 2,
+  "results": [
+    {
+      "votes": [
+        2,
+        2,
+        2,
+        2,
+        5,
+        5,
+        2,
+        5,
+        2,
+        2
+      ],
+      "stable_chunks": 63,
+      "stable_votes": 0,
+      "frees": [
+        103,
+        101,
+        102
+      ],
+      "aborts": [
+        101,
+        102
+      ],
+      "admission_checks": 4,
+      "revalidations": 1,
+      "revocations": 1,
+      "ack_loss_recovered": true,
+      "stale_version_rejected": true,
+      "empty_votes": 0
+    },
+    {
+      "votes": [
+        2,
+        2,
+        2,
+        2,
+        5,
+        5,
+        2,
+        5,
+        2,
+        2
+      ],
+      "stable_chunks": 63,
+      "stable_votes": 0,
+      "frees": [
+        103,
+        101,
+        102
+      ],
+      "aborts": [
+        101,
+        102
+      ],
+      "admission_checks": 4,
+      "revalidations": 1,
+      "revocations": 1,
+      "ack_loss_recovered": true,
+      "stale_version_rejected": true,
+      "empty_votes": 0
+    }
+  ]
+}

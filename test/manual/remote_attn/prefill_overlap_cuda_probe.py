@@ -17,7 +17,7 @@ from unittest.mock import patch
 
 import torch
 from sglang_remote_attn import prefill_overlap as po
-from sglang_remote_attn.pre_layerwise import Config
+from sglang_remote_attn.pre_layerwise import Config, write_json
 
 
 def main():
@@ -52,7 +52,13 @@ def main():
     controller.agree = lambda flags: flags
     overlap = po.PrefillOverlap(controller)
     tasks = queue.Queue()
-    manager = SimpleNamespace(_dsv41_p_overlap=overlap)
+    registration = SimpleNamespace(dst_kv_ptrs=[11, 21], dst_kv_item_len=8)
+    peer = SimpleNamespace(mooncake_session_id="peer:1", is_dummy=False)
+    manager = SimpleNamespace(
+        _dsv41_p_overlap=overlap,
+        transfer_infos={},
+        decode_kv_args_table={"peer:1": registration},
+    )
     freed, observed, worker_errors = [], [], []
     storage = torch.zeros(64, device="cuda")
 
@@ -72,7 +78,7 @@ def main():
         )
 
     def request(room):
-        return SimpleNamespace(
+        request = SimpleNamespace(
             rid=str(room),
             bootstrap_room=room,
             kv=SimpleNamespace(req_pool_idx=room),
@@ -80,23 +86,45 @@ def main():
             start_send_idx=0,
             extend_end=16,
             origin_input_ids=list(range(33)),
-            disagg_kv_sender=SimpleNamespace(poll=lambda: "success"),
+            pending_bootstrap=False,
+            extend_len=16,
+            disagg_kv_sender=SimpleNamespace(
+                poll=lambda: "success", kv_mgr=manager, curr_idx=0
+            ),
         )
+        root = args.output.parent / str(room) / "0"
+        request.offer = (root, {"generation": str(room)})
+        write_json(root / "offer.json", request.offer[1])
+        manager.transfer_infos[room] = {"peer:1": peer}
+        request.disagg_kv_sender.abort = lambda: None
+        return request
 
     req = request(1)
     batch = SimpleNamespace(
         reqs=[req],
-        forward_mode=SimpleNamespace(is_extend=lambda: True, is_prebuilt=lambda: False),
+        forward_mode=SimpleNamespace(
+            is_extend=lambda: True,
+            is_prebuilt=lambda: False,
+            is_split_prefill=lambda: False,
+            is_mixed=lambda: False,
+        ),
+        is_prefill_only=False,
+        return_hidden_states=False,
+        input_embeds=None,
+        replace_embeds=None,
     )
     batch.copy = lambda: SimpleNamespace(reqs=list(batch.reqs))
     controller.candidates = lambda batch, **kw: [
-        (r, r.disagg_kv_sender, None, {"generation": str(r.bootstrap_room)})
+        (r, r.disagg_kv_sender, *r.offer, ((peer, registration),), {})
+        if not r.pending_bootstrap
+        else None
         for r in batch.reqs
     ]
     controller.prepare = lambda batch, **kw: []
 
     def native_send(scheduler, req, *, last_chunk, end_idx=None):
         req.start_send_idx = req.extend_end if end_idx is None else end_idx
+        req.disagg_kv_sender.curr_idx = req.start_send_idx // 8
         wait = getattr(req.disagg_kv_sender, "_early_send_wait_event", None)
         if last_chunk:
             wait = req._dsv41_p_lease.plans[-1].forward_done
@@ -142,7 +170,9 @@ def main():
             middle = overlap.run_batch(launch, scheduler, batch)
             lease = req._dsv41_p_lease
             req.extend_end = 33
+            checks_before_final = overlap.admission.checks
             final = overlap.run_batch(launch, scheduler, batch)
+            assert overlap.admission.checks == checks_before_final == 1
             assert middle._dsv41_p_plan is not final._dsv41_p_plan
             assert len(lease.plans) == 2
             po.after_result(
@@ -202,17 +232,80 @@ def main():
             torch.cuda.synchronize()
             assert storage.eq(777).all().item()
             assert all(all(value < 777 for value in row) for row in observed)
+            # A cached negative result waits for a bootstrap edge, then one
+            # ordered revalidation. Stable checks below perform no new vote.
+            third = request(3)
+            third.pending_bootstrap = True
+            batch.reqs = [third]
+            assert overlap.admission.select(batch)[1] == [0]
+            for _ in range(32):
+                assert overlap.admission.select(batch)[1] == [0]
+            third.pending_bootstrap = False
+
+            def controls():
+                from sglang_remote_attn.prefill_admission import CONTROL
+
+                overlap.poll()
+                for item in overlap.inject([]) or []:
+                    if CONTROL in item:
+                        overlap.admission.arm(item[CONTROL])
+                overlap.finalize_control()
+
+            controls()
+            assert overlap.admission.select(batch)[1] == [1]
+            storage.zero_()
+            torch.cuda.synchronize()
+            revoke_result = overlap.run_batch(launch, scheduler, batch)
+            lease = third._dsv41_p_lease
+            overlap.defer_release(third, lambda: freed.append("revoke"))
+            replacement = SimpleNamespace(dst_kv_ptrs=[31, 41], dst_kv_item_len=8)
+            guard = overlap.admission.guard(manager)
+            guard.publish(
+                "peer:1",
+                replacement,
+                lambda: manager.decode_kv_args_table.__setitem__("peer:1", replacement),
+            )
+            assert manager.decode_kv_args_table["peer:1"] is registration
+
+            def abort():
+                assert lease.closed and not lease.ledger.pending
+                assert manager.decode_kv_args_table["peer:1"] is registration
+
+            third.disagg_kv_sender.abort = abort
+            worker = threading.Thread(target=io_worker)
+            worker.start()
+            tasks.put(None)
+            with patch.dict(
+                sys.modules,
+                {
+                    "sglang.srt.disaggregation.utils": SimpleNamespace(
+                        prepare_abort=lambda req, message: setattr(
+                            req, "finished_reason", message
+                        )
+                    )
+                },
+            ):
+                controls()  # waits real GPU source readers + queued IO before unpin/abort
+            worker.join(6)
+            assert not worker.is_alive() and not worker_errors
+            assert manager.decode_kv_args_table["peer:1"] is replacement
+            assert freed == ["normal", "cancel", "revoke"]
+            assert overlap.admission.checks == 3
+            assert overlap.admission.revalidations == overlap.admission.revocations == 1
             votes = overlap.retirement.final_votes
             for _ in range(100):
                 overlap.poll()
-                overlap.retirement.inject([])
-            assert overlap.retirement.final_votes == votes == 2
-            for plan in overlap.plans.values():
-                # Native scheduler retains and later processes cancelled results.
-                if plan.proof.result is result:
-                    sampled(result)
+                overlap.inject([])
+            assert overlap.retirement.final_votes == votes == 3
+            for plan in list(overlap.plans.values()):
+                if plan.proof.result is result or plan.proof.result is revoke_result:
+                    sampled(plan.proof.result)
                     plan.processed = True
             overlap.poll()
+            storage.fill_(999)
+            torch.cuda.synchronize()
+            assert storage.eq(999).all().item()
+            assert not overlap.admission.guard(manager).pins
         plugin = Path(po.__file__).parent
         result = dict(
             device=torch.cuda.get_device_name(),
@@ -220,7 +313,11 @@ def main():
             cuda=torch.version.cuda,
             pending_indices_observed=pending_observed,
             pinned_indices_equal=True,
-            launch_plans=3,
+            launch_plans=4,
+            admission_checks=overlap.admission.checks,
+            revalidations=overlap.admission.revalidations,
+            revocations=overlap.admission.revocations,
+            stable_chunk_admission_votes=0,
             io_callbacks=len(observed),
             releases=freed,
             final_votes=votes,
@@ -240,6 +337,7 @@ def main():
         args.output.write_text(json.dumps(result, indent=2) + "\n")
         print(json.dumps({k: v for k, v in result.items() if k != "source_sha256"}))
     finally:
+        overlap.admission.close()
         overlap.retirement.close()
 
 
