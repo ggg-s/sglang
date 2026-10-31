@@ -1,5 +1,8 @@
 # 原生 SMG + 多 P × 多 D progressive
 
+Q/O/LSE 的 GPU 数据传输另见 [Mooncake GPU 通道](REMOTE-GPU-TRANSPORT-ZH.md)；
+本页的网络 journal 只同步控制与完成事实。
+
 支持同机或不同机的多个独立 P/D 实例，复用 SMG 选择的每请求 P/D 组合。每个实例内部
 仍为相同 TP、PP=DP=CP=1；TP ranks 位于同一主机。支持现有 Qwen3-8B 和 DSV4.1 路径，
 模型、KV layout、TP 和能力检查继续执行。单请求的前缀由一个 P 提供，不做多 P 分片。

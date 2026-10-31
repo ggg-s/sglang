@@ -131,6 +131,7 @@ def progressive_graph_leases(args, context):
             ("HANDOFF_PD_NETWORK", "1"),
             ("HANDOFF_INSTANCE_ID", "different-instance"),
             ("HANDOFF_NETWORK_BIND_HOST", "127.0.0.2"),
+            ("HANDOFF_REMOTE_GPU_TRANSFER", "1"),
         ):
             with patch.dict(
                 os.environ,
@@ -145,7 +146,7 @@ def progressive_graph_leases(args, context):
                     mesh_rejected.append(False)
                 except RuntimeError:
                     mesh_rejected.append(True)
-        assert mesh_rejected == [True] * 3
+        assert mesh_rejected == [True] * 4
         previous_config = controller.config
         controller.config = Config("remote", Path(args.rendezvous).parent / "mesh-tp")
         scheduler.disaggregation_mode = SimpleNamespace(value="prefill")
@@ -1549,6 +1550,16 @@ def sparse_progressive_lifetimes(args):
             command()  # Both release, but one or both GPU proofs still pending.
             assert not freed and votes == [5, 5, 5]
             gpu[0] = True
+            from sglang_remote_attn.remote_data_plane import RequestIO
+
+            io = dr.req._remote_attn_gpu_io = RequestIO()
+            io.begin()
+            io_done = [args.rank == 0]
+            io.finish(SimpleNamespace(query=lambda: io_done[0]))
+            stable()  # A slow DMA consumer must not cause per-loop TP votes.
+            dist.barrier()
+            assert not freed and votes == [5, 5, 5]
+            io_done[0] = True
             command()
             assert freed == ["KV"] and not owner.targets and not owner.remote_targets
             stable()

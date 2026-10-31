@@ -198,7 +198,8 @@ def execute(job, stream, cache):
         )
         query = job.q_cpu.to(device=device)
         out, lse = sparse.partial(query, keys, float(header["scale"]))
-        out, lse = out.cpu(), lse.cpu()  # Real GPU completion before reply.
+        if not getattr(job, "gpu_transport", False):
+            out, lse = out.cpu(), lse.cpu()  # Real GPU completion before reply.
     return (
         dict(o_shape=list(out.shape), o_dtype="float32", lse_shape=list(lse.shape)),
         out,
@@ -243,6 +244,25 @@ class Target:
         self.check()
         if self.closed:
             raise RuntimeError("Remote sparse target already retired")
+        from . import remote_data_plane
+
+        if remote_data_plane.enabled():
+            header = dict(
+                handoff_id=self.route["handoff_id"],
+                epoch=self.route["epoch"],
+                token=self.route["token"],
+                dsv41_sparse=True,
+                layer=layer,
+                ratio=ratio,
+                positions=positions,
+                scale=float(scale),
+            )
+            _, out, lse = remote_data_plane.call(
+                self.controller, self.route, [query], [header], [self.req]
+            )
+            self.calls += 1
+            self.touched.add(layer)
+            return out[0], lse[0]
         if self.client is None:
             self.client = runtime().TargetClient(self.route["host"], self.route["port"])
             self.client.attach(
@@ -280,6 +300,10 @@ class Target:
     def close(self, reason):
         if self.closed:
             return
+        from .remote_data_plane import ready
+
+        if not ready(self.req):
+            raise RuntimeError("Remote GPU transport has not drained")
         if self.client is not None:
             self.client.detach(self.route["handoff_id"])
             self.client.close()

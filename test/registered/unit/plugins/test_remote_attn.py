@@ -3678,7 +3678,7 @@ class TestRemoteAttn(CustomTestCase):
         )
         self.assertTrue(rows[0]["leases"]["mismatch_rejected"])
         self.assertTrue(rows[0]["leases"]["sparse_mode_mismatch_rejected"])
-        self.assertEqual(rows[0]["leases"]["mesh_settings_rejected"], [True] * 3)
+        self.assertEqual(rows[0]["leases"]["mesh_settings_rejected"], [True] * 4)
         self.assertTrue(rows[0]["leases"]["cache_mismatch_rejected"])
         self.assertTrue(rows[0]["leases"]["overlap_mismatch_rejected"])
         self.assertEqual(rows[0]["d_overlap"], rows[1]["d_overlap"])
@@ -9846,6 +9846,283 @@ class TestRemoteAttn(CustomTestCase):
             self.addCleanup(b.mesh.close)
             self.assertNotEqual(old, b.config.directory)
             self.assertTrue((directory / "control/P0/instance.lock").exists())
+
+    def _gpu_transport_fixture(self):
+        """Real control sockets and tensor copies; only TE/CUDA boundaries are CPU."""
+        from sglang_remote_attn import dsv41_remote
+        from sglang_remote_attn import handoff_control as rt
+        from sglang_remote_attn import remote_data_plane as dp
+
+        self.enterContext(patch.dict(os.environ, {"HANDOFF_REMOTE_GPU_TRANSFER": "1"}))
+
+        class Engine:
+            peers = {}
+
+            def __init__(self, name):
+                self.name, self.regions, self.calls, self.fail = name, {}, [], False
+                self.peers[name] = self
+
+            def get_session_id(self):
+                return self.name
+
+            def batch_register(self, pointers, sizes):
+                self.regions.update(zip(pointers, sizes))
+                return 0
+
+            def batch_deregister(self, pointers):
+                for p in pointers:
+                    self.regions.pop(p)
+                return 0
+
+            def batch_transfer_sync(self, session, sources, targets, sizes):
+                self.calls.append(list(zip(sources, targets, sizes)))
+                if self.fail:
+                    return -1
+                peer = self.peers[session]
+                for a, b, n in zip(sources, targets, sizes):
+                    assert any(
+                        p <= a and a + n <= p + s for p, s in self.regions.items()
+                    )
+                    assert any(
+                        p <= b and b + n <= p + s for p, s in peer.regions.items()
+                    )
+                    ctypes.memmove(b, a, n)
+                return 0
+
+        p, d = Engine("P"), Engine("D")
+        pm, dm = SimpleNamespace(engine=p), SimpleNamespace(engine=d)
+        pp, dd = dp.Plane(pm, "cpu"), dp.Plane(dm, "cpu")
+        scheduler = SimpleNamespace(_pre_layerwise=SimpleNamespace(gpu_data_plane=pp))
+        hub = rt.RemoteHub(scheduler, stream_factory=lambda n: [(None, None, None)] * n)
+        self.addCleanup(hub.close)
+        freed = []
+        self.addCleanup(pp.close)
+        self.addCleanup(dd.close)
+        req = SimpleNamespace(
+            _pre_layerwise_source=SimpleNamespace(
+                peers=((SimpleNamespace(mooncake_session_id="D"), None),)
+            )
+        )
+        ctx = hub.registry.register(
+            "gpu", req, 0, 8, 8, "token", on_release=lambda ctx: freed.append(True)
+        )
+        route = dict(
+            host=hub.host,
+            port=hub.port,
+            handoff_id="gpu",
+            epoch=ctx.owner_epoch,
+            token="token",
+        )
+
+        def compute(job, stream, cache):
+            q = job.q_cpu
+            return {}, q.float() * 3, torch.zeros(q.shape[0], dtype=torch.float32)
+
+        self.enterContext(patch.object(dsv41_remote, "execute", compute))
+        self.enterContext(
+            patch.object(
+                rt, "_send_tensor", side_effect=AssertionError("TCP tensor payload")
+            )
+        )
+        return SimpleNamespace(
+            dp=dp,
+            rt=rt,
+            dsv=dsv41_remote,
+            p=p,
+            d=d,
+            pp=pp,
+            dd=dd,
+            hub=hub,
+            source=req,
+            ctx=ctx,
+            route=route,
+            freed=freed,
+            compute=compute,
+        )
+
+    def test_gpu_transport_control_only_roundtrip_batches_and_slot_reuse(self):
+        """Q/O/LSE must use registered regions; returned tensors cannot alias reuse."""
+        f = self._gpu_transport_fixture()
+        client = f.dd.client(f.route)
+        address = client.slab.tensor.data_ptr()
+        previous = []
+        for size in (1, 2, 4, 1):
+            q = (
+                torch.arange(32, dtype=torch.float32).reshape(4, 8).to(torch.bfloat16)
+                + size
+            )
+            reqs = [SimpleNamespace() for _ in range(size)]
+            rows = [{**f.route, "dsv41_sparse": True} for _ in reqs]
+            result, out, lse = client.call([q] * size, rows, reqs)
+            self.assertTrue(torch.equal(out, torch.stack([q.float() * 3] * size)))
+            self.assertEqual(tuple(lse.shape), (size, 4))
+            self.assertEqual(address, client.slab.tensor.data_ptr())
+            self.assertTrue(all(f.dp.ready(req) for req in reqs))
+            previous.append((out, out.clone()))
+        self.assertTrue(all(torch.equal(out, saved) for out, saved in previous))
+        self.assertEqual([len(c) for c in f.d.calls], [1] * 4)
+        self.assertEqual([len(c) for c in f.p.calls], [2] * 4)
+        client.close()
+        self.assertFalse(f.d.regions)
+        self.assertFalse(f.p.regions)
+
+    def test_gpu_transport_cancel_keeps_registry_until_reader_and_return_dma_finish(
+        self,
+    ):
+        """A cancelled source stays pinned while the GPU RPC owns its reader reference."""
+        f = self._gpu_transport_fixture()
+        started, proceed = threading.Event(), threading.Event()
+
+        def delayed(*args):
+            started.set()
+            if not proceed.wait(4):
+                raise TimeoutError("reader gate")
+            return f.compute(*args)
+
+        self.enterContext(patch.object(f.dsv, "execute", delayed))
+        req = SimpleNamespace()
+        results, errors = [], []
+
+        def run():
+            try:
+                results.append(
+                    f.dd.client(f.route).call(
+                        [torch.ones(2, 8, dtype=torch.bfloat16)],
+                        [{**f.route, "dsv41_sparse": True}],
+                        [req],
+                    )
+                )
+            except Exception as exc:
+                errors.append(exc)
+
+        thread = threading.Thread(target=run)
+        thread.start()
+        try:
+            self.assertTrue(started.wait(4))
+            self.assertFalse(f.dp.ready(req))
+            self.assertFalse(f.hub.registry.release("gpu", expected_req=f.source))
+            self.assertFalse(f.freed)
+        finally:
+            proceed.set()
+            thread.join(4)
+        self.assertFalse(thread.is_alive())
+        self.assertFalse(errors)
+        self._mesh_wait(lambda: bool(f.freed))
+        self.assertTrue(f.dp.ready(req))
+
+    def test_gpu_transport_unknown_dma_quarantines_address_and_never_retries_request(
+        self,
+    ):
+        """An old DMA may still arrive; only a new allocation can serve another request."""
+        f = self._gpu_transport_fixture()
+        client = f.dd.client(f.route)
+        req = SimpleNamespace()
+        f.d.fail = True
+        with self.assertRaises(RuntimeError):
+            client.call(
+                [torch.ones(2, 8, dtype=torch.bfloat16)],
+                [{**f.route, "dsv41_sparse": True}],
+                [req],
+            )
+        old = client.slab
+        self.assertTrue(old.quarantined)
+        with self.assertRaises(RuntimeError):
+            f.dp.ready(req)
+        f.d.fail = False
+        new = f.dd.client(f.route)
+        self.assertNotEqual(new.slab.tensor.data_ptr(), old.tensor.data_ptr())
+        _, out, _ = new.call(
+            [torch.ones(2, 8, dtype=torch.bfloat16)],
+            [{**f.route, "dsv41_sparse": True}],
+            [SimpleNamespace()],
+        )
+        old.tensor.fill_(91)  # simulate a late writer to the quarantined region
+        self.assertTrue(torch.equal(out, torch.full_like(out, 3)))
+        self.assertEqual(len(f.d.calls), 2)  # failed operation was never retried
+        new.close()
+        self.assertIn(old.tensor.data_ptr(), f.d.regions)
+
+    def test_gpu_transport_slot_requires_ack_and_consumer_proof_before_retirement(self):
+        """Sequence changes cannot replace a transfer/consumer completion proof."""
+        from sglang_remote_attn import remote_data_plane as dp
+
+        pending = [True]
+        io = dp.RequestIO()
+        io.begin()
+        self.assertFalse(io.ready())
+        io.finish(SimpleNamespace(query=lambda: not pending[0]))
+        self.assertFalse(io.ready())
+        pending[0] = False
+        self.assertTrue(io.ready())
+        f = self._gpu_transport_fixture()
+        lane = dp.Lane(f.pp, f.dd.client(f.route).slab.descriptor(), "D")
+        self.addCleanup(lane.drop)
+        lane.begin(1)
+        with self.assertRaises(RuntimeError):
+            lane.ack(1)
+        with self.assertRaises(RuntimeError):
+            lane.begin(2)
+        lane.state = "returned"
+        lane.ack(1)
+        lane.begin(2)
+        lane.drop()
+        with self.assertRaises(RuntimeError):
+            lane.begin(3)
+        self.assertTrue(lane.slab.quarantined)
+
+    def test_gpu_transport_mha_native_executor_returns_tensors_without_cpu_payload(
+        self,
+    ):
+        """Dense MHA must preserve native execution while bypassing Q/O/LSE CPU copies."""
+        f = self._gpu_transport_fixture()
+        keys = torch.ones(8, 2, 8)
+        pool = SimpleNamespace(
+            get_key_buffer=lambda layer: keys, get_value_buffer=lambda layer: keys
+        )
+        f.source.kv = SimpleNamespace(req_pool_idx=0)
+        f.hub.scheduler.token_to_kv_pool_allocator = SimpleNamespace(
+            get_kvcache=lambda: pool
+        )
+        f.hub.scheduler.req_to_token_pool = SimpleNamespace(
+            req_to_token=torch.arange(8).reshape(1, 8)
+        )
+        controller = SimpleNamespace(gpu_data_plane=f.dd)
+        q = torch.ones(2, 8, dtype=torch.bfloat16)
+        req = SimpleNamespace(_pre_layerwise_target=SimpleNamespace(owner=controller))
+        state = SimpleNamespace(req=req, remote_service=f.route)
+        prep = dict(
+            state=state,
+            q_row=q,
+            row_header=dict(
+                handoff_id="gpu", epoch=f.ctx.owner_epoch, layer=0, sm_scale=0.25
+            ),
+        )
+        with (
+            patch.dict(
+                sys.modules,
+                {
+                    "flashinfer": SimpleNamespace(
+                        single_decode_with_kv_cache=lambda query, *a, **kw: (
+                            query.float() * 3,
+                            torch.zeros(query.shape[0]),
+                        )
+                    )
+                },
+            ),
+            patch.object(f.rt, "PAGED_BATCH", False),
+            patch.object(torch.cuda, "current_device", return_value=0),
+            patch.object(
+                torch.cuda,
+                "current_stream",
+                return_value=SimpleNamespace(synchronize=lambda: None),
+            ),
+            patch.object(
+                torch.Tensor, "cpu", side_effect=AssertionError("tensor CPU payload")
+            ),
+        ):
+            _, out, lse = f.dp.mha_call([prep])
+        self.assertTrue(torch.equal(out, q.float().unsqueeze(0) * 3))
+        self.assertEqual(tuple(lse.shape), (1, 2))
 
 
 if __name__ == "__main__":

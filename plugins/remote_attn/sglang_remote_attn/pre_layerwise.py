@@ -374,6 +374,10 @@ class Target:
     admission_id: int = 0
 
     def gpu_ready(self):
+        from .remote_data_plane import ready
+
+        if not ready(self.decode_req.req):
+            return False
         if self.release_failed:
             raise RuntimeError("D target release failed; refusing retirement retry")
         pending = []
@@ -643,6 +647,7 @@ class Controller:
             return None
         generation = secrets.token_hex(16)
         from . import pd_mesh
+        from .remote_data_plane import enabled as gpu_payload
 
         mesh = getattr(dr.kv_receiver.kv_mgr, "_remote_attn_mesh", None)
         if mesh is not None:
@@ -682,6 +687,7 @@ class Controller:
                 "tp_size": self.tp_size,
                 "layers": self.layers,
                 "mode": self.config.mode,
+                "gpu_transfer": gpu_payload(),
                 "recv_host_staging": self.config.recv_host_staging,
                 "native_staging": mgr.enable_staging,
             },
@@ -726,6 +732,7 @@ class Controller:
             ):
                 mgr = sender.kv_mgr
                 from .pd_mesh import source_root
+                from .remote_data_plane import enabled as gpu_payload
 
                 root = source_root(self, req)
                 offer = read_json(root / "offer.json")
@@ -735,6 +742,7 @@ class Controller:
                 )
                 if (
                     offer
+                    and bool(offer.get("gpu_transfer", False)) == gpu_payload()
                     and len(peers) == 1
                     and not peers[0][0].is_dummy
                     and peers[0][1] is not None
@@ -1084,6 +1092,10 @@ def initialize(scheduler):
     from . import pd_mesh
 
     pd_mesh.install(controller)
+    from . import remote_data_plane
+
+    if remote_data_plane.enabled():
+        remote_data_plane.plane_for(controller)
     controller.prefill_overlap = None
     controller.cache_guard = None
     from .source_cache import install
@@ -1303,6 +1315,8 @@ def shutdown(scheduler):
         raise RuntimeError("pre-layerwise staging remains quarantined during shutdown")
     if getattr(controller, "mesh", None) is not None:
         controller.mesh.close()
+    if getattr(controller, "gpu_data_plane", None) is not None:
+        controller.gpu_data_plane.close()
 
 
 def init_staging_allocator(

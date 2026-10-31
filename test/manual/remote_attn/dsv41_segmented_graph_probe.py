@@ -29,7 +29,9 @@ from sglang_remote_attn import hooks
 from sglang_remote_attn.dsv41_layerwise import DSV41Source
 
 
-def main(root, output, *, fused=False, bf16_source=False, mesh=False):
+def main(
+    root, output, *, fused=False, bf16_source=False, mesh=False, gpu_transfer=False
+):
     torch.cuda.set_device(0)
     native = root / "python/sglang/srt/model_executor"
     prefix = "sglang.srt.model_executor.runner_backend_utils.breakable_cuda_graph"
@@ -134,9 +136,16 @@ def main(root, output, *, fused=False, bf16_source=False, mesh=False):
         ShapeKey = load("dsv_segment_shape", native / "runner/shape_key.py").ShapeKey
         sf = sparse_fixture(root, "cuda")
         sf.p_controller.dsv41_remote = True
+        transport = None
+        if gpu_transfer:
+            from remote_gpu_probe_support import Transport
+
+            transport = Transport(root)
 
         def make_hub(fixture, index):
             scheduler = fixture.p_controller.scheduler
+            if transport:
+                transport.attach(fixture.p_controller, "prefill")
             if mesh:
                 scheduler.disaggregation_mode = types.SimpleNamespace(value="prefill")
                 scheduler.disagg_prefill_bootstrap_queue = types.SimpleNamespace(
@@ -266,6 +275,17 @@ def main(root, output, *, fused=False, bf16_source=False, mesh=False):
             fused=fused,
             bf16_source=bf16_source,
         )
+        if transport:
+            d_engine = transport.attach(f.controller, "decode")
+            for src in sources:
+                src.peers = (
+                    (
+                        types.SimpleNamespace(
+                            mooncake_session_id=d_engine.get_session_id()
+                        ),
+                        None,
+                    ),
+                )
         f.runner.attention_graph_variants = types.SimpleNamespace(
             capture_labels=labels, graph_limits=()
         )
@@ -436,13 +456,26 @@ def main(root, output, *, fused=False, bf16_source=False, mesh=False):
 
             # A second D independently uses both P endpoints after D0 retires.
             # No D0 cancellation/close may detach D1's readers.
+            d1_controller = f.controller
+            if transport:
+                d1_controller = types.SimpleNamespace(remote_targets={})
+                d1_engine = transport.attach(d1_controller, "decode")
+                for src in sources:
+                    src.peers += (
+                        (
+                            types.SimpleNamespace(
+                                mooncake_session_id=d1_engine.get_session_id()
+                            ),
+                            None,
+                        ),
+                    )
             for row in (0, 1):
                 path, generation, route = cluster.route(
                     row, 1, sources[row].service, 200 + row
                 )
                 req = types.SimpleNamespace(kv=types.SimpleNamespace(req_pool_idx=row))
                 target = sparse.Target(
-                    f.controller, req, path, generation, route, 33, progressive=True
+                    d1_controller, req, path, generation, route, 33, progressive=True
                 )
                 q = torch.ones((1, 512), device="cuda", dtype=torch.bfloat16)
                 out, _ = target.call(q, selected(8), 1, 1, 512**-0.5)
@@ -453,6 +486,7 @@ def main(root, output, *, fused=False, bf16_source=False, mesh=False):
                 lambda: all(read_json(p / "remote-done.json") for p, _ in cluster.links)
             )
         backend.cleanup()
+        gpu_result = transport.close() if transport else None
         for hub in hubs:
             hub.close()
         if cluster:
@@ -469,6 +503,12 @@ def main(root, output, *, fused=False, bf16_source=False, mesh=False):
                 Path(__file__).with_name("pd_mesh_probe_support.py"),
                 root / "python/sglang/srt/disaggregation/mooncake/conn.py",
                 root / "python/sglang/srt/disaggregation/common/conn.py",
+            ]
+        if transport:
+            paths += [
+                Path(__file__).with_name("remote_gpu_probe_support.py"),
+                root
+                / "python/sglang/srt/distributed/device_communicators/mooncake_transfer_engine.py",
             ]
         paths += [
             root / p
@@ -509,6 +549,7 @@ def main(root, output, *, fused=False, bf16_source=False, mesh=False):
             live_swa_and_carry_verified=True,
             unsupported_remote_eager=[3, 8],
             local_full_restored=True,
+            gpu_transfer=gpu_result,
             mesh=dict(
                 prefills=2,
                 decodes=2,
@@ -535,6 +576,7 @@ if __name__ == "__main__":
     parser.add_argument("--fused-projection", action="store_true")
     parser.add_argument("--bf16-kv-source", action="store_true")
     parser.add_argument("--mesh", action="store_true")
+    parser.add_argument("--gpu-transfer", action="store_true")
     args = parser.parse_args()
     main(
         args.source_root.resolve(),
@@ -542,4 +584,5 @@ if __name__ == "__main__":
         fused=args.fused_projection,
         bf16_source=args.bf16_kv_source,
         mesh=args.mesh,
+        gpu_transfer=args.gpu_transfer,
     )

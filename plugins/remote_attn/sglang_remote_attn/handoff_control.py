@@ -723,6 +723,7 @@ class _HubConn:
         "in_flight",
         "last_rx",
         "dead",
+        "gpu_lane",
     )
 
     def __init__(self, sock):
@@ -733,6 +734,7 @@ class _HubConn:
         self.in_flight = 0
         self.last_rx = time.monotonic()
         self.dead = False
+        self.gpu_lane = None
 
 
 @dataclass
@@ -1424,8 +1426,8 @@ def execute_remote_attention(job, stream, cache):
         if PROFILE:
             pre_ev.record()
         t_q0 = time.perf_counter()
-        q_gpu = cache.get("q_gpu")
-        if (
+        q_gpu = q_cpu if getattr(job, "gpu_transport", False) else cache.get("q_gpu")
+        if not getattr(job, "gpu_transport", False) and (
             q_gpu is None
             or q_gpu.shape != q_cpu.shape
             or q_gpu.dtype != q_cpu.dtype
@@ -1433,7 +1435,8 @@ def execute_remote_attention(job, stream, cache):
         ):
             q_gpu = torch.empty(q_cpu.shape, dtype=q_cpu.dtype, device=current_dev)
             cache["q_gpu"] = q_gpu
-        q_gpu.copy_(q_cpu, non_blocking=True)
+        if not getattr(job, "gpu_transport", False):
+            q_gpu.copy_(q_cpu, non_blocking=True)
         q = q_gpu
         if PROFILE:
             q_ev.record()
@@ -1464,9 +1467,9 @@ def execute_remote_attention(job, stream, cache):
             o.record_stream(stream)
             lse.record_stream(stream)
         t_d2h0 = time.perf_counter()
-        o_cpu = o.detach().cpu()
+        o_cpu = o if getattr(job, "gpu_transport", False) else o.detach().cpu()
         t_d2h_o = time.perf_counter()
-        lse_cpu = lse.detach().cpu()
+        lse_cpu = lse if getattr(job, "gpu_transport", False) else lse.detach().cpu()
         t_d2h_lse = time.perf_counter()
 
     t_sync0 = time.perf_counter()
@@ -1634,9 +1637,9 @@ def _execute_paged_batch(job, stream, cache):
             q, (k_buf.unsqueeze(1), v_buf.unsqueeze(1)), return_lse=True
         )
         t_api = time.perf_counter()
-        o_cpu = o.detach().cpu()
+        o_cpu = o if getattr(job, "gpu_transport", False) else o.detach().cpu()
         t_d2h_o = time.perf_counter()
-        lse_cpu = lse.detach().cpu()
+        lse_cpu = lse if getattr(job, "gpu_transport", False) else lse.detach().cpu()
         t_d2h_lse = time.perf_counter()
         stream.synchronize()
         t_done = time.perf_counter()
@@ -1699,6 +1702,8 @@ def execute_remote_attention_batch(job, stream, cache):
 
 
 def _execute_hub_job(job, stream, cache):
+    if getattr(job, "gpu_transport", False):
+        return job.execute(stream, cache)
     if not getattr(job, "is_batch", False) and getattr(job, "header", {}).get(
         "dsv41_sparse"
     ):
@@ -1939,7 +1944,7 @@ class RemoteHub:
             with hc.lock:
                 inflight = hc.in_flight
             idle = time.monotonic() - hc.last_rx
-            if inflight == 0 and idle > self.idle_timeout_s:
+            if inflight == 0 and hc.gpu_lane is None and idle > self.idle_timeout_s:
                 with self._active_lock:
                     self.idle_closes += 1
                 print(
@@ -1969,7 +1974,17 @@ class RemoteHub:
                     pass
             hc.last_rx = time.monotonic()
             cmd = header.get("cmd")
-            if cmd == "attach":
+            if cmd in ("te_open", "te_attn", "te_ack", "te_close"):
+                from .remote_data_plane import handle
+
+                try:
+                    handle(self, hc, header)
+                except Exception as exc:
+                    if hc.gpu_lane is not None:
+                        hc.gpu_lane.drop()
+                    self._send(hc, dict(ok=False, cmd=cmd, error=str(exc)))
+                    return
+            elif cmd == "attach":
                 self._handle_attach(hc, header)
             elif cmd == "detach":
                 hc.attached.pop(str(header.get("handoff_id", "")), None)
@@ -2260,6 +2275,8 @@ class RemoteHub:
             return False
 
     def _drop_conn(self, hc: _HubConn) -> None:
+        if hc.gpu_lane is not None:
+            hc.gpu_lane.drop()
         hc.dead = True
         with self._conns_lock:
             self._conns.discard(hc)
@@ -6196,6 +6213,8 @@ def _pinned_empty(shape, dtype):
 
 def _h2d_pair(o_cpu, lse_cpu, device):
     """One copy stream + one completion event covers both O and LSE H2D."""
+    if o_cpu.device.type == "cuda" and lse_cpu.device.type == "cuda":
+        return o_cpu, lse_cpu
     try:
         if not ASYNC_COPY or not torch.cuda.is_available():
             raise RuntimeError("fallback")
@@ -6424,6 +6443,31 @@ def _batch_remote_attention(module, q, k, v, forward_batch, meta, save_kv_cache)
                 raise RuntimeError(st.error)
             groups.setdefault((st.client.host, st.client.port), []).append(prep)
         for group in groups.values():
+            from . import remote_data_plane
+
+            if remote_data_plane.enabled():
+                for start in range(0, len(group), 4):
+                    part = group[start : start + 4]
+                    t_rpc = time.perf_counter()
+                    header, o_gpu, lse_gpu = remote_data_plane.mha_call(part)
+                    t_call = time.perf_counter()
+                    for j, prep in enumerate(part):
+                        st = prep["state"]
+                        merged = st.finish_remote_row(
+                            prep,
+                            header["rows"][j],
+                            o_gpu[j],
+                            lse_gpu[j],
+                            t_rpc,
+                            t_call,
+                            batch_size=len(part),
+                            q_d2h_ms=0.0,
+                        )
+                        out[prep["row_index"]].copy_(merged.reshape(-1))
+                        batch_remote_wait = max(
+                            batch_remote_wait, float(st.last_rpc_wall_ms or 0)
+                        )
+                continue
             client = group[0]["state"].client
             for prep in group:
                 st = prep["state"]
@@ -7172,7 +7216,9 @@ class _TargetHandoffState:
         v_tail = v_buf[tail_idx]
         q_bytes = None
         q_sync_ms = 0.0
-        if Q_SYNC:
+        from .remote_data_plane import enabled as gpu_payload
+
+        if Q_SYNC and not gpu_payload():
             # Sync Q D2H before launching local tail: small Q (tens of KB) and
             # it lets local tail overlap the remote RPC instead of the copy.
             t_q = time.perf_counter()
@@ -7344,6 +7390,20 @@ class _TargetHandoffState:
             seq_delta,
             row_index=row_index,
         )
+        from . import remote_data_plane
+
+        if remote_data_plane.enabled():
+            t_rpc = time.perf_counter()
+            header, out, lse = remote_data_plane.mha_call([prep])
+            return self.finish_remote_row(
+                prep,
+                header["rows"][0],
+                out[0],
+                lse[0],
+                t_rpc,
+                time.perf_counter(),
+                q_d2h_ms=0.0,
+            )
         if Q_SYNC:
             q_bytes = prep["q_bytes"]
             q_d2h_ms = prep["q_sync_ms"]

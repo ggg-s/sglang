@@ -1,6 +1,7 @@
 # Remote attention / progressive KV handoff plugin
 
 多 P × 多 D（同机/跨机、原生 SMG）：[网络 journal 与部署说明](MULTI-PD-ZH.md)。
+Remote Q/O/LSE 原生 Mooncake GPU 传输：[启用与完成/回收协议](REMOTE-GPU-TRANSPORT-ZH.md)。
 
 DSV4.1 Flash 纯文本 layerwise：[原生 PD 接入与本地验证](DSV41-LAYERWISE-ZH.md)。
 复用原生 global KV / state 传输，关闭 DSpark；另支持 [Remote 提前接纳、逐资源 Local 与分段 CUDA graph](DSV41-REMOTE-EAGER-ZH.md)。

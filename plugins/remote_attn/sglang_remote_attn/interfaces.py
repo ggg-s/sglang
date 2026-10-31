@@ -17,6 +17,27 @@ CORE_CALLS = {
     DISAGG + "decode.DecodeTransferQueue._commit_transfer_to_req": {
         "keep_receiver": False
     },
+    **{
+        "sglang.srt.distributed.device_communicators.mooncake_transfer_engine.MooncakeTransferEngine."
+        + name: parameters
+        for name, parameters in (
+            (
+                "batch_register",
+                {"ptrs": inspect.Parameter.empty, "lengths": inspect.Parameter.empty},
+            ),
+            ("batch_deregister", {"ptrs": inspect.Parameter.empty}),
+            (
+                "batch_transfer_sync",
+                {
+                    "session_id": inspect.Parameter.empty,
+                    "buffers": inspect.Parameter.empty,
+                    "peer_buffer_addresses": inspect.Parameter.empty,
+                    "lengths": inspect.Parameter.empty,
+                },
+            ),
+            ("get_session_id", {}),
+        )
+    },
     MANAGER + "build_receiver_metadata_message": {
         "bootstrap_room": inspect.Parameter.empty,
         "is_dummy": inspect.Parameter.empty,

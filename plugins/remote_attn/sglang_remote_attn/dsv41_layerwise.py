@@ -512,6 +512,7 @@ class DSV41Controller(Controller):
                 ):
                     raise RuntimeError("DSV4.1 host staging unavailable; retaining KV")
                 from .pd_mesh import source_root
+                from .remote_data_plane import enabled as gpu_payload
 
                 root = source_root(self, req)
                 offer = read_json(root / "offer.json")
@@ -523,6 +524,7 @@ class DSV41Controller(Controller):
                 page = schema["page_size"]
                 if (
                     offer
+                    and bool(offer.get("gpu_transfer", False)) == gpu_payload()
                     and (lease is None or offer.get("generation") == lease.generation)
                     and offer.get("dsv41") == schema
                     and offer.get("mode") == self.config.mode

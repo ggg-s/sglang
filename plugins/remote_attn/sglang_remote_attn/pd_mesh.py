@@ -50,6 +50,7 @@ def startup_signature(config):
             "HANDOFF_NETWORK_BIND_HOST",
             "HANDOFF_NETWORK_ADVERTISE_HOST",
             "HANDOFF_CTL_DIR",
+            "HANDOFF_REMOTE_GPU_TRANSFER",
         )
     ), str(config.directory) if enabled() else None
 
