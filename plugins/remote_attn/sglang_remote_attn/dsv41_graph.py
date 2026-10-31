@@ -1,9 +1,8 @@
 """DSV decode graph breaks over native metadata, prepare and attention methods.
 
-Preparation includes fused SWA writes and compressor/indexer side streams. Keep
-that native region eager as a unit so no captured kernel reads stale locations
-and the native stream joins precede the next graph segment. Projection after
-attention, norms, MLP/MoE and the remaining stable forward stay captured.
+Use the core projection/state boundary: QKV is captured, while native SWA,
+carry and indexer updates consume live metadata outside the graph. Ordinary
+full-graph/eager execution retains the core's original prepare dispatch.
 """
 
 import inspect
@@ -11,12 +10,6 @@ import types
 from contextlib import contextmanager
 
 from .segmented_graph import RemoteGraphBackend
-
-PREPARE = (
-    "_forward_prepare",
-    "_forward_prepare_multi_stream",
-    "_forward_prepare_low_ratio_multi_stream",
-)
 
 
 def is_model(runner):
@@ -83,7 +76,7 @@ class DSV41GraphBackend(RemoteGraphBackend):
         expected += [
             item
             for layer in layers
-            for item in (("prepare", layer), ("attention", layer))
+            for item in (("state", layer), ("attention", layer))
         ]
         if self.dynamic_trace != expected:
             raise RuntimeError(
@@ -116,8 +109,6 @@ class DSV41GraphBackend(RemoteGraphBackend):
             self.live_targets.clear()
 
     def _dynamic(self, kind, owner, **arguments):
-        prepare = kind in PREPARE
-        trace_kind = "prepare" if prepare else kind
         capture = self.capture_remote
         batch = self.capture_batch if capture else self.active_batch
         if batch is None or (not capture and not self.use_remote):
@@ -140,7 +131,7 @@ class DSV41GraphBackend(RemoteGraphBackend):
             )
         )
         if capture and self.is_capturing():
-            self.dynamic_trace.append((trace_kind, layer))
+            self.dynamic_trace.append((kind, layer))
             if kind == "attention":
                 self.capture_layers.append(layer)
         arguments["forward_batch"] = batch
@@ -148,7 +139,12 @@ class DSV41GraphBackend(RemoteGraphBackend):
             # Native V4 shares K/V; separate weak-ref views would lose `k is v`.
             arguments["v"] = arguments["k"]
         try:
-            result = owner._dsv41_graph_originals[kind](**arguments)
+            function = (
+                owner.update_decode_state
+                if kind == "state"
+                else owner._dsv41_graph_originals[kind]
+            )
+            result = function(**arguments)
             key = (batch.batch_size, kind, layer)
             spec = output_signature(result)
             if capture:
@@ -191,9 +187,7 @@ def bind(model_runner, owner, name, kind):
     original = getattr(owner, name)
     signature = inspect.signature(original)
     originals[name] = original
-    # Each prepare variant needs its own callable key, while trace uses prepare.
-    key = name if kind == "prepare" else kind
-    originals[key] = original
+    originals[kind] = original
 
     def wrapped(self, *args, **kwargs):
         backend = model_runner._remote_segmented_backend
@@ -217,9 +211,31 @@ def bind(model_runner, owner, name, kind):
             values.update(extra)
         previous, backend.capture_batch = backend.capture_batch, batch
         try:
-            return backend.dynamic_break(
-                kind if kind != "prepare" else key, self, **values
-            )
+            if kind == "prepare":
+                if not batch.forward_mode.is_decode() or any(
+                    values[k] is not None
+                    for k in ("q_rope_out", "k_nope_out", "k_rope_out")
+                ):
+                    raise ValueError(
+                        "split Remote QKV supports native non-unified decode only"
+                    )
+                q, q_lora, kv = self.project_decode_qkv(
+                    values["x"],
+                    values["positions"],
+                    q_out=values["q_out"],
+                    x_quant=values["x_quant"],
+                )
+                backend.dynamic_break(
+                    "state",
+                    self,
+                    x=values["x"],
+                    q_lora=q_lora,
+                    kv=kv,
+                    positions=values["positions"],
+                    attn_backend=values["attn_backend"],
+                )
+                return q, None
+            return backend.dynamic_break(kind, self, **values)
         finally:
             backend.capture_batch = previous
 
@@ -240,8 +256,7 @@ def install(model_runner, runner):
     if len(layers) != model_runner.model_config.num_hidden_layers:
         raise ValueError("DSV Remote graph requires a complete PP=1 model")
     for layer in layers:
-        for name in PREPARE:
-            bind(model_runner, layer.self_attn, name, "prepare")
+        bind(model_runner, layer.self_attn, "prepare_qkv", "prepare")
 
 
 def capture_signature(model_runner, runner):
@@ -261,13 +276,44 @@ def capture_signature(model_runner, runner):
         layers = model_runner.model.model.layers
         valid &= len(layers) == model_runner.model_config.num_hidden_layers
         for layer in layers:
+            owner = layer.self_attn
+            valid &= (
+                owner.is_dsv41
+                and owner.compress_ratio in (0, 1, 2)
+                and not owner.use_mega_attention
+                and not owner.use_fused_qk_norm_rope
+            )
+            rows.append(("projection_policy", owner.fuse_wqa_wkv, owner.compress_ratio))
             owners.extend(
-                (
-                    layer.self_attn,
-                    name,
-                    ("x", "positions", "forward_batch", "attn_backend"),
+                (owner, name, required)
+                for name, required in (
+                    (
+                        "prepare_qkv",
+                        (
+                            "x",
+                            "positions",
+                            "forward_batch",
+                            "attn_backend",
+                            "q_rope_out",
+                            "k_nope_out",
+                            "k_rope_out",
+                            "enable_multi_stream",
+                            "low_ratio_multi_stream",
+                        ),
+                    ),
+                    ("project_decode_qkv", ("x", "positions", "q_out", "x_quant")),
+                    (
+                        "update_decode_state",
+                        (
+                            "x",
+                            "q_lora",
+                            "kv",
+                            "positions",
+                            "forward_batch",
+                            "attn_backend",
+                        ),
+                    ),
                 )
-                for name in PREPARE
             )
         for owner, name, required in owners:
             method = getattr(owner, "_dsv41_graph_originals", {}).get(
@@ -276,6 +322,9 @@ def capture_signature(model_runner, runner):
             signature = inspect.signature(method)
             valid &= set(required) <= signature.parameters.keys()
             rows.append((name, tuple(signature.parameters)))
+        from sglang.srt.environ import envs
+
+        rows.append(("split_qkv_v1", envs.SGLANG_DSV4_USE_BF16_KV_QUANT_SOURCE.get()))
         variants = getattr(runner, "attention_graph_variants", None)
         rows.append(
             (

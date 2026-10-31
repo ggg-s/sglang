@@ -23,18 +23,30 @@ CORE_CALLS = {
     "sglang.srt.layers.attention.deepseek_v4_backend.DeepseekV4AttnBackend.forward": {
         "forward_batch": inspect.Parameter.empty
     },
+    "sglang.srt.models.deepseek_v4.MQALayer.prepare_qkv": {
+        "forward_batch": inspect.Parameter.empty,
+        "attn_backend": inspect.Parameter.empty,
+        "q_out": None,
+        "x_quant": None,
+        "q_rope_out": None,
+        "k_nope_out": None,
+        "k_rope_out": None,
+        "enable_multi_stream": False,
+        "low_ratio_multi_stream": False,
+    },
+    "sglang.srt.models.deepseek_v4.MQALayer.project_decode_qkv": {
+        "q_out": None,
+        "x_quant": None,
+    },
+    "sglang.srt.models.deepseek_v4.MQALayer.update_decode_state": {
+        "q_lora": inspect.Parameter.empty,
+        "kv": inspect.Parameter.empty,
+        "forward_batch": inspect.Parameter.empty,
+        "attn_backend": inspect.Parameter.empty,
+    },
     **{
-        f"sglang.srt.models.deepseek_v4.MQALayer.{name}": {
-            "forward_batch": inspect.Parameter.empty,
-            "attn_backend": inspect.Parameter.empty,
-            "q_out": None,
-            "x_quant": None,
-        }
-        for name in (
-            "_forward_prepare",
-            "_forward_prepare_multi_stream",
-            "_forward_prepare_low_ratio_multi_stream",
-        )
+        f"sglang.srt.models.deepseek_v4.MQALayer.{name}": {"projected_kv": None}
+        for name in ("_compute_kv_to_cache", "_compute_kv_bf16")
     },
     "sglang.srt.model_executor.runner_utils.capture_mode.get_capture_attention_variant": {},
     "sglang.srt.model_executor.runner_utils.capture_mode._set_capture_attention_variant": {

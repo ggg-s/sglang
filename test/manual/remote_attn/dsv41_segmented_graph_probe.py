@@ -1,8 +1,8 @@
 """Real CUDA full/segmented banks plus DSV sparse RemoteHub RPC on RTX4060.
 
-Native full/breakable backends and byte-layout sparse reader are source-loaded.
-The 3-layer model, metadata/indexer/carry planning and pool manager boundaries
-are small fixtures. No DSV checkpoint, SM100 kernel, SMG, NCCL or perf claim.
+Native full/breakable backends, QKV/state methods and sparse reader are source-loaded.
+Linear/norm/store kernels and the 3-layer model/metadata/indexer/carry planning
+boundaries are small fixtures. No DSV checkpoint, SM100, SMG, NCCL or perf claim.
 """
 
 import argparse
@@ -28,7 +28,7 @@ from sglang_remote_attn import hooks
 from sglang_remote_attn.dsv41_layerwise import DSV41Source
 
 
-def main(root, output):
+def main(root, output, *, fused=False, bf16_source=False):
     torch.cuda.set_device(0)
     native = root / "python/sglang/srt/model_executor"
     prefix = "sglang.srt.model_executor.runner_backend_utils.breakable_cuda_graph"
@@ -49,7 +49,10 @@ def main(root, output):
             sys.modules[name] = module
         sys.modules["sglang.srt.environ"] = types.SimpleNamespace(
             envs=types.SimpleNamespace(
-                SGLANG_LOG_DECODE_GRAPH_KEY=types.SimpleNamespace(get=lambda: False)
+                SGLANG_LOG_DECODE_GRAPH_KEY=types.SimpleNamespace(get=lambda: False),
+                SGLANG_DSV4_USE_BF16_KV_QUANT_SOURCE=types.SimpleNamespace(
+                    get=lambda: bf16_source
+                ),
             )
         )
         sys.modules["sglang.srt.utils"] = types.SimpleNamespace(
@@ -204,7 +207,13 @@ def main(root, output):
                 outs.append(out[0, :4].to(q.dtype) + q[row])
             return torch.stack(outs)
 
-        f = fixture("cuda", torch.bfloat16, on_attention=attention)
+        f = fixture(
+            "cuda",
+            torch.bfloat16,
+            on_attention=attention,
+            fused=fused,
+            bf16_source=bf16_source,
+        )
         f.runner.attention_graph_variants = types.SimpleNamespace(
             capture_labels=labels, graph_limits=()
         )
@@ -221,13 +230,18 @@ def main(root, output):
         )
         f.attach(backend)
         inputs = {}
+        # Native runner owns these metadata buffers for the lifetime of its full
+        # graph bank. Keep the fixture's equivalents alive as well: CUDA graph
+        # kernels hold raw addresses, not Python tensor ownership.
+        capture_batches = {}
         stream = torch.cuda.Stream()
         stream.wait_stream(torch.cuda.current_stream())
         with backend.capture_session(stream):
             for size in (8, 4, 2, 1):
                 x = torch.ones((size, 4), device="cuda", dtype=torch.bfloat16)
-                positions = torch.zeros(size, device="cuda", dtype=torch.bfloat16)
+                positions = torch.zeros(size, device="cuda", dtype=torch.int64)
                 dummy = f.batch(size, -100)
+                capture_batches[size] = dummy
                 inputs[size] = (x, positions)
                 for label in labels:
                     with dg.attention_variant(label):
@@ -238,6 +252,12 @@ def main(root, output):
                         )
         torch.cuda.synchronize()
         assert not rpc_calls and not f.calls and not f.prepared
+        projection_capture_calls = len(f.projections)
+        for buffer in f.cache:
+            buffer.fill_(-99)
+        for buffer in f.carry:
+            buffer.zero_()
+        carry_expected = [buf.clone() for buf in f.carry]
         assert sorted(backend.remote_keys) == [1, 2, 4]
         segments = {
             str(key.size): len(value._segments) for key, value in remote._graphs.items()
@@ -273,7 +293,21 @@ def main(root, output):
                     p.fill_(marker)
                     # Independent eager union computation; no graph/RPC state.
                     expected = x.clone()
+                    kv_expected = []
                     for layer in (0, 1, 2):
+                        if bf16_source:
+                            kv = expected * 3 + 0.125
+                            kv.mul_(0.5).add_(p[:, None] * 0.03125)
+                        else:
+                            kv = (
+                                (expected * 3 + 0.125).float() * 0.5
+                                + p.float()[:, None] * 0.03125
+                            ).to(x.dtype)
+                        kv_expected.append(kv)
+                        if layer:
+                            carry_expected[layer].index_add_(
+                                0, live.out_cache_loc, expected.sum(-1)
+                            )
                         expected = expected * 2 + p[:, None]
                         if layer:
                             queries = (
@@ -300,6 +334,19 @@ def main(root, output):
                     err = float((got.float() - expected.float()).abs().max())
                     max_error = max(max_error, err)
                     torch.testing.assert_close(got, expected, atol=0.015625, rtol=0.01)
+                    assert len(f.projections) == projection_capture_calls, (
+                        "QKV executed in eager replay"
+                    )
+                    for layer in (0, 1, 2):
+                        torch.testing.assert_close(
+                            f.cache[layer][live.out_cache_loc],
+                            kv_expected[layer],
+                            atol=0,
+                            rtol=0,
+                        )
+                        torch.testing.assert_close(
+                            f.carry[layer], carry_expected[layer], atol=0, rtol=0
+                        )
                     assert mode.get_capture_attention_variant() is None
                     assert f.metadata[-1] == marker
                     assert f.prepared[-3:] == [(marker, i) for i in range(3)]
@@ -343,6 +390,7 @@ def main(root, output):
                 "python/sglang/test/kernels/deepseek_v4/dsv41_kv_quant_reference.py",
                 "python/sglang/srt/mem_cache/deepseek_v4_memory_pool.py",
                 "python/sglang/srt/layers/attention/deepseek_v4_backend.py",
+                "python/sglang/srt/models/deepseek_v4.py",
             )
         ]
         paths += [
@@ -367,6 +415,11 @@ def main(root, output):
             max_abs_error=max_error,
             live_metadata=True,
             live_sparse_topk=True,
+            qkv_projection_replay_host_calls=0,
+            native_projection_state_source_loaded=True,
+            fused_projection=fused,
+            bf16_kv_source=bf16_source,
+            live_swa_and_carry_verified=True,
             unsupported_remote_eager=[3, 8],
             local_full_restored=True,
             scope=__doc__,
@@ -383,5 +436,12 @@ if __name__ == "__main__":
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--source-root", type=Path, required=True)
     parser.add_argument("--output", type=Path, required=True)
+    parser.add_argument("--fused-projection", action="store_true")
+    parser.add_argument("--bf16-kv-source", action="store_true")
     args = parser.parse_args()
-    main(args.source_root.resolve(), args.output.resolve())
+    main(
+        args.source_root.resolve(),
+        args.output.resolve(),
+        fused=args.fused_projection,
+        bf16_source=args.bf16_kv_source,
+    )

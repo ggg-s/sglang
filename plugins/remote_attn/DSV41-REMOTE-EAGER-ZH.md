@@ -3,7 +3,8 @@
 `HANDOFF_PRE_LAYERWISE=remote` 现在允许 D 在 **global KV 尚未传完**时开始 decode。
 先完成 indexer、SWA/carry 和 metadata 屏障，再由 P 提供缺失 global 前缀的 sparse
 attention；每个 physical global 资源复制完成并经过 TP 有序共识后独立切 Local。
-生产代码只改插件，SMG/SGL 核心无新增修改。D Remote 支持 batch 1/2/4 分段 CUDA graph；
+SMG 无新增修改。D Remote 支持 batch 1/2/4 分段 CUDA graph；稳定 QKV 投影通过少量
+SGL 模型接口进入图内，动态状态更新、sparse、RPC 和 merge 留图外。
 动态 sparse、RPC、merge 仍走 eager 参考计算，未证明生产性能收益。
 
 ## 数据和请求链路
@@ -108,16 +109,22 @@ backend、1/2/4 buckets、cuda-python，且不使用 torch.compile、debug-eager
 - 原生 `candidate_all/candidate_c2_all/candidate_unfiltered/candidate_filtered` full variants
   全部保留。同一 batch 的 Remote native keys 复用一套分段图；图外按本轮原生标签设置
   执行作用域，并在回放结束或异常时恢复。variant 标签和 limits 纳入启动 TP 共识。
-- 图内保留 attention 后投影、norm、MLP/MoE 等稳定计算；图外为 native decode metadata
-  raw→full 升级、原生 attention prepare、attention/sparse 选择、RPC 和 merge。
-  首版 prepare 整段 eager，**QKV 投影也暂留图外**：该原生区域还包含 fused SWA 写入、
-  compressor/indexer、carry 与多流 fork/join，不能只截最后一次 attention 而冻结写地址。
-- 通过 native backend 和 MQALayer 实例方法绑定，沿用原生模型循环；不改 serving 配置或 scheduler，保留多流。回放闭包不保存 capture-time ForwardBatch，全部图外操作
-  使用本轮 live batch；捕获/预热始终 Local，不发 RPC。K/V 以单一 tensor 传递，保留共享语义。
-- metadata 一个 break，每层 prepare + attention 两个 break。L 层是 **2L+1 个 break**，
+- 图内包含 QKV 线性投影、Q norm/RoPE、attention 后投影、norm、MLP/MoE 等稳定计算。
+  图外为 native decode metadata raw→full 升级、KV norm/quantize/SWA 写入、
+  compressor/indexer/carry 更新、attention/sparse 选择、RPC 和 merge。所有动态写入读取
+  本轮 live batch，避免固化捕获时的请求、页地址和 carry。
+- SGL `MQALayer` 提供三个清晰边界：`prepare_qkv` 保留原生串行/多流路由；
+  `project_decode_qkv` 仅返回 Q、q_lora、原始 KV tensors；`update_decode_state` 消费这些
+  tensors 更新本轮状态。原有 KV helper 仅新增可选 `projected_kv`，复用原 KV 精度开关，
+  融合 wqa/wkv 不重复计算；量化 wrapper 不跨 graph/eager 桥。
+- 插件每层只绑定一次 `prepare_qkv`，替换原先三个 private prepare 绑定；保留 backend 的
+  metadata/attention 绑定，沿用原生模型循环。Remote 分离路径的 state 更新串行执行；
+  Local eager/full graph 的串行及多流分派保持原样，不修改 serving 或 scheduler 配置。
+  预热/捕获以 Local 数据初始化桥，不发 RPC；K/V 仍以单一 tensor 传递。
+- metadata 一个 break，每层 state + attention 两个 break。L 层是 **2L+1 个 break**，
   通常 **2L+2 个 CUDA segment**，每个 bucket 一套；不是整层各捕获完整模型一次。
 - rank 启动时先交换开关、buckets、模型/压缩配置及原生方法 ABI，再进入额外 capture
-  barriers。捕获实际边界纳入既有 graph manifest 共识。每个 token 固定资源状态，检测
+  barriers。投影融合模式和 KV 精度开关也纳入启动共识。捕获实际边界纳入既有 graph manifest 共识。每个 token 固定资源状态，检测
   中途 row/attempt/Local mask 变化；图路由不新增逐 decode collective。
 - 部分资源 Local 或刚完成拷贝时继续 Remote bank；全部租约经 GPU/native PD/TP 退休，
   才恢复 full bank；原有退出边界消费最后一份结果后恢复 scheduler overlap。不重新捕获图。
@@ -131,6 +138,9 @@ backend、1/2/4 buckets、cuda-python，且不使用 torch.compile、debug-eager
 已经恢复，还需原有 scheduler policy 日志。
 
 [分段图本地/TP2/4060 证据](validation/dsv41-segmented-graphs-4060.md) 明确区分 fixture 和整模验证。
+新增 QKV 入图的接口、融合/精度矩阵和回归结果见
+[QKV graph 验证记录](validation/dsv41-qkv-graphs-4060.md)。此版本需要本分支配套的
+SGL 核心接口，不能只把新插件复制到旧 SGL；启动前先执行核心接口预检。
 
 ## 确认路径
 

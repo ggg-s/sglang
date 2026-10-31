@@ -2,7 +2,8 @@
 
 此路径只用于同机单 P/D pair、纯文本、相同 TP、PP=DP=CP=1、Mooncake、
 DSpark/其他投机解码关闭，不启用 KV cache sharding。使用原生 SMG 和 `sglang.launch_server`，没有 JSON
-包装器。本次只修改插件、预检、测试和文档，没有修改 SMG/SGL 核心。
+包装器。layerwise 传输和缓存/overlap 接入在插件内；Remote 分段图另依赖本分支
+`MQALayer` 的 QKV 投影/状态边界接口。SMG 无新增修改。
 
 ## 传输与接纳
 
@@ -118,7 +119,8 @@ H2D event 与原生 receiver/metadata 的完成证明。
 - `HANDOFF_PRE_LAYERWISE=remote` 支持 [eager sparse 提前接纳与逐资源 Local](DSV41-REMOTE-EAGER-ZH.md)：
   indexer、SWA/carry 和 metadata 先就绪，global KV 未完成时开始 decode。
   D Remote 串行，全部 Local 且 GPU/TP 退休后恢复原生 graph/overlap。
-  D Remote batch 1/2/4 支持分段 graph，动态 prepare/sparse/RPC/merge 留图外；D0→D1 迁移尚未适配。
+  D Remote batch 1/2/4 支持分段 graph，稳定 QKV 投影入图，动态状态/sparse/RPC/merge
+  留图外；D0→D1 迁移尚未适配。
 - 支持 P send 和 D receive host staging；不使用原生 MHA staging 开关、uniform-FP8 TRTLLM 或 unified KV。
   不能照搬 Qwen 示例的 `--page-size 1`；沿用原生 DSV4.1 支持的页布局。
 
@@ -282,7 +284,7 @@ P overlap 不再为每个 chunk batch 重新执行接管 all_reduce。每个请�
 
 仍有本地状态检查、event query、入队账本和通知处理；这里的 0 指新增 TP 接管
 collective，不代表零 CPU 开销，也不删除模型计算/原生 scheduler 的 collective。
-SMG/SGL 核心、原生采样、future map 和 optimistic/chunk/batch 配置未修改。
+P 接管证书实现不修改 SMG/SGL 核心、原生采样、future map 或 optimistic/chunk/batch 配置。
 
 ## 路径确认与本地证据
 

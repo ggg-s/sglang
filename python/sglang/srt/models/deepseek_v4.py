@@ -1795,6 +1795,8 @@ class MQALayer(MqaAttentionBase):
         attn_backend,
         qkv_a: Optional[torch.Tensor] = None,
         q_rope: Optional[torch.Tensor] = None,
+        *,
+        projected_kv: Optional[torch.Tensor] = None,
     ) -> None:
         """Fused: rmsnorm + RoPE + write directly to FlashMLA paged cache.
 
@@ -1807,12 +1809,16 @@ class MQALayer(MqaAttentionBase):
             # Quantize the nope payload from bf16-rounded values (the fused
             # kernel quantizes from fp32 registers; the bf16 rounding moves
             # values across fp8 bins relative to bf16-sourced consumers).
-            kv = self._compute_kv_bf16(x, positions, qkv_a=qkv_a)
+            kv = self._compute_kv_bf16(
+                x, positions, qkv_a=qkv_a, projected_kv=projected_kv
+            )
             attn_backend.store_cache(
                 layer_id=self.layer_id, swa_k=kv, forward_batch=forward_batch
             )
             return
-        if qkv_a is not None:
+        if projected_kv is not None:
+            kv = projected_kv
+        elif qkv_a is not None:
             kv = qkv_a[..., self.q_lora_rank :]
         else:
             kv, _ = self.wkv(x)
@@ -1836,9 +1842,13 @@ class MQALayer(MqaAttentionBase):
         x: torch.Tensor,
         positions: torch.Tensor,
         qkv_a: Optional[torch.Tensor] = None,
+        *,
+        projected_kv: Optional[torch.Tensor] = None,
     ) -> torch.Tensor:
         """Bf16-kv path used by the DSA prefill-CP case (needs all-gather)."""
-        if qkv_a is not None:
+        if projected_kv is not None:
+            kv = projected_kv
+        elif qkv_a is not None:
             kv = qkv_a[..., self.q_lora_rank :]
         else:
             kv, _ = self.wkv(x)
@@ -1851,6 +1861,146 @@ class MQALayer(MqaAttentionBase):
             positions,
         )
         return kv
+
+    def prepare_qkv(
+        self,
+        x: torch.Tensor,
+        positions: torch.Tensor,
+        forward_batch: ForwardBatch,
+        attn_backend,
+        *,
+        q_out: Optional[torch.Tensor] = None,
+        x_quant=None,
+        q_rope_out: Optional[torch.Tensor] = None,
+        k_nope_out: Optional[torch.Tensor] = None,
+        k_rope_out: Optional[torch.Tensor] = None,
+        enable_multi_stream: bool = False,
+        low_ratio_multi_stream: bool = False,
+    ) -> Tuple[torch.Tensor, Optional[torch.Tensor]]:
+        """Native prepare dispatch, with a stable boundary for graph adapters."""
+        if enable_multi_stream:
+            # Multi-stream path always fuses cache write into the K kernel,
+            # so the bf16 KV intermediate is gone.
+            if _is_hip:
+                q = self._forward_prepare_multi_stream_hip(
+                    x,
+                    positions,
+                    forward_batch,
+                    attn_backend,
+                    q_out,
+                    x_quant=x_quant,
+                )
+            elif _is_npu:
+                q = self._forward_prepare_multi_stream_npu(
+                    x,
+                    positions,
+                    forward_batch,
+                    attn_backend,
+                    q_out,
+                    x_quant=x_quant,
+                )
+            else:
+                q = self._forward_prepare_multi_stream(
+                    x,
+                    positions,
+                    forward_batch,
+                    attn_backend,
+                    q_out,
+                    x_quant=x_quant,
+                )
+            kv = None
+        elif low_ratio_multi_stream:
+            q = self._forward_prepare_low_ratio_multi_stream(
+                x,
+                positions,
+                forward_batch,
+                attn_backend,
+                q_out,
+                x_quant=x_quant,
+            )
+            kv = None
+        else:
+            q, kv = self._forward_prepare(
+                x,
+                positions,
+                forward_batch,
+                attn_backend,
+                q_out,
+                x_quant=x_quant,
+                q_rope_out=q_rope_out,
+                k_nope_out=k_nope_out,
+                k_rope_out=k_rope_out,
+            )
+
+        return q, kv
+
+    def project_decode_qkv(
+        self,
+        x: torch.Tensor,
+        positions: torch.Tensor,
+        *,
+        q_out: Optional[torch.Tensor] = None,
+        x_quant=None,
+    ) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+        """Pure projections for non-unified V4.1 low-ratio decode.
+
+        Uses native fusion/quantization and Q norm/RoPE. It neither reads nor
+        updates request cache state. Only tensors cross the state boundary;
+        quantized input wrappers remain within the projection calculation.
+        """
+        if (
+            not self.is_dsv41
+            or self.compress_ratio not in (0, 1, 2)
+            or self.use_mega_attention
+            or self.use_fused_qk_norm_rope
+        ):
+            raise ValueError(
+                "split decode QKV requires non-unified V4.1 CUDA preparation"
+            )
+        x_linear = x_quant if x_quant is not None else x
+        qkv_a = self.wqkv_a(x_linear)[0] if self.fuse_wqa_wkv else None
+        q_lora, q_for_wqb = self._compute_q_a(x_linear, qkv_a=qkv_a)
+        q = self._compute_q_b(q_for_wqb, positions, q_out)
+        kv = (
+            qkv_a[..., self.q_lora_rank :]
+            if qkv_a is not None
+            else self.wkv(x_linear)[0]
+        )
+        return q, q_lora, kv
+
+    def update_decode_state(
+        self,
+        x: torch.Tensor,
+        q_lora: torch.Tensor,
+        kv: torch.Tensor,
+        positions: torch.Tensor,
+        forward_batch: ForwardBatch,
+        attn_backend,
+    ) -> None:
+        """Consume projected KV using this step's native SWA/carry/indexer state.
+
+        No projection is repeated. The caller must retain projection tensors
+        until these native operations complete and order them before attention.
+        """
+        if not forward_batch.forward_mode.is_decode() or self.compress_ratio not in (
+            0,
+            1,
+            2,
+        ):
+            raise ValueError("split state update requires low-ratio decode")
+        self._compute_kv_to_cache(
+            x, positions, forward_batch, attn_backend, projected_kv=kv
+        )
+        if self.compress_ratio in (1, 2) and (
+            self.compressor is not None or self.indexer is not None
+        ):
+            attn_backend.forward_low_ratio_sources(
+                layer=self,
+                x=x,
+                q_lora=q_lora,
+                positions=positions,
+                forward_batch=forward_batch,
+            )
 
     def _forward_prepare_multi_stream(
         self,
@@ -2720,59 +2870,19 @@ class MQALayer(MqaAttentionBase):
                 q_out = q_padded[:, tp_slice, :]
         attn_sink = self._local_attn_sink(kernel_num_heads)
 
-        if enable_multi_stream:
-            # Multi-stream path always fuses cache write into the K kernel,
-            # so the bf16 KV intermediate is gone.
-            if _is_hip:
-                q = self._forward_prepare_multi_stream_hip(
-                    x,
-                    positions,
-                    forward_batch,
-                    attn_backend,
-                    q_out,
-                    x_quant=x_quant,
-                )
-            elif _is_npu:
-                q = self._forward_prepare_multi_stream_npu(
-                    x,
-                    positions,
-                    forward_batch,
-                    attn_backend,
-                    q_out,
-                    x_quant=x_quant,
-                )
-            else:
-                q = self._forward_prepare_multi_stream(
-                    x,
-                    positions,
-                    forward_batch,
-                    attn_backend,
-                    q_out,
-                    x_quant=x_quant,
-                )
-            kv = None
-        elif low_ratio_multi_stream:
-            q = self._forward_prepare_low_ratio_multi_stream(
-                x,
-                positions,
-                forward_batch,
-                attn_backend,
-                q_out,
-                x_quant=x_quant,
-            )
-            kv = None
-        else:
-            q, kv = self._forward_prepare(
-                x,
-                positions,
-                forward_batch,
-                attn_backend,
-                q_out,
-                x_quant=x_quant,
-                q_rope_out=q_rope,
-                k_nope_out=k_nope,
-                k_rope_out=k_rope,
-            )
+        q, kv = self.prepare_qkv(
+            x,
+            positions,
+            forward_batch,
+            attn_backend,
+            q_out=q_out,
+            x_quant=x_quant,
+            q_rope_out=q_rope,
+            k_nope_out=k_nope,
+            k_rope_out=k_rope,
+            enable_multi_stream=enable_multi_stream,
+            low_ratio_multi_stream=low_ratio_multi_stream,
+        )
 
         if unified_fp8_prefill and is_cp_active(forward_batch):
             # kv is the packed noPE half the fused prefill store left on the kv slot.

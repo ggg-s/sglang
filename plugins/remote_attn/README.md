@@ -5,7 +5,9 @@ DSV4.1 Flash 纯文本 layerwise：[原生 PD 接入与本地验证](DSV41-LAYER
 
 单 pair 最小接入：[原生 SMG + P/D 启动说明](SINGLE-PAIR-ZH.md)。直接使用现有
 P/D/SMG 命令及插件环境，保留线上 optimistic prefill、token chunk 和传输 Batch；
-不需要 JSON 配置或启动包装器。CUDA graphs 的 TP 一致性适配也在插件内，继续依赖下述核心扩展。
+不需要 JSON 配置或启动包装器。CUDA graphs 的 TP 一致性适配在插件内；DSV4.1 稳定
+QKV 投影入图还依赖本分支 `MQALayer` 的 prepare / projection / state 边界接口，
+见 [QKV graph 验证记录](validation/dsv41-qkv-graphs-4060.md)。
 
 中文部署入口：[Progressive 生产接入手册](DEPLOYMENT-ZH.md)，对应 `codex/remote-attn-pre-layerwise`：固定发布制品、P/D 角色配置、双端 host staging、延迟回收、冷态预热、灰度验收与回退。旧 P5.18 D0→D1 实验部署保留在 [历史手册](migration/P5.18-DEPLOYMENT-LEGACY-ZH.md)。
 

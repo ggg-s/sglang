@@ -1475,13 +1475,32 @@ def dsv41_graph_settings(args):
     spec.loader.exec_module(support)
     f = support.fixture()
     outcomes = []
-    for scenario in ("same", "flag", "buckets", "abi", "variants"):
+    precision = [False]
+    environ = SimpleNamespace(
+        envs=SimpleNamespace(
+            SGLANG_DSV4_USE_BF16_KV_QUANT_SOURCE=SimpleNamespace(
+                get=lambda: precision[0]
+            )
+        )
+    )
+    for scenario in (
+        "same",
+        "flag",
+        "buckets",
+        "abi",
+        "variants",
+        "fusion",
+        "precision",
+    ):
         f.runner.attention_graph_variants = (
             SimpleNamespace(capture_labels=("candidate_filtered",), graph_limits=())
             if scenario == "variants" and args.rank == 1
             else None
         )
-        abi = capture_signature(f.mr, f.runner)
+        f.layers[0].fuse_wqa_wkv = scenario == "fusion" and args.rank == 1
+        precision[0] = scenario == "precision" and args.rank == 1
+        with patch.dict(sys.modules, {"sglang.srt.environ": environ}):
+            abi = capture_signature(f.mr, f.runner)
         if scenario == "abi" and args.rank == 1:
             abi = (False, abi[1])
         report = (
@@ -1494,7 +1513,7 @@ def dsv41_graph_settings(args):
             outcomes.append(True)
         except RuntimeError:
             outcomes.append(False)
-    assert outcomes == [True, False, False, False, False]
+    assert outcomes == [True, False, False, False, False, False, False]
     from sglang_remote_attn import hooks
     from sglang_remote_attn.dsv41_graph import DSV41GraphBackend
 

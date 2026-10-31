@@ -3701,7 +3701,7 @@ class TestRemoteAttn(CustomTestCase):
         self.assertEqual(
             rows[0]["dsv41_segments"],
             dict(
-                settings=[True, False, False, False, False],
+                settings=[True, False, False, False, False, False, False],
                 policies=[[True, True, False, True, False]] * 3 + [[True] * 5],
                 per_decode_votes=0,
             ),
@@ -9331,11 +9331,11 @@ class TestRemoteAttn(CustomTestCase):
         self.assertIsNone(b.capture_batch)
         expected = (
             ("metadata", -1),
-            ("prepare", 0),
+            ("state", 0),
             ("attention", 0),
-            ("prepare", 1),
+            ("state", 1),
             ("attention", 1),
-            ("prepare", 2),
+            ("state", 2),
             ("attention", 2),
         )
         self.assertEqual(b.manifest()[0], tuple((n, expected) for n in (1, 2, 4)))
@@ -9415,7 +9415,7 @@ class TestRemoteAttn(CustomTestCase):
         def failed(**kw):
             raise RuntimeError("side-stream launch failed")
 
-        f.layers[1]._dsv41_graph_originals["_forward_prepare_multi_stream"] = failed
+        f.layers[1].update_decode_state = failed
         with self.assertRaisesRegex(RuntimeError, "side-stream"):
             with b.execution(f.batch(1, 2)):
                 b.replay(b.remote_keys[1], b.active_batch)
@@ -9470,6 +9470,140 @@ class TestRemoteAttn(CustomTestCase):
             self.assertIsNone(f.variant_state[0])
         f.controller.targets = []
         self.assertTrue(b.can_run(fb, key))
+
+    def _dsv41_split_core(self, **options):
+        spec = importlib.util.spec_from_file_location(
+            "split_qkv_fixture",
+            ROOT / "test/manual/remote_attn/dsv41_graph_probe_support.py",
+        )
+        support = importlib.util.module_from_spec(spec)
+        spec.loader.exec_module(support)
+        return support.fixture(**options)
+
+    def test_dsv41_split_projection_state_matches_native_fusion_precision_and_aliases(
+        self,
+    ):
+        """Projected-KV reuse cannot change precision mode or repeat the GEMM."""
+        for fused in (False, True):
+            for bf16 in (False, True):
+                with self.subTest(fused=fused, bf16=bf16):
+                    f = self._dsv41_split_core(
+                        dtype=torch.bfloat16, fused=fused, bf16_source=bf16
+                    )
+                    layer = f.layers[1]
+                    fb = f.batch(2, 3)
+                    x = torch.arange(8).reshape(2, 4).to(torch.bfloat16) / 13
+                    pos = torch.tensor([3, 7], dtype=torch.bfloat16)
+                    f.attn.init_forward_metadata_in_graph(fb)
+                    reference = layer._native_prepare(x, pos, fb, f.attn)[0].clone()
+                    cache = f.cache[1].clone()
+                    carry = f.carry[1].clone()
+                    for buf in f.cache:
+                        buf.fill_(-99)
+                    for buf in f.carry:
+                        buf.zero_()
+                    f.projections.clear()
+                    q, q_lora, kv = layer.project_decode_qkv(x, pos)
+                    self.assertTrue(torch.equal(q, reference))
+                    self.assertTrue(all(bool((b == -99).all()) for b in f.cache))
+                    self.assertTrue(all(not bool(b.any()) for b in f.carry))
+                    before = list(f.projections)
+                    q_before = q.clone()
+                    lora_before = q_lora.clone()
+                    layer.update_decode_state(x, q_lora, kv, pos, fb, f.attn)
+                    self.assertEqual(before, f.projections)
+                    self.assertEqual(
+                        [kind for kind, _ in before],
+                        ["qkv", "qb"] if fused else ["qa", "qb", "kv"],
+                    )
+                    self.assertTrue(torch.equal(f.cache[1], cache))
+                    self.assertTrue(torch.equal(f.carry[1], carry))
+                    self.assertTrue(torch.equal(q, q_before))
+                    self.assertTrue(torch.equal(q_lora, lora_before))
+
+    def test_dsv41_split_qkv_keeps_quantized_wrappers_inside_projection_boundary(self):
+        """Opaque quantized Q inputs must not escape to the eager state bridge."""
+        f = self._dsv41_split_core()
+        layer = f.layers[2]
+        original = layer._compute_q_b
+        layer._normalize_q_lora = lambda q: (q, SimpleNamespace(values=q, scale=2))
+        layer._compute_q_b = lambda packed, pos, q_out=None: original(
+            packed.values * packed.scale, pos, q_out
+        )
+        x = torch.ones(2, 4)
+        pos = torch.tensor([1.0, 2.0])
+        q, lora, kv = layer.project_decode_qkv(x, pos, x_quant=x * 3)
+        self.assertTrue(torch.equal(q, x * 12 + pos[:, None]))
+        self.assertTrue(torch.equal(lora, x * 3))
+        self.assertTrue(torch.equal(kv, x * 9 + 0.125))
+        self.assertTrue(all(torch.is_tensor(v) for v in (q, lora, kv)))
+
+    def test_dsv41_native_prepare_router_preserves_all_original_dispatch_branches(self):
+        """Extracted routing must retain native HIP/NPU/CUDA/low-ratio/serial calls."""
+        f = self._dsv41_split_core()
+        router = f.core.prepare_qkv
+        values = []
+        owner = SimpleNamespace()
+        for tag, name in enumerate(
+            (
+                "_forward_prepare_multi_stream_hip",
+                "_forward_prepare_multi_stream_npu",
+                "_forward_prepare_multi_stream",
+                "_forward_prepare_low_ratio_multi_stream",
+                "_forward_prepare",
+            )
+        ):
+
+            def native(*args, _tag=tag, **kw):
+                values.append((_tag, args, kw))
+                return (_tag, "kv") if _tag == 4 else _tag
+
+            setattr(owner, name, native)
+        for hip, npu, multi, low, expected in (
+            (True, False, True, False, 0),
+            (False, True, True, False, 1),
+            (False, False, True, True, 2),
+            (False, False, False, True, 3),
+            (False, False, False, False, 4),
+        ):
+            router.__globals__.update(_is_hip=hip, _is_npu=npu)
+            q, kv = router(
+                owner,
+                "x",
+                "pos",
+                "fb",
+                "backend",
+                q_out="q",
+                x_quant="quant",
+                q_rope_out="rope",
+                k_nope_out="nope",
+                k_rope_out="krope",
+                enable_multi_stream=multi,
+                low_ratio_multi_stream=low,
+            )
+            self.assertEqual(q, expected)
+            self.assertEqual(kv, "kv" if expected == 4 else None)
+            self.assertEqual(values[-1][1], ("x", "pos", "fb", "backend", "q"))
+            self.assertEqual(values[-1][2]["x_quant"], "quant")
+            if expected == 4:
+                self.assertEqual(values[-1][2]["q_rope_out"], "rope")
+
+    def test_dsv41_split_projection_rejects_unsupported_modes_before_state_mutation(
+        self,
+    ):
+        """The narrow split contract must reject fused QK/mega/non-low-ratio use."""
+        for flag, value in (
+            ("use_fused_qk_norm_rope", True),
+            ("use_mega_attention", True),
+            ("compress_ratio", 4),
+            ("is_dsv41", False),
+        ):
+            f = self._dsv41_split_core()
+            setattr(f.layers[0], flag, value)
+            with self.assertRaisesRegex(ValueError, "split decode QKV"):
+                f.layers[0].project_decode_qkv(torch.ones(1, 4), torch.zeros(1))
+            self.assertFalse(f.projections)
+            self.assertTrue(all(bool((b == -99).all()) for b in f.cache))
 
 
 if __name__ == "__main__":
