@@ -434,7 +434,7 @@ PDMux 对 TPOT 的相对改善并未衰减（12K：47.0→34.9，−26%；32K：
 
 两项叠加造成：
 
-1. **每请求 prefill 翻倍**：12K 未命中 16.5% × 8,635 = 1,425 token；32K 未命中 15.0% × 18,593 = 2,789 token。PDMux 靠 decode 空隙隐藏 prefill，量翻倍后藏不完的部分落到 TPOT 上。
+1. **每请求 prefill 翻倍**：12K 未命中 16.5% × 8,635 = 1,425 token；32K 未命中 15.0% × 18,593 = 2,789 token。PDMux 依靠 kernel 级并发来摊掉这部分工作，量翻倍后可并发的部分摊不完，剩余部分落到 TPOT 上。
 2. **并发减半**：12K 用 64、32K 只能 32（KV 限制）。decode 批小一半，每步权重读取成本不变，投机的固定开销摊在 32 个而非 64 个请求上。
 
 结论：**32K 下在无法提高并发时，开 MTP 的 TPOT 是净亏的**（39.1 vs base 36.6）。MTP 的收益依赖大 batch 摊薄固定开销，而长上下文恰恰逼迫降低并发。C 组的真实收益在吞吐（288 vs 263 RPM，+9.5%），不在 TPOT。
@@ -471,11 +471,56 @@ if not write_back and (node.parent != self.root_node and not node.parent.backupe
 
 **HiCache 默认的 `write_through` 策略在长上下文高压力下失效；必须改用 `write_back`，HiCache 才能发挥作用。** 12K 场景下 HiCache 无效，是因为工作集本就在 GPU 容量内（命中率已贴近理论上限），与写入策略无关。
 
+## 13c. Trace 证据：并发到底从哪来
+
+三份 torch profiler trace，同一 12K 负载、32 并发，只改配置。分析口径：把 GPU kernel 事件按 CUDA stream 分组，合并区间后计算「多 stream 同时忙」的时长。
+
+| 组 | RPM | CUDA stream 数 | GPU 忙（并集） | **并发内核时间** | 主 stream 平均 kernel |
+|---|---:|---:|---:|---:|---:|
+| base | 708 | 3 | 94.4% | **3.4%** | 0.043 ms |
+| MTP 单独 | 535（−24%） | 5 | 89.5% | **0.5%** | 0.090 ms |
+| MTP + PDMux | 852（+20%） | 5 | 94.3% | **24.7%** | 0.181 ms |
+
+### 结论
+
+**并发完全由 PDMux 产生，MTP 不产生并发。**
+
+- MTP 单独时并发仅 0.5%，**低于 base 的 3.4%**。EAGLE 的 draft(×3) → verify 是严格串行依赖，verify 必须等全部 draft 完成，中间插不进任何工作，因此 MTP 单独反而把 GPU 并行度压得更低。
+- PDMux 把前向切成 K 层片段分到两条 stream，并发从 0.5% 升到 24.7%（约 50 倍）。
+
+两个组件各提供一个必要条件：
+
+| 组件 | 提供 | 证据 |
+|---|---|---|
+| PDMux | 重叠的**通道** | 并发 0.5% → 24.7% |
+| MTP | 值得重叠的**工作量** | 主 stream kernel 平均时长 0.043 → 0.090 → 0.181 ms |
+
+三个组合的对应结果：
+
+```
+只有通道，工作量不足  → base+PDMux = 613 RPM（−13%）
+只有工作量，没有通道  → MTP 单独   = 535 RPM（−24%）
+通道 + 工作量         → MTP+PDMux = 852 RPM（+20%）
+```
+
+### 对「空隙」说法的修正
+
+先前把机制描述为「PDMux 把 prefill 藏进 decode 的空隙」。trace 显示这个说法不准确：
+
+- base 的 GPU 忙占比已达 94.4%，**时间轴上几乎没有空闲**；
+- 真正的差别不在「有没有空闲时间」，而在「同一段时间里能同时跑几个 kernel」。
+
+所以 PDMux 的机制是：**让两条 stream 的 kernel 真正并发执行**，用计算密集的 kernel 填充访存受限 kernel 留下的 SM 空转，而不是利用时间轴上的空洞。
+
+### 局限
+
+三份 trace 的时间窗口与请求量不完全对齐（MTP 单独那组因吞吐更低、耗时更长），因此适合做结构性对比（stream 数、并发比例、kernel 粒度），不宜直接换算成吞吐差值。
+
 ## 14. 主要结论
 
 1. **Mamba 槽决定并发上限**：`并发 = ⌊槽数 / S⌋`。128→25、160→32、336→64 三处吻合。
 2. **Mamba 槽同时决定前缀缓存容量**：空余 = `槽数 − 并发 × S`。满载时 running 请求会吃光缓存槽，前缀缓存被静默关闭（命中率塌回 system prompt 的 ~20%）。这是本轮最重要的坑。
-3. **PDMux 是 decode 优先策略**：decode lane 拿高优先级，prefill 只能填空隙。decode 受限时提升吞吐，prefill 受限时牺牲吞吐换 TPOT。
+3. **PDMux 的本质是让两条 stream 的 kernel 真正并发执行**（trace 实测：并发内核时间 0.5% → 24.7%，见第 13c 节），而不是把工作塞进时间轴的空洞——base 的 GPU 忙占比本就有 94.4%。decode 的高优先级决定并发时谁先执行，因此 decode 受限时提升吞吐，prefill 受限时牺牲吞吐换 TPOT。
 4. **PDMux 依赖投机**：无投机时 12K −13.4%、32K −5.3%、64K −3.5%，随上下文变长收敛到 0 但从不转正；有投机时 +20%（12K）/ +33%（32K）。同一条 PDMux 在 P=200 的 prefill 受限负载下是 −12%。
 5. **SM 硬预留是纯损失**：分区不改善 TPOT，只削弱 prefill。用 `prefill_full_sm` + 流优先级即可。
 6. **HiCache 只在工作集超出 GPU 容量时才有价值**：合成 P=200 负载下 16 GB 无效、64 GB 让命中率 20%→83.3%、QPS +163%；12K 真实负载工作集 820k < KV 池 990k 时，加 64 GB 也只提升 0.1 个百分点、QPS 反降 5.5%。
@@ -483,8 +528,10 @@ if not write_back and (node.parent != self.root_node and not node.parent.backupe
 8. **MTP 在 32K 下单独使用是 −32%**（263→178 RPM，命中率 85.0%→68.6%）：draft KV 把池从 1.548M 压到 1.196M，低于 64 agent 的保留需求 1.19M。配 `write_back` 的 HiCache 后回到 85.0% / 275 RPM，再加 PDMux 到 288 RPM（+9.5%）。**32K 下 HiCache 对 MTP 是必需项，不是优化项。** 12K 下同配置 MTP 单独为 +3.3%，因为工作集 576k 装得进 990k 的池。
 9. **MTP 单独在 64 并发下是负收益**（−24%），TPOT 33.8→47.8 ms；只有配合 PDMux 才转为正收益。该结论仅在高命中、decode 完全饱和时成立；真实 12K 负载下 MTP 单独为 +3.3%。
 10. **长上下文放大 PDMux（配 MTP）的收益，也放大它的代价**：12K 时 +20.3% 吞吐，32K 时 +32.6%；TTFT p95 代价从 +104% 涨到 +1,613%。但 `base+pdmux` 在 32K/64K 仍为负，说明这份增量来自 MTP 而非长上下文本身。
-11. **PDMux 的收益随并发单调下降**：32K 下 24 并发 +12.9%、32 并发 +9.5%、64 并发 −8.6%。decode 越饱和，可重叠的空隙越少；64 并发时两条 lane 抢同一条 HBM，重叠只是重新分配时间。base 的绝对吞吐在 64 并发最高（301 RPM），全功能配置在 32 并发到顶（288 RPM），两线在 32–64 间交叉。
+11. **PDMux 的收益随并发单调下降**：32K 下 24 并发 +12.9%、32 并发 +9.5%、64 并发 −8.6%。并发升高后两条 lane 抢同一条 HBM 带宽，可并发的 kernel 各自更接近带宽上限，重叠增益被摊薄。base 的绝对吞吐在 64 并发最高（301 RPM），全功能配置在 32 并发到顶（288 RPM），两线在 32–64 间交叉。
 12. **decode 成本对上下文几乎不敏感**：每并发请求吞吐 12K 23.6 → 32K 22.6 → 64K 21.5 tok/s，5 倍上下文只降 9%。MoE 模型下 attention 占比小，这是 PDMux 单独吃不到长上下文红利的原因。
+
+13. **并发来自 PDMux，工作量来自 MTP**（第 13c 节 trace 实测）：并发内核时间 base 3.4%、MTP 单独 **0.5%**、MTP+PDMux **24.7%**。MTP 不产生并发（draft→verify 严格串行），只把每步 kernel 平均时长从 0.043ms 拉到 0.181ms；PDMux 提供并发通道。两者缺一即为负收益。
 
 ## 15. 已知局限
 
@@ -499,7 +546,7 @@ if not write_back and (node.parent != self.root_node and not node.parent.backupe
 
 ### 一句话
 
-**PDMux 是 decode 优先的分流器**：给 decode 一条高优先级 lane，让 prefill 与投机解码的 draft/verify 在 decode 的空隙中执行。它不产生新算力，只重叠原本串行的工作。
+**PDMux 的作用是让两条 stream 的 kernel 真正并发执行。** 它给 decode 一条高优先级 lane，把前向切成 K 层片段分到两条 stream 上交替，使计算密集的 kernel 能填充访存受限 kernel 留下的 SM 空转。它不产生新算力，只把原本串行的工作变成并发（trace 实测并发内核时间 0.5% → 24.7%，见第 13c 节）。
 
 ### 优势
 
@@ -552,11 +599,12 @@ if not write_back and (node.parent != self.root_node and not node.parent.backupe
 ### 收益的量化模型
 
 ```
-PDMux 收益 ≈ f(decode 受限程度) × (1 − prefill 占比)
+PDMux 收益 ≈ (可并发的 kernel 时间占比) × (单个 kernel 内部的 SM 空转率) − (切分与同步开销)
 ```
 
-- decode 越受限（batch 大、上下文长、访存受限）→ 空隙越多 → 收益越大
-- prefill 越少（命中率越高）→ 越不会饿死 prefill → 收益越大
+- 可并发时间越多 → 收益越大（trace：0.5% → 24.7%）
+- 单个 kernel 内部空转越多（访存受限越严重）→ 填充越有价值 → 收益越大
+- 切分与同步是每步的固定开销；步骤越短（batch 小、无投机）时它占比越高，因而转为负收益
 
 l32b 同时满足这两条（32K 长上下文 + 97% 命中），因此 +32.6% 为全部实验最高。C 组两条都较差，仅 +9.5%。
 
