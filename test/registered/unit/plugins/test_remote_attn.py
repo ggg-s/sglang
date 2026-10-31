@@ -2768,6 +2768,156 @@ class TestRemoteAttn(CustomTestCase):
         self.assertEqual([p["cmd"] for role, p in calls], ["submit"])
         self.assertNotIn("live-long", gateway.active)
 
+    def test_gateway_capacity_wait_refreshes_finished_source_members(self):
+        gateway, namespace, calls = self._gateway()
+        template = copy.deepcopy(gateway.journal["long"])
+        longs = ["long", "long-1", "long-2", "long-3"]
+        shorts = [f"short-{i}" for i in range(5)]
+        for rid in longs[1:] + shorts:
+            gateway.journal[rid] = dict(template, rid=rid, drid=f"dst-{rid}")
+        original = gateway.dst.send
+
+        def target(payload, **kwargs):
+            if payload["cmd"] == "status":
+                return {"reqs": [{"rid": "background"}], "max_running": 8}
+            return original(payload, **kwargs)
+
+        def finish_shorts(_delay):
+            self.assertEqual(gateway.src_worker_state(), "DRAINING")
+            for rid in shorts:
+                gateway.journal[rid]["finished"] = True
+
+        gateway.dst.send = target
+        with (
+            patch.dict(os.environ, {"HANDOFF_DRAIN_SLOT_WAIT_S": "1"}),
+            patch.object(namespace["time"], "sleep", side_effect=finish_shorts),
+        ):
+            status = gateway.start_drain(["dst"])
+        self.assertEqual(status["state"], "REQUESTED")
+        self.assertEqual(status["migration_members"], longs)
+        self.assertEqual(status["slot_gate"]["members"], 4)
+        self.assertEqual(status["members"], longs + shorts)
+        reservations = [p for role, p in calls if p["cmd"] == "reserve"]
+        self.assertEqual(len(reservations), 1)
+        self.assertEqual([x["rid"] for x in reservations[0]["items"]],
+                         [f"dst-{rid}" for rid in longs])
+        self.assertTrue(all(gateway.journal[r]["drain_member"] for r in shorts))
+        # Run the real reconcile state machine to SAFE_TO_STOP. Completed
+        # shorts still have source tracking/KV that must be released.
+        epoch = gateway.journal["__drain__"]["epoch"]
+        source_rows = {
+            rid: {"rid": rid, "output_len": 128 if rid in shorts else 32,
+                  "kv_committed_len": 32799, "frozen": False,
+                  "finished": rid in shorts}
+            for rid in longs + shorts
+        }
+        target_states = {}
+        frozen, imported, released = [], [], []
+
+        def source_rpc(payload, **kwargs):
+            cmd = payload["cmd"]
+            if cmd in ("status", "status_lite"):
+                return {"reqs": copy.deepcopy(list(source_rows.values()))}
+            if cmd == "freeze_all":
+                self.assertEqual(payload["epoch"], epoch)
+                self.assertEqual(payload["rids"], longs)
+                frozen.extend(payload["rids"])
+                for rid in payload["rids"]:
+                    source_rows[rid]["frozen"] = True
+                return {"results": [
+                    {"rid": rid, "output_len": 32, "migration_epoch": epoch,
+                     "transfer": {"token": f"kv-{rid}"}}
+                    for rid in payload["rids"]
+                ]}
+            if cmd == "release":
+                rid = payload["rid"]
+                if rid in longs:
+                    self.assertTrue(target_states[rid]["local_ready"])
+                released.append(rid)
+                source_rows.pop(rid, None)
+                return {"released": True}
+            raise AssertionError(payload)
+
+        def target_rpc(payload, **kwargs):
+            cmd = payload["cmd"]
+            if cmd == "status":
+                return {"reqs": [{"rid": "background"}],
+                        "reserved": {f"dst-{rid}": {} for rid in longs},
+                        "target_states": copy.deepcopy(list(target_states.values()))}
+            if cmd == "import_wave":
+                for item in payload["items"]:
+                    self.assertEqual(item["epoch"], epoch)
+                    rid = item["rid"].removeprefix("dst-")
+                    self.assertIn(rid, longs)
+                    imported.append(rid)
+                    target_states[rid] = {
+                        "handoff_id": rid, "migration_epoch": epoch,
+                        "new_tokens": 1, "import_done_at": time.time(),
+                        "local_ready": True,
+                    }
+                return {}
+            raise AssertionError(payload)
+
+        gateway.src.send = source_rpc
+        gateway.dst.send = target_rpc
+        for _ in range(4):
+            gateway._facts_at = 0.0
+            gateway._adopt_at = time.monotonic()
+            gateway._reconcile_once()
+        final = gateway.drain_status()
+        self.assertEqual(final["state"], "SAFE_TO_STOP")
+        self.assertTrue(final["source_clean_all_ranks"])
+        self.assertCountEqual(frozen, longs)
+        self.assertCountEqual(imported, longs)
+        self.assertCountEqual(released, longs + shorts)
+        self.assertEqual(source_rows, {})
+        self.assertTrue(all(gateway.journal[r]["source_released"]
+                            for r in longs + shorts))
+
+    def test_gateway_completed_members_keep_release_bookkeeping(self):
+        gateway, namespace, calls = self._gateway()
+        gateway.journal["__drain__"] = {
+            "drain_id": "pending", "wave_id": "wave", "members": ["long"],
+            "preflight_pending": True, "epoch": "epoch", "wave": {},
+            "state": "REQUESTED", "admission_fenced_at": time.time(),
+        }
+        gateway.journal["long"]["finished"] = True
+        gateway._prepare_drain()
+        status = gateway.drain_status()
+        self.assertEqual(status["members"], ["long"])
+        self.assertEqual(status["migration_members"], [])
+        self.assertEqual(status["reserve_tokens"], 0)
+        self.assertTrue(gateway.journal["long"]["drain_member"])
+        self.assertFalse(any(p["cmd"] == "reserve" for role, p in calls))
+        # The existing reconcile/release paths must still see this row.
+        drain, entries = gateway._drain_snapshot()
+        gateway._sync_member(entries["long"], {
+            "long": {"rid": "long", "finished": True,
+                     "output_len": 128, "frozen": False},
+        }, {}, {}, {})
+        self.assertEqual(entries["long"]["phase"], "done")
+        def release(payload, **kwargs):
+            self.assertEqual(payload["cmd"], "release")
+            calls.append(("src", payload))
+            return {"released": True}
+        gateway.src.send = release
+        gateway._drain_release(drain, entries)
+        self.assertTrue(entries["long"]["source_released"])
+
+    def test_gateway_preflight_tracks_existing_target_owned_members(self):
+        gateway, namespace, calls = self._gateway()
+        gateway.journal["long"]["owner"] = "dst"
+        # Simulate the cutover completing while preflight waits on migration_lock.
+        drain = {"drain_id": "pending", "wave_id": "wave", "members": ["long"],
+                 "preflight_pending": True, "epoch": "epoch", "wave": {},
+                 "state": "REQUESTED", "admission_fenced_at": time.time()}
+        gateway.journal["__drain__"] = drain
+        gateway._prepare_drain()
+        self.assertEqual(gateway.journal["__drain__"]["members"], ["long"])
+        self.assertEqual(gateway.journal["__drain__"]["migration_members"], [])
+        self.assertTrue(gateway.journal["long"]["drain_member"])
+        self.assertFalse(any(p["cmd"] == "reserve" for role, p in calls))
+
     def test_gateway_capacity_failure_reopens_only_before_freeze(self):
         gateway, namespace, calls = self._gateway()
         original = gateway.dst.send

@@ -4023,6 +4023,16 @@ class Gateway:
             flush=True,
         )
 
+    def _drain_migration_members(self, drain):
+        """Refresh demand without dropping naturally completed rows from cleanup."""
+        with self.journal_lock:
+            return [
+                rid for rid in drain.get("members") or []
+                if not (self.journal.get(rid) or {}).get("finished")
+                and (self.journal.get(rid) or {}).get("phase") != "done"
+                and (self.journal.get(rid) or {}).get("owner", "src") == "src"
+            ]
+
     @_serialize_migration
     def _prepare_drain(self):
         # Idempotent after restart and serialized with every legacy cutover.
@@ -4030,15 +4040,10 @@ class Gateway:
         if not drain or not drain.get("preflight_pending"):
             return
         mode = drain.get("mode") or "d2d"
-        # A cutover already in progress at the fence may have finished while
-        # we waited. It now owns its target reservation; do not reserve twice.
-        members = [
-            rid
-            for rid in drain["members"]
-            if not (entries.get(rid) or {}).get("finished")
-            and (entries.get(rid) or {}).get("owner", "src") == "src"
-        ]
-        drain["members"] = members
+        # Keep the original fence membership for reconciliation and release.
+        # Only unfinished source-owned rows need destination execution slots.
+        members = self._drain_migration_members(drain)
+        drain["migration_members"] = members
         drain["preflight_started_at"] = time.time()
         self._drain_persist(drain)
         gate_started = time.monotonic()
@@ -4069,6 +4074,8 @@ class Gateway:
                     and load + len(members) > max_run
                 ):
                     time.sleep(0.1)
+                    members = self._drain_migration_members(drain)
+                    drain["migration_members"] = members
                     try:
                         st_now = self.dst.send({"cmd": "status"}, timeout=2)
                         tps = st_now.get("tp_rank_results") or [st_now]
@@ -4109,12 +4116,20 @@ class Gateway:
             "checked_at": time.time(),
             "elapsed_ms": round((time.monotonic() - gate_started) * 1000, 1),
         }
+        if mode != "natural":
+            with self.journal_lock:
+                drain["reserve_tokens"] = sum(
+                    int((self.journal.get(rid) or {}).get("prompt_len") or 0)
+                    + int((self.journal.get(rid) or {}).get("max_new") or 0)
+                    + 64
+                    for rid in members
+                )
         if mode != "natural" and members:
             if not self._pre_reserve_drain(drain, members):
                 self._finish_drain_preflight(drain)
                 return
         with self.journal_lock:
-            for rid in members:
+            for rid in drain["members"]:
                 e = self.journal.get(rid)
                 if isinstance(e, dict):
                     e["drain_id"] = drain["drain_id"]
@@ -4169,6 +4184,7 @@ class Gateway:
             "terminal": d.get("state") in self.DRAIN_DONE + ("ROLLED_BACK", "FAILED_UNSAFE"),
             "requires_intervention": d.get("state") == "FAILED_UNSAFE",
             "admission_fenced_at": d.get("admission_fenced_at"),
+            "migration_members": list(d.get("migration_members") or []),
             "preflight_pending": bool(d.get("preflight_pending")),
             "preflight_ms": d.get("preflight_ms"),
             "preflight_started_at": d.get("preflight_started_at"),

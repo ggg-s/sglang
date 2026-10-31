@@ -87,3 +87,21 @@ GPU 上仍需按原命令重跑 32K/128、token 32 drain、256/16 短流量，�
 3 轮，与 `--short 0` 对照。保存成员快照、短请求路由和 TTFT/E2E、drain 时长、
 源所有 rank 资源归零证明。另分别在导入前、导入后断开 D1，确认安全回滚与
 FAILED_UNSAFE 两种结果，且 driver 总会产出失败结果文件。
+
+## Source completion during the capacity wait
+
+Refresh migration demand as well as destination load on every slot-wait tick.
+Keep `members` as the complete admission-fence snapshot for reconciliation,
+source resource release and outcomes. `migration_members` records only unfinished
+source-owned rows at preflight; only these rows need migration reservations.
+
+If 5 of the original 9 rows finish during the wait, a destination with load 1
+and max_running 8 now admits the remaining 4 (`1 + 4 <= 8`). The 5 completed
+rows remain in the drain's cleanup bookkeeping. Demand that still exceeds
+capacity after HANDOFF_DRAIN_SLOT_WAIT_S safely rolls back before freeze.
+
+The new CPU regression exercises 9-to-4 demand shrinkage, four-row reservation
+and freeze/import, release of all nine source rows, and SAFE_TO_STOP. Additional
+cases preserve cleanup records for rows completed or target-owned before
+preflight. Worker RPCs are simulated; this does not establish GPU/TE latency
+or throughput results.
