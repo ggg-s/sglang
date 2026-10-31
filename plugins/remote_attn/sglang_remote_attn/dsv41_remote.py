@@ -1,7 +1,8 @@
-"""First post-PD decode eager Remote sparse MLA; no early admission.
+"""Eager sparse Remote with per-resource Local ownership after early admission.
 
 D owns native top-k/indexer, mutable SWA/carry and newly compressed rows. P owns
-only an immutable completed-prefix read lease. Native PD must finish first.
+an immutable completed-prefix read lease until GPU/PD/TP lifetime retirement.
+The native-complete one-forward window remains a compatibility fallback.
 """
 
 import functools
@@ -88,8 +89,10 @@ def register(source):
     ctx.dsv41_pages = tuple(int(x) // page for x in pages)
     # register is called after native forward/result GPU proof; readiness is
     # still fenced explicitly before any socket worker may read shared storage.
-    ctx.dsv41_ready = torch.cuda.Event()
-    ctx.dsv41_ready.record(torch.cuda.current_stream())
+    ctx.dsv41_ready = getattr(source, "final_event", None)
+    if ctx.dsv41_ready is None:
+        ctx.dsv41_ready = torch.cuda.Event()
+        ctx.dsv41_ready.record(torch.cuda.current_stream())
     source.service = dict(
         host=hub.host,
         port=hub.port,
@@ -109,7 +112,9 @@ def register(source):
                 swa="D-native",
                 carry="D-native",
             ),
-            boundary="first-post-PD-decode",
+            boundary="progressive-sparse"
+            if getattr(source, "schema", None)
+            else "first-post-PD-decode",
             at=time.monotonic(),
         ),
     )
@@ -145,7 +150,17 @@ def execute(job, stream, cache):
         raise RuntimeError("Remote source request attempt/row changed; retaining KV")
     if source.cache_lease is not None:
         source.cache_lease.check()
-    if not _poll_success(source.req.disagg_kv_sender):
+    progressive = bool(getattr(source, "schema", None))
+    if progressive:
+        from sglang.srt.disaggregation.base.conn import KVPoll
+
+        if (
+            source.error
+            or source.req.disagg_kv_sender.poll() == KVPoll.Failed
+            or not source.barrier_ready
+        ):
+            raise RuntimeError("Remote read before native indexer/state barrier")
+    if not progressive and not _poll_success(source.req.disagg_kv_sender):
         raise RuntimeError("Remote read before native PD completion")
     header = job.header
     layer_id, ratio = int(header["layer"]), int(header["ratio"])
@@ -203,6 +218,9 @@ class Target:
     calls: int = 0
     closed: bool = False
     touched: set = field(default_factory=set)
+    progressive: bool = False
+    local_entries: set = field(default_factory=set)
+    resource_ids: object = None
     row: int = field(init=False)
     handle: object = field(init=False)
 
@@ -308,7 +326,8 @@ def commit(original, queue, dr, *, keep_receiver=False):
 def release(req, reason="native-release"):
     target = getattr(req, "_dsv41_remote", None)
     if target is not None:
-        target.close(reason)
+        if not getattr(target, "progressive", False):
+            target.close(reason)
     else:
         offered = getattr(req, "_dsv41_remote_offer", None)
         if offered is not None:
@@ -333,8 +352,31 @@ def forward(controller, original, runner, fb, *args, **kwargs):
     ]
     result = original(runner, fb, *args, **kwargs)
     for target in active:
-        target.close("first-post-PD-eager-decode-complete")
+        if not getattr(target, "progressive", False):
+            target.close("first-post-PD-eager-decode-complete")
     return result
+
+
+def resource_local(target, pool, layer, ratio):
+    if not getattr(target, "progressive", False):
+        return False
+    producer = pool.source_layer_of(layer)
+    if target.resource_ids is None:
+        schema = target.controller._schema(
+            target.controller.scheduler.disagg_decode_prealloc_queue.kv_manager
+        )
+        entries = {}
+        for i, entry in enumerate(schema["entries"]):
+            if entry[0] == "kv":
+                key = tuple(entry[1:3])
+                if key in entries:
+                    raise RuntimeError("ambiguous DSV4.1 sparse global producer")
+                entries[key] = i
+        target.resource_ids = entries
+    entry = target.resource_ids.get((ratio, producer))
+    if entry is None:
+        raise RuntimeError("missing DSV4.1 sparse global producer")
+    return entry in target.local_entries
 
 
 def attention(
@@ -388,28 +430,13 @@ def attention(
             cos_sin_cache=cos_sin_cache,
             **kwargs,
         )
-    # In a mixed batch retain the native outputs for ordinary requests. Its
-    # cache store runs once; only Remote rows replace their attention output.
-    native_output = None
-    if any(native_rows):
-        native_output = original(
-            backend,
-            q,
-            k,
-            v,
-            layer,
-            forward_batch,
-            compress_ratio,
-            save_kv_cache=save_kv_cache,
-            attn_sink=attn_sink,
-            cos_sin_cache=cos_sin_cache,
-            **kwargs,
-        )
+    # Eager sparse evaluation covers ordinary rows too. Invoking the native
+    # full-batch kernel here would read an unfinished Remote global prefix.
     if cos_sin_cache is not None or attn_sink is None or k is not v:
         raise ValueError("Remote eager requires native pre-rotated shared KV and sink")
     pool = backend.token_to_kv_pool
     core = backend.forward_metadata.core_attn_metadata
-    if save_kv_cache and native_output is None:
+    if save_kv_cache:
         backend.store_cache(layer.layer_id, k, forward_batch)
     if q.ndim not in (3, 4) or q.shape[-1] != 512:
         raise ValueError("Remote sparse query layout changed")
@@ -434,13 +461,14 @@ def attention(
     )
     outputs = []
     for row, rpi in enumerate(req_rows):
-        if native_rows[row]:
-            outputs.append(native_output[row])
-            continue
         target = controller.remote_targets.get(int(rpi))
         selected = [i for i in extra_ids[row][: extra_lens[row]] if i >= 0]
         local_ids, remote = selected, []
-        if target is not None and compress_ratio:
+        if (
+            target is not None
+            and compress_ratio
+            and not resource_local(target, pool, layer.layer_id, compress_ratio)
+        ):
             pages = (
                 controller.scheduler.req_to_token_pool.req_to_token[
                     int(rpi), : seq_lens[row] : pool.page_size

@@ -10,7 +10,7 @@ import struct
 from . import dsv41_staging
 
 logger = logging.getLogger(__name__)
-WIRE = "dsv41-flat-v1"
+WIRE = "dsv41-flat-v2"
 
 
 def install(controller, manager, role):
@@ -36,8 +36,10 @@ def install(controller, manager, role):
             manager._staging_ctx = PrefillStagingContext()
         manager._dsv41_receive_sender_ready = True
         return
-    if not controller.config.recv_host_staging:
+    progressive = getattr(controller, "dsv41_remote", False)
+    if not controller.config.recv_host_staging and not progressive:
         return
+    manager._dsv41_progressive_pool = controller.pool if progressive else None
     from sglang.srt.disaggregation.common.staging_handler import (
         DecodeStagingContext,
         DecodeStagingHandler,
@@ -49,7 +51,7 @@ def install(controller, manager, role):
         manager._register_staging_memory,
         manager.kv_args,
         device_type="cuda",
-        pin_memory=True,
+        pin_memory=controller.config.recv_host_staging,
     )
     manager._staging_ctx = ctx
     manager.enable_staging = True
@@ -74,7 +76,8 @@ def install(controller, manager, role):
         owners = manager.engine._dsv41_receive_owners = []
     owners.append((manager, ctx.allocator, tensors))
     logger.info(
-        "[dsv41-receive] pinned native ring enabled bytes=%s entries=%s",
+        "[dsv41-receive] native ring enabled pinned=%s bytes=%s entries=%s",
+        controller.config.recv_host_staging,
         ctx.allocator.total_size,
         len(tensors),
     )
@@ -198,6 +201,13 @@ def allocate(original, manager, msg):
             _, offset, rnd, end, _ = infos[index]
         else:
             required = pages * sum(manager.kv_args.kv_item_lens[i] for i in entries)
+            if (
+                getattr(manager, "_dsv41_progressive_pool", None) is not None
+                and required > manager._staging_ctx.allocator.total_size
+            ):
+                raise ValueError(
+                    "progressive scatter cannot fall back to direct page writes"
+                )
             result = manager._staging_ctx.allocator.assign(required)
             while len(infos) <= index:
                 infos.append((-1, -1, 0, -1, 0))
@@ -295,11 +305,58 @@ def scatter(
         for i in entries:
             stride = manager.kv_args.kv_item_lens[i]
             size = num_pages * stride
-            tensors[i].view(torch.uint8).reshape(-1, stride).index_copy_(
-                0, page_ids, gpu[cursor : cursor + size].reshape(num_pages, stride)
-            )
+            dst = tensors[i].view(torch.uint8).reshape(-1, stride)
+            src = gpu[cursor : cursor + size].reshape(num_pages, stride)
+            pool = getattr(manager, "_dsv41_progressive_pool", None)
+            entry = manager._dsv41_layerwise_schema["entries"][i]
+            if pool is not None and entry[0] == "kv":
+                layout = pool.get_extra_key_layout(entry[2])
+                scatter_prefix(
+                    dst,
+                    src,
+                    page_ids,
+                    page_start,
+                    len(decode_req.req.origin_input_ids),
+                    page,
+                    entry[1],
+                    layout,
+                )
+            else:
+                dst.index_copy_(0, page_ids, src)
             cursor += size
     return True
+
+
+def scatter_prefix(dst, src, page_ids, start, prefix, page, ratio, layout):
+    """Write only immutable compressed rows; preserve D tail and native padding.
+
+    Global layout may be interleaved or split data/scales. No whole-page writes
+    are legal after D owns carry or newly compressed rows of the partial page.
+    """
+    import torch
+
+    cpp = page // ratio
+    full = min(src.shape[0], max(0, prefix // page - start))
+    if full:
+        dst.index_copy_(0, page_ids[:full], src[:full])
+    rows = min(cpp, max(0, prefix // ratio - (start + full) * cpp))
+    if full == src.shape[0] or not rows:
+        return
+    data_stride, scale_base, scale_stride = layout.row_addressing(cpp)
+    for base, step, length in (
+        (0, data_stride, layout.data_bytes),
+        (scale_base, scale_stride, layout.scale_bytes),
+    ):
+        columns = (
+            base
+            + torch.arange(rows, device=src.device)[:, None] * step
+            + torch.arange(length, device=src.device)
+        ).reshape(-1)
+        # Keep the page id as a vector: scalar CUDA tensor indexing may call
+        # item() and synchronize the scatter stream on the scheduler thread.
+        dst[page_ids[full : full + 1, None], columns[None, :]] = src[
+            full : full + 1, columns
+        ]
 
 
 def teardown(original, manager):

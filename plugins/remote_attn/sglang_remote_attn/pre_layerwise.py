@@ -565,6 +565,7 @@ class Controller:
             (self.config.mode, self.config.host_staging, self.config.recv_host_staging)
             if getattr(self, "dsv41_layerwise", False)
             else None,
+            getattr(self, "schema_signature", None),
         )
         clean = not _runtime().has_target_states()
         if self.tp_size > 1:
@@ -908,6 +909,13 @@ class Controller:
     def drain_targets(self, required=None):
         overlap = getattr(self, "decode_overlap", None)
         if overlap is not None:
+            if getattr(self, "dsv41_remote", False) and required is not None:
+                # First retire the physical resources at this symmetric boundary;
+                # the parent can then free native metadata/KV without dangling
+                # resource commands querying an already-cleared receiver.
+                for resource in required.resources:
+                    if not resource.closed:
+                        overlap.retirement.drain(resource)
             overlap.retirement.drain(required)
             return
 
@@ -1077,6 +1085,13 @@ def initialize(scheduler):
         from .decode_overlap import install as install_overlap
 
         controller.decode_overlap = install_overlap(controller)
+    if (
+        getattr(controller, "dsv41_remote", False)
+        and scheduler.disaggregation_mode.value == "decode"
+    ):
+        from .decode_overlap import install as install_overlap
+
+        controller.decode_overlap = install_overlap(controller, force=True)
     scheduler._pre_layerwise = controller
     scheduler.tp_worker.model_runner._pre_layerwise = controller
 
@@ -1209,6 +1224,13 @@ def defer_release(req, release, *, checkpoint=None):
 def poll(scheduler):
     controller = getattr(scheduler, "_pre_layerwise", None)
     overlap = getattr(controller, "prefill_overlap", None)
+    if (
+        getattr(controller, "dsv41_remote", False)
+        and controller.scheduler.disaggregation_mode.value == "prefill"
+    ):
+        from .dsv41_progressive import poll_responses
+
+        poll_responses(controller)
     if overlap is not None:
         overlap.poll()
     elif controller is not None and getattr(controller, "sources", None):

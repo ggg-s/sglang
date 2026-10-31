@@ -18,6 +18,9 @@ CORE_CALLS = {
         "keep_receiver": False
     },
     MANAGER + "add_transfer_request": {
+        "aux_index": None,
+        "state_indices": None,
+        "num_kv_tokens": None,
         "wait_event": None,
         "indices_event": None,
         "kv_buffer_indices": None,
@@ -26,6 +29,16 @@ CORE_CALLS = {
         "staging_chunk_idx": None,
         "staging_layer_ids": None,
     },
+    MANAGER + "maybe_send_extra": {"target_rank_registration_info": None},
+    MANAGER + "send_aux": {
+        "req": inspect.Parameter.empty,
+        "prefill_aux_index": inspect.Parameter.empty,
+        "dst_aux_ptrs": inspect.Parameter.empty,
+    },
+    MANAGER + "_poison_unsettled_send": {},
+    DISAGG + "common.conn.CommonKVManager.conclude_failure": {"targets": None},
+    "sglang.srt.mem_cache.deepseek_v4_memory_pool.DeepSeekV4TokenToKVPool.source_layer_of": {},
+    "sglang.srt.mem_cache.deepseek_v4_memory_pool.DeepSeekV4TokenToKVPool.get_extra_key_layout": {},
     MANAGER + "send_kvcache": {"kv_buffer_indices": None, "transfer_fn": None},
     MANAGER + "_publish_peer_registration": {
         "mooncake_session_id": inspect.Parameter.empty,

@@ -1,17 +1,16 @@
-"""DSV4.1 text-only layerwise PD, with native final state/metadata completion.
+"""DSV4.1 native layerwise PD and progressive sparse resource lifetimes.
 
-Only immutable, compressed global KV/index-K page entries are pipelined. SWA
-and compression carry state retain the native last-chunk path and D admission
-barrier. The optional first post-PD eager sparse read closure is delegated to
-dsv41_remote; early sparse admission and model/scheduler loops are not copied.
+Layerwise keeps native final admission. Remote sends native index/state/metadata
+before globals, then admits D through event-proven per-resource ownership.
 """
 
 import functools
 import logging
+import threading
 import time
 from dataclasses import dataclass, field
 
-from . import dsv41_receive, dsv41_remote, dsv41_staging
+from . import dsv41_progressive, dsv41_receive, dsv41_remote, dsv41_staging
 from .pre_layerwise import Controller, Source, read_json, write_json
 
 logger = logging.getLogger(__name__)
@@ -195,7 +194,13 @@ def send_selected(
 
 
 @dataclass
-class DSV41Source(Source):
+class DSV41Source(dsv41_progressive.SourceMixin, Source):
+    schema: dict = field(default_factory=dict)
+    final_payload: object = None
+    final_event: object = None
+    barrier_ready: bool = False
+    sideband_started: bool = False
+    completion_lock: object = field(default_factory=threading.Lock)
     groups: tuple = ()
     submitted: set = field(default_factory=set)
     completed: set = field(default_factory=set)
@@ -217,38 +222,56 @@ class DSV41Source(Source):
             },
         )
 
-    def enqueue(self, producer, event, *, flush=False):
+    def _enqueue(self, ordinal, boundary, indices, event):
         sender = self.req.disagg_kv_sender
+        sender.kv_mgr.add_transfer_request(
+            sender.bootstrap_room,
+            self.indices,
+            self.index_slice,
+            False,
+            wait_event=event,
+            indices_event=self.indices_event,
+            transfer_fn=dsv41_staging.transfer(sender.kv_mgr)
+            if self.stager is not None
+            else None,
+            kv_buffer_indices=indices,
+            staging_chunk_idx=ordinal if self.native_staging else None,
+            staging_layer_ids=indices if self.native_staging else None,
+            on_complete=functools.partial(
+                self.completed_entry
+                if self.owner.dsv41_remote
+                else self.complete_group,
+                boundary,
+                indices,
+            ),
+            trace_ctx=sender.trace_ctx.copy_for_thread(),
+        )
+        self.submitted.add(boundary)
+
+    def enqueue(self, producer, event, *, flush=False):
+        if self.owner.dsv41_remote:
+            # Full-forward proof includes final indexer and mutable native state.
+            # Native finalization captures authoritative state indices afterwards.
+            if flush:
+                self.final_event = event
+            return
         for ordinal, (boundary, indices) in enumerate(self.groups):
-            if boundary in self.submitted or (boundary > producer and not flush):
-                continue
-            sender.kv_mgr.add_transfer_request(
-                sender.bootstrap_room,
-                self.indices,
-                self.index_slice,
-                False,
-                wait_event=event,
-                indices_event=self.indices_event,
-                transfer_fn=dsv41_staging.transfer(sender.kv_mgr)
-                if self.stager is not None
-                else None,
-                kv_buffer_indices=indices,
-                staging_chunk_idx=ordinal if self.native_staging else None,
-                staging_layer_ids=indices if self.native_staging else None,
-                on_complete=functools.partial(self.complete_group, boundary, indices),
-                trace_ctx=sender.trace_ctx.copy_for_thread(),
-            )
-            self.submitted.add(boundary)
+            if boundary not in self.submitted and (boundary <= producer or flush):
+                self._enqueue(ordinal, boundary, indices, event)
 
     def finalize_native(self, original, scheduler, req, *, last_chunk, end_idx):
-        if self.finalized or len(self.submitted) != len(self.groups):
+        if self.finalized or (
+            not self.owner.dsv41_remote and len(self.submitted) != len(self.groups)
+        ):
+            raise RuntimeError("incomplete or duplicate DSV4.1 layerwise finalization")
+        if self.owner.dsv41_remote and self.final_event is None:
             raise RuntimeError("incomplete or duplicate DSV4.1 layerwise finalization")
         if self.owner.dsv41_remote:
             dsv41_remote.register(self)
         try:
             # req.start_send_idx and sender.curr_idx already cover these global
-            # pages. Native finalization sends an empty KV tail AND every native
-            # state component, aux metadata and the canonical Success signal.
+            # pages. Native finalization computes every state/metadata index;
+            # Remote splits its actual delivery around the global transfer.
             result = original(scheduler, req, last_chunk=last_chunk, end_idx=end_idx)
         except BaseException as exc:
             self.error = repr(exc)
@@ -280,6 +303,13 @@ class DSV41Source(Source):
         )
         return result
 
+    def retire(self):
+        super().retire()
+        manager = self.req.disagg_kv_sender.kv_mgr
+        sources = getattr(manager, "_dsv41_progressive_sources", {})
+        if sources.get(int(self.req.bootstrap_room)) is self:
+            sources.pop(int(self.req.bootstrap_room))
+
     def poll(self):
         if not self.owner.dsv41_remote:
             return super().poll()
@@ -309,7 +339,9 @@ class DSV41Controller(Controller):
         if not hasattr(self, "remote_targets"):
             self.remote_targets = {}
         if self.config.mode not in ("layerwise", "remote"):
-            raise ValueError("DSV4.1 requires layerwise or post-PD eager remote mode")
+            raise ValueError(
+                "DSV4.1 requires layerwise or progressive eager remote mode"
+            )
         if not get_disagg().language_model_only:
             raise ValueError("DSV4.1 layerwise requires --language-model-only")
         if get_spec().speculative_algorithm is not None:
@@ -366,7 +398,9 @@ class DSV41Controller(Controller):
             raise ValueError(
                 "DSV4.1 staging requires P send / D receive roles; native MHA staging must be disabled"
             )
-        self._schema(manager)  # reject unsupported storage before serving
+        self.schema_signature = self._schema(
+            manager
+        )  # TP ownership ABI, without pointers
         if self.dsv41_remote:
             dsv41_remote.validate(self, runner, role)
 
@@ -376,14 +410,14 @@ class DSV41Controller(Controller):
             self.stager = dsv41_staging.bind(self.pool, manager)
         if (
             role == "decode"
-            and self.config.recv_host_staging
+            and (self.config.recv_host_staging or self.dsv41_remote)
             and not getattr(self, "receive_installed", False)
         ):
             dsv41_receive.install(self, manager, role)
             self.receive_installed = True
         self.config.directory.mkdir(parents=True, exist_ok=True)
-        # Attach no model hooks on D. Its native completion, graphs and overlap
-        # remain authoritative; it never receives an early-admission offer.
+        # P producer hooks capture native completion. D sparse attention binds
+        # only its backend instance; ordered leases guard graph/overlap recovery.
         if s.disaggregation_mode.value == "prefill":
             layers = runner.model.model.layers
             if len(layers) != self.layers:
@@ -405,20 +439,28 @@ class DSV41Controller(Controller):
             offer["dsv41"] = self._schema(dr.kv_receiver.kv_mgr)
             offer["mode"] = self.config.mode
             offer["remote_boundary"] = (
-                "first-post-PD-decode" if self.dsv41_remote else None
+                "progressive-sparse" if self.dsv41_remote else None
             )
             if self.dsv41_remote:
                 dr.req._dsv41_remote_offer = target.path, target.generation
             offer["staging_wire"] = (
-                dsv41_receive.WIRE if self.config.recv_host_staging else None
+                dsv41_receive.WIRE if target.native_staging else None
             )
-            # No early D admission/graph lease: native queue owns cancellation,
-            # deferred abort ACK, H2D drain and metadata teardown exactly once.
+            offer["progressive_ring_bytes"] = (
+                dr.kv_receiver.kv_mgr._staging_ctx.allocator.total_size
+                if self.dsv41_remote
+                else 0
+            )
+            # Until early commit the native queue still owns cancellation,
+            # abort ACK, H2D drain and metadata cleanup. ProgressiveTarget takes
+            # that ownership only after the TP-agreed early commit.
             dr.req._pre_layerwise_native_target = None
             write_json(target.path.parent / "offer.json", offer)
         return target
 
     def early_targets(self, queue, rids_to_check):
+        if self.dsv41_remote:
+            return dsv41_progressive.early_targets(self, queue, rids_to_check)
         # Physical global entries are not dense model layers. Native staging
         # polling supplies the H2D+metadata+TP barrier; never run Target.refresh.
         return [], [self.offer(queue, dr) for dr in queue.queue]
@@ -501,10 +543,20 @@ class DSV41Controller(Controller):
                         not offer.get("native_staging")
                         and not offer.get("recv_host_staging")
                         or offer.get("native_staging")
-                        and offer.get("recv_host_staging")
+                        and (offer.get("recv_host_staging") or self.dsv41_remote)
                         and offer.get("staging_wire") == dsv41_receive.WIRE
                         and getattr(peers[0][1], "staging_base_ptr", 0) > 0
                         and getattr(peers[0][1], "staging_total_size", 0) > 0
+                    )
+                    and (
+                        not self.dsv41_remote
+                        or (
+                            offer.get("remote_boundary") == "progressive-sparse"
+                            and offer.get("native_staging")
+                            and max(e[-1] for e in schema["entries"])
+                            * ((req.extend_end + page - 1) // page - sender.curr_idx)
+                            <= offer.get("progressive_ring_bytes", 0)
+                        )
                     )
                     and mgr.kv_shard_size == 1
                     and not mgr.enable_all_cp_ranks_for_transfer
@@ -584,7 +636,11 @@ class DSV41Controller(Controller):
             indices, index_slice, last, skip = sender._prepare_send_indices(indices)
             if skip or not last or len(indices) != index_slice.stop - index_slice.start:
                 raise RuntimeError("unexpected DSV4.1 page reservation")
-            groups = resource_groups(schema, group_size)
+            groups = (
+                dsv41_progressive.groups(schema, group_size)
+                if self.dsv41_remote
+                else resource_groups(schema, group_size)
+            )
             if offer.get("native_staging"):
                 dsv41_receive.install(self, sender.kv_mgr, "prefill")
                 sender.kv_mgr.request_layer_staging(
@@ -604,6 +660,7 @@ class DSV41Controller(Controller):
                 group_size=group_size,
                 prefill_chunk_tokens=req.extend_len,
                 groups=groups,
+                schema=schema,
                 stager=self.stager,
                 native_staging=offer.get("native_staging", False),
                 recv_host_staging=offer.get("recv_host_staging", False),
@@ -617,6 +674,11 @@ class DSV41Controller(Controller):
                 indices_event=indices_event,
                 indices_keepalive=keepalive,
             )
+            if self.dsv41_remote:
+                sources = getattr(sender.kv_mgr, "_dsv41_progressive_sources", None)
+                if sources is None:
+                    sources = sender.kv_mgr._dsv41_progressive_sources = {}
+                sources[int(sender.bootstrap_room)] = source
             sender.kv_mgr._dsv41_layerwise_schema = schema
             sender._record_transfer_indices(indices, None)
             sender._transfer_start_time = (

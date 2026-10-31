@@ -1322,6 +1322,7 @@ class TestRemoteAttn(CustomTestCase):
             controller, target, freed = self._overlap_target(directory)
             controller.targets = []
             scheduler = native()
+            scheduler.enable_overlap = True
             controller.scheduler = scheduler
             scheduler._pre_layerwise = controller
             scheduler.gracefully_exit = scheduler._engine_paused = False
@@ -2799,16 +2800,22 @@ class TestRemoteAttn(CustomTestCase):
         self.assertEqual(status["members"], longs + shorts)
         reservations = [p for role, p in calls if p["cmd"] == "reserve"]
         self.assertEqual(len(reservations), 1)
-        self.assertEqual([x["rid"] for x in reservations[0]["items"]],
-                         [f"dst-{rid}" for rid in longs])
+        self.assertEqual(
+            [x["rid"] for x in reservations[0]["items"]],
+            [f"dst-{rid}" for rid in longs],
+        )
         self.assertTrue(all(gateway.journal[r]["drain_member"] for r in shorts))
         # Run the real reconcile state machine to SAFE_TO_STOP. Completed
         # shorts still have source tracking/KV that must be released.
         epoch = gateway.journal["__drain__"]["epoch"]
         source_rows = {
-            rid: {"rid": rid, "output_len": 128 if rid in shorts else 32,
-                  "kv_committed_len": 32799, "frozen": False,
-                  "finished": rid in shorts}
+            rid: {
+                "rid": rid,
+                "output_len": 128 if rid in shorts else 32,
+                "kv_committed_len": 32799,
+                "frozen": False,
+                "finished": rid in shorts,
+            }
             for rid in longs + shorts
         }
         target_states = {}
@@ -2824,11 +2831,17 @@ class TestRemoteAttn(CustomTestCase):
                 frozen.extend(payload["rids"])
                 for rid in payload["rids"]:
                     source_rows[rid]["frozen"] = True
-                return {"results": [
-                    {"rid": rid, "output_len": 32, "migration_epoch": epoch,
-                     "transfer": {"token": f"kv-{rid}"}}
-                    for rid in payload["rids"]
-                ]}
+                return {
+                    "results": [
+                        {
+                            "rid": rid,
+                            "output_len": 32,
+                            "migration_epoch": epoch,
+                            "transfer": {"token": f"kv-{rid}"},
+                        }
+                        for rid in payload["rids"]
+                    ]
+                }
             if cmd == "release":
                 rid = payload["rid"]
                 if rid in longs:
@@ -2841,9 +2854,11 @@ class TestRemoteAttn(CustomTestCase):
         def target_rpc(payload, **kwargs):
             cmd = payload["cmd"]
             if cmd == "status":
-                return {"reqs": [{"rid": "background"}],
-                        "reserved": {f"dst-{rid}": {} for rid in longs},
-                        "target_states": copy.deepcopy(list(target_states.values()))}
+                return {
+                    "reqs": [{"rid": "background"}],
+                    "reserved": {f"dst-{rid}": {} for rid in longs},
+                    "target_states": copy.deepcopy(list(target_states.values())),
+                }
             if cmd == "import_wave":
                 for item in payload["items"]:
                     self.assertEqual(item["epoch"], epoch)
@@ -2851,8 +2866,10 @@ class TestRemoteAttn(CustomTestCase):
                     self.assertIn(rid, longs)
                     imported.append(rid)
                     target_states[rid] = {
-                        "handoff_id": rid, "migration_epoch": epoch,
-                        "new_tokens": 1, "import_done_at": time.time(),
+                        "handoff_id": rid,
+                        "migration_epoch": epoch,
+                        "new_tokens": 1,
+                        "import_done_at": time.time(),
                         "local_ready": True,
                     }
                 return {}
@@ -2871,15 +2888,21 @@ class TestRemoteAttn(CustomTestCase):
         self.assertCountEqual(imported, longs)
         self.assertCountEqual(released, longs + shorts)
         self.assertEqual(source_rows, {})
-        self.assertTrue(all(gateway.journal[r]["source_released"]
-                            for r in longs + shorts))
+        self.assertTrue(
+            all(gateway.journal[r]["source_released"] for r in longs + shorts)
+        )
 
     def test_gateway_completed_members_keep_release_bookkeeping(self):
         gateway, namespace, calls = self._gateway()
         gateway.journal["__drain__"] = {
-            "drain_id": "pending", "wave_id": "wave", "members": ["long"],
-            "preflight_pending": True, "epoch": "epoch", "wave": {},
-            "state": "REQUESTED", "admission_fenced_at": time.time(),
+            "drain_id": "pending",
+            "wave_id": "wave",
+            "members": ["long"],
+            "preflight_pending": True,
+            "epoch": "epoch",
+            "wave": {},
+            "state": "REQUESTED",
+            "admission_fenced_at": time.time(),
         }
         gateway.journal["long"]["finished"] = True
         gateway._prepare_drain()
@@ -2891,15 +2914,27 @@ class TestRemoteAttn(CustomTestCase):
         self.assertFalse(any(p["cmd"] == "reserve" for role, p in calls))
         # The existing reconcile/release paths must still see this row.
         drain, entries = gateway._drain_snapshot()
-        gateway._sync_member(entries["long"], {
-            "long": {"rid": "long", "finished": True,
-                     "output_len": 128, "frozen": False},
-        }, {}, {}, {})
+        gateway._sync_member(
+            entries["long"],
+            {
+                "long": {
+                    "rid": "long",
+                    "finished": True,
+                    "output_len": 128,
+                    "frozen": False,
+                },
+            },
+            {},
+            {},
+            {},
+        )
         self.assertEqual(entries["long"]["phase"], "done")
+
         def release(payload, **kwargs):
             self.assertEqual(payload["cmd"], "release")
             calls.append(("src", payload))
             return {"released": True}
+
         gateway.src.send = release
         gateway._drain_release(drain, entries)
         self.assertTrue(entries["long"]["source_released"])
@@ -2908,9 +2943,16 @@ class TestRemoteAttn(CustomTestCase):
         gateway, namespace, calls = self._gateway()
         gateway.journal["long"]["owner"] = "dst"
         # Simulate the cutover completing while preflight waits on migration_lock.
-        drain = {"drain_id": "pending", "wave_id": "wave", "members": ["long"],
-                 "preflight_pending": True, "epoch": "epoch", "wave": {},
-                 "state": "REQUESTED", "admission_fenced_at": time.time()}
+        drain = {
+            "drain_id": "pending",
+            "wave_id": "wave",
+            "members": ["long"],
+            "preflight_pending": True,
+            "epoch": "epoch",
+            "wave": {},
+            "state": "REQUESTED",
+            "admission_fenced_at": time.time(),
+        }
         gateway.journal["__drain__"] = drain
         gateway._prepare_drain()
         self.assertEqual(gateway.journal["__drain__"]["members"], ["long"])
@@ -3655,6 +3697,18 @@ class TestRemoteAttn(CustomTestCase):
         self.assertEqual(
             rows[0]["p_overlap"],
             dict(votes=[5, 5], freed=[1, 2], commits=2, registered=0, local_votes=0),
+        )
+        self.assertEqual(rows[0]["sparse_progressive"], rows[1]["sparse_progressive"])
+        self.assertEqual(
+            rows[0]["sparse_progressive"],
+            dict(
+                votes=[5, 5, 5, 5],
+                freed=["KV"],
+                local_entries=[0, 1],
+                retries=1,
+                closed=1,
+                stable_votes=0,
+            ),
         )
         self.assertEqual(rows[0]["sparse_remote"], rows[1]["sparse_remote"])
         self.assertEqual(
@@ -7293,8 +7347,13 @@ class TestRemoteAttn(CustomTestCase):
         f.runner.attn_backend = f.runner.decode_attn_backend = backend
         f.runner.decode_attn_backend_group = [backend]
         f.scheduler.disaggregation_mode = SimpleNamespace(value="decode")
-        with patch.dict(sys.modules, {"sglang.srt.runtime_context": f.context}):
+        # Ring allocation has its own native CUDA/source-loaded coverage.
+        with (
+            patch.dict(sys.modules, {"sglang.srt.runtime_context": f.context}),
+            patch("sglang_remote_attn.dsv41_receive.install") as receive,
+        ):
             f.controller.validate()
+        receive.assert_called_once_with(f.controller, f.manager, "decode")
         self.assertIs(backend._dsv41_remote, f.controller)
         self.assertEqual(
             backend._forward_attention(
@@ -7438,7 +7497,9 @@ class TestRemoteAttn(CustomTestCase):
             2,
             attn_sink=f.sink,
         )
-        self.assertTrue(torch.equal(mixed[1], native[1]))
+        # Ordinary rows use the same eager union while a peer row is Remote;
+        # native full-batch reads would touch its unfinished global pages.
+        torch.testing.assert_close(mixed[1], expected, atol=0.015625, rtol=0.01)
         torch.testing.assert_close(mixed[0], expected, atol=0.015625, rtol=0.01)
         self.assertEqual(f.stores, [3])
         self.assertEqual(math.partition([24], f.d_pages, 34, 8, 2), ([16], []))
@@ -8517,6 +8578,629 @@ class TestRemoteAttn(CustomTestCase):
         loaded[target] = missing_scatter_state
         with self.assertRaisesRegex(RuntimeError, "_staging_layer_events"):
             self.check.check_runtime_interfaces(resolve=loaded.__getitem__)
+
+    def test_dsv41_progressive_native_state_barrier_survives_reordered_index_groups(
+        self,
+    ):
+        """Neither ordinal arrival nor finalization may resend D-owned state."""
+        import numpy as np
+        from sglang_remote_attn import dsv41_progressive as pg
+        from sglang_remote_attn.dsv41_layerwise import DSV41Source
+
+        f = self._dsv41_fixture()
+        pending, states, aux = [], [], []
+        schema = dict(entries=[["kv", 2, 2], ["index", 2, 2], ["index", 2, 2]])
+        source = DSV41Source(
+            f.controller,
+            f.req,
+            f.controller.config.directory / "ordered",
+            "ordered",
+            np.array([2]),
+            slice(4, 5),
+            ((f.manager.transfer_infos[7]["peer:1"], f.registration),),
+            33,
+            schema=schema,
+            groups=pg.groups(schema, 1),
+            final_event=object(),
+        )
+        f.controller.dsv41_remote = True
+        f.manager._dsv41_progressive_sources = {7: source}
+        f.registration.dst_aux_ptrs = []
+        f.manager.maybe_send_extra = lambda peer, rows, ex, reg: (
+            states.append(rows) or 0
+        )
+        f.manager.send_aux = lambda *a: aux.append(a) or 0
+
+        def native(manager, room, indices, span, last, **kw):
+            pending.append((indices, span, last, kw))
+
+        f.manager.add_transfer_request = functools.partial(
+            pg.canonical_track, native, f.manager
+        )
+        source.req.disagg_kv_sender.trace_ctx = SimpleNamespace(
+            copy_for_thread=lambda: None
+        )
+        f.manager.add_transfer_request(
+            7,
+            np.array([], dtype=np.int32),
+            slice(5, 5),
+            True,
+            aux_index=4,
+            state_indices=["swa", "carry"],
+        )
+        self.assertEqual(len(pending), 2)
+        pending[1][3]["on_complete"]()
+        self.assertFalse(source.barrier_ready)
+        self.assertFalse(states)
+        with patch.dict(sys.modules, f.modules):
+            pending[0][3]["on_complete"]()
+        self.assertTrue(source.barrier_ready)
+        self.assertEqual(states, [["swa", "carry"]])
+        self.assertEqual(len(aux), 1)
+        self.assertTrue(pending[-1][2])
+        self.assertEqual(pending[-1][3]["state_indices"], [])
+        self.assertEqual(pending[-2][3]["kv_buffer_indices"], (0,))
+        self.assertIs(pending[-2][3]["wait_event"], source.final_event)
+        self.assertEqual(
+            pg.send_aux(
+                lambda *a: self.fail("second aux DMA"),
+                f.manager,
+                f.manager.transfer_infos[7]["peer:1"],
+                4,
+                [],
+            ),
+            0,
+        )
+        # A duplicate native final is an error rather than another state write.
+        with self.assertRaisesRegex(RuntimeError, "duplicate"):
+            f.manager.add_transfer_request(
+                7, np.array([]), slice(5, 5), True, aux_index=4
+            )
+
+    def test_dsv41_progressive_barrier_needs_index_scatter_state_metadata_and_attempt(
+        self,
+    ):
+        """A P TE marker cannot replace D index/scales GPU completion."""
+        from sglang_remote_attn import dsv41_progressive as pg
+
+        f = self._dsv41_fixture()
+        req = SimpleNamespace(
+            origin_input_ids=list(range(33)), bootstrap_room=7, finished=lambda: False
+        )
+        dr = SimpleNamespace(
+            req=req,
+            metadata_buffer_index=0,
+            _staging_completed_layers=[],
+            kv_receiver=SimpleNamespace(kv_mgr=f.manager, poll=lambda: 3),
+        )
+        queue = SimpleNamespace(
+            staging_handler=SimpleNamespace(
+                advance_scatter=lambda dr: None, is_failed=lambda dr: False
+            ),
+            metadata_buffers=SimpleNamespace(bootstrap_room=torch.tensor([[0]])),
+        )
+        owner = SimpleNamespace(
+            _schema=lambda m: dict(entries=[["kv"], ["index"], ["index"]])
+        )
+        offer = SimpleNamespace(
+            path=f.controller.config.directory / "barrier",
+            generation="g",
+            decode_req=dr,
+            queue=queue,
+            owner=owner,
+        )
+        write = self.hooks.pre_layerwise.write_json
+        write(offer.path / "sparse-ready.json", dict(generation="g", prefix_len=33))
+        write(
+            offer.path / "remote-service.json",
+            dict(generation="g", prefix_len=33, route={}),
+        )
+        modules = {
+            "sglang.srt.disaggregation.base.conn": SimpleNamespace(
+                KVPoll=SimpleNamespace(Failed=0)
+            )
+        }
+        with patch.dict(sys.modules, modules):
+            self.assertIsNone(pg.barrier_ready(offer))
+            dr._staging_completed_layers = [((1,), 0, 5)]
+            queue.metadata_buffers.bootstrap_room[0, 0] = 7
+            self.assertIsNone(pg.barrier_ready(offer))
+            dr._staging_completed_layers.append(((2,), 0, 5))
+            self.assertIsNotNone(pg.barrier_ready(offer))  # Global entry 0 absent.
+            dr.kv_receiver.poll = lambda: 0
+            self.assertIsNone(pg.barrier_ready(offer))
+            dr.kv_receiver.poll = lambda: 3
+            write(
+                offer.path / "sparse-ready.json", dict(generation="old", prefix_len=33)
+            )
+            self.assertIsNone(pg.barrier_ready(offer))
+
+    def test_dsv41_progressive_scatter_preserves_new_rows_scales_and_page_padding(self):
+        """Odd c2 carry and D new c1 rows must survive final-prefix DMA scatter."""
+        from sglang_remote_attn.dsv41_receive import scatter_prefix
+
+        support = self._dsv41_remote_support()
+        f = support.fixture(ROOT, "cpu")
+        for layout in (
+            f.layout.V41,
+            f.layout.V41_NEW,
+            f.layout.V41_FP4,
+            f.layout.V41_FP4_NEW,
+        ):
+            for ratio in (1, 2):
+                for prefix in (32, 33, 34, 39):
+                    cpp = 8 // ratio
+                    src = support.encoded(layout.encoding, 3, cpp, "cpu")
+                    if layout.is_interleaved:
+                        src = f.oracle.interleave_pages(
+                            src, cpp, layout.data_bytes, layout.scale_bytes
+                        )
+                    dst = torch.full((8, src.shape[1]), 199, dtype=torch.uint8)
+                    before = dst.clone()
+                    ids = torch.tensor([6, 2, 4])
+                    scatter_prefix(dst, src, ids, 2, prefix, 8, ratio, layout)
+                    # Independent per-byte mask from native address geometry.
+                    mask = torch.zeros_like(dst, dtype=torch.bool)
+                    ds, base, ss = layout.row_addressing(cpp)
+                    for n, p in enumerate(ids.tolist()):
+                        if (2 + n + 1) * 8 <= prefix:
+                            mask[p] = True
+                        for row in range(
+                            min(cpp, max(0, prefix // ratio - (2 + n) * cpp))
+                        ):
+                            for col, size in (
+                                (row * ds, layout.data_bytes),
+                                (base + row * ss, layout.scale_bytes),
+                            ):
+                                mask[p, col : col + size] = True
+                                self.assertTrue(
+                                    torch.equal(
+                                        dst[p, col : col + size],
+                                        src[n, col : col + size],
+                                    )
+                                )
+                    self.assertTrue(torch.equal(dst[~mask], before[~mask]))
+
+    def test_dsv41_progressive_resource_switch_waits_ordered_vote_and_final_gpu_proof(
+        self,
+    ):
+        """Rank-local scatter cannot switch; Local idle adds no retirement votes."""
+        from sglang_remote_attn import dsv41_progressive as pg
+        from sglang_remote_attn.pre_layerwise import Controller
+        from sglang_remote_attn.retirement import Retirement
+
+        with tempfile.TemporaryDirectory() as directory:
+            owner = Controller.__new__(Controller)
+            owner.rank, owner.tp_size = 0, 1
+            owner.scheduler = SimpleNamespace()
+            owner.config = SimpleNamespace(drain_timeout=0.05)
+            votes = []
+            owner.agree = lambda flags: votes.append(list(flags)) or flags
+            dr = SimpleNamespace(
+                req=SimpleNamespace(rid="r", bootstrap_room=7),
+                _staging_completed_layers=[],
+            )
+            parent = SimpleNamespace(
+                closed=False,
+                decode_req=dr,
+                generation="g",
+                rpc=SimpleNamespace(local_entries=set()),
+                path=Path(directory),
+                queue=SimpleNamespace(
+                    staging_handler=SimpleNamespace(
+                        advance_scatter=lambda dr: None, is_failed=lambda dr: False
+                    )
+                ),
+            )
+            resources = [pg.Resource(parent, i, i + 1) for i in (0, 1)]
+            owner.targets = list(resources)
+            protocol = Retirement(owner)
+            self.addCleanup(protocol.close)
+            for resource in resources:
+                protocol.register(resource)
+            for _ in range(32):
+                protocol.observe()
+            self.assertEqual(votes, [])
+            dr._staging_completed_layers = [((1,), 0, 5)]
+            protocol.observe()
+            self.assertFalse(parent.rpc.local_entries)
+            command = protocol.poll_command()
+            protocol.arm(command)
+            protocol.finalize()
+            self.assertEqual(parent.rpc.local_entries, {1})
+            self.assertEqual(len(votes), 1)
+            for _ in range(32):
+                protocol.observe()
+            self.assertEqual(len(votes), 1)
+            dr._staging_completed_layers.append(((0,), 0, 5))
+            protocol.observe()
+            protocol.arm(protocol.poll_command())
+            protocol.finalize()
+            self.assertEqual(parent.rpc.local_entries, {0, 1})
+            self.assertEqual(owner.targets, [])
+            for _ in range(32):
+                protocol.observe()
+            self.assertEqual(len(votes), 2)
+
+    def test_dsv41_progressive_eager_survives_multiple_tokens_and_mixed_unready_global(
+        self,
+    ):
+        """No whole-batch native attention may read a still-missing global page."""
+        from sglang_remote_attn import dsv41_remote as remote
+        from sglang_remote_attn import dsv41_sparse_math as math
+
+        f = self._dsv41_remote_support().fixture(ROOT, "cpu")
+        schema = dict(entries=[["kv", 1, 1], ["kv", 2, 2]])
+        f.controller._schema = lambda m: schema
+        f.controller.scheduler.disagg_decode_prealloc_queue = SimpleNamespace(
+            kv_manager=None
+        )
+        target = remote.Target(
+            f.controller, f.req, Path("/tmp/unused"), "g", {}, 33, progressive=True
+        )
+        f.controller.remote_targets[0] = target
+
+        def call(q, positions, layer, ratio, scale):
+            target.calls += 1
+            cpp = 8 // ratio
+            ids = torch.tensor([f.p_pages[p // cpp] * cpp + p % cpp for p in positions])
+            keys = math.read_slots(
+                f.p_pool.get_extra_key_buffer(layer), ids, cpp, f.layout.V41_FP4
+            )
+            return math.partial(q, keys, scale)
+
+        target.call = call
+        # Keep the new odd carry row, poison all completed prefix rows on D.
+        expected = f.d_pool.get_extra_key_buffer(3).clone()
+        for p in f.d_pages[:4]:
+            f.d_pool.get_extra_key_buffer(3)[p].fill_(0)
+        kv = torch.zeros(1, 512)
+
+        def native(*a, **kw):
+            self.fail("native full-batch read of unready global")
+
+        def decode(runner, fb):
+            return remote.attention(
+                native,
+                f.backend,
+                f.query,
+                kv,
+                kv,
+                SimpleNamespace(layer_id=3),
+                fb,
+                2,
+                attn_sink=f.sink,
+            )
+
+        a = remote.forward(f.controller, decode, None, f.fb)
+        b = remote.forward(f.controller, decode, None, f.fb)
+        self.assertFalse(target.closed)
+        self.assertEqual(target.calls, 2)
+        torch.testing.assert_close(a, b)
+        # Per-resource Local is producer-based: consumer 3 shares producer 2.
+        target.local_entries.add(1)
+        f.d_pool.get_extra_key_buffer(3).copy_(expected)
+        c = remote.forward(f.controller, decode, None, f.fb)
+        torch.testing.assert_close(a, c, atol=0.015625, rtol=0.01)
+        self.assertEqual(target.calls, 2)
+        remote.release(f.req)  # No early detach/free while transport is live.
+        self.assertFalse(target.closed)
+
+    def test_dsv41_progressive_early_commit_retains_metadata_and_free_until_gpu_tp_retirement(
+        self,
+    ):
+        """Decode can run before global Success; cancellation cannot free that row."""
+        from sglang_remote_attn import dsv41_progressive as pg
+        from sglang_remote_attn.decode_overlap import BatchProof, DecodeOverlap
+        from sglang_remote_attn.pre_layerwise import Controller, write_json
+
+        with tempfile.TemporaryDirectory() as directory:
+            owner = Controller.__new__(Controller)
+            owner.rank, owner.tp_size, owner.graph_fast_path = 0, 1, True
+            owner.dsv41_remote = True
+            owner.scheduler = SimpleNamespace(enable_overlap=True)
+            owner.config = SimpleNamespace(drain_timeout=0.02)
+            owner.targets, owner.remote_targets, owner.early_admissions = [], {}, 0
+            owner.agree = lambda flags: flags
+            owner._schema = lambda manager: dict(
+                entries=[["kv", 1, 1], ["index", 2, 2], ["kv", 2, 2]]
+            )
+            overlap = DecodeOverlap(owner)
+            owner.decode_overlap = overlap
+            self.addCleanup(overlap.retirement.close)
+            finished = []
+            status = [3]
+            receiver = SimpleNamespace(
+                kv_mgr=None,
+                poll=lambda: status[0],
+                clear=lambda: finished.append("receiver"),
+            )
+            req = SimpleNamespace(
+                rid="early",
+                bootstrap_room=7,
+                origin_input_ids=list(range(33)),
+                kv=SimpleNamespace(req_pool_idx=0),
+                finished=lambda: False,
+            )
+            dr = SimpleNamespace(
+                req=req,
+                kv_receiver=receiver,
+                metadata_buffer_index=0,
+                _staging_completed_layers=[((1,), 0, 5)],
+            )
+            done = [False]
+            queue = SimpleNamespace(
+                queue=[dr],
+                staging_handler=SimpleNamespace(
+                    advance_scatter=lambda dr: None,
+                    is_failed=lambda dr: False,
+                    is_done=lambda dr: done[0],
+                    unregister_decode_req=lambda room: finished.append("ring"),
+                ),
+                metadata_buffers=SimpleNamespace(bootstrap_room=torch.tensor([[7]])),
+                req_to_metadata_buffer_idx_allocator=SimpleNamespace(
+                    free=lambda idx: finished.append("metadata")
+                ),
+            )
+            commits = []
+            queue._commit_transfer_to_req = lambda dr, **kw: commits.append(kw)
+            path = Path(directory)
+            offer = SimpleNamespace(
+                owner=owner,
+                queue=queue,
+                decode_req=dr,
+                path=path,
+                generation="g",
+                coverage=SimpleNamespace(prefix_len=33),
+            )
+            owner.offer = lambda queue, dr: offer
+            write_json(
+                path / "remote-service.json",
+                dict(generation="g", prefix_len=33, route={}),
+            )
+            write_json(path / "sparse-ready.json", dict(generation="g", prefix_len=33))
+            with patch.dict(
+                sys.modules,
+                {
+                    "sglang.srt.disaggregation.base.conn": SimpleNamespace(
+                        KVPoll=SimpleNamespace(Success=4, Failed=0)
+                    )
+                },
+            ):
+                admitted, _ = pg.early_targets(owner, queue, None)
+                self.assertEqual(admitted, [req])
+                self.assertEqual(commits, [dict(keep_receiver=True)])
+                self.assertEqual(queue.queue, [])
+                self.assertIs(dr.kv_receiver, receiver)
+                self.assertTrue(overlap.serial())
+                target = req._pre_layerwise_target
+                proof = BatchProof(
+                    result=SimpleNamespace(
+                        delay_sample_func=None,
+                        copy_done=SimpleNamespace(query=lambda: gpu[0]),
+                    )
+                )
+                gpu = [False]
+                target.forward_proofs.append(proof)
+                target.forward_count = 1
+                freed = []
+                self.assertTrue(
+                    self.hooks.pre_layerwise.defer_release(
+                        req, lambda: freed.append("KV")
+                    )
+                )
+                self.assertFalse(target.rpc.closed)
+                self.assertEqual(freed, [])
+                self.assertEqual(overlap.retirement.final_votes, 0)
+                status[0] = 4
+                done[0] = True
+                dr._staging_completed_layers += [((0,), 0, 5), ((2,), 0, 5)]
+                protocol = overlap.retirement
+                protocol.observe()
+                protocol.arm(protocol.poll_command())
+                protocol.finalize()
+                self.assertEqual(freed, [])
+                self.assertIs(dr.kv_receiver, receiver)
+                gpu[0] = True
+                protocol.observe()
+                protocol.arm(protocol.poll_command())
+                runtime = SimpleNamespace(_drop_target_state_for=lambda req: None)
+                with patch(
+                    "sglang_remote_attn.pre_layerwise._runtime", return_value=runtime
+                ):
+                    protocol.finalize()
+                self.assertEqual(freed, ["KV"])
+                self.assertEqual(finished, ["ring", "receiver", "metadata"])
+                self.assertIsNone(dr.kv_receiver)
+                self.assertEqual(owner.targets, [])
+                self.assertEqual(owner.remote_targets, {})
+                self.assertTrue(
+                    overlap.serial()
+                )  # Consume final serial result boundary.
+                self.assertFalse(overlap.serial())
+                for _ in range(32):
+                    protocol.observe()
+                self.assertEqual(protocol.final_votes, 2)
+
+    def test_dsv41_progressive_http_snapshot_needs_all_tp_barriers_without_kv_mutation(
+        self,
+    ):
+        """Returning P early cannot release the native request or skip a shard."""
+        from sglang_remote_attn import dsv41_progressive as pg
+        from sglang_remote_attn.pre_layerwise import write_json
+
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            emitted = []
+            req = SimpleNamespace(
+                bootstrap_room=7,
+                return_logprob=False,
+                finished_reason=None,
+                disagg_kv_sender=SimpleNamespace(poll=lambda: 3),
+            )
+            source = SimpleNamespace(
+                req=req,
+                generation="g0",
+                prefix_len=33,
+                barrier_ready=True,
+                responded=False,
+            )
+            controller = SimpleNamespace(
+                rank=0,
+                tp_size=2,
+                sources=[source],
+                config=SimpleNamespace(directory=root),
+                scheduler=SimpleNamespace(
+                    output_streamer=SimpleNamespace(
+                        stream_output=lambda rows, *a: emitted.extend(rows)
+                    )
+                ),
+            )
+            for rank in (0, 1):
+                write_json(
+                    root / f"7/{rank}/offer.json",
+                    dict(generation=f"g{rank}", mode="remote"),
+                )
+            write_json(
+                root / "7/0/g0/sparse-ready.json", dict(generation="g0", prefix_len=33)
+            )
+            modules = {
+                "sglang.srt.managers.schedule_batch": SimpleNamespace(
+                    FINISH_LENGTH=lambda **kw: kw
+                )
+            }
+            with patch.dict(sys.modules, modules):
+                pg.poll_responses(controller)
+                self.assertFalse(emitted)
+                write_json(
+                    root / "7/1/g1/sparse-ready.json",
+                    dict(generation="old", prefix_len=33),
+                )
+                pg.poll_responses(controller)
+                self.assertFalse(emitted)
+                write_json(
+                    root / "7/1/g1/sparse-ready.json",
+                    dict(generation="g1", prefix_len=33),
+                )
+                pg.poll_responses(controller)
+                pg.poll_responses(controller)
+            self.assertEqual(len(emitted), 1)
+            self.assertIsNot(emitted[0], req)
+            self.assertTrue(emitted[0]._pre_layerwise_response_snapshot)
+            self.assertIsNone(req.finished_reason)
+            self.assertEqual(req.disagg_kv_sender.poll(), 3)
+            self.assertTrue(source.responded)
+
+    def test_dsv41_progressive_state_transfer_failure_poison_retains_and_does_not_admit(
+        self,
+    ):
+        """An uncertain sideband DMA cannot publish readiness or kill shared IO."""
+        import numpy as np
+        from sglang_remote_attn import dsv41_progressive as pg
+        from sglang_remote_attn.dsv41_layerwise import DSV41Source
+
+        f = self._dsv41_fixture()
+        poison, failed = [], []
+        f.manager._poison_unsettled_send = poison.append
+        f.manager.conclude_failure = lambda **kw: failed.append(kw)
+        source = DSV41Source(
+            f.controller,
+            f.req,
+            f.controller.config.directory / "failed",
+            "failed",
+            np.array([]),
+            slice(0, 0),
+            (),
+            33,
+            final_payload=([], slice(0, 0), {}),
+        )
+        with patch.object(
+            pg, "send_states", side_effect=RuntimeError("native DMA timeout")
+        ):
+            source._sideband()
+        self.assertEqual(poison, [7])
+        self.assertEqual(failed[0]["bootstrap_room"], 7)
+        self.assertFalse(source.barrier_ready)
+        self.assertFalse((source.path / "sparse-ready.json").exists())
+        self.assertTrue((source.path / "error.json").exists())
+
+    def test_dsv41_progressive_direct_reset_fences_before_attempt_mutation(self):
+        """Native direct reset must not change row/attempt before the TP drain."""
+        events = []
+        req = SimpleNamespace(kv=SimpleNamespace(req_pool_idx=8))
+        target = SimpleNamespace(owner=SimpleNamespace(dsv41_remote=True))
+        req._pre_layerwise_target = target
+
+        def drain(*, required):
+            self.assertIs(required, target)
+            self.assertEqual(req.kv.req_pool_idx, 8)
+            events.append("gpu-io-tp-drained")
+            req._pre_layerwise_target = None
+
+        target.owner.drain_targets = drain
+
+        def reset(req):
+            self.assertEqual(events, ["gpu-io-tp-drained"])
+            events.append("native-reset")
+            req.kv.req_pool_idx = 9
+
+        self.hooks._reset_retracted(reset, req)
+        self.assertEqual(events, ["gpu-io-tp-drained", "native-reset"])
+
+    def test_dsv41_progressive_oversized_entry_falls_back_before_reserving_native_pages(
+        self,
+    ):
+        """A bounded receive ring must never force unsafe direct final-page DMA."""
+        f = self._dsv41_receive_fixture()
+        f.controller.dsv41_remote = True
+        f.controller.config = dataclasses.replace(f.controller.config, mode="remote")
+        path = f.controller.config.directory / "7/0/offer.json"
+        offer = json.loads(path.read_text())
+        offer.update(
+            mode="remote",
+            remote_boundary="progressive-sparse",
+            recv_host_staging=False,
+            progressive_ring_bytes=1,
+        )
+        self.hooks.pre_layerwise.write_json(path, offer)
+        before = (f.req.start_send_idx, f.sender.curr_idx, f.tasks.qsize())
+        with patch.dict(sys.modules, f.modules):
+            self.assertEqual(f.controller.candidates(f.batch), [None])
+            self.assertIsNone(f.controller.prepare(f.batch))
+        self.assertEqual(
+            (f.req.start_send_idx, f.sender.curr_idx, f.tasks.qsize()), before
+        )
+        self.assertEqual(f.requests, [])
+
+    def test_dsv41_progressive_normal_scheduler_records_actual_gpu_stream_completion(
+        self,
+    ):
+        """Normal mode has no overlap copy_done; never query an unrecorded event."""
+        with tempfile.TemporaryDirectory() as directory:
+            controller, target, _ = self._overlap_target(directory)
+            scheduler = controller.scheduler
+            scheduler.enable_overlap = False
+            overlap = controller.decode_overlap
+            batch = SimpleNamespace(
+                reqs=[target.decode_req.req],
+                forward_mode=SimpleNamespace(is_prebuilt=lambda: False),
+            )
+            recorded = []
+            stream = object()
+            complete = [False]
+            fence = SimpleNamespace(query=lambda: complete[0], record=recorded.append)
+            result = SimpleNamespace(delay_sample_func=None, copy_done=None)
+            with (
+                patch.object(torch.cuda, "Event", return_value=fence),
+                patch.object(torch.cuda, "current_stream", return_value=stream),
+            ):
+                self.assertIs(
+                    overlap.run_batch(lambda *a: result, scheduler, batch), result
+                )
+            self.assertEqual(recorded, [stream])
+            self.assertFalse(target.gpu_ready())
+            complete[0] = True
+            self.assertTrue(target.gpu_ready())
 
 
 if __name__ == "__main__":

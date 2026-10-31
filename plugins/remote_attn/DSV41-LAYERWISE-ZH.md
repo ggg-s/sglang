@@ -115,8 +115,10 @@ H2D event 与原生 receiver/metadata 的完成证明。
   overlap 模式通过本次 launch 的 plan 绕过内嵌 decoder tail graph，不临时改写
   模型的 tail 对象；普通 P forward 不改图配置。关闭 P overlap 的对照仍保留原串行路径。
   P 不使用 torch.compile，不能让编译图跳过 Python 完成通知。
-- `HANDOFF_PRE_LAYERWISE=remote` 支持 post-PD 首轮 eager sparse attention。
-  传输未完成时提前 decode、逐资源 progressive 切换、Remote 分段图和 D0→D1 迁移尚未适配。
+- `HANDOFF_PRE_LAYERWISE=remote` 支持 [eager sparse 提前接纳与逐资源 Local](DSV41-REMOTE-EAGER-ZH.md)：
+  indexer、SWA/carry 和 metadata 先就绪，global KV 未完成时开始 decode。
+  D Remote 串行，全部 Local 且 GPU/TP 退休后恢复原生 graph/overlap。
+  Remote 分段图和 D0→D1 迁移尚未适配。
 - 支持 P send 和 D receive host staging；不使用原生 MHA staging 开关、uniform-FP8 TRTLLM 或 unified KV。
   不能照搬 Qwen 示例的 `--page-size 1`；沿用原生 DSV4.1 支持的页布局。
 

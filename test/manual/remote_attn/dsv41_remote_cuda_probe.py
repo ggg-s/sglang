@@ -30,6 +30,7 @@ def main():
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--sglang-root", type=Path, required=True)
     parser.add_argument("--output", type=Path, required=True)
+    parser.add_argument("--progressive", action="store_true")
     args = parser.parse_args()
     root = args.sglang_root.resolve()
     torch.cuda.set_device(0)
@@ -126,6 +127,9 @@ def main():
                 33,
                 cache_lease=guard.hold(req),
             )
+            if args.progressive:
+                src.schema = dict(entries=[["kv", 1, 1], ["kv", 2, 2]])
+                src.barrier_ready = generation == "cancel"
             remote.register(src)
             sources.append(src)
             return src
@@ -146,7 +150,9 @@ def main():
             target.call(f.query[0], [0], 3, 2, 512**-0.5)
         except RuntimeError:
             rejected_before_pd = True
-        src.req.disagg_kv_sender.poll = lambda: 4
+        src.req.disagg_kv_sender.poll = lambda: 3 if args.progressive else 4
+        if args.progressive:
+            src.barrier_ready = True
         rejected_half_pair = False
         try:
             target.call(f.query[0], [16], 3, 2, 512**-0.5)
@@ -161,6 +167,12 @@ def main():
         global_before = [p.kv_buffer[0].clone() for p in f.p_pool.kv_pools.values()]
         swa_before = [x.clone() for x in f.p_swa]
         index_before = f.core.c2_sparse_page_indices.clone()
+        progressive_state = None
+        progressive_result = None
+        if args.progressive:
+            import dsv41_progressive_probe_support as progressive
+
+            progressive_state = progressive.start(f, src, target)
         max_error = 0.0
         kv = torch.zeros((1, 512), device="cuda", dtype=torch.bfloat16)
 
@@ -206,7 +218,12 @@ def main():
                         .long()
                     )
                     extra = f.oracle.dequantize_k_cache_v41_fp4(
-                        f.d_pool.get_extra_key_buffer(layer_id).cpu(), 8 // ratio
+                        (
+                            progressive_state.saved[ratio]
+                            if args.progressive
+                            else f.d_pool.get_extra_key_buffer(layer_id)
+                        ).cpu(),
+                        8 // ratio,
                     ).reshape(-1, 512)[ids]
                     rows.append(extra)
                 keys = torch.cat(rows).float()
@@ -222,7 +239,23 @@ def main():
             return "native-model-result"
 
         assert remote.forward(f.controller, decode, None, f.fb) == "native-model-result"
-        assert target.calls == 3 and target.closed and not f.controller.remote_targets
+        if args.progressive:
+            assert target.calls == 3 and not target.closed
+            assert src.req.disagg_kv_sender.poll() == 3
+            # Continuous eager decode while both resources remain missing.
+            remote.forward(f.controller, decode, None, f.fb)
+            assert target.calls == 6
+            progressive.transfer(f, progressive_state, 0)
+            remote.forward(f.controller, decode, None, f.fb)
+            assert target.calls == 8  # c1 Local; producer c2 serves two consumers.
+            progressive.transfer(f, progressive_state, 1)
+            remote.forward(f.controller, decode, None, f.fb)
+            assert target.calls == 8  # No RPC once both resources are TP-Local.
+            progressive_result = progressive.finish(f, progressive_state, target)
+        else:
+            assert (
+                target.calls == 3 and target.closed and not f.controller.remote_targets
+            )
         for _ in range(32):
             assert hooks._decode_graph(lambda *a: True, graph_runner, f.fb)
         assert torch.equal(index_before, f.core.c2_sparse_page_indices)
@@ -292,6 +325,10 @@ def main():
             Path(__file__).resolve(),
             Path(__file__).with_name("dsv41_remote_probe_support.py").resolve(),
         ]
+        if args.progressive:
+            files.append(
+                Path(__file__).with_name("dsv41_progressive_probe_support.py").resolve()
+            )
         files += [
             root / p
             for p in (
@@ -306,7 +343,10 @@ def main():
             torch=torch.__version__,
             layouts_bit_exact=layout_cases,
             remote_calls=target.calls,
-            rejected_before_pd=rejected_before_pd,
+            rejected_before_pd=rejected_before_pd if not args.progressive else None,
+            rejected_before_sparse_barrier=rejected_before_pd
+            if args.progressive
+            else None,
             rejected_half_pair=rejected_half_pair,
             max_abs_error=max_error,
             odd_half_pair_stays_local=True,
@@ -317,7 +357,8 @@ def main():
             cancel_inflight_gpu_retained=retained,
             cancel_rpc_errors=errors,
             source_pins_closed=True,
-            scope=__doc__,
+            progressive=progressive_result,
+            scope=(__doc__ if not args.progressive else progressive.__doc__),
             source_sha256={
                 str(p.relative_to(root)): hashlib.sha256(p.read_bytes()).hexdigest()
                 for p in files

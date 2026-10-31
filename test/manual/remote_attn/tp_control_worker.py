@@ -4,6 +4,7 @@ import argparse
 import json
 import sys
 import threading
+import time
 from dataclasses import make_dataclass
 from datetime import timedelta
 from pathlib import Path
@@ -1316,6 +1317,149 @@ def sparse_remote_lifetimes(args):
         protocol.close()
 
 
+def sparse_progressive_lifetimes(args):
+    """Real TP2 commands, staggered scatter/GPU and cancellation release edges."""
+    import torch
+    from sglang_remote_attn import dsv41_progressive as pg
+    from sglang_remote_attn.decode_overlap import DecodeOverlap
+    from sglang_remote_attn.pre_layerwise import Config, Controller
+
+    owner = Controller.__new__(Controller)
+    owner.rank, owner.tp_size, owner.graph_fast_path = args.rank, 2, True
+    owner.dsv41_remote = True
+    owner.scheduler = SimpleNamespace(
+        attn_tp_cpu_group=dist.group.WORLD, enable_overlap=True
+    )
+    owner.config = Config("remote", Path(args.output).with_suffix(".progressive"))
+    owner.targets, owner.remote_targets = [], {0: True}
+    status = [3]
+    dr = SimpleNamespace(
+        req=SimpleNamespace(
+            rid="progressive", bootstrap_room=801, kv=SimpleNamespace(req_pool_idx=0)
+        ),
+        metadata_buffer_index=0,
+        _staging_completed_layers=[],
+        kv_receiver=SimpleNamespace(poll=lambda: status[0], clear=lambda: None),
+    )
+    queue = SimpleNamespace(
+        staging_handler=SimpleNamespace(
+            advance_scatter=lambda dr: None,
+            is_failed=lambda dr: False,
+            is_done=lambda dr: status[0] == 4,
+            unregister_decode_req=lambda room: None,
+        ),
+        metadata_buffers=SimpleNamespace(bootstrap_room=torch.tensor([[801]])),
+        req_to_metadata_buffer_idx_allocator=SimpleNamespace(free=lambda idx: None),
+    )
+    closed = []
+    rpc = SimpleNamespace(
+        local_entries=set(),
+        calls=0,
+        check=lambda: None,
+        close=lambda reason: (closed.append(reason), owner.remote_targets.clear()),
+    )
+    target = pg.ProgressiveTarget(
+        owner,
+        queue,
+        dr,
+        owner.config.directory,
+        f"pg-{args.rank}",
+        SimpleNamespace(prefix_len=33),
+        native_staging=True,
+        rpc=rpc,
+    )
+    resources = [pg.Resource(target, i, i + 1) for i in (0, 1)]
+    target.resources = resources
+    target.admission_id = 3
+    gpu = [False]
+    target.forward_proofs = [SimpleNamespace(ready=lambda: gpu[0])]
+    owner.targets = [*resources, target]
+    overlap = DecodeOverlap(owner)
+    owner.decode_overlap = overlap
+    assert overlap.serial()
+    protocol = overlap.retirement
+    for item in owner.targets:
+        protocol.register(item)
+    votes = []
+    actual = dist.all_reduce
+
+    def counted(tensor, *a, **kw):
+        votes.append(tensor.numel())
+        return actual(tensor, *a, **kw)
+
+    def command():
+        for _ in range(128):
+            protocol.observe()
+            message = [protocol.poll_command()]
+            dist.broadcast_object_list(message, src=0)
+            if message[0] is not None:
+                protocol.arm(message[0])
+                protocol.finalize()
+                return
+            time.sleep(0.001)
+        raise AssertionError("ordered progressive command missing")
+
+    def stable():
+        for _ in range(32):
+            protocol.observe()
+            assert protocol.poll_command() is None
+
+    freed = []
+    try:
+        with (
+            patch.object(dist, "all_reduce", counted),
+            patch(
+                "sglang_remote_attn.pre_layerwise._runtime",
+                return_value=SimpleNamespace(_drop_target_state_for=lambda req: None),
+            ),
+            patch.dict(
+                sys.modules,
+                {
+                    "sglang.srt.disaggregation.base.conn": SimpleNamespace(
+                        KVPoll=SimpleNamespace(Success=4, Failed=0)
+                    )
+                },
+            ),
+        ):
+            if args.rank == 0:
+                dr._staging_completed_layers = [((0,), 0, 5)]
+            stable()
+            dist.barrier()
+            assert not votes and not rpc.local_entries
+            if args.rank == 1:
+                dr._staging_completed_layers = [((0,), 0, 5)]
+            command()
+            assert rpc.local_entries == {0} and votes == [5]
+            dr._staging_completed_layers.append(((1,), 0, 5))
+            command()
+            assert rpc.local_entries == {0, 1} and votes == [5, 5]
+            status[0] = 4
+            if args.rank == 0:
+                target.release = lambda: freed.append("KV")
+            stable()
+            dist.barrier()  # Release mismatch never frees or votes per loop.
+            if args.rank == 1:
+                target.release = lambda: freed.append("KV")
+            command()  # Both release, but one or both GPU proofs still pending.
+            assert not freed and votes == [5, 5, 5]
+            gpu[0] = True
+            command()
+            assert freed == ["KV"] and not owner.targets and not owner.remote_targets
+            stable()
+            assert overlap.serial()  # Final Remote result boundary.
+            assert not overlap.serial()
+            return dict(
+                votes=votes,
+                freed=freed,
+                local_entries=sorted(rpc.local_entries),
+                retries=protocol.retries,
+                closed=len(closed),
+                stable_votes=0,
+            )
+    finally:
+        protocol.close()
+
+
 def main():
     parser = argparse.ArgumentParser()
     parser.add_argument("rank", type=int)
@@ -1531,6 +1675,7 @@ def main():
         p_staging_failure = prefill_staging_failure(args)
         d_receive_staging = receive_staging_consensus(args)
         sparse_remote = sparse_remote_lifetimes(args)
+        sparse_progressive = sparse_progressive_lifetimes(args)
         Path(args.output).write_text(
             json.dumps(
                 {
@@ -1548,6 +1693,7 @@ def main():
                     "p_staging_failure": p_staging_failure,
                     "d_receive_staging": d_receive_staging,
                     "sparse_remote": sparse_remote,
+                    "sparse_progressive": sparse_progressive,
                     "segmented_startup": startup,
                     "segmented_routing": routing,
                 }

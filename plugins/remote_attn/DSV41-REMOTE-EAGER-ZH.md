@@ -1,65 +1,64 @@
-# DSV4.1 Remote sparse attention：post-PD eager 最小闭环
+# DSV4.1 Remote sparse：提前接纳与逐资源 Local
 
-此版本仅完成原生 PD **完成后**首轮 D decode 的真实稀疏 RPC：P 计算不可变 global
-前缀的已选 attention，D 保留本地部分，再切回 Local。没有 early admission、传输
-未完成时 decode、按资源 progressive 迁入或 Remote 分段图；不据此声称 TTFT/吞吐收益。
-全量 KV 仍通过既有 layerwise PD 传到 D。生产代码仅修改插件，SMG/SGL 核心不改。
+`HANDOFF_PRE_LAYERWISE=remote` 现在允许 D 在 **global KV 尚未传完**时开始 decode。
+先完成 indexer、SWA/carry 和 metadata 屏障，再由 P 提供缺失 global 前缀的 sparse
+attention；每个 physical global 资源复制完成并经过 TP 有序共识后独立切 Local。
+生产代码只改插件，SMG/SGL 核心无新增修改。仍是 eager 参考实现，未证明生产性能收益。
 
-## 数据归属
+## 数据和请求链路
 
-| 资源 | 归属和读取规则 |
-|---|---|
-| 已完成 global compressed KV 前缀 | P 保留只读 lease；RPC 只读 D 选中的 logical position，不传 D 物理地址给 P |
-| indexer payload/scale、candidate/top-k | 通过原生 PD 到 D；D 原生 indexer、候选缓存和 top-k 是唯一权威，不在 P 重排/截断或重做 top-k |
-| 新生成 compressed KV | D 原生 compressor 写入；最终 top-k 中属于新增部分的 slot 在 D 计算 |
-| ratio-2 pending half-pair/carry | 原生 final-chunk carry 到 D 并在 D 接续；P 仅可读 `< floor(prompt_len / ratio)` 的完整压缩行 |
-| SWA 和 attention sink | D 原生存储/更新；SWA-only 层走原生 attention，带 Remote global 的层在 D 合并本地 SWA/新增行，sink 仅计一次 |
+1. P 原生 middle chunk 及其传输 FIFO 保留。最终 chunk 完成 forward 后，插件通过
+   原生 `send_kv_chunk` / `CommonKVSender.send` 获取 authoritative state indices、
+   metadata 和已预留的 final page slice；没有复制模型的 SWA/carry planner。
+2. 最终 chunk 先发送全部 indexer payload/scale 条目。所有对应 native TE callback
+   完成后，在仍计入 native outstanding/IO ledger 的 worker callback 内，调用原生
+   `maybe_send_extra` 和 `send_aux` 发送 SWA、compression/indexer carry、metadata。
+   不能以“最后一个编号的 chunk 完成”替代全部 indexer 完成集合。
+3. P 发布本代 `sparse-ready.json`，再发送 global KV，并保留 canonical final Success。
+   final 不重发已交给 D 更新的 SWA/carry，也不再次 DMA metadata。P 的 HTTP leg
+   可以用 response-only snapshot 提前返回：需要各 TP rank 的同代屏障；不改变 native
+   Req、sender 状态或 KV 所有权，没有新增 response all_reduce。
+4. D 必须同时看到：本代 P state/metadata 屏障、**全部 indexer/scales 的 native scatter
+   CUDA event 完成**、匹配的 metadata bootstrap room、有效 receiver 和未取消请求。
+   既有 TP admission MIN 一致通过后，调用 native `_commit_transfer_to_req(...,
+   keep_receiver=True)`，从 transfer queue 移出请求，保留 receiver 和 metadata slot。
+5. D 继续原生 compressor/indexer、candidate/top-k 和 SWA 更新。选中的 physical
+   sparse slots 按请求 FULL page map 分成 P logical 前缀与 D 新增行，顺序和重复项
+   保留。P 只读 `< floor(prompt_len / ratio)` 的完整压缩行；ratio-2 未完成 half-pair
+   及其接续始终归 D。sink 仅由 D 计一次。
+6. global KV 通过 native receive ring/scatter 写入 D。完整 immutable 页可整体写入；
+   最后一页仅复制 P 的有效压缩行，分别处理 native data/scale 地址，保留 D 新行、
+   carry 接续及末页 padding。indexer 在接纳前复制一次，接纳后不覆盖 D 的更新。
+7. 每个 global physical entry 的 GPU 完成事实只产生本地通知。既有 request receiver
+   广播同一有序退休命令；各 TP rank 对命令规定的同形向量做最终 MIN 后，才把资源
+   标为 Local。共享消费者通过 native `source_layer_of` 复用同一生产者资源。
+   稳定 Remote 观察不做逐轮退休投票，Local 稳态不增加同步。
+8. Remote 期间 D 串行运行；全部资源 Local、canonical Success、native scatter 完成、
+   forward/sampling/readback GPU proof 和取消 release 状态一致之后，最终退休清理
+   receiver/metadata、关闭 RPC、写 `remote-done.json`，再恢复原生 overlap/full graph。
+   重牵引在 TP 对称边界先 drain 资源、再 drain 请求 lifetime，之后才能 backup/free/reset。
 
-共享消费者按原生 `source_layer_of` / `layer_mapping` 读取生产者资源；不假定每层一份 KV。
-D sparse metadata 的 physical slots 先按该请求的 FULL page map 分为 P logical 前缀位置
-和 D 新增 slot。保留 top-k 顺序、重复项、长度与 padding 语义。P 再用自己冻结的 page
-map 定位，拒绝越界位置、错误 ratio、陈旧 epoch/attempt 或其他请求的页面。
-
-## 请求链路与保护
-
-1. P 最终 chunk 沿用既有分层发送、host staging 和原生 SWA/carry/metadata final 接口。
-   P 为只读前缀注册原生插件 `RemoteHub` 的 token/epoch lease，发布本代 `remote-service.json`。
-   服务端在原生 sender Success 前拒绝 sparse read，即使请求已经 attach。
-2. D 保留原生 receive host staging、H2D/scatter、metadata gate 和 TP MIN。
-   只有 native `_commit_transfer_to_req` 完成才激活此次首轮 eager 窗口。
-3. 模型继续运行原生 compressor/indexer。插件只在 D 的 native attention backend 实例上绑定
-   eager 入口；不全局导入/替换 Qwen attention。选中的 P global 前缀经真实 RemoteHub TCP
-   计算 partial output/LSE，D 合并本地结果。当前是选中行的 FP32 Torch eager 参考计算；
-   读取支持 V41/V41_NEW、V41_FP4/V41_FP4_NEW，SWA 主格式须为 V41 编码。
-   混合 batch 的普通请求保留 native 输出，SWA store 不重复。
-4. 完成该请求的第一轮 D model forward 后停止 RPC、写本代 `remote-done.json`，后续恢复
-   原生 Local full graph/overlap。此转换基于“KV 已经全部本地 + 完成同一轮 decode”，
-   不依据某个 rank 的独立 copy 查询，也没有新加入的逐 token CPU collective。
-5. P registry 收到完成事实先 tombstone，拒绝新 reader；已有 reader 须经过原生
-   `RemoteJob.finish` 的 GPU fence 和最后一个 `release_ref` 才能触发 release callback。
-   FULL/SWA 缓存 pin、request row 与源分配继续保留，随后沿用 P overlap 已有事件驱动 TP
-   最终退休协议。GPU fence 失败保留资源；没有跨故障自动恢复。
-
-取消/retraction 关闭旧 target 的 attach 并写旧 generation 完成事实；旧回调不会清除
-复用行上的新 target。TCP 断开不代替 GPU 完成证明。P 请求 attempt/row、D target
-attempt/row 和 epoch 校验阻止陈旧读取。P 串行对照仍沿用原有保守释放路径。
+P registry 保留 token/epoch、attempt/row、cache pin 和真实 GPU reader ref 保护。D
+结束不等于 P 可立即释放：tombstone 先禁止新读，最后一个 `RemoteJob.finish` GPU fence
+与 read ref 归零后，才能沿用 P overlap 的最终 TP 退休回收 FULL/SWA cache lease。
+DMA timeout、scatter/forward proof 失败均保留页面，拒绝不安全复用；没有跨进程故障恢复。
 
 ## 原生启动
 
-先使用 [原生 P/D 启动文档](DSV41-LAYERWISE-ZH.md) 中已验证的参数数组及公共环境。
-保持纯文本、同机单 pair、同 TP、PP=DP=CP=1、DSpark/HiCache 关闭，D radix cache 仍关闭。
-P FULL/SWA cache、P/D scheduler overlap、optimistic prefill、chunk 和 transfer batch 保持现值。
-Remote 当前要求原生 `flashmla` backend；D 的 mega/TRTLLM 路径启动时拒绝。
+沿用 [原生 SMG/P/D 参数数组](DSV41-LAYERWISE-ZH.md)。保留 P FULL/SWA cache、P/D overlap、
+optimistic prefill、chunk 和 transfer batch 的线上原值；D radix cache 保留既有限制。
+纯文本、同机单 pair、同 TP、PP=DP=CP=1，关闭 DSpark/HiCache；使用 `flashmla`，
+不启用 mega/TRTLLM、LoRA、unified KV、whole-prefix checksum 或 mixed chunk。
 
-两端设置：
+两端公共环境：
 
 ```bash
 export HANDOFF_PRE_LAYERWISE=remote
-export SGLANG_DISAGG_STAGING_BUFFER=0
-# HANDOFF_PD_DIR 用同一份本机共享目录，每轮重启换新目录。
+export SGLANG_DISAGG_STAGING_BUFFER=0  # 原生 MHA staging 开关保持关闭
+# HANDOFF_PD_DIR 指向同一份本机目录，每轮启动换新目录。
 ```
 
-P：
+P 继续原生命令：
 
 ```bash
 export HANDOFF_PRE_LAYERWISE_HOST_STAGING=1
@@ -68,7 +67,7 @@ python -m sglang.launch_server "${P_NATIVE_ARGS[@]}" \
   --language-model-only --dsv4-attn-backend flashmla
 ```
 
-D：
+D 继续原生命令：
 
 ```bash
 export HANDOFF_PRE_LAYERWISE_HOST_STAGING=0
@@ -77,21 +76,31 @@ python -m sglang.launch_server "${D_NATIVE_ARGS[@]}" \
   --language-model-only --disable-radix-cache --dsv4-attn-backend flashmla
 ```
 
-已有 native args 不重复填写 backend；将其原值改为上述兼容选项。P send / D receive
-staging 可各自关闭做对照。无需 JSON 包装器，SMG 继续原有 PD router 命令。
-DSV 模式不捕获 Qwen 的 Remote graph bank；普通 Local graph 配置保留。
+backend 参数已有时不重复追加。SMG 保留原生 PD router 命令，不加载插件变量，无 JSON
+包装器。P send staging 可关闭。D receive host staging 关闭时仍需要 **GPU receive ring**：
+progressive 不能直接把整页 DMA 到正被 decode 修改的末页。ring 使用原生
+`SGLANG_DISAGG_STAGING_POOL_SIZE_MB`，需计入 GPU/host 内存预算，不是无额外内存方案。
+若一个 final-chunk physical entry 超过 ring 容量，请求在接管前回退完整 native PD，
+不发布 early-ready；不会把 unsafe direct-page write 当作 progressive fallback。
 
-## 确认路径与验收
+短 prompt、bootstrap/资格不匹配等继续原生 PD；旧 wire/version 的 peer 也不进入本接管路径。
+Remote 不捕获 DSV 分段 graph。带 Remote 的混合 batch 全部行用 eager sparse union 计算，
+避免 native whole-batch kernel 误读尚未就绪的 global 页；SWA store 只执行一次。
+全部 Local 并退休后恢复原生计算。此参考路径有 CPU 序列化与同步开销。
 
-- 原生 `/health`、`/server_info` 先确认模型、backend、cache/overlap 和 chunk 配置。
-- 本代 `remote-service.json` 应有 `boundary=first-post-PD-decode` 及上述 owners。
-- 首轮 eager decode 后 `remote-done.json` 有 `remote_calls > 0`、读取层号及完成 reason；
-  prefix 太短/top-k 没有 P 部分时可为 0，不算成功覆盖了 Remote 计算。
-- `released.json` 只能出现在 P reader fence、native PD 和 TP 退休证明均满足之后。
-  普通 `done.json` 仅表示 native PD 完成，不能替代 Remote reader 的完成证明。
+## 确认路径
 
-本地 136 项测试、真实 TP2 和 RTX4060 小型 GPU/TCP 记录见
-[验证记录](validation/dsv41-remote-eager-4060.md)。尚未加载完整模型、运行完整 SMG/P/D
-服务或多 GPU NCCL；未证明 token/logprob 一致性和生产收益。完整模型验收应分别比较
-native/layerwise/post-PD eager 的输出、资源回收和开销。本阶段主要验证语义和接口，
-下一阶段才接全局 KV 传输尚未完成时的 D 接纳与逐资源 Local 切换。
+- `remote-service.json`：`boundary=progressive-sparse`，同代 route/token/epoch。
+- `sparse-ready.json`：P 的 indexer TE + native SWA/carry/metadata 屏障。
+- `admitted.json`：D 的 indexer GPU/metadata/TP 屏障已通过；不能只凭 P ready 认定已接纳。
+- `resource-*.json`：P 的 native TE 事实；不能替代 D GPU/TP Local 证书。
+- `local-<physical-entry>.json`：`completion=native-scatter-gpu`、`tp_agreed=true`。
+- `remote-done.json`：最终退出与 RPC 计数；`done.json`：D receiver/metadata 清理及 GPU proof。
+- `released.json`：P native IO、reader fence、cache pin 和 TP 退休全部完成。
+
+验收需证明 **实际 RPC 发生在 canonical transfer Success 之前**，再证明逐项 Local 后
+对应 producer 不再 RPC；只看到 `remote_calls > 0` 不足以证明提前 decode。
+
+[本地/TP2/4060 验证记录](validation/dsv41-progressive-4060.md) 区分真实运行部分与 fixture。
+4060 不支持完整模型的 SM100 FlashMLA/indexer/compressor kernels；尚未运行完整 checkpoint、
+SMG/P/D、多 GPU NCCL，也未证明 token/logprob 一致性或生产 TTFT/吞吐收益。

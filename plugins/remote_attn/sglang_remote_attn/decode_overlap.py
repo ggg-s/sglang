@@ -10,6 +10,7 @@ logger = logging.getLogger(__name__)
 class BatchProof:
     # Attach before launch so a failed/partial forward can never look completed.
     result: object = None
+    serial_done: object = None
 
     def ready(self):
         if self.result is None:
@@ -18,7 +19,9 @@ class BatchProof:
         # copy_done before deferred sampling; it records/submits the copy later.
         if self.result.delay_sample_func is not None:
             return False
-        event = self.result.copy_done
+        event = (
+            self.serial_done if self.serial_done is not None else self.result.copy_done
+        )
         if event is None:
             raise RuntimeError("D overlap result has no GPU completion proof")
         if not event.query():
@@ -69,23 +72,35 @@ class DecodeOverlap:
         # Its optional inner idle batch re-enters the ordinary run_batch hook.
         if not self.controller.targets or batch.forward_mode.is_prebuilt():
             return original(scheduler, batch, *args, **kwargs)
-        active = {id(t.decode_req.req): t for t in self.controller.targets}
+        active = {
+            id(t.decode_req.req): t
+            for t in self.controller.targets
+            if hasattr(t, "forward_proofs")
+        }
         targets = [active[id(req)] for req in batch.reqs if id(req) in active]
         if not targets:
             return original(scheduler, batch, *args, **kwargs)
         proof = BatchProof()
+        overlap_enabled = scheduler.enable_overlap
         for target in targets:
             target.forward_proofs.append(proof)
             target.forward_count += 1
         proof.result = original(scheduler, batch, *args, **kwargs)
+        if not overlap_enabled:
+            # The normal scheduler samples on its forward stream; no native
+            # overlap copy_done is submitted. Fence that actual stream instead.
+            import torch
+
+            proof.serial_done = torch.cuda.Event()
+            proof.serial_done.record(torch.cuda.current_stream())
         # The native copy_done covers forward, future-map publication, sampling
         # and readback (on copy_stream after waiting for forward_stream). Retain
         # the result through delayed sampling and never query its empty event.
         return proof.result
 
 
-def install(controller):
-    if not controller.scheduler.enable_overlap:
+def install(controller, *, force=False):
+    if not controller.scheduler.enable_overlap and not force:
         return None
     if not controller.graph_fast_path:
         raise RuntimeError("D overlap cannot start with unmanaged handoff states")

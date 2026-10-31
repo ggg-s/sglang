@@ -10,6 +10,7 @@ import time
 from . import (
     decode_overlap,
     dsv41_layerwise,
+    dsv41_progressive,
     dsv41_receive,
     dsv41_remote,
     pre_layerwise,
@@ -279,6 +280,11 @@ def _alloc_extend(original, batch):
 
 
 def _reset_retracted(original, req):
+    target = getattr(req, "_pre_layerwise_target", None)
+    if target is not None and getattr(target.owner, "dsv41_remote", False):
+        # Direct native reset callers must respect the same TP-symmetric fence
+        # as release_req; do not let a new attempt inherit pending PD writes.
+        target.owner.drain_targets(required=target)
     dsv41_remote.release(req, "retraction")
     lease = getattr(req, "_dsv41_p_lease", None)
     if lease is not None:
@@ -380,7 +386,7 @@ def _graph_decision(original, runner, forward_batch, kind):
         # prepare agreed the batch across TP before any rank reaches this guard.
         return False
     if getattr(controller, "dsv41_remote", False) and controller.remote_targets:
-        return False  # Native PD TP commit owns the first eager decode window.
+        return False  # TP resource/lifetime leases still require eager decode.
     if controller is not None and controller.graph_fast_path:
         # early_targets admits/removes leases only after TP agreement. Keep
         # even a locally complete lease eager until its slowest peer retires.
@@ -521,7 +527,8 @@ HOOKS = {
     "sglang.srt.disaggregation.mooncake.conn.MooncakeKVManager.__init__": _mooncake_init,
     "sglang.srt.disaggregation.mooncake.conn.MooncakeKVManager._transfer_data": _transfer,
     "sglang.srt.disaggregation.mooncake.conn.MooncakeKVManager.send_kvcache": dsv41_layerwise.send_selected,
-    "sglang.srt.disaggregation.mooncake.conn.MooncakeKVManager.add_transfer_request": prefill_overlap.track_transfer,
+    "sglang.srt.disaggregation.mooncake.conn.MooncakeKVManager.send_aux": dsv41_progressive.send_aux,
+    "sglang.srt.disaggregation.mooncake.conn.MooncakeKVManager.add_transfer_request": dsv41_progressive.canonical_track,
     "sglang.srt.models.deepseek_v4_replay_tail.DecoderReplayTail.plan": prefill_overlap.tail_plan,
     "sglang.srt.disaggregation.prefill.SchedulerDisaggregationPrefillMixin.clear_pending_chunk_send": prefill_overlap.before_mutation,
     "sglang.srt.disaggregation.prefill.SchedulerDisaggregationPrefillMixin.optimistic_release_and_requeue": prefill_overlap.before_mutation,
