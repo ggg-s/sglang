@@ -1,7 +1,7 @@
 # Remote attention / progressive KV handoff plugin
 
 DSV4.1 Flash 纯文本 layerwise：[原生 PD 接入与本地验证](DSV41-LAYERWISE-ZH.md)。
-复用原生 global KV / state 传输，关闭 DSpark；另支持 [Remote eager 提前接纳与逐资源 Local](DSV41-REMOTE-EAGER-ZH.md)。
+复用原生 global KV / state 传输，关闭 DSpark；另支持 [Remote 提前接纳、逐资源 Local 与分段 CUDA graph](DSV41-REMOTE-EAGER-ZH.md)。
 
 单 pair 最小接入：[原生 SMG + P/D 启动说明](SINGLE-PAIR-ZH.md)。直接使用现有
 P/D/SMG 命令及插件环境，保留线上 optimistic prefill、token chunk 和传输 Batch；

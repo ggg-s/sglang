@@ -50,6 +50,7 @@ class RemoteGraphBackend:
         self.remote = remote
         self.is_capturing = is_capturing
         self.restore_pool = restore_pool
+        self._eager_on_graph = eager_on_graph
         self.attention_break = eager_on_graph(self._attention)
         self.capture_remote = False
         self.capture_batch = None
@@ -84,12 +85,9 @@ class RemoteGraphBackend:
         self.full.capture_one(shape_key, forward_fn, capture_inputs, post_warmup_hook)
         if shape_key.size not in REMOTE_BATCHES:
             return
-        if any(
-            getattr(shape_key, key) is not None
-            for key in ("stream_idx", "variant_label", "attention_variant")
-        ):
-            raise RuntimeError("Remote graph supports only plain decode graph keys")
+        self.validate_capture_key(shape_key)
         self.capture_layers = []
+        self.begin_remote_capture()
         self.capture_remote = True
         try:
             # The Remote bank owns a private pool. Opening its native session
@@ -106,6 +104,7 @@ class RemoteGraphBackend:
             raise RuntimeError(
                 f"Remote graph attention boundaries differ: {self.capture_layers}, expected {expected}"
             )
+        self.validate_remote_capture(shape_key.size)
         self.remote_keys[shape_key.size] = shape_key
         self.boundaries[shape_key.size] = tuple(self.capture_layers)
         logger.info(
@@ -113,6 +112,24 @@ class RemoteGraphBackend:
             shape_key.size,
             len(expected),
         )
+
+    def validate_capture_key(self, shape_key):
+        if any(
+            getattr(shape_key, key) is not None
+            for key in ("stream_idx", "variant_label", "attention_variant")
+        ):
+            raise RuntimeError("Remote graph supports only plain decode graph keys")
+
+    def begin_remote_capture(self):
+        pass
+
+    def validate_remote_capture(self, size):
+        pass
+
+    def validate_live(self, batch):
+        meta = _runtime()._row_meta(batch)
+        for state in meta["states"]:
+            _runtime()._check_target_state(state)
 
     def supports_remote(self, batch):
         key = self.remote_keys.get(batch.batch_size)
@@ -145,9 +162,7 @@ class RemoteGraphBackend:
         if use_remote:
             # Freeze the per-token layer masks before the first segment. Never
             # retain a Req or a capture-time dummy ForwardBatch in the callback.
-            meta = _runtime()._row_meta(batch)
-            for state in meta["states"]:
-                _runtime()._check_target_state(state)
+            self.validate_live(batch)
         self.use_remote, self.active_batch = use_remote, batch
         try:
             yield
@@ -269,18 +284,9 @@ def install_attention(model_runner):
 def resolve_backend(original, runner):
     from sglang.srt.runtime_context import get_disagg, get_exec, get_parallel
 
-    if (
-        getattr(
-            getattr(
-                getattr(runner.model_runner, "model_config", None), "hf_config", None
-            ),
-            "model_type",
-            None,
-        )
-        == "deepseek_v41"
-    ):
-        # This first sparse RPC closure deliberately uses eager Remote decode.
-        return original(runner)
+    from . import dsv41_graph
+
+    dsv41 = dsv41_graph.is_model(runner)
     parallel = get_parallel()
     option = os.environ.get("HANDOFF_REMOTE_SEGMENTED_GRAPH", "1")
     settings = (
@@ -300,6 +306,7 @@ def resolve_backend(original, runner):
         or controller is not None
         and (controller.targets or controller.sources)
     )
+    abi = dsv41_graph.capture_signature(mr, runner) if dsv41 else None
     report = (
         settings,
         tuple(runner.capture_bs),
@@ -310,6 +317,11 @@ def resolve_backend(original, runner):
         config.features.enable_memory_saver,
         mr.model_config.num_hidden_layers,
         mr.lora_manager is not None,
+        getattr(mr.model_config.hf_config, "model_type", None) if dsv41 else None,
+        tuple(getattr(mr.model_config.hf_config, "compress_ratios", ()))
+        if dsv41
+        else None,
+        abi,
         live,
         cuda_python if settings == ("decode", "remote", "1") else True,
     )
@@ -322,6 +334,10 @@ def resolve_backend(original, runner):
     )
     if option not in ("0", "1"):
         raise ValueError("HANDOFF_REMOTE_SEGMENTED_GRAPH must be 0 or 1")
+    if settings == ("decode", "remote", "1") and dsv41 and not abi[0]:
+        raise ValueError(
+            "DSV Remote graph native metadata/prepare/attention ABI is incompatible"
+        )
     full = original(runner)
     if settings != ("decode", "remote", "1"):
         return full
@@ -355,7 +371,9 @@ def resolve_backend(original, runner):
         raise ValueError(
             "Remote segments require native full decode graphs without torch.compile, debug-eager or memory saver"
         )
-    if type(mr.model).__name__ != "Qwen3ForCausalLM" or mr.lora_manager is not None:
+    if (
+        not dsv41 and type(mr.model).__name__ != "Qwen3ForCausalLM"
+    ) or mr.lora_manager is not None:
         raise ValueError("Remote segments require Qwen3ForCausalLM without LoRA")
     if not set(REMOTE_BATCHES).issubset(runner.capture_bs):
         raise ValueError(
@@ -365,7 +383,8 @@ def resolve_backend(original, runner):
         raise RuntimeError("Cannot recapture Remote graphs with live handoff leases")
     remote = BreakableCudaGraphBackend(runner)
     remote._pool = runner.device_module.graph_pool_handle()
-    backend = RemoteGraphBackend(
+    cls = dsv41_graph.DSV41GraphBackend if dsv41 else RemoteGraphBackend
+    backend = cls(
         runner,
         full,
         remote,
@@ -374,5 +393,8 @@ def resolve_backend(original, runner):
         lambda: set_graph_pool_id(full._pool),
     )
     mr._remote_segmented_backend = backend
-    install_attention(mr)
+    if dsv41:
+        dsv41_graph.install(mr, runner)
+    else:
+        install_attention(mr)
     return backend

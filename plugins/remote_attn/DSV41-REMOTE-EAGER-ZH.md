@@ -3,7 +3,8 @@
 `HANDOFF_PRE_LAYERWISE=remote` 现在允许 D 在 **global KV 尚未传完**时开始 decode。
 先完成 indexer、SWA/carry 和 metadata 屏障，再由 P 提供缺失 global 前缀的 sparse
 attention；每个 physical global 资源复制完成并经过 TP 有序共识后独立切 Local。
-生产代码只改插件，SMG/SGL 核心无新增修改。仍是 eager 参考实现，未证明生产性能收益。
+生产代码只改插件，SMG/SGL 核心无新增修改。D Remote 支持 batch 1/2/4 分段 CUDA graph；
+动态 sparse、RPC、merge 仍走 eager 参考计算，未证明生产性能收益。
 
 ## 数据和请求链路
 
@@ -84,9 +85,52 @@ progressive 不能直接把整页 DMA 到正被 decode 修改的末页。ring �
 不发布 early-ready；不会把 unsafe direct-page write 当作 progressive fallback。
 
 短 prompt、bootstrap/资格不匹配等继续原生 PD；旧 wire/version 的 peer 也不进入本接管路径。
-Remote 不捕获 DSV 分段 graph。带 Remote 的混合 batch 全部行用 eager sparse union 计算，
+D Remote 分段图的启用要求见下节。带 Remote 的混合 batch 全部行用 eager sparse union 计算，
 避免 native whole-batch kernel 误读尚未就绪的 global 页；SWA store 只执行一次。
 全部 Local 并退休后恢复原生计算。此参考路径有 CPU 序列化与同步开销。
+
+## D Remote 分段 CUDA graph
+
+复用插件现有的 native full + BreakableCudaGraphBackend 双 bank，D 设置：
+
+```bash
+export HANDOFF_REMOTE_SEGMENTED_GRAPH=1  # 默认开启；设 0 并重启可做 eager 对照
+# D_NATIVE_ARGS 保留原生 full decode backend，capture buckets 包含 1/2/4。
+# 使用本分支原生 --cuda-graph-backend-decode full 或等价 cuda-graph-config。
+```
+
+P 不需要开启分段图。原生 graph 若已关闭，仍走 eager；启用分段图的 D 需要原生 full
+backend、1/2/4 buckets、cuda-python，且不使用 torch.compile、debug-eager、memory saver
+或自定义 full backend。更大 buckets 可保留供 Local full graph 使用。
+
+- 只额外捕获 batch **1/2/4**；Remote batch 3/8 等回退 eager，不 padding 到其他 Remote
+  bucket。Local 继续原生 full bank 的 buckets/padding 策略。不是每个请求重新捕获。
+- 原生 `candidate_all/candidate_c2_all/candidate_unfiltered/candidate_filtered` full variants
+  全部保留。同一 batch 的 Remote native keys 复用一套分段图；图外按本轮原生标签设置
+  执行作用域，并在回放结束或异常时恢复。variant 标签和 limits 纳入启动 TP 共识。
+- 图内保留 attention 后投影、norm、MLP/MoE 等稳定计算；图外为 native decode metadata
+  raw→full 升级、原生 attention prepare、attention/sparse 选择、RPC 和 merge。
+  首版 prepare 整段 eager，**QKV 投影也暂留图外**：该原生区域还包含 fused SWA 写入、
+  compressor/indexer、carry 与多流 fork/join，不能只截最后一次 attention 而冻结写地址。
+- 通过 native backend 和 MQALayer 实例方法绑定，沿用原生模型循环；不改 serving 配置或 scheduler，保留多流。回放闭包不保存 capture-time ForwardBatch，全部图外操作
+  使用本轮 live batch；捕获/预热始终 Local，不发 RPC。K/V 以单一 tensor 传递，保留共享语义。
+- metadata 一个 break，每层 prepare + attention 两个 break。L 层是 **2L+1 个 break**，
+  通常 **2L+2 个 CUDA segment**，每个 bucket 一套；不是整层各捕获完整模型一次。
+- rank 启动时先交换开关、buckets、模型/压缩配置及原生方法 ABI，再进入额外 capture
+  barriers。捕获实际边界纳入既有 graph manifest 共识。每个 token 固定资源状态，检测
+  中途 row/attempt/Local mask 变化；图路由不新增逐 decode collective。
+- 部分资源 Local 或刚完成拷贝时继续 Remote bank；全部租约经 GPU/native PD/TP 退休，
+  才恢复 full bank；原有退出边界消费最后一份结果后恢复 scheduler overlap。不重新捕获图。
+- Remote bank 使用独立于 full bank 的 pool，每个 bucket 保留独立 output bridge。
+  eager/graph 结果 shape、dtype、device type 必须相同。RPC 失败不重跑同一 token；native
+  prepare 异常可能缺失侧流 join，标记 unsafe、保留 graph storage，拒绝仅凭主流 event 回收。
+
+日志可用原生 `SGLANG_LOG_DECODE_GRAPH_KEY=1`：Remote 看到
+`path=remote-segmented` / `replay bank=remote batch=1/2/4`；全部退休后为
+`path=graph-eligible all_local=True` / `replay bank=full`。仅有 full graph 日志不证明 overlap
+已经恢复，还需原有 scheduler policy 日志。
+
+[分段图本地/TP2/4060 证据](validation/dsv41-segmented-graphs-4060.md) 明确区分 fixture 和整模验证。
 
 ## 确认路径
 

@@ -25,16 +25,16 @@ DSpark/其他投机解码关闭，不启用 KV cache sharding。使用原生 SMG
 - 最终仍调用原生 `send_kv_chunk(last_chunk=True)`，发送空 global KV 尾部、原生 SWA、
   压缩续接状态和 metadata。ratio-2 的奇数前缀携带 pending half-pair，偶数前缀
   沿用原生空 carry 索引。**只传 global KV 不代表 D 可以开始 decode。**
-- layerwise 下 D 继续等待原生 receiver Success。Remote 最小闭环也等待全量 PD，
-  再执行一轮稀疏 RPC；无 early metadata 或提前接纳。P 还须等待远端 reader
-  完成及 TP 退休共识，才执行延迟释放。
+- layerwise 下 D 继续等待原生 receiver Success。Remote 模式则在 indexer、SWA/carry、
+  metadata 屏障后提前接纳，global 未完成时可 decode；详见专用 Remote 指南。
+  P 还须等待远端 reader 完成及 TP 退休共识，才执行延迟释放。
 
 一个模型层的完成标记只表示其 global 资源传输结束，不代表所有共享消费者和
 原生状态都已就绪。失败不使用请求的 released 标志推断写入完成；保留资源并报错。
 本次不提供跨故障自动恢复协议。
 
-`HANDOFF_PRE_LAYERWISE=remote` 现支持**原生 PD 完成后的首轮 D decode eager 稀疏 RPC**；
-归属、启动和限制见 [Remote 最小闭环](DSV41-REMOTE-EAGER-ZH.md)。本版不提前接纳 D。
+`HANDOFF_PRE_LAYERWISE=remote` 支持提前接纳、逐资源 Local 和 batch 1/2/4 分段 graph；
+归属、启动和限制见 [Remote 接入指南](DSV41-REMOTE-EAGER-ZH.md)。
 
 ## P 端 host staging
 
@@ -48,7 +48,7 @@ compressed global KV、indexer FP4 payload/scale，逐项验证地址、连续�
 最后一个 chunk 的分组任务通过原生 `transfer_fn=partial(_transfer_data, stage=True)`
 发送。原生 worker 先等生产层 event 和页索引 event，再执行 D2H；同一 slot 的锁覆盖
 D2H 到 TE 返回，成功后才执行原有完成回调。SWA、carry 和 metadata 保留原生
-final-chunk 顺序及 Success 屏障，D 不提前 decode。`prefill.json.host_staging=true`
+final-chunk 顺序及 Success 屏障；layerwise 下 D 不提前 decode，Remote 使用专用提前状态屏障。`prefill.json.host_staging=true`
 用于确认本次接管启用了该路径。
 
 普通 middle chunk 保持已有原生策略。若原生线上已设置
@@ -75,7 +75,7 @@ staging 可独立开关。两端保持 `SGLANG_DISAGG_STAGING_BUFFER=0`：原生
 原生 tensor 列表，在 D 创建同款 pinned `StagingAllocator`、GPU shadow 和
 `DecodeStagingHandler`，再打开相应实例的原生完成门控；不临时改全局环境变量。
 
-offer 的 `staging_wire=dsv41-flat-v1`、精确 DSV4.1 manifest、同 TP 和原生 ring
+offer 的 `staging_wire=dsv41-flat-v2`、精确 DSV4.1 manifest、同 TP 和原生 ring
 注册必须匹配。P 在最后一个 chunk 的 forward 前，用原生 `STAGING_REQ/RSP`
 为各组申请区间，payload 按选中的物理条目及各自 native stride 紧凑排列。
 分组写入保留原生 TE planner 和 batch 上限；没有把 indexer scale 误当作 V，
@@ -118,7 +118,7 @@ H2D event 与原生 receiver/metadata 的完成证明。
 - `HANDOFF_PRE_LAYERWISE=remote` 支持 [eager sparse 提前接纳与逐资源 Local](DSV41-REMOTE-EAGER-ZH.md)：
   indexer、SWA/carry 和 metadata 先就绪，global KV 未完成时开始 decode。
   D Remote 串行，全部 Local 且 GPU/TP 退休后恢复原生 graph/overlap。
-  Remote 分段图和 D0→D1 迁移尚未适配。
+  D Remote batch 1/2/4 支持分段 graph，动态 prepare/sparse/RPC/merge 留图外；D0→D1 迁移尚未适配。
 - 支持 P send 和 D receive host staging；不使用原生 MHA staging 开关、uniform-FP8 TRTLLM 或 unified KV。
   不能照搬 Qwen 示例的 `--page-size 1`；沿用原生 DSV4.1 支持的页布局。
 

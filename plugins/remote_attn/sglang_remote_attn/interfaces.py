@@ -17,6 +17,29 @@ CORE_CALLS = {
     DISAGG + "decode.DecodeTransferQueue._commit_transfer_to_req": {
         "keep_receiver": False
     },
+    "sglang.srt.layers.attention.deepseek_v4_backend.DeepseekV4AttnBackend.init_forward_metadata_in_graph": {
+        "forward_batch": inspect.Parameter.empty
+    },
+    "sglang.srt.layers.attention.deepseek_v4_backend.DeepseekV4AttnBackend.forward": {
+        "forward_batch": inspect.Parameter.empty
+    },
+    **{
+        f"sglang.srt.models.deepseek_v4.MQALayer.{name}": {
+            "forward_batch": inspect.Parameter.empty,
+            "attn_backend": inspect.Parameter.empty,
+            "q_out": None,
+            "x_quant": None,
+        }
+        for name in (
+            "_forward_prepare",
+            "_forward_prepare_multi_stream",
+            "_forward_prepare_low_ratio_multi_stream",
+        )
+    },
+    "sglang.srt.model_executor.runner_utils.capture_mode.get_capture_attention_variant": {},
+    "sglang.srt.model_executor.runner_utils.capture_mode._set_capture_attention_variant": {
+        "variant": inspect.Parameter.empty
+    },
     MANAGER + "add_transfer_request": {
         "aux_index": None,
         "state_indices": None,

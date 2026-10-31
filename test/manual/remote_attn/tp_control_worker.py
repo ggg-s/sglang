@@ -1460,6 +1460,77 @@ def sparse_progressive_lifetimes(args):
         protocol.close()
 
 
+def dsv41_graph_settings(args):
+    """Exchange native ABI/capture choices before any segmented capture barrier."""
+    import importlib.util
+
+    from sglang_remote_attn.dsv41_graph import capture_signature
+    from sglang_remote_attn.segmented_graph import agree_capture_settings
+
+    spec = importlib.util.spec_from_file_location(
+        "dsv41_graph_probe_support",
+        Path(__file__).with_name("dsv41_graph_probe_support.py"),
+    )
+    support = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(support)
+    f = support.fixture()
+    outcomes = []
+    for scenario in ("same", "flag", "buckets", "abi", "variants"):
+        f.runner.attention_graph_variants = (
+            SimpleNamespace(capture_labels=("candidate_filtered",), graph_limits=())
+            if scenario == "variants" and args.rank == 1
+            else None
+        )
+        abi = capture_signature(f.mr, f.runner)
+        if scenario == "abi" and args.rank == 1:
+            abi = (False, abi[1])
+        report = (
+            False if scenario == "flag" and args.rank == 1 else True,
+            (1, 2) if scenario == "buckets" and args.rank == 1 else (1, 2, 4),
+            abi,
+        )
+        try:
+            agree_capture_settings(report, group=dist.group.WORLD, world_size=2)
+            outcomes.append(True)
+        except RuntimeError:
+            outcomes.append(False)
+    assert outcomes == [True, False, False, False, False]
+    from sglang_remote_attn import hooks
+    from sglang_remote_attn.dsv41_graph import DSV41GraphBackend
+
+    backend = DSV41GraphBackend.__new__(DSV41GraphBackend)
+    backend.remote_keys = {n: SimpleNamespace(size=n) for n in (1, 2, 4)}
+    backend.remote = SimpleNamespace(can_run=lambda *a: True)
+    f.runner.backend = backend
+    policies = []
+    votes = []
+    native_reduce = dist.all_reduce
+
+    def counted(*a, **kw):
+        votes.append(True)
+        return native_reduce(*a, **kw)
+
+    context = SimpleNamespace(
+        get_parallel=lambda: SimpleNamespace(tp_size=2, tp_rank=args.rank)
+    )
+    with (
+        patch.dict(sys.modules, {"sglang.srt.runtime_context": context}),
+        patch.object(dist, "all_reduce", counted),
+    ):
+        for stage in ("remote", "partial-local", "all-copied", "retired"):
+            f.controller.targets = [] if stage == "retired" else [object()]
+            f.controller.remote_targets = {} if stage == "retired" else {0: True}
+            policies.append(
+                [
+                    hooks._decode_graph(lambda *a: True, f.runner, f.batch(n))
+                    for n in (1, 2, 3, 4, 8)
+                ]
+            )
+        assert not votes
+    assert policies == [[True, True, False, True, False]] * 3 + [[True] * 5]
+    return dict(settings=outcomes, policies=policies, per_decode_votes=len(votes))
+
+
 def main():
     parser = argparse.ArgumentParser()
     parser.add_argument("rank", type=int)
@@ -1676,6 +1747,7 @@ def main():
         d_receive_staging = receive_staging_consensus(args)
         sparse_remote = sparse_remote_lifetimes(args)
         sparse_progressive = sparse_progressive_lifetimes(args)
+        dsv41_segments = dsv41_graph_settings(args)
         Path(args.output).write_text(
             json.dumps(
                 {
@@ -1694,6 +1766,7 @@ def main():
                     "d_receive_staging": d_receive_staging,
                     "sparse_remote": sparse_remote,
                     "sparse_progressive": sparse_progressive,
+                    "dsv41_segments": dsv41_segments,
                     "segmented_startup": startup,
                     "segmented_routing": routing,
                 }

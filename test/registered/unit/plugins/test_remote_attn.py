@@ -3698,6 +3698,15 @@ class TestRemoteAttn(CustomTestCase):
             rows[0]["p_overlap"],
             dict(votes=[5, 5], freed=[1, 2], commits=2, registered=0, local_votes=0),
         )
+        self.assertEqual(
+            rows[0]["dsv41_segments"],
+            dict(
+                settings=[True, False, False, False, False],
+                policies=[[True, True, False, True, False]] * 3 + [[True] * 5],
+                per_decode_votes=0,
+            ),
+        )
+        self.assertEqual(rows[0]["dsv41_segments"], rows[1]["dsv41_segments"])
         self.assertEqual(rows[0]["sparse_progressive"], rows[1]["sparse_progressive"])
         self.assertEqual(
             rows[0]["sparse_progressive"],
@@ -9201,6 +9210,266 @@ class TestRemoteAttn(CustomTestCase):
             self.assertFalse(target.gpu_ready())
             complete[0] = True
             self.assertTrue(target.gpu_ready())
+
+    def _dsv41_graph_fixture(self, variants=(None,)):
+        from sglang_remote_attn import dsv41_graph as dg
+
+        name = "dsv41_graph_probe_support"
+        spec = importlib.util.spec_from_file_location(
+            name, ROOT / "test/manual/remote_attn/dsv41_graph_probe_support.py"
+        )
+        support = importlib.util.module_from_spec(spec)
+        spec.loader.exec_module(support)
+        f = support.fixture()
+        f.runner.attention_graph_variants = SimpleNamespace(
+            capture_labels=variants, graph_limits=()
+        )
+        state = [None]
+
+        def set_variant(value):
+            state[0] = value
+
+        self.enterContext(
+            patch.dict(
+                sys.modules,
+                {
+                    "sglang.srt.model_executor.runner_utils.capture_mode": SimpleNamespace(
+                        get_capture_attention_variant=lambda: state[0],
+                        _set_capture_attention_variant=set_variant,
+                    )
+                },
+            )
+        )
+        f.variant_state = state
+
+        class Bank:
+            def __init__(self):
+                self.capturing = False
+                self.keys = {}
+                self.callbacks = {}
+                self.known_keys = []
+
+            def capture_session(self, stream):
+                return nullcontext()
+
+            def capture_one(self, key, fn, *args):
+                self.capturing = True
+                self.record = []
+                try:
+                    fn()
+                    self.keys[key.size] = key
+                    self.known_keys.append(key)
+                    self.callbacks[key.size] = self.record
+                finally:
+                    self.capturing = False
+
+            def can_run(self, fb, key):
+                return key in self.known_keys
+
+            def replay_session(self):
+                return nullcontext()
+
+            def replay(self, key, fb):
+                for callback in self.callbacks[key.size]:
+                    callback()
+                return torch.ones(fb.batch_size, 4)
+
+            def cleanup(self):
+                self.keys.clear()
+
+        full, remote = Bank(), Bank()
+
+        def eager(fn):
+            def wrapped(*a, **kw):
+                result = fn(*a, **kw)
+                if remote.capturing:
+                    remote.record.append(lambda: fn(*a, **kw))
+                return result
+
+            return wrapped
+
+        f.runner.device_module = SimpleNamespace(
+            Event=lambda: SimpleNamespace(
+                record=lambda stream: None, synchronize=lambda: None
+            ),
+            current_stream=lambda: None,
+        )
+        b = dg.DSV41GraphBackend(
+            f.runner, full, remote, eager, lambda: remote.capturing, lambda: None
+        )
+        f.attach(b)
+        with b.capture_session(None):
+            for size in (8, 4, 2, 1):
+                for variant in variants:
+                    fb = f.batch(size, -100)
+                    key = SimpleNamespace(
+                        size=size,
+                        stream_idx=None,
+                        variant_label=None,
+                        attention_variant=variant,
+                    )
+                    b.capture_one(
+                        key,
+                        lambda fb=fb: f.model(
+                            torch.ones(fb.batch_size, 4), torch.zeros(fb.batch_size), fb
+                        ),
+                    )
+        f.backend, f.full, f.remote = b, full, remote
+        self.addCleanup(b.cleanup)
+        return f
+
+    def test_dsv41_segments_bind_live_metadata_prepare_and_attention_without_capture_rpc(
+        self,
+    ):
+        """Captured dummy FB must not select replay sparse rows/carry or RPC route."""
+        f = self._dsv41_graph_fixture()
+        b = f.backend
+        self.assertEqual(sorted(b.remote_keys), [1, 2, 4])
+        self.assertEqual(sorted(f.full.keys), [1, 2, 4, 8])
+        self.assertEqual(f.calls, [])
+        self.assertEqual(f.prepared, [])
+        self.assertIsNone(b.capture_batch)
+        expected = (
+            ("metadata", -1),
+            ("prepare", 0),
+            ("attention", 0),
+            ("prepare", 1),
+            ("attention", 1),
+            ("prepare", 2),
+            ("attention", 2),
+        )
+        self.assertEqual(b.manifest()[0], tuple((n, expected) for n in (1, 2, 4)))
+        f.controller.targets = [object()]
+        for n in (1, 2, 4):
+            for marker in (3, 7):
+                live = f.batch(n, marker)
+                with b.execution(live), b.replay_session():
+                    b.replay(b.remote_keys[n], live)
+                self.assertEqual(f.calls[-3:], [(marker, i) for i in range(3)])
+                self.assertEqual(f.prepared[-3:], [(marker, i) for i in range(3)])
+                self.assertEqual(f.metadata[-1], marker)
+        self.assertIsNone(b.active_batch)
+        self.assertIsNone(b.capture_batch)
+
+    def test_dsv41_segments_graph_policy_uses_shared_lease_and_never_pads_remote_rows(
+        self,
+    ):
+        """Only TP-registered lifetimes enable Remote graph; Local uses native full."""
+        f = self._dsv41_graph_fixture()
+        f.controller.targets = [object()]
+        context = SimpleNamespace(
+            get_parallel=lambda: SimpleNamespace(tp_size=1, tp_rank=0)
+        )
+        with patch.dict(sys.modules, {"sglang.srt.runtime_context": context}):
+            for size, expected in (
+                (1, True),
+                (2, True),
+                (3, False),
+                (4, True),
+                (8, False),
+            ):
+                self.assertEqual(
+                    self.hooks._decode_graph(lambda *a: True, f.runner, f.batch(size)),
+                    expected,
+                )
+            # A compatibility/post-PD target has no shared progressive lease.
+            f.controller.targets = []
+            f.controller.remote_targets = {0: object()}
+            self.assertFalse(
+                self.hooks._decode_graph(lambda *a: True, f.runner, f.batch(1))
+            )
+            f.controller.remote_targets = {}
+            for _ in range(32):
+                self.assertTrue(
+                    self.hooks._decode_graph(lambda *a: True, f.runner, f.batch(8))
+                )
+
+    def test_dsv41_segments_reject_mid_token_resource_mutation_and_wrong_bridge(self):
+        """A resource state edge cannot leak into half of one segmented token."""
+        f = self._dsv41_graph_fixture()
+        b = f.backend
+        f.controller.targets = [object()]
+        target = SimpleNamespace(
+            progressive=True, closed=False, check=lambda: None, local_entries=set()
+        )
+        f.controller.remote_targets[0] = target
+        live = f.batch(1, 3)
+        with b.execution(live):
+            target.local_entries.add(1)
+            with self.assertRaisesRegex(RuntimeError, "ownership changed"):
+                b.replay(b.remote_keys[1], live)
+        target.local_entries.clear()
+        original = f.attn._dsv41_graph_originals["attention"]
+        f.attn._dsv41_graph_originals["attention"] = lambda **kw: original(**kw)[:, :2]
+        with self.assertRaisesRegex(RuntimeError, "graph bridge"):
+            with b.execution(live):
+                b.replay(b.remote_keys[1], live)
+        self.assertIsNone(b.active_batch)
+
+    def test_dsv41_segments_preparation_failure_retains_unjoined_gpu_storage(self):
+        """A main-stream event cannot fence an unfinished native side stream."""
+        f = self._dsv41_graph_fixture()
+        b = f.backend
+        f.controller.targets = [object()]
+
+        def failed(**kw):
+            raise RuntimeError("side-stream launch failed")
+
+        f.layers[1]._dsv41_graph_originals["_forward_prepare_multi_stream"] = failed
+        with self.assertRaisesRegex(RuntimeError, "side-stream"):
+            with b.execution(f.batch(1, 2)):
+                b.replay(b.remote_keys[1], b.active_batch)
+        self.assertTrue(b.unsafe)
+        with self.assertRaisesRegex(RuntimeError, "completion is unproven"):
+            b.cleanup()
+        # Test-only CPU fake bank has no GPU storage; permit its cleanup fixture.
+        b.unsafe = False
+
+    def test_dsv41_segments_native_abi_and_boundary_completeness_fail_closed(self):
+        """Missing prepare/metadata breaks cannot silently freeze native sparse state."""
+        from sglang_remote_attn import dsv41_graph as dg
+
+        f = self._dsv41_graph_fixture()
+        self.assertTrue(dg.capture_signature(f.mr, f.runner)[0])
+        f.backend.dynamic_trace.pop()
+        with self.assertRaisesRegex(RuntimeError, "dynamic boundaries"):
+            f.backend.validate_remote_capture(1)
+        f.attn.trtllm_attn = True
+        self.assertFalse(dg.capture_signature(f.mr, f.runner)[0])
+
+    def test_dsv41_segments_native_candidate_variants_share_three_remote_captures(self):
+        """Context-length variants must preserve native policy without multiplying Remote banks."""
+        labels = (
+            "candidate_all",
+            "candidate_c2_all",
+            "candidate_unfiltered",
+            "candidate_filtered",
+        )
+        f = self._dsv41_graph_fixture(labels)
+        b = f.backend
+        self.assertEqual(len(f.full.known_keys), 16)
+        self.assertEqual(len(f.remote.known_keys), 3)
+        f.controller.targets = [object()]
+        original = f.attn._dsv41_graph_originals["attention"]
+        observed = []
+
+        def attention(**kw):
+            observed.append(f.variant_state[0])
+            return original(**kw)
+
+        f.attn._dsv41_graph_originals["attention"] = attention
+        for label in labels:
+            key = SimpleNamespace(
+                size=2, stream_idx=None, variant_label=None, attention_variant=label
+            )
+            fb = f.batch(2, 3)
+            self.assertTrue(b.can_run(fb, key))
+            with b.execution(fb):
+                b.replay(key, fb)
+            self.assertEqual(observed[-3:], [label] * 3)
+            self.assertIsNone(f.variant_state[0])
+        f.controller.targets = []
+        self.assertTrue(b.can_run(fb, key))
 
 
 if __name__ == "__main__":

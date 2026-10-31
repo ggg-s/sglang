@@ -1,0 +1,176 @@
+{
+  "date": "2026-10-31",
+  "run_directory": "/tmp/dsv41-segments-20261031",
+  "source_sha256_verified": {
+    "dsv41_graph": 35,
+    "qwen_graph": 5,
+    "dsv41_progressive": 28
+  },
+  "results": {
+    "dsv41_graph": {
+      "device": "NVIDIA GeForce RTX 4060 Laptop GPU",
+      "torch": "2.13.0+cu130",
+      "remote_buckets": [
+        1,
+        2,
+        4
+      ],
+      "native_full_shapes": 16,
+      "native_candidate_variants": [
+        "candidate_all",
+        "candidate_c2_all",
+        "candidate_filtered",
+        "candidate_unfiltered"
+      ],
+      "remote_segments": {
+        "4": 8,
+        "2": 8,
+        "1": 8
+      },
+      "remote_replays": 18,
+      "full_replays": 8,
+      "rpc_calls": 42,
+      "capture_rpc_calls": 0,
+      "max_abs_error": 0.0,
+      "live_metadata": true,
+      "live_sparse_topk": true,
+      "unsupported_remote_eager": [
+        3,
+        8
+      ],
+      "local_full_restored": true,
+      "scope": "Real CUDA full/segmented banks plus DSV sparse RemoteHub RPC on RTX4060.\n\nNative full/breakable backends and byte-layout sparse reader are source-loaded.\nThe 3-layer model, metadata/indexer/carry planning and pool manager boundaries\nare small fixtures. No DSV checkpoint, SM100 kernel, SMG, NCCL or perf claim.\n",
+      "source_sha256": {
+        "plugins/remote_attn/sglang_remote_attn/decode_overlap.py": "da20612d4ca0ea2b33760a85681dd1ce5fb30936377d96b0bc6dcd34b43e1ff8",
+        "plugins/remote_attn/sglang_remote_attn/prefill_overlap.py": "a4510c6934ef898b74dc2c5655f2bb6e1f2c94afa03568164f72a1c976c9def6",
+        "plugins/remote_attn/sglang_remote_attn/pre_layerwise.py": "86af82d4157835672868ab09521464378db738b785af98dc931daf5e284e9093",
+        "plugins/remote_attn/sglang_remote_attn/segmented_graph.py": "12392f9546ae5b948683871628b010e41bbd1b403675532dc277587c385f9d40",
+        "plugins/remote_attn/sglang_remote_attn/dsv41_staging.py": "d0c267fd40f259fb495a8b224d68764fec4b9f1272ab2abdf2a2267c4212ef6d",
+        "plugins/remote_attn/sglang_remote_attn/source_cache.py": "07d2c508c540411beeb96f273dc6a961e83815bf2658fb9125385c4c6f6fc594",
+        "plugins/remote_attn/sglang_remote_attn/dsv41_receive.py": "3c2c9a218f24852a4726d20d7461173b80c8bc697ceb248786d5ccd8e9ce6a62",
+        "plugins/remote_attn/sglang_remote_attn/dsv41_sparse_math.py": "84cb68108900c8a6cc30035d6bee885e6036778e201b18e134ef975beed790a5",
+        "plugins/remote_attn/sglang_remote_attn/dsv41_remote.py": "2a72a61ca75598ee8ad85373a4682e8e02614119be485ad47f2a2da7bae8962a",
+        "plugins/remote_attn/sglang_remote_attn/prefill_admission.py": "7a6d28a9807b547667c0d62d6912ad656ed19243f5a5f0ffa5090a8715e53480",
+        "plugins/remote_attn/sglang_remote_attn/dsv41_layerwise.py": "25d51925399d94ff1d3eb6ac3f500137b3c24051ddf53e2c0bcd16043f06405b",
+        "plugins/remote_attn/sglang_remote_attn/interfaces.py": "cd9e9dd3895ed483b9698a72dec3fa1a25b3572134609ab671e94fcc898e4735",
+        "plugins/remote_attn/sglang_remote_attn/tp.py": "766b5028a3a08a801c2891580e406a40f1868d7d21cde8ef46be1d76b86b059c",
+        "plugins/remote_attn/sglang_remote_attn/__init__.py": "f64e878600a7775c62cd79063dbd94d92ccfd6513909f6fed3a221758ebe067f",
+        "plugins/remote_attn/sglang_remote_attn/compat.py": "8772dd8af6143737b0ccbd53a3a88cc441259e9cadb374e66547abe8b420a971",
+        "plugins/remote_attn/sglang_remote_attn/dsv41_graph.py": "0ecba769ceb098e63da970370ea47f84c0d71c7d51a8c4512891921f9104576d",
+        "plugins/remote_attn/sglang_remote_attn/check.py": "a7e23c69b57df34ec943df1aad40e4a4e11171fc30cb0f7fcb8ee9072bada438",
+        "plugins/remote_attn/sglang_remote_attn/dsv41_progressive.py": "9157f920fecf33c8002960c6888b0d3464b6fc8fb51b3ce02b77b32df5b91bbf",
+        "plugins/remote_attn/sglang_remote_attn/hooks.py": "d75f73cbe9826afb6ca8793e4042223133c41a2eb543e5cd50dfe9397f039be5",
+        "plugins/remote_attn/sglang_remote_attn/handoff_control.py": "54a9643da38652a07a14f9cfa5e24bb43f2553e81e5efa60fa315d8e680b5156",
+        "plugins/remote_attn/sglang_remote_attn/retirement.py": "a5dec5c9061273cf847c4a7a8e1f63edb0c7e57ae23ebbd309ed427ca97fbf1e",
+        "test/manual/remote_attn/dsv41_segmented_graph_probe.py": "12321ae5e39e57f619047ca8ceedf349fd96386dc69e290f8db0a8062341a958",
+        "test/manual/remote_attn/dsv41_graph_probe_support.py": "80351b555215e7b1a4b49ea15b764806c303ff484ce4ebe11ebf48b1e7f5b75e",
+        "test/manual/remote_attn/dsv41_remote_probe_support.py": "6ff25f696dc3d2fafd2391d472047dcc08bb1b6a6944ac240736e6da176a7e52",
+        "test/manual/remote_attn/segmented_graph_probe.py": "2f0a14bb954b4e6e2bb41178f96e4ba21d863aa4bd3d354e05c8fd13556f8930",
+        "python/sglang/kernels/ops/attention/dsv4/kv_layout.py": "85f012a8a5c3cd1a534e5250030b4085ebd9f2dfac83c1fca4b5d9cbc771a8a4",
+        "python/sglang/test/kernels/deepseek_v4/dsv41_kv_quant_reference.py": "7370805c53323eaf0059fc4987688aac59a8ca4c80aefb673e87b002a31e3292",
+        "python/sglang/srt/mem_cache/deepseek_v4_memory_pool.py": "bdccf8c9c2d30691fa71a183c6c51503335d42127498b6272c11742d87d3bd44",
+        "python/sglang/srt/layers/attention/deepseek_v4_backend.py": "70498af7eafc15bbb9d9a6b6b995415766139233433851e0e3bbfc4635129ac9",
+        "python/sglang/srt/model_executor/runner_backend/full_cuda_graph_backend.py": "4cdf861b6dbf61d2875598602c77855df06910784fcec43c89fc132cc99bf217",
+        "python/sglang/srt/model_executor/runner_backend/breakable_cuda_graph_backend.py": "2c598110d6c8d3556fbce50c0f57b9afe98fd85b4ff3012c15e6714aa4d519d8",
+        "python/sglang/srt/model_executor/runner/shape_key.py": "f52324e74d2b9e7d11b494f273d8a841de33c56f68ba7a57d7e5f631b82a2984",
+        "python/sglang/srt/model_executor/runner_utils/capture_mode.py": "a75a3e72052229d934af0218fe4cefe6acecbdabc4c341cd9b01f57ed8426acc",
+        "python/sglang/srt/model_executor/runner_backend_utils/breakable_cuda_graph/breakable_cuda_graph.py": "596adf3e0e806e3f6a1964582a33f1c655254e3ba3939824e71a156543c76d51",
+        "python/sglang/srt/model_executor/runner_backend_utils/breakable_cuda_graph/cuda_utils.py": "48401eceaf0c0d006f85d86abf70c2db56ddd142cbb2feb028f05a936ca1142a"
+      }
+    },
+    "qwen_graph": {
+      "device": "NVIDIA GeForce RTX 4060 Laptop GPU",
+      "torch": "2.13.0+cu130",
+      "dtype": "torch.bfloat16",
+      "layers": 3,
+      "remote_segments": {
+        "4": 4,
+        "2": 4,
+        "1": 4
+      },
+      "replays": {
+        "remote": 12,
+        "full": 4
+      },
+      "rpc_calls": 22,
+      "capture_rpc_calls": 0,
+      "max_allocated_bytes": 17072640,
+      "strong_ref_boundary": false,
+      "source_sha256": {
+        "plugins/remote_attn/sglang_remote_attn/segmented_graph.py": "12392f9546ae5b948683871628b010e41bbd1b403675532dc277587c385f9d40",
+        "test/manual/remote_attn/segmented_graph_probe.py": "2f0a14bb954b4e6e2bb41178f96e4ba21d863aa4bd3d354e05c8fd13556f8930",
+        "python/sglang/srt/model_executor/runner_backend/full_cuda_graph_backend.py": "4cdf861b6dbf61d2875598602c77855df06910784fcec43c89fc132cc99bf217",
+        "python/sglang/srt/model_executor/runner_backend/breakable_cuda_graph_backend.py": "2c598110d6c8d3556fbce50c0f57b9afe98fd85b4ff3012c15e6714aa4d519d8",
+        "python/sglang/srt/model_executor/runner_backend_utils/breakable_cuda_graph/breakable_cuda_graph.py": "596adf3e0e806e3f6a1964582a33f1c655254e3ba3939824e71a156543c76d51"
+      },
+      "scope": "real CUDA; source-loaded native backends; toy attention/RPC; TP1; no pool borrowing/precarving"
+    },
+    "dsv41_progressive": {
+      "device": "NVIDIA GeForce RTX 4060 Laptop GPU",
+      "torch": "2.13.0+cu130",
+      "layouts_bit_exact": [
+        "v41",
+        "v41_new",
+        "v41_fp4",
+        "v41_fp4_new"
+      ],
+      "remote_calls": 8,
+      "rejected_before_pd": null,
+      "rejected_before_sparse_barrier": true,
+      "rejected_half_pair": true,
+      "max_abs_error": 3.814697265625e-06,
+      "odd_half_pair_stays_local": true,
+      "native_topk_unchanged": true,
+      "shared_source_consumer": true,
+      "p_kv_swa_unchanged": true,
+      "local_graph_restored": true,
+      "cancel_inflight_gpu_retained": true,
+      "cancel_rpc_errors": [
+        "RuntimeError"
+      ],
+      "source_pins_closed": true,
+      "progressive": {
+        "per_resource_final_votes": [
+          5,
+          5
+        ],
+        "stable_remote_votes": 0,
+        "stable_local_votes": 0,
+        "pinned_h2d": true,
+        "odd_partial_page_tail_preserved": true,
+        "global_incomplete_during_decode": true
+      },
+      "scope": "CUDA scatter/ordered-switch fixture for the real RemoteHub probe.\n\nNative checkpoint/indexer kernels are outside this small 4060 test. Real native\npaged bytes, pinned H2D, CUDA events, eager RPC and ordered plugin retirement run.\n",
+      "source_sha256": {
+        "plugins/remote_attn/sglang_remote_attn/decode_overlap.py": "da20612d4ca0ea2b33760a85681dd1ce5fb30936377d96b0bc6dcd34b43e1ff8",
+        "plugins/remote_attn/sglang_remote_attn/prefill_overlap.py": "a4510c6934ef898b74dc2c5655f2bb6e1f2c94afa03568164f72a1c976c9def6",
+        "plugins/remote_attn/sglang_remote_attn/pre_layerwise.py": "86af82d4157835672868ab09521464378db738b785af98dc931daf5e284e9093",
+        "plugins/remote_attn/sglang_remote_attn/segmented_graph.py": "12392f9546ae5b948683871628b010e41bbd1b403675532dc277587c385f9d40",
+        "plugins/remote_attn/sglang_remote_attn/dsv41_staging.py": "d0c267fd40f259fb495a8b224d68764fec4b9f1272ab2abdf2a2267c4212ef6d",
+        "plugins/remote_attn/sglang_remote_attn/source_cache.py": "07d2c508c540411beeb96f273dc6a961e83815bf2658fb9125385c4c6f6fc594",
+        "plugins/remote_attn/sglang_remote_attn/dsv41_receive.py": "3c2c9a218f24852a4726d20d7461173b80c8bc697ceb248786d5ccd8e9ce6a62",
+        "plugins/remote_attn/sglang_remote_attn/dsv41_sparse_math.py": "84cb68108900c8a6cc30035d6bee885e6036778e201b18e134ef975beed790a5",
+        "plugins/remote_attn/sglang_remote_attn/dsv41_remote.py": "2a72a61ca75598ee8ad85373a4682e8e02614119be485ad47f2a2da7bae8962a",
+        "plugins/remote_attn/sglang_remote_attn/prefill_admission.py": "7a6d28a9807b547667c0d62d6912ad656ed19243f5a5f0ffa5090a8715e53480",
+        "plugins/remote_attn/sglang_remote_attn/dsv41_layerwise.py": "25d51925399d94ff1d3eb6ac3f500137b3c24051ddf53e2c0bcd16043f06405b",
+        "plugins/remote_attn/sglang_remote_attn/interfaces.py": "cd9e9dd3895ed483b9698a72dec3fa1a25b3572134609ab671e94fcc898e4735",
+        "plugins/remote_attn/sglang_remote_attn/tp.py": "766b5028a3a08a801c2891580e406a40f1868d7d21cde8ef46be1d76b86b059c",
+        "plugins/remote_attn/sglang_remote_attn/__init__.py": "f64e878600a7775c62cd79063dbd94d92ccfd6513909f6fed3a221758ebe067f",
+        "plugins/remote_attn/sglang_remote_attn/compat.py": "8772dd8af6143737b0ccbd53a3a88cc441259e9cadb374e66547abe8b420a971",
+        "plugins/remote_attn/sglang_remote_attn/dsv41_graph.py": "0ecba769ceb098e63da970370ea47f84c0d71c7d51a8c4512891921f9104576d",
+        "plugins/remote_attn/sglang_remote_attn/check.py": "a7e23c69b57df34ec943df1aad40e4a4e11171fc30cb0f7fcb8ee9072bada438",
+        "plugins/remote_attn/sglang_remote_attn/dsv41_progressive.py": "9157f920fecf33c8002960c6888b0d3464b6fc8fb51b3ce02b77b32df5b91bbf",
+        "plugins/remote_attn/sglang_remote_attn/hooks.py": "d75f73cbe9826afb6ca8793e4042223133c41a2eb543e5cd50dfe9397f039be5",
+        "plugins/remote_attn/sglang_remote_attn/handoff_control.py": "54a9643da38652a07a14f9cfa5e24bb43f2553e81e5efa60fa315d8e680b5156",
+        "plugins/remote_attn/sglang_remote_attn/retirement.py": "a5dec5c9061273cf847c4a7a8e1f63edb0c7e57ae23ebbd309ed427ca97fbf1e",
+        "test/manual/remote_attn/dsv41_remote_cuda_probe.py": "70ebcbfe342152a4bdfa52e220c37c859d6fd70e072bf7f43391312b998fe1b3",
+        "test/manual/remote_attn/dsv41_remote_probe_support.py": "6ff25f696dc3d2fafd2391d472047dcc08bb1b6a6944ac240736e6da176a7e52",
+        "test/manual/remote_attn/dsv41_progressive_probe_support.py": "38426dc9de227cadf2e5cc5a5fcd11f64885277677fcbf05cd72fc285fa3a7f3",
+        "python/sglang/kernels/ops/attention/dsv4/kv_layout.py": "85f012a8a5c3cd1a534e5250030b4085ebd9f2dfac83c1fca4b5d9cbc771a8a4",
+        "python/sglang/test/kernels/deepseek_v4/dsv41_kv_quant_reference.py": "7370805c53323eaf0059fc4987688aac59a8ca4c80aefb673e87b002a31e3292",
+        "python/sglang/srt/mem_cache/deepseek_v4_memory_pool.py": "bdccf8c9c2d30691fa71a183c6c51503335d42127498b6272c11742d87d3bd44",
+        "python/sglang/srt/layers/attention/deepseek_v4_backend.py": "70498af7eafc15bbb9d9a6b6b995415766139233433851e0e3bbfc4635129ac9"
+      }
+    }
+  }
+}

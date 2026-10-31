@@ -385,8 +385,12 @@ def _graph_decision(original, runner, forward_batch, kind):
     ):
         # prepare agreed the batch across TP before any rank reaches this guard.
         return False
-    if getattr(controller, "dsv41_remote", False) and controller.remote_targets:
-        return False  # TP resource/lifetime leases still require eager decode.
+    if (
+        getattr(controller, "dsv41_remote", False)
+        and controller.remote_targets
+        and not (controller.graph_fast_path and controller.targets)
+    ):
+        return False  # Compatibility windows have no TP progressive graph lease.
     if controller is not None and controller.graph_fast_path:
         # early_targets admits/removes leases only after TP agreement. Keep
         # even a locally complete lease eager until its slowest peer retires.
