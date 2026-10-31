@@ -13,6 +13,7 @@ from . import (
     dsv41_progressive,
     dsv41_receive,
     dsv41_remote,
+    pd_mesh,
     pre_layerwise,
     prefill_overlap,
     segmented_graph,
@@ -542,6 +543,9 @@ HOOKS = {
 # Thin adapters; layer-pipeline state is owned by the scheduler instance.
 HOOKS.update(
     {
+        "sglang.srt.disaggregation.common.conn.CommonKVReceiver._send_bootstrap_message": pd_mesh.bootstrap,
+        "sglang.srt.disaggregation.mooncake.conn.TransferInfo.from_zmq": pd_mesh.parse_transfer,
+        "sglang.srt.disaggregation.common.conn.CommonKVManager.resolve_kv_replica_factor": pd_mesh.resolve_peers,
         "sglang.srt.disaggregation.common.staging_handler.init_staging_allocator": pre_layerwise.init_staging_allocator,
         "sglang.srt.disaggregation.common.staging_handler.init_staging_buffers": pre_layerwise.init_staging_buffers,
         "sglang.srt.managers.scheduler.Scheduler.run_batch": pre_layerwise.run_batch,

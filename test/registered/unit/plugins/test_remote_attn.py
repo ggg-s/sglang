@@ -3678,6 +3678,7 @@ class TestRemoteAttn(CustomTestCase):
         )
         self.assertTrue(rows[0]["leases"]["mismatch_rejected"])
         self.assertTrue(rows[0]["leases"]["sparse_mode_mismatch_rejected"])
+        self.assertEqual(rows[0]["leases"]["mesh_settings_rejected"], [True] * 3)
         self.assertTrue(rows[0]["leases"]["cache_mismatch_rejected"])
         self.assertTrue(rows[0]["leases"]["overlap_mismatch_rejected"])
         self.assertEqual(rows[0]["d_overlap"], rows[1]["d_overlap"])
@@ -9050,6 +9051,7 @@ class TestRemoteAttn(CustomTestCase):
             source = SimpleNamespace(
                 req=req,
                 generation="g0",
+                path=root / "7/0/g0",
                 prefix_len=33,
                 barrier_ready=True,
                 responded=False,
@@ -9604,6 +9606,246 @@ class TestRemoteAttn(CustomTestCase):
                 f.layers[0].project_decode_qkv(torch.ones(1, 4), torch.zeros(1))
             self.assertFalse(f.projections)
             self.assertTrue(all(bool((b == -99).all()) for b in f.cache))
+
+    def _mesh_instances(self):
+        from sglang_remote_attn.pd_mesh import Mesh
+
+        directory = Path(self.enterContext(tempfile.TemporaryDirectory()))
+        meshes = {}
+        for i, name in enumerate(("P0", "P1", "D0", "D1")):
+            meshes[name] = Mesh(
+                directory / name,
+                name,
+                uuid.uuid4().hex,
+                0,
+                "127.0.0.1",
+                "127.0.0.1",
+                ("127.0.0.1", 32000 + i),
+            )
+            self.addCleanup(meshes[name].close)
+        return meshes
+
+    def _mesh_wait(self, predicate):
+        deadline = time.monotonic() + 4
+        while not predicate():
+            if time.monotonic() > deadline:
+                self.fail("PD journal propagation timed out")
+            threading.Event().wait(0.005)
+
+    def _mesh_link(self, p, d, room):
+        from sglang_remote_attn.pd_mesh import JournalPath
+
+        target = d.new_room(room, f"session-{d.instance}", p.source_endpoint)
+        generation = uuid.uuid4().hex
+        target.publish(
+            "offer.json", dict(generation=generation, session=f"session-{d.instance}")
+        )
+        peer = SimpleNamespace(
+            _remote_attn_journal=target.descriptor,
+            room=room,
+            mooncake_session_id=f"session-{d.instance}",
+            is_dummy=False,
+        )
+        p.open_peer(peer)
+        source = peer._remote_attn_room
+        self._mesh_wait(lambda: (source.root / "offer.json").exists())
+        return JournalPath(source) / generation, JournalPath(target) / generation, peer
+
+    def test_pd_mesh_two_by_two_local_mirrors_isolate_requests_and_cancellation(self):
+        """A single D must consume proofs from different P without cross-request release."""
+        from sglang_remote_attn.pre_layerwise import read_json, write_json
+
+        m = self._mesh_instances()
+        links = [
+            self._mesh_link(m[p], m[d], n)
+            for p, d, n in (
+                ("P0", "D0", 10),
+                ("P1", "D0", 11),
+                ("P0", "D1", 12),
+                ("P1", "D1", 13),
+            )
+        ]
+        for i, (p, d, _) in enumerate(links):
+            self.assertNotEqual(p.local, d.local)
+            write_json(p / "layer-0.json", dict(generation=p.name, layer=0, source=i))
+        self._mesh_wait(lambda: all(read_json(d / "layer-0.json") for _, d, _ in links))
+        self.assertEqual(
+            [read_json(d / "layer-0.json")["source"] for _, d, _ in links],
+            list(range(4)),
+        )
+        p, d, _ = links[0]
+        write_json(
+            d / "done.json", dict(generation=d.name, cancelled=True, gpu_proven=True)
+        )
+        self._mesh_wait(lambda: read_json(p / "done.json"))
+        self.assertTrue(read_json(p / "done.json")["cancelled"])
+        self.assertTrue(
+            all(read_json(other / "done.json") is None for other, _, _ in links[1:])
+        )
+        p, d, _ = links[1]
+        write_json(p / "resource-2.json", dict(generation=p.name, producer=2))
+        self._mesh_wait(lambda: read_json(d / "resource-2.json"))
+
+    def test_pd_mesh_disconnect_reconnect_replays_only_same_attempt_facts(self):
+        """Network loss must retain proofs and never manufacture a release."""
+        from sglang_remote_attn.pre_layerwise import read_json, write_json
+
+        m = self._mesh_instances()
+        p, d, _ = self._mesh_link(m["P0"], m["D0"], 7)
+        import socket
+
+        with p.room.condition:
+            sockets = list(p.room.sockets)
+        for sock in sockets:
+            sock.shutdown(socket.SHUT_RDWR)
+        write_json(p / "ready.json", dict(generation=p.name, prefix_len=33))
+        self._mesh_wait(lambda: read_json(d / "ready.json"))
+        self.assertIsNone(read_json(p / "done.json"))
+        write_json(d / "done.json", dict(generation=d.name, gpu_proven=True))
+        self._mesh_wait(lambda: read_json(p / "done.json"))
+        self.assertTrue(read_json(p / "done.json")["gpu_proven"])
+
+    def test_pd_mesh_capabilities_reject_forged_retirement_and_old_attempt_writes(self):
+        """Neither a source nor a previous attempt can publish the new D's retirement."""
+        from sglang_remote_attn.pre_layerwise import read_json, write_json
+
+        m = self._mesh_instances()
+        p, d, peer = self._mesh_link(m["P0"], m["D0"], 7)
+        with self.assertRaises(ValueError):
+            write_json(p / "done.json", dict(generation=p.name))
+        with self.assertRaises(ValueError):
+            write_json(p / "../done.json", dict(generation=p.name))
+        p2, d2, _ = self._mesh_link(m["P0"], m["D0"], 7)
+        self.assertNotEqual(p.local, p2.local)
+        write_json(d / "done.json", dict(generation=d.name, old=True))
+        self._mesh_wait(lambda: read_json(p / "done.json"))
+        self.assertIsNone(read_json(p2 / "done.json"))
+        bad = copy.copy(peer)
+        bad._remote_attn_journal = {**peer._remote_attn_journal, "session": "wrong"}
+        del bad._remote_attn_room
+        m["P1"].open_peer(bad)
+        self.assertFalse(hasattr(bad, "_remote_attn_room"))
+        self.assertNotEqual(d.room.descriptor["token"], d2.room.descriptor["token"])
+        from sglang_remote_attn.prefill_admission import fingerprint
+
+        baseline = fingerprint(peer)
+        changed = copy.copy(peer)
+        changed._remote_attn_room = object()
+        self.assertEqual(fingerprint(changed), baseline)
+        changed._remote_attn_journal = {
+            **peer._remote_attn_journal,
+            "token": "new-attempt",
+        }
+        self.assertNotEqual(fingerprint(changed), baseline)
+
+    def test_pd_mesh_native_bootstrap_extension_preserves_wire_and_rejects_invalid_cap(
+        self,
+    ):
+        """Native request destinations remain authoritative; malformed extras fall back."""
+        from sglang_remote_attn import pd_mesh
+
+        m = self._mesh_instances()
+        import numpy as np
+
+        spec = importlib.util.spec_from_file_location(
+            "mesh_native_defs",
+            ROOT / "test/manual/remote_attn/dsv41_remote_probe_support.py",
+        )
+        support = importlib.util.module_from_spec(spec)
+        spec.loader.exec_module(support)
+        native = support.definitions(
+            ROOT,
+            "python/sglang/srt/disaggregation/mooncake/conn.py",
+            owner="TransferInfo",
+            members={"from_zmq"},
+        )
+        parse = native.from_zmq.__func__
+        parse.__globals__.update(np=np, unpack_int_lists=lambda raw, fmt: [])
+        frames = [
+            b"7",
+            b"127.0.0.1",
+            b"32002",
+            b"session-D0",
+            np.array([3, 4], dtype=np.int32).tobytes(),
+            b"0",
+            b"",
+            b"1",
+            b"33",
+            b"",
+        ]
+        receiver = SimpleNamespace(
+            bootstrap_room=7,
+            kv_mgr=SimpleNamespace(
+                _remote_attn_mesh=m["D0"], get_session_id=lambda: "session-D0"
+            ),
+        )
+        sent = []
+        info = dict(rank_ip="127.0.0.1", rank_port=32000, is_dummy=False)
+        pd_mesh.bootstrap(
+            lambda receiver, **kw: sent.append(kw["message"]) or True,
+            receiver,
+            bootstrap_info=info,
+            message=frames,
+            operation="send_metadata",
+        )
+        self.assertEqual(sent[0][:10], frames)
+        peer = pd_mesh.parse_transfer(lambda msg: parse(SimpleNamespace, msg), sent[0])
+        self.assertEqual(peer.dst_kv_indices.tolist(), [3, 4])
+        pd_mesh.resolve_peers(
+            lambda *a: None,
+            SimpleNamespace(_remote_attn_mesh=m["P0"]),
+            {"session-D0": peer},
+        )
+        self.assertTrue(hasattr(peer, "_remote_attn_room"))
+        malformed = pd_mesh.parse_transfer(
+            lambda msg: parse(SimpleNamespace, msg),
+            [*frames, pd_mesh.MAGIC + b'{"instance":"../bad"}'],
+        )
+        self.assertFalse(hasattr(malformed, "_remote_attn_journal"))
+
+    def test_pd_mesh_startup_lock_rejects_duplicate_instance_and_restart_uses_new_epoch(
+        self,
+    ):
+        """Two live instances must not share control commands or a restart's proofs."""
+        from sglang_remote_attn import pd_mesh
+        from sglang_remote_attn.pre_layerwise import Config
+
+        directory = Path(self.enterContext(tempfile.TemporaryDirectory()))
+
+        def controller():
+            return SimpleNamespace(
+                rank=0,
+                tp_size=1,
+                config=Config("remote", directory / "journal"),
+                scheduler=SimpleNamespace(
+                    disaggregation_mode=SimpleNamespace(value="prefill"),
+                    disagg_prefill_bootstrap_queue=SimpleNamespace(
+                        kv_manager=SimpleNamespace(
+                            local_ip="127.0.0.1", rank_port=32000
+                        )
+                    ),
+                ),
+            )
+
+        with patch.dict(
+            os.environ,
+            {
+                "HANDOFF_PD_NETWORK": "1",
+                "HANDOFF_INSTANCE_ID": "P0",
+                "HANDOFF_CTL_DIR": str(directory / "control"),
+            },
+        ):
+            a, b = controller(), controller()
+            pd_mesh.install(a)
+            self.addCleanup(a.mesh.close)
+            with self.assertRaisesRegex(RuntimeError, "already serving"):
+                pd_mesh.install(b)
+            old = a.config.directory
+            a.mesh.close()
+            pd_mesh.install(b)
+            self.addCleanup(b.mesh.close)
+            self.assertNotEqual(old, b.config.directory)
+            self.assertTrue((directory / "control/P0/instance.lock").exists())
 
 
 if __name__ == "__main__":

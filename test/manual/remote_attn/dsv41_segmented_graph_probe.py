@@ -8,6 +8,7 @@ boundaries are small fixtures. No DSV checkpoint, SM100, SMG, NCCL or perf claim
 import argparse
 import hashlib
 import json
+import os
 import sys
 import tempfile
 import types
@@ -28,7 +29,7 @@ from sglang_remote_attn import hooks
 from sglang_remote_attn.dsv41_layerwise import DSV41Source
 
 
-def main(root, output, *, fused=False, bf16_source=False):
+def main(root, output, *, fused=False, bf16_source=False, mesh=False):
     torch.cuda.set_device(0)
     native = root / "python/sglang/srt/model_executor"
     prefix = "sglang.srt.model_executor.runner_backend_utils.breakable_cuda_graph"
@@ -133,12 +134,28 @@ def main(root, output, *, fused=False, bf16_source=False):
         ShapeKey = load("dsv_segment_shape", native / "runner/shape_key.py").ShapeKey
         sf = sparse_fixture(root, "cuda")
         sf.p_controller.dsv41_remote = True
-        hub = rt.RemoteHub(
-            sf.p_controller.scheduler,
-            stream_factory=lambda n: [
-                (torch.cuda.Stream(), None, None) for _ in range(n)
-            ],
-        )
+
+        def make_hub(fixture, index):
+            scheduler = fixture.p_controller.scheduler
+            if mesh:
+                scheduler.disaggregation_mode = types.SimpleNamespace(value="prefill")
+                scheduler.disagg_prefill_bootstrap_queue = types.SimpleNamespace(
+                    kv_manager=types.SimpleNamespace(local_ip=f"127.0.0.{3 + index}")
+                )
+            with patch.dict(
+                os.environ,
+                {"HANDOFF_PD_NETWORK": "1", "HANDOFF_INSTANCE_ID": f"graph-p{index}"}
+                if mesh
+                else {},
+            ):
+                return rt.RemoteHub(
+                    scheduler,
+                    stream_factory=lambda n: [
+                        (torch.cuda.Stream(), None, None) for _ in range(n)
+                    ],
+                )
+
+        hub = make_hub(sf, 0)
         sf.p_controller.scheduler._handoff_hub = hub
         sys.modules["sglang.srt.disaggregation.base.conn"] = types.SimpleNamespace(
             KVPoll=types.SimpleNamespace(Success=4, Failed=0)
@@ -160,6 +177,40 @@ def main(root, output, *, fused=False, bf16_source=False):
             barrier_ready=True,
         )
         sparse.register(source)
+        source_fixtures, sources, hubs = [sf], [source], [hub]
+        cluster = None
+        if mesh:
+            from pd_mesh_probe_support import Cluster
+
+            cluster = Cluster(root, Path(temp) / "mesh")
+            second = sparse_fixture(root, "cuda")
+            second.p_controller.dsv41_remote = True
+            # Distinct native bytes ensure a mixed-source row cannot silently
+            # read another P's cache and still pass the numerical comparison.
+            for pool in second.p_pool.kv_pools.values():
+                pool.kv_buffer[0].bitwise_xor_(1)
+            second_hub = make_hub(second, 1)
+            second.p_controller.scheduler._handoff_hub = second_hub
+            second_source = DSV41Source(
+                second.p_controller,
+                types.SimpleNamespace(
+                    kv=types.SimpleNamespace(req_pool_idx=0),
+                    cache_request_handle="graph",
+                    disagg_kv_sender=types.SimpleNamespace(poll=lambda: 3),
+                ),
+                Path(temp) / "p1",
+                "graph-p1",
+                None,
+                None,
+                (),
+                33,
+                schema=dict(entries=[["kv", 1, 1], ["kv", 2, 2]]),
+                barrier_ready=True,
+            )
+            sparse.register(second_source)
+            source_fixtures.append(second)
+            sources.append(second_source)
+            hubs.append(second_hub)
         rpc_calls = []
         seen_variants = set()
         live_targets = {}
@@ -167,7 +218,8 @@ def main(root, output, *, fused=False, bf16_source=False):
         def selected(marker):
             return [0, 15] if marker % 2 else [15, 0, 15]
 
-        def keys(layer, marker):
+        def keys(layer, marker, row=0):
+            sf = source_fixtures[row % len(source_fixtures)]
             ratio = layer
             cpp = 8 // ratio
             ids = torch.tensor(
@@ -193,7 +245,7 @@ def main(root, output, *, fused=False, bf16_source=False):
                 query = q[row].repeat(128).reshape(1, 512).to(torch.bfloat16)
                 if layer.layer_id in target.local_entries:
                     out, _ = math.partial(
-                        query, keys(layer.layer_id, fb.marker), 512**-0.5
+                        query, keys(layer.layer_id, fb.marker, row), 512**-0.5
                     )
                 else:
                     out, _ = target.call(
@@ -266,12 +318,16 @@ def main(root, output, *, fused=False, bf16_source=False):
         f.controller.targets = [object()]
         for row in range(4):
             req = types.SimpleNamespace(kv=types.SimpleNamespace(req_pool_idx=row))
+            current_source = sources[row % len(sources)]
+            path, generation, route = Path(temp), "graph", current_source.service
+            if cluster:
+                path, generation, route = cluster.route(row % 2, 0, route, 100 + row)
             target = sparse.Target(
                 f.controller,
                 req,
-                Path(temp),
-                "graph",
-                source.service,
+                path,
+                generation,
+                route,
                 33,
                 progressive=True,
             )
@@ -315,12 +371,13 @@ def main(root, output, *, fused=False, bf16_source=False):
                                 .reshape(size, 1, 512)
                                 .to(torch.bfloat16)
                             )
-                            k = keys(layer, marker)
                             expected = (
                                 torch.stack(
                                     [
-                                        math.partial(q, k, 512**-0.5)[0][0, :4]
-                                        for q in queries
+                                        math.partial(
+                                            q, keys(layer, marker, row), 512**-0.5
+                                        )[0][0, :4]
+                                        for row, q in enumerate(queries)
                                     ]
                                 ).to(x.dtype)
                                 + expected
@@ -350,7 +407,7 @@ def main(root, output, *, fused=False, bf16_source=False):
                     assert mode.get_capture_attention_variant() is None
                     assert f.metadata[-1] == marker
                     assert f.prepared[-3:] == [(marker, i) for i in range(3)]
-        assert source.req.disagg_kv_sender.poll() == 3
+        assert all(s.req.disagg_kv_sender.poll() == 3 for s in sources)
         count = len(rpc_calls)
         for size in (3, 8):
             assert not hooks._decode_graph(lambda *a: True, f.runner, f.batch(size))
@@ -374,8 +431,32 @@ def main(root, output, *, fused=False, bf16_source=False):
         assert len(rpc_calls) == count
         assert seen_variants == set(labels)
         assert len(full._graphs) == 16
+        if cluster:
+            from sglang_remote_attn.pre_layerwise import read_json
+
+            # A second D independently uses both P endpoints after D0 retires.
+            # No D0 cancellation/close may detach D1's readers.
+            for row in (0, 1):
+                path, generation, route = cluster.route(
+                    row, 1, sources[row].service, 200 + row
+                )
+                req = types.SimpleNamespace(kv=types.SimpleNamespace(req_pool_idx=row))
+                target = sparse.Target(
+                    f.controller, req, path, generation, route, 33, progressive=True
+                )
+                q = torch.ones((1, 512), device="cuda", dtype=torch.bfloat16)
+                out, _ = target.call(q, selected(8), 1, 1, 512**-0.5)
+                expected, _ = math.partial(q, keys(1, 8, row), 512**-0.5)
+                torch.testing.assert_close(out, expected)
+                target.close("d1-complete")
+            cluster.wait(
+                lambda: all(read_json(p / "remote-done.json") for p, _ in cluster.links)
+            )
         backend.cleanup()
-        hub.close()
+        for hub in hubs:
+            hub.close()
+        if cluster:
+            cluster.close()
         paths = list((root / "plugins/remote_attn/sglang_remote_attn").glob("*.py"))
         paths += [
             Path(__file__),
@@ -383,6 +464,12 @@ def main(root, output, *, fused=False, bf16_source=False):
             Path(__file__).with_name("dsv41_remote_probe_support.py"),
             Path(__file__).with_name("segmented_graph_probe.py"),
         ]
+        if cluster:
+            paths += [
+                Path(__file__).with_name("pd_mesh_probe_support.py"),
+                root / "python/sglang/srt/disaggregation/mooncake/conn.py",
+                root / "python/sglang/srt/disaggregation/common/conn.py",
+            ]
         paths += [
             root / p
             for p in (
@@ -422,6 +509,15 @@ def main(root, output, *, fused=False, bf16_source=False):
             live_swa_and_carry_verified=True,
             unsupported_remote_eager=[3, 8],
             local_full_restored=True,
+            mesh=dict(
+                prefills=2,
+                decodes=2,
+                mixed_source_batch=True,
+                separate_journals=True,
+                independent_d1_after_d0_retirement=True,
+            )
+            if cluster
+            else None,
             scope=__doc__,
             source_sha256={
                 str(p.relative_to(root)): hashlib.sha256(p.read_bytes()).hexdigest()
@@ -438,10 +534,12 @@ if __name__ == "__main__":
     parser.add_argument("--output", type=Path, required=True)
     parser.add_argument("--fused-projection", action="store_true")
     parser.add_argument("--bf16-kv-source", action="store_true")
+    parser.add_argument("--mesh", action="store_true")
     args = parser.parse_args()
     main(
         args.source_root.resolve(),
         args.output.resolve(),
         fused=args.fused_projection,
         bf16_source=args.bf16_kv_source,
+        mesh=args.mesh,
     )

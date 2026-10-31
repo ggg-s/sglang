@@ -38,7 +38,11 @@ def fingerprint(value):
         if hasattr(item, "tolist"):
             return item.tolist()
         if hasattr(item, "__dict__"):
-            return vars(item)
+            # The capability is an immutable part of peer identity; its live
+            # TCP/condition handle is not serialized or fingerprinted.
+            return {
+                k: v for k, v in vars(item).copy().items() if k != "_remote_attn_room"
+            }
         raise TypeError(type(item).__name__)
 
     return hashlib.sha256(
@@ -313,12 +317,9 @@ class Admission:
 
     def watch(self, cert):
         req, manager = cert.req, cert.req.disagg_kv_sender.kv_mgr
-        path = (
-            self.owner.config.directory
-            / str(int(req.bootstrap_room))
-            / str(self.rank)
-            / "offer.json"
-        )
+        from .pd_mesh import source_root
+
+        path = source_root(self.owner, req) / "offer.json"
         try:
             modified = path.stat().st_mtime_ns
         except OSError:

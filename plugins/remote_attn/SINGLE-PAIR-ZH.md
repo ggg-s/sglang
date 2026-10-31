@@ -1,5 +1,7 @@
 # 原生 SMG + 单 pair P/D 接入
 
+同机/跨机多 P × 多 D 另见 [原生 SMG 网络模式](MULTI-PD-ZH.md)。本页保留原有单 pair 配置。
+
 DSV4.1 Flash 的纯文本 layerwise 路径见 [专用接入说明](DSV41-LAYERWISE-ZH.md)；
 下文的 Qwen3/MHA 参数和 Remote 限制适用于原有路径。
 

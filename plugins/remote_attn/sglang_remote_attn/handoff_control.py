@@ -53,6 +53,10 @@ import torch
 from .compat import bind_decode_prefix, snapshot_layout
 
 _CTL_DIR = os.environ.get("HANDOFF_CTL_DIR", "")
+if _CTL_DIR and os.environ.get("HANDOFF_PD_NETWORK") == "1":
+    from .pd_mesh import instance_id
+
+    _CTL_DIR = str(Path(_CTL_DIR) / instance_id())
 _SEQ = 0
 HANDOFF_PREFIX_CLEARED = 0
 # P5.2-D control-plane timeline: one id per scheduler iteration.  Rank 0
@@ -1712,7 +1716,9 @@ class RemoteHub:
     def __init__(self, scheduler, executor=None, stream_factory=None) -> None:
         self.scheduler = scheduler
         self.registry = HandoffRegistry()
-        self.host = "127.0.0.1"
+        from .pd_mesh import address
+
+        bind_host, self.host = address(scheduler)
         self._closed = False
         # Active, validated connections only; the scheduler idles cooperatively
         # while any handoff RPC is in flight, so this is a count, not a flag.
@@ -1738,9 +1744,11 @@ class RemoteHub:
         self._conn_threads_lock = threading.Lock()
         # Frees requested by socket threads are drained on the scheduler thread.
         self._release_q: queue.Queue[HandoffContext] = queue.Queue()
-        self._listener = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+        self._listener = socket.socket(
+            socket.AF_INET6 if ":" in bind_host else socket.AF_INET, socket.SOCK_STREAM
+        )
         self._listener.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
-        self._listener.bind((self.host, 0))
+        self._listener.bind((bind_host, 0))
         self._listener.listen(_HUB_LISTEN_BACKLOG)
         self._listener.settimeout(_HUB_ACCEPT_TIMEOUT_S)
         self.port = int(self._listener.getsockname()[1])

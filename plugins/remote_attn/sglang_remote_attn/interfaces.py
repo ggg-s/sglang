@@ -17,6 +17,11 @@ CORE_CALLS = {
     DISAGG + "decode.DecodeTransferQueue._commit_transfer_to_req": {
         "keep_receiver": False
     },
+    MANAGER + "build_receiver_metadata_message": {
+        "bootstrap_room": inspect.Parameter.empty,
+        "is_dummy": inspect.Parameter.empty,
+        "device_kv_indices": None,
+    },
     "sglang.srt.layers.attention.deepseek_v4_backend.DeepseekV4AttnBackend.init_forward_metadata_in_graph": {
         "forward_batch": inspect.Parameter.empty
     },

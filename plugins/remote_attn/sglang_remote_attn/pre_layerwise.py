@@ -31,6 +31,8 @@ def read_json(path):
 
 
 def write_json(path, value):
+    if hasattr(path, "publish"):
+        return path.publish(value)
     path.parent.mkdir(parents=True, exist_ok=True)
     tmp = path.with_name(f".{path.name}.{secrets.token_hex(8)}")
     try:
@@ -537,6 +539,7 @@ class Controller:
     def validate_graphs(self):
         from sglang.srt.runtime_context import get_exec
 
+        from .pd_mesh import startup_signature
         from .source_cache import cache_signature
 
         self.graph_fast_path = False
@@ -566,6 +569,7 @@ class Controller:
             if getattr(self, "dsv41_layerwise", False)
             else None,
             getattr(self, "schema_signature", None),
+            startup_signature(self.config),
         )
         clean = not _runtime().has_target_states()
         if self.tp_size > 1:
@@ -638,7 +642,18 @@ class Controller:
         if queue._is_host_destination(dr):
             return None
         generation = secrets.token_hex(16)
-        root = self.config.directory / str(int(dr.req.bootstrap_room)) / str(self.rank)
+        from . import pd_mesh
+
+        mesh = getattr(dr.kv_receiver.kv_mgr, "_remote_attn_mesh", None)
+        if mesh is not None:
+            room = getattr(dr.kv_receiver, "_remote_attn_room", None)
+            if room is None:
+                return None
+            root = pd_mesh.JournalPath(room)
+        else:
+            root = (
+                self.config.directory / str(int(dr.req.bootstrap_room)) / str(self.rank)
+            )
         path = root / generation
         target = Target(
             self,
@@ -710,11 +725,9 @@ class Controller:
                 and getattr(req, "_pre_layerwise_source", None) is None
             ):
                 mgr = sender.kv_mgr
-                root = (
-                    self.config.directory
-                    / str(int(req.bootstrap_room))
-                    / str(self.rank)
-                )
+                from .pd_mesh import source_root
+
+                root = source_root(self, req)
                 offer = read_json(root / "offer.json")
                 peers = tuple(
                     (peer, mgr.decode_kv_args_table.get(peer.mooncake_session_id))
@@ -1068,6 +1081,9 @@ def initialize(scheduler):
     controller = cls(scheduler, config)
     controller.validate()
     controller.validate_graphs()
+    from . import pd_mesh
+
+    pd_mesh.install(controller)
     controller.prefill_overlap = None
     controller.cache_guard = None
     from .source_cache import install
@@ -1285,6 +1301,8 @@ def shutdown(scheduler):
     # Native manager owns shared staging teardown after its workers drain.
     if controller.stager is not None and controller.stager.poisoned:
         raise RuntimeError("pre-layerwise staging remains quarantined during shutdown")
+    if getattr(controller, "mesh", None) is not None:
+        controller.mesh.close()
 
 
 def init_staging_allocator(

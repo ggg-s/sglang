@@ -2,6 +2,7 @@
 
 import argparse
 import json
+import os
 import sys
 import threading
 import time
@@ -125,6 +126,110 @@ def progressive_graph_leases(args, context):
         patch.object(dist, "all_reduce", counted_reduce),
     ):
         controller.validate_graphs()
+        mesh_rejected = []
+        for key, value in (
+            ("HANDOFF_PD_NETWORK", "1"),
+            ("HANDOFF_INSTANCE_ID", "different-instance"),
+            ("HANDOFF_NETWORK_BIND_HOST", "127.0.0.2"),
+        ):
+            with patch.dict(
+                os.environ,
+                {
+                    key: value
+                    if args.rank == 1
+                    else ("0" if key == "HANDOFF_PD_NETWORK" else "")
+                },
+            ):
+                try:
+                    controller.validate_graphs()
+                    mesh_rejected.append(False)
+                except RuntimeError:
+                    mesh_rejected.append(True)
+        assert mesh_rejected == [True] * 3
+        previous_config = controller.config
+        controller.config = Config("remote", Path(args.rendezvous).parent / "mesh-tp")
+        scheduler.disaggregation_mode = SimpleNamespace(value="prefill")
+        scheduler.disagg_prefill_bootstrap_queue = SimpleNamespace(
+            kv_manager=SimpleNamespace(
+                local_ip="127.0.0.1", rank_port=34000 + args.rank
+            )
+        )
+        with patch.dict(
+            os.environ, {"HANDOFF_PD_NETWORK": "1", "HANDOFF_INSTANCE_ID": "tp-p"}
+        ):
+            from sglang_remote_attn import pd_mesh
+
+            controller.validate_graphs()
+            pd_mesh.install(controller)
+            epochs = [None, None]
+            dist.all_gather_object(
+                epochs, controller.mesh.epoch, group=dist.group.WORLD
+            )
+            assert epochs[0] == epochs[1]
+            d_mesh = pd_mesh.Mesh(
+                Path(args.rendezvous).parent / "mesh-d",
+                "D0",
+                "d" * 32,
+                args.rank,
+                "127.0.0.1",
+                "127.0.0.1",
+                ("127.0.0.1", 35000 + args.rank),
+            )
+            try:
+                d_room = d_mesh.new_room(
+                    999, f"d-session-{args.rank}", controller.mesh.source_endpoint
+                )
+                generation = f"{args.rank + 1:032x}"
+                d_room.publish("offer.json", dict(generation=generation, mode="remote"))
+                peer = SimpleNamespace(
+                    _remote_attn_journal=d_room.descriptor,
+                    room=999,
+                    mooncake_session_id=f"d-session-{args.rank}",
+                    is_dummy=False,
+                )
+                controller.mesh.open_peer(peer)
+                path = pd_mesh.JournalPath(peer._remote_attn_room)
+                deadline = time.monotonic() + 4
+                while not (path / "offer.json").exists():
+                    if time.monotonic() > deadline:
+                        raise TimeoutError("TP mesh offer")
+                    time.sleep(0.005)
+                write_json(
+                    path / generation / "sparse-ready.json",
+                    dict(generation=generation, prefix_len=33),
+                )
+                dist.barrier()
+                emitted = []
+                scheduler.output_streamer = SimpleNamespace(
+                    stream_output=lambda rows, *a: emitted.extend(rows)
+                )
+                req = SimpleNamespace(bootstrap_room=999, return_logprob=False)
+                source = SimpleNamespace(
+                    req=req,
+                    path=path / generation,
+                    generation=generation,
+                    prefix_len=33,
+                    barrier_ready=True,
+                    responded=False,
+                )
+                controller.sources = [source]
+                from sglang_remote_attn import dsv41_progressive
+
+                with patch.dict(
+                    sys.modules,
+                    {
+                        "sglang.srt.managers.schedule_batch": SimpleNamespace(
+                            FINISH_LENGTH=lambda **kw: kw
+                        )
+                    },
+                ):
+                    dsv41_progressive.poll_responses(controller)
+                assert source.responded and len(emitted) == 1
+                controller.sources = []
+            finally:
+                d_mesh.close()
+            controller.mesh.close()
+        controller.config = previous_config
         previous = controller.config
         controller.dsv41_layerwise = True
         controller.config = Config("remote" if args.rank == 0 else "layerwise", root)
@@ -219,6 +324,7 @@ def progressive_graph_leases(args, context):
         "snapshots": snapshots,
         "mismatch_rejected": mismatch_rejected,
         "sparse_mode_mismatch_rejected": sparse_mode_mismatch_rejected,
+        "mesh_settings_rejected": mesh_rejected,
         "cache_mismatch_rejected": cache_mismatch_rejected,
         "overlap_mismatch_rejected": overlap_mismatch_rejected,
         "existing_state_fallback": existing_state_fallback,

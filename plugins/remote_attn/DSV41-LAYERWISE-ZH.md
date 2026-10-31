@@ -1,9 +1,11 @@
 # DSV4.1 Flash：原生 PD 的 layerwise 与 eager Remote 接入
 
-此路径只用于同机单 P/D pair、纯文本、相同 TP、PP=DP=CP=1、Mooncake、
+此路径用于纯文本、相同 TP、PP=DP=CP=1、Mooncake、
 DSpark/其他投机解码关闭，不启用 KV cache sharding。使用原生 SMG 和 `sglang.launch_server`，没有 JSON
 包装器。layerwise 传输和缓存/overlap 接入在插件内；Remote 分段图另依赖本分支
 `MQALayer` 的 QKV 投影/状态边界接口。SMG 无新增修改。
+默认是同机单 pair；同机/跨机多 P × 多 D 使用 [网络 journal 模式](MULTI-PD-ZH.md)，
+每个实例的 TP ranks 仍需在同一主机。
 
 ## 传输与接纳
 

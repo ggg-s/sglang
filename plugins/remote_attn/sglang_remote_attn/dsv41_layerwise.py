@@ -511,11 +511,9 @@ class DSV41Controller(Controller):
                     or self.stager.poisoned
                 ):
                     raise RuntimeError("DSV4.1 host staging unavailable; retaining KV")
-                root = (
-                    self.config.directory
-                    / str(int(req.bootstrap_room))
-                    / str(self.rank)
-                )
+                from .pd_mesh import source_root
+
+                root = source_root(self, req)
                 offer = read_json(root / "offer.json")
                 peers = tuple(
                     (peer, mgr.decode_kv_args_table.get(peer.mooncake_session_id))

@@ -362,7 +362,7 @@ def poll_responses(controller):
         if source.responded or not getattr(source, "barrier_ready", False):
             continue
         ready = True
-        room = controller.config.directory / str(int(source.req.bootstrap_room))
+        room = source.path.parent.parent
         for rank in range(controller.tp_size):
             root = room / str(rank)
             offer = read_json(root / "offer.json") or {}
