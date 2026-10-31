@@ -15,7 +15,7 @@
 | 投机模型 | Qwen3_5ForCausalLMMTP，2.70 GB |
 | 服务端 | `--tp-size 1 --dtype bfloat16 --context-length 16384 --max-prefill-tokens 32768 --chunked-prefill-size 16384 --mem-fraction-static 0.9 --attention-backend flashinfer --linear-attn-prefill-backend triton --linear-attn-decode-backend triton --mamba-ssm-dtype bfloat16 --mamba-radix-cache-strategy extra_buffer_lazy --mamba-cache-size 336 --max-running-requests 64` |
 | 投机 | `--speculative-algorithm EAGLE --speculative-num-steps 3 --speculative-eagle-topk 1 --speculative-num-draft-tokens 4` |
-| PDMux | `--enable-pdmux --pdmux-prefill-mode layer_split --sm-group-num 3`，YAML `split_forward_token_budget: 131072 / split_forward_max_layers: 16 / prefill_full_sm: true` |
+| PDMux | `--enable-pdmux --pdmux-prefill-mode layer_split --sm-group-num 3`，YAML `split_forward_token_budget: 131072 / split_forward_max_layers: 16 / prefill_full_sm: true`（基线；K 的调优见第 13d 节，推荐 budget 262144） |
 | 客户端 | `POST /generate`，`input_ids` + `stream: true`，`temperature 0 / top_k 1 / max_new_tokens 128 / ignore_eos: true` |
 
 ## 2. 工作负载构造
@@ -315,7 +315,7 @@ Mamba 空余 80 槽      ≥  活跃前缀 64 条
 
 `chunk 16384 → 8192` 后 QPS 全部落在噪声范围内，TTFT 仅 ±15% 波动。**该参数不是性能杠杆。**
 
-顺带验证 PDMux 分段粒度：`forward_count = min(remaining_layers, split_forward_token_budget // prefill_tokens)`，再被 `split_forward_max_layers` 截断（`multiplexing_mixin.py:334-390`）。chunk=16384 → K=8，chunk=8192 → K=16。
+顺带验证 PDMux 分段粒度：`forward_count = min(remaining_layers, split_forward_token_budget // prefill_tokens)`，再被 `split_forward_max_layers` 截断（`multiplexing_mixin.py:334-390`）。chunk=16384 配 budget 131072 → K=8；chunk=8192 配 131072 → K=16；固定 chunk=16384、把 budget 提到 262144 同样得到 K=16，且可避免同时改动批处理。
 
 | PDMux 配置 | K | RPM |
 |---|---:|---:|
@@ -592,6 +592,57 @@ PDMux 仍有 **+12.5%**，收益没有消失，但显著缩小：
 
 三份 trace 的时间窗口与请求量不完全对齐（MTP 单独那组因吞吐更低、耗时更长），因此适合做结构性对比（stream 数、并发比例、kernel 粒度），不宜直接换算成吞吐差值。
 
+## 13d. TTFT 分解：p90 与 p95 由不同因素主导
+
+全部数据来自 P=50 负载（12K、64 并发、chunk 固定 16384）。
+
+### 分段粒度 K 只影响 p90
+
+`K = split_forward_token_budget ÷ 实际 prefill 批大小`，再被 `split_forward_max_layers` 截断。模型共 40 层，故分段数 = ⌈40/K⌉，段边界（可被打断的点）= 分段数 − 1。
+
+| K | budget | 分段数 | 段边界 | RPM | TTFT p50 | **p90** | p95 | TPOT |
+|---:|---:|---:|---:|---:|---:|---:|---:|---:|
+| 4 | 65,536 | 10 | 9 | 842 | 422 ms | **2,574 ms** | 13,765 ms | 21.3 ms |
+| 8 | 131,072 | 5 | 4 | 852 | 429 ms | **1,761 ms** | 11,215 ms | 22.4 ms |
+| 16 | 262,144 | 3 | 2 | **868** | 422 ms | **549 ms** | 10,774 ms | 22.6 ms |
+
+**p90 与段边界数单调相关（9→4→2 对应 2,574→1,761→549 ms），吞吐同时略升（842→868）。** 机制：每个段边界都是一次把 GPU 让给 decode 的机会；多数请求能连续跑完所有段（p50 不受影响，422–429 ms），被多次插队的少数请求构成 p90。段边界越多，被多次打断的概率越大。K=16 在吞吐与尾部上都是净收益，无代价。
+
+该解释由「段边界数 vs p90」的相关性推出，未直接测量段间等待时间。
+
+### p95 由冷启动波次主导，与 K 无关
+
+P=50 的 1000 条请求按轮转排列，前 100 条即 50 条 rep0 + 50 条 rep1，并发 64 时开跑的正是这两批，此时缓存为空。
+
+| rep 批次 | 请求数 | 命中率 | TTFT 中位数 | 最大 |
+|---|---:|---:|---:|---:|
+| rep 0 | 50 | **19.0%** | **11,099 ms** | 22,251 ms |
+| rep 1 | 50 | 97.9% | **12,667 ms** | 22,250 ms |
+| rep 2 | 50 | 98.3% | 450 ms | 2,981 ms |
+| rep 3+ | 850 | 99.7% | 463 ms | 519 ms |
+
+TTFT > 5 s 的 83 条请求全部落在 rep0（39 条）与 rep1（44 条）。K 从 8 提到 16 时 p95 仅从 11,215 降到 10,774（−4%），因为 rep0 的耗时是「真算 9.6k token」本身，而非分段等待。
+
+冷启动总量与量级吻合：
+
+```
+冷启动需真算的 prefill = 50 × 12,037 = 601,850 token
+按 20k tok/s 折算 ≈ 30 s GPU 时间
+观测最大 TTFT ≈ 22 s
+```
+
+决定性对照：同一 PDMux + MTP + 64 并发配置，换成「同一 prompt ×1000」（无冷启动）后，p95 为 **868 ms**，与 P=50 的 11,182 ms 相差 **13 倍**。
+
+### rep0 的 19% 命中来自共享 system prompt
+
+rep0 的 50 条请求中，47 条的 `cached_tokens` 精确等于 **2,432**，仅 3 条为 0（首批 prefill 早于该前缀入缓存）。2,432 ÷ 12,942（rep0 中位 prompt）= 18.8%，与实测 19.0% 一致。
+
+这段 2,432 token 是所有轨迹共用的 OpenHands system prompt。它也解释了此前所有「缓存完全失效」场景为何都停在 ~20%：**那个 20% 地板就是 system prompt，不是缓存失效。**
+
+### 报告口径
+
+P=50 的 p95 = 11 s 是 1000 条请求的**冷启动瞬态**，不是稳态特性。若请求数增至 5000，这 100 条冷请求占比降到 2%，p95 会落到 ~450 ms 量级。对外报 p95 时必须注明「含冷启动」还是「稳态」，两者相差 13 倍。
+
 ## 14. 主要结论
 
 1. **Mamba 槽决定并发上限**：`并发 = ⌊槽数 / S⌋`。128→25、160→32、336→64 三处吻合。
@@ -666,6 +717,8 @@ PDMux 仍有 **+12.5%**，收益没有消失，但显著缩小：
 
 **3. TTFT 尾部**：12K p95 5,495 → 11,215 ms（+104%）；32K 高命中 p95 359 → 6,151 ms（+17 倍）。配 MTP + 64 并发时 p90 亦从 373 涨到 1,732 ms。根因是 prefill 前向被切成 K 层片段并在段间插入 decode，首字要等全部段完成——**代价随每请求 prefill 量线性增长**（第 13c 节剂量表），与流优先级无关。
 
+p90 与 p95 的可调性不同（第 13d 节）：**p90 由分段粒度 K 决定，K 从 4→8→16 可使 p90 从 2,574 降到 549 ms，且吞吐不降**；**p95 由冷启动波次决定，K 几乎无效**（−4%），只能靠提高命中率或缩短冷启动量改善。
+
 **4. 低并发下投机摊不薄**：32K 只能跑 32 并发时，MTP+PDMux 的 TPOT 39.1 ms 高于 base 的 36.6 ms，收益全在吞吐。
 
 **5. 配置被锁死**：必须开 overlap schedule；与 prefill CP 互斥；只能 `layer_split` / `standard`；`sm_group_num` 必须 3。SM 硬分区无收益（psm120/78 的 TPOT 完全相同，只削弱 prefill）。
@@ -701,7 +754,7 @@ l32b 同时满足这两条（32K 长上下文 + 97% 命中），因此 +32.6% �
 
 | 场景 | 配置 | 结果 |
 |---|---|---|
-| 12K、高复用 | `MTP+PDMux` | 852 RPM / TPOT 22.4 ms |
+| 12K、高复用 | `MTP+PDMux`（budget 262144） | **868 RPM / TPOT 22.6 ms / TTFT p90 549 ms** |
 | 12K、真实 agent | `MTP+PDMux` | 667 RPM / TPOT 34.9 ms |
 | **长上下文 + 高命中（长文档批量处理）** | `MTP+PDMux` | **451 RPM / TPOT 19.8 ms（最佳场景）** |
 | 长上下文 + 低命中（多 agent） | `MTP+PDMux+HiCache(write_back)` | 288 RPM，TPOT 让位于 base |
