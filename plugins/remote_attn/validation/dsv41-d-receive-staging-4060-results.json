@@ -1,0 +1,212 @@
+{
+  "device": "NVIDIA GeForce RTX 4060 Laptop GPU",
+  "torch": "2.13.0+cu130",
+  "entries": 12,
+  "native_strides": [
+    131072,
+    131072,
+    131072,
+    32,
+    32,
+    32,
+    8,
+    8,
+    8,
+    131072,
+    64,
+    16
+  ],
+  "receive_ring_bytes": 1048576,
+  "p_send_slot_bytes": 65536,
+  "cases": [
+    {
+      "p_host_staging": false,
+      "bytes_exact": true,
+      "pending_h2d_observed": true,
+      "ring_wrapped": true,
+      "watermark": [
+        2,
+        0
+      ],
+      "native_ring_empty": true
+    },
+    {
+      "p_host_staging": true,
+      "bytes_exact": true,
+      "pending_h2d_observed": true,
+      "ring_wrapped": true,
+      "watermark": [
+        4,
+        0
+      ],
+      "native_ring_empty": true
+    }
+  ],
+  "ring_deregistered_after_drain": true,
+  "cancel_waited_for_gpu": true,
+  "cancel_freed_issued_and_unsent": true,
+  "no_post_release_write": true,
+  "scope": "Real DSV4.1 byte plans, CUDA H2D/scatter and Mooncake TCP on one GPU.\n\nSmall pools/control sockets are fixtures; native ring, watermark, event lifetime\nand data transport are real. No model/server/NCCL or latency claim.\n",
+  "source_sha256": {
+    "plugins/remote_attn/sglang_remote_attn/decode_overlap.py": "a697a43698065c8d8df0c09246c291ccc26b9d2495d114d3656b26ab6f0c95c1",
+    "plugins/remote_attn/sglang_remote_attn/prefill_overlap.py": "96c8903fef2bca96c5b0426bb63c388740edd9ce1a3f4c86a76b643114f222b0",
+    "plugins/remote_attn/sglang_remote_attn/pre_layerwise.py": "037116f1e1300f359d1299bccc36cb0c7738c08b1cf44bc874090248d4be0a7d",
+    "plugins/remote_attn/sglang_remote_attn/segmented_graph.py": "f061c51f66ecfa8b4501bf4108299170f505d16297725f00db23ee36c383308d",
+    "plugins/remote_attn/sglang_remote_attn/dsv41_staging.py": "d0c267fd40f259fb495a8b224d68764fec4b9f1272ab2abdf2a2267c4212ef6d",
+    "plugins/remote_attn/sglang_remote_attn/source_cache.py": "07d2c508c540411beeb96f273dc6a961e83815bf2658fb9125385c4c6f6fc594",
+    "plugins/remote_attn/sglang_remote_attn/dsv41_receive.py": "b2d40ca00d5e27db45d305a67b4761549b776f9c10463bafadb3df236c2a6c3a",
+    "plugins/remote_attn/sglang_remote_attn/prefill_admission.py": "7a6d28a9807b547667c0d62d6912ad656ed19243f5a5f0ffa5090a8715e53480",
+    "plugins/remote_attn/sglang_remote_attn/dsv41_layerwise.py": "8deb8f88deb557721bed8e77f598122225d8437d9575bd49abd5aec2c4a2a2dd",
+    "plugins/remote_attn/sglang_remote_attn/interfaces.py": "557f2ca2791505aeb366b2c9b669d3b15983e8a24e2fc879fc6c31c26bae5eca",
+    "plugins/remote_attn/sglang_remote_attn/tp.py": "766b5028a3a08a801c2891580e406a40f1868d7d21cde8ef46be1d76b86b059c",
+    "plugins/remote_attn/sglang_remote_attn/__init__.py": "f64e878600a7775c62cd79063dbd94d92ccfd6513909f6fed3a221758ebe067f",
+    "plugins/remote_attn/sglang_remote_attn/compat.py": "8772dd8af6143737b0ccbd53a3a88cc441259e9cadb374e66547abe8b420a971",
+    "plugins/remote_attn/sglang_remote_attn/check.py": "a7e23c69b57df34ec943df1aad40e4a4e11171fc30cb0f7fcb8ee9072bada438",
+    "plugins/remote_attn/sglang_remote_attn/hooks.py": "d38139839488ff98649ef23828b052a17031f35a7687ab3ae4f0ebbb13e56499",
+    "plugins/remote_attn/sglang_remote_attn/handoff_control.py": "797319385d0956b8f57454e234e7ce36444008b5ab20b607fb35ec783a5bb402",
+    "plugins/remote_attn/sglang_remote_attn/retirement.py": "a5dec5c9061273cf847c4a7a8e1f63edb0c7e57ae23ebbd309ed427ca97fbf1e",
+    "test/manual/remote_attn/dsv41_receive_staging_cuda_probe.py": "f09abc2c82d80f829f2256436dd380e2da9dd136292e52dc1e225c1549639274",
+    "test/manual/remote_attn/dsv41_host_staging_cuda_probe.py": "ae363d6fd34d47dc5ca133d6490167f8dffe603e9617c1a31e69fa2aeffc0c15",
+    "python/sglang/srt/disaggregation/pinned_staging_buffer.py": "24913fbfea163837e8ef7453897c6293281b0fbb3135cb0edc2a16f52c64520e",
+    "python/sglang/srt/disaggregation/mooncake/pinned_staging_core.py": "871b33f6121a73cad6e1bd3ad50ffd3aaf4037a5ae3e8e08be3adc0003afebb2",
+    "python/sglang/srt/disaggregation/mooncake/conn.py": "29db1aa8869061c8b2ec675cc96c7734f9e9341f56e078bfb20ac350576024e8",
+    "python/sglang/srt/disaggregation/common/conn.py": "8d7b4c8ef857beb989e745587bc2019c37e4391965c7edc39358935a9aae38b3",
+    "python/sglang/srt/disaggregation/common/utils.py": "cc0c93eea974e12006b137b6d8a2893ad286c348527480e40f88814424d67c35",
+    "python/sglang/srt/disaggregation/utils.py": "307962ae66b8635c6cb76bbce6d23496b68ac12c77e51301f07d1b2e0f2de8bf",
+    "python/sglang/srt/disaggregation/common/staging_handler.py": "3831fd7fe95b8c007b455662caa8954e79c93e41f89e5ccfc417b1a81995f253",
+    "python/sglang/srt/disaggregation/common/staging_buffer.py": "03404023fb605107d5500261c4b405283f932faaacb6d33584f299e355554e85",
+    "python/sglang/srt/mem_cache/deepseek_v4_memory_pool.py": "bdccf8c9c2d30691fa71a183c6c51503335d42127498b6272c11742d87d3bd44"
+  },
+  "p_send_regression": {
+    "device": "NVIDIA GeForce RTX 4060 Laptop GPU",
+    "torch": "2.13.0+cu130",
+    "entries": 12,
+    "native_strides": [
+      256,
+      256,
+      256,
+      32,
+      32,
+      32,
+      8,
+      8,
+      8,
+      256,
+      64,
+      16
+    ],
+    "producer_pending": true,
+    "bytes_exact": true,
+    "bounded_host_batches": 32,
+    "slot_capacity": 257,
+    "nonblocking_copy_stream": true,
+    "ordinary_middle_reuses_slot": true,
+    "final_state_direct": true,
+    "failed_slot_quarantined": true,
+    "failed_retry_no_te": true,
+    "source_sha256": {
+      "plugins/remote_attn/sglang_remote_attn/decode_overlap.py": "a697a43698065c8d8df0c09246c291ccc26b9d2495d114d3656b26ab6f0c95c1",
+      "plugins/remote_attn/sglang_remote_attn/prefill_overlap.py": "96c8903fef2bca96c5b0426bb63c388740edd9ce1a3f4c86a76b643114f222b0",
+      "plugins/remote_attn/sglang_remote_attn/pre_layerwise.py": "037116f1e1300f359d1299bccc36cb0c7738c08b1cf44bc874090248d4be0a7d",
+      "plugins/remote_attn/sglang_remote_attn/segmented_graph.py": "f061c51f66ecfa8b4501bf4108299170f505d16297725f00db23ee36c383308d",
+      "plugins/remote_attn/sglang_remote_attn/dsv41_staging.py": "d0c267fd40f259fb495a8b224d68764fec4b9f1272ab2abdf2a2267c4212ef6d",
+      "plugins/remote_attn/sglang_remote_attn/source_cache.py": "07d2c508c540411beeb96f273dc6a961e83815bf2658fb9125385c4c6f6fc594",
+      "plugins/remote_attn/sglang_remote_attn/dsv41_receive.py": "b2d40ca00d5e27db45d305a67b4761549b776f9c10463bafadb3df236c2a6c3a",
+      "plugins/remote_attn/sglang_remote_attn/prefill_admission.py": "7a6d28a9807b547667c0d62d6912ad656ed19243f5a5f0ffa5090a8715e53480",
+      "plugins/remote_attn/sglang_remote_attn/dsv41_layerwise.py": "8deb8f88deb557721bed8e77f598122225d8437d9575bd49abd5aec2c4a2a2dd",
+      "plugins/remote_attn/sglang_remote_attn/interfaces.py": "557f2ca2791505aeb366b2c9b669d3b15983e8a24e2fc879fc6c31c26bae5eca",
+      "plugins/remote_attn/sglang_remote_attn/tp.py": "766b5028a3a08a801c2891580e406a40f1868d7d21cde8ef46be1d76b86b059c",
+      "plugins/remote_attn/sglang_remote_attn/__init__.py": "f64e878600a7775c62cd79063dbd94d92ccfd6513909f6fed3a221758ebe067f",
+      "plugins/remote_attn/sglang_remote_attn/compat.py": "8772dd8af6143737b0ccbd53a3a88cc441259e9cadb374e66547abe8b420a971",
+      "plugins/remote_attn/sglang_remote_attn/check.py": "a7e23c69b57df34ec943df1aad40e4a4e11171fc30cb0f7fcb8ee9072bada438",
+      "plugins/remote_attn/sglang_remote_attn/hooks.py": "d38139839488ff98649ef23828b052a17031f35a7687ab3ae4f0ebbb13e56499",
+      "plugins/remote_attn/sglang_remote_attn/handoff_control.py": "797319385d0956b8f57454e234e7ce36444008b5ab20b607fb35ec783a5bb402",
+      "plugins/remote_attn/sglang_remote_attn/retirement.py": "a5dec5c9061273cf847c4a7a8e1f63edb0c7e57ae23ebbd309ed427ca97fbf1e",
+      "test/manual/remote_attn/dsv41_host_staging_cuda_probe.py": "ae363d6fd34d47dc5ca133d6490167f8dffe603e9617c1a31e69fa2aeffc0c15",
+      "python/sglang/srt/disaggregation/pinned_staging_buffer.py": "24913fbfea163837e8ef7453897c6293281b0fbb3135cb0edc2a16f52c64520e",
+      "python/sglang/srt/disaggregation/mooncake/pinned_staging_core.py": "871b33f6121a73cad6e1bd3ad50ffd3aaf4037a5ae3e8e08be3adc0003afebb2",
+      "python/sglang/srt/disaggregation/mooncake/conn.py": "29db1aa8869061c8b2ec675cc96c7734f9e9341f56e078bfb20ac350576024e8",
+      "python/sglang/srt/disaggregation/common/conn.py": "8d7b4c8ef857beb989e745587bc2019c37e4391965c7edc39358935a9aae38b3",
+      "python/sglang/srt/disaggregation/common/utils.py": "cc0c93eea974e12006b137b6d8a2893ad286c348527480e40f88814424d67c35",
+      "python/sglang/srt/disaggregation/utils.py": "307962ae66b8635c6cb76bbce6d23496b68ac12c77e51301f07d1b2e0f2de8bf",
+      "python/sglang/srt/mem_cache/deepseek_v4_memory_pool.py": "bdccf8c9c2d30691fa71a183c6c51503335d42127498b6272c11742d87d3bd44"
+    },
+    "scope": "real CUDA+Mooncake TCP, two endpoints on one GPU; toy pool, source-loaded native planners; no DSV4.1 model, full scheduler, NCCL or performance claim"
+  },
+  "overlap_cache_regression": {
+    "device": "NVIDIA GeForce RTX 4060 Laptop GPU",
+    "torch": "2.13.0+cu130",
+    "cuda": "13.0",
+    "pending_indices_observed": true,
+    "pinned_indices_equal": true,
+    "prefix_cache": true,
+    "cache_reads_drained": true,
+    "cache_backend": "lock/checkpoint boundary fixture; real hybrid receipt tests on CPU",
+    "launch_plans": 4,
+    "admission_checks": 3,
+    "revalidations": 1,
+    "revocations": 1,
+    "stable_chunk_admission_votes": 0,
+    "io_callbacks": 4,
+    "releases": [
+      "normal",
+      "cancel",
+      "revoke"
+    ],
+    "final_votes": 3,
+    "empty_poll_votes": 0,
+    "cancel_with_unsubmitted_sampling": true,
+    "no_post_release_write": true,
+    "source_sha256": {
+      "prefill_overlap_cuda_probe.py": "530197accd810c2c42e06e5a62cb4f10a78f6e40e1e6d33fa173aeb2e8320ce5",
+      "__init__.py": "f64e878600a7775c62cd79063dbd94d92ccfd6513909f6fed3a221758ebe067f",
+      "check.py": "a7e23c69b57df34ec943df1aad40e4a4e11171fc30cb0f7fcb8ee9072bada438",
+      "compat.py": "8772dd8af6143737b0ccbd53a3a88cc441259e9cadb374e66547abe8b420a971",
+      "decode_overlap.py": "a697a43698065c8d8df0c09246c291ccc26b9d2495d114d3656b26ab6f0c95c1",
+      "dsv41_layerwise.py": "8deb8f88deb557721bed8e77f598122225d8437d9575bd49abd5aec2c4a2a2dd",
+      "dsv41_receive.py": "b2d40ca00d5e27db45d305a67b4761549b776f9c10463bafadb3df236c2a6c3a",
+      "dsv41_staging.py": "d0c267fd40f259fb495a8b224d68764fec4b9f1272ab2abdf2a2267c4212ef6d",
+      "handoff_control.py": "797319385d0956b8f57454e234e7ce36444008b5ab20b607fb35ec783a5bb402",
+      "hooks.py": "d38139839488ff98649ef23828b052a17031f35a7687ab3ae4f0ebbb13e56499",
+      "interfaces.py": "557f2ca2791505aeb366b2c9b669d3b15983e8a24e2fc879fc6c31c26bae5eca",
+      "pre_layerwise.py": "037116f1e1300f359d1299bccc36cb0c7738c08b1cf44bc874090248d4be0a7d",
+      "prefill_admission.py": "7a6d28a9807b547667c0d62d6912ad656ed19243f5a5f0ffa5090a8715e53480",
+      "prefill_overlap.py": "96c8903fef2bca96c5b0426bb63c388740edd9ce1a3f4c86a76b643114f222b0",
+      "retirement.py": "a5dec5c9061273cf847c4a7a8e1f63edb0c7e57ae23ebbd309ed427ca97fbf1e",
+      "segmented_graph.py": "f061c51f66ecfa8b4501bf4108299170f505d16297725f00db23ee36c383308d",
+      "source_cache.py": "07d2c508c540411beeb96f273dc6a961e83815bf2658fb9125385c4c6f6fc594",
+      "tp.py": "766b5028a3a08a801c2891580e406a40f1868d7d21cde8ef46be1d76b86b059c"
+    },
+    "limitations": [
+      "No DSV4.1 model load or token accuracy/performance measurement",
+      "IO callback fixture; no Mooncake TE or SMG",
+      "TP1 CUDA; real TP2 Gloo is covered separately on CPU"
+    ]
+  },
+  "local_validation": {
+    "cpu_tests": 130,
+    "dsv41_tests": 32,
+    "source_hooks": 39,
+    "core_interfaces": 88,
+    "tp2_receive_polls": [
+      [
+        3
+      ],
+      [
+        3
+      ],
+      [
+        4
+      ],
+      [
+        0
+      ]
+    ],
+    "tp2_native_collective_shapes": [
+      1,
+      1,
+      1,
+      1
+    ]
+  }
+}

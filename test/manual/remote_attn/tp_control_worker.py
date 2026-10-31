@@ -1079,6 +1079,80 @@ def prefill_staging_failure(args):
         protocol.close()
 
 
+def receive_staging_consensus(args):
+    """Use native D poll reduction: H2D and metadata gate before shared Success."""
+    import ast
+
+    import torch
+
+    path = (
+        Path(__file__).resolve().parents[3]
+        / "python/sglang/srt/disaggregation/utils.py"
+    )
+    names = {
+        "poll_and_all_reduce_with_staging",
+        "_poll_with_failure_injection",
+        "_apply_metadata_gate",
+        "_is_fake_transfer",
+        "_all_reduce_polls",
+        "all_reduce_flags",
+    }
+    nodes = [
+        n for n in ast.parse(path.read_text()).body if getattr(n, "name", None) in names
+    ]
+    namespace = dict(
+        torch=torch,
+        dist=dist,
+        KVPoll=SimpleNamespace(Success=4, Transferring=3, Failed=0),
+        FAKE_BOOTSTRAP_HOST="fake",
+        envs=SimpleNamespace(
+            SGLANG_TEST_DISAGG_FAILURE_PROB=SimpleNamespace(get=lambda: 0)
+        ),
+    )
+    tree = ast.Module(
+        body=[
+            ast.ImportFrom(
+                module="__future__", names=[ast.alias(name="annotations")], level=0
+            ),
+            *nodes,
+        ],
+        type_ignores=[],
+    )
+    exec(compile(ast.fix_missing_locations(tree), str(path), "exec"), namespace)
+    state = SimpleNamespace(done=args.rank == 0, failed=False)
+    dr = SimpleNamespace(
+        kv_receiver=SimpleNamespace(require_staging=True, poll=lambda: 4),
+        req=SimpleNamespace(bootstrap_host="real-peer"),
+        metadata_buffer_index=0,
+    )
+    handler = SimpleNamespace(
+        is_done=lambda req: state.done,
+        is_failed=lambda req: state.failed,
+        advance_scatter=lambda req: None,
+    )
+    metadata = SimpleNamespace(bootstrap_room=torch.ones((1, 1), dtype=torch.int64))
+    polls, shapes = [], []
+    actual = dist.all_reduce
+
+    def counted(tensor, *a, **kw):
+        shapes.append(tensor.numel())
+        return actual(tensor, *a, **kw)
+
+    with patch.object(dist, "all_reduce", counted):
+        poll = namespace["poll_and_all_reduce_with_staging"]
+        polls.append(poll([dr], handler, dist.group.WORLD, metadata))
+        state.done = True
+        if args.rank == 1:
+            metadata.bootstrap_room.zero_()
+        polls.append(poll([dr], handler, dist.group.WORLD, metadata))
+        metadata.bootstrap_room.fill_(501)
+        polls.append(poll([dr], handler, dist.group.WORLD, metadata))
+        state.failed = args.rank == 1
+        polls.append(poll([dr], handler, dist.group.WORLD, metadata))
+    assert polls == [[3], [3], [4], [0]] and shapes == [1, 1, 1, 1]
+    return dict(polls=polls, native_collective_shapes=shapes)
+
+
 def main():
     parser = argparse.ArgumentParser()
     parser.add_argument("rank", type=int)
@@ -1292,6 +1366,7 @@ def main():
         p_certificates = prefill_certificate_lifetimes(args)
         p_cached_certificates = prefill_certificate_lifetimes(args, prefix_cache=True)
         p_staging_failure = prefill_staging_failure(args)
+        d_receive_staging = receive_staging_consensus(args)
         Path(args.output).write_text(
             json.dumps(
                 {
@@ -1307,6 +1382,7 @@ def main():
                     "p_certificates": p_certificates,
                     "p_cached_certificates": p_cached_certificates,
                     "p_staging_failure": p_staging_failure,
+                    "d_receive_staging": d_receive_staging,
                     "segmented_startup": startup,
                     "segmented_routing": routing,
                 }

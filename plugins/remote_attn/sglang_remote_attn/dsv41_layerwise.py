@@ -10,7 +10,7 @@ import logging
 import time
 from dataclasses import dataclass, field
 
-from . import dsv41_staging
+from . import dsv41_receive, dsv41_staging
 from .pre_layerwise import Controller, Source, read_json, write_json
 
 logger = logging.getLogger(__name__)
@@ -218,7 +218,7 @@ class DSV41Source(Source):
 
     def enqueue(self, producer, event, *, flush=False):
         sender = self.req.disagg_kv_sender
-        for boundary, indices in self.groups:
+        for ordinal, (boundary, indices) in enumerate(self.groups):
             if boundary in self.submitted or (boundary > producer and not flush):
                 continue
             sender.kv_mgr.add_transfer_request(
@@ -232,6 +232,8 @@ class DSV41Source(Source):
                 if self.stager is not None
                 else None,
                 kv_buffer_indices=indices,
+                staging_chunk_idx=ordinal if self.native_staging else None,
+                staging_layer_ids=indices if self.native_staging else None,
                 on_complete=functools.partial(self.complete_group, boundary, indices),
                 trace_ctx=sender.trace_ctx.copy_for_thread(),
             )
@@ -262,6 +264,8 @@ class DSV41Source(Source):
                 "layer_group_size": self.group_size,
                 "native_final_states": True,
                 "host_staging": self.stager is not None,
+                "recv_host_staging": self.recv_host_staging,
+                "native_staging": self.native_staging,
                 "p_radix_read_lease": self.cache_lease is not None,
                 "cached_prefix_tokens": self.cache_lease.cached_tokens
                 if self.cache_lease is not None
@@ -300,14 +304,17 @@ class DSV41Controller(Controller):
             raise ValueError("DSV4.1 layerwise requires --disable-radix-cache on D")
         if (
             (self.config.host_staging and s.disaggregation_mode.value != "prefill")
-            or self.config.recv_host_staging
-            or s.enable_staging
+            or (
+                self.config.recv_host_staging
+                and s.disaggregation_mode.value != "decode"
+            )
+            or (s.enable_staging and not getattr(self, "receive_installed", False))
             or s.enable_pdmux
             or get_memory().enable_unified_memory
             or get_memory().enable_hierarchical_cache
         ):
             raise ValueError(
-                "DSV4.1 supports P send host staging only; no receive staging/HiCache/PD multiplexing"
+                "DSV4.1 staging requires P send / D receive roles; no HiCache/PD multiplexing"
             )
         if get_disagg().disaggregation_decode_allocation_policy == "prefill_complete":
             raise ValueError(
@@ -336,17 +343,24 @@ class DSV41Controller(Controller):
             if role == "prefill"
             else s.disagg_decode_prealloc_queue.kv_manager
         )
-        if manager.enable_staging or (
-            role != "prefill" and getattr(manager, "_host_staging_all", False)
-        ):
+        if (
+            manager.enable_staging and not getattr(self, "receive_installed", False)
+        ) or (role != "prefill" and getattr(manager, "_host_staging_all", False)):
             raise ValueError(
-                "DSV4.1 supports P send host staging only; no receive staging"
+                "DSV4.1 staging requires P send / D receive roles; native MHA staging must be disabled"
             )
         self._schema(manager)  # reject unsupported storage before serving
         if role == "prefill" and (
             self.config.host_staging or getattr(manager, "_host_staging_all", False)
         ):
             self.stager = dsv41_staging.bind(self.pool, manager)
+        if (
+            role == "decode"
+            and self.config.recv_host_staging
+            and not getattr(self, "receive_installed", False)
+        ):
+            dsv41_receive.install(self, manager, role)
+            self.receive_installed = True
         self.config.directory.mkdir(parents=True, exist_ok=True)
         # Attach no model hooks on D. Its native completion, graphs and overlap
         # remain authoritative; it never receives an early-admission offer.
@@ -369,8 +383,19 @@ class DSV41Controller(Controller):
         if target is not None:
             offer = read_json(target.path.parent / "offer.json")
             offer["dsv41"] = self._schema(dr.kv_receiver.kv_mgr)
+            offer["staging_wire"] = (
+                dsv41_receive.WIRE if self.config.recv_host_staging else None
+            )
+            # No early D admission/graph lease: native queue owns cancellation,
+            # deferred abort ACK, H2D drain and metadata teardown exactly once.
+            dr.req._pre_layerwise_native_target = None
             write_json(target.path.parent / "offer.json", offer)
         return target
+
+    def early_targets(self, queue, rids_to_check):
+        # Physical global entries are not dense model layers. Native staging
+        # polling supplies the H2D+metadata+TP barrier; never run Target.refresh.
+        return [], [self.offer(queue, dr) for dr in queue.queue]
 
     def candidates(self, batch, *, allow_middle=False):
         from sglang.srt.disaggregation.mooncake.conn import MooncakeKVSender
@@ -446,6 +471,15 @@ class DSV41Controller(Controller):
                     and peers[0][0].dst_device_kv_indices is None
                     and len(peers[0][1].dst_kv_ptrs) == len(schema["entries"])
                     and not mgr.enable_staging
+                    and (
+                        not offer.get("native_staging")
+                        and not offer.get("recv_host_staging")
+                        or offer.get("native_staging")
+                        and offer.get("recv_host_staging")
+                        and offer.get("staging_wire") == dsv41_receive.WIRE
+                        and getattr(peers[0][1], "staging_base_ptr", 0) > 0
+                        and getattr(peers[0][1], "staging_total_size", 0) > 0
+                    )
                     and mgr.kv_shard_size == 1
                     and not mgr.enable_all_cp_ranks_for_transfer
                     and not mgr.is_dummy_cp_rank
@@ -525,6 +559,13 @@ class DSV41Controller(Controller):
             if skip or not last or len(indices) != index_slice.stop - index_slice.start:
                 raise RuntimeError("unexpected DSV4.1 page reservation")
             groups = resource_groups(schema, group_size)
+            if offer.get("native_staging"):
+                dsv41_receive.install(self, sender.kv_mgr, "prefill")
+                sender.kv_mgr.request_layer_staging(
+                    sender.bootstrap_room,
+                    index_slice,
+                    tuple((indices, None) for _, indices in groups),
+                )
             source = DSV41Source(
                 self,
                 req,
@@ -538,6 +579,8 @@ class DSV41Controller(Controller):
                 prefill_chunk_tokens=req.extend_len,
                 groups=groups,
                 stager=self.stager,
+                native_staging=offer.get("native_staging", False),
+                recv_host_staging=offer.get("recv_host_staging", False),
                 cache_lease=(
                     getattr(getattr(req, "_dsv41_p_lease", None), "cache_lease", None)
                     if plan is not None

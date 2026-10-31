@@ -3505,6 +3505,11 @@ class TestRemoteAttn(CustomTestCase):
             rows[0]["p_overlap"],
             dict(votes=[5, 5], freed=[1, 2], commits=2, registered=0, local_votes=0),
         )
+        self.assertEqual(rows[0]["d_receive_staging"], rows[1]["d_receive_staging"])
+        self.assertEqual(
+            rows[0]["d_receive_staging"],
+            dict(polls=[[3], [3], [4], [0]], native_collective_shapes=[1, 1, 1, 1]),
+        )
         self.assertEqual(rows[0]["p_staging_failure"], rows[1]["p_staging_failure"])
         self.assertEqual(
             rows[0]["p_staging_failure"],
@@ -7033,6 +7038,338 @@ class TestRemoteAttn(CustomTestCase):
                 json.loads((source.path / "prefill.json").read_text())["host_staging"]
             )
 
+    def _dsv41_receive_fixture(self, *, capacity=128):
+        import struct
+
+        from sglang_remote_attn import dsv41_receive as rx
+
+        f = self._dsv41_fixture()
+        f.stager, f.calls = self._dsv41_stage_fixture(f)
+        r = self._native_ring_fixture(capacity=capacity)
+        r.handler._wm_subscribers.clear()
+        r.receiver.chunk_staging_infos.clear()
+        r.receiver.chunk_staging_layers.clear()
+        r.receiver.prefill_info.attn_tp_size = 1
+        r.handler.decode_tp = 1
+        r.manager.attn_tp_size = 1
+        r.manager._dsv41_layerwise_schema = f.schema
+        r.manager.kv_args = copy.copy(f.manager.kv_args)
+        r.manager.kv_args.page_size = f.manager.kv_args.page_size = 8
+        f.registration.dst_kv_item_len = f.manager.kv_args.kv_item_lens[0]
+        r.manager.kv_args.kv_data_ptrs = f.registration.dst_kv_ptrs
+        r.manager._staging_ctx.allocator = r.allocator
+        r.manager._staging_handler = r.handler
+        r.handler.kv_buffer_info = dict(
+            k_buffers=f.destination, v_buffers=[], page_size=8
+        )
+        row = torch.cat([torch.arange(p * 8, p * 8 + 8) for p in (5, 6, 1, 2, 3)])
+        r.handler.scheduler.req_to_token_pool.req_to_token = row.reshape(1, -1)
+        r.dr.req.origin_input_ids = list(range(33))
+        r.handler._scatter_region = lambda *a, **kw: rx.scatter(
+            None, r.handler, *a, **kw
+        )
+        self.enterContext(
+            patch.dict(
+                sys.modules,
+                {
+                    "sglang.srt.utils": SimpleNamespace(
+                        create_device_stream=lambda device: SimpleNamespace(
+                            wait_event=lambda event: None,
+                            synchronize=lambda: [
+                                setattr(e, "complete", True) for e in r.events
+                            ],
+                        ),
+                        device_stream_context=lambda stream: nullcontext(),
+                    ),
+                    "sglang.srt.disaggregation.common.staging_handler": SimpleNamespace(
+                        PrefillStagingContext=lambda: SimpleNamespace(
+                            remote_watermarks={}, watermark_cv=threading.Condition()
+                        )
+                    ),
+                },
+            )
+        )
+        requests = []
+        f.manager._staging_ctx = None
+        f.manager.request_layer_staging = lambda room, span, groups: requests.extend(
+            [
+                b"STAGING_REQ",
+                str(room).encode(),
+                str(i).encode(),
+                str(span.stop - span.start).encode(),
+                b"peer:1",
+                b"0",
+                struct.pack(f"{len(indices)}Q", *indices),
+                str(span.start).encode(),
+            ]
+            for i, (indices, _) in enumerate(groups)
+        )
+        f.registration.staging_base_ptr = r.allocator.get_base_ptr()
+        f.registration.staging_total_size = r.allocator.total_size
+        offer_path = f.controller.config.directory / "7/0/offer.json"
+        offer = json.loads(offer_path.read_text())
+        offer.update(native_staging=True, recv_host_staging=True, staging_wire=rx.WIRE)
+        self.hooks.pre_layerwise.write_json(offer_path, offer)
+        f.req.start_send_idx, f.sender.curr_idx = 16, 2
+        f.req.extend_end, f.req.extend_len = 33, 17
+        f.rx, f.ring, f.requests = rx, r, requests
+        return f
+
+    def test_dsv41_receive_native_ring_roundtrip_and_gpu_completion_barrier(self):
+        f = self._dsv41_receive_fixture()
+        r = f.ring
+        with patch.dict(sys.modules, f.modules):
+            source = f.controller.prepare(f.batch)[0]
+        self.assertTrue(source.native_staging and source.recv_host_staging)
+        self.assertEqual(len(f.requests), len(source.groups))
+        source.enqueue(39, None, flush=True)
+        # Allocate all groups first. Native overcommit and watermark prevent
+        # a later round from overwriting an earlier unconsumed pinned interval.
+        for msg in f.requests:
+            f.rx.allocate(None, r.manager, msg)
+        self.assertEqual(len(r.allocator.allocations), 4)
+        strategy_cls = _source_class(
+            "disaggregation/common/staging_handler.py",
+            "PrefillStagingStrategy",
+            {"check_ready"},
+        )
+        strategy = strategy_cls()
+        strategy.kv_manager = f.manager
+        watermark = _source_function(
+            "disaggregation/common/staging_handler.py", "is_watermark_ready"
+        )
+        f.manager._is_watermark_ready = lambda session, rnd, end: watermark(
+            f.manager._staging_ctx, session, rnd, end
+        )
+        f.manager._staging_ctx.remote_watermarks["peer:1"] = r.allocator.get_watermark()
+        # Canonical Success may arrive before the last CHUNK_READY is consumed.
+        r.handler.submit_last_scatter_async(7)
+        for ordinal, (_, entries) in enumerate(source.groups):
+            task = f.tasks.get_nowait()
+            task.prefill_kv_indices = task.indices
+            ready, _, offset, rnd, end = strategy.check_ready(
+                SimpleNamespace(
+                    staging=SimpleNamespace(
+                        offsets=[i[1] for i in r.receiver.chunk_staging_infos],
+                        rounds=[i[2] for i in r.receiver.chunk_staging_infos],
+                        ends=[i[3] for i in r.receiver.chunk_staging_infos],
+                    ),
+                    mooncake_session_id="peer:1",
+                ),
+                2,
+                3,
+                chunk_idx=ordinal,
+            )
+            self.assertTrue(ready)
+            self.assertEqual(task.staging_chunk_idx, ordinal)
+            self.assertEqual(task.staging_layer_ids, entries)
+            self.assertEqual(
+                f.rx.send_group(
+                    None,
+                    f.manager,
+                    SimpleNamespace(mooncake_session_id="peer:1"),
+                    task,
+                    f.registration,
+                    offset,
+                    None,
+                ),
+                0,
+            )
+            task.on_complete()
+            self.assertTrue(r.handler.handle_chunk_arrived(7, ordinal, 2, 3, "peer:1"))
+            r.handler.advance_scatter(r.dr)
+            self.assertFalse(r.handler.is_done(r.dr))
+            self.assertTrue(r.allocator.allocations)
+            # Duplicate allocation after consumption cannot reassign a slot.
+            before = dict(r.allocator.allocations)
+            f.rx.allocate(None, r.manager, f.requests[ordinal])
+            self.assertEqual(r.allocator.allocations, before)
+            for e in r.events:
+                e.complete = True
+            r.handler.advance_scatter(r.dr)
+            f.manager._staging_ctx.remote_watermarks["peer:1"] = (
+                r.allocator.get_watermark()
+            )
+        self.assertTrue(r.handler.is_done(r.dr))
+        self.assertFalse(r.allocator.allocations)
+        self.assertEqual(len(source.completed), 12)
+        for ptr, stride, dst in zip(
+            f.manager.kv_args.kv_data_ptrs,
+            f.manager.kv_args.kv_item_lens,
+            f.destination,
+        ):
+            for sp, dp in zip((3, 4, 5), (1, 2, 3)):
+                self.assertEqual(
+                    bytes(dst[dp * stride : (dp + 1) * stride]),
+                    ctypes.string_at(ptr + sp * stride, stride),
+                )
+            self.assertFalse(
+                dst[5 * stride : 7 * stride].any()
+            )  # Middle pages unchanged.
+        self.assertEqual(f.manager.max_transfer_batch_indices, 2)
+        self.assertGreater(r.allocator.get_watermark()[0], 0)
+
+    def test_dsv41_receive_rejects_oversize_overlap_and_changed_envelopes(self):
+        import struct
+
+        f = self._dsv41_receive_fixture(capacity=16)
+        with patch.dict(sys.modules, f.modules):
+            source = f.controller.prepare(f.batch)[0]
+        r = f.ring
+        f.rx.allocate(None, r.manager, f.requests[0])
+        self.assertEqual(r.receiver.chunk_staging_infos[0][1], -2)
+        self.assertFalse(r.allocator.allocations)
+        repeated = list(f.requests[0])
+        repeated[3] = b"2"
+        with self.assertRaisesRegex(ValueError, "envelope"):
+            f.rx.allocate(None, r.manager, repeated)
+        repeated = list(f.requests[0])
+        repeated[2] = b"1"
+        with self.assertRaisesRegex(ValueError, "duplicate"):
+            f.rx.allocate(None, r.manager, repeated)
+        repeated = list(f.requests[0])
+        repeated[6] = struct.pack("Q", 999)
+        with self.assertRaisesRegex(ValueError, "entries"):
+            f.rx.allocate(None, r.manager, repeated)
+        repeated = list(f.requests[0])
+        repeated[2] = b"9999999"
+        with self.assertRaisesRegex(ValueError, "envelope"):
+            f.rx.allocate(None, r.manager, repeated)
+        self.assertFalse(r.allocator.allocations)
+        from sglang_remote_attn.prefill_overlap import SourceLease
+
+        lease = SourceLease.__new__(SourceLease)
+        lease.check = lambda: None
+        lease.chunk = SimpleNamespace(sender=f.sender)
+        f.native_status[0] = f.polls.Failed
+        with patch.dict(sys.modules, f.modules):
+            with self.assertRaisesRegex(RuntimeError, "transport failed"):
+                lease.transport_ready()
+        # Fail before publication when a peer advertises unknown wire semantics.
+        offer_path = f.controller.config.directory / "7/0/offer.json"
+        offer = json.loads(offer_path.read_text())
+        offer["staging_wire"] = "foreign"
+        self.hooks.pre_layerwise.write_json(offer_path, offer)
+        f.req._pre_layerwise_source = None
+        with patch.dict(sys.modules, f.modules):
+            self.assertEqual(f.controller.candidates(f.batch), [None])
+
+    def test_dsv41_receive_cancel_drains_h2d_before_native_page_free(self):
+        f = self._dsv41_receive_fixture()
+        r = f.ring
+        with patch.dict(sys.modules, f.modules):
+            f.controller.prepare(f.batch)
+        f.rx.allocate(None, r.manager, f.requests[0])
+        r.handler.handle_chunk_arrived(7, 0, 2, 3, "peer:1")
+        self.assertTrue(r.allocator.allocations)
+        self.assertFalse(r.events[-1].complete)
+        # The actual native release routine drains the stream before freeing
+        # issued/unsent allocations. Simulate its successful GPU fence only.
+        r.allocator._scatter_stream.synchronize = lambda: [
+            setattr(e, "complete", True) for e in r.events
+        ]
+        r.handler.unregister_decode_req(7)
+        self.assertTrue(r.events[-1].complete)
+        self.assertFalse(r.allocator.allocations)
+        self.assertFalse(r.dr._chunk_events)
+        self.assertFalse(r.handler.is_staging_room(7))
+        # Late messages cannot resurrect the old room or allocate more memory.
+        f.rx.allocate(None, r.manager, f.requests[0])
+        self.assertFalse(r.allocator.allocations)
+
+    def test_dsv41_receive_install_offer_and_clean_teardown_use_native_lifetime(self):
+        f = self._dsv41_receive_fixture()
+        r = f.ring
+        f.scheduler.disaggregation_mode = SimpleNamespace(value="decode")
+        f.scheduler.schedule_stream = r.handler.scheduler.schedule_stream
+        f.scheduler.disagg_decode_prealloc_queue.transfer_queue = SimpleNamespace()
+        f.controller.config = dataclasses.replace(
+            f.controller.config, host_staging=False, recv_host_staging=True
+        )
+        ctx = _source_class(
+            "disaggregation/common/staging_handler.py", "DecodeStagingContext"
+        )
+        native = sys.modules["sglang.srt.disaggregation.common.staging_handler"]
+        registered, deregistered = [], []
+        f.manager._register_staging_memory = lambda pointer, size: registered.append(
+            (pointer, size)
+        )
+
+        def allocate(register, kv_args, **kw):
+            self.assertTrue(kw["pin_memory"])
+            register(r.allocator.get_base_ptr(), r.allocator.total_size)
+            return r.allocator
+
+        f.manager._worker_threads = []
+        f.manager.engine.batch_deregister = lambda pointers: (
+            deregistered.extend(pointers) or 0
+        )
+        f.manager.get_session_id = lambda: "peer:1"
+        with (
+            patch.dict(sys.modules, {"sglang.srt.runtime_context": f.context}),
+            patch.multiple(
+                native,
+                DecodeStagingContext=ctx,
+                DecodeStagingHandler=type(r.handler),
+                init_staging_allocator=allocate,
+                create=True,
+            ),
+        ):
+            f.controller.validate()
+        queue = f.scheduler.disagg_decode_prealloc_queue.transfer_queue
+        self.assertTrue(queue.enable_staging)
+        self.assertTrue(f.manager.enable_staging)
+        self.assertIs(queue.staging_handler, f.manager._staging_handler)
+        self.assertEqual(
+            registered, [(r.allocator.get_base_ptr(), r.allocator.total_size)]
+        )
+        r.receiver.kv_mgr = f.manager
+        r.receiver.poll = lambda: f.polls.Transferring
+        r.dr.is_rebootstrap = False
+        queue._is_host_destination = lambda dr: False
+        queue.queue = [r.dr]
+        modules = dict(f.modules)
+        modules["sglang.srt.disaggregation.mooncake.conn"] = SimpleNamespace(
+            MooncakeKVReceiver=type(r.receiver)
+        )
+        with patch.dict(sys.modules, modules):
+            admitted, offered = f.controller.early_targets(queue, None)
+        self.assertEqual(admitted, [])
+        self.assertTrue(offered[0].native_staging)
+        self.assertTrue(r.receiver.require_staging)
+        self.assertIsNone(r.dr.req._pre_layerwise_native_target)
+        offer = json.loads(
+            (f.controller.config.directory / "7/0/offer.json").read_text()
+        )
+        self.assertEqual(offer["staging_wire"], f.rx.WIRE)
+        self.assertTrue(offer["recv_host_staging"])
+        with self.assertRaisesRegex(RuntimeError, "still active"):
+            f.rx.teardown(
+                lambda manager: self.fail("unsafe native teardown"), f.manager
+            )
+        f.manager._staging_handler.unregister_decode_req(7)
+        f.rx.teardown(lambda manager: None, f.manager)
+        self.assertEqual(deregistered, [r.allocator.get_base_ptr()])
+        self.assertEqual(f.manager.engine._dsv41_receive_owners, [])
+
+    def test_dsv41_receive_failed_gpu_drain_quarantines_ring(self):
+        f = self._dsv41_receive_fixture()
+        r = f.ring
+        with patch.dict(sys.modules, f.modules):
+            f.controller.prepare(f.batch)
+        f.rx.allocate(None, r.manager, f.requests[0])
+        r.handler.handle_chunk_arrived(7, 0, 2, 3, "peer:1")
+
+        def failed():
+            raise RuntimeError("injected GPU fence failure")
+
+        r.allocator._scatter_stream.synchronize = failed
+        with self.assertRaisesRegex(RuntimeError, "GPU fence failure"):
+            r.handler.unregister_decode_req(7)
+        self.assertTrue(r.allocator.allocations)
+        self.assertTrue(r.dr._chunk_events)
+        self.assertFalse(r.events[-1].complete)
+
     def test_dsv41_host_staging_startup_roles_and_native_all_policy(self):
         f = self._dsv41_fixture()
         stager, _ = self._dsv41_stage_fixture(f)
@@ -7057,19 +7394,19 @@ class TestRemoteAttn(CustomTestCase):
         f.scheduler.disaggregation_mode = SimpleNamespace(value="decode")
         memory.disable_radix_cache = True
         with patch.dict(sys.modules, {"sglang.srt.runtime_context": f.context}):
-            with self.assertRaisesRegex(ValueError, "P send host staging only"):
+            with self.assertRaisesRegex(ValueError, "P send / D receive roles"):
                 f.controller.validate()
             f.manager._host_staging_all = False
             f.controller.config = dataclasses.replace(
                 f.controller.config, host_staging=True
             )
-            with self.assertRaisesRegex(ValueError, "P send host staging only"):
+            with self.assertRaisesRegex(ValueError, "P send / D receive roles"):
                 f.controller.validate()
             f.scheduler.disaggregation_mode = SimpleNamespace(value="prefill")
             f.controller.config = dataclasses.replace(
                 f.controller.config, recv_host_staging=True
             )
-            with self.assertRaisesRegex(ValueError, "no receive staging"):
+            with self.assertRaisesRegex(ValueError, "P send / D receive roles"):
                 f.controller.validate()
 
     def test_dsv41_host_staging_layout_and_callback_fail_closed(self):

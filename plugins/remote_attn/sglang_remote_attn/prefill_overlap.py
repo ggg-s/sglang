@@ -123,6 +123,11 @@ class SourceLease:
         stager = getattr(self.chunk.sender.kv_mgr, "_dsv41_host_stager", None)
         if stager is not None and stager.poisoned:
             raise RuntimeError("P host staging failed; retaining KV and pinned slot")
+        if getattr(self.chunk.sender.kv_mgr, "_dsv41_receive_sender_ready", False):
+            # An oversized/lost receive allocation can fail native PD without
+            # poisoning P's optional D2H slot. Observe failure before pending
+            # successful callbacks can mask it indefinitely. No collective.
+            _poll_success(self.chunk.sender)
         with self.ledger.lock:
             outstanding = bool(self.ledger.pending)
         if self.cancelling:

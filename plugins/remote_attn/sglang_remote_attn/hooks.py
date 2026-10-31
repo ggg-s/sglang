@@ -10,6 +10,7 @@ import time
 from . import (
     decode_overlap,
     dsv41_layerwise,
+    dsv41_receive,
     pre_layerwise,
     prefill_overlap,
     segmented_graph,
@@ -490,6 +491,11 @@ def _publish_peer_now(original, manager, mooncake_session_id, decode_kv_args):
 
 
 HOOKS = {
+    "sglang.srt.disaggregation.common.staging_handler.StagingManagerMixin._handle_staging_req": dsv41_receive.allocate,
+    "sglang.srt.disaggregation.common.staging_handler.DecodeStagingHandler._scatter_region": dsv41_receive.scatter,
+    "sglang.srt.disaggregation.mooncake.conn.MooncakeKVManager._try_create_staging_strategy": dsv41_receive.strategy,
+    "sglang.srt.disaggregation.mooncake.conn.MooncakeKVManager.send_layer_group_to_staging": dsv41_receive.send_group,
+    "sglang.srt.disaggregation.mooncake.conn.MooncakeKVManager.teardown": dsv41_receive.teardown,
     "sglang.srt.model_executor.runner_backend.utils.resolve_decode_backend": segmented_graph.resolve_backend,
     "sglang.srt.managers.scheduler.Scheduler.__init__": _scheduler_init,
     "sglang.srt.managers.scheduler.Scheduler.run_event_loop": _event_loop,

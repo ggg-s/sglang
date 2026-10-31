@@ -34,8 +34,8 @@ DSpark/其他投机解码关闭，不启用 KV cache sharding。使用原生 SMG
 
 ## P 端 host staging
 
-P 设置 `HANDOFF_PRE_LAYERWISE_HOST_STAGING=1`，D 保持该变量和
-`HANDOFF_PRE_LAYERWISE_RECV_HOST_STAGING` 为 0。插件在启动时按原生注册顺序绑定
+P 设置 `HANDOFF_PRE_LAYERWISE_HOST_STAGING=1`，D 的该变量保持 0。
+D 可独立启用下节的 receive host staging。插件在启动时按原生注册顺序绑定
 compressed global KV、indexer FP4 payload/scale，逐项验证地址、连续性、设备、
 总字节数和原生 page stride，然后预热原生 rank-owned `CorePinnedStager`。
 复用 Qwen 的 bounded pinned slot、非阻塞 D2H stream、Mooncake 同步发送和失败隔离；
@@ -63,6 +63,43 @@ TP 共识；所有 rank 保留 KV/cache 读租约，不重用或释放失败 slo
 [host staging 验证记录](validation/dsv41-p-host-staging-4060.md)。这些小型测试尚不代表
 完整模型精度、生产吞吐或尾延迟收益。
 
+## D 端 receive host staging
+
+D 设置 `HANDOFF_PRE_LAYERWISE_RECV_HOST_STAGING=1`；P 的此变量为 0，P send
+staging 可独立开关。两端保持 `SGLANG_DISAGG_STAGING_BUFFER=0`：原生这个开关
+面向成对 K/V，会在 MLA 启动时拒绝。插件在 native MLA manager 初始化后补绑定
+原生 tensor 列表，在 D 创建同款 pinned `StagingAllocator`、GPU shadow 和
+`DecodeStagingHandler`，再打开相应实例的原生完成门控；不临时改全局环境变量。
+
+offer 的 `staging_wire=dsv41-flat-v1`、精确 DSV4.1 manifest、同 TP 和原生 ring
+注册必须匹配。P 在最后一个 chunk 的 forward 前，用原生 `STAGING_REQ/RSP`
+为各组申请区间，payload 按选中的物理条目及各自 native stride 紧凑排列。
+分组写入保留原生 TE planner 和 batch 上限；没有把 indexer scale 误当作 V，
+也不重新打包 FP4。普通 middle/cached-prefix chunk 保持原生同 TP 直传，
+SWA/carry/metadata 继续原生 final-chunk 状态传输。
+
+D 等原生 `CHUNK_READY` 后，在 scatter stream 上等待 req-to-token row event，
+执行 pinned H2D，再按 FULL page ID 和各条目的 native stride 做字节 scatter。
+原生 event 记录在全部写入后；只有 event 完成才能释放 ring allocation、推进
+watermark。奇数尾页按 `ceil(prompt/page_size)` 校验，仍携带原生 carry。
+receiver 网络 Success 不代表可 decode：原生 polling 还会门控 H2D/scatter 与
+metadata，随后原有 TP MIN 一致提交。没有提前接纳，没有额外逐 token 同步；
+D 全部本地后的 graph/overlap 保持原生路径。
+
+取消/失败沿用原生 deferred abort ACK；P 写入安全证明完成后，native room release
+先 drain scatter stream，再回收已提交和未提交的 ring 区间，最后释放 D KV。
+GPU drain 失败则保留 allocation；manager teardown 在 active room/区间或 worker
+尚未退出时拒绝回收。engine 强引用 ring/KV，直到正常 drain 和显式 deregister 均完成。
+分配超限不回退直写等待 staging 的 D；P 经原有有序退休流程上报 native PD 失败。
+
+ring 容量沿用 `SGLANG_DISAGG_STAGING_POOL_SIZE_MB`，需要同等大小的 pinned host
+和 GPU shadow；单个分组必须能放入 ring。确认路径可检查 D 启动日志
+`[dsv41-receive] pinned native ring enabled`、offer 中上述 wire 标记，以及本次
+`prefill.json` 的 `recv_host_staging=true` / `native_staging=true`。这些标记不替代
+H2D event 与原生 receiver/metadata 的完成证明。
+
+详见 [D receive staging 验证记录](validation/dsv41-d-receive-staging-4060.md)。
+
 ## 首版边界
 
 - `model_type=deepseek_v41`，原生非 unified FlashMLA 池，compression ratio 0/1/2。
@@ -76,7 +113,7 @@ TP 共识；所有 rank 保留 KV/cache 读租约，不重用或释放失败 slo
   P 不使用 torch.compile，不能让编译图跳过 Python 完成通知。
 - `HANDOFF_PRE_LAYERWISE=remote` 对 DSV4.1 拒绝启动；Remote sparse attention、
   DSV4.1 Remote 分段图和 D0→D1 迁移不在本次支持范围。
-- 支持 P send host staging；不使用 native receive staging、uniform-FP8 TRTLLM 或 unified KV。
+- 支持 P send 和 D receive host staging；不使用原生 MHA staging 开关、uniform-FP8 TRTLLM 或 unified KV。
   不能照搬 Qwen 示例的 `--page-size 1`；沿用原生 DSV4.1 支持的页布局。
 
 ## 原生启动方式
@@ -106,6 +143,8 @@ export HANDOFF_PD_DIR=/workspace/remote-attn/dsv41-run-001/journal
 export HANDOFF_PRE_LAYERWISE=layerwise
 export HANDOFF_PRE_LAYERWISE_HOST_STAGING=0
 export HANDOFF_PRE_LAYERWISE_RECV_HOST_STAGING=0
+# DSV4.1 使用插件 flat-entry 适配，原生此开关会拒绝 MLA。
+export SGLANG_DISAGG_STAGING_BUFFER=0
 ```
 
 现场 Linux x86_64 镜像的 A/B 已确认：直接启动时必须优先加载上述系统
@@ -129,6 +168,7 @@ D 终端：
 
 ```bash
 export HANDOFF_CTL_DIR=/workspace/remote-attn/dsv41-run-001/control/decode
+export HANDOFF_PRE_LAYERWISE_RECV_HOST_STAGING=1
 python -m sglang.launch_server "${D_NATIVE_ARGS[@]}" \
   --language-model-only --disable-radix-cache
 ```
@@ -261,8 +301,8 @@ SMG/SGL 核心、原生采样、future map 和 optimistic/chunk/batch 配置未�
 非整页 final chunk、奇偶 carry、GPU event 未完成不得写入/释放、布局不匹配和
 TP 不同意时游标不变、P eager / D native graph、错误时保留源分配。
 
-当前共有 27 项 DSV4.1 专项测试，完整 125 项本地插件测试通过，包含真实双进程
-Gloo；源码预检覆盖 34 个 hook、83 个核心接口。新增覆盖两批 final 交错、同请求
+当前共有 32 项 DSV4.1 专项测试，完整 130 项本地插件测试通过，包含真实双进程
+Gloo；源码预检覆盖 39 个 hook、88 个核心接口。新增覆盖两批 final 交错、同请求
 middle→final、队列任务继承、延迟采样、失败保留、重试/retraction/reset 栅栏、长
 prompt 短尾块策略。TP2 用例验证不同 rank 的 generation 和 GPU 就绪时序，
 最终正常/取消各一次共识，稳定轮询不产生额外退休投票。新增证书 TP2 用例

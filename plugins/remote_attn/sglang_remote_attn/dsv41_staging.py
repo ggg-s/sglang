@@ -3,7 +3,7 @@
 import functools
 
 
-def bind(pool, manager):
+def buffers(pool, manager):
     # MLA skips the MHA tensor-binding path in native prefill initialization.
     # Preserve native registration order and *native* strides: FP4 index scales
     # and payload can span several physical rows for one logical global page.
@@ -46,6 +46,14 @@ def bind(pool, manager):
     ranges = sorted(zip(pointers, args.kv_data_lens))
     if any(a + n > b for (a, n), (b, _) in zip(ranges, ranges[1:])):
         raise ValueError("overlapping DSV4.1 host staging entries")
+    return ordered
+
+
+def bind(pool, manager):
+    ordered = buffers(pool, manager)
+    args = manager.kv_args
+    pointers = list(args.kv_data_ptrs)
+    device = ordered[0].device
     stager = manager.ensure_host_stager()
     if stager.poisoned:
         raise RuntimeError("DSV4.1 host staging poisoned; retaining KV")
