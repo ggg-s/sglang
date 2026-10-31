@@ -32,6 +32,37 @@ DSpark/其他投机解码关闭，不启用 KV cache sharding。使用原生 SMG
 原生状态都已就绪。失败不使用请求的 released 标志推断写入完成；保留资源并报错。
 本次不提供跨故障自动恢复协议。
 
+## P 端 host staging
+
+P 设置 `HANDOFF_PRE_LAYERWISE_HOST_STAGING=1`，D 保持该变量和
+`HANDOFF_PRE_LAYERWISE_RECV_HOST_STAGING` 为 0。插件在启动时按原生注册顺序绑定
+compressed global KV、indexer FP4 payload/scale，逐项验证地址、连续性、设备、
+总字节数和原生 page stride，然后预热原生 rank-owned `CorePinnedStager`。
+复用 Qwen 的 bounded pinned slot、非阻塞 D2H stream、Mooncake 同步发送和失败隔离；
+不 gather、不解量化、不重打包，也不按模型层分配 pinned buffer。
+
+最后一个 chunk 的分组任务通过原生 `transfer_fn=partial(_transfer_data, stage=True)`
+发送。原生 worker 先等生产层 event 和页索引 event，再执行 D2H；同一 slot 的锁覆盖
+D2H 到 TE 返回，成功后才执行原有完成回调。SWA、carry 和 metadata 保留原生
+final-chunk 顺序及 Success 屏障，D 不提前 decode。`prefill.json.host_staging=true`
+用于确认本次接管启用了该路径。
+
+普通 middle chunk 保持已有原生策略。若原生线上已设置
+`SGLANG_MOONCAKE_HOST_STAGING_ALL=1`，它们也复用同一 slot；没有该设置时普通
+middle 仍直传，不擅自改成全量 host staging。chunk 大小和 transfer batch 上限不变，
+optimistic prefill 不变，P FULL/SWA 前缀读租约与 overlap plan/接管证书照常使用。
+P staging 启用失败直接拒绝启动，不静默退回直传。
+
+传输失败会 quarantine 原生 pinned slot，完成回调不会提前执行。overlap 的本地
+退休观察在检查 outstanding IO 前检测 poisoned slot，经已有有序切换命令触发最终
+TP 共识；所有 rank 保留 KV/cache 读租约，不重用或释放失败 slot。稳定 chunk
+不新增 TP collective；没有逐 chunk staging 投票。串行路径沿用已有 Source 失败保护，
+最终释放仍要求 GPU、TE 和原生 sender Success 均完成。
+
+4060 的真实 CUDA + Mooncake TCP 验证、缓存/overlap 回归和本地 TP2 结果见
+[host staging 验证记录](validation/dsv41-p-host-staging-4060.md)。这些小型测试尚不代表
+完整模型精度、生产吞吐或尾延迟收益。
+
 ## 首版边界
 
 - `model_type=deepseek_v41`，原生非 unified FlashMLA 池，compression ratio 0/1/2。
@@ -45,7 +76,7 @@ DSpark/其他投机解码关闭，不启用 KV cache sharding。使用原生 SMG
   P 不使用 torch.compile，不能让编译图跳过 Python 完成通知。
 - `HANDOFF_PRE_LAYERWISE=remote` 对 DSV4.1 拒绝启动；Remote sparse attention、
   DSV4.1 Remote 分段图和 D0→D1 迁移不在本次支持范围。
-- 不使用 native receive staging、host staging、uniform-FP8 TRTLLM 或 unified KV。
+- 支持 P send host staging；不使用 native receive staging、uniform-FP8 TRTLLM 或 unified KV。
   不能照搬 Qwen 示例的 `--page-size 1`；沿用原生 DSV4.1 支持的页布局。
 
 ## 原生启动方式
@@ -89,6 +120,7 @@ P 终端（`P_NATIVE_ARGS` 沿用原生线上参数，删除其中的 speculativ
 
 ```bash
 export HANDOFF_CTL_DIR=/workspace/remote-attn/dsv41-run-001/control/prefill
+export HANDOFF_PRE_LAYERWISE_HOST_STAGING=1
 python -m sglang.launch_server "${P_NATIVE_ARGS[@]}" \
   --language-model-only
 ```
@@ -229,7 +261,7 @@ SMG/SGL 核心、原生采样、future map 和 optimistic/chunk/batch 配置未�
 非整页 final chunk、奇偶 carry、GPU event 未完成不得写入/释放、布局不匹配和
 TP 不同意时游标不变、P eager / D native graph、错误时保留源分配。
 
-当前共有 24 项 DSV4.1 专项测试，完整 122 项本地插件测试通过，包含真实双进程
+当前共有 27 项 DSV4.1 专项测试，完整 125 项本地插件测试通过，包含真实双进程
 Gloo；源码预检覆盖 34 个 hook、83 个核心接口。新增覆盖两批 final 交错、同请求
 middle→final、队列任务继承、延迟采样、失败保留、重试/retraction/reset 栅栏、长
 prompt 短尾块策略。TP2 用例验证不同 rank 的 generation 和 GPU 就绪时序，

@@ -546,7 +546,7 @@ def prefill_overlap_lifetimes(args):
             cache_request_handle=(index, 0),
             kv=SimpleNamespace(req_pool_idx=index),
         )
-        req.disagg_kv_sender = SimpleNamespace(poll=lambda: 4)
+        req.disagg_kv_sender = SimpleNamespace(poll=lambda: 4, kv_mgr=SimpleNamespace())
         chunk = Chunk(req, req.disagg_kv_sender, (index, 0), index, 0, 16, True)
         lease = SourceLease(overlap, chunk, index, f"{index}-rank-{args.rank}")
         event = SimpleNamespace(query=lambda: args.rank == 0)
@@ -1009,6 +1009,76 @@ def prefill_certificate_lifetimes(args, *, prefix_cache=False):
         overlap.retirement.close()
 
 
+def prefill_staging_failure(args):
+    """An asymmetric poisoned slot must reach the same ordered abort vote."""
+    import time
+
+    from sglang_remote_attn.pre_layerwise import Config, Controller
+    from sglang_remote_attn.prefill_overlap import SourceLease
+    from sglang_remote_attn.retirement import Retirement
+
+    owner = Controller.__new__(Controller)
+    owner.rank, owner.tp_size = args.rank, 2
+    owner.scheduler = SimpleNamespace(attn_tp_cpu_group=dist.group.WORLD)
+    owner.config = Config("layerwise", Path(args.output).with_suffix(".staging"))
+    slot = SimpleNamespace(poisoned=False)
+    manager = SimpleNamespace(_dsv41_host_stager=slot)
+    chunk = SimpleNamespace(
+        req=SimpleNamespace(rid="staged", bootstrap_room=501),
+        sender=SimpleNamespace(kv_mgr=manager),
+        check=lambda: None,
+    )
+    lease = SourceLease(None, chunk, 1, f"stage-{args.rank}")
+    lease.ledger.pending.add(1)  # Failed sends never run their callback.
+    lease.finish = lambda **kw: (_ for _ in ()).throw(AssertionError("unsafe free"))
+    owner.targets = [lease]
+    protocol = Retirement(owner)
+    protocol.register(lease)
+    votes = []
+    actual_reduce = dist.all_reduce
+
+    def counted(tensor, *a, **kw):
+        votes.append(tensor.numel())
+        return actual_reduce(tensor, *a, **kw)
+
+    try:
+        with patch.object(dist, "all_reduce", counted):
+            for _ in range(32):
+                protocol.observe()
+                assert protocol.poll_command() is None
+            assert not votes  # Stable pending IO never votes per poll/chunk.
+            dist.barrier()  # Complete both stable windows before injecting failure.
+            slot.poisoned = args.rank == 1
+            command = None
+            for _ in range(100):
+                protocol.observe()
+                candidate = protocol.poll_command()
+                message = [candidate]
+                dist.broadcast_object_list(message, src=0)
+                if message[0] is not None:
+                    command = message[0]
+                    break
+                time.sleep(0.005)
+            assert command is not None and command["kind"] == "abort"
+            protocol.arm(command)
+            rejected = False
+            try:
+                protocol.finalize()
+            except RuntimeError as exc:
+                rejected = "retaining KV" in str(exc)
+            assert rejected and votes == [5]
+            assert owner.targets == [lease] and not lease.closed
+            assert lease.ledger.pending == {1}
+            return dict(
+                stable_votes=0,
+                final_vote_shapes=votes,
+                both_rejected=True,
+                kv_retained=True,
+            )
+    finally:
+        protocol.close()
+
+
 def main():
     parser = argparse.ArgumentParser()
     parser.add_argument("rank", type=int)
@@ -1221,6 +1291,7 @@ def main():
         p_overlap = prefill_overlap_lifetimes(args)
         p_certificates = prefill_certificate_lifetimes(args)
         p_cached_certificates = prefill_certificate_lifetimes(args, prefix_cache=True)
+        p_staging_failure = prefill_staging_failure(args)
         Path(args.output).write_text(
             json.dumps(
                 {
@@ -1235,6 +1306,7 @@ def main():
                     "p_overlap": p_overlap,
                     "p_certificates": p_certificates,
                     "p_cached_certificates": p_cached_certificates,
+                    "p_staging_failure": p_staging_failure,
                     "segmented_startup": startup,
                     "segmented_routing": routing,
                 }

@@ -10,6 +10,7 @@ import logging
 import time
 from dataclasses import dataclass, field
 
+from . import dsv41_staging
 from .pre_layerwise import Controller, Source, read_json, write_json
 
 logger = logging.getLogger(__name__)
@@ -165,7 +166,10 @@ def send_selected(
         or manager.pp_size != 1
         or manager.enable_staging
         or dst_device_kv_indices is not None
-        or transfer_fn is not None
+        or (
+            transfer_fn is not None
+            and not dsv41_staging.is_transfer(manager, transfer_fn)
+        )
         or dst_layer_ids
         or len(dst_kv_ptrs) != len(schema["entries"])
         or list(dst_kv_ptrs) != list(peer.dst_kv_ptrs)
@@ -185,6 +189,7 @@ def send_selected(
         dst_data_indices=dst_kv_indices,
         executor=executor,
         force_flat=True,
+        transfer_fn=transfer_fn,
     )
 
 
@@ -223,6 +228,9 @@ class DSV41Source(Source):
                 False,
                 wait_event=event,
                 indices_event=self.indices_event,
+                transfer_fn=dsv41_staging.transfer(sender.kv_mgr)
+                if self.stager is not None
+                else None,
                 kv_buffer_indices=indices,
                 on_complete=functools.partial(self.complete_group, boundary, indices),
                 trace_ctx=sender.trace_ctx.copy_for_thread(),
@@ -253,6 +261,7 @@ class DSV41Source(Source):
                 "prefill_chunk_tokens": self.prefill_chunk_tokens,
                 "layer_group_size": self.group_size,
                 "native_final_states": True,
+                "host_staging": self.stager is not None,
                 "p_radix_read_lease": self.cache_lease is not None,
                 "cached_prefix_tokens": self.cache_lease.cached_tokens
                 if self.cache_lease is not None
@@ -290,7 +299,7 @@ class DSV41Controller(Controller):
         ):
             raise ValueError("DSV4.1 layerwise requires --disable-radix-cache on D")
         if (
-            self.config.host_staging
+            (self.config.host_staging and s.disaggregation_mode.value != "prefill")
             or self.config.recv_host_staging
             or s.enable_staging
             or s.enable_pdmux
@@ -298,7 +307,7 @@ class DSV41Controller(Controller):
             or get_memory().enable_hierarchical_cache
         ):
             raise ValueError(
-                "DSV4.1 layerwise requires native device PD without staging/HiCache/PD multiplexing"
+                "DSV4.1 supports P send host staging only; no receive staging/HiCache/PD multiplexing"
             )
         if get_disagg().disaggregation_decode_allocation_policy == "prefill_complete":
             raise ValueError(
@@ -327,11 +336,17 @@ class DSV41Controller(Controller):
             if role == "prefill"
             else s.disagg_decode_prealloc_queue.kv_manager
         )
-        if manager.enable_staging or getattr(manager, "_host_staging_all", False):
+        if manager.enable_staging or (
+            role != "prefill" and getattr(manager, "_host_staging_all", False)
+        ):
             raise ValueError(
-                "DSV4.1 layerwise requires native device transfer without host staging"
+                "DSV4.1 supports P send host staging only; no receive staging"
             )
         self._schema(manager)  # reject unsupported storage before serving
+        if role == "prefill" and (
+            self.config.host_staging or getattr(manager, "_host_staging_all", False)
+        ):
+            self.stager = dsv41_staging.bind(self.pool, manager)
         self.config.directory.mkdir(parents=True, exist_ok=True)
         # Attach no model hooks on D. Its native completion, graphs and overlap
         # remain authoritative; it never receives an early-admission offer.
@@ -398,6 +413,11 @@ class DSV41Controller(Controller):
                 )
             ):
                 mgr = sender.kv_mgr
+                if self.stager is not None and (
+                    self.stager is not getattr(mgr, "_core_stager", None)
+                    or self.stager.poisoned
+                ):
+                    raise RuntimeError("DSV4.1 host staging unavailable; retaining KV")
                 root = (
                     self.config.directory
                     / str(int(req.bootstrap_room))
@@ -429,7 +449,6 @@ class DSV41Controller(Controller):
                     and mgr.kv_shard_size == 1
                     and not mgr.enable_all_cp_ranks_for_transfer
                     and not mgr.is_dummy_cp_rank
-                    and not getattr(mgr, "_host_staging_all", False)
                     and req.disagg_decode_prefix_len == 0
                     and 0 <= req.start_send_idx < req.extend_end
                     and req.start_send_idx % page == 0
@@ -518,6 +537,7 @@ class DSV41Controller(Controller):
                 group_size=group_size,
                 prefill_chunk_tokens=req.extend_len,
                 groups=groups,
+                stager=self.stager,
                 cache_lease=(
                     getattr(getattr(req, "_dsv41_p_lease", None), "cache_lease", None)
                     if plan is not None

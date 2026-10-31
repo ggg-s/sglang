@@ -117,6 +117,12 @@ class SourceLease:
 
     def transport_ready(self):
         self.check()
+        # Failed TE sends leave their completion callbacks pending. Observe the
+        # rank-owned slot here (including middle chunks with no Source yet),
+        # inside the ordered retirement protocol, before the pending fast exit.
+        stager = getattr(self.chunk.sender.kv_mgr, "_dsv41_host_stager", None)
+        if stager is not None and stager.poisoned:
+            raise RuntimeError("P host staging failed; retaining KV and pinned slot")
         with self.ledger.lock:
             outstanding = bool(self.ledger.pending)
         if self.cancelling:

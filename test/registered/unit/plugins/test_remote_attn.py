@@ -3505,6 +3505,16 @@ class TestRemoteAttn(CustomTestCase):
             rows[0]["p_overlap"],
             dict(votes=[5, 5], freed=[1, 2], commits=2, registered=0, local_votes=0),
         )
+        self.assertEqual(rows[0]["p_staging_failure"], rows[1]["p_staging_failure"])
+        self.assertEqual(
+            rows[0]["p_staging_failure"],
+            dict(
+                stable_votes=0,
+                final_vote_shapes=[5],
+                both_rejected=True,
+                kv_retained=True,
+            ),
+        )
         self.assertEqual(rows[0]["p_certificates"], rows[1]["p_certificates"])
         self.assertEqual(
             rows[0]["p_certificates"]["votes"], [2, 2, 2, 2, 5, 5, 2, 5, 2, 2]
@@ -6832,6 +6842,291 @@ class TestRemoteAttn(CustomTestCase):
             source.finalize_native(
                 f.native_send, f.scheduler, f.req, last_chunk=True, end_idx=None
             )
+
+    def _dsv41_stage_fixture(self, f):
+        """Real native byte stager with only CUDA allocation/copy mocked."""
+        from sglang.srt.disaggregation.pinned_staging_buffer import PinnedKVStager
+
+        spec = importlib.util.spec_from_file_location(
+            "dsv41_core_staging_test",
+            ROOT / "python/sglang/srt/disaggregation/mooncake/pinned_staging_core.py",
+        )
+        core = importlib.util.module_from_spec(spec)
+        spec.loader.exec_module(core)
+
+        class TensorBoundary:
+            device = torch.device("cuda", 0)
+
+            def __init__(self, tensor):
+                self.tensor = tensor
+
+            def __getattr__(self, key):
+                return getattr(self.tensor, key)
+
+            def __getitem__(self, key):
+                return self.tensor[key]
+
+            def view(self, *args):
+                return TensorBoundary(self.tensor.view(*args))
+
+            def flatten(self, *args):
+                return TensorBoundary(self.tensor.flatten(*args))
+
+        for ratio, buffers in f.pool.kv_pools.items():
+            buffers.kv_buffer = [TensorBoundary(t) for t in buffers.kv_buffer]
+            index = f.pool.index_pools[ratio]
+            for name in ("index_k_payload_buffer", "index_k_scale_buffer"):
+                setattr(index, name, [TensorBoundary(t) for t in getattr(index, name)])
+        proxy = _host_staging_manager()
+        stager = core.CorePinnedStager(proxy.engine, capacity=23)
+        stager.buffer = PinnedKVStager(proxy, 0, slot_factory=_HostStagingSlot)
+        stager.buffer.reserve(23)
+        stager._reserve = lambda device: stager.buffer._check_live()
+        native = _source_class(
+            "disaggregation/mooncake/conn.py",
+            "MooncakeKVManager",
+            {"ensure_host_stager", "set_kv_buffer_tensors", "_transfer_data"},
+        )
+        manager = f.manager
+        manager._core_stager, manager._host_staging_all = stager, False
+        for name in ("ensure_host_stager", "set_kv_buffer_tensors", "_transfer_data"):
+            setattr(manager, name, getattr(native, name).__get__(manager))
+        calls = []
+        slot = stager.buffer.slot
+        allowed = list(zip(manager.kv_args.kv_data_ptrs, manager.kv_args.kv_data_lens))
+        allowed.append((slot.ptr, slot.capacity))
+        allowed += [
+            (p, n)
+            for pointers, targets in zip(manager.kv_args.state_data_ptrs, f.states)
+            for p, target in zip(pointers, targets)
+            for n in (target.nbytes,)
+        ]
+
+        def te(session, sources, targets, sizes):
+            for src, dst, size in zip(sources, targets, sizes):
+                self.assertTrue(
+                    any(p <= src and src + size <= p + n for p, n in allowed)
+                )
+                ctypes.memmove(dst, src, size)
+            calls.append(list(zip(sources, targets, sizes)))
+            return 0
+
+        manager.engine = SimpleNamespace(batch_transfer_sync=te)
+        f.controller.config = dataclasses.replace(
+            f.controller.config, host_staging=True
+        )
+        f.scheduler.disaggregation_mode = SimpleNamespace(value="prefill")
+        for handle in f.controller._layer_handles:
+            handle.remove()
+        with patch.dict(sys.modules, {"sglang.srt.runtime_context": f.context}):
+            f.controller.validate()
+        f.scheduler.disaggregation_mode = "prefill"
+        stack = ExitStack()
+        stack.enter_context(patch.object(torch.cuda, "device", lambda _: nullcontext()))
+        stack.enter_context(patch.object(torch.cuda, "stream", lambda _: nullcontext()))
+        self.addCleanup(stack.close)
+        return stager, calls
+
+    def test_dsv41_host_staging_native_bytes_chunks_states_and_bounded_slot(self):
+        import numpy as np
+
+        f = self._dsv41_fixture()
+        stager, calls = self._dsv41_stage_fixture(f)
+        self.assertIs(f.controller.stager, stager)
+        self.assertEqual(len(stager.regions), 12)
+        self.assertEqual(f.manager.max_transfer_batch_indices, 2)
+        dst_pages = np.array([5, 6, 1, 2, 3], dtype=np.int32)
+        with patch.dict(sys.modules, f.modules):
+            # Ordinary middle chunks keep native policy: direct unless native
+            # host-staging-all is on. Both share the same bound rank slot.
+            f.native_send(f.scheduler, f.req, last_chunk=False)
+            middle = f.tasks.get_nowait()
+            f.manager._host_staging_all = True
+            f.ds.send_selected(
+                type(f.manager).send_kvcache,
+                f.manager,
+                "peer:1",
+                middle.indices,
+                f.registration.dst_kv_ptrs,
+                dst_pages[middle.index_slice],
+                None,
+                dst_attn_tp_size=1,
+            )
+            f.manager._host_staging_all = False
+            f.req.extend_end, f.req.extend_len = 33, 17
+            source = f.controller.prepare(f.batch)[0]
+            self.assertIs(source.stager, stager)
+            source.enqueue(39, None, flush=True)
+            for _ in source.groups:
+                task = f.tasks.get_nowait()
+                self.assertTrue(
+                    f.ds.dsv41_staging.is_transfer(f.manager, task.transfer_fn)
+                )
+                f.ds.send_selected(
+                    None,
+                    f.manager,
+                    "peer:1",
+                    task.indices,
+                    f.registration.dst_kv_ptrs,
+                    dst_pages[task.index_slice],
+                    None,
+                    dst_attn_tp_size=1,
+                    kv_buffer_indices=task.kv_buffer_indices,
+                    transfer_fn=task.transfer_fn,
+                )
+                task.on_complete()
+            self.assertEqual(len(source.completed), 12)
+            self.assertTrue(calls)
+            slot = stager.buffer.slot
+            self.assertTrue(
+                all(
+                    slot.ptr <= p and p + n <= slot.ptr + slot.capacity
+                    for blocks in calls
+                    for p, _, n in blocks
+                )
+            )
+            self.assertTrue(all(sum(n for _, _, n in blocks) <= 23 for blocks in calls))
+            for pointer, stride, dst in zip(
+                f.manager.kv_args.kv_data_ptrs,
+                f.manager.kv_args.kv_item_lens,
+                f.destination,
+            ):
+                for src_page, dst_page in zip([1, 2, 3, 4, 5], dst_pages):
+                    self.assertEqual(
+                        bytes(dst[dst_page * stride : (dst_page + 1) * stride]),
+                        ctypes.string_at(pointer + src_page * stride, stride),
+                    )
+            source.finalize_native(
+                f.native_send, f.scheduler, f.req, last_chunk=True, end_idx=None
+            )
+            final = f.tasks.get_nowait()
+            self.assertTrue(final.last)
+            self.assertEqual(final.indices.size, 0)
+            self.assertEqual(final.state_indices[1].tolist(), [0])
+            before = len(calls)
+            # SWA/carry retain native state planners and are not repacked/staged.
+            f.manager._host_staging_all = True
+            for srcs, dsts, strides, indices in zip(
+                f.manager.kv_args.state_data_ptrs,
+                f.states,
+                f.manager.kv_args.state_item_lens,
+                final.state_indices,
+            ):
+                f.manager._send_kvcache_generic(
+                    "peer:1",
+                    srcs,
+                    [t.data_ptr() for t in dsts],
+                    strides,
+                    indices,
+                    indices,
+                    None,
+                    force_flat=True,
+                )
+            self.assertTrue(
+                all(
+                    not (slot.ptr <= p < slot.ptr + slot.capacity)
+                    for blocks in calls[before:]
+                    for p, _, _ in blocks
+                )
+            )
+            self.assertTrue(
+                json.loads((source.path / "prefill.json").read_text())["host_staging"]
+            )
+
+    def test_dsv41_host_staging_startup_roles_and_native_all_policy(self):
+        f = self._dsv41_fixture()
+        stager, _ = self._dsv41_stage_fixture(f)
+        f.controller.config = dataclasses.replace(
+            f.controller.config, host_staging=False
+        )
+        f.manager._host_staging_all = True
+        f.scheduler.disaggregation_mode = SimpleNamespace(value="prefill")
+        f.scheduler.enable_overlap = True
+        for handle in f.controller._layer_handles:
+            handle.remove()
+        memory = f.context.get_memory()
+        memory.disable_radix_cache = False
+        with (
+            patch.dict(sys.modules, {"sglang.srt.runtime_context": f.context}),
+            patch.object(f.context, "get_memory", lambda: memory),
+        ):
+            f.controller.validate()
+        self.assertIs(f.controller.stager, stager)
+        self.assertTrue(f.scheduler.enable_overlap)
+        self.assertFalse(memory.disable_radix_cache)
+        f.scheduler.disaggregation_mode = SimpleNamespace(value="decode")
+        memory.disable_radix_cache = True
+        with patch.dict(sys.modules, {"sglang.srt.runtime_context": f.context}):
+            with self.assertRaisesRegex(ValueError, "P send host staging only"):
+                f.controller.validate()
+            f.manager._host_staging_all = False
+            f.controller.config = dataclasses.replace(
+                f.controller.config, host_staging=True
+            )
+            with self.assertRaisesRegex(ValueError, "P send host staging only"):
+                f.controller.validate()
+            f.scheduler.disaggregation_mode = SimpleNamespace(value="prefill")
+            f.controller.config = dataclasses.replace(
+                f.controller.config, recv_host_staging=True
+            )
+            with self.assertRaisesRegex(ValueError, "no receive staging"):
+                f.controller.validate()
+
+    def test_dsv41_host_staging_layout_and_callback_fail_closed(self):
+        f = self._dsv41_fixture()
+        stager, calls = self._dsv41_stage_fixture(f)
+        stage = f.ds.dsv41_staging
+        f.manager._dsv41_layerwise_schema = f.schema
+        original = f.manager.kv_args.kv_item_lens[0]
+        f.manager.kv_args.kv_item_lens[0] = original + 1
+        with self.assertRaisesRegex(ValueError, "tensor/stride"):
+            stage.bind(f.pool, f.manager)
+        f.manager.kv_args.kv_item_lens[0] = original
+        f.manager.kv_args.kv_data_lens[0] -= 1
+        with self.assertRaisesRegex(ValueError, "tensor/stride"):
+            stage.bind(f.pool, f.manager)
+        f.manager.kv_args.kv_data_lens[0] += 1
+        for callback in (
+            lambda *a: 0,
+            functools.partial(f.manager._transfer_data, stage=False),
+        ):
+            with self.assertRaisesRegex(ValueError, "peer/layout changed"):
+                f.ds.send_selected(
+                    None,
+                    f.manager,
+                    "peer:1",
+                    [],
+                    f.registration.dst_kv_ptrs,
+                    [],
+                    None,
+                    dst_attn_tp_size=1,
+                    kv_buffer_indices=(0,),
+                    transfer_fn=callback,
+                )
+        self.assertEqual(calls, [])
+        # Native TE error poisons the shared slot. No direct-GPU retry.
+        f.manager._dsv41_layerwise_schema = f.schema
+        f.manager.engine.batch_transfer_sync = lambda *a: -1
+        src = f.manager.kv_args.kv_data_ptrs[0]
+        dst = f.registration.dst_kv_ptrs[0]
+        self.assertEqual(
+            f.manager._transfer_data("peer:1", [(src, dst, 8)], stage=True), -1
+        )
+        self.assertTrue(stager.poisoned)
+        self.assertFalse(stager.close())
+        self.assertIn(stager, stager.engine._core_staging_owners)
+        with patch.dict(sys.modules, f.modules):
+            with self.assertRaisesRegex(RuntimeError, "unavailable"):
+                f.controller.candidates(f.batch, allow_middle=True)
+        from sglang_remote_attn.prefill_overlap import SourceLease
+
+        lease = SourceLease.__new__(SourceLease)
+        lease.check = lambda: None
+        lease.chunk = SimpleNamespace(sender=f.sender)
+        # Poison is observed before the outstanding-IO early exit; this method
+        # is polled by ordered TP retirement, not by rank-local KV free hooks.
+        with self.assertRaisesRegex(RuntimeError, "retaining KV and pinned slot"):
+            lease.transport_ready()
 
     def test_dsv41_startup_rejects_remote_multimodal_speculation_and_unsafe_storage(
         self,
