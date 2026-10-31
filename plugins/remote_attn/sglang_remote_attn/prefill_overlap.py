@@ -82,6 +82,7 @@ class SourceLease:
     closed: bool = False
     error: str | None = None
     ledger: TransferLedger = field(default_factory=TransferLedger)
+    cache_lease: object = None
 
     @property
     def decode_req(self):
@@ -90,6 +91,8 @@ class SourceLease:
 
     def check(self):
         self.chunk.check()
+        if self.cache_lease is not None:
+            self.cache_lease.check()
         if self.error or self.ledger.error:
             raise RuntimeError(
                 f"P overlap source failed; retaining KV: {self.error or self.ledger.error}"
@@ -124,6 +127,7 @@ class SourceLease:
         return (
             self.finalized
             and not outstanding
+            and (self.cache_lease is None or self.release is not None)
             and _poll_success(self.chunk.sender)
             and self.gpu_ready()
         )
@@ -137,11 +141,17 @@ class SourceLease:
         req = self.chunk.req
         try:
             if self.source is not None:
-                self.source.release = self.release
+                self.source.release = (
+                    self.release or (lambda: None)
+                    if self.cache_lease is not None
+                    else self.release
+                )
                 self.source.retire()
                 if self.source in self.overlap.controller.sources:
                     self.overlap.controller.sources.remove(self.source)
                 self.source.indices_keepalive = None
+            elif self.cache_lease is not None:
+                self.cache_lease.retire(self.release or (lambda: None))
             elif self.release is not None:
                 self.release()
         except BaseException as exc:
@@ -232,6 +242,9 @@ class PrefillOverlap:
                         int(chunk.req.bootstrap_room), TransferLedger()
                     ),
                 )
+                cache = getattr(self.controller, "cache_guard", None)
+                if cache is not None:
+                    lease.cache_lease = chunk.req._dsv41_p_certificate.cache_lease
                 chunk.req._dsv41_p_lease = lease
                 self.leases.append(lease)
                 self.by_room[int(chunk.req.bootstrap_room)] = lease

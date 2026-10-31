@@ -1,5 +1,8 @@
 # DSV4.1 P TP 证书：本地与 RTX4060 验证
 
+本页为 `cac6ef3011` 的证书历史基线；新增 P 缓存验证见
+[缓存记录](dsv41-p-cache-4060.md)。默认 probe 仍支持无缓存，`--prefix-cache` 启用缓存边界用例。
+
 验证日期：2026-10-31。接入说明见 [DSV4.1 文档](../DSV41-LAYERWISE-ZH.md)。
 只修改插件、预检、测试和文档，未修改 SMG/SGL 核心；原生 optimistic prefill、
 chunk、batch 和 D overlap 配置保留。

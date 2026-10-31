@@ -617,10 +617,11 @@ def prefill_overlap_lifetimes(args):
         protocol.close()
 
 
-def prefill_certificate_lifetimes(args):
+def prefill_certificate_lifetimes(args, *, prefix_cache=False):
     """Real TP2: cached chunks, asymmetric bootstrap, lost notice, revoke/retire."""
     import ast
     import copy
+    from typing import NamedTuple
 
     import torch
     from sglang_remote_attn import hooks
@@ -638,6 +639,30 @@ def prefill_certificate_lifetimes(args):
     scheduler = controller.scheduler = SimpleNamespace(
         attn_tp_cpu_group=dist.group.WORLD, _pre_layerwise=controller
     )
+    cache = None
+    if prefix_cache:
+        from sglang_remote_attn.source_cache import CacheGuard
+
+        refs = {}
+
+        def lock(node):
+            refs[node] = refs.get(node, 0) + 1
+            return SimpleNamespace(node=node, closed=False)
+
+        def unlock(receipt):
+            assert not receipt.closed and refs[receipt.node] > 0
+            refs[receipt.node] -= 1
+            receipt.closed = True
+
+        cache = SimpleNamespace(
+            lock=lock,
+            unlock=unlock,
+            checkpoint=lambda *a, **kw: None,
+            finish=lambda *a: None,
+            reset=lambda: None,
+            refs=refs,
+        )
+        controller.cache_guard = CacheGuard(cache)
     overlap = controller.prefill_overlap = po.PrefillOverlap(controller)
     manager = SimpleNamespace(
         transfer_infos={}, decode_kv_args_table={}, _dsv41_p_overlap=overlap
@@ -664,11 +689,15 @@ def prefill_certificate_lifetimes(args):
         votes.append(tensor.numel())
         return original_reduce(tensor, *a, **kw)
 
+    class Handle(NamedTuple):
+        rid: str
+        attempt_id: int = 0
+
     def make_req(room, pending=False):
         req = SimpleNamespace(
             rid=str(room),
             bootstrap_room=room,
-            cache_request_handle=SimpleNamespace(attempt_id=0),
+            cache_request_handle=Handle(str(room)),
             retraction_count=0,
             kv=SimpleNamespace(req_pool_idx=room),
             start_send_idx=0,
@@ -692,6 +721,9 @@ def prefill_certificate_lifetimes(args):
         offer = dict(generation=f"{room}-rank-{args.rank}", prefix_len=1025)
         write_json(root / "offer.json", offer)
         req.offer = (root, offer)
+        if cache is not None:
+            req.kv.cache_protected_len = 8 + args.rank * 8
+            req.last_node, req.lock = room, cache.lock(room)
         return req
 
     def candidates(batch, **kwargs):
@@ -763,6 +795,15 @@ def prefill_certificate_lifetimes(args):
 
         def release():
             assert not lease.ledger.pending and lease.gpu_ready()
+            if cache is not None:
+                if not lease.cancelling:
+                    cache.checkpoint(req, up_to=req.extend_end)
+                cache.finish(
+                    req.cache_request_handle,
+                    SimpleNamespace(name="ABORT" if lease.cancelling else "SUCCESS"),
+                )
+                cache.unlock(req.lock)
+                req.lock = None
             frees.append(req.bootstrap_room)
 
         overlap.defer_release(req, release)
@@ -918,6 +959,11 @@ def prefill_certificate_lifetimes(args):
                 pump()
             assert len(votes) == before
             empty_votes = len(votes) - before
+            active_cache_closed = cache is None or (
+                not controller.cache_guard.leases
+                and all(cache.refs.get(room, 0) == 0 for room in (101, 102, 103))
+            )
+            assert active_cache_closed
             d = make_req(104, pending=True)
             run([d])
             d.pending_bootstrap = False
@@ -945,6 +991,8 @@ def prefill_certificate_lifetimes(args):
             assert rejected and not cert.active
             return dict(
                 votes=votes,
+                prefix_cache=prefix_cache,
+                active_cache_closed=active_cache_closed,
                 stable_chunks=63,
                 stable_votes=stable_votes,
                 frees=frees,
@@ -1172,6 +1220,7 @@ def main():
         overlap_lifetimes = decode_overlap_lifetimes(args)
         p_overlap = prefill_overlap_lifetimes(args)
         p_certificates = prefill_certificate_lifetimes(args)
+        p_cached_certificates = prefill_certificate_lifetimes(args, prefix_cache=True)
         Path(args.output).write_text(
             json.dumps(
                 {
@@ -1185,6 +1234,7 @@ def main():
                     "d_overlap": overlap_lifetimes,
                     "p_overlap": p_overlap,
                     "p_certificates": p_certificates,
+                    "p_cached_certificates": p_cached_certificates,
                     "segmented_startup": startup,
                     "segmented_routing": routing,
                 }

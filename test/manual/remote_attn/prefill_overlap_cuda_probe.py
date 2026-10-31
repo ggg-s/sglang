@@ -23,6 +23,7 @@ from sglang_remote_attn.pre_layerwise import Config, write_json
 def main():
     parser = argparse.ArgumentParser()
     parser.add_argument("--output", type=Path, required=True)
+    parser.add_argument("--prefix-cache", action="store_true")
     args = parser.parse_args()
     args.output.parent.mkdir(parents=True, exist_ok=True)
     torch.cuda.init()
@@ -51,6 +52,39 @@ def main():
     controller.config = Config("layerwise", args.output.parent, drain_timeout=5)
     controller.agree = lambda flags: flags
     overlap = po.PrefillOverlap(controller)
+    cache = None
+    if args.prefix_cache:
+        from sglang_remote_attn.source_cache import CacheGuard
+
+        class PrefixCacheBoundary:
+            def __init__(self):
+                self.refs = {}
+                self.operations = []
+
+            def lock(self, node):
+                refs = self.refs.setdefault(node, {"FULL": 0, "SWA": 0})
+                for ct in refs:
+                    refs[ct] += 1
+                return SimpleNamespace(node=node, closed=False)
+
+            def unlock(self, receipt):
+                assert not receipt.closed
+                for ct in self.refs[receipt.node]:
+                    assert self.refs[receipt.node][ct] > 0
+                    self.refs[receipt.node][ct] -= 1
+                receipt.closed = True
+
+            def checkpoint(self, req, **kwargs):
+                self.operations.append("checkpoint")
+
+            def finish(self, handle, outcome):
+                self.operations.append("finish")
+
+            def reset(self):
+                assert not any(n for refs in self.refs.values() for n in refs.values())
+
+        cache = PrefixCacheBoundary()
+        controller.cache_guard = CacheGuard(cache)
     tasks = queue.Queue()
     registration = SimpleNamespace(dst_kv_ptrs=[11, 21], dst_kv_item_len=8)
     peer = SimpleNamespace(mooncake_session_id="peer:1", is_dummy=False)
@@ -97,6 +131,10 @@ def main():
         write_json(root / "offer.json", request.offer[1])
         manager.transfer_infos[room] = {"peer:1": peer}
         request.disagg_kv_sender.abort = lambda: None
+        if cache is not None:
+            request.kv.cache_protected_len = 8
+            request.last_node = room
+            request.lock = cache.lock(room)
         return request
 
     req = request(1)
@@ -150,6 +188,21 @@ def main():
             result.copy_done.record()
         result.delay_sample_func = None
 
+    def native_release(req, label):
+        def release():
+            if cache is not None:
+                if label == "normal":
+                    cache.checkpoint(req, up_to=req.extend_end)
+                cache.finish(
+                    req.cache_request_handle,
+                    SimpleNamespace(name="SUCCESS" if label == "normal" else "ABORT"),
+                )
+                cache.unlock(req.lock)
+                req.lock = None
+            freed.append(label)
+
+        return release
+
     def io_worker():
         try:
             while True:
@@ -159,6 +212,8 @@ def main():
                 if task.wait_event is not None:
                     task.wait_event.synchronize()
                 task.indices_event.synchronize()
+                if cache is not None:
+                    assert all(ref > 0 for ref in cache.refs[task.room].values())
                 observed.append(storage.cpu().tolist())
                 task.on_complete()
         except BaseException as exc:
@@ -193,7 +248,10 @@ def main():
                 None,
                 final,
             )
-            overlap.defer_release(req, lambda: freed.append("normal"))
+            overlap.defer_release(req, native_release(req, "normal"))
+            if cache is not None:
+                cache.checkpoint(req, up_to=req.extend_end)
+                assert not cache.operations
             assert not lease.ready_to_finish()  # deferred sample/copy plus queued IO
             sampled(middle)
             sampled(final)
@@ -215,7 +273,7 @@ def main():
             batch.reqs = [cancel]
             result = overlap.run_batch(launch, scheduler, batch)
             lease = cancel._dsv41_p_lease
-            overlap.defer_release(cancel, lambda: freed.append("cancel"))
+            overlap.defer_release(cancel, native_release(cancel, "cancel"))
             before = len(observed)
             worker = threading.Thread(target=io_worker)
             worker.start()
@@ -257,7 +315,7 @@ def main():
             torch.cuda.synchronize()
             revoke_result = overlap.run_batch(launch, scheduler, batch)
             lease = third._dsv41_p_lease
-            overlap.defer_release(third, lambda: freed.append("revoke"))
+            overlap.defer_release(third, native_release(third, "revoke"))
             replacement = SimpleNamespace(dst_kv_ptrs=[31, 41], dst_kv_item_len=8)
             guard = overlap.admission.guard(manager)
             guard.publish(
@@ -306,6 +364,15 @@ def main():
             torch.cuda.synchronize()
             assert storage.eq(999).all().item()
             assert not overlap.admission.guard(manager).pins
+            if cache is not None:
+                assert cache.operations == ["checkpoint", "finish", "finish", "finish"]
+                assert not controller.cache_guard.leases
+                assert all(
+                    value == 0
+                    for refs in cache.refs.values()
+                    for value in refs.values()
+                )
+                cache.reset()
         plugin = Path(po.__file__).parent
         result = dict(
             device=torch.cuda.get_device_name(),
@@ -313,6 +380,13 @@ def main():
             cuda=torch.version.cuda,
             pending_indices_observed=pending_observed,
             pinned_indices_equal=True,
+            prefix_cache=args.prefix_cache,
+            cache_reads_drained=(not controller.cache_guard.leases)
+            if cache is not None
+            else None,
+            cache_backend="lock/checkpoint boundary fixture; real hybrid receipt tests on CPU"
+            if cache is not None
+            else None,
             launch_plans=4,
             admission_checks=overlap.admission.checks,
             revalidations=overlap.admission.revalidations,

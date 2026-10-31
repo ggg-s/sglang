@@ -1,0 +1,48 @@
+{
+  "device": "NVIDIA GeForce RTX 4060 Laptop GPU",
+  "torch": "2.13.0+cu130",
+  "cuda": "13.0",
+  "pending_indices_observed": true,
+  "pinned_indices_equal": true,
+  "prefix_cache": true,
+  "cache_reads_drained": true,
+  "cache_backend": "lock/checkpoint boundary fixture; real hybrid receipt tests on CPU",
+  "launch_plans": 4,
+  "admission_checks": 3,
+  "revalidations": 1,
+  "revocations": 1,
+  "stable_chunk_admission_votes": 0,
+  "io_callbacks": 4,
+  "releases": [
+    "normal",
+    "cancel",
+    "revoke"
+  ],
+  "final_votes": 3,
+  "empty_poll_votes": 0,
+  "cancel_with_unsubmitted_sampling": true,
+  "no_post_release_write": true,
+  "source_sha256": {
+    "prefill_overlap_cuda_probe.py": "530197accd810c2c42e06e5a62cb4f10a78f6e40e1e6d33fa173aeb2e8320ce5",
+    "__init__.py": "f64e878600a7775c62cd79063dbd94d92ccfd6513909f6fed3a221758ebe067f",
+    "check.py": "a7e23c69b57df34ec943df1aad40e4a4e11171fc30cb0f7fcb8ee9072bada438",
+    "compat.py": "8772dd8af6143737b0ccbd53a3a88cc441259e9cadb374e66547abe8b420a971",
+    "decode_overlap.py": "a697a43698065c8d8df0c09246c291ccc26b9d2495d114d3656b26ab6f0c95c1",
+    "dsv41_layerwise.py": "3f1c1bd9e5558a9ac2ff66b0b6110deb111d682c876b747c46c6b3cd88f2613b",
+    "handoff_control.py": "797319385d0956b8f57454e234e7ce36444008b5ab20b607fb35ec783a5bb402",
+    "hooks.py": "6850b9069c35a491750d27aba813a875c8760ddfbbc03202dd4683116459da0d",
+    "interfaces.py": "4394aa7e6d54d0e316f9b1d538ddf9eddd7129231ea3653f7f41232953feebae",
+    "pre_layerwise.py": "037116f1e1300f359d1299bccc36cb0c7738c08b1cf44bc874090248d4be0a7d",
+    "prefill_admission.py": "7a6d28a9807b547667c0d62d6912ad656ed19243f5a5f0ffa5090a8715e53480",
+    "prefill_overlap.py": "c94e4096f11681e3a52dc9cda97aa5e6c928ebb66dcb4967edd4492a15384814",
+    "retirement.py": "a5dec5c9061273cf847c4a7a8e1f63edb0c7e57ae23ebbd309ed427ca97fbf1e",
+    "segmented_graph.py": "f061c51f66ecfa8b4501bf4108299170f505d16297725f00db23ee36c383308d",
+    "source_cache.py": "07d2c508c540411beeb96f273dc6a961e83815bf2658fb9125385c4c6f6fc594",
+    "tp.py": "766b5028a3a08a801c2891580e406a40f1868d7d21cde8ef46be1d76b86b059c"
+  },
+  "limitations": [
+    "No DSV4.1 model load or token accuracy/performance measurement",
+    "IO callback fixture; no Mooncake TE or SMG",
+    "TP1 CUDA; real TP2 Gloo is covered separately on CPU"
+  ]
+}

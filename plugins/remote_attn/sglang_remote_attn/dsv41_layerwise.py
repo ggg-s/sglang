@@ -253,6 +253,10 @@ class DSV41Source(Source):
                 "prefill_chunk_tokens": self.prefill_chunk_tokens,
                 "layer_group_size": self.group_size,
                 "native_final_states": True,
+                "p_radix_read_lease": self.cache_lease is not None,
+                "cached_prefix_tokens": self.cache_lease.cached_tokens
+                if self.cache_lease is not None
+                else 0,
                 "resource_groups": len(self.groups),
                 "at": time.monotonic(),
             },
@@ -280,10 +284,11 @@ class DSV41Controller(Controller):
             raise ValueError("DSV4.1 layerwise requires --language-model-only")
         if get_spec().speculative_algorithm is not None:
             raise ValueError("DSV4.1 layerwise requires DSpark/speculation disabled")
-        if not get_memory().disable_radix_cache:
-            raise ValueError(
-                "DSV4.1 layerwise requires --disable-radix-cache on P and D"
-            )
+        if (
+            not get_memory().disable_radix_cache
+            and s.disaggregation_mode.value != "prefill"
+        ):
+            raise ValueError("DSV4.1 layerwise requires --disable-radix-cache on D")
         if (
             self.config.host_staging
             or self.config.recv_host_staging
@@ -513,6 +518,13 @@ class DSV41Controller(Controller):
                 group_size=group_size,
                 prefill_chunk_tokens=req.extend_len,
                 groups=groups,
+                cache_lease=(
+                    getattr(getattr(req, "_dsv41_p_lease", None), "cache_lease", None)
+                    if plan is not None
+                    else self.cache_guard.hold(req)
+                    if getattr(self, "cache_guard", None) is not None
+                    else None
+                ),
                 indices_event=indices_event,
                 indices_keepalive=keepalive,
             )

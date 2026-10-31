@@ -3510,6 +3510,15 @@ class TestRemoteAttn(CustomTestCase):
             rows[0]["p_certificates"]["votes"], [2, 2, 2, 2, 5, 5, 2, 5, 2, 2]
         )
         self.assertEqual(rows[0]["p_certificates"]["stable_votes"], 0)
+        self.assertEqual(
+            rows[0]["p_cached_certificates"], rows[1]["p_cached_certificates"]
+        )
+        self.assertEqual(
+            rows[0]["p_cached_certificates"]["votes"],
+            rows[0]["p_certificates"]["votes"],
+        )
+        self.assertTrue(rows[0]["p_cached_certificates"]["active_cache_closed"])
+        self.assertEqual(rows[0]["p_cached_certificates"]["stable_votes"], 0)
         self.assertEqual(rows[0]["p_certificates"]["empty_votes"], 0)
         self.assertEqual(rows[0]["p_certificates"]["frees"], [103, 101, 102])
         self.assertEqual(rows[0]["p_certificates"]["revocations"], 1)
@@ -5618,6 +5627,395 @@ class TestRemoteAttn(CustomTestCase):
         f.runner.model.model._dsv41_p_overlap = f.overlap
         return f
 
+    def _dsv41_cache(self):
+        """Native hybrid component locks/receipts, with storage/LRU at the boundary."""
+        from sglang_remote_attn.source_cache import install
+
+        r = self._radix()
+        tree_cls = _source_class(
+            "mem_cache/unified_cache/unified_tree_core.py",
+            "UnifiedTreeCore",
+            {
+                "inc_lock_ref",
+                "dec_lock_ref",
+                "_assert_receipt_anchor",
+                "_release_components",
+            },
+        )
+        tree_cls.inc_lock_ref.__globals__.update(
+            IncLockRefResult=r.IncLockRefResult,
+            DecLockRefResult=r.DecLockRefResult,
+            ComponentType=r.ComponentType,
+        )
+        cache_cls = _source_class(
+            "mem_cache/unified_radix_cache.py",
+            "UnifiedRadixCache",
+            {"lock", "unlock", "inc_lock_ref", "dec_lock_ref"},
+        )
+        cache_cls.lock.__globals__.update(
+            TreeLock=r.TreeLock, is_virtual_node=lambda node: False
+        )
+        base = _source_class(
+            "mem_cache/unified_cache/components/base.py",
+            "TreeComponent",
+            {"value_len", "reclaimable_value_len"},
+        )
+        classes = [
+            (
+                _source_class(
+                    "mem_cache/unified_cache/components/full.py",
+                    "FullComponent",
+                    {
+                        "acquire_component_lock",
+                        "release_component_lock",
+                        "redistribute_on_node_split",
+                    },
+                ),
+                r.ComponentType.FULL,
+            ),
+            (
+                _source_class(
+                    "mem_cache/unified_cache/components/swa.py",
+                    "SWAComponent",
+                    {
+                        "acquire_component_lock",
+                        "release_component_lock",
+                        "redistribute_on_node_split",
+                    },
+                ),
+                r.ComponentType.SWA,
+            ),
+        ]
+        node_cls = type("Node", (), {})
+
+        def node(index, size, parent=None):
+            value = node_cls()
+            value.id, value.parent, value.key = index, parent, list(range(size))
+            value.component_data = {
+                ct: SimpleNamespace(
+                    value=torch.arange(size),
+                    host_value=None,
+                    lock_ref=0,
+                    host_lock_ref=0,
+                    session_ref=0,
+                    session_ids=None,
+                    metadata={},
+                )
+                for _, ct in classes
+            }
+            return value
+
+        root, leaf = node(0, 0), node(1, 8)
+        leaf.parent = root
+        tree = tree_cls()
+        tree.root_node = root
+        tree.nodes = {0: root, 1: leaf}
+        tree.node_by_id = tree.nodes.__getitem__
+        tree._update_evictable_leaf_sets = lambda node: None
+        tree.evictable_device_leaves = set()
+        tree.component_evictable_size_ = {ct: 8 for _, ct in classes}
+        tree.component_protected_size_ = {ct: 0 for _, ct in classes}
+        tree.lru_lists = tree.host_lru_lists = {ct: None for _, ct in classes}
+        components = []
+        for cls, ct in classes:
+            cls.value_len, cls.reclaimable_value_len = (
+                base.value_len,
+                base.reclaimable_value_len,
+            )
+            cls.acquire_component_lock.__globals__.update(
+                next_component_uuid=lambda ct: 17
+            )
+            component = cls()
+            component.component_type, component.tree_core = ct, tree
+            component.sliding_window_size = 8
+            components.append(component)
+        tree.components = components
+        tree.components_by_type = {c.component_type: c for c in components}
+        cache = cache_cls()
+        cache.disable, cache.tree_components, cache.tree_core = (
+            False,
+            (r.ComponentType.FULL, r.ComponentType.SWA),
+            tree,
+        )
+        cache.cache_controller = cache.linker = None
+        cache.enable_session_radix_cache = False
+        operations = []
+        cache.checkpoint = lambda req, **kw: operations.append("checkpoint")
+        cache.finish = lambda *a: operations.append("finish")
+        cache.reset = lambda: operations.append("reset")
+        with patch.dict(
+            sys.modules,
+            {
+                "sglang.srt.mem_cache.radix_cache": SimpleNamespace(
+                    RadixCache=r.RadixCache
+                ),
+                "sglang.srt.mem_cache.unified_radix_cache": SimpleNamespace(
+                    UnifiedRadixCache=cache_cls
+                ),
+                "sglang.srt.mem_cache.unified_cache.component_type": SimpleNamespace(
+                    ComponentType=r.ComponentType
+                ),
+            },
+        ):
+            guard = install(cache, allow_swa=True)
+        return SimpleNamespace(
+            cache=cache,
+            guard=guard,
+            tree=tree,
+            leaf=leaf,
+            node=node,
+            components=components,
+            operations=operations,
+            native=r,
+        )
+
+    def test_dsv41_prefix_cache_pin_keeps_full_swa_receipt_valid_across_split(self):
+        f = self._dsv41_cache()
+        req = SimpleNamespace(
+            cache_request_handle=f.native.CacheRequestHandle("prefix", 0),
+            last_node=1,
+            lock=f.cache.lock(1),
+            kv=SimpleNamespace(cache_protected_len=8),
+        )
+        lease = f.guard.hold(req)
+        parent = f.node(2, 4, f.tree.root_node)
+        for component in f.components:
+            component.redistribute_on_node_split(parent, f.leaf)
+        f.leaf.key = [4, 5, 6, 7]
+        f.leaf.parent = parent
+        f.tree.nodes[2] = parent
+        f.cache.unlock(req.lock)
+        req.lock = None
+        for ct in f.cache.tree_components:
+            self.assertEqual(f.tree.component_protected_size_[ct], 8)
+            self.assertEqual(f.leaf.component_data[ct].lock_ref, 1)
+            self.assertEqual(parent.component_data[ct].lock_ref, 1)
+        f.cache.checkpoint(req, up_to=8)
+        self.assertEqual(f.operations, [])
+        lease.retire(lambda: f.cache.checkpoint(req, up_to=8))
+        self.assertEqual(f.operations, ["checkpoint"])
+        for ct in f.cache.tree_components:
+            self.assertEqual(f.tree.component_protected_size_[ct], 0)
+            self.assertEqual(f.tree.component_evictable_size_[ct], 8)
+        self.assertTrue(lease.closed)
+
+    def test_dsv41_cached_request_waits_for_gpu_io_and_tp_before_checkpoint(self):
+        f = self._dsv41_overlap_fixture()
+        c = self._dsv41_cache()
+        f.controller.cache_guard = c.guard
+        f.req.cache_request_handle = c.native.CacheRequestHandle(f.req.rid, 0)
+        f.req.kv.cache_protected_len = 8
+        f.req.last_node, f.req.lock = 1, c.cache.lock(1)
+
+        class Event:
+            def record(self, stream):
+                pass
+
+            def query(self):
+                return True
+
+        def launch(scheduler, batch):
+            f.controller.forward(lambda *a: None, f.runner, batch)
+            return SimpleNamespace(delay_sample_func=None, copy_done=Event())
+
+        with (
+            patch.dict(sys.modules, f.modules),
+            patch.object(torch.cuda, "Event", Event),
+            patch.object(torch.cuda, "current_stream", lambda: None),
+        ):
+            first = f.overlap.run_batch(launch, f.scheduler, f.batch)
+            lease = f.req._dsv41_p_lease
+            f.po.after_result(lambda *a: None, f.scheduler, f.batch, first)
+            self.assertIsNotNone(lease.cache_lease)
+            f.req.finished = lambda: False
+            f.req.skip_radix_cache_insert = False
+            _source_function("mem_cache/common.py", "checkpoint_kv_cache")(
+                f.req, c.cache
+            )
+            self.assertEqual(
+                f.req.prefix_len, 16
+            )  # native chunk progress survives deferred publication
+            self.assertEqual(c.operations, [])
+            f.req.extend_end, f.req.extend_len = 33, 17
+            with patch.object(
+                f.po,
+                "page_indices",
+                lambda raw, page: (
+                    (raw[::page] // page).numpy().copy(),
+                    Event(),
+                    (raw,),
+                ),
+            ):
+                final = f.overlap.run_batch(launch, f.scheduler, f.batch)
+            f.po.after_result(
+                lambda scheduler, *a: scheduler.send_kv_chunk(f.req, last_chunk=True),
+                f.scheduler,
+                f.batch,
+                final,
+            )
+            f.overlap.defer_release(
+                f.req,
+                lambda: (
+                    c.cache.checkpoint(f.req, up_to=33),
+                    c.cache.unlock(f.req.lock),
+                ),
+            )
+            c.cache.finish(
+                f.req.cache_request_handle, c.native.CacheRequestOutcome.SUCCESS
+            )
+            f.native_status[0] = f.polls.Success
+            self.assertFalse(lease.ready_to_finish())
+            self.assertEqual(c.operations, [])
+            for _ in range(f.tasks.qsize()):
+                f.tasks.get_nowait().on_complete()
+            self.assertTrue(lease.ready_to_finish())
+            f.overlap.poll()
+            self.assertEqual(c.operations, [])
+            f.overlap.retirement.arm(f.overlap.retirement.poll_command())
+            f.overlap.retirement.finalize()
+            self.assertEqual(c.operations, ["checkpoint", "finish"])
+            self.assertTrue(lease.cache_lease.closed)
+            self.assertFalse(c.guard.leases)
+            self.assertFalse(f.overlap.leases)
+            self.assertEqual(f.overlap.admission.checks, 1)
+            for ct in c.cache.tree_components:
+                self.assertEqual(c.tree.component_protected_size_[ct], 0)
+
+    def test_dsv41_prefix_cache_serial_final_retains_native_state_completion(self):
+        f, c = self._dsv41_fixture(), self._dsv41_cache()
+        f.controller.cache_guard = c.guard
+        f.req.cache_request_handle = c.native.CacheRequestHandle(f.req.rid, 0)
+        f.req.kv.cache_protected_len = 8
+        f.req.last_node, f.req.lock = 1, c.cache.lock(1)
+        f.req.extend_end, f.req.extend_len = 33, 25
+        pl = self.hooks.pre_layerwise
+        with patch.dict(sys.modules, f.modules):
+            source = f.controller.prepare(f.batch)[0]
+            source.enqueue(f.controller.layers - 1, object(), flush=True)
+            source.finalize_native(
+                f.native_send, f.scheduler, f.req, last_chunk=True, end_idx=None
+            )
+            self.assertEqual(
+                pl.read_json(source.path / "prefill.json")["cached_prefix_tokens"], 8
+            )
+            self.assertTrue(
+                pl.read_json(source.path / "prefill.json")["p_radix_read_lease"]
+            )
+            pl.defer_release(
+                f.req,
+                lambda: (
+                    c.cache.checkpoint(f.req, up_to=33),
+                    c.cache.unlock(f.req.lock),
+                ),
+            )
+            c.cache.finish(
+                f.req.cache_request_handle, c.native.CacheRequestOutcome.SUCCESS
+            )
+            self.assertFalse(source.poll())
+            for _ in range(f.tasks.qsize()):
+                task = f.tasks.get_nowait()
+                if getattr(task, "on_complete", None) is not None:
+                    task.on_complete()
+            f.native_status[0] = f.polls.Success
+            self.assertTrue(source.poll())
+            source.retire()
+            self.assertEqual(c.operations, ["checkpoint", "finish"])
+            self.assertTrue(
+                pl.read_json(source.path / "released.json")["p_radix_lease_closed"]
+            )
+            self.assertFalse(c.guard.leases)
+
+    def test_dsv41_prefix_cache_late_admission_waits_old_native_io_edge(self):
+        f, c = self._dsv41_overlap_fixture(), self._dsv41_cache()
+        f.controller.cache_guard = c.guard
+        f.req.cache_request_handle = c.native.CacheRequestHandle(f.req.rid, 0)
+        f.req.kv.cache_protected_len = 8
+        f.req.last_node, f.req.lock = 1, c.cache.lock(1)
+        f.manager.add_transfer_request(7, [], slice(0, 0), False)
+        task = f.tasks.get_nowait()
+        with patch.dict(sys.modules, f.modules):
+            self.assertEqual(f.overlap.admission.select(f.batch)[1], [0])
+            self.assertFalse(c.guard.leases)
+            for _ in range(8):
+                f.overlap.poll()
+                self.hooks._process_requests(
+                    lambda *a: None, f.scheduler, f.overlap.inject([])
+                )
+            self.assertEqual(f.overlap.admission.revalidations, 0)
+            task.on_complete()
+            f.overlap.poll()
+            self.hooks._process_requests(
+                lambda *a: None, f.scheduler, f.overlap.inject([])
+            )
+            self.assertEqual(f.overlap.admission.select(f.batch)[1], [1])
+            self.assertEqual(f.overlap.admission.revalidations, 1)
+            self.assertIsNotNone(f.req._dsv41_p_certificate.cache_lease)
+            f.overlap.admission.retired(f.req)
+            c.cache.unlock(f.req.lock)
+            self.assertFalse(c.guard.leases)
+            for ct in c.cache.tree_components:
+                self.assertEqual(c.tree.component_protected_size_[ct], 0)
+
+    def test_dsv41_prefix_cache_cancel_without_release_keeps_native_request_pin(self):
+        f, c = self._dsv41_overlap_fixture(), self._dsv41_cache()
+        f.controller.cache_guard = c.guard
+        f.req.cache_request_handle = c.native.CacheRequestHandle(f.req.rid, 0)
+        f.req.kv.cache_protected_len = 8
+        f.req.last_node, f.req.lock = 1, c.cache.lock(1)
+        with patch.dict(sys.modules, f.modules):
+            f.overlap.admission.select(f.batch)
+            cert = f.req._dsv41_p_certificate
+            chunk = f.po.Chunk(
+                f.req, f.sender, f.req.cache_request_handle, 0, 0, 16, False
+            )
+            lease = f.po.SourceLease(
+                f.overlap, chunk, 1, "attempt-1", cache_lease=cert.cache_lease
+            )
+            event = SimpleNamespace(query=lambda: False)
+            plan = f.po.LaunchPlan(1, f.batch, (chunk,), [], [])
+            plan.forward_done = event
+            plan.proof.result = SimpleNamespace(
+                delay_sample_func=lambda: None, copy_done=None
+            )
+            lease.plans.append(plan)
+            marker = object()
+            lease.ledger.pending.add(marker)
+            f.req._dsv41_p_lease = lease
+            f.overlap.leases.append(lease)
+            f.overlap.by_room[7] = lease
+            f.overlap.retirement.register(lease)
+
+            def complete():
+                event.query = lambda: True
+                with lease.ledger.lock:
+                    lease.ledger.pending.remove(marker)
+
+            timer = threading.Timer(0.04, complete)
+            timer.start()
+            trace = []
+
+            def native_reset(scheduler, req):
+                self.assertTrue(lease.closed)
+                self.assertTrue(lease.cache_lease.closed)
+                for ct in c.cache.tree_components:
+                    self.assertEqual(c.tree.component_protected_size_[ct], 8)
+                c.cache.unlock(req.lock)
+                c.cache.finish(
+                    req.cache_request_handle, c.native.CacheRequestOutcome.ABORT
+                )
+                trace.append("native-reset")
+
+            try:
+                f.po.before_mutation(native_reset, f.scheduler, f.req)
+            finally:
+                timer.join()
+            self.assertEqual(trace, ["native-reset"])
+            self.assertEqual(c.operations, ["finish"])
+            self.assertFalse(c.guard.leases)
+            self.assertEqual(f.overlap.retirement.final_votes, 1)
+            for ct in c.cache.tree_components:
+                self.assertEqual(c.tree.component_protected_size_[ct], 0)
+
     def test_dsv41_certificate_stable_chunks_and_final_reuse_one_tp_decision(self):
         f = self._dsv41_overlap_fixture()
         votes = []
@@ -6459,15 +6857,29 @@ class TestRemoteAttn(CustomTestCase):
                     SimpleNamespace(speculative_algorithm="DSPARK"),
                     "speculation disabled",
                 ),
-                (
-                    "get_memory",
-                    SimpleNamespace(disable_radix_cache=False),
-                    "disable-radix-cache",
-                ),
             ):
                 with patch.object(f.context, method, lambda: value):
                     with self.assertRaisesRegex(ValueError, reason):
                         f.controller.validate()
+        for handle in f.controller._layer_handles:
+            handle.remove()
+        f.scheduler.disaggregation_mode = SimpleNamespace(value="prefill")
+        memory = f.context.get_memory()
+        memory.disable_radix_cache = False
+        with (
+            patch.dict(sys.modules, {"sglang.srt.runtime_context": f.context}),
+            patch.object(f.context, "get_memory", lambda: memory),
+        ):
+            f.controller.validate()  # P enabled cache is accepted; D remains gated.
+        f.scheduler.disaggregation_mode = SimpleNamespace(value="decode")
+        memory = f.context.get_memory()
+        memory.disable_radix_cache = False
+        with (
+            patch.dict(sys.modules, {"sglang.srt.runtime_context": f.context}),
+            patch.object(f.context, "get_memory", lambda: memory),
+        ):
+            with self.assertRaisesRegex(ValueError, "disable-radix-cache on D"):
+                f.controller.validate()
         f.pool.uniform_fp8 = True
         with self.assertRaisesRegex(ValueError, "non-unified FlashMLA"):
             f.ds.manifest(f.pool, f.manager.kv_args, f.runner.model_config.hf_config)

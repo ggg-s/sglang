@@ -36,7 +36,8 @@ DSpark/其他投机解码关闭，不启用 KV cache sharding。使用原生 SMG
 
 - `model_type=deepseek_v41`，原生非 unified FlashMLA 池，compression ratio 0/1/2。
   原生 SWA paged/request-window 状态由原生 final-chunk 接口处理。
-- 两端均 `--language-model-only --disable-radix-cache`；P 支持原生 scheduler overlap。
+- 两端均 `--language-model-only`，D 保留 `--disable-radix-cache`；P 支持原生
+  UnifiedRadixCache 的设备内 FULL/SWA 前缀缓存和 scheduler overlap。
   不启用 LoRA、HiCache、PD multiplexing、mixed chunk 或 whole-prefix checksum。
 - 保留 D 原生 full graph/overlap。只有实际参与 layerwise 的 P forward 走 eager，
   overlap 模式通过本次 launch 的 plan 绕过内嵌 decoder tail graph，不临时改写
@@ -84,12 +85,12 @@ export HANDOFF_PRE_LAYERWISE_RECV_HOST_STAGING=0
 这属于进程动态库环境适配，不改变 optimistic prefill、chunk、SEND_LOCK 或 FAST 参数。
 
 P 终端（`P_NATIVE_ARGS` 沿用原生线上参数，删除其中的 speculative 参数和
-`--disable-overlap-schedule`；不新增插件环境变量）：
+`--disable-overlap-schedule`；启用 P 缓存时也删除 `--disable-radix-cache`，不新增插件环境变量）：
 
 ```bash
 export HANDOFF_CTL_DIR=/workspace/remote-attn/dsv41-run-001/control/prefill
 python -m sglang.launch_server "${P_NATIVE_ARGS[@]}" \
-  --language-model-only --disable-radix-cache
+  --language-model-only
 ```
 
 D 终端：
@@ -138,7 +139,35 @@ SMG 使用原有 PD router 命令，不加载插件环境。先通过原生 `/he
   CUDA/传输异常、未知完成或 drain 超时均保留分配并报错，不自动复用页或故障回滚。
 
 SMG、SGL scheduler loop、future map、采样和原生结果队列没有修改；D 的原生
-overlap/full graph 路径保持不变。P radix cache 和 DSpark 仍关闭。
+overlap/full graph 路径保持不变。P 可启用下面的前缀缓存；DSpark 仍关闭。
+
+## P 前缀缓存
+
+P 可删除原生 `--disable-radix-cache`，无需新增插件变量。仅支持原生
+`UnifiedRadixCache` 的设备内 FULL 或 FULL+SWA 组件；session refs、Mamba/C128
+等其他组件、HiCache、linker 和 unified KV 仍不开放。D 缓存保持关闭。
+
+- FULL 页同时覆盖对应的压缩 global KV、indexer payload/scale 的物理页归属；
+  原生树锁一起锁住 FULL/SWA 组件，SWA 锁回执在节点 split 后仍按原生 UUID 边界释放。
+- overlap 在首次接管投票前获取独立缓存读租约，通过同一证书保存给请求的
+  SourceLease。后续 middle→final 不重锁、不重投票；关闭 overlap 的原串行
+  layerwise 路径也在 final 接管时使用同一缓存 guard。
+- 读租约期间延迟该请求的 checkpoint/dedup、finish 和释放，避免正在发送的
+  后缀被原生去重换页。已有前缀独立 pin，其他请求仍可命中它，不能将其淘汰。
+- 不是把 SWA/carry 当成新缓存格式：SWA prefix match/re-prefill、request-window
+  和压缩续接状态沿用原生 SGL；原生 final-chunk 仍负责将完整状态交给 D。
+- 若首次接管前已有未完成的 native 发送，先缓存否定证书，等其 IO 账本清空
+  触发资格边沿，再有序重确认，避免跨越未知的旧物理页引用历史。
+- 正常完成须等原生 release 回调、GPU、IO 和 TP 共识；之后一次执行延迟的
+  checkpoint/finish、原生释放及独立读 pin 释放。取消/retraction 先 drain，再
+  交回原生状态变更；未知完成、失败回调继续保留资源。
+
+读租约会延迟新增后缀的缓存发布/去重，可能增加瞬时占用，需在目标负载验证
+显存及命中率。它不额外复制整个 KV，也不改变 optimistic/chunk/batch 参数。
+路径证明：先用同前缀请求预热，再确认 `prefill.json` 中
+`p_radix_read_lease=true`、`cached_prefix_tokens>0`，最终 `released.json` 的
+`p_radix_lease_closed=true`。开关对照应保持 chunk、TP、graph、overlap 等参数一致。
+验证记录见 [P 缓存验证](validation/dsv41-p-cache-4060.md)。
 
 ## TP 接管证书与资格变化
 
@@ -200,7 +229,7 @@ SMG/SGL 核心、原生采样、future map 和 optimistic/chunk/batch 配置未�
 非整页 final chunk、奇偶 carry、GPU event 未完成不得写入/释放、布局不匹配和
 TP 不同意时游标不变、P eager / D native graph、错误时保留源分配。
 
-当前共有 19 项 DSV4.1 专项测试，完整 117 项本地插件测试通过，包含真实双进程
+当前共有 24 项 DSV4.1 专项测试，完整 122 项本地插件测试通过，包含真实双进程
 Gloo；源码预检覆盖 34 个 hook、83 个核心接口。新增覆盖两批 final 交错、同请求
 middle→final、队列任务继承、延迟采样、失败保留、重试/retraction/reset 栅栏、长
 prompt 短尾块策略。TP2 用例验证不同 rank 的 generation 和 GPU 就绪时序，

@@ -11,6 +11,7 @@ import hashlib
 import json
 import logging
 import threading
+from contextlib import nullcontext
 from dataclasses import dataclass
 from types import SimpleNamespace
 
@@ -212,6 +213,7 @@ class Certificate:
     revoking: bool = False
     watch: object = None
     observed_ready: bool = False
+    cache_lease: object = None
 
     @property
     def logical_key(self):
@@ -254,6 +256,15 @@ class Admission:
             or getattr(req.kv, "req_pool_idx", None) is None
         ):
             return None
+        # Earlier native sends had no plugin read pin. Do not acquire a new
+        # cache lease across their unknown physical-page history. Wait for a
+        # local IO edge, then revalidate through the shared command path.
+        if getattr(self.owner, "cache_guard", None) is not None:
+            ledger = self.overlap.ledgers.get(int(req.bootstrap_room))
+            if ledger is not None:
+                with ledger.lock:
+                    if ledger.pending or ledger.error:
+                        return None
         return self.owner.candidates(cert.batch, allow_middle=True)[0]
 
     def local_change(self, cert):
@@ -294,6 +305,9 @@ class Admission:
                 candidate = None
             if candidate is not None:
                 cert.assessment_stamp = (candidate[2] / "offer.json").stat().st_mtime_ns
+                cache = getattr(self.owner, "cache_guard", None)
+                if cache is not None and cert.cache_lease is None:
+                    cert.cache_lease = cache.hold(cert.req)
                 guard.pin(cert.key, candidate)  # provisional pin closes check/vote race
             return candidate
 
@@ -317,6 +331,9 @@ class Admission:
                 for session in peers
             )
             dirty = cert.key in guard.dirty
+        ledger = self.overlap.ledgers.get(int(req.bootstrap_room))
+        with ledger.lock if ledger is not None else nullcontext():
+            old_io = bool(ledger is not None and (ledger.pending or ledger.error))
         page = getattr(getattr(self.owner, "pool", None), "page_size", 1)
         start, end = getattr(req, "start_send_idx", 0), getattr(req, "extend_end", None)
         cursor_ok = (
@@ -340,6 +357,7 @@ class Admission:
             cert.batch.return_hidden_states,
             cert.batch.input_embeds is not None,
             cert.batch.replace_embeds is not None,
+            old_io,
         )
 
     def commit(self, cert, candidate, accepted):
@@ -349,6 +367,9 @@ class Admission:
         if accepted:
             cert.stamp = cert.assessment_stamp
         else:
+            if cert.cache_lease is not None:
+                cert.cache_lease.retire(lambda: None)
+                cert.cache_lease = None
             self.guard(cert.req.disagg_kv_sender.kv_mgr).unpin(cert.key)
         cert.reported = None
         cert.watch = self.watch(cert)
@@ -606,6 +627,9 @@ class Admission:
                     scheduler._pending_chunked_abort_req = cert.req
                 cert.revoking = False
                 cert.active, cert.done = False, True
+                if cert.cache_lease is not None and not cert.cache_lease.closed:
+                    cert.cache_lease.retire(lambda: None)
+                cert.cache_lease = None
                 self.guard(cert.req.disagg_kv_sender.kv_mgr).unpin(cert.key)
                 cert.version += 1
                 cert.candidate = None
@@ -619,6 +643,9 @@ class Admission:
     def retired(self, req):
         cert = getattr(req, "_dsv41_p_certificate", None)
         if cert is not None and cert.logical_key == key_of(req):
+            if cert.cache_lease is not None and not cert.cache_lease.closed:
+                cert.cache_lease.retire(lambda: None)
+            cert.cache_lease = None
             cert.done, cert.active = True, False
             self.records.pop(cert.key, None)
             self.reports.pop(cert.key, None)

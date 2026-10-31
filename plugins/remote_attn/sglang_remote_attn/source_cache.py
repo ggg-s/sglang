@@ -119,7 +119,7 @@ class CacheGuard:
         return self.reset()
 
 
-def install(cache):
+def install(cache, *, allow_swa=False):
     if cache.disable:
         return None
     from sglang.srt.mem_cache.radix_cache import RadixCache
@@ -128,14 +128,23 @@ def install(cache):
 
     if type(cache) not in (RadixCache, UnifiedRadixCache):
         raise ValueError("P radix Remote reads require a built-in dense cache")
+    if allow_swa and type(cache) is not UnifiedRadixCache:
+        raise ValueError("DSV4.1 P prefix cache requires native UnifiedRadixCache")
+    supported = (
+        ((ComponentType.FULL,), (ComponentType.FULL, ComponentType.SWA))
+        if allow_swa
+        else ((ComponentType.FULL,),)
+    )
     if type(cache) is UnifiedRadixCache and (
-        cache.tree_components != (ComponentType.FULL,)
+        cache.tree_components not in supported
         or cache.cache_controller is not None
         or cache.linker is not None
         or cache.enable_session_radix_cache
     ):
         raise ValueError(
-            "P radix Remote reads support device-only FULL cache without session refs"
+            "P radix reads support device-only FULL"
+            + ("/SWA" if allow_swa else "")
+            + " cache without session refs"
         )
     if hasattr(cache, "_remote_attn_source_cache"):
         return cache._remote_attn_source_cache
@@ -147,4 +156,6 @@ def install(cache):
 def checkpoint_allowed(req, requested):
     source = getattr(req, "_pre_layerwise_source", None)
     lease = getattr(source, "cache_lease", None)
+    if lease is None:
+        lease = getattr(getattr(req, "_dsv41_p_lease", None), "cache_lease", None)
     return requested and not (lease is not None and lease.abort)
