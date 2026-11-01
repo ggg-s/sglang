@@ -28,7 +28,7 @@ import unittest
 import uuid
 import weakref
 from array import array
-from contextlib import ExitStack, nullcontext
+from contextlib import ExitStack, contextmanager, nullcontext
 from pathlib import Path
 from types import SimpleNamespace
 from unittest.mock import patch
@@ -9352,6 +9352,194 @@ class TestRemoteAttn(CustomTestCase):
                 self.assertEqual(f.metadata[-1], marker)
         self.assertIsNone(b.active_batch)
         self.assertIsNone(b.capture_batch)
+
+    def test_dsv41_probe_native_logits_survive_bank_batch_and_sampler_changes(self):
+        """Tensor-only probes missed BCG output/import failures and sampler leakage.
+
+        Native capture/replay/output methods and DSV bank selection run on CPU.
+        Graph launches are a boundary substitute executing the small CPU model;
+        this is not CUDA capture or GPU numerical validation.
+        """
+        f = self._dsv41_split_core()
+        output = f.model(torch.zeros(2, 4), torch.zeros(2), f.batch(2))
+        self.assertTrue(dataclasses.is_dataclass(output))
+        self.assertEqual(type(output).__name__, "LogitsProcessorOutput")
+        self.assertEqual(output.next_token_logits.shape, (2, 4))
+        manual = ROOT / "test/manual/remote_attn"
+        with patch.object(sys, "path", [str(manual), *sys.path]):
+            spec = importlib.util.spec_from_file_location(
+                "dsv41_output_probe", manual / "dsv41_segmented_graph_probe.py"
+            )
+            probe = importlib.util.module_from_spec(spec)
+            spec.loader.exec_module(probe)
+        from sglang_remote_attn.dsv41_graph import DSV41GraphBackend
+
+        mode = type(sys)("sglang.srt.model_executor.runner_utils.capture_mode")
+        mode.__dict__.update(
+            contextmanager=contextmanager, _capture_attention_variant=None
+        )
+        probe.definitions(
+            ROOT / "python/sglang/srt/model_executor/runner_utils/capture_mode.py",
+            mode.__dict__,
+        )
+        previous_mode = sys.modules.get(mode.__name__)
+        sys.modules[mode.__name__] = mode
+
+        def restore_mode():
+            if previous_mode is None:
+                sys.modules.pop(mode.__name__, None)
+            else:
+                sys.modules[mode.__name__] = previous_mode
+
+        self.addCleanup(restore_mode)
+        capturing = [False]
+
+        class Graph:
+            def __init__(self, *args):
+                self.work = lambda: None
+
+            def replay(self):
+                self.work()
+
+            def reset(self):
+                pass
+
+        @contextmanager
+        def capture(**kwargs):
+            capturing[0] = True
+            try:
+                yield
+            finally:
+                capturing[0] = False
+
+        device = SimpleNamespace(
+            synchronize=lambda: None,
+            graph=capture,
+            Event=lambda: SimpleNamespace(
+                record=lambda *a: None, synchronize=lambda: None
+            ),
+            current_stream=lambda: None,
+        )
+        namespace = dict(
+            torch=torch,
+            contextmanager=contextmanager,
+            BaseCudaGraphBackend=object,
+            DedupedCudaGraphMixin=type(
+                "Dedup",
+                (),
+                dict(
+                    deduped_cuda_graph=None,
+                    begin_cuda_graph_capture=lambda self: None,
+                    end_cuda_graph_capture=lambda self: None,
+                    close=lambda self: None,
+                ),
+            ),
+            PPProxyTensors=type("Proxy", (), {}),
+            GraphPoolPrecarve=lambda: SimpleNamespace(
+                measure=nullcontext, mint=lambda: None
+            ),
+            TorchMemorySaverAdapter=SimpleNamespace(create=lambda **kw: None),
+            get_parallel=lambda: SimpleNamespace(
+                tp_group=SimpleNamespace(barrier=lambda: None)
+            ),
+            get_or_create_global_graph_memory_pool=lambda device: None,
+            set_graph_pool_id=lambda *a: None,
+            graph_pool_capture_scope=nullcontext,
+            graph_pool_replay_scope=nullcontext,
+            eager_on_graph=lambda fn: fn,
+            BreakableCUDAGraph=Graph,
+            BreakableCUDAGraphCapture=capture,
+            enable_breakable_cuda_graph=nullcontext,
+        )
+        # Load through the actual CUDA probe entry: a separate test namespace
+        # must not accidentally provide the missing dataclasses dependency.
+        probe.load_native_backends(ROOT, namespace)
+        f.runner.device_module = device
+        full = namespace["FullCudaGraphBackend"](f.runner)
+        remote = namespace["BreakableCudaGraphBackend"](f.runner)
+        backend = DSV41GraphBackend(
+            f.runner, full, remote, lambda fn: fn, lambda: capturing[0], lambda: None
+        )
+        f.attach(backend)
+        self.addCleanup(backend.cleanup)
+        ShapeKey = probe.load(
+            "dsv_output_shape",
+            ROOT / "python/sglang/srt/model_executor/runner/shape_key.py",
+        ).ShapeKey
+        inputs = {}
+        with (
+            patch.object(torch.cuda, "CUDAGraph", Graph),
+            backend.capture_session(None),
+        ):
+            for size in (8, 4, 2, 1):
+                inputs[size] = (torch.zeros(size, 4), torch.zeros(size))
+                dummy = f.batch(size, -100)
+                backend.capture_one(
+                    ShapeKey(size),
+                    lambda size=size, fb=dummy: f.model(*inputs[size], fb),
+                )
+        self.assertEqual(sorted(backend.remote_keys), [1, 2, 4])
+        self.assertEqual(f.calls, [])
+
+        def replay_body(bank, key):
+            result = f.model(*inputs[key.size], backend.active_batch)
+            # Substitute only the GPU work. The native backend still returns
+            # its original capture buffers and the runner processes them.
+            for name in ("next_token_logits", "hidden_states"):
+                getattr(bank._outputs[key], name).copy_(getattr(result, name))
+
+        for bank in (remote, full):
+            for key, graph in bank._graphs.items():
+                graph.work = functools.partial(replay_body, bank, key)
+        previous = []
+        for use_remote, sizes in (
+            (True, (4, 1, 2, 4, 1, 2, 4)),
+            (False, (4, 1, 2, 4, 1, 2, 4, 8, 8)),
+        ):
+            f.controller.targets = [object()] if use_remote else []
+            before = len(f.calls)
+            for step, size in enumerate(sizes):
+                live = f.batch(size, step + 1)
+                x, pos = inputs[size]
+                x.fill_(step / 8)
+                pos.fill_(step % 3)
+                expected = x.clone()
+                for _ in range(3):
+                    expected = expected * 2 + pos[:, None] + 1
+                    if use_remote:
+                        expected += live.marker
+                key = ShapeKey(size)
+                with backend.execution(live):
+                    output = f.decode_output(key, live)
+                self.assertTrue(all(output is not prior for prior in previous))
+                bank = remote if use_remote else full
+                template = bank._outputs[key]
+                self.assertIsInstance(output, f.output_type)
+                self.assertIsNot(output, template)
+                self.assertEqual(
+                    output.next_token_logits.data_ptr(),
+                    template.next_token_logits.data_ptr(),
+                )
+                f.check_output(output, expected)
+                self.assertIsNone(template.next_token_logprobs)
+                self.assertIsNone(template.sampling_mask_output)
+                previous.append(output)
+            self.assertEqual(len(f.calls) - before, 3 * len(sizes) if use_remote else 0)
+        self.assertEqual(backend.replays, {"remote": 7, "full": 9})
+
+    def test_dsv41_probe_rejects_dirty_sampler_output(self):
+        """The probe must reject stale fields even when logits remain correct."""
+        f = self._dsv41_split_core()
+        expected = torch.ones(2, 4)
+        for name in (
+            "next_token_logprobs",
+            "sampling_mask_output",
+            "next_token_sampling_logprobs",
+        ):
+            output = f.output_type(expected, hidden_states=expected + 0.25)
+            setattr(output, name, [object()])
+            with self.assertRaisesRegex(AssertionError, "sampler field leaked"):
+                f.check_output(output, expected)
 
     def test_dsv41_segments_graph_policy_uses_shared_lease_and_never_pads_remote_rows(
         self,

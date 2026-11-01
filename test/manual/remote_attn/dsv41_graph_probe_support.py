@@ -1,6 +1,7 @@
 """Small native-ABI-shaped model fixture; no DSV checkpoint/kernel substitution claim."""
 
 import importlib.util
+from contextlib import nullcontext
 from pathlib import Path
 from types import SimpleNamespace
 
@@ -29,6 +30,30 @@ def fixture(
     )
     support = importlib.util.module_from_spec(spec)
     spec.loader.exec_module(support)
+    Output = support.definitions(
+        root,
+        "python/sglang/srt/layers/logits_processor.py",
+        owner="LogitsProcessorOutput",
+    )
+    DecodeRunner = support.definitions(
+        root,
+        "python/sglang/srt/model_executor/runner/decode_cuda_graph_runner.py",
+        owner="DecodeCudaGraphRunner",
+        members={"execute", "_process_output_after_replay"},
+    )
+    # Keep the actual native output processing, including the fresh wrapper
+    # between full-graph storage and the sampler. Input staging/timers/PD proof
+    # publication are outside this small model fixture's validation scope.
+    DecodeRunner.execute.__globals__.update(
+        LogitsProcessorOutput=Output,
+        device_timer_ctx=lambda *args: nullcontext(),
+        SharedReadEnds=SimpleNamespace(
+            PRE_REPLAY=object(), IN_REPLAY=object(), POST_REPLAY=object()
+        ),
+        envs=SimpleNamespace(
+            SGLANG_LOG_DECODE_GRAPH_KEY=SimpleNamespace(get=lambda: False)
+        ),
+    )
     Core = support.definitions(
         root,
         "python/sglang/srt/models/deepseek_v4.py",
@@ -268,7 +293,7 @@ def fixture(
                     )
                     + 1
                 )
-            return x
+            return Output(next_token_logits=x, hidden_states=x + 0.25)
 
     model = Model()
     mr = SimpleNamespace(
@@ -281,13 +306,14 @@ def fixture(
         ),
         attn_backend=attn,
         _pre_layerwise=controller,
+        device_timer=None,
     )
     runner = SimpleNamespace(
         model_runner=mr,
         attn_backend=attn,
         device_module=torch.cuda if device == "cuda" else None,
-        cuda_graph_output_capacity_rows=lambda out: out.shape[0],
-        cuda_graph_output_rows=lambda out: out.shape[0],
+        cuda_graph_output_capacity_rows=lambda out: out.next_token_logits.shape[0],
+        cuda_graph_output_rows=lambda out: out.next_token_logits.shape[0],
     )
 
     def batch(size, marker=0, fail=None):
@@ -297,7 +323,7 @@ def fixture(
             input_embeds=None,
             replace_embeds=None,
             req_pool_indices_cpu=list(range(size)),
-            forward_mode=SimpleNamespace(is_decode=lambda: True),
+            forward_mode=SimpleNamespace(is_decode=lambda: True, name="DECODE"),
             marker=marker,
             out_cache_loc=torch.arange(size, device=device, dtype=torch.int64)
             + max(0, marker) % max(1, 9 - size),
@@ -309,6 +335,47 @@ def fixture(
         runner.backend = backend
         mr._remote_segmented_backend = backend
         dg.install(mr, runner)
+
+    decode = DecodeRunner.__new__(DecodeRunner)
+    decode.model_runner = mr
+    decode.model_context = nullcontext
+    decode._resolve_shared_read_ends = lambda *args: None
+    decode._replay_attn_backend = lambda: attn
+    decode.is_dllm = False
+
+    def load_batch(fb, pp_proxy_tensors=None):
+        decode.raw_num_token = fb.batch_size
+
+    decode.load_batch = load_batch
+
+    def decode_output(key, fb):
+        decode.backend = bank[0]
+        decode._replay_graph_key = key
+        return decode.execute(fb)
+
+    def check_output(output, expected, **tolerances):
+        assert isinstance(output, Output), type(output)
+        torch.testing.assert_close(output.next_token_logits, expected, **tolerances)
+        torch.testing.assert_close(output.hidden_states, expected + 0.25, **tolerances)
+        for name in (
+            "next_token_logprobs",
+            "next_token_top_logprobs_val",
+            "next_token_top_logprobs_idx",
+            "next_token_token_ids_logprobs_val",
+            "next_token_token_ids_logprobs_idx",
+            "sampling_mask_output",
+            "next_token_sampling_mask_idx",
+            "next_token_sampling_logprobs",
+            "next_token_sampling_mask_status",
+        ):
+            assert getattr(output, name) is None, f"sampler field leaked: {name}"
+            setattr(
+                output,
+                name,
+                torch.ones(expected.shape[0], device=expected.device)
+                if name == "next_token_logprobs"
+                else [object()] * expected.shape[0],
+            )
 
     return SimpleNamespace(
         controller=controller,
@@ -326,4 +393,7 @@ def fixture(
         cache=cache,
         carry=carry,
         core=Core,
+        output_type=Output,
+        decode_output=decode_output,
+        check_output=check_output,
     )

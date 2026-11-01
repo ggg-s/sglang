@@ -26,7 +26,8 @@ def definitions(root, relative, *, owner=None, members=None):
     if owner:
         node = next(n for n in nodes if getattr(n, "name", None) == owner)
         node.bases, node.keywords = [], []
-        node.body = [n for n in node.body if getattr(n, "name", None) in members]
+        if members is not None:
+            node.body = [n for n in node.body if getattr(n, "name", None) in members]
         nodes = [node]
     namespace = dict(
         torch=torch,

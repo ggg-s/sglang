@@ -6,6 +6,7 @@ boundaries are small fixtures. No DSV checkpoint, SM100, SMG, NCCL or perf claim
 """
 
 import argparse
+import dataclasses
 import hashlib
 import json
 import os
@@ -27,6 +28,14 @@ from sglang_remote_attn import dsv41_sparse_math as math
 from sglang_remote_attn import handoff_control as rt
 from sglang_remote_attn import hooks
 from sglang_remote_attn.dsv41_layerwise import DSV41Source
+
+
+def load_native_backends(root, namespace):
+    """Source-loaded methods need their original dataclasses dependency too."""
+    namespace["dataclasses"] = dataclasses
+    native = root / "python/sglang/srt/model_executor"
+    definitions(native / "runner_backend/full_cuda_graph_backend.py", namespace)
+    definitions(native / "runner_backend/breakable_cuda_graph_backend.py", namespace)
 
 
 def main(
@@ -131,8 +140,7 @@ def main(
             BreakableCUDAGraphCapture=primitive.BreakableCUDAGraphCapture,
             enable_breakable_cuda_graph=nullcontext,
         )
-        definitions(native / "runner_backend/full_cuda_graph_backend.py", ns)
-        definitions(native / "runner_backend/breakable_cuda_graph_backend.py", ns)
+        load_native_backends(root, ns)
         ShapeKey = load("dsv_segment_shape", native / "runner/shape_key.py").ShapeKey
         sf = sparse_fixture(root, "cuda")
         sf.p_controller.dsv41_remote = True
@@ -357,6 +365,7 @@ def main(
             get_parallel=lambda: types.SimpleNamespace(tp_size=1, tp_rank=0)
         )
         max_error = 0.0
+        remote_batches, local_batches = [], []
         for phase, local in enumerate(((), (1,), (1, 2))):
             for target in live_targets.values():
                 target.local_entries = set(local)
@@ -404,13 +413,16 @@ def main(
                             )
                         expected = expected + 1
                     assert hooks._decode_graph(lambda *a: True, f.runner, live)
-                    with backend.execution(live), backend.replay_session():
-                        got = backend.replay(
+                    with backend.execution(live):
+                        got = f.decode_output(
                             ShapeKey(size, attention_variant=live.variant), live
                         )
-                    err = float((got.float() - expected.float()).abs().max())
+                    remote_batches.append(size)
+                    err = float(
+                        (got.next_token_logits.float() - expected.float()).abs().max()
+                    )
                     max_error = max(max_error, err)
-                    torch.testing.assert_close(got, expected, atol=0.015625, rtol=0.01)
+                    f.check_output(got, expected, atol=0.015625, rtol=0.01)
                     assert len(f.projections) == projection_capture_calls, (
                         "QKV executed in eager replay"
                     )
@@ -434,20 +446,21 @@ def main(
         f.controller.targets = []
         for target in list(live_targets.values()):
             target.close("tp-local-graph-probe")
-        for step in range(8):
-            live = f.batch(4, 42)
-            x, p = inputs[4]
+        for step, size in enumerate((4, 1, 2, 4, 1, 2, 4, 8)):
+            live = f.batch(size, 42)
+            x, p = inputs[size]
             x.fill_(0.25)
             p.fill_(2)
             expected = x.clone()
             for _ in range(3):
                 expected = expected * 2 + p[:, None] + 1
             assert hooks._decode_graph(lambda *a: True, f.runner, live)
-            with backend.execution(live), backend.replay_session():
-                got = backend.replay(
-                    ShapeKey(4, attention_variant=labels[step % 4]), live
+            with backend.execution(live):
+                got = f.decode_output(
+                    ShapeKey(size, attention_variant=labels[step % 4]), live
                 )
-            torch.testing.assert_close(got, expected)
+            local_batches.append(size)
+            f.check_output(got, expected)
         assert len(rpc_calls) == count
         assert seen_variants == set(labels)
         assert len(full._graphs) == 16
@@ -518,6 +531,8 @@ def main(
                 "python/sglang/srt/mem_cache/deepseek_v4_memory_pool.py",
                 "python/sglang/srt/layers/attention/deepseek_v4_backend.py",
                 "python/sglang/srt/models/deepseek_v4.py",
+                "python/sglang/srt/layers/logits_processor.py",
+                "python/sglang/srt/model_executor/runner/decode_cuda_graph_runner.py",
             )
         ]
         paths += [
@@ -540,6 +555,11 @@ def main(
             rpc_calls=count,
             capture_rpc_calls=0,
             max_abs_error=max_error,
+            output_type="LogitsProcessorOutput",
+            native_decode_output_processing=True,
+            sampler_fields_checked=True,
+            remote_batch_sequence=remote_batches,
+            local_batch_sequence=local_batches,
             live_metadata=True,
             live_sparse_topk=True,
             qkv_projection_replay_host_calls=0,
