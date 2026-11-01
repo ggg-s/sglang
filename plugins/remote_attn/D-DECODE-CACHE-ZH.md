@@ -2,8 +2,8 @@
 
 此接入复用原生增量 PD：D 先匹配并锁定已缓存的前缀 `H`，只为 `[H,N)` 分配和
 传输新 KV。SMG、SGL 核心没有新增修改；公共保护层和接入均在插件内。
-当前支持 Qwen3 dense NHD MHA、page size 1、同 TP 的既有部署。DSV4.1 D 缓存
-仍被启动检查拒绝，其 indexer、SWA/carry 需要另行适配。
+当前支持 Qwen3 dense NHD MHA、page size 1、同 TP 的既有部署。DSV4.1 的 indexer、SWA/carry
+适配见 [DSV D 缓存](DSV41-D-CACHE-ZH.md)，复用此公共保护层。
 
 ## 原生启动差异
 
@@ -21,7 +21,7 @@ FULL 前缀缓存配置；原有 graph、optimistic prefill、token chunk、传�
 证明和 TP 退休仍生效。P 的 overlap 支持范围沿用原有模型限制。
 
 支持内置 `RadixCache`、设备内 FULL `UnifiedRadixCache`；不支持 HiCache、外部
-linker、session refs 或混合缓存组件。新增预检总计 46 hooks / 113 core interfaces。
+linker、session refs 或混合缓存组件。新增预检总计 46 hooks / 114 core interfaces。
 
 ## 前缀、页面与发布边界
 

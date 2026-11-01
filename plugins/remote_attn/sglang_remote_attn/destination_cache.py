@@ -161,8 +161,10 @@ class Lease:
 
 
 class Guard:
-    def __init__(self, cache):
+    def __init__(self, cache, *, page_size=1, skip_lock_components=()):
         self.cache = cache
+        self.page_size = page_size
+        self.skip_lock_components = skip_lock_components
         self.leases = {}
         self.pending = {}
         self.poisoned = False
@@ -176,6 +178,11 @@ class Guard:
             self._finish,
             self._reset,
         )
+
+    def pin(self, node):
+        if self.skip_lock_components:
+            return self.cache.lock(node, skip_lock_components=self.skip_lock_components)
+        return self.cache.lock(node)
 
     def check(self):
         if self.poisoned:
@@ -201,7 +208,7 @@ class Guard:
         if prefix and req.lock is None:
             raise RuntimeError("D cached prefix has no native lock")
         self.drop_match(req)
-        pin = self.cache.lock(req.last_node)
+        pin = self.pin(req.last_node)
         if pin is None:
             raise RuntimeError("D cache did not return an independent prefix pin")
         lease = Lease(
@@ -274,27 +281,40 @@ class Guard:
             req.lock = None
 
 
-def install(cache):
+def install(cache, *, allow_swa=False):
     if cache.disable:
         return None
     from sglang.srt.mem_cache.radix_cache import RadixCache
     from sglang.srt.mem_cache.unified_cache.component_type import ComponentType
     from sglang.srt.mem_cache.unified_radix_cache import UnifiedRadixCache
 
-    if type(cache) not in (RadixCache, UnifiedRadixCache) or (
-        type(cache) is UnifiedRadixCache
-        and (
-            cache.tree_components != (ComponentType.FULL,)
-            or cache.cache_controller is not None
-            or cache.linker is not None
-            or cache.enable_session_radix_cache
+    supported = ((ComponentType.FULL,),)
+    if allow_swa:
+        supported += ((ComponentType.FULL, ComponentType.SWA),)
+    if (
+        (allow_swa and type(cache) is not UnifiedRadixCache)
+        or type(cache) not in (RadixCache, UnifiedRadixCache)
+        or (
+            type(cache) is UnifiedRadixCache
+            and (
+                cache.tree_components not in supported
+                or cache.cache_controller is not None
+                or cache.linker is not None
+                or cache.enable_session_radix_cache
+            )
         )
     ):
         raise ValueError(
-            "Qwen D cache requires native device-only FULL cache without session refs"
+            "D cache requires native device-only FULL"
+            + ("/SWA UnifiedRadixCache" if allow_swa else " cache")
+            + " without session refs"
         )
     if not hasattr(cache, "_remote_attn_destination_guard"):
-        cache._remote_attn_destination_guard = Guard(cache)
+        cache._remote_attn_destination_guard = Guard(
+            cache,
+            page_size=cache.page_size if allow_swa else 1,
+            skip_lock_components=(ComponentType.SWA,) if allow_swa else (),
+        )
     return cache._remote_attn_destination_guard
 
 
@@ -314,11 +334,13 @@ def match_prefix(original, queue, req):
         guard.check()
         result = original(queue, req)
         prefix = int(result.l1_prefix_len)
-        if prefix != result.decode_prefix_len or not 0 <= prefix <= len(
-            req.origin_input_ids
+        if (
+            prefix % guard.page_size
+            or prefix != result.decode_prefix_len
+            or not 0 <= prefix <= len(req.origin_input_ids)
         ):
             raise RuntimeError("D cache supports device-only prefix matches")
-        pin = guard.cache.lock(req.last_node)
+        pin = guard.pin(req.last_node)
         if pin is None:
             raise RuntimeError("D pending cache match has no native pin")
         report = (
@@ -404,6 +426,9 @@ def send_metadata(
         or req.lock is None
     ):
         raise RuntimeError("D cache prefix changed before native PD metadata")
+    from .dsv41_receive import cache_metadata
+
+    state_indices = cache_metadata(queue, decode_req, state_indices)
     try:
         return original(
             queue, decode_req, kv_indices, page_size, state_indices, **metadata_kwargs

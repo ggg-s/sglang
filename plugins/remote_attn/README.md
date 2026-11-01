@@ -106,7 +106,7 @@ The initial port targets the supplied single-host Qwen3-8B setup: CUDA,
 plain TP (including TP2, with the same TP width across roles), dense NHD MHA KV in BF16/FP16, page size 1,
 P scheduler overlap disabled. Qwen D device-only FULL radix cache is opt-in with
 native `--disaggregation-decode-enable-radix-cache` (remove `--disable-radix-cache`);
-DSV4.1 D cache remains gated. See [D cache integration](D-DECODE-CACHE-ZH.md).
+DSV4.1 D cache uses native device FULL/FULL+SWA UnifiedRadixCache with the same opt-in; see [DSV D cache](DSV41-D-CACHE-ZH.md) and [common D cache integration](D-DECODE-CACHE-ZH.md).
 D may use native scheduler overlap: Remote batches serialize at the native
 per-batch gate, then Local resumes native overlap after TP-agreed retirement
 with native result completion proofs. Two-batch overlap remains unsupported.

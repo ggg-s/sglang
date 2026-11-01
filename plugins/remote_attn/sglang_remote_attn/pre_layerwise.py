@@ -1117,12 +1117,6 @@ def initialize(scheduler):
     cls = DSV41Controller if is_dsv41(scheduler.tp_worker.model_runner) else Controller
     controller = cls(scheduler, config)
     controller.validate()
-    if (
-        getattr(controller, "dsv41_layerwise", False)
-        and scheduler.disaggregation_mode.value == "decode"
-        and not scheduler.tree_cache.disable
-    ):
-        raise ValueError("DSV4.1 D radix cache is not yet adapted")
     controller.validate_graphs()
     from . import pd_mesh
 
@@ -1147,22 +1141,25 @@ def initialize(scheduler):
     if not getattr(controller, "dsv41_layerwise", False):
         if scheduler.disaggregation_mode.value == "prefill":
             controller.cache_guard = install(scheduler.tree_cache)
-        else:
-            from .destination_cache import install as install_destination
+    if scheduler.disaggregation_mode.value == "decode":
+        from .destination_cache import install as install_destination
 
-            controller.destination_cache = install_destination(scheduler.tree_cache)
+        controller.destination_cache = install_destination(
+            scheduler.tree_cache,
+            allow_swa=getattr(controller, "dsv41_layerwise", False),
+        )
+    if (
+        not getattr(controller, "dsv41_layerwise", False)
+        or getattr(controller, "dsv41_remote", False)
+        or controller.destination_cache is not None
+    ) and scheduler.disaggregation_mode.value == "decode":
         from .decode_overlap import install as install_overlap
 
         controller.decode_overlap = install_overlap(
-            controller, force=controller.destination_cache is not None
+            controller,
+            force=getattr(controller, "dsv41_remote", False)
+            or controller.destination_cache is not None,
         )
-    if (
-        getattr(controller, "dsv41_remote", False)
-        and scheduler.disaggregation_mode.value == "decode"
-    ):
-        from .decode_overlap import install as install_overlap
-
-        controller.decode_overlap = install_overlap(controller, force=True)
     scheduler._pre_layerwise = controller
     scheduler.tp_worker.model_runner._pre_layerwise = controller
 

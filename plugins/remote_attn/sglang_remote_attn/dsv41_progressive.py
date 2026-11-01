@@ -63,6 +63,7 @@ def send_states(source):
         dict(
             generation=source.generation,
             prefix_len=source.prefix_len,
+            decode_prefix_len=source.decode_prefix_len,
             barrier="indexer+swa+carry+metadata",
             at=time.monotonic(),
         ),
@@ -143,6 +144,11 @@ class SourceMixin:
 
 
 def completed(queue, dr):
+    from .destination_cache import lease_for
+
+    lease = lease_for(dr.req)
+    if lease is not None:
+        lease.check()
     handler = queue.staging_handler
     handler.advance_scatter(dr)
     if handler.is_failed(dr):
@@ -160,6 +166,10 @@ def barrier_ready(offer):
         service.get("generation") != offer.generation
         or data.get("prefix_len") != len(dr.req.origin_input_ids)
         or service.get("prefix_len") != len(dr.req.origin_input_ids)
+        or data.get("decode_prefix_len", 0)
+        != getattr(dr.req.kv, "cache_protected_len", 0)
+        or service.get("decode_prefix_len", 0)
+        != getattr(dr.req.kv, "cache_protected_len", 0)
     ):
         raise RuntimeError("DSV4.1 sparse barrier identity changed")
     schema = offer.owner._schema(dr.kv_receiver.kv_mgr)
@@ -230,6 +240,8 @@ class ProgressiveTarget(NativeTarget):
         if self.closed:
             return
         self.rpc.check()
+        if self.cache_lease is not None:
+            self.cache_lease.check()
         completed(self.queue, self.decode_req)
         failure = read_json(self.path / "error.json")
         if failure and failure.get("generation") == self.generation:
@@ -296,7 +308,12 @@ def early_targets(controller, queue, rids_to_check):
             offer.coverage,
             native_staging=True,
             rpc=rpc,
+            decode_prefix_len=getattr(dr.req.kv, "cache_protected_len", 0),
         )
+        guard = getattr(controller, "destination_cache", None)
+        if guard is not None:
+            target.cache_lease = guard.hold(dr.req)
+        rpc.decode_prefix_len = target.decode_prefix_len
         dr.req._pre_layerwise_target = target
         dr.req._dsv41_remote = rpc
         controller.remote_targets[rpc.row] = rpc

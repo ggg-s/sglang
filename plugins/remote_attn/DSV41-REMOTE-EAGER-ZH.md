@@ -50,7 +50,7 @@ DMA timeout、scatter/forward proof 失败均保留页面，拒绝不安全复�
 ## 原生启动
 
 沿用 [原生 SMG/P/D 参数数组](DSV41-LAYERWISE-ZH.md)。保留 P FULL/SWA cache、P/D overlap、
-optimistic prefill、chunk 和 transfer batch 的线上原值；D radix cache 保留既有限制。
+optimistic prefill、chunk 和 transfer batch 的线上原值；D radix cache 可按 [专用说明](DSV41-D-CACHE-ZH.md) 显式开启。
 纯文本、同机单 pair、同 TP、PP=DP=CP=1，关闭 DSpark/HiCache；使用 `flashmla`，
 不启用 mega/TRTLLM、LoRA、unified KV、whole-prefix checksum 或 mixed chunk。
 
@@ -77,7 +77,7 @@ D 继续原生命令：
 export HANDOFF_PRE_LAYERWISE_HOST_STAGING=0
 export HANDOFF_PRE_LAYERWISE_RECV_HOST_STAGING=1
 python -m sglang.launch_server "${D_NATIVE_ARGS[@]}" \
-  --language-model-only --disable-radix-cache --dsv4-attn-backend flashmla
+  --language-model-only --disaggregation-decode-enable-radix-cache --dsv4-attn-backend flashmla
 ```
 
 backend 参数已有时不重复追加。SMG 保留原生 PD router 命令，不加载插件变量，无 JSON

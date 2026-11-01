@@ -40,7 +40,7 @@ export HANDOFF_NETWORK_ADVERTISE_HOST=10.0.0.11
 
 P/D 启动仍直接执行各自既有 `python -m sglang.launch_server ...` 命令。保留线上完整的
 optimistic prefill、chunk、transfer batch、graph buckets、缓存和 overlap 配置。模型已有
-限制仍适用，例如 DSV4.1 的 D radix cache 与 DSpark 没有因此放开。
+限制仍适用，例如 DSpark 仍关闭；DSV4.1 D radix cache 须按 [专用接入](DSV41-D-CACHE-ZH.md) 显式开启。
 
 原生 SMG 在独立终端启动，不加载插件环境。下面示例为两个 P、两个 D：
 

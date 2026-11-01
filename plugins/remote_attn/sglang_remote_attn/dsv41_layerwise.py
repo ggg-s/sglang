@@ -349,8 +349,11 @@ class DSV41Controller(Controller):
         if (
             not get_memory().disable_radix_cache
             and s.disaggregation_mode.value != "prefill"
+            and not getattr(
+                get_disagg(), "disaggregation_decode_enable_radix_cache", False
+            )
         ):
-            raise ValueError("DSV4.1 layerwise requires --disable-radix-cache on D")
+            raise ValueError("DSV4.1 D cache requires native decode radix opt-in")
         if (
             (self.config.host_staging and s.disaggregation_mode.value != "prefill")
             or (
@@ -554,19 +557,27 @@ class DSV41Controller(Controller):
                             offer.get("remote_boundary") == "progressive-sparse"
                             and offer.get("native_staging")
                             and max(e[-1] for e in schema["entries"])
-                            * ((req.extend_end + page - 1) // page - sender.curr_idx)
+                            * (
+                                (req.extend_end + page - 1) // page
+                                - req.disagg_decode_prefix_len // page
+                                - sender.curr_idx
+                            )
                             <= offer.get("progressive_ring_bytes", 0)
                         )
                     )
                     and mgr.kv_shard_size == 1
                     and not mgr.enable_all_cp_ranks_for_transfer
                     and not mgr.is_dummy_cp_rank
-                    and req.disagg_decode_prefix_len == 0
+                    and offer.get("decode_prefix_len", 0)
+                    == req.disagg_decode_prefix_len
+                    and req.disagg_decode_prefix_len % page == 0
                     and 0 <= req.start_send_idx < req.extend_end
                     and req.start_send_idx % page == 0
-                    and sender.curr_idx == req.start_send_idx // page
+                    and sender.curr_idx
+                    == (req.start_send_idx - req.disagg_decode_prefix_len) // page
                     and sender.num_kv_indices
                     == (len(req.origin_input_ids) + page - 1) // page
+                    - req.disagg_decode_prefix_len // page
                 ):
                     candidate = req, sender, root, offer, peers, schema
             candidates.append(candidate)
@@ -673,6 +684,7 @@ class DSV41Controller(Controller):
                 ),
                 indices_event=indices_event,
                 indices_keepalive=keepalive,
+                decode_prefix_len=req.disagg_decode_prefix_len,
             )
             if self.dsv41_remote:
                 sources = getattr(sender.kv_mgr, "_dsv41_progressive_sources", None)

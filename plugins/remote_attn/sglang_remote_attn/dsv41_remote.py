@@ -106,6 +106,7 @@ def register(source):
             generation=source.generation,
             route=source.service,
             prefix_len=source.prefix_len,
+            decode_prefix_len=source.decode_prefix_len,
             owners=dict(
                 global_prefix="P-readonly",
                 indexer_topk="D-native",
@@ -222,6 +223,7 @@ class Target:
     progressive: bool = False
     local_entries: set = field(default_factory=set)
     resource_ids: object = None
+    decode_prefix_len: int = 0
     row: int = field(init=False)
     handle: object = field(init=False)
 
@@ -230,6 +232,11 @@ class Target:
         self.handle = getattr(self.req, "cache_request_handle", None)
 
     def check(self):
+        from .destination_cache import lease_for
+
+        lease = lease_for(self.req)
+        if lease is not None:
+            lease.check()
         if (
             self.req.kv.req_pool_idx != self.row
             or getattr(self.req, "cache_request_handle", None) != self.handle
@@ -341,6 +348,7 @@ def commit(original, queue, dr, *, keep_receiver=False):
             offer.generation,
             data["route"],
             int(data["prefix_len"]),
+            decode_prefix_len=getattr(dr.req.kv, "cache_protected_len", 0),
         )
         dr.req._dsv41_remote = target
         controller.remote_targets[int(dr.req.kv.req_pool_idx)] = target
@@ -502,7 +510,12 @@ def attention(
             )
             pages = [int(x) // pool.page_size for x in pages]
             remote, local_ids = sparse.partition(
-                selected, pages, target.prefix_len, pool.page_size, compress_ratio
+                selected,
+                pages,
+                target.prefix_len,
+                pool.page_size,
+                compress_ratio,
+                cached_prefix=getattr(target, "decode_prefix_len", 0),
             )
         swa = torch.tensor(
             [i for i in swa_ids[row][: swa_lens[row]] if i >= 0], device=q.device

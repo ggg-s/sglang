@@ -32,7 +32,7 @@ python -m sglang_remote_attn.check
 python -c 'import sglang_router; print(sglang_router.__file__)'
 ```
 
-安装态预检应输出 `hooks: 46`、`core_interfaces: 113`、`send_probe: true`。
+安装态预检应输出 `hooks: 46`、`core_interfaces: 114`、`send_probe: true`。
 它检查实际加载的接口：保留 receiver 的 metadata commit、选层发送与完成回调、
 staging 分组、host copy、缓存 checkpoint/lock/finish、字段初始化及 typed env 声明；插件注册时也会执行同样的
 核心检查，避免直接启动 P/D 绕过预检。`**kwargs` 不能替代显式参数。
@@ -153,7 +153,7 @@ D 的其他线上参数同样保留。默认每个 D rank 需要 4 GiB pinned ho
 `--disable-radix-cache`，加入原生 `--disaggregation-decode-enable-radix-cache`。
 只删除 disable 参数不会启用 D cache；不需要新增插件环境变量。支持设备内 FULL
 RadixCache / UnifiedRadixCache，可与 D scheduler overlap 同时开启。增量传输、
-缓存发布、取消和回收边界见 [D 缓存说明](D-DECODE-CACHE-ZH.md)。DSV4.1 D 仍关闭缓存。
+缓存发布、取消和回收边界见 [D 缓存说明](D-DECODE-CACHE-ZH.md)。DSV4.1 D 缓存见 [专用接入](DSV41-D-CACHE-ZH.md)。
 
 两端保留线上原生 graph backend、capture buckets/max-bs 配置；同一角色各 TP rank
 必须一致。插件不要求新增环境变量，不强制扩大原生 capture 范围；分段图在启动时额外捕获，服务中不重新 capture。

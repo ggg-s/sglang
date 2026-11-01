@@ -94,7 +94,9 @@ def merge(left, right):
     return a * wa[:, None] + b * wb[:, None]
 
 
-def partition(selected, full_pages, prefix_len, full_page_size, ratio):
+def partition(
+    selected, full_pages, prefix_len, full_page_size, ratio, *, cached_prefix=0
+):
     """Native D physical compressed slots -> P logical positions / D suffix.
 
     A ratio-2 pending half-pair belongs to D, even if its raw first token was
@@ -115,7 +117,7 @@ def partition(selected, full_pages, prefix_len, full_page_size, ratio):
         if page not in inverse:
             raise ValueError("top-k slot does not belong to this request")
         position = inverse[page] * cpp + offset
-        if position < prefix_len // ratio:
+        if cached_prefix // ratio <= position < prefix_len // ratio:
             remote.append(position)
         else:
             local.append(slot)

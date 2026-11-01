@@ -38,7 +38,7 @@ optimistic prefill、chunk 和 Batch，不需要 JSON 配置或启动包装器�
 
 - `Qwen3ForCausalLM`、CUDA、dense NHD MHA、BF16/FP16 KV、page size 1。
 - P/D 相同 TP 宽度，PP=DP=CP=1；示例为 TP2，不能直接沿用异构 TP 拓扑。
-- P 可开启设备内 FULL radix cache；Qwen D 可显式开启原生增量 PD radix cache，见 [D 缓存说明](D-DECODE-CACHE-ZH.md)，DSV4.1 D 仍关闭。P 关闭 scheduler overlap，D Remote 串行、全部 Local 后恢复原生 overlap；保留原生 full decode graphs，capture buckets 包含 1/2/4。D Remote batch 1/2/4/8/16 使用分段图，attention/RPC/merge 在图外；未覆盖的 Remote batch 为 eager，统一回收后恢复 full graph。最终 chunk 的分层 prefill 仍 eager。P 关闭 scheduler overlap 不影响分层计算/传输重叠；D two_batch_overlap 仍关闭。
+- P 可开启设备内 FULL radix cache；Qwen D 可显式开启原生增量 PD radix cache，见 [D 缓存说明](D-DECODE-CACHE-ZH.md)，DSV4.1 D 见 [专用缓存接入](DSV41-D-CACHE-ZH.md)。P 关闭 scheduler overlap，D Remote 串行、全部 Local 后恢复原生 overlap；保留原生 full decode graphs，capture buckets 包含 1/2/4。D Remote batch 1/2/4/8/16 使用分段图，attention/RPC/merge 在图外；未覆盖的 Remote batch 为 eager，统一回收后恢复 full graph。最终 chunk 的分层 prefill 仍 eager。P 关闭 scheduler overlap 不影响分层计算/传输重叠；D two_batch_overlap 仍关闭。
 - 原生 `mooncake_tcp`，P/D 均使用 `--disaggregation-decode-allocation-policy early`（代码默认）；不能使用 `prefill_complete`。
 - LoRA、MLA/混合/量化 KV、HiCache、speculative、统一 KV、PD multiplexing、live role switching 不在当前支持范围；原生 host KV destination 也不等于这里的 host staging ring。
 
@@ -133,7 +133,7 @@ PY
 "$HANDOFF_PYTHON" -m sglang_remote_attn.check
 ```
 
-当前 preflight 应输出 `hooks: 46`、`core_interfaces: 113`、`send_probe: true`、
+当前 preflight 应输出 `hooks: 46`、`core_interfaces: 114`、`send_probe: true`、
 `plugin: remote_attn`。核心接口检查同时覆盖 metadata receiver 保留、选层发送、
 staging/host copy、任务与状态字段和 typed env；安装态检查实际加载模块，源码模式
 检查所选 checkout。直接启动服务的插件注册也执行核心检查。

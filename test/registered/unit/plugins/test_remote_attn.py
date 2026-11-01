@@ -837,38 +837,6 @@ class TestRemoteAttn(CustomTestCase):
             f.cache.evict(f.EvictParams(num_tokens=32))
             self.assertEqual(f.allocator.available_size(), 32)
 
-    def test_dsv41_d_cache_stays_rejected_before_adapter_initialization(self):
-        """Opening Qwen D cache must not silently enable sparse state caching."""
-        from sglang_remote_attn import dsv41_layerwise as ds
-
-        pl = self.hooks.pre_layerwise
-        with tempfile.TemporaryDirectory() as directory:
-            scheduler = SimpleNamespace(
-                tp_worker=SimpleNamespace(model_runner=object()),
-                tree_cache=SimpleNamespace(disable=False),
-                disaggregation_mode=SimpleNamespace(value="decode"),
-            )
-            controller = SimpleNamespace(
-                dsv41_layerwise=True,
-                validate=lambda: None,
-                validate_graphs=lambda: self.fail(
-                    "unsupported D cache reached graph init"
-                ),
-            )
-            with (
-                patch.object(
-                    pl.Config,
-                    "from_env",
-                    return_value=pl.Config("remote", Path(directory)),
-                ),
-                patch.object(ds, "is_dsv41", return_value=True),
-                patch.object(ds, "DSV41Controller", return_value=controller),
-                self.assertRaisesRegex(
-                    ValueError, "DSV4.1 D radix cache is not yet adapted"
-                ),
-            ):
-                pl.initialize(scheduler)
-
     def test_p_radix_read_pin_survives_tree_split_and_eviction(self):
         from sglang_remote_attn.source_cache import CacheGuard
 
@@ -4358,6 +4326,23 @@ class TestRemoteAttn(CustomTestCase):
         )
         self.assertEqual(rows[0]["sparse_progressive"], rows[1]["sparse_progressive"])
         self.assertEqual(
+            rows[0]["sparse_cached_progressive"], rows[1]["sparse_cached_progressive"]
+        )
+        self.assertEqual(
+            rows[0]["sparse_cached_progressive"],
+            dict(
+                votes=[5, 5, 5, 5, 1],
+                freed=["KV"],
+                local_entries=[0, 1],
+                retries=1,
+                closed=1,
+                stable_votes=0,
+                cache_votes=1,
+                pins_closed=True,
+                published=[],
+            ),
+        )
+        self.assertEqual(
             rows[0]["sparse_progressive"],
             dict(
                 votes=[5, 5, 5, 5],
@@ -6658,6 +6643,425 @@ class TestRemoteAttn(CustomTestCase):
             native=r,
         )
 
+    def _dsv41_destination_cache(self):
+        from sglang_remote_attn.destination_cache import install, key
+
+        f = self._dsv41_cache()
+        f.cache.checkpoint, f.cache.finish, f.cache.reset = (
+            f.guard.checkpoint,
+            f.guard.finish,
+            f.guard.reset,
+        )
+        f.cache.page_size = 8
+        with patch.dict(
+            sys.modules,
+            {
+                "sglang.srt.mem_cache.radix_cache": SimpleNamespace(
+                    RadixCache=f.native.RadixCache
+                ),
+                "sglang.srt.mem_cache.unified_radix_cache": SimpleNamespace(
+                    UnifiedRadixCache=type(f.cache)
+                ),
+                "sglang.srt.mem_cache.unified_cache.component_type": SimpleNamespace(
+                    ComponentType=f.native.ComponentType
+                ),
+            },
+        ):
+            f.guard = install(f.cache, allow_swa=True)
+        req = SimpleNamespace(
+            rid="dsv-cache",
+            bootstrap_room=7,
+            origin_input_ids=list(range(33)),
+            extra_key=None,
+            cache_salt=None,
+            cache_request_handle=f.native.CacheRequestHandle("dsv-cache", 0),
+            kv=SimpleNamespace(req_pool_idx=0, cache_protected_len=8),
+            last_node=1,
+            lock=f.cache.lock(1, skip_lock_components=(f.native.ComponentType.SWA,)),
+            refresh_fill_ids=lambda: None,
+            owned_kv_len=lambda: 33,
+        )
+        req._remote_attn_decode_match = (
+            req.cache_request_handle,
+            8,
+            key(req),
+            req.lock,
+        )
+        f.req = req
+        return f
+
+    def test_dsv41_d_cache_pins_only_full_and_defers_abort_across_tree_split(self):
+        """Global/index pages stay pinned; old SWA is evictable and ABORT never inserts."""
+        f = self._dsv41_destination_cache()
+        lease = f.guard.hold(f.req)
+        f.cache.checkpoint(f.req, up_to=33)
+        f.cache.finish(f.req.cache_request_handle, f.native.CacheRequestOutcome.ABORT)
+        self.assertEqual(f.operations, [])
+        parent = f.node(2, 4, f.tree.root_node)
+        for component in f.components:
+            component.redistribute_on_node_split(parent, f.leaf)
+        f.leaf.key, f.leaf.parent = [4, 5, 6, 7], parent
+        f.tree.nodes[2] = parent
+        self.assertEqual(
+            f.tree.component_protected_size_[f.native.ComponentType.FULL], 8
+        )
+        self.assertEqual(
+            f.tree.component_protected_size_[f.native.ComponentType.SWA], 0
+        )
+        lease.retire(lambda: f.cache.unlock(f.req.lock))
+        self.assertEqual(f.operations, ["finish"])
+        self.assertTrue(lease.closed and lease.abort)
+        for component in f.cache.tree_components:
+            self.assertEqual(f.tree.component_protected_size_[component], 0)
+
+    def test_dsv41_d_cache_initialization_binds_common_guard_and_ordered_receiver(self):
+        """Native D startup must actually install the guard, including serial control mode."""
+        from sglang_remote_attn import pd_mesh, remote_data_plane
+
+        f, cached = self._dsv41_fixture(), self._dsv41_destination_cache()
+        f.scheduler.disaggregation_mode = SimpleNamespace(value="decode")
+        f.scheduler.tree_cache = cached.cache
+        f.scheduler.enable_overlap = False
+        receiver = _source_class(
+            "managers/scheduler_components/request_receiver.py",
+            "SchedulerRequestReceiver",
+            strip_method_decorators=True,
+        )
+        f.scheduler.request_receiver = receiver(
+            **{field.name: None for field in dataclasses.fields(receiver)}
+        )
+        disagg, memory = f.context.get_disagg(), f.context.get_memory()
+        disagg.disaggregation_decode_enable_radix_cache = True
+        memory.disable_radix_cache = False
+        with (
+            patch.dict(
+                sys.modules,
+                {
+                    "sglang.srt.runtime_context": f.context,
+                    "sglang.srt.mem_cache.radix_cache": SimpleNamespace(
+                        RadixCache=cached.native.RadixCache
+                    ),
+                    "sglang.srt.mem_cache.unified_radix_cache": SimpleNamespace(
+                        UnifiedRadixCache=type(cached.cache)
+                    ),
+                    "sglang.srt.mem_cache.unified_cache.component_type": SimpleNamespace(
+                        ComponentType=cached.native.ComponentType
+                    ),
+                },
+            ),
+            patch.object(f.context, "get_disagg", lambda: disagg),
+            patch.object(f.context, "get_memory", lambda: memory),
+            patch.object(
+                self.hooks.pre_layerwise.Config,
+                "from_env",
+                return_value=f.controller.config,
+            ),
+            patch.object(
+                f.ds.DSV41Controller,
+                "validate_graphs",
+                lambda c: setattr(c, "graph_fast_path", True),
+            ),
+            patch.object(pd_mesh, "enabled", return_value=False),
+            patch.object(remote_data_plane, "enabled", return_value=False),
+        ):
+            self.hooks.pre_layerwise.initialize(f.scheduler)
+        controller = f.scheduler._pre_layerwise
+        self.addCleanup(controller.decode_overlap.retirement.close)
+        self.assertIs(controller.destination_cache, cached.guard)
+        self.assertIs(f.runner._pre_layerwise, controller)
+        self.assertIs(
+            f.scheduler.request_receiver.retire_protocol,
+            controller.decode_overlap.retirement,
+        )
+        self.assertFalse(controller.decode_overlap.serial())
+
+    def test_dsv41_d_cache_pending_certificate_pins_full_without_retry_collectives(
+        self,
+    ):
+        """Admission retries cannot reacquire a different H or hold obsolete SWA."""
+        from sglang_remote_attn.destination_cache import match_prefix, send_metadata
+
+        f = self._dsv41_destination_cache()
+        f.cache.unlock(f.req.lock)
+        f.req.lock, f.req.kv.req_pool_idx = None, None
+        controller = SimpleNamespace(
+            destination_cache=f.guard,
+            tp_size=1,
+            dsv41_layerwise=True,
+            pool=SimpleNamespace(request_window=None),
+        )
+        queue = SimpleNamespace(scheduler=SimpleNamespace(_pre_layerwise=controller))
+
+        def native(queue, req):
+            req.lock = f.cache.lock(
+                1, skip_lock_components=(f.native.ComponentType.SWA,)
+            )
+            return SimpleNamespace(l1_prefix_len=8, decode_prefix_len=8)
+
+        def unaligned(queue, req):
+            native(queue, req)
+            return SimpleNamespace(l1_prefix_len=7, decode_prefix_len=7)
+
+        with self.assertRaisesRegex(RuntimeError, "TP prefix match differs"):
+            match_prefix(unaligned, queue, f.req)
+        self.assertEqual(
+            f.tree.component_protected_size_[f.native.ComponentType.FULL], 0
+        )
+
+        match_prefix(native, queue, f.req)
+        with (
+            patch.object(
+                torch.distributed,
+                "all_reduce",
+                side_effect=AssertionError("retry collective"),
+            ),
+            patch.object(
+                torch.distributed,
+                "all_gather_object",
+                side_effect=AssertionError("retry gather"),
+            ),
+        ):
+            for _ in range(8):
+                f.cache.unlock(f.req.lock)
+                f.req.lock = None
+                self.assertEqual(
+                    match_prefix(
+                        lambda *a: self.fail("new lookup"), queue, f.req
+                    ).l1_prefix_len,
+                    8,
+                )
+        f.req.kv.req_pool_idx = 0
+        sent = []
+        send_metadata(
+            lambda *a, **kw: sent.append(kw["decode_prefix_len"]),
+            queue,
+            SimpleNamespace(req=f.req),
+            [],
+            8,
+            decode_prefix_len=8,
+        )
+        self.assertEqual(sent, [8])
+        self.assertFalse(f.guard.pending)
+        lease = f.guard.hold(f.req)
+        self.assertNotIn(
+            f.native.ComponentType.SWA, lease.pin.receipt.component_lock_uuids
+        )
+        lease.abort = True
+        lease.retire(lambda: f.cache.unlock(f.req.lock))
+        self.assertEqual(
+            f.tree.component_protected_size_[f.native.ComponentType.FULL], 0
+        )
+
+    def test_dsv41_d_cache_incremental_sender_reserves_only_suffix_pages(self):
+        """Native sender cursors are relative to H, including final odd compressed rows."""
+        f = self._dsv41_receive_fixture()
+        f.req.disagg_decode_prefix_len = 8
+        f.sender.curr_idx, f.sender.num_kv_indices = 1, 4
+        path = f.controller.config.directory / "7/0/offer.json"
+        offer = self.hooks.pre_layerwise.read_json(path)
+        offer["decode_prefix_len"] = 8
+        self.hooks.pre_layerwise.write_json(path, offer)
+        with patch.dict(sys.modules, f.modules):
+            self.assertIsNotNone(f.controller.candidates(f.batch)[0])
+            source = f.controller.prepare(f.batch)[0]
+        self.assertEqual((source.index_slice.start, source.index_slice.stop), (1, 4))
+        self.assertEqual(source.indices.tolist(), [3, 4, 5])
+        self.assertEqual(source.decode_prefix_len, 8)
+        self.assertTrue(all(msg[7] == b"1" and msg[3] == b"3" for msg in f.requests))
+
+    def test_dsv41_d_cache_scatter_preserves_cached_global_indexer_and_mutable_tail(
+        self,
+    ):
+        """Suffix-relative wire offsets must never overwrite shared global/index pages."""
+        f = self._dsv41_receive_fixture(capacity=4096)
+        r = f.ring
+        r.dr.req.kv.cache_protected_len = 8
+        r.dr.req.cache_request_handle = ("scatter", 0)
+        r.dr.req._remote_attn_decode_match = (r.dr.req.cache_request_handle, 8)
+        r.manager._dsv41_progressive_pool = f.pool
+        f.pool.get_extra_key_layout = lambda layer: None
+        # Only the final page is sent; its wire cursor is suffix-relative.
+        entries = (0, 4)
+        sizes = r.manager.kv_args.kv_item_lens
+        required = sum(sizes[i] for i in entries)
+        r.allocator.buffer.buffer[:required] = 211
+        before = [t.clone() for t in f.destination]
+        f.rx.scatter(
+            None,
+            r.handler,
+            0,
+            3,
+            1,
+            r.dr,
+            r.receiver,
+            layer_ids=entries,
+            staging_bytes=required,
+        )
+        # Physical last page=3, cached prefix page=5; neither cached entry is touched.
+        for i in entries:
+            stride = sizes[i]
+            self.assertTrue(
+                torch.equal(
+                    f.destination[i][5 * stride : 6 * stride],
+                    before[i][5 * stride : 6 * stride],
+                )
+            )
+        # N=33 has no completed ratio-2 row in the last page: carry/new rows stay D-owned.
+        self.assertTrue(torch.equal(f.destination[0], before[0]))
+        self.assertTrue(
+            bool((f.destination[4][3 * sizes[4] : 4 * sizes[4]] == 211).all())
+        )
+
+        r.dr.req.kv.cache_protected_len = 16
+        with self.assertRaisesRegex(RuntimeError, "changed after native metadata"):
+            f.rx.scatter(
+                None,
+                r.handler,
+                0,
+                3,
+                1,
+                r.dr,
+                r.receiver,
+                layer_ids=entries,
+                staging_bytes=required,
+            )
+
+    def test_dsv41_d_cache_native_match_keeps_complete_swa_tail_fresh(self):
+        """A complete cached prompt must still allocate the live SWA window privately."""
+        f = self._radix()
+        warm, _ = f.request(list(range(16)), "warm-window")
+        f.release_kv_cache(warm, f.cache, checkpoint=True)
+        req = self._req()
+        req.origin_input_ids, req.output_ids = array("q", range(17)), array("q")
+        req.extra_key, req.cache_salt = None, None
+        req._compute_max_prefix_len = lambda size: size - 1
+        native = _source_function("mem_cache/common.py", "match_kv_cache")
+        radix_key = _source_function("mem_cache/common.py", "_req_radix_key")
+        radix_key.__globals__["RadixKey"] = f.RadixKey
+        native.__globals__.update(
+            MatchPrefixParams=f.MatchPrefixParams,
+            _req_radix_key=radix_key,
+            envs=SimpleNamespace(
+                SGLANG_RADIX_FORCE_MISS=SimpleNamespace(get=lambda: False)
+            ),
+        )
+        cls = _source_class(
+            "disaggregation/decode.py",
+            "DecodePreallocQueue",
+            {"_match_prefix_and_lock", "_swa_tail_len"},
+        )
+        cls._swa_tail_len.__globals__["get_disagg"] = lambda: SimpleNamespace(
+            disaggregation_decode_enable_radix_cache=True
+        )
+        cls._match_prefix_and_lock.__globals__["match_kv_cache"] = native
+        queue = cls()
+        queue._uses_swa_tail_prealloc = lambda: True
+        queue.scheduler = SimpleNamespace(sliding_window_size=8)
+        queue.token_to_kv_pool_allocator = SimpleNamespace(page_size=8)
+        queue.tree_cache = f.cache
+        queue._pre_alloc_fill_len = lambda r: 17
+        queue._build_decode_prefix_match = lambda req, result, **kw: result
+        result = queue._match_prefix_and_lock(req)
+        self.assertEqual(
+            result.device_prefix_len, 8
+        )  # Native caps a 16-token tree hit.
+        self.assertEqual(queue._swa_tail_len(17), 9)
+        f.cache.unlock(req.lock)
+
+    def test_dsv41_d_cache_request_window_metadata_uses_native_request_row_indices(
+        self,
+    ):
+        """SWA ring ownership cannot be inferred from the cached FULL page map."""
+        from sglang_remote_attn.dsv41_receive import cache_metadata
+
+        cls = _source_class(
+            "mem_cache/dsv41_request_window.py",
+            "RequestWindow",
+            {"row_loc", "page_indices"},
+        )
+        cls.page_indices.__globals__["torch"] = torch
+        window = cls()
+        window.page_size, window.capacity = 8, 24
+        pool = SimpleNamespace(request_window=window, page_size=8, sliding_window=16)
+        controller = SimpleNamespace(dsv41_layerwise=True, pool=pool)
+        queue = SimpleNamespace(
+            scheduler=SimpleNamespace(_pre_layerwise=controller),
+            kv_manager=SimpleNamespace(
+                kv_args=SimpleNamespace(state_types=["swa", "carry"])
+            ),
+        )
+        dr = SimpleNamespace(
+            req=SimpleNamespace(
+                origin_input_ids=list(range(41)),
+                kv=SimpleNamespace(cache_protected_len=8, req_pool_idx=2),
+            )
+        )
+        carry = object()
+        native_payload = [object(), carry]
+        with patch.dict(
+            sys.modules,
+            {
+                "sglang.srt.disaggregation.base.conn": SimpleNamespace(
+                    StateType=SimpleNamespace(SWA="swa")
+                )
+            },
+        ):
+            result = cache_metadata(queue, dr, native_payload)
+        self.assertEqual(
+            result[0].tolist(), [6, 7, 8]
+        )  # slot2, positions24/32/40 wrap.
+        self.assertIs(result[1], carry)
+        self.assertIsNot(result, native_payload)
+
+    def test_dsv41_d_cache_sparse_reads_cached_prefix_locally_before_global_switch(
+        self,
+    ):
+        """A cached selected slot stays Local while only the missing suffix uses P."""
+        from sglang_remote_attn import dsv41_sparse_math as math
+
+        f = self._dsv41_remote_support().fixture(ROOT, "cpu")
+        calls = []
+
+        def rpc(query, positions, layer, ratio, scale):
+            calls.append(positions)
+            ids = torch.tensor([f.p_pages[p // 4] * 4 + p % 4 for p in positions])
+            keys = math.read_slots(
+                f.p_pool.get_extra_key_buffer(layer), ids, 4, f.layout.V41_FP4
+            )
+            return math.partial(query, keys, scale)
+
+        target = SimpleNamespace(prefix_len=33, decode_prefix_len=8, call=rpc)
+        f.controller.remote_targets[0] = target
+        selected = f.core.c2_sparse_page_indices[0, :4]
+        keys = math.read_slots(
+            f.d_pool.get_extra_key_buffer(3), selected, 4, f.layout.V41_FP4
+        )
+        swa = math.read_slots(
+            f.d_pool.get_swa_key_buffer_radix(3),
+            torch.tensor([13, 14]),
+            8,
+            f.layout.V41,
+        )
+        expected = math.partial(f.query[0], torch.cat((swa, keys)), 512**-0.5, f.sink)[
+            0
+        ].to(f.query.dtype)
+        # Corrupt P's cached page; reading it remotely would change the answer.
+        f.p_pool.get_extra_key_buffer(3)[f.p_pages[0]].zero_()
+        kv = torch.zeros(1, 512)
+        got = f.remote.attention(
+            None,
+            f.backend,
+            f.query,
+            kv,
+            kv,
+            SimpleNamespace(layer_id=3),
+            f.fb,
+            2,
+            attn_sink=f.sink,
+        )
+        self.assertEqual(calls, [[15, 15]])  # Preserve native repeated top-k entries.
+        torch.testing.assert_close(got[0], expected, atol=0.015625, rtol=0.01)
+
     def test_dsv41_prefix_cache_pin_keeps_full_swa_receipt_valid_across_split(self):
         f = self._dsv41_cache()
         req = SimpleNamespace(
@@ -8747,7 +9151,7 @@ class TestRemoteAttn(CustomTestCase):
             patch.dict(sys.modules, {"sglang.srt.runtime_context": f.context}),
             patch.object(f.context, "get_memory", lambda: memory),
         ):
-            f.controller.validate()  # P enabled cache is accepted; D remains gated.
+            f.controller.validate()  # P keeps its existing cache path.
         f.scheduler.disaggregation_mode = SimpleNamespace(value="decode")
         memory = f.context.get_memory()
         memory.disable_radix_cache = False
@@ -8755,7 +9159,16 @@ class TestRemoteAttn(CustomTestCase):
             patch.dict(sys.modules, {"sglang.srt.runtime_context": f.context}),
             patch.object(f.context, "get_memory", lambda: memory),
         ):
-            with self.assertRaisesRegex(ValueError, "disable-radix-cache on D"):
+            with self.assertRaisesRegex(ValueError, "native decode radix opt-in"):
+                f.controller.validate()
+            original = f.context.get_disagg
+            with patch.object(
+                f.context,
+                "get_disagg",
+                lambda: SimpleNamespace(
+                    **vars(original()), disaggregation_decode_enable_radix_cache=True
+                ),
+            ):
                 f.controller.validate()
         f.pool.uniform_fp8 = True
         with self.assertRaisesRegex(ValueError, "non-unified FlashMLA"):
@@ -9348,7 +9761,10 @@ class TestRemoteAttn(CustomTestCase):
 
         f = self._dsv41_fixture()
         req = SimpleNamespace(
-            origin_input_ids=list(range(33)), bootstrap_room=7, finished=lambda: False
+            origin_input_ids=list(range(33)),
+            bootstrap_room=7,
+            finished=lambda: False,
+            kv=SimpleNamespace(cache_protected_len=8),
         )
         dr = SimpleNamespace(
             req=req,
@@ -9373,10 +9789,13 @@ class TestRemoteAttn(CustomTestCase):
             owner=owner,
         )
         write = self.hooks.pre_layerwise.write_json
-        write(offer.path / "sparse-ready.json", dict(generation="g", prefix_len=33))
+        write(
+            offer.path / "sparse-ready.json",
+            dict(generation="g", prefix_len=33, decode_prefix_len=8),
+        )
         write(
             offer.path / "remote-service.json",
-            dict(generation="g", prefix_len=33, route={}),
+            dict(generation="g", prefix_len=33, decode_prefix_len=8, route={}),
         )
         modules = {
             "sglang.srt.disaggregation.base.conn": SimpleNamespace(
@@ -9573,6 +9992,16 @@ class TestRemoteAttn(CustomTestCase):
         self,
     ):
         """Decode can run before global Success; cancellation cannot free that row."""
+        self._check_dsv41_progressive_retirement(with_cache=False, cancel=True)
+
+    def test_dsv41_d_cache_progressive_graph_overlap_publish_and_cancel_boundaries(
+        self,
+    ):
+        for cancel in (False, True):
+            with self.subTest(cancel=cancel):
+                self._check_dsv41_progressive_retirement(with_cache=True, cancel=cancel)
+
+    def _check_dsv41_progressive_retirement(self, *, with_cache, cancel):
         from sglang_remote_attn import dsv41_progressive as pg
         from sglang_remote_attn.decode_overlap import BatchProof, DecodeOverlap
         from sglang_remote_attn.pre_layerwise import Controller, write_json
@@ -9605,6 +10034,12 @@ class TestRemoteAttn(CustomTestCase):
                 kv=SimpleNamespace(req_pool_idx=0),
                 finished=lambda: False,
             )
+            if with_cache:
+                cached = self._dsv41_destination_cache()
+                req = cached.req
+                req.finished = lambda: False
+                owner.destination_cache = cached.guard
+            prefix = 8 if with_cache else 0
             dr = SimpleNamespace(
                 req=req,
                 kv_receiver=receiver,
@@ -9639,9 +10074,12 @@ class TestRemoteAttn(CustomTestCase):
             owner.offer = lambda queue, dr: offer
             write_json(
                 path / "remote-service.json",
-                dict(generation="g", prefix_len=33, route={}),
+                dict(generation="g", prefix_len=33, decode_prefix_len=prefix, route={}),
             )
-            write_json(path / "sparse-ready.json", dict(generation="g", prefix_len=33))
+            write_json(
+                path / "sparse-ready.json",
+                dict(generation="g", prefix_len=33, decode_prefix_len=prefix),
+            )
             with patch.dict(
                 sys.modules,
                 {
@@ -9657,6 +10095,41 @@ class TestRemoteAttn(CustomTestCase):
                 self.assertIs(dr.kv_receiver, receiver)
                 self.assertTrue(overlap.serial())
                 target = req._pre_layerwise_target
+                if with_cache:
+                    from sglang_remote_attn.segmented_graph import RemoteGraphBackend
+
+                    backend = RemoteGraphBackend.__new__(RemoteGraphBackend)
+                    backend.supports_remote = lambda batch: batch.bs in (1, 2, 4, 8, 16)
+                    graph = SimpleNamespace(
+                        model_runner=SimpleNamespace(_pre_layerwise=owner),
+                        backend=backend,
+                    )
+                    context = SimpleNamespace(
+                        get_parallel=lambda: SimpleNamespace(tp_rank=0, tp_size=1)
+                    )
+
+                    def graph_check(all_local):
+                        with (
+                            patch.dict(
+                                sys.modules, {"sglang.srt.runtime_context": context}
+                            ),
+                            patch.object(
+                                torch.distributed,
+                                "all_reduce",
+                                side_effect=AssertionError("graph steady-state vote"),
+                            ),
+                        ):
+                            for bs in (1, 2, 4, 8, 16):
+                                self.assertTrue(
+                                    self.hooks._decode_graph(
+                                        lambda *a: True, graph, SimpleNamespace(bs=bs)
+                                    )
+                                )
+                                self.assertEqual(
+                                    graph._remote_attn_graph_verdict, (True, all_local)
+                                )
+
+                    graph_check(False)
                 proof = BatchProof(
                     result=SimpleNamespace(
                         delay_sample_func=None,
@@ -9667,11 +10140,24 @@ class TestRemoteAttn(CustomTestCase):
                 target.forward_proofs.append(proof)
                 target.forward_count = 1
                 freed = []
-                self.assertTrue(
-                    self.hooks.pre_layerwise.defer_release(
-                        req, lambda: freed.append("KV")
+                if cancel:
+                    if with_cache:
+                        cached.cache.finish(
+                            req.cache_request_handle,
+                            cached.native.CacheRequestOutcome.ABORT,
+                        )
+
+                    def release():
+                        freed.append("KV")
+                        if with_cache:
+                            cached.cache.unlock(req.lock)
+
+                    self.assertTrue(
+                        self.hooks.pre_layerwise.defer_release(req, release)
                     )
-                )
+                if with_cache:
+                    graph_check(False)
+                    self.assertEqual(cached.operations, [])
                 self.assertFalse(target.rpc.closed)
                 self.assertEqual(freed, [])
                 self.assertEqual(overlap.retirement.final_votes, 0)
@@ -9692,7 +10178,7 @@ class TestRemoteAttn(CustomTestCase):
                     "sglang_remote_attn.pre_layerwise._runtime", return_value=runtime
                 ):
                     protocol.finalize()
-                self.assertEqual(freed, ["KV"])
+                self.assertEqual(freed, ["KV"] if cancel else [])
                 self.assertEqual(finished, ["ring", "receiver", "metadata"])
                 self.assertIsNone(dr.kv_receiver)
                 self.assertEqual(owner.targets, [])
@@ -9704,6 +10190,21 @@ class TestRemoteAttn(CustomTestCase):
                 for _ in range(32):
                     protocol.observe()
                 self.assertEqual(protocol.final_votes, 2)
+                if with_cache:
+                    self.assertTrue(target.cache_lease.closed)
+                    graph_check(True)
+                    self.assertEqual(protocol.cache_votes, 1)
+                    self.assertEqual(
+                        cached.operations, ["finish"] if cancel else ["checkpoint"]
+                    )
+                    if not cancel:
+                        cached.cache.unlock(req.lock)
+                    self.assertEqual(
+                        cached.tree.component_protected_size_[
+                            cached.native.ComponentType.FULL
+                        ],
+                        0,
+                    )
 
     def test_dsv41_progressive_http_snapshot_needs_all_tp_barriers_without_kv_mutation(
         self,

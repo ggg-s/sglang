@@ -111,7 +111,8 @@ H2D event 与原生 receiver/metadata 的完成证明。
 
 - `model_type=deepseek_v41`，原生非 unified FlashMLA 池，compression ratio 0/1/2。
   原生 SWA paged/request-window 状态由原生 final-chunk 接口处理。
-- 两端均 `--language-model-only`，D 保留 `--disable-radix-cache`；P 支持原生
+- 两端均 `--language-model-only`，D 可按 [D 缓存接入](DSV41-D-CACHE-ZH.md)
+  显式开启原生增量 PD radix cache；P 支持原生
   UnifiedRadixCache 的设备内 FULL/SWA 前缀缓存和 scheduler overlap。
   不启用 LoRA、HiCache、PD multiplexing、mixed chunk 或 whole-prefix checksum。
 - 保留 D 原生 full graph/overlap。只有实际参与 layerwise 的 P forward 走 eager，
@@ -180,7 +181,7 @@ D 终端：
 export HANDOFF_CTL_DIR=/workspace/remote-attn/dsv41-run-001/control/decode
 export HANDOFF_PRE_LAYERWISE_RECV_HOST_STAGING=1
 python -m sglang.launch_server "${D_NATIVE_ARGS[@]}" \
-  --language-model-only --disable-radix-cache
+  --language-model-only --disaggregation-decode-enable-radix-cache
 ```
 
 P/D 必须在 prefill 期间完成目的端分配；首版不使用
@@ -227,7 +228,7 @@ overlap/full graph 路径保持不变。P 可启用下面的前缀缓存；DSpar
 
 P 可删除原生 `--disable-radix-cache`，无需新增插件变量。仅支持原生
 `UnifiedRadixCache` 的设备内 FULL 或 FULL+SWA 组件；session refs、Mamba/C128
-等其他组件、HiCache、linker 和 unified KV 仍不开放。D 缓存保持关闭。
+等其他组件、HiCache、linker 和 unified KV 仍不开放。D 缓存已复用公共保护层接入，见 [专用说明](DSV41-D-CACHE-ZH.md)。
 
 - FULL 页同时覆盖对应的压缩 global KV、indexer payload/scale 的物理页归属；
   原生树锁一起锁住 FULL/SWA 组件，SWA 锁回执在节点 split 后仍按原生 UUID 边界释放。

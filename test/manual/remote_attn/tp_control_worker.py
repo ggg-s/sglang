@@ -1424,7 +1424,7 @@ def sparse_remote_lifetimes(args):
         protocol.close()
 
 
-def sparse_progressive_lifetimes(args):
+def sparse_progressive_lifetimes(args, *, prefix_cache=False):
     """Real TP2 commands, staggered scatter/GPU and cancellation release edges."""
     import torch
     from sglang_remote_attn import dsv41_progressive as pg
@@ -1475,6 +1475,40 @@ def sparse_progressive_lifetimes(args):
         native_staging=True,
         rpc=rpc,
     )
+    pins, published = set(), []
+    if prefix_cache:
+        from sglang_remote_attn.destination_cache import Guard, key
+
+        def lock(node):
+            pin = object()
+            pins.add(pin)
+            return pin
+
+        cache = SimpleNamespace(
+            lock=lock,
+            unlock=pins.remove,
+            checkpoint=lambda req, **kw: published.append(kw["up_to"]),
+            finish=lambda *a: None,
+            reset=lambda: None,
+        )
+        guard = owner.destination_cache = Guard(cache, page_size=8)
+        req = dr.req
+        req.origin_input_ids, req.extra_key, req.cache_salt = (
+            list(range(33)),
+            None,
+            None,
+        )
+        req.cache_request_handle = ("sparse-cached", 0)
+        req.kv.cache_protected_len = target.decode_prefix_len = 8
+        req.last_node, req.lock = 1, lock(1)
+        req.refresh_fill_ids, req.owned_kv_len = lambda: None, lambda: 33
+        req._remote_attn_decode_match = (
+            req.cache_request_handle,
+            8,
+            key(req),
+            req.lock,
+        )
+        target.cache_lease = guard.hold(req)
     resources = [pg.Resource(target, i, i + 1) for i in (0, 1)]
     target.resources = resources
     target.admission_id = 3
@@ -1542,10 +1576,18 @@ def sparse_progressive_lifetimes(args):
             assert rpc.local_entries == {0, 1} and votes == [5, 5]
             status[0] = 4
             if args.rank == 0:
+                if prefix_cache:
+                    from sglang_remote_attn.destination_cache import suppress
+
+                    suppress(dr.req)
                 target.release = lambda: freed.append("KV")
             stable()
             dist.barrier()  # Release mismatch never frees or votes per loop.
             if args.rank == 1:
+                if prefix_cache:
+                    from sglang_remote_attn.destination_cache import suppress
+
+                    suppress(dr.req)
                 target.release = lambda: freed.append("KV")
             command()  # Both release, but one or both GPU proofs still pending.
             assert not freed and votes == [5, 5, 5]
@@ -1562,6 +1604,10 @@ def sparse_progressive_lifetimes(args):
             io_done[0] = True
             command()
             assert freed == ["KV"] and not owner.targets and not owner.remote_targets
+            if prefix_cache:
+                assert target.cache_lease.closed and not published
+                cache.unlock(dr.req.lock)
+                assert not pins and protocol.cache_votes == 1
             stable()
             assert overlap.serial()  # Final Remote result boundary.
             assert not overlap.serial()
@@ -1572,6 +1618,15 @@ def sparse_progressive_lifetimes(args):
                 retries=protocol.retries,
                 closed=len(closed),
                 stable_votes=0,
+                **(
+                    dict(
+                        cache_votes=protocol.cache_votes,
+                        pins_closed=not pins,
+                        published=published,
+                    )
+                    if prefix_cache
+                    else {}
+                ),
             )
     finally:
         protocol.close()
@@ -2168,6 +2223,9 @@ def main():
         d_receive_staging = receive_staging_consensus(args)
         sparse_remote = sparse_remote_lifetimes(args)
         sparse_progressive = sparse_progressive_lifetimes(args)
+        sparse_cached_progressive = sparse_progressive_lifetimes(
+            args, prefix_cache=True
+        )
         dsv41_segments = dsv41_graph_settings(args)
         d_cache = decode_cache_lifetimes(args)
         Path(args.output).write_text(
@@ -2188,6 +2246,7 @@ def main():
                     "d_receive_staging": d_receive_staging,
                     "sparse_remote": sparse_remote,
                     "sparse_progressive": sparse_progressive,
+                    "sparse_cached_progressive": sparse_cached_progressive,
                     "dsv41_segments": dsv41_segments,
                     "d_cache": d_cache,
                     "segmented_startup": startup,

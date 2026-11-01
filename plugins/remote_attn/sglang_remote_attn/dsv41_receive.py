@@ -103,6 +103,49 @@ def selected(manager, indices):
     return indices
 
 
+def prefix_pages(dr, page):
+    from .destination_cache import lease_for
+
+    lease = lease_for(dr.req)
+    if lease is not None:
+        lease.check()
+    prefix = int(getattr(dr.req.kv, "cache_protected_len", 0))
+    if prefix < 0 or prefix > len(dr.req.origin_input_ids) or prefix % page:
+        raise ValueError("DSV4.1 cached prefix is not native page aligned")
+    stamp = getattr(dr.req, "_remote_attn_decode_match", None)
+    if prefix and (stamp is None or stamp[:2] != (dr.req.cache_request_handle, prefix)):
+        raise RuntimeError("DSV4.1 cached prefix changed after native metadata")
+    return prefix // page
+
+
+def cache_metadata(queue, dr, state_indices):
+    """Request-window SWA uses request rows, never the FULL page mapping."""
+    controller = getattr(queue.scheduler, "_pre_layerwise", None)
+    if not getattr(controller, "dsv41_layerwise", False):
+        return state_indices
+    window = controller.pool.request_window
+    if window is None:
+        return state_indices
+    from sglang.srt.disaggregation.base.conn import StateType
+
+    types = queue.kv_manager.kv_args.state_types
+    if (
+        types.count(StateType.SWA) != 1
+        or state_indices is None
+        or len(types) != len(state_indices)
+    ):
+        raise ValueError("DSV4.1 request window requires one native SWA payload")
+    seq_len = len(dr.req.origin_input_ids)
+    start = max(dr.req.kv.cache_protected_len, seq_len - controller.pool.sliding_window)
+    page = controller.pool.page_size
+    start = start // page * page
+    updated = list(state_indices)
+    updated[types.index(StateType.SWA)] = window.page_indices(
+        int(dr.req.kv.req_pool_idx), start, seq_len
+    )
+    return updated
+
+
 def send_group(original, manager, req, chunk, target_info, offset, executor):
     if getattr(manager, "_dsv41_layerwise_schema", None) is None:
         return original(manager, req, chunk, target_info, offset, executor)
@@ -166,6 +209,7 @@ def allocate(original, manager, msg):
         entries = selected(manager, struct.unpack(f"{len(msg[6]) // 8}Q", msg[6]))
         start = int(msg[7].decode("ascii"))
         page = manager.kv_args.page_size
+        cached = prefix_pages(dr, page)
         if (
             index < 0
             or index >= len(manager.kv_args.kv_item_lens)
@@ -175,8 +219,8 @@ def allocate(original, manager, msg):
             or receiver.prefill_info.pp_size != 1
             or start < 0
             or pages <= 0
-            or start + pages != (len(dr.req.origin_input_ids) + page - 1) // page
-            or dr.req.kv.cache_protected_len != 0
+            or cached + start + pages
+            != (len(dr.req.origin_input_ids) + page - 1) // page
         ):
             raise ValueError("invalid DSV4.1 final-chunk staging envelope")
         descriptor = (entries, start, pages)
@@ -268,6 +312,8 @@ def scatter(
     entries = selected(manager, layer_ids or ())
     required = num_pages * sum(manager.kv_args.kv_item_lens[i] for i in entries)
     allocator = handler.staging_allocator
+    page = manager.kv_args.page_size
+    cached = prefix_pages(decode_req, page)
     if (
         staging_bytes != required
         or required <= 0
@@ -275,7 +321,10 @@ def scatter(
         or staging_offset + required > allocator.total_size
         or receiver.prefill_info.attn_tp_size != handler.decode_tp
         or receiver.prefill_info.pp_size != 1
-        or decode_req.req.kv.cache_protected_len != 0
+        or page_start < 0
+        or num_pages <= 0
+        or cached + page_start + num_pages
+        != (len(decode_req.req.origin_input_ids) + page - 1) // page
     ):
         raise ValueError("DSV4.1 scatter layout mismatch")
     handler.device_module.set_device(handler.gpu_id)
@@ -289,12 +338,12 @@ def scatter(
         host = allocator.buffer.buffer[staging_offset:end]
         gpu = allocator.buffer.gpu_buffer[staging_offset:end]
         gpu.copy_(host, non_blocking=True)
-        page = manager.kv_args.page_size
         row = handler.scheduler.req_to_token_pool.req_to_token
         page_ids = (
             row[
                 decode_req.req.kv.req_pool_idx,
-                page_start * page : (page_start + num_pages) * page : page,
+                (cached + page_start) * page : (cached + page_start + num_pages)
+                * page : page,
             ]
             // page
         ).to(torch.int64)
@@ -315,7 +364,7 @@ def scatter(
                     dst,
                     src,
                     page_ids,
-                    page_start,
+                    cached + page_start,
                     len(decode_req.req.origin_input_ids),
                     page,
                     entry[1],

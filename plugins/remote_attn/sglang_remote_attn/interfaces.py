@@ -213,7 +213,13 @@ CORE_CALLS = {
         "up_to": inspect.Parameter.empty
     },
     "sglang.srt.mem_cache.unified_radix_cache.UnifiedRadixCache.lock": {
-        "node_id": inspect.Parameter.empty
+        "node_id": inspect.Parameter.empty,
+        "skip_lock_components": (),
+    },
+    "sglang.srt.mem_cache.dsv41_request_window.RequestWindow.page_indices": {
+        "slot": inspect.Parameter.empty,
+        "start": inspect.Parameter.empty,
+        "end": inspect.Parameter.empty,
     },
     "sglang.srt.mem_cache.unified_radix_cache.UnifiedRadixCache.unlock": {
         "lock": inspect.Parameter.empty
