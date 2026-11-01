@@ -379,6 +379,496 @@ class TestRemoteAttn(CustomTestCase):
 
         return SimpleNamespace(cache=cache, allocator=allocator, request=request, **ns)
 
+    def _destination_cache_target(self, directory):
+        from sglang_remote_attn.destination_cache import Guard, key
+
+        f = self._radix()
+        warm, _ = f.request([1, 2], "warm-d")
+        f.release_kv_cache(warm, f.cache, checkpoint=True)
+        req, indices = f.request([1, 2, 3, 4], "decode-cache")
+        req.bootstrap_room = 71
+        req.finished = lambda: False
+        req._remote_attn_decode_match = (
+            req.cache_request_handle,
+            2,
+            key(req),
+            req.lock,
+        )
+        guard = Guard(f.cache)
+        lease = guard.hold(req)
+        controller, target, freed = self._overlap_target(directory, req)
+        controller.destination_cache = guard
+        controller.scheduler.tree_cache = f.cache
+        target.cache_lease = lease
+        target.decode_prefix_len = 2
+        target.coverage = self.hooks.pre_layerwise.LayerCoverage(4, 2)
+        for layer in range(2):
+            target.coverage.complete(layer, 0, 2)
+
+        def complete():
+            target.decode_req.kv_receiver.done = True
+            for layer in range(2):
+                self.hooks.pre_layerwise.write_json(
+                    target.path / f"layer-{layer}.json",
+                    dict(generation="g", layer=layer, start=2, end=4),
+                )
+
+        f.req, f.indices, f.guard, f.lease = req, indices, guard, lease
+        f.controller, f.target, f.complete = controller, target, complete
+        return f
+
+    def test_d_cache_native_prefix_match_and_prealloc_use_only_incremental_indices(
+        self,
+    ):
+        """Native cached pages stay shared; PD receives only fresh suffix indices."""
+        from sglang_remote_attn.destination_cache import (
+            Guard,
+            match_prefix,
+            send_metadata,
+        )
+
+        f = self._radix()
+        warm, cached = f.request([1, 2], "warm-native-d")
+        f.release_kv_cache(warm, f.cache, checkpoint=True)
+        req = self._req()
+        req.rid, req.bootstrap_room = "native-d", 91
+        req.origin_input_ids, req.output_ids = array("q", [1, 2, 3, 4]), array("q")
+        req.extra_key, req.cache_salt, req.priority = None, None, 0
+        req.cache_request_handle = f.CacheRequestHandle(req.rid, 0)
+        req.lock = None
+        req.owned_kv_len = lambda: 4
+        req.finished = lambda: False
+        req._compute_max_prefix_len = lambda size: size - 1
+        native_match = _source_function("mem_cache/common.py", "match_kv_cache")
+        radix_key = _source_function("mem_cache/common.py", "_req_radix_key")
+        radix_key.__globals__["RadixKey"] = f.RadixKey
+        native_match.__globals__.update(
+            MatchPrefixParams=f.MatchPrefixParams,
+            _req_radix_key=radix_key,
+            envs=SimpleNamespace(
+                SGLANG_RADIX_FORCE_MISS=SimpleNamespace(get=lambda: False)
+            ),
+        )
+        Queue = _source_class(
+            "disaggregation/decode.py",
+            "DecodePreallocQueue",
+            {"_match_prefix_and_lock", "_pre_alloc", "_alloc_for_decode_prealloc"},
+        )
+        prefix = _source_class(
+            "disaggregation/decode_hicache_mixin.py", "DecodePrefixMatch"
+        )
+        build = _source_class(
+            "disaggregation/decode_hicache_mixin.py",
+            "DecodeHiCachePreallocMixin",
+            {"_build_decode_prefix_match"},
+        )
+        build._build_decode_prefix_match.__globals__["DecodePrefixMatch"] = prefix
+        Queue._build_decode_prefix_match = build._build_decode_prefix_match
+        alloc = _source_function(
+            "disaggregation/decode.py", "alloc_for_decode_prealloc"
+        )
+        ns = Queue._pre_alloc.__globals__
+        ns.update(
+            match_kv_cache=native_match,
+            alloc_for_decode_prealloc=alloc,
+            get_disagg=lambda: SimpleNamespace(
+                disaggregation_decode_enable_radix_cache=True
+            ),
+        )
+        queue_ = Queue()
+        guard = Guard(f.cache)
+        queue_.scheduler = SimpleNamespace(
+            _pre_layerwise=SimpleNamespace(destination_cache=guard, tp_size=1),
+            enable_decode_hicache=False,
+            enable_hisparse=False,
+        )
+        queue_.tree_cache = f.cache
+        queue_.req_to_token_pool = f.cache.req_to_token_pool
+        queue_.token_to_kv_pool_allocator = f.allocator
+        queue_._uses_swa_tail_prealloc = lambda: False
+        queue_._swa_tail_len = lambda fill: fill
+        queue_._pre_alloc_fill_len = lambda req: len(req.origin_input_ids)
+        queue_._required_alloc_tokens = lambda **kw: kw["fill_len"] - kw["prefix_len"]
+        queue_._radix_full_available = f.allocator.available_size
+        result = match_prefix(Queue._match_prefix_and_lock, queue_, req)
+        self.assertEqual((result.l1_prefix_len, result.decode_prefix_len), (2, 2))
+        # Failed capacity admission unlocks the native request pin. The pending
+        # certificate keeps this exact hit alive and retries without lookup/TP.
+        for _ in range(8):
+            f.cache.unlock(req.lock)
+            req.lock = None
+            self.assertIs(
+                match_prefix(
+                    lambda *a: self.fail("repeated native cache lookup"), queue_, req
+                ),
+                result,
+            )
+        before = f.allocator.available_size()
+        delta = queue_._pre_alloc(req, result.prefix_indices, 2, 2)
+        self.assertEqual(delta.numel(), 2)
+        self.assertEqual(before - f.allocator.available_size(), 2)
+        self.assertEqual(
+            f.cache.req_to_token_pool.req_to_token[req.kv.req_pool_idx, :2].tolist(),
+            cached.tolist(),
+        )
+        self.assertTrue(set(delta.tolist()).isdisjoint(cached.tolist()))
+        # Native pop_preallocated sets this after _pre_alloc, before metadata.
+        req.kv.cache_protected_len = 2
+        sent = []
+        metadata = lambda *a, **kw: sent.append(
+            (a[2].tolist(), kw["decode_prefix_len"])
+        )
+        with self.assertRaisesRegex(RuntimeError, "changed before"):
+            send_metadata(
+                metadata,
+                queue_,
+                SimpleNamespace(req=req),
+                delta,
+                1,
+                decode_prefix_len=1,
+            )
+        self.assertEqual(sent, [])
+        send_metadata(
+            metadata, queue_, SimpleNamespace(req=req), delta, 1, decode_prefix_len=2
+        )
+        self.assertEqual(sent, [(delta.tolist(), 2)])
+        self.assertEqual(guard.pending, {})
+        lease = guard.hold(req)
+        self.assertEqual(lease.prefix, 2)
+        lease.abort = True
+        req.skip_radix_cache_insert = False
+        lease.retire(lambda: f.release_kv_cache(req, f.cache, checkpoint=False))
+        pending_req = copy.copy(req)
+        pending_req.kv, pending_req.lock = self.Kv(), None
+        pending_req.cache_request_handle = f.CacheRequestHandle("cancel-pending", 0)
+        pending_req.rid = "cancel-pending"
+        match_prefix(Queue._match_prefix_and_lock, queue_, pending_req)
+        self.assertEqual(len(guard.pending), 1)
+        f.cache.finish(pending_req.cache_request_handle, f.CacheRequestOutcome.ABORT)
+        self.assertEqual(guard.pending, {})
+        self.assertIsNone(pending_req.lock)
+        f.cache.evict(f.EvictParams(num_tokens=32))
+        self.assertEqual(f.allocator.available_size(), 32)
+
+    def test_d_cache_publish_waits_for_transport_gpu_and_ordered_retirement(self):
+        """Half-local KV must not become cache-visible or be deduped under DMA."""
+        from sglang_remote_attn.decode_overlap import BatchProof
+
+        with tempfile.TemporaryDirectory() as directory:
+            f = self._destination_cache_target(directory)
+            req, target = f.req, f.target
+            # Prompt publication is armed by admission itself, not dependent
+            # on a running decode request calling checkpoint before finish.
+            self.assertEqual(f.lease.pending, 4)
+            hit = lambda: f.cache.match_prefix(
+                f.MatchPrefixParams(f.RadixKey(array("q", [1, 2, 3, 4])))
+            )
+            self.assertEqual(hit().device_prefix_len, 2)
+            f.cache.evict(f.EvictParams(num_tokens=32))
+            self.assertTrue(
+                set(f.indices.tolist()).isdisjoint(f.allocator.free_pages.tolist())
+            )
+            with self.assertRaisesRegex(RuntimeError, "cannot reset"):
+                f.cache.reset()
+            # A concurrent complete request inserts canonical suffix pages.
+            other, canonical = f.request([1, 2, 3, 4], "canonical-d")
+            f.release_kv_cache(other, f.cache, checkpoint=True)
+            self.assertNotEqual(f.indices[2:].tolist(), canonical[2:].tolist())
+            ready = [False]
+            target.forward_proofs.append(
+                BatchProof(
+                    result=SimpleNamespace(
+                        delay_sample_func=None,
+                        copy_done=SimpleNamespace(query=lambda: ready[0]),
+                    )
+                )
+            )
+            protocol = f.controller.decode_overlap.retirement
+            for _ in range(16):
+                self.assertIsNone(self._retire_step(f.controller))
+            self.assertEqual(protocol.final_votes, 0)
+            f.complete()
+            self._retire_step(f.controller)
+            self.assertFalse(target.closed)
+            self.assertEqual(
+                f.cache.req_to_token_pool.req_to_token[
+                    req.kv.req_pool_idx, :4
+                ].tolist(),
+                f.indices.tolist(),
+            )
+            ready[0] = True
+            self._retire_step(f.controller)
+            self.assertTrue(target.closed and f.lease.closed)
+            done = self.hooks.pre_layerwise.read_json(target.path / "done.json")
+            self.assertTrue(
+                done["d_cache_tp_committed"] and done["d_cache_guard_closed"]
+            )
+            self.assertEqual(
+                (done["d_cached_prefix_tokens"], done["d_cache_retained_tokens"]),
+                (2, 4),
+            )
+            self.assertEqual(
+                f.cache.req_to_token_pool.req_to_token[
+                    req.kv.req_pool_idx, :4
+                ].tolist(),
+                canonical.tolist(),
+            )
+            before = protocol.final_votes
+            for _ in range(32):
+                self._retire_step(f.controller)
+            self.assertEqual(protocol.final_votes, before)
+            f.release_kv_cache(req, f.cache, checkpoint=True)
+            f.cache.evict(f.EvictParams(num_tokens=32))
+            self.assertEqual(f.allocator.available_size(), 32)
+            self.assertEqual(len(set(f.allocator.free_pages.tolist())), 32)
+
+    def test_d_cache_cancel_is_sticky_and_native_release_frees_only_private_pages(self):
+        """Cancel during Remote must drain writes and never publish its suffix."""
+        with tempfile.TemporaryDirectory() as directory:
+            f = self._destination_cache_target(directory)
+            f.cache.checkpoint(f.req, up_to=4)
+            hit = f.cache.match_prefix(
+                f.MatchPrefixParams(f.RadixKey(array("q", [1, 2, 3, 4])))
+            )
+            self.assertEqual(hit.device_prefix_len, 2)  # No publication under DMA.
+            f.cache.finish(f.req.cache_request_handle, f.CacheRequestOutcome.ABORT)
+            f.cache.finish(f.req.cache_request_handle, f.CacheRequestOutcome.SUCCESS)
+            self.hooks._release_kv(f.release_kv_cache, f.req, f.cache, checkpoint=False)
+            self.assertIsNone(self._retire_step(f.controller))
+            self.assertFalse(f.req.kv.is_kv_released)
+            f.complete()
+            self._retire_step(f.controller)
+            self.assertTrue(f.req.kv.is_kv_released and f.lease.closed)
+            f.cache.checkpoint(
+                f.req, up_to=4
+            )  # Late checkpoint after ABORT is ignored.
+            hit = f.cache.match_prefix(
+                f.MatchPrefixParams(f.RadixKey(array("q", [1, 2, 3, 4])))
+            )
+            self.assertEqual(hit.device_prefix_len, 2)
+            self.hooks._release_kv(f.release_kv_cache, f.req, f.cache, checkpoint=True)
+            f.cache.evict(f.EvictParams(num_tokens=32))
+            self.assertEqual(f.allocator.available_size(), 32)
+            self.assertEqual(len(set(f.allocator.free_pages.tolist())), 32)
+
+    def test_d_cache_stale_retirement_intent_retries_only_after_new_state(self):
+        """A queued publish command cannot override a later cancellation."""
+        with tempfile.TemporaryDirectory() as directory:
+            f = self._destination_cache_target(directory)
+            f.cache.checkpoint(f.req, up_to=4)
+            f.complete()
+            command = self._retire_step(f.controller, finalize=False)
+            self.assertIsNotNone(command)
+            self.hooks._release_kv(f.release_kv_cache, f.req, f.cache, checkpoint=False)
+            protocol = f.controller.decode_overlap.retirement
+            protocol.finalize()
+            self.assertFalse(f.target.closed)
+            self.assertEqual(protocol.retries, 1)
+            self._retire_step(f.controller)
+            self.assertTrue(f.target.closed and f.req.kv.is_kv_released)
+            self.assertEqual(protocol.final_votes, 2)
+            f.cache.evict(f.EvictParams(num_tokens=32))
+            self.assertEqual(f.allocator.available_size(), 32)
+
+    def test_d_cache_checkpoint_failure_quarantines_pin_and_rejects_attempt_reuse(self):
+        """Partial native cache mutation is not retryable or proof of release."""
+        with tempfile.TemporaryDirectory() as directory:
+            f = self._destination_cache_target(directory)
+            f.cache.checkpoint(f.req, up_to=4)
+            f.complete()
+            f.guard.checkpoint = lambda *a, **kw: (_ for _ in ()).throw(
+                RuntimeError("cache insert failed")
+            )
+            with self.assertRaisesRegex(RuntimeError, "cache insert failed"):
+                self._retire_step(f.controller)
+            self.assertTrue(f.lease.failed and f.target.release_failed)
+            self.assertIsNotNone(f.lease.pin)
+            self.assertEqual(len(f.guard.leases), 1)
+            with self.assertRaisesRegex(RuntimeError, "retaining"):
+                f.lease.retire(None)
+            with self.assertRaisesRegex(RuntimeError, "quarantined"):
+                f.cache.reset()
+
+    def test_d_cache_retraction_drains_before_backup_and_invalidates_old_match(self):
+        """Retraction cannot read partial KV or let an old attempt own new pages."""
+        from sglang_remote_attn.decode_overlap import before_retract
+        from sglang_remote_attn.destination_cache import checkpoint_allowed
+
+        with tempfile.TemporaryDirectory() as directory:
+            f = self._destination_cache_target(directory)
+            f.cache.checkpoint(f.req, up_to=4)
+            f.complete()
+            seen = []
+            NativeReq = _source_class(
+                "managers/schedule_batch.py",
+                "Req",
+                {"reset_for_retract", "advance_cache_request_handle"},
+            )
+            f.req.retraction_count, f.req.input_embeds = 0, None
+            f.req.advance_cache_request_handle = lambda: (
+                NativeReq.advance_cache_request_handle(f.req)
+            )
+
+            def backup_and_release(*, req):
+                self.assertTrue(f.target.closed and f.lease.closed)
+                self.assertFalse(checkpoint_allowed(req, True))
+                seen.append(
+                    f.cache.req_to_token_pool.req_to_token[
+                        req.kv.req_pool_idx, :4
+                    ].clone()
+                )
+                f.release_kv_cache(req, f.cache, checkpoint=False)
+                self.hooks._reset_retracted(NativeReq.reset_for_retract, req)
+                return True
+
+            self.assertTrue(before_retract(backup_and_release, req=f.req))
+            self.assertTrue(torch.equal(seen[0], f.indices))
+            self.assertIsNone(f.req._remote_attn_decode_match)
+            self.assertTrue(checkpoint_allowed(f.req, True))
+            f.cache.evict(f.EvictParams(num_tokens=32))
+            self.assertEqual(f.allocator.available_size(), 32)
+
+    def test_d_cache_incremental_coverage_separates_cached_prefix_from_wire_offsets(
+        self,
+    ):
+        """Suffix-relative scatter must not mark a hole or rewrite shared prefix."""
+        pl = self.hooks.pre_layerwise
+        with tempfile.TemporaryDirectory() as directory:
+            f = self._destination_cache_target(directory)
+            f.target.native_staging = True
+            f.target.decode_req._staging_completed_layers = [([0], 0, 2)]
+            f.target.queue.staging_handler = SimpleNamespace(
+                advance_scatter=lambda dr: None, is_failed=lambda dr: False
+            )
+            f.target.refresh()
+            self.assertTrue(f.target.coverage.ready(0))
+            self.assertFalse(f.target.coverage.ready(1))
+            proof = pl.read_json(f.target.path / "layer-0.json")
+            self.assertEqual((proof["start"], proof["end"]), (2, 4))
+            f.req.kv.cache_protected_len = 3
+            f.target.queue.staging_handler.advance_scatter = lambda dr: self.fail(
+                "scatter ran after prefix changed"
+            )
+            with self.assertRaisesRegex(RuntimeError, "changed attempt, row or prefix"):
+                f.target.refresh()
+            f.req.kv.cache_protected_len = 2
+            f.target.queue.staging_handler.advance_scatter = lambda dr: None
+            f.target.decode_req._staging_completed_layers = [([1], 1, 2)]
+            with self.assertRaisesRegex(RuntimeError, "does not cover"):
+                f.target.refresh()
+            source = pl.Source(
+                None,
+                f.req,
+                Path(directory),
+                "source",
+                None,
+                slice(0, 2),
+                (),
+                4,
+                decode_prefix_len=2,
+            )
+            source.complete([0])
+            self.assertEqual(pl.read_json(Path(directory) / "layer-0.json")["start"], 2)
+
+    def test_d_cache_unknown_transport_completion_never_publishes_or_reuses_pages(self):
+        """A failed transfer is not a cancellation ACK or permission to free."""
+        with tempfile.TemporaryDirectory() as directory:
+            f = self._destination_cache_target(directory)
+            self.hooks._release_kv(f.release_kv_cache, f.req, f.cache, checkpoint=False)
+            self.hooks.pre_layerwise.write_json(
+                f.target.path / "error.json",
+                dict(generation="g", error="DMA completion unknown"),
+            )
+            with self.assertRaisesRegex(RuntimeError, "proof unproven"):
+                self._retire_step(f.controller)
+            self.assertFalse(f.req.kv.is_kv_released or f.lease.closed)
+            self.assertIsNotNone(f.lease.pin)
+            self.assertTrue(
+                set(f.indices.tolist()).isdisjoint(f.allocator.free_pages.tolist())
+            )
+            with self.assertRaisesRegex(RuntimeError, "cannot reset"):
+                f.cache.reset()
+
+    def test_d_cache_without_overlap_still_requires_recorded_gpu_completion(self):
+        """Turning scheduler overlap off must not bypass the publication barrier."""
+        from sglang_remote_attn.decode_overlap import install
+
+        native_receiver = _source_class(
+            "managers/scheduler_components/request_receiver.py",
+            "SchedulerRequestReceiver",
+            strip_method_decorators=True,
+        )
+        with tempfile.TemporaryDirectory() as directory:
+            f = self._destination_cache_target(directory)
+            scheduler = f.controller.scheduler
+            scheduler.enable_overlap = False
+            scheduler.request_receiver = native_receiver(
+                **{field.name: None for field in dataclasses.fields(native_receiver)}
+            )
+            f.controller.decode_overlap.retirement.close()
+            self.assertIsNone(install(f.controller))
+            overlap = f.controller.decode_overlap = install(f.controller, force=True)
+            self.addCleanup(overlap.retirement.close)
+            overlap.retirement.register(f.target)
+            completed, recorded, stream = [False], [], object()
+            event = SimpleNamespace(query=lambda: completed[0], record=recorded.append)
+            batch = SimpleNamespace(
+                reqs=[f.req],
+                forward_mode=SimpleNamespace(is_prebuilt=lambda: False),
+            )
+            with (
+                patch.object(torch.cuda, "Event", return_value=event),
+                patch.object(torch.cuda, "current_stream", return_value=stream),
+            ):
+                overlap.run_batch(
+                    lambda *a: SimpleNamespace(delay_sample_func=None, copy_done=None),
+                    scheduler,
+                    batch,
+                )
+            self.assertEqual(recorded, [stream])
+            f.complete()
+            self._retire_step(f.controller)
+            self.assertFalse(f.lease.closed)
+            completed[0] = True
+            self._retire_step(f.controller)
+            self.assertTrue(f.lease.closed)
+            self.assertEqual(overlap.retirement.cache_votes, 1)
+            f.release_kv_cache(f.req, f.cache, checkpoint=True)
+            f.cache.evict(f.EvictParams(num_tokens=32))
+            self.assertEqual(f.allocator.available_size(), 32)
+
+    def test_dsv41_d_cache_stays_rejected_before_adapter_initialization(self):
+        """Opening Qwen D cache must not silently enable sparse state caching."""
+        from sglang_remote_attn import dsv41_layerwise as ds
+
+        pl = self.hooks.pre_layerwise
+        with tempfile.TemporaryDirectory() as directory:
+            scheduler = SimpleNamespace(
+                tp_worker=SimpleNamespace(model_runner=object()),
+                tree_cache=SimpleNamespace(disable=False),
+                disaggregation_mode=SimpleNamespace(value="decode"),
+            )
+            controller = SimpleNamespace(
+                dsv41_layerwise=True,
+                validate=lambda: None,
+                validate_graphs=lambda: self.fail(
+                    "unsupported D cache reached graph init"
+                ),
+            )
+            with (
+                patch.object(
+                    pl.Config,
+                    "from_env",
+                    return_value=pl.Config("remote", Path(directory)),
+                ),
+                patch.object(ds, "is_dsv41", return_value=True),
+                patch.object(ds, "DSV41Controller", return_value=controller),
+                self.assertRaisesRegex(
+                    ValueError, "DSV4.1 D radix cache is not yet adapted"
+                ),
+            ):
+                pl.initialize(scheduler)
+
     def test_p_radix_read_pin_survives_tree_split_and_eviction(self):
         from sglang_remote_attn.source_cache import CacheGuard
 
@@ -1300,6 +1790,12 @@ class TestRemoteAttn(CustomTestCase):
 
     def test_decode_overlap_native_loop_serializes_remote_and_restores_local(self):
         """Native PD loop must drain before Remote launches, then pipeline Local again."""
+        self._check_decode_overlap_native_loop(with_cache=False)
+
+    def test_d_cache_native_overlap_restores_pipeline_only_after_cache_commit(self):
+        self._check_decode_overlap_native_loop(with_cache=True)
+
+    def _check_decode_overlap_native_loop(self, *, with_cache):
         from collections import deque
 
         from sglang_remote_attn.decode_overlap import disable_overlap
@@ -1319,7 +1815,14 @@ class TestRemoteAttn(CustomTestCase):
             )
         )
         with tempfile.TemporaryDirectory() as directory:
-            controller, target, freed = self._overlap_target(directory)
+            if with_cache:
+                f = self._destination_cache_target(directory)
+                controller, target = f.controller, f.target
+                freed = []
+                target.decode_req.kv_receiver.clear = lambda: freed.append("receiver")
+                target.queue.req_to_metadata_buffer_idx_allocator.free = freed.append
+            else:
+                controller, target, freed = self._overlap_target(directory)
             controller.targets = []
             scheduler = native()
             scheduler.enable_overlap = True
@@ -1366,12 +1869,26 @@ class TestRemoteAttn(CustomTestCase):
                 if iteration == 1:
                     controller.targets.append(target)
                 if iteration == 3:
-                    target.decode_req.kv_receiver.done = True
+                    if with_cache:
+                        f.complete()
+                    else:
+                        target.decode_req.kv_receiver.done = True
                 self._retire_step(controller, finalize=False)
                 if iteration == len(batches) - 1:
                     scheduler.gracefully_exit = True
 
             def launch(scheduler, b):
+                if with_cache and b.name != "local-0":
+                    local = b.name.startswith("local")
+                    hit = f.cache.match_prefix(
+                        f.MatchPrefixParams(f.RadixKey(array("q", [1, 2, 3, 4])))
+                    )
+                    self.assertEqual(hit.device_prefix_len, 4 if local else 2)
+                    self.assertEqual(f.lease.closed, local)
+                    self.assertEqual(
+                        controller.decode_overlap.retirement.cache_votes,
+                        1 if local else 0,
+                    )
                 launches.append(
                     (b.name, [name for name, e in events.items() if not e.done])
                 )
@@ -1440,6 +1957,11 @@ class TestRemoteAttn(CustomTestCase):
                         disable_overlap(predicate, scheduler, batches[4], batches[5])
                     )
                     scheduler.run_batch(batches[4])
+            if with_cache:
+                f.release_kv_cache(f.req, f.cache, checkpoint=True)
+                f.cache.evict(f.EvictParams(num_tokens=32))
+                self.assertEqual(f.allocator.available_size(), 32)
+                self.assertEqual(len(set(f.allocator.free_pages.tolist())), 32)
 
     def test_decode_overlap_defers_native_kv_free_until_gpu_and_io_drained(self):
         f = self._radix()
@@ -2234,6 +2756,12 @@ class TestRemoteAttn(CustomTestCase):
                                 RuntimeError, "disable-radix-cache"
                             ):
                                 self.hooks.validate_config()
+            for mode in ("remote", "layerwise"):
+                with patch.dict(os.environ, {"HANDOFF_PRE_LAYERWISE": mode}):
+                    disagg.disaggregation_mode = "decode"
+                    disagg.disaggregation_decode_enable_radix_cache = True
+                    self.hooks.validate_config()
+            disagg.disaggregation_decode_enable_radix_cache = False
             schedule.disable_overlap_schedule = False
             memory.disable_radix_cache = True
             for mode in ("remote", "layerwise", "off"):
@@ -3816,6 +4344,18 @@ class TestRemoteAttn(CustomTestCase):
             ),
         )
         self.assertEqual(rows[0]["dsv41_segments"], rows[1]["dsv41_segments"])
+        self.assertEqual(rows[0]["d_cache"], rows[1]["d_cache"])
+        self.assertEqual(
+            rows[0]["d_cache"],
+            dict(
+                match_rejections=[True, True],
+                final_vote_shapes=[5, 5, 5, 1, 5, 1],
+                released=1,
+                published=0,
+                local_votes=0,
+                partial_apply_failure_stopped=True,
+            ),
+        )
         self.assertEqual(rows[0]["sparse_progressive"], rows[1]["sparse_progressive"])
         self.assertEqual(
             rows[0]["sparse_progressive"],
@@ -8402,6 +8942,7 @@ class TestRemoteAttn(CustomTestCase):
                 self.assertEqual(jobs[0][0].indices.tolist(), [104, 105, 106, 107, 108])
                 self.assertEqual(jobs[0][0].index_slice, slice(4, 9))
                 self.assertEqual(sender.curr_idx, 9)
+
                 self.assertEqual(req.start_send_idx, 9)
                 self.assertEqual(jobs[0][1], [(tuple(range(36)), tuple(range(72)))])
                 self.assertEqual(jobs[0][0].prefill_chunk_tokens, 5)
@@ -8410,6 +8951,24 @@ class TestRemoteAttn(CustomTestCase):
                 self.assertIsNone(controller.prepare(batch))
                 self.assertEqual(len(controller.sources), 1)
                 self.assertEqual(sender.curr_idx, 9)
+
+                # D already owns two prompt tokens. Sender cursors and staging
+                # slices are relative to that immutable decode-prefix boundary.
+                req._pre_layerwise_source = None
+                req.disagg_decode_prefix_len = 2
+                req.start_send_idx = 4
+                sender.curr_idx, sender.num_kv_indices = 2, 7
+                controller.cache_guard = None
+                offer.update(generation="cached-d", decode_prefix_len=2)
+                pl.write_json(offer_path, offer)
+                delta = controller.prepare(batch)[0][0]
+                self.assertEqual(delta.index_slice, slice(2, 7))
+                self.assertEqual(delta.indices.tolist(), [104, 105, 106, 107, 108])
+                self.assertEqual(delta.decode_prefix_len, 2)
+                delta.complete([0])
+                proof = pl.read_json(delta.path / "layer-0.json")
+                self.assertEqual((proof["start"], proof["end"]), (2, 9))
+                self.assertEqual(sender.curr_idx, 7)
 
     def test_prelayer_leases_prevent_idle_cache_reset(self):
         pl = self.hooks.pre_layerwise
@@ -8468,6 +9027,12 @@ class TestRemoteAttn(CustomTestCase):
             ),
             ("sglang.srt.mem_cache.base_prefix_cache.BasePrefixCache.finish", "handle"),
             ("decode.DecodeTransferQueue._commit_transfer_to_req", "keep_receiver"),
+            ("decode.DecodePreallocQueue._match_prefix_and_lock", "req"),
+            ("decode.DecodePreallocQueue._pre_alloc", "prefix_indices"),
+            (
+                "mooncake.conn.MooncakeKVManager.build_receiver_metadata_message",
+                "decode_prefix_len",
+            ),
             (
                 "mooncake.conn.MooncakeKVManager.add_transfer_request",
                 "kv_buffer_indices",

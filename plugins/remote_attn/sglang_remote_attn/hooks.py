@@ -9,6 +9,7 @@ import time
 
 from . import (
     decode_overlap,
+    destination_cache,
     dsv41_layerwise,
     dsv41_progressive,
     dsv41_receive,
@@ -117,12 +118,16 @@ def validate_config():
         raise RuntimeError(
             "remote_attn requires --disable-overlap-schedule except progressive D or DSV4.1 PD P"
         )
-    if not memory.disable_radix_cache and (
-        get_disagg().disaggregation_mode != "prefill"
-        or os.environ.get("HANDOFF_PRE_LAYERWISE", "off") not in ("remote", "layerwise")
+    if not memory.disable_radix_cache and not (
+        os.environ.get("HANDOFF_PRE_LAYERWISE", "off") in ("remote", "layerwise")
+        and (
+            get_disagg().disaggregation_mode == "prefill"
+            or get_disagg().disaggregation_mode == "decode"
+            and getattr(get_disagg(), "disaggregation_decode_enable_radix_cache", False)
+        )
     ):
         raise RuntimeError(
-            "remote_attn requires --disable-radix-cache except progressive P"
+            "remote_attn requires --disable-radix-cache except progressive P or native decode radix PD"
         )
     if memory.enable_unified_memory or memory.enable_hierarchical_cache:
         raise RuntimeError("remote_attn does not yet support unified KV or HiCache")
@@ -281,8 +286,14 @@ def _alloc_extend(original, batch):
 
 
 def _reset_retracted(original, req):
+    previous_handle = getattr(req, "cache_request_handle", None)
+    destination_cache.cancel_pending(req)
     target = getattr(req, "_pre_layerwise_target", None)
-    if target is not None and getattr(target.owner, "dsv41_remote", False):
+    destination_cache.suppress(req)
+    if target is not None and (
+        getattr(target.owner, "dsv41_remote", False)
+        or getattr(target, "cache_lease", None) is not None
+    ):
         # Direct native reset callers must respect the same TP-symmetric fence
         # as release_req; do not let a new attempt inherit pending PD writes.
         target.owner.drain_targets(required=target)
@@ -295,6 +306,12 @@ def _reset_retracted(original, req):
         if cert is not None:
             cert.admission.overlap.drain(req)
     result = original(req)
+    if (
+        getattr(req, "_remote_attn_decode_cache_enabled", False)
+        and req.cache_request_handle == previous_handle
+    ):
+        req.advance_cache_request_handle()
+    req._remote_attn_decode_match = None
     req.handoff_prefix_indices = None
     req._handoff_prefix_indices = None
     return result
@@ -303,10 +320,17 @@ def _reset_retracted(original, req):
 def _release_kv(original, req, tree_cache, *, checkpoint):
     from .pre_layerwise import defer_release
 
+    cache_lease = destination_cache.lease_for(req)
+    if cache_lease is not None and not checkpoint:
+        destination_cache.suppress(req)
     if defer_release(
         req,
         lambda: original(
-            req, tree_cache, checkpoint=source_cache.checkpoint_allowed(req, checkpoint)
+            req,
+            tree_cache,
+            checkpoint=source_cache.checkpoint_allowed(req, checkpoint)
+            and not (cache_lease is not None and cache_lease.abort)
+            and destination_cache.checkpoint_allowed(req, True),
         ),
         checkpoint=checkpoint,
     ):
@@ -329,7 +353,11 @@ def _release_kv(original, req, tree_cache, *, checkpoint):
     # Mamba state is independent of KV and must retain upstream's release path.
     if req.kv.is_kv_released and not req.kv.holds_kv and not req.kv.holds_mamba:
         return
-    return original(req, tree_cache, checkpoint=checkpoint)
+    return original(
+        req,
+        tree_cache,
+        checkpoint=destination_cache.checkpoint_allowed(req, checkpoint),
+    )
 
 
 def _stream_output(original, streamer, reqs, *args, **kwargs):
@@ -508,6 +536,8 @@ def _publish_peer_now(original, manager, mooncake_session_id, decode_kv_args):
 
 
 HOOKS = {
+    "sglang.srt.disaggregation.decode.DecodePreallocQueue._match_prefix_and_lock": destination_cache.match_prefix,
+    "sglang.srt.disaggregation.decode.DecodePreallocQueue._send_kv_metadata": destination_cache.send_metadata,
     "sglang.srt.disaggregation.decode.DecodeTransferQueue._commit_transfer_to_req": dsv41_remote.commit,
     "sglang.srt.disaggregation.common.staging_handler.StagingManagerMixin._handle_staging_req": dsv41_receive.allocate,
     "sglang.srt.disaggregation.common.staging_handler.DecodeStagingHandler._scatter_region": dsv41_receive.scatter,

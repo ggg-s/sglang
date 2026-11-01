@@ -136,6 +136,9 @@ def reap(original, queue, *args, **kwargs):
 
 
 def before_retract(original, *, req, **kwargs):
+    from .destination_cache import suppress
+
+    suppress(req)
     source = getattr(req, "_dsv41_p_lease", None)
     if source is not None:
         # Native release_req may back up source KV before release_kv_cache;

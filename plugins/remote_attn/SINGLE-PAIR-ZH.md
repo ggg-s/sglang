@@ -11,7 +11,7 @@ DSV4.1 Flash 的纯文本 layerwise 路径见 [专用接入说明](DSV41-LAYERWI
 依赖、容量和完整验收见 [部署手册](DEPLOYMENT-ZH.md)。
 
 当前范围是同机 Qwen3 dense NHD MHA BF16/FP16、同 TP、PP=DP=CP=1、page size 1、
-early allocation、mooncake_tcp。P 可开启设备内 dense FULL radix cache；D 仍关闭 radix cache。P 关闭 scheduler overlap；D 支持 Remote 串行、全部 Local 后恢复原生 overlap。
+early allocation、mooncake_tcp。P 可开启设备内 dense FULL radix cache；Qwen D 可显式开启原生增量 PD radix cache，见下文。P 关闭 scheduler overlap；D 支持 Remote 串行、全部 Local 后恢复原生 overlap。
 CUDA graphs 沿用原生 full decode 配置：D 的 Remote 阶段对 batch 1/2/4/8/16 使用分段图，
 其他 batch 为 eager；完成 GPU scatter 并经 TP 一致回收后恢复原生 full graph。
 P 普通 prefill 保留原生 graph，最终 chunk 的分层 prefill 和 P 端 Remote RPC 仍为 eager。
@@ -32,7 +32,7 @@ python -m sglang_remote_attn.check
 python -c 'import sglang_router; print(sglang_router.__file__)'
 ```
 
-安装态预检应输出 `hooks: 40`、`core_interfaces: 88`、`send_probe: true`。
+安装态预检应输出 `hooks: 46`、`core_interfaces: 113`、`send_probe: true`。
 它检查实际加载的接口：保留 receiver 的 metadata commit、选层发送与完成回调、
 staging 分组、host copy、缓存 checkpoint/lock/finish、字段初始化及 typed env 声明；插件注册时也会执行同样的
 核心检查，避免直接启动 P/D 绕过预检。`**kwargs` 不能替代显式参数。
@@ -148,6 +148,12 @@ python -m sglang.launch_server \
 D 的其他线上参数同样保留。默认每个 D rank 需要 4 GiB pinned host ring 加
 4 GiB GPU shadow，此外还有模型、KV 和 workspace；显存比例须留出空间。
 目录 `/workspace/handoff_state` 是现有 runtime 固定诊断路径，服务账户需要可写。
+
+上面的 D 命令保留 cache off 对照。开启 **Qwen D radix cache** 时，删除
+`--disable-radix-cache`，加入原生 `--disaggregation-decode-enable-radix-cache`。
+只删除 disable 参数不会启用 D cache；不需要新增插件环境变量。支持设备内 FULL
+RadixCache / UnifiedRadixCache，可与 D scheduler overlap 同时开启。增量传输、
+缓存发布、取消和回收边界见 [D 缓存说明](D-DECODE-CACHE-ZH.md)。DSV4.1 D 仍关闭缓存。
 
 两端保留线上原生 graph backend、capture buckets/max-bs 配置；同一角色各 TP rank
 必须一致。插件不要求新增环境变量，不强制扩大原生 capture 范围；分段图在启动时额外捕获，服务中不重新 capture。
@@ -290,7 +296,7 @@ python /workspace/sglang/test/manual/remote_attn/pre_layerwise_report.py \
 `deferred_cache_checkpoints`。这证明锁已接入、命中存在且正常回收；不代替 GPU
 正确性验证。单独比较 P cache off/on：相同 input_ids、greedy 输出应一致，测
 TTFT、输入计算 token 数、吞吐和 P KV 占用高水位；加并发、淘汰压力和取消请求，
-确认回收后容量恢复。D 保留 `--disable-radix-cache`；P 保留
+确认回收后容量恢复。验证 P 缓存时 D 可先保留 `--disable-radix-cache`；P 保留
 `--disable-overlap-schedule`，D 按下节开启 scheduler overlap。
 
 P 的共享前缀持有独立读锁；当前最终块的私有尾部在所有 TP rank 的传输及 RPC
@@ -303,12 +309,13 @@ P 的共享前缀持有独立读锁；当前最终块的私有尾部在所有 TP
 
 上面的 D 命令已去掉 `--disable-overlap-schedule`，P 保留该参数。
 不用增加插件环境变量，不改线上 optimistic、token chunk、传输 Batch 或 SMG。
-`two_batch_overlap` 继续关闭；D radix cache 仍关闭。需要对照时在 D 加回
+`two_batch_overlap` 继续关闭；Qwen D radix cache 可按上文同时开启。需要对照时在 D 加回
 `--disable-overlap-schedule` 并重启，使用新的 journal 目录。
 
 D 的 Remote 阶段在原生 `is_disable_overlap_for_batch` 边界先处理上一批结果，
 继续使用 Remote 分段 graph；所有层已 Local 后，还需等待参与过的 native
-`copy_done` 完成并经过 TP 退休投票，再恢复 full graph 和原生 overlap。
+`copy_done` 完成并经过 TP 退休投票；启用 D cache 时，还要完成原生缓存发布及
+执行结果共识，再恢复 full graph 和原生 overlap。
 Local 稳态不新增 GPU event、event 查询、CPU all_reduce 或 synchronize。
 这表示保留原生自身的同步与限制，并不表示删除 SGL 原本的同步。
 

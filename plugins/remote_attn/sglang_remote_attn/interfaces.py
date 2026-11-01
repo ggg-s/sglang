@@ -17,6 +17,17 @@ CORE_CALLS = {
     DISAGG + "decode.DecodeTransferQueue._commit_transfer_to_req": {
         "keep_receiver": False
     },
+    DISAGG + "decode.DecodePreallocQueue._match_prefix_and_lock": {
+        "req": inspect.Parameter.empty
+    },
+    DISAGG + "decode.DecodePreallocQueue._pre_alloc": {
+        "prefix_indices": None,
+        "prefix_len": None,
+        "total_prefix_len": None,
+    },
+    "sglang.srt.managers.schedule_batch.Req.owned_kv_len": {},
+    "sglang.srt.managers.schedule_batch.Req.refresh_fill_ids": {},
+    "sglang.srt.managers.schedule_batch.Req.advance_cache_request_handle": {},
     **{
         "sglang.srt.distributed.device_communicators.mooncake_transfer_engine.MooncakeTransferEngine."
         + name: parameters
@@ -42,6 +53,7 @@ CORE_CALLS = {
         "bootstrap_room": inspect.Parameter.empty,
         "is_dummy": inspect.Parameter.empty,
         "device_kv_indices": None,
+        "decode_prefix_len": inspect.Parameter.empty,
     },
     "sglang.srt.layers.attention.deepseek_v4_backend.DeepseekV4AttnBackend.init_forward_metadata_in_graph": {
         "forward_batch": inspect.Parameter.empty

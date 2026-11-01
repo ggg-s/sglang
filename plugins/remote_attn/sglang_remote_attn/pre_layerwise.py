@@ -187,6 +187,7 @@ class Source:
     native_staging: bool = False
     recv_host_staging: bool = False
     cache_lease: object = None
+    decode_prefix_len: int = 0
 
     def complete(self, layers):
         if self.native_staging:
@@ -195,7 +196,8 @@ class Source:
             return
         # add_transfer_request shards a room onto one FIFO. Earlier ordinary
         # chunks have settled before this final-chunk subset runs. Thus this
-        # proof covers [0, prefix_len), not merely the final chunk. Native
+        # proof covers [decode_prefix_len, prefix_len), not merely the final
+        # chunk. The D-certified cached prefix needs no transfer. Native
         # staging, relayout and multi-destination fanout remain disallowed.
         for layer in layers:
             write_json(
@@ -203,7 +205,7 @@ class Source:
                 {
                     "generation": self.generation,
                     "layer": layer,
-                    "start": 0,
+                    "start": self.decode_prefix_len,
                     "end": self.prefix_len,
                     "at": time.monotonic(),
                 },
@@ -372,6 +374,8 @@ class Target:
     release: object = None
     release_failed: bool = False
     admission_id: int = 0
+    cache_lease: object = None
+    decode_prefix_len: int = 0
 
     def gpu_ready(self):
         from .remote_data_plane import ready
@@ -390,13 +394,17 @@ class Target:
         return not pending
 
     def refresh(self):
+        if self.closed:
+            return
+        if self.cache_lease is not None:
+            self.cache_lease.check()
         if self.native_staging:
             handler = self.queue.staging_handler
             handler.advance_scatter(self.decode_req)
             if handler.is_failed(self.decode_req):
                 raise RuntimeError("native scatter failed; retaining destination KV")
             for layers, start, pages in self.decode_req._staging_completed_layers:
-                if start + pages != self.coverage.prefix_len:
+                if self.decode_prefix_len + start + pages != self.coverage.prefix_len:
                     raise RuntimeError(
                         "native layer scatter does not cover final chunk"
                     )
@@ -404,13 +412,15 @@ class Target:
                 # FIFO before any final-group write. Their prefix is already local.
                 for layer in layers:
                     if not self.coverage.ready(layer):
-                        self.coverage.complete(layer, 0, self.coverage.prefix_len)
+                        self.coverage.complete(
+                            layer, self.decode_prefix_len, self.coverage.prefix_len
+                        )
                         write_json(
                             self.path / f"layer-{layer}.json",
                             {
                                 "generation": self.generation,
                                 "layer": layer,
-                                "start": 0,
+                                "start": self.decode_prefix_len,
                                 "end": self.coverage.prefix_len,
                                 "at": time.monotonic(),
                                 "completion": "scatter",
@@ -492,13 +502,13 @@ class Target:
                 else None,
             },
         )
-        self.closed = True
-        self.decode_req.req._pre_layerwise_target = None
-        self.decode_req.req._pre_layerwise_native_target = None
         release, self.release = self.release, None
-        if release is not None:
+        if release is not None or self.cache_lease is not None:
             try:
-                release()
+                if self.cache_lease is not None:
+                    self.cache_lease.retire(release)
+                else:
+                    release()
             except BaseException:
                 self.release_failed = True
                 write_json(
@@ -509,6 +519,9 @@ class Target:
                     },
                 )
                 raise
+        self.closed = True
+        self.decode_req.req._pre_layerwise_target = None
+        self.decode_req.req._pre_layerwise_native_target = None
 
     def transport_ready(self):
         self.refresh()
@@ -535,6 +548,7 @@ class Controller:
         self.early_admissions = 0
         self.stager = None
         self.cache_guard = None
+        self.destination_cache = None
         self.decode_overlap = None
         # Enabled only after graph configuration/capture manifests agree at
         # startup. Membership of targets is then changed only by TP votes.
@@ -574,6 +588,7 @@ class Controller:
             else None,
             getattr(self, "schema_signature", None),
             startup_signature(self.config),
+            ("destination-cache-v1",),
         )
         clean = not _runtime().has_target_states()
         if self.tp_size > 1:
@@ -668,6 +683,12 @@ class Controller:
             generation,
             LayerCoverage(len(dr.req.origin_input_ids), self.layers),
         )
+        target.decode_prefix_len = int(
+            getattr(dr.req.kv, "cache_protected_len", 0) or 0
+        )
+        if target.decode_prefix_len:
+            for layer in range(self.layers):
+                target.coverage.complete(layer, 0, target.decode_prefix_len)
         if mgr.enable_staging:
             if not queue.staging_handler.is_staging_room(dr.req.bootstrap_room):
                 queue.staging_handler.register_decode_req(dr.req.bootstrap_room, dr)
@@ -684,6 +705,7 @@ class Controller:
                 "generation": generation,
                 "session": mgr.get_session_id(),
                 "prefix_len": target.coverage.prefix_len,
+                "decode_prefix_len": target.decode_prefix_len,
                 "tp_size": self.tp_size,
                 "layers": self.layers,
                 "mode": self.config.mode,
@@ -750,6 +772,8 @@ class Controller:
                     and (not mgr.enable_staging or peers[0][1].staging_base_ptr != 0)
                     and offer.get("session") == peers[0][0].mooncake_session_id
                     and offer.get("prefix_len") == len(req.origin_input_ids)
+                    and offer.get("decode_prefix_len", 0)
+                    == getattr(req, "disagg_decode_prefix_len", 0)
                     and offer.get("tp_size") == self.tp_size
                     and offer.get("layers") == self.layers
                     and offer.get("mode") == self.config.mode
@@ -761,7 +785,8 @@ class Controller:
                     and len(mgr.kv_args.kv_data_ptrs) == len(peers[0][1].dst_kv_ptrs)
                     and not mgr.kv_args.state_data_ptrs
                     and 0 <= req.start_send_idx < len(req.origin_input_ids)
-                    and sender.curr_idx == req.start_send_idx
+                    and sender.curr_idx
+                    == req.start_send_idx - getattr(req, "disagg_decode_prefix_len", 0)
                 ):
                     candidate = (req, offer, root, peers)
             candidates.append(candidate)
@@ -831,6 +856,7 @@ class Controller:
                 cache_lease=self.cache_guard.hold(req)
                 if getattr(self, "cache_guard", None) is not None
                 else None,
+                decode_prefix_len=int(offer.get("decode_prefix_len", 0)),
             )
             sender._record_transfer_indices(indices, None)
             sender._transfer_start_time = (
@@ -996,6 +1022,9 @@ class Controller:
             queue._commit_transfer_to_req(dr, keep_receiver=True)
             if dr.kv_receiver is None or dr.req.finished():
                 raise RuntimeError("early PD metadata commit failed")
+            guard = getattr(self, "destination_cache", None)
+            if guard is not None:
+                target.cache_lease = guard.hold(dr.req)
             state = _runtime()._TargetHandoffState(
                 dr.req.kv.req_pool_idx,
                 target.coverage.prefix_len,
@@ -1088,6 +1117,12 @@ def initialize(scheduler):
     cls = DSV41Controller if is_dsv41(scheduler.tp_worker.model_runner) else Controller
     controller = cls(scheduler, config)
     controller.validate()
+    if (
+        getattr(controller, "dsv41_layerwise", False)
+        and scheduler.disaggregation_mode.value == "decode"
+        and not scheduler.tree_cache.disable
+    ):
+        raise ValueError("DSV4.1 D radix cache is not yet adapted")
     controller.validate_graphs()
     from . import pd_mesh
 
@@ -1098,6 +1133,7 @@ def initialize(scheduler):
         remote_data_plane.plane_for(controller)
     controller.prefill_overlap = None
     controller.cache_guard = None
+    controller.destination_cache = None
     from .source_cache import install
 
     if (
@@ -1109,10 +1145,17 @@ def initialize(scheduler):
 
         controller.prefill_overlap = install_prefill_overlap(controller)
     if not getattr(controller, "dsv41_layerwise", False):
-        controller.cache_guard = install(scheduler.tree_cache)
+        if scheduler.disaggregation_mode.value == "prefill":
+            controller.cache_guard = install(scheduler.tree_cache)
+        else:
+            from .destination_cache import install as install_destination
+
+            controller.destination_cache = install_destination(scheduler.tree_cache)
         from .decode_overlap import install as install_overlap
 
-        controller.decode_overlap = install_overlap(controller)
+        controller.decode_overlap = install_overlap(
+            controller, force=controller.destination_cache is not None
+        )
     if (
         getattr(controller, "dsv41_remote", False)
         and scheduler.disaggregation_mode.value == "decode"

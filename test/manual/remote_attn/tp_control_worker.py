@@ -1672,6 +1672,282 @@ def dsv41_graph_settings(args):
     return dict(settings=outcomes, policies=policies, per_decode_votes=len(votes))
 
 
+def decode_cache_lifetimes(args):
+    """Actual Gloo agreement; cache/GPU boundaries have separate native CPU tests."""
+    import torch
+    from sglang_remote_attn.decode_overlap import BatchProof, DecodeOverlap
+    from sglang_remote_attn.destination_cache import Guard, match_prefix
+    from sglang_remote_attn.pre_layerwise import (
+        Config,
+        Controller,
+        LayerCoverage,
+        Target,
+    )
+
+    pins, published, released = set(), [], []
+
+    def lock(node):
+        pin = object()
+        pins.add(pin)
+        return pin
+
+    cache = SimpleNamespace(
+        lock=lock,
+        unlock=pins.remove,
+        reset=lambda: None,
+        checkpoint=lambda req, **kw: published.append(kw["up_to"]),
+        finish=lambda *args: None,
+    )
+    guard = Guard(cache)
+    controller = Controller.__new__(Controller)
+    controller.rank, controller.tp_size = args.rank, 2
+    controller.graph_fast_path = True
+    controller.config = Config("remote", Path(args.output).with_suffix(".dcache"))
+    controller.targets = []
+    controller.destination_cache = guard
+    controller.scheduler = SimpleNamespace(
+        attn_tp_cpu_group=dist.group.WORLD, enable_overlap=True
+    )
+    controller.scheduler._pre_layerwise = controller
+    queue = SimpleNamespace(scheduler=controller.scheduler)
+
+    def request():
+        req = SimpleNamespace(
+            rid="d-cache",
+            bootstrap_room=71,
+            origin_input_ids=[1, 2, 3, 4],
+            extra_key=None,
+            cache_salt=None,
+            cache_request_handle=("d-cache", 0),
+            lock=None,
+            last_node=object(),
+            kv=SimpleNamespace(req_pool_idx=None, cache_protected_len=2),
+        )
+        req.refresh_fill_ids = lambda: None
+        req.owned_kv_len = lambda: 4
+        return req
+
+    rejected = []
+    for scenario in ("prefix", "error"):
+        req = request()
+
+        def native(queue, req):
+            if scenario == "error" and args.rank == 1:
+                raise RuntimeError("one rank cache lookup failed")
+            req.lock = cache.lock(req.last_node)
+            h = 1 if scenario == "prefix" and args.rank == 1 else 2
+            return SimpleNamespace(l1_prefix_len=h, decode_prefix_len=h)
+
+        try:
+            match_prefix(native, queue, req)
+            rejected.append(False)
+        except RuntimeError:
+            rejected.append(True)
+    assert rejected == [True, True] and not pins
+    req = request()
+
+    def native(queue, req):
+        req.lock = cache.lock(req.last_node)
+        return SimpleNamespace(l1_prefix_len=2, decode_prefix_len=2)
+
+    match_prefix(native, queue, req)
+    with (
+        patch.object(
+            dist,
+            "all_gather_object",
+            side_effect=AssertionError("pending match gather"),
+        ),
+        patch.object(
+            dist, "all_reduce", side_effect=AssertionError("pending match vote")
+        ),
+    ):
+        for _ in range(16):
+            cache.unlock(req.lock)
+            req.lock = None
+            match_prefix(
+                lambda *a: (_ for _ in ()).throw(AssertionError("pending lookup")),
+                queue,
+                req,
+            )
+    req.kv.req_pool_idx = 0
+    req.owned_kv_len = lambda: 6
+    lease = guard.hold(req)
+    controller.decode_overlap = DecodeOverlap(controller)
+    protocol = controller.decode_overlap.retirement
+    done = [args.rank == 0]
+    receiver = SimpleNamespace(poll=lambda: 4, clear=lambda: None)
+    target = Target(
+        controller,
+        SimpleNamespace(
+            metadata_buffers=SimpleNamespace(bootstrap_room=torch.ones((1, 1))),
+            req_to_metadata_buffer_idx_allocator=SimpleNamespace(
+                free=lambda index: None
+            ),
+        ),
+        SimpleNamespace(req=req, kv_receiver=receiver, metadata_buffer_index=0),
+        controller.config.directory,
+        f"rank-{args.rank}",
+        LayerCoverage(4, 1),
+        admission_id=1,
+        cache_lease=lease,
+        decode_prefix_len=2,
+    )
+    target.forward_proofs.append(
+        BatchProof(
+            result=SimpleNamespace(
+                delay_sample_func=None, copy_done=SimpleNamespace(query=lambda: done[0])
+            )
+        )
+    )
+    controller.targets = [target]
+    req._pre_layerwise_target = target
+    protocol.register(target)
+    shape = []
+    native_agree = controller.agree
+
+    def agree(flags):
+        shape.append(len(flags))
+        return native_agree(flags)
+
+    controller.agree = agree
+
+    def proposal():
+        protocol.observe()
+        dist.barrier()
+        values = [protocol.poll_command() if args.rank == 0 else None]
+        dist.broadcast_object_list(values, src=0)
+        if values[0] is not None:
+            protocol.arm(values[0])
+        return values[0]
+
+    poller = patch.dict(
+        sys.modules,
+        {
+            "sglang.srt.disaggregation.base.conn": SimpleNamespace(
+                KVPoll=SimpleNamespace(Success=4, Failed=0)
+            )
+        },
+    )
+    poller.start()
+    try:
+        cache.checkpoint(req, up_to=6 if args.rank == 0 else 5)
+        for _ in range(4):
+            assert proposal() is None
+        assert not shape
+        cache.checkpoint(req, up_to=6)
+        for _ in range(16):
+            if proposal() is not None:
+                break
+        else:
+            raise AssertionError("missing initial D cache retirement proposal")
+        protocol.finalize()
+        assert not target.closed and not published and pins
+        done[0] = True
+        for _ in range(16):
+            if proposal() is not None:
+                break
+        else:
+            raise AssertionError("GPU completion did not wake retirement")
+        # A single rank changes cache action after the command was broadcast.
+        if args.rank == 1:
+            cache.finish(req.cache_request_handle, SimpleNamespace(name="ABORT"))
+        protocol.finalize()
+        assert not target.closed and not published and pins
+        cache.finish(req.cache_request_handle, SimpleNamespace(name="ABORT"))
+        cache.finish(req.cache_request_handle, SimpleNamespace(name="SUCCESS"))
+
+        def release():
+            assert lease.abort
+            cache.unlock(req.lock)
+            req.lock = None
+            released.append(True)
+
+        target.release = release
+        for _ in range(16):
+            if proposal() is not None:
+                break
+        else:
+            raise AssertionError("cache ABORT did not wake retirement")
+        protocol.finalize()
+        assert target.closed and lease.closed and not pins
+        assert released == [True] and not published and shape == [5, 5, 5, 1]
+        with (
+            patch.object(
+                dist, "all_reduce", side_effect=AssertionError("Local cache vote")
+            ),
+            patch.object(
+                dist,
+                "all_gather_object",
+                side_effect=AssertionError("Local cache gather"),
+            ),
+            patch.object(
+                dist,
+                "broadcast_object_list",
+                side_effect=AssertionError("Local cache broadcast"),
+            ),
+        ):
+            for _ in range(32):
+                protocol.observe()
+                assert protocol.poll_command() is None
+        # Native checkpoint may mutate one rank's tree before another throws.
+        # The post-apply command vote must prevent BOTH ranks resuming Local.
+        next_req = request()
+        next_req.cache_request_handle = ("d-cache", 1)
+        match_prefix(native, queue, next_req)
+        next_req.kv.req_pool_idx = 0
+        next_lease = guard.hold(next_req)
+        next_target = Target(
+            controller,
+            target.queue,
+            SimpleNamespace(
+                req=next_req, kv_receiver=receiver, metadata_buffer_index=0
+            ),
+            controller.config.directory / "failed-insert",
+            f"fail-rank-{args.rank}",
+            LayerCoverage(4, 1),
+            admission_id=2,
+            cache_lease=next_lease,
+        )
+        controller.targets = [next_target]
+        next_req._pre_layerwise_target = next_target
+        protocol.register(next_target)
+        cache.checkpoint(next_req, up_to=4)
+        if args.rank == 1:
+
+            def fail_insert(*a, **kw):
+                raise RuntimeError("one rank native cache insert failed")
+
+            guard.checkpoint = fail_insert
+        for _ in range(16):
+            if proposal() is not None:
+                break
+        else:
+            raise AssertionError("missing fault-injection proposal")
+        try:
+            protocol.finalize()
+            raise AssertionError("partial cache failure resumed Local")
+        except RuntimeError as error:
+            assert "publication failed across TP" in str(error)
+        assert not controller.graph_fast_path and guard.poisoned
+        assert next_target.release_failed
+        if args.rank == 1:
+            assert next_lease.failed and next_lease.pin in pins
+        else:
+            assert next_lease.closed and published == [4]
+        assert shape == [5, 5, 5, 1, 5, 1]
+        return dict(
+            match_rejections=rejected,
+            final_vote_shapes=shape,
+            released=1,
+            published=0,
+            local_votes=0,
+            partial_apply_failure_stopped=True,
+        )
+    finally:
+        protocol.close()
+        poller.stop()
+
+
 def main():
     parser = argparse.ArgumentParser()
     parser.add_argument("rank", type=int)
@@ -1893,6 +2169,7 @@ def main():
         sparse_remote = sparse_remote_lifetimes(args)
         sparse_progressive = sparse_progressive_lifetimes(args)
         dsv41_segments = dsv41_graph_settings(args)
+        d_cache = decode_cache_lifetimes(args)
         Path(args.output).write_text(
             json.dumps(
                 {
@@ -1912,6 +2189,7 @@ def main():
                     "sparse_remote": sparse_remote,
                     "sparse_progressive": sparse_progressive,
                     "dsv41_segments": dsv41_segments,
+                    "d_cache": d_cache,
                     "segmented_startup": startup,
                     "segmented_routing": routing,
                 }

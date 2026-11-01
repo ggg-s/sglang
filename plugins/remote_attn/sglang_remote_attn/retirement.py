@@ -14,6 +14,8 @@ import time
 from dataclasses import dataclass, fields, is_dataclass
 from pathlib import Path
 
+from .destination_cache import intent as cache_intent
+
 logger = logging.getLogger(__name__)
 CONTROL = "__remote_attn_retire_intent__"
 
@@ -93,7 +95,7 @@ class Retirement:
         self.inflight = None
         self.pending = None
         self.arm_error = False
-        self.final_votes = self.commits = self.retries = 0
+        self.final_votes = self.commits = self.retries = self.cache_votes = 0
         self.closed = False
 
     @staticmethod
@@ -155,17 +157,18 @@ class Retirement:
                 raise RuntimeError(
                     "progressive target lacks ordered retirement registration"
                 )
-            error = None
+            error = cache = None
             try:
                 gpu_ready = target.gpu_ready()  # Advisory; never retires KV.
                 ready = target.transport_ready()
+                cache = cache_intent(target)
                 if target.admission_id in self.needs_gpu_notice and not gpu_ready:
                     continue
             except Exception as exc:
                 error, ready = f"{type(exc).__name__}: {str(exc)[:256]}", True
             if not ready:
                 continue
-            state = (target.release is not None, error)
+            state = (target.release is not None, error, cache)
             index = target.admission_id
             if self.sent.get(index) == state:
                 continue
@@ -179,6 +182,7 @@ class Retirement:
                     "generation": entry[2],
                     "release": state[0],
                     "error": error,
+                    "cache": state[2],
                     "version": self.revisions[index],
                 }
                 self.outbox[index] = (state, notice)
@@ -218,12 +222,20 @@ class Retirement:
             if not failed and (
                 len(reports) != self.size
                 or len({n["release"] for n in reports.values()}) != 1
+                or len(
+                    {
+                        json.dumps(n.get("cache"), sort_keys=True)
+                        for n in reports.values()
+                    }
+                )
+                != 1
             ):
                 continue
             abort |= failed
             entries.append(
                 {
                     **self.identity(target),
+                    "cache": reports.get(0, {}).get("cache"),
                     "generations": [
                         reports[r]["generation"] if r in reports else None
                         for r in range(self.size)
@@ -306,6 +318,12 @@ class Retirement:
                             raise RuntimeError("D GPU/PD lifetime did not drain")
                         time.sleep(0.005)
                         local_ready = target.ready_to_finish()
+                    # A checkpoint/ABORT may have changed since the ordered
+                    # proposal. Consume it but wait for a new state edge; never
+                    # publish different radix ownership on different ranks.
+                    local_ready = local_ready and cache_intent(target) == item.get(
+                        "cache"
+                    )
                 except Exception:
                     error_free = False
             ready.append(int(local_ready))
@@ -338,8 +356,52 @@ class Retirement:
         )
         self.inflight = None
         if accepted:
+            cache_transition = any(item.get("cache") is not None for item in entries)
+            if cache_transition:
+                failure = None
+                for target in selected:
+                    try:
+                        target.finish(wait=False)
+                    except Exception as exc:
+                        failure = exc
+                        break
+                # Checkpoint/dedup/free can fail AFTER the pre-apply proof vote.
+                # All ranks consume this second, command-scoped result before
+                # any can resume Local. No collective is added to normal steps.
+                applied = self.owner.agree([int(failure is None)])[0]
+                self.cache_votes += 1
+                if not applied:
+                    self.owner.graph_fast_path = False
+                    self.owner.destination_cache.poisoned = True
+                    for target in selected:
+                        target.release_failed = True
+                    raise RuntimeError(
+                        f"D cache publication failed across TP: {failure or 'peer failed'}; refusing Local resume"
+                    ) from failure
             for target in selected:
-                target.finish(wait=False)
+                if not cache_transition:
+                    target.finish(wait=False)
+                elif getattr(target, "cache_lease", None) is not None:
+                    from .pre_layerwise import read_json, write_json
+
+                    lease = target.cache_lease
+                    try:
+                        data = read_json(target.path / "done.json") or {}
+                        data.update(
+                            generation=target.generation,
+                            d_cached_prefix_tokens=lease.prefix,
+                            d_cache_guard_closed=lease.closed,
+                            d_cache_aborted=lease.abort,
+                            d_cache_retained_tokens=lease.req.kv.cache_protected_len,
+                            d_cache_tp_committed=True,
+                        )
+                        write_json(target.path / "done.json", data)
+                    except Exception:
+                        # Diagnostic IO after the shared apply vote cannot
+                        # change an already-committed TP control decision.
+                        logger.warning(
+                            "D cache retirement diagnostics unavailable", exc_info=True
+                        )
                 self.owner.targets.remove(target)
                 index = target.admission_id
                 self.registered.pop(index, None)
@@ -377,9 +439,16 @@ class Retirement:
         command = None
         if self.rank == 0:
             targets = self.owner.targets if required is None else [required]
-            command = self._command(
-                [{**self.identity(t), "generations": None} for t in targets], "drain"
-            )
+            entries, kind = [], "drain"
+            for target in targets:
+                try:
+                    cache = cache_intent(target)
+                except Exception:
+                    cache, kind = None, "abort"
+                entries.append(
+                    {**self.identity(target), "generations": None, "cache": cache}
+                )
+            command = self._command(entries, kind)
         if self.size > 1:
             import torch.distributed as dist
 

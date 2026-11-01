@@ -26,7 +26,7 @@ still need acceptance on the target deployment.
 
 - `sglang_remote_attn/handoff_control.py`: adapted runtime, including Copy, Layer,
   Remote, Fast Freeze/Resume, RemoteHub, progressive LOCAL, epochs, fences and leases.
-- `sglang_remote_attn/hooks.py`: 30 function-boundary hooks. No scheduler event
+- `sglang_remote_attn/hooks.py`: 46 function-boundary hooks. No scheduler event
   loop, graph runner, allocation function or Mooncake connector is copied/replaced.
 - `control_plane/p2d_driver.py`: original supplied driver. `p4_gateway.py` now
   carries a targeted C1 reservation/epoch fix; its protocol and fixed state paths
@@ -104,10 +104,19 @@ by default; the P5.19 adapter is enabled only through the plugin and its explici
 
 The initial port targets the supplied single-host Qwen3-8B setup: CUDA,
 plain TP (including TP2, with the same TP width across roles), dense NHD MHA KV in BF16/FP16, page size 1,
-D radix cache disabled, and P scheduler overlap disabled.
+P scheduler overlap disabled. Qwen D device-only FULL radix cache is opt-in with
+native `--disaggregation-decode-enable-radix-cache` (remove `--disable-radix-cache`);
+DSV4.1 D cache remains gated. See [D cache integration](D-DECODE-CACHE-ZH.md).
 D may use native scheduler overlap: Remote batches serialize at the native
 per-batch gate, then Local resumes native overlap after TP-agreed retirement
 with native result completion proofs. Two-batch overlap remains unsupported.
+With D cache enabled, a command-scoped post-apply consensus also confirms native
+checkpoint/dedup/free succeeded before Local resumes. Prefix certificates and
+independent native pins protect incremental PD and pending admission retries;
+stable retries and Local steps add no collective. Cancellation suppresses cache
+publication, and retraction drains before native backup/reset. Unknown completion
+or partial cache failure quarantines ownership. Local-only evidence is in the
+[validation record](validation/D-RADIX-CACHE-LOCAL.md).
 Progressive P supports device-only dense FULL radix caching through plugin read
 leases: cached prefixes stay pinned and final-tail checkpoint/dedup/release waits
 for native transfer and Remote readers to drain across TP. Ordinary requests keep
