@@ -878,3 +878,86 @@ PDMux 的相对增益随并发单调下降；base 的绝对吞吐在 64 并发�
 2. **HiCache 的符号只取决于容量与写入策略**：工作集装得下时是纯开销；装不下时是必需品，但只在 `write_back` 下有效。
 3. **TPOT 与 TTFT 反向**：吞吐最优的组 TPOT 最好（22.4 / 34.9 ms）但 TTFT 最差（429 / 1,523 ms）；`base+PDMux` 的 TTFT 最好（236 / 517 ms）但 TPOT 最差（40.0 / 51.8 ms）。
 4. **最优配置随负载变化**：12K 合成是 `MTP+PDMux`（852 RPM）；12K 真实是 `MTP+PDMux`（667 RPM）；32K 真实是 `MTP+PDMux+HiCache(write_back)`（288 RPM）。
+
+## 18. 附录：复现命令（P=50 组）
+
+以下命令对应第 8 节与第 9 节的 P=50 实验（12K、`workload1000.json`、64 并发）。原始脚本：`/root/pdmux-swe-20261029/run_rpm_matrix2.sh`。
+
+### 环境准备
+
+```bash
+source /root/rivermind-data/activate-sglang.sh
+export PYTHONPATH="/root/pdmux-swe-20261029/shim:/root/rivermind-data/sglang-pdmux2/python"
+unset SGLANG_ENABLE_OVERLAP_PLAN_STREAM
+```
+
+`shim` 为 sgl-kernel 提供 `build_tree_kernel_efficient` 与 `verify_tree_greedy` 的 Triton 回退。
+
+### PDMux 的 YAML
+
+```yaml
+sm_group_num: 3
+split_forward_token_budget: 131072   # 推荐 262144：K 顶到上限 16，p90 由 1,761 降至 549 ms（第 13d 节）
+split_forward_max_layers: 16
+prefill_full_sm: true
+```
+
+### 服务端（最优组：MTP + PDMux）
+
+```bash
+python -m sglang.launch_server \
+  --model-path /root/rivermind-data/models/Qwen/Qwen3.6-35B-A3B-FP8 \
+  --trust-remote-code --language-only \
+  --tp-size 1 --dtype bfloat16 \
+  --context-length 16384 \
+  --max-prefill-tokens 32768 \
+  --chunked-prefill-size 16384 \
+  --mem-fraction-static 0.9 \
+  --mamba-ssm-dtype bfloat16 \
+  --mamba-radix-cache-strategy extra_buffer_lazy \
+  --max-mamba-cache-size 336 \
+  --attention-backend flashinfer \
+  --linear-attn-prefill-backend triton \
+  --linear-attn-decode-backend triton \
+  --cuda-graph-backend-decode full \
+  --cuda-graph-backend-prefill disabled \
+  --cuda-graph-max-bs-decode 64 \
+  --cuda-graph-bs-decode 1 2 4 8 16 32 64 \
+  --max-running-requests 64 \
+  --speculative-algorithm EAGLE \
+  --speculative-num-steps 3 --speculative-eagle-topk 1 \
+  --speculative-num-draft-tokens 4 \
+  --enable-pdmux --pdmux-prefill-mode layer_split \
+  --sm-group-num 3 \
+  --pdmux-config-path /root/pdmux-swe-20261029/pdmux-fullsm-c16-k8.yaml \
+  --random-seed 42 --watchdog-timeout 3600 --enable-metrics \
+  --host 127.0.0.1 --port 30189
+```
+
+### 客户端压测
+
+```bash
+python bench_swe.py \
+  --url http://127.0.0.1:30189 \
+  --workload workload1000.json \
+  --phase cold --concurrency 64 \
+  --output q_mtp_pdmux.json
+```
+
+`--phase cold` 先调用 `/flush_cache`，保证每组从空缓存开始。
+
+### 五组之间只差以下开关
+
+| 组 | 相对上一行增减 |
+|---|---|
+| base | 去掉 `--speculative-*` 与 `--enable-pdmux` 系列 |
+| +HiCache | 加 `--enable-hierarchical-cache --hicache-size 16 --hicache-write-policy write_through --hicache-io-backend kernel --hicache-mem-layout page_first` |
+| +MTP | 加 `--speculative-algorithm EAGLE --speculative-num-steps 3 --speculative-eagle-topk 1 --speculative-num-draft-tokens 4` |
+| +MTP+HiCache | 两组都加 |
+| +MTP+HiCache+PDMux | 再加 PDMux 四行与 YAML |
+
+### 三个易踩的坑
+
+1. **`--max-mamba-cache-size 336` 不可省。** 用 128 或 160 时 `并发 × S` 会吃光槽位，前缀缓存被静默关闭，命中率塌到 ~20%（第 6、7 节记录了该事故）。
+2. **`extra_buffer_lazy` 要求 overlap schedule 开启**，不要加 `--disable-overlap-schedule`。
+3. **不要设 `--kv-cache-dtype fp8`**，除非专门做带宽实验——它会改变 KV 容量（1.55M → 3.10M token），与本节基线不可比。
