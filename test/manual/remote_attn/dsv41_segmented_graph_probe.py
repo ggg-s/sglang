@@ -253,6 +253,7 @@ def main(
                 and not primitive.is_capturing()
             )
             assert mode.get_capture_attention_variant() == fb.variant
+            assert q.shape[0] == fb.batch_size
             seen_variants.add(fb.variant)
             if layer.layer_id == 0:
                 return q
@@ -369,31 +370,33 @@ def main(
         for phase, local in enumerate(((), (1,), (1, 2))):
             for target in live_targets.values():
                 target.local_entries = set(local)
-            for size in (1, 2, 4, 8, 16):
+            for size in (1, 2, 3, 4, 5, 6, 7, 8, 13, 14, 15, 16, 3):
                 for marker in (3, 8):
                     live = f.batch(size, marker)
                     live.variant = labels[(phase + marker) % 4]
-                    x, p = inputs[size]
+                    bucket = backend.remote_key(live).size
+                    x, p = inputs[bucket]
                     x.fill_(marker * 0.1)
                     p.fill_(marker)
                     # Independent eager union computation; no graph/RPC state.
-                    expected = x.clone()
+                    expected = x[:size].clone()
+                    live_positions = p[:size]
                     kv_expected = []
                     for layer in (0, 1, 2):
                         if bf16_source:
                             kv = expected * 3 + 0.125
-                            kv.mul_(0.5).add_(p[:, None] * 0.03125)
+                            kv.mul_(0.5).add_(live_positions[:, None] * 0.03125)
                         else:
                             kv = (
                                 (expected * 3 + 0.125).float() * 0.5
-                                + p.float()[:, None] * 0.03125
+                                + live_positions.float()[:, None] * 0.03125
                             ).to(x.dtype)
                         kv_expected.append(kv)
                         if layer:
                             carry_expected[layer].index_add_(
                                 0, live.out_cache_loc, expected.sum(-1)
                             )
-                        expected = expected * 2 + p[:, None]
+                        expected = expected * 2 + live_positions[:, None]
                         if layer:
                             queries = (
                                 expected.repeat(1, 128)
@@ -415,7 +418,7 @@ def main(
                     assert hooks._decode_graph(lambda *a: True, f.runner, live)
                     with backend.execution(live):
                         got = f.decode_output(
-                            ShapeKey(size, attention_variant=live.variant), live
+                            ShapeKey(bucket, attention_variant=live.variant), live
                         )
                     remote_batches.append(size)
                     err = float(
@@ -441,7 +444,7 @@ def main(
                     assert f.prepared[-3:] == [(marker, i) for i in range(3)]
         assert all(s.req.disagg_kv_sender.poll() == 3 for s in sources)
         count = len(rpc_calls)
-        for size in (3, 12, 32):
+        for size in (17, 32):
             assert not hooks._decode_graph(lambda *a: True, f.runner, f.batch(size))
         f.controller.targets = []
         for target in list(live_targets.values()):

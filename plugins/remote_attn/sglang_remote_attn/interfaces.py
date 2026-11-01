@@ -58,6 +58,9 @@ CORE_CALLS = {
     "sglang.srt.layers.attention.deepseek_v4_backend.DeepseekV4AttnBackend.init_forward_metadata_in_graph": {
         "forward_batch": inspect.Parameter.empty
     },
+    "sglang.srt.layers.attention.deepseek_v4_backend.DeepseekV4AttnBackend.init_forward_metadata": {
+        "forward_batch": inspect.Parameter.empty
+    },
     "sglang.srt.layers.attention.deepseek_v4_backend.DeepseekV4AttnBackend.forward": {
         "forward_batch": inspect.Parameter.empty
     },

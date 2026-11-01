@@ -9,7 +9,7 @@ import inspect
 import types
 from contextlib import contextmanager
 
-from .segmented_graph import RemoteGraphBackend
+from .segmented_graph import RemoteGraphBackend, pad_attention_output
 
 
 def is_model(runner):
@@ -54,21 +54,33 @@ class DSV41GraphBackend(RemoteGraphBackend):
         from .segmented_graph import leased
 
         if leased(self.runner):
-            return self.supports_remote(batch) and shape_key in self.native_keys
+            key = self.remote_key(batch)
+            return (
+                self.supports_remote(batch)
+                and shape_key in self.native_keys
+                and shape_key.size == key.size
+            )
         return self.full.can_run(batch, shape_key)
 
     def replay(self, shape_key, batch, **kwargs):
         if not self.use_remote:
             return super().replay(shape_key, batch, **kwargs)
-        if shape_key not in self.native_keys or shape_key.size != batch.batch_size:
+        if shape_key not in self.native_keys or shape_key.size != self.active_key.size:
             raise RuntimeError("DSV replay has an uncaptured native candidate variant")
         # All candidate-dependent work is eager. One Remote bank per batch can
         # serve every native label, while retaining the native per-token policy.
         with attention_variant(shape_key.attention_variant):
-            return super().replay(self.remote_keys[batch.batch_size], batch, **kwargs)
+            return super().replay(self.active_key, batch, **kwargs)
 
     def begin_remote_capture(self):
         self.dynamic_trace = []
+
+    def prepare_padded_metadata(self, batch):
+        try:
+            super().prepare_padded_metadata(batch)
+        except BaseException:
+            self.unsafe = True
+            raise
 
     def validate_remote_capture(self, size):
         layers = range(self.runner.model_runner.model_config.num_hidden_layers)
@@ -135,6 +147,23 @@ class DSV41GraphBackend(RemoteGraphBackend):
             if kind == "attention":
                 self.capture_layers.append(layer)
         arguments["forward_batch"] = batch
+        bucket = batch.batch_size if capture else self.active_key.size
+        if not capture and bucket != batch.batch_size:
+            # Projection stays in the bucket-sized graph. SWA writes, carry,
+            # indexer updates and attention must see only actual requests.
+            names = (
+                ("x", "q_lora", "kv", "positions")
+                if kind == "state"
+                else ("q", "k")
+                if kind == "attention"
+                else ()
+            )
+            for name in names:
+                value = arguments[name]
+                if value is not None:
+                    if value.shape[0] != bucket:
+                        raise RuntimeError("DSV dynamic input has a mismatched bucket")
+                    arguments[name] = value[: batch.batch_size]
         if kind == "attention":
             # Native V4 shares K/V; separate weak-ref views would lose `k is v`.
             arguments["v"] = arguments["k"]
@@ -145,7 +174,9 @@ class DSV41GraphBackend(RemoteGraphBackend):
                 else owner._dsv41_graph_originals[kind]
             )
             result = function(**arguments)
-            key = (batch.batch_size, kind, layer)
+            if not capture and kind == "attention":
+                result = pad_attention_output(result, batch.batch_size, bucket)
+            key = (bucket, kind, layer)
             spec = output_signature(result)
             if capture:
                 self.bridge_specs[key] = spec
@@ -267,6 +298,7 @@ def capture_signature(model_runner, runner):
         valid = backend.is_dsv41 and not backend.trtllm_attn and not backend.mega_attn
         owners = [
             (backend, "init_forward_metadata_in_graph", ("forward_batch",)),
+            (backend, "init_forward_metadata", ("forward_batch",)),
             (
                 backend,
                 "forward",

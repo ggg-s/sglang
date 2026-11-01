@@ -423,7 +423,10 @@ def _graph_decision(original, runner, forward_batch, kind):
         and controller.remote_targets
         and not (controller.graph_fast_path and controller.targets)
     ):
+        if forward_batch is not None:
+            forward_batch._remote_attn_graph_fallback = "compatibility_window"
         return False  # Compatibility windows have no TP progressive graph lease.
+    reason = None
     if controller is not None and controller.graph_fast_path:
         # early_targets admits/removes leases only after TP agreement. Keep
         # even a locally complete lease eager until its slowest peer retires.
@@ -439,6 +442,13 @@ def _graph_decision(original, runner, forward_batch, kind):
         can_replay = (all_local or remote_graph) and bool(
             original(runner, forward_batch)
         )
+        if not can_replay:
+            if all_local or remote_graph:
+                reason = "native_graph_ineligible"
+            elif isinstance(backend, segmented_graph.RemoteGraphBackend):
+                reason = backend.remote_fallback_reason(forward_batch)
+            else:
+                reason = "remote_segments_disabled"
     else:
         # Legacy/manual imports have no progressive lease certificate. Every
         # rank must still join this conservative per-forward vote.
@@ -449,6 +459,12 @@ def _graph_decision(original, runner, forward_batch, kind):
             group=parallel.tp_group.cpu_group if parallel.tp_size > 1 else None,
             world_size=parallel.tp_size,
         )
+        if not can_replay:
+            reason = (
+                "native_graph_ineligible" if all_local else "remote_work_without_lease"
+            )
+    if kind == "decode" and forward_batch is not None:
+        forward_batch._remote_attn_graph_fallback = reason
     verdict = (can_replay, all_local)
     if getattr(runner, "_remote_attn_graph_verdict", None) != verdict:
         runner._remote_attn_graph_verdict = verdict
@@ -468,10 +484,46 @@ def _graph_decision(original, runner, forward_batch, kind):
 def _graph_execute(original, runner, forward_batch, *args, **kwargs):
     _runtime().graph_step_begin(forward_batch)
     backend = getattr(runner, "backend", None)
-    if isinstance(backend, segmented_graph.RemoteGraphBackend):
-        with backend.execution(forward_batch):
-            return original(runner, forward_batch, *args, **kwargs)
-    return original(runner, forward_batch, *args, **kwargs)
+    path, bucket = "full", None
+    if isinstance(
+        backend, segmented_graph.RemoteGraphBackend
+    ) and segmented_graph.leased(runner):
+        path = "remote-segmented"
+    try:
+        if isinstance(backend, segmented_graph.RemoteGraphBackend):
+            with backend.execution(forward_batch):
+                path = "remote-segmented" if backend.use_remote else "full"
+                output = original(runner, forward_batch, *args, **kwargs)
+                bucket = getattr(
+                    getattr(runner, "_replay_graph_key", None), "size", None
+                )
+        else:
+            output = original(runner, forward_batch, *args, **kwargs)
+            bucket = getattr(getattr(runner, "_replay_graph_key", None), "size", None)
+    except BaseException:
+        segmented_graph.record_step(
+            runner.model_runner, forward_batch, path, failed=True
+        )
+        raise
+    segmented_graph.record_step(runner.model_runner, forward_batch, path, bucket=bucket)
+    return output
+
+
+def _eager_execute(original, runner, forward_batch, *args, **kwargs):
+    if not forward_batch.forward_mode.is_decode():
+        return original(runner, forward_batch, *args, **kwargs)
+    reason = getattr(forward_batch, "_remote_attn_graph_fallback", None)
+    try:
+        output = original(runner, forward_batch, *args, **kwargs)
+    except BaseException:
+        segmented_graph.record_step(
+            runner.model_runner, forward_batch, "eager", reason=reason, failed=True
+        )
+        raise
+    segmented_graph.record_step(
+        runner.model_runner, forward_batch, "eager", reason=reason
+    )
+    return output
 
 
 def _mooncake_init(original, manager, *args, **kwargs):
@@ -563,6 +615,7 @@ HOOKS = {
     "sglang.srt.managers.scheduler_components.output_streamer.SchedulerOutputStreamer.stream_output": _stream_output,
     "sglang.srt.model_executor.runner.decode_cuda_graph_runner.DecodeCudaGraphRunner.can_run_graph": _decode_graph,
     "sglang.srt.model_executor.runner.decode_cuda_graph_runner.DecodeCudaGraphRunner.execute": _graph_execute,
+    "sglang.srt.model_executor.runner.eager_runner.EagerRunner.execute": _eager_execute,
     "sglang.srt.model_executor.runner.prefill_cuda_graph_runner.PrefillCudaGraphRunner.can_run_graph": _prefill_graph,
     "sglang.srt.disaggregation.mooncake.conn.MooncakeKVManager.__init__": _mooncake_init,
     "sglang.srt.disaggregation.mooncake.conn.MooncakeKVManager._transfer_data": _transfer,

@@ -2945,6 +2945,12 @@ class TestRemoteAttn(CustomTestCase):
         runner = SimpleNamespace(
             model_runner=mr,
             device_module=SimpleNamespace(Event=Event, current_stream=lambda: "stream"),
+            capture_bs=sorted(sizes),
+            attn_backend=SimpleNamespace(
+                init_forward_metadata=lambda fb: trace.append(
+                    ("metadata", fb.batch_size)
+                )
+            ),
         )
 
         class Bank:
@@ -2970,7 +2976,7 @@ class TestRemoteAttn(CustomTestCase):
 
             def replay(self, key, batch):
                 if self.name == "remote":
-                    q = torch.ones(batch.batch_size, 4)
+                    q = torch.ones(key.size, 4)
                     for module in modules:
                         q = backend._attention(module, q, q, q, save_kv_cache=True)
                     self.outputs[key.size].copy_(q)
@@ -3006,11 +3012,17 @@ class TestRemoteAttn(CustomTestCase):
                 input_ids=torch.zeros(size, dtype=torch.int64),
                 input_embeds=None,
                 replace_embeds=None,
-                forward_mode=SimpleNamespace(is_decode=lambda: True),
+                forward_mode=SimpleNamespace(
+                    is_decode=lambda: True, is_idle=lambda: False
+                ),
+                needs_forward_metadata_init=lambda: True,
                 marker=marker,
             )
 
         def attention(module, q, k, v, live, **kwargs):
+            self.assertEqual(q.shape[0], live.batch_size)
+            self.assertEqual(k.shape[0], live.batch_size)
+            self.assertEqual(v.shape[0], live.batch_size)
             trace.append(("rpc", live.marker, module.layer_id))
             return q + live.marker
 
@@ -3085,7 +3097,7 @@ class TestRemoteAttn(CustomTestCase):
                     self.assertTrue(
                         torch.equal(output, torch.full((size, 4), 1 + marker * 2))
                     )
-            for size in (3, 12, 32):
+            for size in (17, 32):
                 self.assertFalse(b.supports_remote(f.batch(size)))
                 self.assertFalse(
                     self.hooks._decode_graph(lambda *a: True, f.runner, f.batch(size))
@@ -3118,6 +3130,45 @@ class TestRemoteAttn(CustomTestCase):
         self.assertEqual(sorted(small.full.keys), [1, 2, 4])
         self.assertFalse(small.backend.supports_remote(small.batch(8)))
         small.backend.cleanup()
+
+    def test_remote_segments_pad_live_rows_and_restore_native_buckets(self):
+        """RPC/KV sees real rows; every subsequent segment sees the full bridge."""
+        f = self._segmented_graph_fixture(sizes=(32, 16, 14, 8, 6, 4, 3, 2, 1))
+        b = f.backend
+        f.controller.targets = [object()]
+        native = f.runner.capture_bs
+        with patch.object(
+            self.hooks.segmented_graph, "_runtime", return_value=f.runtime
+        ):
+            for size in (13, 3, 15, 5, 7, 14, 6, 1, 16, 3):
+                live = f.batch(size, size)
+                key = b.remote_key(live)
+                self.assertTrue(b.supports_remote(live))
+                self.assertTrue(b.can_run(live, key))
+                with b.execution(live), b.replay_session():
+                    self.assertEqual(f.runner.capture_bs, [1, 2, 4, 8, 16])
+                    output = b.replay(key, live)
+                self.assertIs(f.runner.capture_bs, native)
+                self.assertIsNone(b.active_key)
+                torch.testing.assert_close(
+                    output[:size], torch.full((size, 4), float(1 + 2 * size))
+                )
+                self.assertEqual(torch.count_nonzero(output[size:]).item(), 0)
+            # Replaying a full-bank key (e.g. native 14) is forbidden when
+            # remote eligibility selected 16; no graph/RPC may start.
+            live = f.batch(13)
+            with b.execution(live):
+                with self.assertRaisesRegex(RuntimeError, "mismatched key"):
+                    b.replay(f.full.keys[14], live)
+            self.assertIs(f.runner.capture_bs, native)
+            f.runner.disable_padding = True
+            self.assertFalse(b.supports_remote(f.batch(3)))
+            self.assertTrue(b.supports_remote(f.batch(4)))
+            f.runner.disable_padding = False
+            f.controller.targets.clear()
+            with b.execution(f.batch(3)):
+                self.assertIs(f.runner.capture_bs, native)
+        b.cleanup()
 
     def test_remote_segments_startup_preserves_small_buckets_and_agrees_policy(self):
         """New buckets are optional; mixed plugin policies must fail before capture."""
@@ -3215,6 +3266,143 @@ class TestRemoteAttn(CustomTestCase):
             with self.assertRaisesRegex(RuntimeError, "settings differ"):
                 sg.resolve_backend(original, f.runner)
             self.assertEqual(len(allocations), before)
+
+    def test_padded_remote_lease_rebuilds_metadata_for_wholly_local_layers(self):
+        f = self._segmented_graph_fixture()
+        b = f.backend
+        self.addCleanup(b.cleanup)
+        f.controller.targets = [object()]
+        attn = f.runner.attn_backend
+        attn.current = f.batch(4)  # Native staging prepared bucket-sized metadata.
+        attn.init_forward_metadata = lambda fb: setattr(attn, "current", fb)
+
+        def local(module, q, k, v, live, **kw):
+            self.assertIs(attn.current, live)
+            self.assertEqual(q.shape[0], attn.current.batch_size)
+            return module._handoff_orig_forward(q, k, v, live, **kw)
+
+        f.runtime._handoff_attention_forward = local
+        live = f.batch(3)
+        with patch.object(
+            self.hooks.segmented_graph, "_runtime", return_value=f.runtime
+        ):
+            with b.execution(live), b.replay_session():
+                output = b.replay(b.remote_key(live), live)
+        torch.testing.assert_close(output[:3], torch.full((3, 4), 4.0))
+        self.assertEqual(torch.count_nonzero(output[3:]).item(), 0)
+
+    def test_remote_graph_stats_count_execution_not_eligibility(self):
+        import bisect
+
+        f = self._segmented_graph_fixture(sizes=(16, 14, 8, 6, 4, 3, 2, 1))
+        b = f.backend
+        self.addCleanup(b.cleanup)
+        f.controller.targets = [object()]
+        f.runtime.graph_step_begin = lambda fb: None
+        pad = _source_class(
+            "model_executor/runner/base_cuda_graph_runner.py",
+            "BaseCudaGraphRunner",
+            {"_pad_to_bucket"},
+        )._pad_to_bucket
+        pad.__globals__["bisect"] = bisect
+        native = _source_class(
+            "model_executor/runner/decode_cuda_graph_runner.py",
+            "DecodeCudaGraphRunner",
+            {"load_batch"},
+        )
+        staged = []
+        runner = f.runner
+        runner.__dict__.update(
+            dllm_uses_input_embeds=False,
+            ragged_verify_mode=False,
+            deepep_adapter=SimpleNamespace(replay=lambda: None),
+            buffers=SimpleNamespace(),
+            _validate_capture_hidden_mode=lambda fb: None,
+            captured_req_width=1,
+            require_mlp_tp_gather=False,
+            _pad_to_bucket=pad,
+            _capture_graph_size=lambda bs, num_tokens: bs,
+            _resolve_attention_variant=lambda *a: None,
+            _glue_key=lambda *a: None,
+            _take_early_verify_metadata=lambda *a, **kw: False,
+            buffer_registry=SimpleNamespace(
+                fill_from=lambda fb, **kw: staged.append(kw)
+            ),
+            _skips_prefilled_inputs=False,
+            _set_dp_real_num_tokens=lambda n: None,
+            enable_two_batch_overlap=False,
+            _init_replay_attn_metadata=lambda *a, **kw: None,
+            _draft_metadata_glue=False,
+            _target_metadata_glue=False,
+            _resolve_lora_variant=lambda fb: None,
+            _early_verify_metadata=None,
+            enable_pdmux=False,
+            _make_graph_key=lambda size, *a: f.full.keys[size],
+        )
+        runner.model_runner.spec_algorithm = SimpleNamespace(
+            is_dflash_family=lambda: False
+        )
+        runner.model_runner.hisparse_coordinator = None
+        context = SimpleNamespace(
+            get_parallel=lambda: SimpleNamespace(tp_rank=1, tp_size=2)
+        )
+
+        def execute(runner, live):
+            native.load_batch(runner, live)
+            with b.replay_session():
+                return b.replay(runner._replay_graph_key, live)
+
+        with (
+            patch.dict(sys.modules, {"sglang.srt.runtime_context": context}),
+            patch.object(self.hooks, "_runtime", return_value=f.runtime),
+            patch.object(
+                self.hooks.segmented_graph, "_runtime", return_value=f.runtime
+            ),
+        ):
+            live = f.batch(13, 3)
+            for _ in range(20):
+                self.assertTrue(
+                    self.hooks._decode_graph(lambda *a: True, f.runner, live)
+                )
+            self.assertFalse(hasattr(f.runner.model_runner, "_remote_attn_graph_stats"))
+            with self.assertLogs(
+                self.hooks.segmented_graph.logger, level="INFO"
+            ) as logs:
+                from sglang.srt.environ import envs
+
+                with envs.SGLANG_LOG_DECODE_GRAPH_KEY.override(True):
+                    for _ in range(3):
+                        self.hooks._graph_execute(execute, f.runner, live)
+            self.assertEqual(
+                sum("[remote-attn-graph-step]" in line for line in logs.output), 3
+            )
+            self.assertFalse(
+                self.hooks._decode_graph(lambda *a: True, f.runner, f.batch(17))
+            )
+            eager = f.batch(17)
+            self.hooks._decode_graph(lambda *a: True, f.runner, eager)
+            for _ in range(2):
+                self.hooks._eager_execute(lambda *a: "ok", f.runner, eager)
+            f.controller.targets.clear()
+            self.hooks._graph_execute(execute, f.runner, f.batch(3))
+
+            # Failed executions are reported separately and must not inflate
+            # successful step percentages or silently restart on eager.
+            def fail(*args):
+                raise RuntimeError("forward failed")
+
+            with self.assertRaisesRegex(RuntimeError, "forward failed"):
+                self.hooks._eager_execute(fail, f.runner, eager)
+        stats = f.runner.model_runner._remote_attn_graph_stats
+        self.assertEqual(stats["rank"], 1)
+        self.assertEqual(stats["steps"], 6)
+        self.assertEqual(stats["paths"], {"remote-segmented": 3, "eager": 2, "full": 1})
+        self.assertEqual(stats["batches"]["remote-segmented:13:16"], 3)
+        self.assertEqual(stats["batches"]["full:3:3"], 1)
+        self.assertEqual(stats["fallbacks"], {"remote_bucket_unavailable": 2})
+        self.assertEqual(stats["failures"], {"eager": 1})
+        self.assertEqual([item["padded_bs"] for item in staged], [16, 16, 16, 3])
+        self.assertEqual([item["raw_bs"] for item in staged], [13, 13, 13, 3])
 
     def test_remote_segments_fail_without_retry_and_retain_unfenced_banks(self):
         """An RPC/event failure cannot restart the token or free queued segment storage."""
@@ -4903,7 +5091,12 @@ class TestRemoteAttn(CustomTestCase):
         self.assertEqual(rows[0]["segmented_routing"], rows[1]["segmented_routing"])
         self.assertEqual(
             rows[0]["segmented_routing"],
-            [[True] * 7, [True, True, False, True, True, True, False]] * 2,
+            [[True] * 13, [True] * 12 + [False]] * 2,
+        )
+        self.assertEqual(rows[0]["segmented_buckets"], rows[1]["segmented_buckets"])
+        self.assertEqual(
+            rows[0]["segmented_buckets"],
+            [[1, 2, 4, 4, 8, 8, 8, 8, 16, 16, 16, 16, None]] * 4,
         )
         self.assertTrue(rows[0]["leases"]["mismatch_rejected"])
         self.assertTrue(rows[0]["leases"]["sparse_mode_mismatch_rejected"])
@@ -4932,8 +5125,7 @@ class TestRemoteAttn(CustomTestCase):
             rows[0]["dsv41_segments"],
             dict(
                 settings=[True] + [False] * 7,
-                policies=[[True, True, False, True, True, True, False]] * 3
-                + [[True] * 7],
+                policies=[[True] * 6 + [False]] * 3 + [[True] * 7],
                 per_decode_votes=0,
             ),
         )
@@ -11289,7 +11481,39 @@ class TestRemoteAttn(CustomTestCase):
         self.assertEqual(f.calls, [])
 
         def replay_body(bank, key):
-            result = f.model(*inputs[key.size], backend.active_batch)
+            live = backend.active_batch
+            x, positions = inputs[key.size]
+            if bank is remote:
+                # Execute graph projection segments around the real dynamic
+                # breaks, preserving their bucket-sized output bridges.
+                backend._dynamic("metadata", f.attn)
+                for layer in f.layers:
+                    q, q_lora, kv = layer.project_decode_qkv(x, positions)
+                    backend._dynamic(
+                        "state",
+                        layer,
+                        x=x,
+                        q_lora=q_lora,
+                        kv=kv,
+                        positions=positions,
+                        attn_backend=f.attn,
+                    )
+                    x = (
+                        backend._dynamic(
+                            "attention",
+                            f.attn,
+                            q=q,
+                            k=q,
+                            layer=layer,
+                            save_kv_cache=False,
+                            compress_ratio=layer.layer_id,
+                            attn_sink=None,
+                        )
+                        + 1
+                    )
+                result = f.output_type(next_token_logits=x, hidden_states=x + 0.25)
+            else:
+                result = f.model(x, positions, live)
             # Substitute only the GPU work. The native backend still returns
             # its original capture buffers and the runner processes them.
             for name in ("next_token_logits", "hidden_states"):
@@ -11300,22 +11524,24 @@ class TestRemoteAttn(CustomTestCase):
                 graph.work = functools.partial(replay_body, bank, key)
         previous = []
         for use_remote, sizes in (
-            (True, (16, 8, 4, 1, 2, 16, 8, 4)),
+            (True, (16, 3, 13, 5, 6, 7, 14, 15, 8, 4, 1, 2, 16, 3)),
             (False, (16, 8, 4, 1, 2, 16, 8, 32, 32)),
         ):
             f.controller.targets = [object()] if use_remote else []
             before = len(f.calls)
             for step, size in enumerate(sizes):
                 live = f.batch(size, step + 1)
-                x, pos = inputs[size]
+                key = backend.remote_key(live) if use_remote else ShapeKey(size)
+                x, pos = inputs[key.size]
                 x.fill_(step / 8)
                 pos.fill_(step % 3)
-                expected = x.clone()
+                expected = x[:size].clone()
                 for _ in range(3):
-                    expected = expected * 2 + pos[:, None] + 1
+                    expected = expected * 2 + pos[:size, None] + 1
                     if use_remote:
                         expected += live.marker
-                key = ShapeKey(size)
+                # Capture uses ShapeKey, while canonical remote keys preserve
+                # native candidate policy through replay.
                 with backend.execution(live):
                     output = f.decode_output(key, live)
                 self.assertTrue(all(output is not prior for prior in previous))
@@ -11332,7 +11558,7 @@ class TestRemoteAttn(CustomTestCase):
                 self.assertIsNone(template.sampling_mask_output)
                 previous.append(output)
             self.assertEqual(len(f.calls) - before, 3 * len(sizes) if use_remote else 0)
-        self.assertEqual(backend.replays, {"remote": 8, "full": 9})
+        self.assertEqual(backend.replays, {"remote": 14, "full": 9})
 
     def test_dsv41_probe_rejects_dirty_sampler_output(self):
         """The probe must reject stale fields even when logits remain correct."""
@@ -11348,7 +11574,7 @@ class TestRemoteAttn(CustomTestCase):
             with self.assertRaisesRegex(AssertionError, "sampler field leaked"):
                 f.check_output(output, expected)
 
-    def test_dsv41_segments_graph_policy_uses_shared_lease_and_never_pads_remote_rows(
+    def test_dsv41_segments_graph_policy_uses_shared_lease_and_padded_buckets(
         self,
     ):
         """Only TP-registered lifetimes enable Remote graph; Local uses native full."""
@@ -11361,11 +11587,11 @@ class TestRemoteAttn(CustomTestCase):
             for size, expected in (
                 (1, True),
                 (2, True),
-                (3, False),
+                (3, True),
                 (4, True),
                 (8, True),
                 (16, True),
-                (12, False),
+                (12, True),
                 (32, False),
             ):
                 self.assertEqual(
@@ -11405,6 +11631,29 @@ class TestRemoteAttn(CustomTestCase):
             with b.execution(live):
                 b.replay(b.remote_keys[1], live)
         self.assertIsNone(b.active_batch)
+
+    def test_dsv41_padded_segments_never_write_dummy_kv_or_carry_rows(self):
+        f = self._dsv41_graph_fixture()
+        b = f.backend
+        f.controller.targets = [object()]
+        for size in (3, 5, 6, 7, 13, 14, 15, 3):
+            live = f.batch(size, 7)
+            for cache, carry in zip(f.cache, f.carry):
+                cache.fill_(-99)
+                carry.zero_()
+            with b.execution(live):
+                b.replay(b.remote_key(live), live)
+            unused = torch.ones(32, dtype=torch.bool)
+            unused[live.out_cache_loc] = False
+            for i, (cache, carry) in enumerate(zip(f.cache, f.carry)):
+                self.assertTrue(torch.all(cache[unused] == -99))
+                self.assertTrue(torch.all(cache[live.out_cache_loc] != -99))
+                self.assertTrue(torch.all(carry[unused] == 0))
+                self.assertTrue(
+                    torch.all(carry[live.out_cache_loc] > 0)
+                    if i
+                    else torch.all(carry == 0)
+                )
 
     def test_dsv41_segments_preparation_failure_retains_unjoined_gpu_storage(self):
         """A main-stream event cannot fence an unfinished native side stream."""

@@ -6,6 +6,7 @@ retains static Q/K/V addresses and reads request state from the live replay.
 """
 
 import importlib.util
+import json
 import logging
 import os
 import types
@@ -14,6 +15,63 @@ from contextlib import contextmanager
 logger = logging.getLogger(__name__)
 REMOTE_BATCHES = (1, 2, 4, 8, 16)
 MIN_REMOTE_BATCHES = (1, 2, 4)
+
+
+def record_step(model_runner, batch, path, *, reason=None, bucket=None, failed=False):
+    """Count executions, never eligibility probes or verdict transitions (per rank)."""
+    stats = getattr(model_runner, "_remote_attn_graph_stats", None)
+    if stats is None:
+        from sglang.srt.runtime_context import get_parallel
+
+        stats = model_runner._remote_attn_graph_stats = {
+            "rank": get_parallel().tp_rank,
+            "steps": 0,
+            "paths": {},
+            "fallbacks": {},
+            "batches": {},
+            "failures": {},
+        }
+    if failed:
+        counts, key = stats["failures"], path
+    else:
+        stats["steps"] += 1
+        counts, key = stats["paths"], path
+        shape = f"{path}:{batch.batch_size}:{bucket}"
+        stats["batches"][shape] = stats["batches"].get(shape, 0) + 1
+        if path == "eager":
+            reason = reason or "graph_unavailable"
+            stats["fallbacks"][reason] = stats["fallbacks"].get(reason, 0) + 1
+    counts[key] = counts.get(key, 0) + 1
+    from sglang.srt.environ import envs
+
+    if envs.SGLANG_LOG_DECODE_GRAPH_KEY.get():
+        logger.info(
+            "[remote-attn-graph-step] rank=%s step=%s path=%s raw_bs=%s bucket=%s reason=%s failed=%s",
+            stats["rank"],
+            stats["steps"],
+            path,
+            batch.batch_size,
+            bucket,
+            reason,
+            failed,
+        )
+    if not failed and stats["steps"] % 256 == 0:
+        logger.info(
+            "[remote-attn-graph-stats] rank=%s %s",
+            stats["rank"],
+            json.dumps(stats, sort_keys=True),
+        )
+
+
+def pad_attention_output(result, raw_bs, bucket):
+    """Restore the captured bridge shape without creating dummy request work."""
+    if result.shape[0] != raw_bs:
+        raise RuntimeError("Remote attention output has unexpected live rows")
+    if raw_bs == bucket:
+        return result
+    output = result.new_zeros((bucket, *result.shape[1:]))
+    output[:raw_bs].copy_(result)
+    return output
 
 
 def _runtime():
@@ -57,6 +115,7 @@ class RemoteGraphBackend:
         self.capture_batch = None
         self.capturing = False
         self.active_batch = None
+        self.active_key = None
         self.use_remote = False
         self.capture_layers = []
         self.remote_keys = {}
@@ -132,23 +191,38 @@ class RemoteGraphBackend:
         for state in meta["states"]:
             _runtime()._check_target_state(state)
 
-    def supports_remote(self, batch):
-        key = self.remote_keys.get(batch.batch_size)
-        return bool(
-            key is not None
-            and batch.forward_mode.is_decode()
-            and batch.input_ids.numel() == batch.batch_size
-            and batch.input_embeds is None
-            and batch.replace_embeds is None
-            and self.remote.can_run(batch, key)
+    def remote_key(self, batch):
+        if getattr(self.runner, "disable_padding", False):
+            return self.remote_keys.get(batch.batch_size)
+        return next(
+            (
+                self.remote_keys[size]
+                for size in sorted(self.remote_keys)
+                if size >= batch.batch_size
+            ),
+            None,
         )
+
+    def remote_fallback_reason(self, batch):
+        if not batch.forward_mode.is_decode():
+            return "not_decode"
+        if batch.batch_size <= 0 or batch.input_ids.numel() != batch.batch_size:
+            return "not_one_token_per_request"
+        if batch.input_embeds is not None or batch.replace_embeds is not None:
+            return "embedding_override"
+        key = self.remote_key(batch)
+        if key is None:
+            return "remote_bucket_unavailable"
+        if not self.remote.can_run(batch, key):
+            return "remote_graph_unavailable"
+        return None
+
+    def supports_remote(self, batch):
+        return self.remote_fallback_reason(batch) is None
 
     def can_run(self, batch, shape_key):
         if leased(self.runner):
-            return (
-                self.supports_remote(batch)
-                and self.remote_keys[batch.batch_size] == shape_key
-            )
+            return self.supports_remote(batch) and self.remote_key(batch) == shape_key
         return self.full.can_run(batch, shape_key)
 
     @contextmanager
@@ -165,6 +239,13 @@ class RemoteGraphBackend:
             # retain a Req or a capture-time dummy ForwardBatch in the callback.
             self.validate_live(batch)
         self.use_remote, self.active_batch = use_remote, batch
+        self.active_key = self.remote_key(batch) if use_remote else None
+        # Native load_batch must stage exactly the bucket that eligibility and
+        # replay selected, even if the full bank also captured 3/6/12/etc.
+        # This runner cannot execute concurrently or nest (guarded above).
+        native_buckets = self.runner.capture_bs
+        if use_remote:
+            self.runner.capture_bs = sorted(self.remote_keys)
         try:
             yield
         finally:
@@ -179,7 +260,9 @@ class RemoteGraphBackend:
                 raise
             finally:
                 self.active_batch = None
+                self.active_key = None
                 self.use_remote = False
+                self.runner.capture_bs = native_buckets
 
     @contextmanager
     def replay_session(self):
@@ -192,8 +275,14 @@ class RemoteGraphBackend:
             raise RuntimeError("Remote graph replay has no matching live batch")
         name = "remote" if self.use_remote else "full"
         backend = self.remote if self.use_remote else self.full
-        if self.use_remote and self.remote_keys.get(batch.batch_size) != shape_key:
-            raise RuntimeError("Remote graph cannot replay a padded or mismatched key")
+        if self.use_remote:
+            if self.active_key != shape_key:
+                raise RuntimeError("Remote graph cannot replay a mismatched key")
+            if shape_key.size != batch.batch_size:
+                # load_batch prepared padded native attention metadata. Eager
+                # breaks consume only real rows, including wholly Local layers
+                # while a progressive lease still selects the Remote bank.
+                self.prepare_padded_metadata(batch)
         output = backend.replay(shape_key, batch, **kwargs)
         self.replays[name] += 1
         from sglang.srt.environ import envs
@@ -203,6 +292,9 @@ class RemoteGraphBackend:
                 "[remote-attn-graph] replay bank=%s batch=%s", name, batch.batch_size
             )
         return output
+
+    def prepare_padded_metadata(self, batch):
+        self.runner.attn_backend.init_forward_metadata(batch)
 
     def _attention(self, module, q, k, v, save_kv_cache=True, **kwargs):
         if self.capture_remote:
@@ -217,10 +309,18 @@ class RemoteGraphBackend:
         batch = self.active_batch
         if not self.use_remote or batch is None or self.is_capturing():
             raise RuntimeError("Remote attention break is outside its live replay")
-        if q.shape[0] != batch.batch_size:
-            raise RuntimeError("Remote attention break cannot consume padding rows")
+        bucket = self.active_key.size
+        if q.shape[0] != bucket:
+            raise RuntimeError("Remote attention break has a mismatched bucket")
+        raw_bs = batch.batch_size
         result = _runtime()._handoff_attention_forward(
-            module, q, k, v, batch, save_kv_cache=save_kv_cache, **kwargs
+            module,
+            q[:raw_bs],
+            k[:raw_bs] if k is not None else None,
+            v[:raw_bs] if v is not None else None,
+            batch,
+            save_kv_cache=save_kv_cache,
+            **kwargs,
         )
         if (
             result.shape != (batch.batch_size, module.tp_q_head_num * module.v_head_dim)
@@ -228,7 +328,7 @@ class RemoteGraphBackend:
         ):
             raise RuntimeError("Remote attention output differs from its graph bridge")
         self.attention_calls += 1
-        return result
+        return pad_attention_output(result, raw_bs, bucket)
 
     def manifest(self):
         return tuple(sorted(self.boundaries.items()))
@@ -244,6 +344,16 @@ class RemoteGraphBackend:
             self.done.synchronize()
         self.remote.cleanup()
         self.full.cleanup()
+        logger.info(
+            "[remote-attn-graph-stats] rank=%s %s",
+            getattr(self.runner.model_runner, "_remote_attn_graph_stats", {}).get(
+                "rank"
+            ),
+            json.dumps(
+                getattr(self.runner.model_runner, "_remote_attn_graph_stats", {}),
+                sort_keys=True,
+            ),
+        )
         self.remote_keys.clear()
         self.boundaries.clear()
         self.closed = True

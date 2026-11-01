@@ -28,7 +28,7 @@ still need acceptance on the target deployment.
 
 - `sglang_remote_attn/handoff_control.py`: adapted runtime, including Copy, Layer,
   Remote, Fast Freeze/Resume, RemoteHub, progressive LOCAL, epochs, fences and leases.
-- `sglang_remote_attn/hooks.py`: 47 function-boundary hooks. No scheduler event
+- `sglang_remote_attn/hooks.py`: 48 function-boundary hooks. No scheduler event
   loop, graph runner, allocation function or Mooncake connector is copied/replaced.
 - `control_plane/p2d_driver.py`: original supplied driver. `p4_gateway.py` now
   carries a targeted C1 reservation/epoch fix; its protocol and fixed state paths
@@ -141,6 +141,15 @@ graph dispatch. The older functional experiment launchers still disable graphs.
 See [graph adaptation and validation](validation/PROGRESSIVE-CUDA-GRAPHS.md).
 The [segmented GPU probe](validation/REMOTE-SEGMENTED-GRAPHS.md) passed real CUDA
 BF16/FP16 capture/replay with toy attention/RPC; full Qwen3 PD/NCCL validation remains pending.
+
+Remote decode now rounds up to the smallest captured Remote bucket (for example,
+3→4, 5/6/7→8, 13/14/15→16). Eligibility, native input staging and replay share
+that bucket even when the full bank also contains intermediate sizes. With
+`--disable-cuda-graph-padding`, only exact sizes remain eligible. Eager attention
+and DSV SWA/carry/indexer updates consume real request rows; zero-filled attention
+bridges retain the graph's bucket shape, and the native runner trims final outputs.
+Padded Remote replay rebuilds real-row attention metadata before the first segment.
+See [padding validation and counters](validation/REMOTE-GRAPH-PADDING.md).
 
 The plugin rejects PP/DP/CP/DCP, speculative decoding, mixed chunks, unified KV,
 HiCache, hybrid/MLA/quantized KV pools and live PD role switching. These layouts

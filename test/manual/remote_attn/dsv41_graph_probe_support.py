@@ -104,6 +104,9 @@ def fixture(
         is_dsv41 = True
         trtllm_attn = mega_attn = False
 
+        def init_forward_metadata(self, forward_batch):
+            self.init_forward_metadata_in_graph(forward_batch)
+
         def init_forward_metadata_in_graph(self, forward_batch):
             self.current = forward_batch
             if bank[0] and bank[0].use_remote:
@@ -312,6 +315,7 @@ def fixture(
         model_runner=mr,
         attn_backend=attn,
         device_module=torch.cuda if device == "cuda" else None,
+        capture_bs=[1, 2, 4, 8, 16, 32],
         cuda_graph_output_capacity_rows=lambda out: out.next_token_logits.shape[0],
         cuda_graph_output_rows=lambda out: out.next_token_logits.shape[0],
     )

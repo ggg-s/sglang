@@ -1875,6 +1875,7 @@ def dsv41_graph_settings(args):
     from sglang_remote_attn.dsv41_graph import DSV41GraphBackend
 
     backend = DSV41GraphBackend.__new__(DSV41GraphBackend)
+    backend.runner = f.runner
     backend.remote_keys = {n: SimpleNamespace(size=n) for n in (1, 2, 4, 8, 16)}
     backend.remote = SimpleNamespace(can_run=lambda *a: True)
     f.runner.backend = backend
@@ -1903,7 +1904,7 @@ def dsv41_graph_settings(args):
                 ]
             )
         assert not votes
-    assert policies == [[True, True, False, True, True, True, False]] * 3 + [[True] * 7]
+    assert policies == [[True] * 6 + [False]] * 3 + [[True] * 7]
     return dict(settings=outcomes, policies=policies, per_decode_votes=len(votes))
 
 
@@ -2373,7 +2374,7 @@ def main():
         )
         backend.remote = SimpleNamespace(can_run=lambda *a: True)
         runner.backend = backend
-        routing = []
+        routing, selected_buckets = [], []
         import torch
 
         with (
@@ -2384,8 +2385,8 @@ def main():
         ):
             for remote_active in (False, True, False, True):
                 controller.targets = [object()] if remote_active else []
-                row = []
-                for size in (1, 2, 3, 4, 8, 16, 32):
+                row, buckets = [], []
+                for size in (1, 2, 3, 4, 5, 6, 7, 8, 13, 14, 15, 16, 32):
                     batch = SimpleNamespace(
                         batch_size=size,
                         input_ids=torch.zeros(size, dtype=torch.int64),
@@ -2394,7 +2395,10 @@ def main():
                         forward_mode=SimpleNamespace(is_decode=lambda: True),
                     )
                     row.append(hooks._decode_graph(lambda *a: True, runner, batch))
+                    key = backend.remote_key(batch)
+                    buckets.append(key.size if key else None)
                 routing.append(row)
+                selected_buckets.append(buckets)
         overlap_lifetimes = decode_overlap_lifetimes(args)
         p_overlap = prefill_overlap_lifetimes(args)
         p_certificates = prefill_certificate_lifetimes(args)
@@ -2433,6 +2437,7 @@ def main():
                     "d_cache": d_cache,
                     "segmented_startup": startup,
                     "segmented_routing": routing,
+                    "segmented_buckets": selected_buckets,
                 }
             )
         )

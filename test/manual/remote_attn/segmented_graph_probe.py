@@ -225,6 +225,8 @@ def run(root, allow_strong_refs, dtype, logits_output=False):
         runner = types.SimpleNamespace(
             model_runner=mr,
             device_module=torch.cuda,
+            capture_bs=[1, 2, 3, 4, 6, 8, 14, 16, 32],
+            attn_backend=types.SimpleNamespace(init_forward_metadata=lambda fb: None),
             cuda_graph_output_capacity_rows=lambda output: tensor_output(output).shape[
                 0
             ],
@@ -262,6 +264,7 @@ def run(root, allow_strong_refs, dtype, logits_output=False):
                 and not torch.cuda.is_current_stream_capturing()
             )
             assert live.marker >= 0, "capture-time request escaped into replay"
+            assert q.shape[0] == k.shape[0] == v.shape[0] == live.batch_size
             if module.layer_id in live.local_layers:
                 return q
             callbacks.append((live.marker, module.layer_id))
@@ -289,7 +292,7 @@ def run(root, allow_strong_refs, dtype, logits_output=False):
             sg.install_attention(mr)
             stream = torch.cuda.Stream()
             with backend.capture_session(stream):
-                for size in (32, 16, 8, 4, 2, 1):
+                for size in reversed(runner.capture_bs):
                     inputs[size] = torch.randn(size, width, device="cuda", dtype=dtype)
                     dummy = batch(size)
                     backend.capture_one(
@@ -309,19 +312,34 @@ def run(root, allow_strong_refs, dtype, logits_output=False):
                 "16": layers + 1,
             }, segment_counts
             controller.targets.append(object())
-            for size in (16, 8, 4, 1, 2, 16, 8, 1):
+            padded_replays = []
+            for size in (16, 3, 5, 6, 7, 13, 14, 15, 8, 4, 1, 2, 16, 3):
                 for marker, local in ((11, ()), (12, (0,)), (13, (0, 1, 2))):
                     live = batch(size, marker, local)
-                    inputs[size].normal_()
-                    expected = model(inputs[size], live, reference=True)
+                    key = backend.remote_key(live)
+                    inputs[key.size].normal_()
+                    expected = model(inputs[key.size][:size], live, reference=True)
                     with backend.execution(live), backend.replay_session():
-                        output = backend.replay(shape(size), live)
+                        output = backend.replay(key, live)
+                    # Native decode output slicing is covered by the DSV probe;
+                    # inspect this toy graph's raw bridge as well as live rows.
+                    if key.size != size:
+                        padded_replays.append([size, key.size])
+                    if logits_output:
+                        output = dataclasses.replace(
+                            output,
+                            next_token_logits=output.next_token_logits[:size],
+                            hidden_states=output.hidden_states[:size],
+                            hidden_states_token_indices=output.hidden_states_token_indices[
+                                :size
+                            ],
+                        )
+                    else:
+                        output = output[:size]
                     check_output(output, expected)
-            assert (
-                not backend.supports_remote(batch(3))
-                and not backend.supports_remote(batch(12))
-                and not backend.supports_remote(batch(32))
-            )
+            assert not backend.supports_remote(
+                batch(17)
+            ) and not backend.supports_remote(batch(32))
             controller.targets.clear()
             before = len(callbacks)
             for size in (16, 8, 4, 2, 1, 32):
@@ -354,6 +372,7 @@ def run(root, allow_strong_refs, dtype, logits_output=False):
             "layers": layers,
             "remote_segments": segment_counts,
             "replays": replay_counts,
+            "padded_replays": padded_replays,
             "rpc_calls": len(callbacks),
             "capture_rpc_calls": 0,
             "max_allocated_bytes": torch.cuda.max_memory_allocated(),
