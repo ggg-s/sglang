@@ -294,6 +294,10 @@ class DSV41Source(dsv41_progressive.SourceMixin, Source):
                 "recv_host_staging": self.recv_host_staging,
                 "native_staging": self.native_staging,
                 "p_radix_read_lease": self.cache_lease is not None,
+                "range_stream": getattr(self, "prefix_stream", None) is not None,
+                "range_pieces": len(self.prefix_stream.pieces)
+                if getattr(self, "prefix_stream", None) is not None
+                else 0,
                 "cached_prefix_tokens": self.cache_lease.cached_tokens
                 if self.cache_lease is not None
                 else 0,
@@ -311,6 +315,8 @@ class DSV41Source(dsv41_progressive.SourceMixin, Source):
             sources.pop(int(self.req.bootstrap_room))
 
     def poll(self):
+        if getattr(self, "prefix_stream", None) is not None and not self.finalized:
+            return super().poll()
         if not self.owner.dsv41_remote:
             return super().poll()
         from .pre_layerwise import _poll_success
@@ -497,7 +503,13 @@ class DSV41Controller(Controller):
                 and (allow_middle or req.extend_end == len(req.origin_input_ids))
                 and req.multimodal_inputs is None
                 and req.input_embeds is None
-                and getattr(req, "_pre_layerwise_source", None) is None
+                and (
+                    getattr(req, "_pre_layerwise_source", None) is None
+                    or getattr(
+                        getattr(req, "_remote_attn_prefix_stream", None), "bound", True
+                    )
+                    is False
+                )
                 and not getattr(
                     getattr(req, "_dsv41_p_lease", None), "cancelling", False
                 )
@@ -556,13 +568,17 @@ class DSV41Controller(Controller):
                         or (
                             offer.get("remote_boundary") == "progressive-sparse"
                             and offer.get("native_staging")
-                            and max(e[-1] for e in schema["entries"])
-                            * (
-                                (req.extend_end + page - 1) // page
-                                - req.disagg_decode_prefix_len // page
-                                - sender.curr_idx
+                            and (
+                                getattr(req, "_remote_attn_prefix_stream", None)
+                                is not None
+                                or max(e[-1] for e in schema["entries"])
+                                * (
+                                    (req.extend_end + page - 1) // page
+                                    - req.disagg_decode_prefix_len // page
+                                    - sender.curr_idx
+                                )
+                                <= offer.get("progressive_ring_bytes", 0)
                             )
-                            <= offer.get("progressive_ring_bytes", 0)
                         )
                     )
                     and mgr.kv_shard_size == 1
@@ -652,7 +668,10 @@ class DSV41Controller(Controller):
                 if self.dsv41_remote
                 else resource_groups(schema, group_size)
             )
-            if offer.get("native_staging"):
+            if (
+                offer.get("native_staging")
+                and getattr(req, "_remote_attn_prefix_stream", None) is None
+            ):
                 dsv41_receive.install(self, sender.kv_mgr, "prefill")
                 sender.kv_mgr.request_layer_staging(
                     sender.bootstrap_room,
@@ -678,7 +697,12 @@ class DSV41Controller(Controller):
                 cache_lease=(
                     getattr(getattr(req, "_dsv41_p_lease", None), "cache_lease", None)
                     if plan is not None
-                    else self.cache_guard.hold(req)
+                    else getattr(
+                        getattr(req, "_remote_attn_prefix_stream", None),
+                        "cache_lease",
+                        None,
+                    )
+                    or self.cache_guard.hold(req)
                     if getattr(self, "cache_guard", None) is not None
                     else None
                 ),
@@ -686,6 +710,9 @@ class DSV41Controller(Controller):
                 indices_keepalive=keepalive,
                 decode_prefix_len=req.disagg_decode_prefix_len,
             )
+            from .prefix_stream import bind
+
+            source = bind(req, source)
             if self.dsv41_remote:
                 sources = getattr(sender.kv_mgr, "_dsv41_progressive_sources", None)
                 if sources is None:
@@ -698,7 +725,8 @@ class DSV41Controller(Controller):
             )
             req._pre_layerwise_source = source
             req.start_send_idx = req.extend_end
-            self.sources.append(source)
+            if not any(s is source for s in self.sources):
+                self.sources.append(source)
             jobs.append(source)
         if jobs:
             self.batches += 1

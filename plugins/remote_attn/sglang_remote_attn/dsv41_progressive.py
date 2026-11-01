@@ -149,6 +149,15 @@ def completed(queue, dr):
     lease = lease_for(dr.req)
     if lease is not None:
         lease.check()
+    from .prefix_stream import update
+
+    target = getattr(dr.req, "_pre_layerwise_target", None) or getattr(
+        dr, "_pre_layerwise_offer", None
+    )
+    if target is not None:
+        ranges = update(target)
+        if ranges is not None:
+            return {i for i in range(ranges.layers) if ranges.ready(i)}
     handler = queue.staging_handler
     handler.advance_scatter(dr)
     if handler.is_failed(dr):
@@ -204,6 +213,12 @@ class Resource:
         return self.parent.generation
 
     def gpu_ready(self):
+        from .prefix_stream import header
+
+        if self.parent.closed:
+            return True
+        if header(self.parent) is not None:
+            return self.parent.gpu_ready()
         return self.transport_ready()
 
     def transport_ready(self):
@@ -212,7 +227,7 @@ class Resource:
         )
 
     def ready_to_finish(self):
-        return self.transport_ready()
+        return self.gpu_ready() and self.transport_ready()
 
     def finish(self, *, wait=False):
         if not self.ready_to_finish():
@@ -256,7 +271,11 @@ class ProgressiveTarget(NativeTarget):
     def ready_to_finish(self):
         # Full canonical completion may supersede outstanding resource commands
         # at a TP-symmetric retraction boundary. All scatters still need proving.
-        return self.gpu_ready() and self.transport_ready()
+        ready = self.gpu_ready() and self.transport_ready()
+        ranges = getattr(self, "_range_coverage", None)
+        return ready and (
+            ranges is None or all(ranges.ready(i) for i in range(ranges.layers))
+        )
 
     def finish(self, *, wait=False):
         if not self.ready_to_finish():

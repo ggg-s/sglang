@@ -190,6 +190,8 @@ class Source:
     decode_prefix_len: int = 0
 
     def complete(self, layers):
+        if getattr(self, "prefix_stream", None) is not None:
+            return  # Explicit per-range receipts replace the FIFO shortcut.
         if self.native_staging:
             # Network completion is not GPU completion. The native receiver's
             # scatter event, observed by Target.refresh, publishes readiness.
@@ -232,6 +234,10 @@ class Source:
                 "recv_host_staging": self.recv_host_staging,
                 "native_staging": self.native_staging,
                 "p_radix_read_lease": self.cache_lease is not None,
+                "range_stream": getattr(self, "prefix_stream", None) is not None,
+                "range_pieces": len(self.prefix_stream.pieces)
+                if getattr(self, "prefix_stream", None) is not None
+                else 0,
                 "cached_prefix_tokens": self.cache_lease.cached_tokens
                 if self.cache_lease is not None
                 else 0,
@@ -266,18 +272,24 @@ class Source:
                 sender = self.req.disagg_kv_sender
                 # An independent metadata write can wait for the current TE
                 # call's mutex, but does not sit behind the whole KV queue.
-                for peer, registration in self.peers:
-                    rc = sender.kv_mgr.send_aux(
-                        peer, sender.aux_index, registration.dst_aux_ptrs
-                    )
-                    if rc != 0:
-                        raise RuntimeError(f"early metadata transfer failed: {rc}")
+                from contextlib import nullcontext
+
+                stream = getattr(self, "prefix_stream", None)
+                with stream.priority() if stream is not None else nullcontext():
+                    for peer, registration in self.peers:
+                        rc = sender.kv_mgr.send_aux(
+                            peer, sender.aux_index, registration.dst_aux_ptrs
+                        )
+                        if rc != 0:
+                            raise RuntimeError(f"early metadata transfer failed: {rc}")
                 write_json(
                     self.path / "ready.json",
                     {
                         "generation": self.generation,
                         "prefix_len": self.prefix_len,
                         "service": self.service,
+                        "range_stream": getattr(self, "prefix_stream", None)
+                        is not None,
                         "at": time.monotonic(),
                     },
                 )
@@ -299,6 +311,11 @@ class Source:
     def poll(self):
         if self.released:
             return True
+        stream = getattr(self, "prefix_stream", None)
+        if stream is not None:
+            stream.check()
+        if stream is not None and not self.finalized:
+            return stream.aborted and self.release is not None and stream.drained()
         native_complete = _poll_success(self.req.disagg_kv_sender)
         if self.error:
             raise RuntimeError(f"pre-layerwise source failed: {self.error}")
@@ -329,6 +346,10 @@ class Source:
             self.thread.join(timeout=self.owner.config.drain_timeout)
             if self.thread.is_alive():
                 raise RuntimeError("metadata writer did not drain")
+        from .prefix_stream import cleanup
+
+        # The pin still has to be live when the final IO proof is checked.
+        cleanup(self.req)
         release = self.release
         if self.cache_lease is not None:
             self.cache_lease.check()
@@ -376,6 +397,7 @@ class Target:
     admission_id: int = 0
     cache_lease: object = None
     decode_prefix_len: int = 0
+    resources: list = field(default_factory=list)
 
     def gpu_ready(self):
         from .remote_data_plane import ready
@@ -398,7 +420,12 @@ class Target:
             return
         if self.cache_lease is not None:
             self.cache_lease.check()
-        if self.native_staging:
+        from .prefix_stream import update
+
+        ranges = update(self)
+        if ranges is not None:
+            self.coverage = ranges
+        elif self.native_staging:
             handler = self.queue.staging_handler
             handler.advance_scatter(self.decode_req)
             if handler.is_failed(self.decode_req):
@@ -433,11 +460,17 @@ class Target:
             return
         for layer in range(self.coverage.layers):
             if self.coverage.ready(layer):
+                if ranges is not None:
+                    continue  # A shared Layer command, not rank-local IO, sets events.
                 if not self.state.events[layer].is_set():
                     self.state.layer_ready_at[layer] = time.monotonic()
                     self.state.events[layer].set()
                 continue
-            proof = read_json(self.path / f"layer-{layer}.json")
+            proof = (
+                None
+                if ranges is not None
+                else read_json(self.path / f"layer-{layer}.json")
+            )
             if proof and proof.get("generation") == self.generation:
                 if proof.get("layer") != layer:
                     raise RuntimeError("layer completion identity mismatch")
@@ -491,6 +524,7 @@ class Target:
                 "scheduler_overlap": getattr(self.owner, "decode_overlap", None)
                 is not None,
                 "deferred_kv_release": self.release is not None,
+                "range_stream": hasattr(self, "_range_coverage"),
                 "remote_calls": self.state.remote_calls
                 if self.state is not None
                 else 0,
@@ -531,7 +565,11 @@ class Target:
         )
 
     def ready_to_finish(self):
-        return self.gpu_ready() and self.transport_ready()
+        ready = self.gpu_ready() and self.transport_ready()
+        ranges = getattr(self, "_range_coverage", None)
+        return ready and (
+            ranges is None or all(ranges.ready(i) for i in range(ranges.layers))
+        )
 
 
 class Controller:
@@ -558,6 +596,7 @@ class Controller:
         from sglang.srt.runtime_context import get_exec
 
         from .pd_mesh import startup_signature
+        from .prefix_stream import enabled as prefix_enabled
         from .source_cache import cache_signature
 
         self.graph_fast_path = False
@@ -588,7 +627,7 @@ class Controller:
             else None,
             getattr(self, "schema_signature", None),
             startup_signature(self.config),
-            ("destination-cache-v1",),
+            ("destination-cache-v1", "prefix-range-v1", prefix_enabled()),
         )
         clean = not _runtime().has_target_states()
         if self.tp_size > 1:
@@ -706,6 +745,7 @@ class Controller:
                 "session": mgr.get_session_id(),
                 "prefix_len": target.coverage.prefix_len,
                 "decode_prefix_len": target.decode_prefix_len,
+                "range_stream": 1,
                 "tp_size": self.tp_size,
                 "layers": self.layers,
                 "mode": self.config.mode,
@@ -750,7 +790,13 @@ class Controller:
                 and req.multimodal_inputs is None
                 and req.input_embeds is None
                 and type(sender) is MooncakeKVSender
-                and getattr(req, "_pre_layerwise_source", None) is None
+                and (
+                    getattr(req, "_pre_layerwise_source", None) is None
+                    or getattr(
+                        getattr(req, "_remote_attn_prefix_stream", None), "bound", True
+                    )
+                    is False
+                )
             ):
                 mgr = sender.kv_mgr
                 from .pd_mesh import source_root
@@ -853,19 +899,28 @@ class Controller:
                 stager=stager,
                 native_staging=sender.kv_mgr.enable_staging,
                 recv_host_staging=offer.get("recv_host_staging", False),
-                cache_lease=self.cache_guard.hold(req)
+                cache_lease=getattr(
+                    getattr(req, "_remote_attn_prefix_stream", None),
+                    "cache_lease",
+                    None,
+                )
+                or self.cache_guard.hold(req)
                 if getattr(self, "cache_guard", None) is not None
                 else None,
                 decode_prefix_len=int(offer.get("decode_prefix_len", 0)),
             )
+            from .prefix_stream import bind
+
+            source = bind(req, source)
             sender._record_transfer_indices(indices, None)
             sender._transfer_start_time = (
                 sender._transfer_start_time or time.perf_counter()
             )
             req._pre_layerwise_source = source
             req.start_send_idx = req.extend_end
-            self.sources.append(source)
-            if source.native_staging:
+            if not any(s is source for s in self.sources):
+                self.sources.append(source)
+            if source.native_staging and getattr(source, "prefix_stream", None) is None:
                 sender.kv_mgr.request_layer_staging(
                     sender.bootstrap_room, index_slice, groups
                 )
@@ -956,7 +1011,7 @@ class Controller:
     def drain_targets(self, required=None):
         overlap = getattr(self, "decode_overlap", None)
         if overlap is not None:
-            if getattr(self, "dsv41_remote", False) and required is not None:
+            if required is not None and getattr(required, "resources", None):
                 # First retire the physical resources at this symmetric boundary;
                 # the parent can then free native metadata/KV without dangling
                 # resource commands querying an already-cleared receiver.
@@ -982,6 +1037,8 @@ class Controller:
                 time.sleep(0.005)
 
     def early_targets(self, queue, rids_to_check):
+        from .prefix_stream import header as range_header
+
         # Retired receivers are not in queue.queue but still own metadata and
         # prefix writes. Reap them before considering new admissions.
         if getattr(self, "decode_overlap", None) is None:
@@ -1002,6 +1059,9 @@ class Controller:
                     and data
                     and data.get("generation") == target.generation
                     and data.get("prefix_len") == target.coverage.prefix_len
+                    and (
+                        not data.get("range_stream") or range_header(target) is not None
+                    )
                     and int(
                         queue.metadata_buffers.bootstrap_room[dr.metadata_buffer_index][
                             0
@@ -1045,7 +1105,21 @@ class Controller:
             target.refresh()
             dr.req._pre_layerwise_target = target
             _runtime()._install_attention_wrappers(self.scheduler, state)
-            target.admission_id = self.early_admissions + 1
+            from .prefix_stream import Layer, header
+
+            stream = header(target)
+            if stream is not None:
+                retirement = self.decode_overlap.retirement
+                for layer in range(self.layers):
+                    resource = Layer(target, layer, retirement.last_admission + 1)
+                    target.resources.append(resource)
+                    retirement.register(resource)
+                    self.targets.append(resource)
+            target.admission_id = (
+                self.decode_overlap.retirement.last_admission + 1
+                if getattr(self, "decode_overlap", None) is not None
+                else self.early_admissions + 1
+            )
             if getattr(self, "decode_overlap", None) is not None:
                 self.decode_overlap.retirement.register(target)
             self.targets.append(target)
@@ -1081,6 +1155,7 @@ class Controller:
             for src in sources
         ]
         retired = []
+        prefix_error = False
         for src, respond in zip(sources, self.agree(ready)):
             if respond:
                 snapshot = copy.copy(src.req)
@@ -1090,7 +1165,15 @@ class Controller:
                     [snapshot], snapshot.return_logprob, None
                 )
                 src.responded = True
-            complete = src.poll()
+            try:
+                complete = src.poll()
+            except Exception as exc:
+                stream = getattr(src, "prefix_stream", None)
+                if stream is None:
+                    raise
+                stream.fail(exc)
+                prefix_error = True
+                complete = False
             if (
                 self.config.mode == "layerwise"
                 and src.cache_lease is None
@@ -1102,7 +1185,14 @@ class Controller:
                 complete = True
             retired.append(int(complete))
         # Do not change the collective's vector size independently by rank.
-        for src, retire in zip(sources, self.agree(retired)):
+        if any(getattr(src, "prefix_stream", None) is not None for src in sources):
+            votes = self.agree([int(not prefix_error), *retired])
+            if not votes[0]:
+                raise RuntimeError("prefix source proof failed across TP; retaining KV")
+            retired = votes[1:]
+        else:
+            retired = self.agree(retired)
+        for src, retire in zip(sources, retired):
             if retire:
                 src.retire()
                 self.sources.remove(src)
@@ -1157,7 +1247,7 @@ def initialize(scheduler):
 
         controller.decode_overlap = install_overlap(
             controller,
-            force=getattr(controller, "dsv41_remote", False)
+            force=controller.config.mode == "remote"
             or controller.destination_cache is not None,
         )
     scheduler._pre_layerwise = controller
@@ -1176,8 +1266,12 @@ def run_batch(original, scheduler, batch, *args, **kwargs):
     if getattr(controller, "cache_guard", None) is not None:
         # Native cached-prefix sends must precede final-tail reservation. The
         # repeated call inside Scheduler.run_batch is then a native no-op.
-        for req in batch.reqs:
-            scheduler.maybe_send_cached_prefix_chunk(req)
+        controller.prefix_batch = batch
+        try:
+            for req in batch.reqs:
+                scheduler.maybe_send_cached_prefix_chunk(req)
+        finally:
+            controller.prefix_batch = None
     controller.plan = controller.prepare(batch)
     try:
         return original(scheduler, batch, *args, **kwargs)
@@ -1203,6 +1297,9 @@ def send_chunk(original, scheduler, req, last_chunk=False, end_idx=None):
     source = getattr(req, "_pre_layerwise_source", None)
     if source is None or not last_chunk:
         return original(scheduler, req, last_chunk=last_chunk, end_idx=end_idx)
+    stream = getattr(source, "prefix_stream", None)
+    if stream is not None and not stream.bound:
+        raise RuntimeError("prefix final qualification revoked; retaining pinned IO")
     if hasattr(source, "finalize_native"):
         return source.finalize_native(
             original, scheduler, req, last_chunk=last_chunk, end_idx=end_idx
@@ -1247,6 +1344,9 @@ def defer_release(req, release, *, checkpoint=None):
     ):
         raise RuntimeError("pre-layerwise staging is unsettled; retaining source KV")
     lease = getattr(source, "cache_lease", None)
+    stream = getattr(source, "prefix_stream", None)
+    if stream is not None and checkpoint is False:
+        stream.aborted = True
     if source is not None and (
         source.owner.config.mode == "remote"
         or lease is not None
@@ -1256,7 +1356,7 @@ def defer_release(req, release, *, checkpoint=None):
             lease.check()
         if lease is not None and checkpoint is False:
             lease.abort = True
-        if not source.finalized:
+        if not source.finalized and not (stream is not None and stream.aborted):
             raise RuntimeError(
                 "cannot recycle a failed Prefill with layer writes in flight"
             )

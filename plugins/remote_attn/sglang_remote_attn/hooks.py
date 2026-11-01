@@ -17,6 +17,7 @@ from . import (
     pd_mesh,
     pre_layerwise,
     prefill_overlap,
+    prefix_stream,
     segmented_graph,
     source_cache,
 )
@@ -305,6 +306,8 @@ def _reset_retracted(original, req):
         cert = getattr(req, "_dsv41_p_certificate", None)
         if cert is not None:
             cert.admission.overlap.drain(req)
+    if prefix_stream.stream_for(req) is not None:
+        raise RuntimeError("prefix stream must retire before request reset")
     result = original(req)
     if (
         getattr(req, "_remote_attn_decode_cache_enabled", False)
@@ -312,6 +315,7 @@ def _reset_retracted(original, req):
     ):
         req.advance_cache_request_handle()
     req._remote_attn_decode_match = None
+    req._remote_attn_prefix_stream_seen = False
     req.handoff_prefix_indices = None
     req._handoff_prefix_indices = None
     return result
@@ -536,6 +540,7 @@ def _publish_peer_now(original, manager, mooncake_session_id, decode_kv_args):
 
 
 HOOKS = {
+    "sglang.srt.disaggregation.prefill.SchedulerDisaggregationPrefillMixin.maybe_send_cached_prefix_chunk": prefix_stream.cached_prefix,
     "sglang.srt.disaggregation.decode.DecodePreallocQueue._match_prefix_and_lock": destination_cache.match_prefix,
     "sglang.srt.disaggregation.decode.DecodePreallocQueue._send_kv_metadata": destination_cache.send_metadata,
     "sglang.srt.disaggregation.decode.DecodeTransferQueue._commit_transfer_to_req": dsv41_remote.commit,
@@ -563,7 +568,7 @@ HOOKS = {
     "sglang.srt.disaggregation.mooncake.conn.MooncakeKVManager._transfer_data": _transfer,
     "sglang.srt.disaggregation.mooncake.conn.MooncakeKVManager.send_kvcache": dsv41_layerwise.send_selected,
     "sglang.srt.disaggregation.mooncake.conn.MooncakeKVManager.send_aux": dsv41_progressive.send_aux,
-    "sglang.srt.disaggregation.mooncake.conn.MooncakeKVManager.add_transfer_request": dsv41_progressive.canonical_track,
+    "sglang.srt.disaggregation.mooncake.conn.MooncakeKVManager.add_transfer_request": prefix_stream.track,
     "sglang.srt.models.deepseek_v4_replay_tail.DecoderReplayTail.plan": prefill_overlap.tail_plan,
     "sglang.srt.disaggregation.prefill.SchedulerDisaggregationPrefillMixin.clear_pending_chunk_send": prefill_overlap.before_mutation,
     "sglang.srt.disaggregation.prefill.SchedulerDisaggregationPrefillMixin.optimistic_release_and_requeue": prefill_overlap.before_mutation,

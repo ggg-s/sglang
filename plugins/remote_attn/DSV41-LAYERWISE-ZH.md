@@ -1,5 +1,7 @@
 # DSV4.1 Flash：原生 PD 的 layerwise 与 eager Remote 接入
 
+P 缓存前缀（Qwen3/DSV4.1）：[统一 Remote progressive 与 A/B 对照](PREFIX-REMOTE-PROGRESSIVE-ZH.md)。
+
 此路径用于纯文本、相同 TP、PP=DP=CP=1、Mooncake、
 DSpark/其他投机解码关闭，不启用 KV cache sharding。使用原生 SMG 和 `sglang.launch_server`，没有 JSON
 包装器。layerwise 传输和缓存/overlap 接入在插件内；Remote 分段图另依赖本分支

@@ -1632,6 +1632,186 @@ def sparse_progressive_lifetimes(args, *, prefix_cache=False):
         protocol.close()
 
 
+def prefix_range_lifetimes(args):
+    """TP2 final-tail arrival cannot hide a missing prefix on either rank."""
+    import threading
+
+    import torch
+    from sglang_remote_attn import dsv41_progressive as pg
+    from sglang_remote_attn import prefix_stream as ps
+    from sglang_remote_attn.decode_overlap import DecodeOverlap
+    from sglang_remote_attn.pre_layerwise import (
+        Config,
+        Controller,
+        LayerCoverage,
+        Target,
+    )
+
+    results = []
+    for dsv in (False, True):
+        owner = Controller.__new__(Controller)
+        owner.rank, owner.tp_size, owner.graph_fast_path = args.rank, 2, True
+        owner.scheduler = SimpleNamespace(
+            attn_tp_cpu_group=dist.group.WORLD, enable_overlap=True
+        )
+        owner.config = Config("remote", Path(args.output).with_suffix(f".range-{dsv}"))
+        owner.targets, owner.remote_targets = [], {}
+        generation = f"range-{dsv}-{args.rank}"
+        req = SimpleNamespace(
+            rid=f"prefix-{dsv}",
+            bootstrap_room=871,
+            origin_input_ids=list(range(6)),
+            kv=SimpleNamespace(req_pool_idx=0, cache_protected_len=0),
+        )
+        status = [3]
+        dr = SimpleNamespace(
+            req=req,
+            metadata_buffer_index=0,
+            _staging_completed_layers=[((0,), 3, 3), ((1,), 0, 6)],
+            kv_receiver=SimpleNamespace(poll=lambda: status[0], clear=lambda: None),
+        )
+        dr._prefix_range_header = dict(
+            version=1,
+            generation=generation,
+            length=6,
+            base=0,
+            page=1,
+            resources=2,
+            staged=True,
+            count=3,
+        )
+        dr._prefix_range_registry = {0: ((0,), 0, 3), 1: ((0,), 3, 3), 2: ((1,), 0, 6)}
+        queue = SimpleNamespace(
+            staging_handler=SimpleNamespace(
+                advance_scatter=lambda dr: None,
+                is_failed=lambda dr: False,
+                is_done=lambda dr: status[0] == 4,
+                unregister_decode_req=lambda room: None,
+            ),
+            metadata_buffers=SimpleNamespace(bootstrap_room=torch.tensor([[871]])),
+            req_to_metadata_buffer_idx_allocator=SimpleNamespace(
+                free=lambda index: None
+            ),
+        )
+        state = SimpleNamespace(
+            events=[threading.Event(), threading.Event()],
+            layer_ready_at=[None, None],
+            import_done_at=None,
+            remote_calls=0,
+            admitted_at=0,
+        )
+        if dsv:
+            rpc = SimpleNamespace(
+                local_entries=set(),
+                check=lambda: None,
+                calls=0,
+                close=lambda reason: owner.remote_targets.clear(),
+            )
+            parent = pg.ProgressiveTarget(
+                owner,
+                queue,
+                dr,
+                owner.config.directory,
+                generation,
+                LayerCoverage(6, 2),
+                native_staging=True,
+                rpc=rpc,
+            )
+            owner.remote_targets[0] = rpc
+        else:
+            parent = Target(
+                owner,
+                queue,
+                dr,
+                owner.config.directory,
+                generation,
+                LayerCoverage(6, 2),
+                state=state,
+                native_staging=True,
+            )
+        req._pre_layerwise_target = parent
+        owner.decode_overlap = DecodeOverlap(owner)
+        protocol = owner.decode_overlap.retirement
+        cls = pg.Resource if dsv else ps.Layer
+        resources = [cls(parent, i, i + 1) for i in range(2)]
+        parent.admission_id = 3
+        owner.targets = [*resources, parent]
+        for item in owner.targets:
+            protocol.register(item)
+        votes = []
+        actual = dist.all_reduce
+
+        def counted(tensor, *a, **kw):
+            votes.append(tensor.numel())
+            return actual(tensor, *a, **kw)
+
+        def command():
+            for _ in range(256):
+                protocol.observe()
+                value = [protocol.poll_command()]
+                dist.broadcast_object_list(value, src=0)
+                if value[0] is not None:
+                    protocol.arm(value[0])
+                    protocol.finalize()
+                    return
+                time.sleep(0.001)
+            raise AssertionError("prefix range command missing")
+
+        def stable():
+            for _ in range(32):
+                protocol.observe()
+                assert protocol.poll_command() is None
+
+        try:
+            with (
+                patch.object(dist, "all_reduce", counted),
+                patch(
+                    "sglang_remote_attn.pre_layerwise._runtime",
+                    return_value=SimpleNamespace(
+                        _drop_target_state_for=lambda req: None
+                    ),
+                ),
+                patch.dict(
+                    sys.modules,
+                    {
+                        "sglang.srt.disaggregation.base.conn": SimpleNamespace(
+                            KVPoll=SimpleNamespace(Success=4, Failed=0)
+                        )
+                    },
+                ),
+            ):
+                command()
+                local = lambda: (
+                    sorted(rpc.local_entries)
+                    if dsv
+                    else [i for i, event in enumerate(state.events) if event.is_set()]
+                )
+                assert local() == [1] and votes == [5]
+                if args.rank == 0:
+                    dr._staging_completed_layers.append(((0,), 0, 3))
+                stable()
+                dist.barrier()
+                assert local() == [1] and votes == [5]
+                if args.rank == 1:
+                    dr._staging_completed_layers.append(((0,), 0, 3))
+                command()
+                assert local() == [0, 1] and votes == [5, 5]
+                status[0] = 4
+                command()
+                assert parent.closed and not owner.targets
+                before = len(votes)
+                stable()
+                assert len(votes) == before
+                results.append(
+                    dict(
+                        votes=votes, local=local(), closed=parent.closed, steady_votes=0
+                    )
+                )
+        finally:
+            protocol.close()
+    return results
+
+
 def dsv41_graph_settings(args):
     """Exchange native ABI/capture choices before any segmented capture barrier."""
     import importlib.util
@@ -2227,6 +2407,7 @@ def main():
             args, prefix_cache=True
         )
         dsv41_segments = dsv41_graph_settings(args)
+        prefix_ranges = prefix_range_lifetimes(args)
         d_cache = decode_cache_lifetimes(args)
         Path(args.output).write_text(
             json.dumps(
@@ -2248,6 +2429,7 @@ def main():
                     "sparse_progressive": sparse_progressive,
                     "sparse_cached_progressive": sparse_cached_progressive,
                     "dsv41_segments": dsv41_segments,
+                    "prefix_ranges": prefix_ranges,
                     "d_cache": d_cache,
                     "segmented_startup": startup,
                     "segmented_routing": routing,

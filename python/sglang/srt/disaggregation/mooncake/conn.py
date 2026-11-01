@@ -663,13 +663,17 @@ class MooncakeKVManager(StagingManagerMixin, CommonKVManager):
 
         return PrefillStagingStrategy(self, staging_buffer)
 
-    def request_layer_staging(self, room, index_slice, groups):
-        """Reserve final-chunk groups through the existing staging protocol.
+    def request_layer_staging(
+        self, room, index_slice, groups, *, chunk_id_base=0, stream_generation=None
+    ):
+        """Reserve selected groups through the existing staging protocol.
 
-        Same-TP ordinary chunks bypass staging, so group ordinals own this
-        room's staging chunk ids. All requests precede CHUNK_READY / Success
-        on the same native notification socket.
+        Default callers retain ordinal ids and the existing eight-frame wire.
+        Range-aware callers reserve distinct ids and an optional attempt tag.
+        Requests precede CHUNK_READY / Success on the same notification socket.
         """
+        if chunk_id_base < 0:
+            raise ValueError("staging chunk id base must be nonnegative")
         for req in self.transfer_infos[room].values():
             if req.is_dummy:
                 continue
@@ -680,13 +684,18 @@ class MooncakeKVManager(StagingManagerMixin, CommonKVManager):
                     [
                         b"STAGING_REQ",
                         str(room).encode("ascii"),
-                        str(index).encode("ascii"),
+                        str(chunk_id_base + index).encode("ascii"),
                         str(index_slice.stop - index_slice.start).encode("ascii"),
                         req.mooncake_session_id.encode("ascii"),
                         str(self.pp_rank).encode("ascii"),
                         struct.pack(f"{len(layers)}Q", *layers),
                         str(index_slice.start).encode("ascii"),
-                    ],
+                    ]
+                    + (
+                        [stream_generation.encode("ascii")]
+                        if stream_generation is not None
+                        else []
+                    ),
                     is_ipv6=na.is_ipv6,
                 )
 

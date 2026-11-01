@@ -18,7 +18,7 @@ from pathlib import Path
 MAGIC = b"REMOTE_ATTN_PD_V1:"
 LIMIT = 2 * 1024 * 1024
 P_FILES = re.compile(
-    r"(?:layer-\d+|resource-\d+|prefill|ready|sparse-ready|remote-service|error|released)\.json\Z"
+    r"(?:layer-\d+|resource-\d+|range-stream|range-(?:done-)?\d+|prefill|ready|sparse-ready|remote-service|error|released)\.json\Z"
 )
 D_FILES = re.compile(r"(?:done|remote-done|admitted|local-\d+|layer-\d+|error)\.json\Z")
 

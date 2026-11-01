@@ -192,7 +192,26 @@ def send_group(original, manager, req, chunk, target_info, offset, executor):
 
 
 def allocate(original, manager, msg):
+    from .prefix_stream import register_range
+
+    streamed = register_range(manager, msg)
     if getattr(manager, "_dsv41_layerwise_schema", None) is None:
+        if streamed:
+            from .prefix_stream import allocate_mha_range
+
+            return allocate_mha_range(manager, msg)
+        if (
+            not streamed
+            and len(msg) == 8
+            and getattr(manager, "_staging_handler", None) is not None
+        ):
+            dr = manager._staging_handler._room_to_decode_req.get(int(msg[1]))
+            offer = getattr(dr, "_pre_layerwise_offer", None)
+            if offer is not None:
+                from .prefix_stream import descriptor
+
+                entries = struct.unpack(f"{len(msg[6]) // 8}Q", msg[6])
+                descriptor(offer, int(msg[2]), entries, int(msg[7]), int(msg[3]))
         return original(manager, msg)
     from sglang.srt.disaggregation.common.staging_buffer import StagingAllocator
 
@@ -204,23 +223,36 @@ def allocate(original, manager, msg):
         if dr is None:
             return  # Late message after native room cleanup.
         receiver = dr.kv_receiver
-        if len(msg) != 8 or not msg[6] or len(msg[6]) % 8:
+        if len(msg) not in (8, 9) or not msg[6] or len(msg[6]) % 8:
             raise ValueError("DSV4.1 staging requires explicit physical entries")
         entries = selected(manager, struct.unpack(f"{len(msg[6]) // 8}Q", msg[6]))
         start = int(msg[7].decode("ascii"))
         page = manager.kv_args.page_size
         cached = prefix_pages(dr, page)
+        from .prefix_stream import descriptor
+
+        offered = getattr(dr, "_pre_layerwise_offer", None)
+        streamed = streamed or (
+            offered is not None and descriptor(offered, index, entries, start, pages)
+        )
         if (
             index < 0
-            or index >= len(manager.kv_args.kv_item_lens)
+            or (not streamed and index >= len(manager.kv_args.kv_item_lens))
             or manager.pp_size != 1
             or int(msg[5]) != 0
             or receiver.prefill_info.attn_tp_size != manager.attn_tp_size
             or receiver.prefill_info.pp_size != 1
             or start < 0
             or pages <= 0
-            or cached + start + pages
-            != (len(dr.req.origin_input_ids) + page - 1) // page
+            or (
+                cached + start + pages
+                > (len(dr.req.origin_input_ids) + page - 1) // page
+            )
+            or (
+                not streamed
+                and cached + start + pages
+                != (len(dr.req.origin_input_ids) + page - 1) // page
+            )
         ):
             raise ValueError("invalid DSV4.1 final-chunk staging envelope")
         descriptor = (entries, start, pages)
@@ -228,8 +260,12 @@ def allocate(original, manager, msg):
         if previous is not None and previous != descriptor:
             raise ValueError("DSV4.1 staging identity changed")
         # Reject overlapping entry ownership even when chunk ids differ.
-        for other, (used, _, _) in receiver.chunk_staging_layers.items():
-            if other != index and set(used).intersection(entries):
+        for other, (used, lo, count) in receiver.chunk_staging_layers.items():
+            if (
+                other != index
+                and set(used).intersection(entries)
+                and (not streamed or max(lo, start) < min(lo + count, start + pages))
+            ):
                 raise ValueError("duplicate DSV4.1 staging entries")
         receiver.chunk_staging_layers[index] = descriptor
         infos = receiver.chunk_staging_infos
@@ -314,6 +350,10 @@ def scatter(
     allocator = handler.staging_allocator
     page = manager.kv_args.page_size
     cached = prefix_pages(decode_req, page)
+    from .prefix_stream import header
+
+    offered = getattr(decode_req, "_pre_layerwise_offer", None)
+    streamed = offered is not None and header(offered) is not None
     if (
         staging_bytes != required
         or required <= 0
@@ -324,7 +364,12 @@ def scatter(
         or page_start < 0
         or num_pages <= 0
         or cached + page_start + num_pages
-        != (len(decode_req.req.origin_input_ids) + page - 1) // page
+        > (len(decode_req.req.origin_input_ids) + page - 1) // page
+        or (
+            not streamed
+            and cached + page_start + num_pages
+            != (len(decode_req.req.origin_input_ids) + page - 1) // page
+        )
     ):
         raise ValueError("DSV4.1 scatter layout mismatch")
     handler.device_module.set_device(handler.gpu_id)

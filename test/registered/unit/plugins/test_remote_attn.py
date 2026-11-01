@@ -1520,6 +1520,632 @@ class TestRemoteAttn(CustomTestCase):
             ],
         )
 
+    def _prefix_stream_fixture(self, *, dsv=False, staged=False, enabled=True):
+        from collections import deque
+
+        from sglang_remote_attn import prefix_stream as ps
+        from sglang_remote_attn.source_cache import CacheGuard
+
+        staged = staged or dsv
+        f = self._dsv41_fixture(length=33 if dsv else 8)
+        if dsv:
+            c = self._dsv41_cache()
+            req = f.req
+            req.cache_request_handle = c.native.CacheRequestHandle(req.rid, 0)
+            req.kv.cache_protected_len = 8
+            req.last_node, req.lock = 1, c.cache.lock(1)
+            cache, guard = c.cache, c.guard
+            f.controller.dsv41_remote = True
+            f.controller.schema_signature = f.schema
+            f.manager._dsv41_layerwise_schema = f.schema
+            f.manager._dsv41_receive_sender_ready = True
+        else:
+            c = self._radix()
+            warm, _ = c.request(list(range(4)), "prefix-warm")
+            c.release_kv_cache(warm, c.cache, checkpoint=True)
+            req, _ = c.request(list(range(8)), "prefix-qwen")
+            req.disagg_kv_sender = f.sender
+            req.bootstrap_room = 7
+            req.pending_bootstrap = False
+            req.start_send_idx = req.disagg_decode_prefix_len = 0
+            req.extend_end, req.extend_len = 8, 4
+            req.inflight_middle_chunks = 0
+            req.multimodal_inputs = req.input_embeds = None
+            cache, guard = c.cache, CacheGuard(c.cache)
+            controller = self.hooks.pre_layerwise.Controller.__new__(
+                self.hooks.pre_layerwise.Controller
+            )
+            controller.scheduler = f.scheduler
+            controller.rank, controller.tp_size, controller.layers = 0, 1, 2
+            controller.config = dataclasses.replace(
+                f.controller.config, mode="remote", group_size=1
+            )
+            controller.sources = []
+            controller.batches = 0
+            f.controller = controller
+            f.manager.kv_args.kv_data_ptrs = f.manager.kv_args.kv_data_ptrs[:4]
+            f.manager.kv_args.kv_item_lens = [8] * 4
+            f.manager.kv_args.page_size = 1
+            f.manager.kv_args.state_data_ptrs = []
+            f.registration.dst_kv_ptrs = f.registration.dst_kv_ptrs[:4]
+            f.scheduler.req_to_token_pool = c.cache.req_to_token_pool
+            f.scheduler.token_to_kv_pool_allocator = SimpleNamespace(
+                page_size=1, translate_kv_indices_for_transfer=lambda x: x
+            )
+            f.sender.num_kv_indices = 8
+        req.prefix_len = 8 if dsv else 4
+        req.extra_key = req.cache_salt = None
+        req.host_hit_length = 0
+        req.early_send_prefix_end = None
+        f.req = req
+        f.batch.reqs = [req]
+        f.controller.cache_guard = guard
+        f.controller.config = dataclasses.replace(f.controller.config, mode="remote")
+        f.scheduler._pre_layerwise = f.controller
+        f.scheduler.enable_overlap = False
+        # Native computation/chunking is separately exercised by existing tests;
+        # this fixture controls only the transport/GPU boundaries.
+        f.scheduler.enable_staging = False
+        f.manager.enable_staging = staged and not dsv
+        f.manager.pp_rank = 0
+        f.registration.dst_aux_ptrs = []
+        f.registration.staging_base_ptr, f.registration.staging_total_size = 4096, 4096
+        f.manager.kv_args.page_size = 8 if dsv else 1
+        f.scheduler.disagg_metadata_buffers = SimpleNamespace(set_buf=lambda req: None)
+        offer_path = f.controller.config.directory / "7/0/offer.json"
+        offer = self.hooks.pre_layerwise.read_json(offer_path)
+        offer.update(
+            mode="remote",
+            prefix_len=len(req.origin_input_ids),
+            layers=f.controller.layers,
+            range_stream=1,
+            native_staging=staged,
+            recv_host_staging=staged,
+        )
+        if dsv:
+            offer.update(
+                remote_boundary="progressive-sparse",
+                staging_wire=self.hooks.dsv41_receive.WIRE,
+                progressive_ring_bytes=4096,
+            )
+            f.registration.staging_base_ptr, f.registration.staging_total_size = (
+                4096,
+                4096,
+            )
+        self.hooks.pre_layerwise.write_json(offer_path, offer)
+        wire, requests = deque(), []
+
+        def raw(manager, room, indices, span, last, **kw):
+            wire.append(
+                SimpleNamespace(
+                    room=room, indices=indices, index_slice=span, last=last, kwargs=kw
+                )
+            )
+
+        f.manager.add_transfer_request = lambda *a, **kw: ps.track(
+            raw, f.manager, *a, **kw
+        )
+        native_request = _source_class(
+            "disaggregation/mooncake/conn.py",
+            "MooncakeKVManager",
+            {"request_layer_staging"},
+        ).request_layer_staging
+        native_request.__globals__.update(
+            NetworkAddress=lambda *a: SimpleNamespace(
+                to_tcp=lambda: "native-endpoint", is_ipv6=False
+            ),
+            struct=__import__("struct"),
+        )
+        f.peer = next(iter(f.manager.transfer_infos[7].values()))
+        f.peer.endpoint, f.peer.dst_port = "127.0.0.1", 31017
+        f.manager._send_multipart_locked = lambda endpoint, msg, **kw: requests.append(
+            msg
+        )
+        f.manager.request_layer_staging = functools.partial(native_request, f.manager)
+        cached = _source_class(
+            "disaggregation/prefill.py",
+            "SchedulerDisaggregationPrefillMixin",
+            {"maybe_send_cached_prefix_chunk"},
+        ).maybe_send_cached_prefix_chunk
+        cached.__globals__["envs"] = SimpleNamespace(
+            SGLANG_DISAGG_PREFILL_EARLY_SEND_CACHED_PREFIX=SimpleNamespace(
+                get=lambda: True
+            )
+        )
+        f.cache, f.guard, f.cache_fixture, f.ps = (
+            f.cache if hasattr(f, "cache") else cache,
+            guard,
+            c,
+            ps,
+        )
+        f.wire, f.requests, f.raw, f.offer = wire, requests, raw, offer
+
+        def activate():
+            with (
+                patch.dict(sys.modules, f.modules),
+                patch.dict(
+                    os.environ,
+                    {"HANDOFF_PREFIX_REMOTE_PROGRESSIVE": "1" if enabled else "0"},
+                ),
+            ):
+                return ps.cached_prefix(cached, f.scheduler, req)
+
+        f.activate = activate
+        f.activate()
+        f.plan = ps.stream_for(req)
+        if enabled:
+            self.assertIsNotNone(f.plan)
+        return f
+
+    def test_prefix_stream_off_preserves_native_cached_send(self):
+        """The ablation must keep the native cached chunk without range ownership."""
+        f = self._prefix_stream_fixture(enabled=False)
+        self.assertIsNone(f.plan)
+        self.assertFalse(f.controller.sources or f.guard.leases)
+        self.assertEqual(len(f.wire), 1)
+        task = f.wire.popleft()
+        self.assertEqual(len(task.indices), 4)
+        self.assertIsNone(task.kwargs.get("kv_buffer_indices"))
+        self.assertFalse(hasattr(f.manager, "_prefix_stream_pump"))
+
+    def test_prefix_stream_native_cached_send_has_bounded_ranges_and_staging_ids(self):
+        """Logical cached-prefix send expands once, with unique native wire ids."""
+        for dsv in (False, True):
+            with self.subTest(dsv=dsv):
+                f = self._prefix_stream_fixture(dsv=dsv, staged=True)
+                self.assertEqual(f.req.start_send_idx, 8 if dsv else 4)
+                self.assertEqual(len(f.controller.sources), 1)
+                self.assertEqual(len(f.wire), 1)
+                before = len(f.plan.pieces)
+                f.activate()
+                self.assertEqual(len(f.plan.pieces), before)
+                completed = []
+                while f.wire:
+                    task = f.wire.popleft()
+                    self.assertLessEqual(len(task.indices), 2)
+                    self.assertFalse(task.last)
+                    completed.append(task.kwargs["staging_chunk_idx"])
+                    task.kwargs["on_complete"]()
+                self.assertTrue(f.plan.drained())
+                self.assertEqual(len(completed), before)
+                self.assertEqual(len(set(completed)), before)
+                self.assertEqual([int(m[2]) for m in f.requests], completed)
+                self.assertTrue(f.guard.leases)  # IO completion alone never unpins.
+
+    def test_prefix_stream_indexer_and_metadata_precede_pending_global(self):
+        """Final indexer work must not wait behind an entire cached global prefix."""
+        f = self._prefix_stream_fixture(dsv=True)
+        first = f.wire.popleft()
+        self.assertEqual(first.kwargs["kv_buffer_indices"], (0,))
+        first.kwargs["on_complete"]()
+        second = f.wire.popleft()
+        self.assertEqual(
+            f.schema["entries"][second.kwargs["kv_buffer_indices"][0]][0], "index"
+        )
+        # Drain urgent index work while leaving cached globals queued.
+        second.kwargs["on_complete"]()
+        while (
+            f.wire
+            and f.schema["entries"][f.wire[0].kwargs["kv_buffer_indices"][0]][0]
+            == "index"
+        ):
+            f.wire.popleft().kwargs["on_complete"]()
+        active = f.wire.popleft()
+        with f.plan.priority():
+            active.kwargs["on_complete"]()
+            self.assertFalse(f.wire)
+            self.assertTrue(f.plan.pump.bulk)
+        self.assertEqual(len(f.wire), 1)
+        self.assertFalse(f.plan.drained())
+
+    def test_prefix_stream_qwen_final_binding_metadata_and_native_cache_reclaim(self):
+        """Metadata can publish while cached KV remains queued; final waits for all ranges."""
+        f = self._prefix_stream_fixture()
+        f.req.extend_end, f.req.extend_len = 6, 2
+        f.scheduler.send_kv_chunk(f.req, last_chunk=False, end_idx=6)
+        f.req.extend_end, f.req.extend_len = 8, 2
+        with patch.dict(sys.modules, f.modules):
+            source = f.controller.prepare(f.batch)[0][0]
+        self.assertIs(source, f.plan.source)
+        self.assertEqual(len(f.controller.sources), 1)
+        self.assertTrue(f.plan.bound)
+        for layers, buffers in self.hooks.pre_layerwise.buffer_groups(
+            [0, 1, 0, 1], 2, 1
+        ):
+            f.manager.add_transfer_request(
+                7,
+                source.indices,
+                source.index_slice,
+                False,
+                kv_buffer_indices=buffers,
+                on_complete=functools.partial(source.complete, layers),
+            )
+        metadata = []
+        f.manager.send_aux = lambda *a: metadata.append("metadata") or 0
+        event = SimpleNamespace(record=lambda *a: None, synchronize=lambda: None)
+        hub = SimpleNamespace(register_handoff=lambda *a, **kw: dict(host="P", port=1))
+        runtime = SimpleNamespace(get_remote_hub=lambda s: hub)
+        with (
+            patch("sglang_remote_attn.pre_layerwise._runtime", return_value=runtime),
+            patch.object(torch.cuda, "Event", return_value=event),
+            patch.object(torch.cuda, "current_stream", return_value=object()),
+            patch.object(torch.cuda, "current_device", return_value=0),
+            patch.object(torch.cuda, "set_device", return_value=None),
+        ):
+            source.finalize()
+            source.thread.join(2)
+        self.assertIsNone(source.error)
+        self.assertEqual(metadata, ["metadata"])
+        self.assertTrue(f.wire and not f.plan.drained())
+        self.assertTrue(f.plan.sealed)
+        self.assertFalse(any(t.last for t in f.wire))
+        while f.wire:
+            task = f.wire.popleft()
+            if not task.last:
+                task.kwargs["on_complete"]()
+            else:
+                self.assertTrue(f.plan.drained())
+        source.release = lambda: f.cache_fixture.release_kv_cache(
+            f.req, f.cache, checkpoint=False
+        )
+        source.retire()
+        f.cache.evict(f.cache_fixture.EvictParams(num_tokens=32))
+        self.assertEqual(f.cache_fixture.allocator.available_size(), 32)
+        self.assertIsNone(f.ps.stream_for(f.req))
+
+    def test_prefix_stream_range_gap_cannot_publish_layer_local(self):
+        """Final-tail completion is not proof that the cached prefix has arrived."""
+        f = self._prefix_stream_fixture(staged=True)
+        with patch.dict(sys.modules, f.modules):
+            source = f.controller.prepare(f.batch)[0][0]
+        for layers, buffers in self.hooks.pre_layerwise.buffer_groups(
+            [0, 1, 0, 1], 2, 1
+        ):
+            f.manager.add_transfer_request(
+                7, source.indices, source.index_slice, False, kv_buffer_indices=buffers
+            )
+        pieces = f.plan.pieces
+        dr = SimpleNamespace(req=f.req, _staging_completed_layers=[])
+        # This is D's request ownership, independent from P's cached prefix.
+        dr.req = copy.copy(f.req)
+        dr.req.kv = SimpleNamespace(cache_protected_len=0)
+        target = SimpleNamespace(
+            path=f.plan.path,
+            generation=f.plan.generation,
+            decode_req=dr,
+            owner=SimpleNamespace(),
+            queue=SimpleNamespace(
+                staging_handler=SimpleNamespace(
+                    advance_scatter=lambda dr: None, is_failed=lambda dr: False
+                )
+            ),
+        )
+        dr._prefix_range_registry = {
+            p["id"]: (tuple(p["resources"]), p["lo"], p["hi"] - p["lo"]) for p in pieces
+        }
+        tail = [p for p in pieces if p["lo"] >= 4]
+        dr._staging_completed_layers = [
+            (p["resources"], p["lo"], p["hi"] - p["lo"]) for p in tail
+        ]
+        coverage = f.ps.update(target)
+        self.assertFalse(coverage.ready(0) or coverage.ready(1))
+        head = [p for p in pieces if p["lo"] < 4]
+        dr._staging_completed_layers += [
+            (p["resources"], p["lo"], p["hi"] - p["lo"]) for p in head
+        ]
+        self.assertTrue(all(f.ps.update(target).ready(i) for i in (0, 1)))
+        dr._staging_completed_layers.append(((0,), 3, 5))
+        with self.assertRaisesRegex(RuntimeError, "no registered prefix range"):
+            f.ps.update(target)
+
+    def test_prefix_stream_dsv_native_final_barrier_bypasses_cached_globals(self):
+        """Native final state/aux precedes the full cached global backlog."""
+        f = self._prefix_stream_fixture(dsv=True)
+        f.scheduler.send_kv_chunk(f.req, last_chunk=False, end_idx=16)
+        f.req.extend_end, f.req.extend_len = 33, 17
+        with patch.dict(sys.modules, f.modules):
+            source = f.controller.prepare(f.batch)[0]
+        self.assertIs(source, f.plan.source)
+        states, aux = [], []
+        f.manager.maybe_send_extra = lambda peer, rows, executor, registration: (
+            states.append(rows) or 0
+        )
+        f.manager.send_aux = lambda *a: aux.append(a) or 0
+        source.final_event = object()
+        with (
+            patch.dict(sys.modules, f.modules),
+            patch(
+                "sglang_remote_attn.dsv41_remote.register",
+                side_effect=lambda s: setattr(s, "service", dict(host="P", port=1)),
+            ),
+        ):
+            source.finalize_native(
+                f.native_send, f.scheduler, f.req, last_chunk=True, end_idx=33
+            )
+        f.wire.popleft().kwargs["on_complete"]()
+        with patch.dict(sys.modules, f.modules):
+            while not source.barrier_ready:
+                task = f.wire.popleft()
+                self.assertTrue(
+                    all(
+                        f.schema["entries"][i][0] == "index"
+                        for i in task.kwargs["kv_buffer_indices"]
+                    )
+                )
+                task.kwargs["on_complete"]()
+        self.assertEqual(len(states), 1)
+        self.assertEqual(len(aux), 1)
+        self.assertTrue(f.wire and not f.plan.drained())
+        self.assertFalse(any(t.last for t in f.wire))
+        with patch.dict(sys.modules, f.modules):
+            while f.wire:
+                task = f.wire.popleft()
+                if not task.last:
+                    task.kwargs["on_complete"]()
+                else:
+                    self.assertEqual(task.kwargs["state_indices"], [])
+                    self.assertTrue(f.plan.drained())
+        self.assertTrue(
+            all(f.plan.sent.ready(i) for i in range(len(f.schema["entries"])))
+        )
+
+    def test_prefix_stream_qwen_native_ring_accepts_nonfinal_ranges(self):
+        """Legacy final-only validation must not reject bounded cached-prefix IO."""
+        import logging
+        import struct
+
+        from sglang_remote_attn import prefix_stream
+
+        f = self._native_ring_fixture(capacity=32)
+        f.dr.req.origin_input_ids = list(range(4))
+        f.manager._staging_handler = f.handler
+        f.manager._staging_ctx.allocator = f.allocator
+        f.manager.kv_buffer_tensors = f.handler.kv_buffer_info
+        target = SimpleNamespace(
+            generation="prefix-attempt",
+            path=Path(self.enterContext(tempfile.TemporaryDirectory())),
+            decode_req=f.dr,
+            queue=SimpleNamespace(staging_handler=f.handler),
+        )
+        f.dr._pre_layerwise_offer = target
+        native = _source_function(
+            "disaggregation/common/staging_handler.py", "handle_staging_req"
+        )
+        native.__globals__.update(struct=struct, logger=logging.getLogger(__name__))
+        original = _source_class(
+            "disaggregation/common/staging_handler.py",
+            "StagingManagerMixin",
+            {"_handle_staging_req"},
+        )._handle_staging_req
+        original.__globals__["handle_staging_req"] = native
+        with patch.dict(
+            sys.modules,
+            {
+                "sglang.srt.disaggregation.common.staging_handler": SimpleNamespace(
+                    handle_staging_req=native
+                )
+            },
+        ):
+            for index, start in enumerate((0, 2)):
+                msg = [
+                    b"STAGING_REQ",
+                    b"7",
+                    str(index).encode(),
+                    b"2",
+                    b"peer",
+                    b"0",
+                    struct.pack("Q", 0),
+                    str(start).encode(),
+                    b"prefix-attempt",
+                ]
+                self.hooks.dsv41_receive.allocate(original, f.manager, msg)
+                slot = f.receiver.chunk_staging_infos[index]
+                self.assertGreaterEqual(slot[0], 0)
+                self.assertEqual(slot[3] - slot[1], 8)
+                payload = torch.arange(8, dtype=torch.uint8) + index * 8
+                f.allocator.buffer.buffer[slot[1] : slot[3]].copy_(payload)
+                f.handler.handle_chunk_arrived(7, index, start, 2, "peer")
+                coverage = prefix_stream.update(target)
+                self.assertFalse(coverage.ready(0))
+                for event in f.events:
+                    event.complete = True
+                coverage = prefix_stream.update(target)
+                self.assertEqual(coverage.ready(0), index == 1)
+                self.assertFalse(coverage.ready(1))
+                before = dict(f.allocator.allocations)
+                self.hooks.dsv41_receive.allocate(original, f.manager, msg)
+                self.assertEqual(f.allocator.allocations, before)
+                for buf, values in ((f.k[0], payload[:4]), (f.v[0], payload[4:])):
+                    self.assertTrue(
+                        torch.equal(
+                            buf[f.rows[0, start : start + 2]], values.reshape(2, 1, 2)
+                        )
+                    )
+                self.assertTrue(torch.all(f.k[1] == 255).item())
+
+    def test_prefix_stream_dsv_native_ring_tracks_disjoint_entry_ranges(self):
+        """Physical indexer entry completion requires both cached and tail scatters."""
+        import struct
+
+        from sglang_remote_attn import prefix_stream
+
+        f = self._dsv41_receive_fixture()
+        r = f.ring
+        entry = next(i for i, e in enumerate(f.schema["entries"]) if e[0] == "index")
+        target = SimpleNamespace(
+            path=Path(self.enterContext(tempfile.TemporaryDirectory())),
+            generation="dsv-prefix",
+            decode_req=r.dr,
+            queue=SimpleNamespace(staging_handler=r.handler),
+        )
+        r.dr._pre_layerwise_offer = target
+        for index, start, pages in ((20, 0, 2), (21, 2, 3)):
+            msg = [
+                b"STAGING_REQ",
+                b"7",
+                str(index).encode(),
+                str(pages).encode(),
+                b"peer:1",
+                b"0",
+                struct.pack("Q", entry),
+                str(start).encode(),
+                b"dsv-prefix",
+            ]
+            f.rx.allocate(None, r.manager, msg)
+            slot = r.receiver.chunk_staging_infos[index]
+            r.allocator.buffer.buffer[slot[1] : slot[3]].fill_(index)
+            r.handler.handle_chunk_arrived(7, index, start, pages, "peer:1")
+            self.assertFalse(prefix_stream.update(target).ready(entry))
+            for event in r.events:
+                event.complete = True
+            self.assertEqual(prefix_stream.update(target).ready(entry), index == 21)
+            self.assertFalse(r.allocator.allocations)
+            stride = r.manager.kv_args.kv_item_lens[entry]
+            for dst in (5, 6) if index == 20 else (1, 2, 3):
+                self.assertTrue(
+                    torch.all(
+                        f.destination[entry][dst * stride : (dst + 1) * stride] == index
+                    ).item()
+                )
+
+    def test_prefix_stream_wire_registration_does_not_wait_for_remote_journal(self):
+        """STAGING_REQ may precede its network journal without false completion."""
+        for dsv in (False, True):
+            f = self._prefix_stream_fixture(dsv=dsv, staged=True)
+            req = SimpleNamespace(
+                origin_input_ids=f.req.origin_input_ids,
+                kv=SimpleNamespace(cache_protected_len=0),
+            )
+            dr = SimpleNamespace(req=req, _staging_completed_layers=[])
+            target = SimpleNamespace(
+                path=Path(f.controller.config.directory) / "delayed-mirror",
+                generation=f.plan.generation,
+                decode_req=dr,
+                owner=SimpleNamespace(),
+                queue=SimpleNamespace(
+                    staging_handler=SimpleNamespace(
+                        advance_scatter=lambda dr: None, is_failed=lambda dr: False
+                    )
+                ),
+            )
+            dr._pre_layerwise_offer = target
+            manager = SimpleNamespace(
+                kv_args=f.manager.kv_args,
+                _dsv41_layerwise_schema=f.schema if dsv else None,
+                _staging_handler=SimpleNamespace(_room_to_decode_req={7: dr}),
+            )
+            msg = f.requests[0]
+            self.assertEqual(len(msg), 9)
+            self.assertTrue(f.ps.register_range(manager, msg))
+            self.assertTrue(f.ps.register_range(manager, msg))
+            resources, lo, n = dr._prefix_range_registry[int(msg[2])]
+            dr._staging_completed_layers = [(resources, lo, n)]
+            self.assertFalse(
+                any(
+                    f.ps.update(target).ready(i)
+                    for i in range(f.ps.header(target)["resources"])
+                )
+            )
+            changed = list(msg)
+            changed[2] = b"999"
+            with self.assertRaisesRegex(RuntimeError, "overlapping"):
+                f.ps.register_range(manager, changed)
+            changed = list(msg)
+            changed[8] = b"old-attempt"
+            with self.assertRaisesRegex(RuntimeError, "stale"):
+                f.ps.register_range(manager, changed)
+
+    def test_prefix_stream_direct_completion_requires_gpu_visibility_and_event(self):
+        """TE completion cannot publish Local before D's receive GPU proof."""
+        f = self._prefix_stream_fixture()
+        while f.wire:
+            f.wire.popleft().kwargs["on_complete"]()
+        dr = SimpleNamespace(req=copy.copy(f.req))
+        dr.req.kv = SimpleNamespace(cache_protected_len=0)
+        target = SimpleNamespace(
+            path=f.plan.path,
+            generation=f.plan.generation,
+            decode_req=dr,
+            owner=SimpleNamespace(),
+            queue=SimpleNamespace(
+                scheduler=SimpleNamespace(
+                    req_to_token_pool=SimpleNamespace(req_to_token=torch.empty(1))
+                )
+            ),
+        )
+        ready = [False]
+        from sglang_remote_attn import remote_data_plane
+
+        with (
+            patch.dict(
+                sys.modules, {"sglang_remote_attn.remote_data_plane": remote_data_plane}
+            ),
+            patch.object(
+                remote_data_plane,
+                "event",
+                return_value=SimpleNamespace(query=lambda: ready[0]),
+            ),
+        ):
+            coverage = f.ps.update(target)
+            self.assertEqual(coverage.intervals, {})
+            ready[0] = True
+            coverage = f.ps.update(target)
+            self.assertEqual(coverage.intervals, {0: [(0, 4)], 1: [(0, 4)]})
+        self.assertFalse(coverage.ready(0))
+
+    def test_prefix_stream_abort_and_reset_keep_pages_until_native_io_drains(self):
+        """P abort fences queued ranges before native sender.abort/free."""
+        f = self._prefix_stream_fixture()
+        with self.assertRaisesRegex(RuntimeError, "retire before request reset"):
+            self.hooks._reset_retracted(lambda req: self.fail("reset live IO"), f.req)
+        error = []
+        mutation = []
+
+        def abort():
+            try:
+                self.hooks.prefill_overlap.before_mutation(
+                    lambda s, r: mutation.append("native-abort"), f.scheduler, f.req
+                )
+            except Exception as exc:
+                error.append(exc)
+
+        thread = threading.Thread(target=abort)
+        thread.start()
+        try:
+            self.assertTrue(f.guard.leases)
+            while f.wire:
+                f.wire.popleft().kwargs["on_complete"]()
+            thread.join(2)
+            self.assertFalse(thread.is_alive())
+            self.assertEqual(error, [])
+            self.assertEqual(mutation, ["native-abort"])
+            self.assertFalse(f.guard.leases)
+            self.assertIsNone(f.ps.stream_for(f.req))
+            f.cache_fixture.release_kv_cache(f.req, f.cache, checkpoint=False)
+            f.cache.evict(f.cache_fixture.EvictParams(num_tokens=32))
+            self.assertEqual(f.cache_fixture.allocator.available_size(), 32)
+        finally:
+            thread.join(2)
+
+    def test_prefix_stream_peer_change_quarantines_inflight_storage(self):
+        """Unknown transfer ownership cannot be repaired by recycling cached pages."""
+        f = self._prefix_stream_fixture()
+        task = f.wire.popleft()
+        f.manager.decode_kv_args_table["peer:1"] = copy.copy(f.registration)
+        with self.assertRaisesRegex(RuntimeError, "registration changed"):
+            task.kwargs["on_complete"]()
+        self.assertTrue(f.plan.error and f.guard.leases)
+        self.assertIsNotNone(f.plan.pump.active)
+        with self.assertRaisesRegex(RuntimeError, "unproven"):
+            f.plan.source.retire()
+
+    def test_prefix_stream_native_staging_defaults_keep_legacy_wire(self):
+        """The core extension must leave ordinary PD's existing frame unchanged."""
+        f = self._prefix_stream_fixture(staged=True)
+        f.requests.clear()
+        f.manager.request_layer_staging(7, slice(0, 1), (((0,), None),))
+        self.assertEqual((len(f.requests[0]), f.requests[0][2]), (8, b"0"))
+
     def _overlap_target(self, directory, req=None):
         from sglang_remote_attn.decode_overlap import DecodeOverlap
 
@@ -4325,6 +4951,11 @@ class TestRemoteAttn(CustomTestCase):
             ),
         )
         self.assertEqual(rows[0]["sparse_progressive"], rows[1]["sparse_progressive"])
+        self.assertEqual(rows[0]["prefix_ranges"], rows[1]["prefix_ranges"])
+        self.assertEqual(
+            rows[0]["prefix_ranges"],
+            [dict(votes=[5, 5, 5], local=[0, 1], closed=True, steady_votes=0)] * 2,
+        )
         self.assertEqual(
             rows[0]["sparse_cached_progressive"], rows[1]["sparse_cached_progressive"]
         )
@@ -8891,7 +9522,7 @@ class TestRemoteAttn(CustomTestCase):
 
         lease = SourceLease.__new__(SourceLease)
         lease.check = lambda: None
-        lease.chunk = SimpleNamespace(sender=f.sender)
+        lease.chunk = SimpleNamespace(sender=f.sender, req=SimpleNamespace())
         f.native_status[0] = f.polls.Failed
         with patch.dict(sys.modules, f.modules):
             with self.assertRaisesRegex(RuntimeError, "transport failed"):
@@ -9110,7 +9741,7 @@ class TestRemoteAttn(CustomTestCase):
 
         lease = SourceLease.__new__(SourceLease)
         lease.check = lambda: None
-        lease.chunk = SimpleNamespace(sender=f.sender)
+        lease.chunk = SimpleNamespace(sender=f.sender, req=SimpleNamespace())
         # Poison is observed before the outstanding-IO early exit; this method
         # is polled by ordered TP retirement, not by rank-local KV free hooks.
         with self.assertRaisesRegex(RuntimeError, "retaining KV and pinned slot"):

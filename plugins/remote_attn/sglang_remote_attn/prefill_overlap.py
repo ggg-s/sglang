@@ -117,6 +117,12 @@ class SourceLease:
 
     def transport_ready(self):
         self.check()
+        stream = getattr(self.chunk.req, "_remote_attn_prefix_stream", None)
+        if stream is not None:
+            if self.cancelling and not stream.bound:
+                stream.aborted = True
+            if not stream.drained():
+                return False
         # Failed TE sends leave their completion callbacks pending. Observe the
         # rank-owned slot here (including middle chunks with no Source yet),
         # inside the ordered retirement protocol, before the pending fast exit.
@@ -130,8 +136,10 @@ class SourceLease:
             _poll_success(self.chunk.sender)
         with self.ledger.lock:
             outstanding = bool(self.ledger.pending)
-        if self.source is not None and getattr(
-            getattr(self.source, "owner", None), "dsv41_remote", False
+        if (
+            self.source is not None
+            and self.source.finalized
+            and getattr(getattr(self.source, "owner", None), "dsv41_remote", False)
         ):
             from .dsv41_remote import source_ready
 
@@ -572,6 +580,10 @@ def before_mutation(original, scheduler, req, *args, **kwargs):
         cert = getattr(req, "_dsv41_p_certificate", None)
         if cert is not None:
             cert.admission.overlap.drain(req)
+        else:
+            from .prefix_stream import before_mutation as drain_prefix
+
+            drain_prefix(scheduler, req)
     return original(scheduler, req, *args, **kwargs)
 
 

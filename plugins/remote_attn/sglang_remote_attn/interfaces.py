@@ -131,7 +131,7 @@ CORE_CALLS = {
     "sglang.srt.mem_cache.deepseek_v4_memory_pool.DeepSeekV4TokenToKVPool.get_request_state_buf_infos": {},
     "sglang.srt.mem_cache.deepseek_v4_memory_pool.DeepSeekV4TokenToKVPool.request_state_transfer_indices": {},
     MANAGER + "_transfer_data": {"stage": False},
-    MANAGER + "request_layer_staging": {},
+    MANAGER + "request_layer_staging": {"chunk_id_base": 0, "stream_generation": None},
     MANAGER + "send_layer_group_to_staging": {},
     MANAGER + "ensure_host_stager": {},
     MANAGER + "set_kv_buffer_tensors": {},

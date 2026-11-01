@@ -1,5 +1,7 @@
 # DSV4.1 Remote sparse：提前接纳与逐资源 Local
 
+P 缓存前缀（Qwen3/DSV4.1）：[统一 Remote progressive 与 A/B 对照](PREFIX-REMOTE-PROGRESSIVE-ZH.md)。
+
 `HANDOFF_PRE_LAYERWISE=remote` 现在允许 D 在 **global KV 尚未传完**时开始 decode。
 先完成 indexer、SWA/carry 和 metadata 屏障，再由 P 提供缺失 global 前缀的 sparse
 attention；每个 physical global 资源复制完成并经过 TP 有序共识后独立切 Local。

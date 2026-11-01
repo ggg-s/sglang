@@ -1,5 +1,7 @@
 # Remote-attn Progressive 生产接入手册
 
+P 缓存前缀（Qwen3/DSV4.1）：[统一 Remote progressive 与 A/B 对照](PREFIX-REMOTE-PROGRESSIVE-ZH.md)。
+
 DSV4.1 Flash 的纯文本 layerwise 路径见 [专用接入说明](DSV41-LAYERWISE-ZH.md)；
 下文的 Qwen3/MHA 参数和 Remote 限制适用于原有路径。
 
@@ -133,7 +135,7 @@ PY
 "$HANDOFF_PYTHON" -m sglang_remote_attn.check
 ```
 
-当前 preflight 应输出 `hooks: 46`、`core_interfaces: 114`、`send_probe: true`、
+当前 preflight 应输出 `hooks: 47`、`core_interfaces: 114`、`send_probe: true`、
 `plugin: remote_attn`。核心接口检查同时覆盖 metadata receiver 保留、选层发送、
 staging/host copy、任务与状态字段和 typed env；安装态检查实际加载模块，源码模式
 检查所选 checkout。直接启动服务的插件注册也执行核心检查。

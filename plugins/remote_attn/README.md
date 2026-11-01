@@ -1,5 +1,7 @@
 # Remote attention / progressive KV handoff plugin
 
+P 缓存前缀（Qwen3/DSV4.1）：[统一 Remote progressive 与 A/B 对照](PREFIX-REMOTE-PROGRESSIVE-ZH.md)。
+
 多 P × 多 D（同机/跨机、原生 SMG）：[网络 journal 与部署说明](MULTI-PD-ZH.md)。
 Remote Q/O/LSE 原生 Mooncake GPU 传输：[启用与完成/回收协议](REMOTE-GPU-TRANSPORT-ZH.md)。
 
@@ -26,7 +28,7 @@ still need acceptance on the target deployment.
 
 - `sglang_remote_attn/handoff_control.py`: adapted runtime, including Copy, Layer,
   Remote, Fast Freeze/Resume, RemoteHub, progressive LOCAL, epochs, fences and leases.
-- `sglang_remote_attn/hooks.py`: 46 function-boundary hooks. No scheduler event
+- `sglang_remote_attn/hooks.py`: 47 function-boundary hooks. No scheduler event
   loop, graph runner, allocation function or Mooncake connector is copied/replaced.
 - `control_plane/p2d_driver.py`: original supplied driver. `p4_gateway.py` now
   carries a targeted C1 reservation/epoch fix; its protocol and fixed state paths

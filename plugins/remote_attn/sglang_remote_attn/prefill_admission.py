@@ -267,7 +267,10 @@ class Admission:
             ledger = self.overlap.ledgers.get(int(req.bootstrap_room))
             if ledger is not None:
                 with ledger.lock:
-                    if ledger.pending or ledger.error:
+                    if ledger.error or (
+                        ledger.pending
+                        and getattr(req, "_remote_attn_prefix_stream", None) is None
+                    ):
                         return None
         return self.owner.candidates(cert.batch, allow_middle=True)[0]
 
@@ -342,7 +345,7 @@ class Admission:
             and start < end
             and start % page == 0
             and getattr(req.disagg_kv_sender, "curr_idx", start // page)
-            == start // page
+            == (start - getattr(req, "disagg_decode_prefix_len", 0)) // page
         )
         return (
             key_of(req),

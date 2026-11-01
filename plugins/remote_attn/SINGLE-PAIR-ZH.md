@@ -1,5 +1,7 @@
 # 原生 SMG + 单 pair P/D 接入
 
+P 缓存前缀（Qwen3/DSV4.1）：[统一 Remote progressive 与 A/B 对照](PREFIX-REMOTE-PROGRESSIVE-ZH.md)。
+
 同机/跨机多 P × 多 D 另见 [原生 SMG 网络模式](MULTI-PD-ZH.md)。本页保留原有单 pair 配置。
 
 DSV4.1 Flash 的纯文本 layerwise 路径见 [专用接入说明](DSV41-LAYERWISE-ZH.md)；
@@ -32,7 +34,7 @@ python -m sglang_remote_attn.check
 python -c 'import sglang_router; print(sglang_router.__file__)'
 ```
 
-安装态预检应输出 `hooks: 46`、`core_interfaces: 114`、`send_probe: true`。
+安装态预检应输出 `hooks: 47`、`core_interfaces: 114`、`send_probe: true`。
 它检查实际加载的接口：保留 receiver 的 metadata commit、选层发送与完成回调、
 staging 分组、host copy、缓存 checkpoint/lock/finish、字段初始化及 typed env 声明；插件注册时也会执行同样的
 核心检查，避免直接启动 P/D 绕过预检。`**kwargs` 不能替代显式参数。
