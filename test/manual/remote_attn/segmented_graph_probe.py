@@ -9,6 +9,7 @@ sgl_kernel; --allow-strong-refs explicitly tests the reduced-dependency boundary
 
 import argparse
 import ast
+import dataclasses
 import hashlib
 import importlib.util
 import json
@@ -30,11 +31,12 @@ def load(name, path):
     return module
 
 
-def definitions(path, namespace):
+def definitions(path, namespace, names=None):
     nodes = [
         node
         for node in ast.parse(path.read_text()).body
         if isinstance(node, (ast.ClassDef, ast.FunctionDef))
+        and (names is None or node.name in names)
     ]
     tree = ast.Module(
         body=[
@@ -48,7 +50,7 @@ def definitions(path, namespace):
     exec(compile(ast.fix_missing_locations(tree), str(path), "exec"), namespace)
 
 
-def run(root, allow_strong_refs, dtype):
+def run(root, allow_strong_refs, dtype, logits_output=False):
     if not torch.cuda.is_available():
         raise RuntimeError("CUDA is required")
     prefix = "sglang.srt.model_executor.runner_backend_utils.breakable_cuda_graph"
@@ -115,6 +117,7 @@ def run(root, allow_strong_refs, dtype):
         }
         namespace.update(
             torch=torch,
+            dataclasses=dataclasses,
             contextmanager=contextmanager,
             AbstractContextManager=typing.ContextManager,
             BaseCudaGraphBackend=object,
@@ -136,6 +139,11 @@ def run(root, allow_strong_refs, dtype):
             BreakableCUDAGraph=primitive.BreakableCUDAGraph,
             BreakableCUDAGraphCapture=primitive.BreakableCUDAGraphCapture,
             enable_breakable_cuda_graph=nullcontext,
+        )
+        definitions(
+            root / "python/sglang/srt/layers/logits_processor.py",
+            namespace,
+            names={"LogitsProcessorOutput"},
         )
         definitions(native / "runner_backend/full_cuda_graph_backend.py", namespace)
         definitions(
@@ -175,7 +183,35 @@ def run(root, allow_strong_refs, dtype):
                     q = torch.nn.functional.linear(x, weight) + 0.1
                     x = q if reference else module(q, q, q, batch)
                     x = torch.relu(x) + 0.2
+                if logits_output:
+                    return namespace["LogitsProcessorOutput"](
+                        next_token_logits=x,
+                        hidden_states=x + 0.3,
+                        hidden_states_token_indices=torch.arange(
+                            x.shape[0], device=x.device
+                        ),
+                    )
                 return x
+
+        def tensor_output(output):
+            return output.next_token_logits if logits_output else output
+
+        def check_output(output, expected):
+            torch.testing.assert_close(tensor_output(output), tensor_output(expected))
+            if logits_output:
+                torch.testing.assert_close(output.hidden_states, expected.hidden_states)
+                torch.testing.assert_close(
+                    output.hidden_states_token_indices,
+                    expected.hidden_states_token_indices,
+                )
+                assert output.next_token_logprobs is None
+                assert output.next_token_top_logprobs_val is None
+                assert output.sampling_mask_output is None
+                # Exercise sampler mutations: another replay must return a clean
+                # wrapper over the same graph-owned tensors.
+                output.next_token_logprobs = torch.ones_like(output.next_token_logits)
+                output.next_token_top_logprobs_val = [[0.5]]
+                output.sampling_mask_output = object()
 
         model = Model()
         controller = types.SimpleNamespace(graph_fast_path=True, targets=[])
@@ -189,8 +225,10 @@ def run(root, allow_strong_refs, dtype):
         runner = types.SimpleNamespace(
             model_runner=mr,
             device_module=torch.cuda,
-            cuda_graph_output_capacity_rows=lambda output: output.shape[0],
-            cuda_graph_output_rows=lambda output: output.shape[0],
+            cuda_graph_output_capacity_rows=lambda output: tensor_output(output).shape[
+                0
+            ],
+            cuda_graph_output_rows=lambda output: tensor_output(output).shape[0],
         )
         full = namespace["FullCudaGraphBackend"](runner)
         remote = namespace["BreakableCudaGraphBackend"](runner)
@@ -276,7 +314,7 @@ def run(root, allow_strong_refs, dtype):
                     expected = model(inputs[size], live, reference=True)
                     with backend.execution(live), backend.replay_session():
                         output = backend.replay(shape(size), live)
-                    torch.testing.assert_close(output, expected)
+                    check_output(output, expected)
             assert not backend.supports_remote(
                 batch(3)
             ) and not backend.supports_remote(batch(8))
@@ -288,7 +326,7 @@ def run(root, allow_strong_refs, dtype):
                 expected = model(inputs[size], live, reference=True)
                 with backend.execution(live), backend.replay_session():
                     output = backend.replay(shape(size), live)
-                torch.testing.assert_close(output, expected)
+                check_output(output, expected)
             assert len(callbacks) == before, "Local full replay invoked RPC"
             controller.targets.append(object())
             live = batch(1, 99, fail=1)
@@ -308,6 +346,7 @@ def run(root, allow_strong_refs, dtype):
             "device": torch.cuda.get_device_name(),
             "torch": torch.__version__,
             "dtype": str(dtype),
+            "output_type": "LogitsProcessorOutput" if logits_output else "Tensor",
             "layers": layers,
             "remote_segments": segment_counts,
             "replays": replay_counts,
@@ -324,6 +363,7 @@ def run(root, allow_strong_refs, dtype):
                     Path(__file__),
                     native / "runner_backend/full_cuda_graph_backend.py",
                     native / "runner_backend/breakable_cuda_graph_backend.py",
+                    root / "python/sglang/srt/layers/logits_processor.py",
                     primitive_dir / "breakable_cuda_graph.py",
                 )
             },
@@ -337,6 +377,7 @@ if __name__ == "__main__":
         "--source-root", type=Path, default=Path(__file__).resolve().parents[3]
     )
     parser.add_argument("--allow-strong-refs", action="store_true")
+    parser.add_argument("--logits-output", action="store_true")
     parser.add_argument(
         "--dtype", choices=("bfloat16", "float16", "float32"), default="bfloat16"
     )
@@ -347,6 +388,7 @@ if __name__ == "__main__":
                 args.source_root.resolve(),
                 args.allow_strong_refs,
                 getattr(torch, args.dtype),
+                args.logits_output,
             ),
             indent=2,
         )

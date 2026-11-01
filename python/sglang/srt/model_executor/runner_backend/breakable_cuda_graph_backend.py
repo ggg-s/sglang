@@ -18,6 +18,7 @@ No torch.compile.
 
 from __future__ import annotations
 
+import dataclasses
 from contextlib import contextmanager
 from typing import TYPE_CHECKING, Any, Callable, Dict, Optional
 
@@ -174,6 +175,16 @@ class BreakableCudaGraphBackend(DedupedCudaGraphMixin, BaseCudaGraphBackend):
             return min([cap, *rows])
         if isinstance(output, (list, tuple)) and output:
             return min(self._output_rows(o, cap) for o in output if o is not None)
+        if dataclasses.is_dataclass(output):
+            rows = [
+                tensor.shape[0]
+                for field in dataclasses.fields(output)
+                if torch.is_tensor(tensor := getattr(output, field.name))
+                and tensor.ndim > 0
+            ]
+            if len(set(rows)) > 1:
+                raise ValueError("BCG dataclass tensor fields need matching row counts")
+            return min([cap, *rows])
         return cap
 
     def _alloc_full_buffer(self, output: Any, size: int) -> Any:
@@ -193,6 +204,19 @@ class BreakableCudaGraphBackend(DedupedCudaGraphMixin, BaseCudaGraphBackend):
             return tuple(self._alloc_full_buffer(o, size) for o in output)
         if isinstance(output, list):
             return [self._alloc_full_buffer(o, size) for o in output]
+        if dataclasses.is_dataclass(output):
+            # Decode dataclasses (e.g. LogitsProcessorOutput) contain row-major
+            # tensors and static metadata. Sampler-owned fields are None here.
+            tensors = {}
+            for field in dataclasses.fields(output):
+                value = getattr(output, field.name)
+                if torch.is_tensor(value):
+                    if value.ndim == 0:
+                        raise ValueError(
+                            f"BCG dataclass tensor field {field.name} needs a row dimension"
+                        )
+                    tensors[field.name] = self._alloc_full_buffer(value, size)
+            return dataclasses.replace(output, **tensors)
         raise TypeError(f"Unsupported BCG output type: {type(output)}")
 
     def _slice_output(self, output: Any, num_tokens: int) -> Any:
@@ -206,6 +230,15 @@ class BreakableCudaGraphBackend(DedupedCudaGraphMixin, BaseCudaGraphBackend):
             return tuple(self._slice_output(item, num_tokens) for item in output)
         if isinstance(output, list):
             return [self._slice_output(item, num_tokens) for item in output]
+        if dataclasses.is_dataclass(output):
+            return dataclasses.replace(
+                output,
+                **{
+                    field.name: self._slice_output(value, num_tokens)
+                    for field in dataclasses.fields(output)
+                    if torch.is_tensor(value := getattr(output, field.name))
+                },
+            )
         raise TypeError(f"Unsupported BCG output type: {type(output)}")
 
     def _copy_output_to_buffer(
@@ -245,6 +278,13 @@ class BreakableCudaGraphBackend(DedupedCudaGraphMixin, BaseCudaGraphBackend):
             for item, buffer in zip(output, output_buffer):
                 self._copy_output_to_buffer(item, buffer, num_tokens)
             return
+        if dataclasses.is_dataclass(output) and type(output) is type(output_buffer):
+            for field in dataclasses.fields(output):
+                value = getattr(output, field.name)
+                buffer = getattr(output_buffer, field.name)
+                if torch.is_tensor(value) or torch.is_tensor(buffer):
+                    self._copy_output_to_buffer(value, buffer, num_tokens)
+            return
         raise TypeError(
             "Unsupported BCG output buffer pair: "
             f"{type(output)} vs {type(output_buffer)}"
@@ -266,7 +306,12 @@ class BreakableCudaGraphBackend(DedupedCudaGraphMixin, BaseCudaGraphBackend):
     ) -> Any:
         with graph_pool_replay_scope():
             self._graphs[shape_key].replay()
-        return self._outputs[shape_key]
+        output = self._outputs[shape_key]
+        # Sampler assigns logprobs/masks after replay. Keep the capture template
+        # pristine while retaining the graph's stable tensor storage.
+        return (
+            dataclasses.replace(output) if dataclasses.is_dataclass(output) else output
+        )
 
     def cleanup(self) -> None:
         self.close()
