@@ -36,7 +36,7 @@ DSpark/其他投机解码关闭，不启用 KV cache sharding。使用原生 SMG
 原生状态都已就绪。失败不使用请求的 released 标志推断写入完成；保留资源并报错。
 本次不提供跨故障自动恢复协议。
 
-`HANDOFF_PRE_LAYERWISE=remote` 支持提前接纳、逐资源 Local 和 batch 1/2/4 分段 graph；
+`HANDOFF_PRE_LAYERWISE=remote` 支持提前接纳、逐资源 Local 和 batch 1/2/4/8/16 分段 graph；
 归属、启动和限制见 [Remote 接入指南](DSV41-REMOTE-EAGER-ZH.md)。
 
 ## P 端 host staging
@@ -121,7 +121,7 @@ H2D event 与原生 receiver/metadata 的完成证明。
 - `HANDOFF_PRE_LAYERWISE=remote` 支持 [eager sparse 提前接纳与逐资源 Local](DSV41-REMOTE-EAGER-ZH.md)：
   indexer、SWA/carry 和 metadata 先就绪，global KV 未完成时开始 decode。
   D Remote 串行，全部 Local 且 GPU/TP 退休后恢复原生 graph/overlap。
-  D Remote batch 1/2/4 支持分段 graph，稳定 QKV 投影入图，动态状态/sparse/RPC/merge
+  D Remote batch 1/2/4/8/16 支持分段 graph，稳定 QKV 投影入图，动态状态/sparse/RPC/merge
   留图外；D0→D1 迁移尚未适配。
 - 支持 P send 和 D receive host staging；不使用原生 MHA staging 开关、uniform-FP8 TRTLLM 或 unified KV。
   不能照搬 Qwen 示例的 `--page-size 1`；沿用原生 DSV4.1 支持的页布局。

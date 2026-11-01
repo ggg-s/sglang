@@ -82,7 +82,7 @@ python -m sglang_router.launch_router \
    继续经过原有资格撤销/重确认；稳定 middle→final 不增加逐 chunk 接管 all_reduce。
    网络配置先进入已有 TP 启动共识，再进行一次启动代次广播；运行期退休协议不变。
 
-同一 D 含多个 P 的 Remote 请求时继续使用现有 batch 1/2/4 分段图；全部相关租约退休后
+同一 D 含多个 P 的 Remote 请求时继续使用现有 batch 1/2/4/8/16 分段图；全部相关租约退休后
 恢复 native full graph/overlap。没有新增图切分点、逐 token TP 投票或 serving 配置覆盖。
 后台控制通道的终止/清理只清理通信对象，不执行 KV/cache 释放。
 

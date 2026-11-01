@@ -317,7 +317,7 @@ def main(
         stream = torch.cuda.Stream()
         stream.wait_stream(torch.cuda.current_stream())
         with backend.capture_session(stream):
-            for size in (8, 4, 2, 1):
+            for size in (32, 16, 8, 4, 2, 1):
                 x = torch.ones((size, 4), device="cuda", dtype=torch.bfloat16)
                 positions = torch.zeros(size, device="cuda", dtype=torch.int64)
                 dummy = f.batch(size, -100)
@@ -338,13 +338,13 @@ def main(
         for buffer in f.carry:
             buffer.zero_()
         carry_expected = [buf.clone() for buf in f.carry]
-        assert sorted(backend.remote_keys) == [1, 2, 4]
+        assert sorted(backend.remote_keys) == [1, 2, 4, 8, 16]
         segments = {
             str(key.size): len(value._segments) for key, value in remote._graphs.items()
         }
-        assert segments == {"1": 8, "2": 8, "4": 8}, segments
+        assert segments == {"1": 8, "2": 8, "4": 8, "8": 8, "16": 8}, segments
         f.controller.targets = [object()]
-        for row in range(4):
+        for row in range(16):
             req = types.SimpleNamespace(kv=types.SimpleNamespace(req_pool_idx=row))
             current_source = sources[row % len(sources)]
             path, generation, route = Path(temp), "graph", current_source.service
@@ -369,7 +369,7 @@ def main(
         for phase, local in enumerate(((), (1,), (1, 2))):
             for target in live_targets.values():
                 target.local_entries = set(local)
-            for size in (1, 2, 4):
+            for size in (1, 2, 4, 8, 16):
                 for marker in (3, 8):
                     live = f.batch(size, marker)
                     live.variant = labels[(phase + marker) % 4]
@@ -441,12 +441,12 @@ def main(
                     assert f.prepared[-3:] == [(marker, i) for i in range(3)]
         assert all(s.req.disagg_kv_sender.poll() == 3 for s in sources)
         count = len(rpc_calls)
-        for size in (3, 8):
+        for size in (3, 12, 32):
             assert not hooks._decode_graph(lambda *a: True, f.runner, f.batch(size))
         f.controller.targets = []
         for target in list(live_targets.values()):
             target.close("tp-local-graph-probe")
-        for step, size in enumerate((4, 1, 2, 4, 1, 2, 4, 8)):
+        for step, size in enumerate((16, 8, 4, 1, 2, 16, 8, 32)):
             live = f.batch(size, 42)
             x, p = inputs[size]
             x.fill_(0.25)
@@ -463,7 +463,7 @@ def main(
             f.check_output(got, expected)
         assert len(rpc_calls) == count
         assert seen_variants == set(labels)
-        assert len(full._graphs) == 16
+        assert len(full._graphs) == 24
         if cluster:
             from sglang_remote_attn.pre_layerwise import read_json
 
@@ -546,8 +546,8 @@ def main(
         result = dict(
             device=torch.cuda.get_device_name(),
             torch=torch.__version__,
-            remote_buckets=[1, 2, 4],
-            native_full_shapes=16,
+            remote_buckets=[1, 2, 4, 8, 16],
+            native_full_shapes=24,
             native_candidate_variants=sorted(seen_variants),
             remote_segments=segments,
             remote_replays=backend.replays["remote"],
@@ -567,7 +567,7 @@ def main(
             fused_projection=fused,
             bf16_kv_source=bf16_source,
             live_swa_and_carry_verified=True,
-            unsupported_remote_eager=[3, 8],
+            unsupported_remote_eager=[3, 12, 32],
             local_full_restored=True,
             gpu_transfer=gpu_result,
             mesh=dict(

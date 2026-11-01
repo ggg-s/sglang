@@ -89,7 +89,7 @@ P0–P5.18 features to this port and distinguishes code coverage from deployment
 | Decode-style resume | Preserve `Req.kv` and its allocated row; set committed and allocated KV lengths; use the current `process_prebuilt(future_map)` API |
 | KV release / retraction | Fence target receiver writes before upstream frees KV; handle imports aborted before row admission |
 | Normal SSE output | Filter `_handoff_req` out of the regular output streamer; gateway/status retains output ownership |
-| CUDA graphs | TP-agreed receiver leases select Remote segments at exact batch 1/2/4, eager for other Remote shapes, native full graphs after Local; no per-forward collective; legacy imports retain conservative TP votes |
+| CUDA graphs | TP-agreed receiver leases select Remote segments at exact batch 1/2/4/8/16, eager for other Remote shapes, native full graphs after Local; no per-forward collective; legacy imports retain conservative TP votes |
 | Mooncake | Create the send mutex before constructor threads start; serialize process-wide transport batches; probe changed peers before upstream registration publication |
 
 Main's existing `prefill_decode_interval` implements P5.10. The old scheduler
@@ -114,13 +114,14 @@ for native transfer and Remote readers to drain across TP. Ordinary requests kee
 the native cache path. HiCache, external linkers and session refs remain gated. Native CUDA graphs may
 remain enabled. Progressive uses its existing TP admission/retirement votes
 to keep identical receiver leases: a live lease selects D-only Remote segmented
-graphs for exact batch 1/2/4, with attention/RPC/merge outside graphs; other
+graphs for exact batch 1/2/4/8/16, with attention/RPC/merge outside graphs; other
 Remote batches remain eager. Once all leases retire, native full replay resumes without recapture
 or an added per-forward collective. Startup checks graph configuration and
 capture manifests across ranks. Native TP input/config consistency remains
 required; legacy/manual imports revoke this fast path and retain the
 conservative per-forward native-eligibility/readiness vote.
-Remote segments require native full decode graphs with capture buckets 1/2/4,
+Remote segments require native full decode graphs with at least capture buckets 1/2/4;
+8/16 are enabled when present in the native capture list. They require
 Qwen3 dense MHA, cuda-python, and no torch.compile/debug-eager/memory-saver.
 The private Remote graph pool adds capture time and memory. Set
 `HANDOFF_REMOTE_SEGMENTED_GRAPH=0` on D and restart for the Remote eager control.

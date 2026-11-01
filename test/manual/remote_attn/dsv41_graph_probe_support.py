@@ -67,8 +67,8 @@ def fixture(
             "_compute_kv_bf16",
         },
     )
-    cache = [torch.full((8, 4), -99.0, device=device, dtype=dtype) for _ in range(3)]
-    carry = [torch.zeros(8, device=device, dtype=dtype) for _ in range(3)]
+    cache = [torch.full((32, 4), -99.0, device=device, dtype=dtype) for _ in range(3)]
+    carry = [torch.zeros(32, device=device, dtype=dtype) for _ in range(3)]
 
     def norm(kv, weight, eps, freqs, pos):
         # External fused norm/RoPE kernel boundary; preserve in-place semantics.

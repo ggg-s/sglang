@@ -50,9 +50,9 @@ class TestBreakableOutput(CustomTestCase):
         self.assertIsNone(result.sampling_mask_output)
 
     def test_replay_does_not_reuse_sampler_mutations_across_batches(self):
-        buffer = self.backend._alloc_full_buffer(self.output(4), 4)
+        buffer = self.backend._alloc_full_buffer(self.output(16), 16)
         self.backend._outputs = {
-            size: self.backend._slice_output(buffer, size) for size in (1, 2, 4)
+            size: self.backend._slice_output(buffer, size) for size in (1, 2, 4, 8, 16)
         }
         self.backend._graphs = {
             size: SimpleNamespace(
@@ -60,14 +60,14 @@ class TestBreakableOutput(CustomTestCase):
                     self.output(size), buffer, size
                 )
             )
-            for size in (1, 2, 4)
+            for size in (1, 2, 4, 8, 16)
         }
         previous = []
         with mock.patch(
             "sglang.srt.model_executor.runner_backend.breakable_cuda_graph_backend.graph_pool_replay_scope",
             contextlib.nullcontext,
         ):
-            for size in (4, 1, 2, 4, 1):
+            for size in (16, 8, 4, 1, 2, 16, 8, 1):
                 output = self.backend.replay(size, None)
                 self.assertTrue(all(output is not item for item in previous))
                 torch.testing.assert_close(

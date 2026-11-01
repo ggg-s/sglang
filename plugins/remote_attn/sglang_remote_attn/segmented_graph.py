@@ -12,7 +12,8 @@ import types
 from contextlib import contextmanager
 
 logger = logging.getLogger(__name__)
-REMOTE_BATCHES = (1, 2, 4)
+REMOTE_BATCHES = (1, 2, 4, 8, 16)
+MIN_REMOTE_BATCHES = (1, 2, 4)
 
 
 def _runtime():
@@ -310,6 +311,7 @@ def resolve_backend(original, runner):
     report = (
         settings,
         tuple(runner.capture_bs),
+        REMOTE_BATCHES,
         type(runner.model_runner.model).__name__,
         runner.enable_torch_compile,
         config.graph.cuda_graph_config.decode.backend,
@@ -375,7 +377,7 @@ def resolve_backend(original, runner):
         not dsv41 and type(mr.model).__name__ != "Qwen3ForCausalLM"
     ) or mr.lora_manager is not None:
         raise ValueError("Remote segments require Qwen3ForCausalLM without LoRA")
-    if not set(REMOTE_BATCHES).issubset(runner.capture_bs):
+    if not set(MIN_REMOTE_BATCHES).issubset(runner.capture_bs):
         raise ValueError(
             "Native decode capture buckets must include 1, 2, 4 for Remote segments"
         )

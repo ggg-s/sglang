@@ -17,7 +17,8 @@ P/D 能力不匹配的请求不接管，保留原生 PD 传输，不能据此判
   通过注册 GPU 缓冲区及 `batch_transfer_sync` 搬运；不另建 engine，不加入 KV 指针清单。
 - **TCP**：RemoteHub 只交换认证、GPU region、序号、shape/dtype、sparse positions 与
   `te_open/te_attn/te_ack/te_close` 控制消息，不发送 Q/O/LSE 字节。
-- 首先支持逻辑 batch 1/2/4；MHA 按 P endpoint 分组，每帧最多4行；DSV 保留逐行 sparse
+- Remote 图支持逻辑 batch 1/2/4/8/16；MHA 按 P endpoint 分组，每帧仍最多4行，
+  8/16 复用现有拆帧循环；DSV 保留逐行 sparse
   RPC。大组按最多4行拆分，未增加 graph buckets，其他 shape 的图策略保持原样。
 - Q 为 BF16/FP16，O 保持原计算 dtype，LSE 为 FP32；不改变 attention 或 merge 数学。
   MHA 和 DSV executor 直接消费 GPU Q、返回 GPU O/LSE。动态 sparse、RPC、merge 仍在图外；

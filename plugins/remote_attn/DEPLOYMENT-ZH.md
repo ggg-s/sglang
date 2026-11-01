@@ -38,7 +38,7 @@ optimistic prefill、chunk 和 Batch，不需要 JSON 配置或启动包装器�
 
 - `Qwen3ForCausalLM`、CUDA、dense NHD MHA、BF16/FP16 KV、page size 1。
 - P/D 相同 TP 宽度，PP=DP=CP=1；示例为 TP2，不能直接沿用异构 TP 拓扑。
-- P 可开启设备内 FULL radix cache，D 关闭 radix cache；P 关闭 scheduler overlap，D Remote 串行、全部 Local 后恢复原生 overlap；保留原生 full decode graphs，capture buckets 包含 1/2/4。D Remote batch 1/2/4 使用分段图，attention/RPC/merge 在图外；未覆盖的 Remote batch 为 eager，统一回收后恢复 full graph。最终 chunk 的分层 prefill 仍 eager。P 关闭 scheduler overlap 不影响分层计算/传输重叠；D two_batch_overlap 仍关闭。
+- P 可开启设备内 FULL radix cache，D 关闭 radix cache；P 关闭 scheduler overlap，D Remote 串行、全部 Local 后恢复原生 overlap；保留原生 full decode graphs，capture buckets 包含 1/2/4。D Remote batch 1/2/4/8/16 使用分段图，attention/RPC/merge 在图外；未覆盖的 Remote batch 为 eager，统一回收后恢复 full graph。最终 chunk 的分层 prefill 仍 eager。P 关闭 scheduler overlap 不影响分层计算/传输重叠；D two_batch_overlap 仍关闭。
 - 原生 `mooncake_tcp`，P/D 均使用 `--disaggregation-decode-allocation-policy early`（代码默认）；不能使用 `prefill_complete`。
 - LoRA、MLA/混合/量化 KV、HiCache、speculative、统一 KV、PD multiplexing、live role switching 不在当前支持范围；原生 host KV destination 也不等于这里的 host staging ring。
 
@@ -282,7 +282,7 @@ core 共享 slot 的 `reserve()` 新建并注册 slot 后，使用**同一 copy 
 必须保留本路径约束：page size 1、同 TP、D 关闭 radix cache、P 关闭 overlap scheduler，D 使用插件的 Remote 串行 / Local 原生 overlap 策略，P 设备内 FULL radix 读租约见 [原生接入](SINGLE-PAIR-ZH.md)、`mooncake_tcp`、提前分配。
 graphs 沿用原生配置；Progressive 复用准入/回收的 TP 投票维护统一接收租约，租约清空后
 恢复原生 graph 判断，正常 Local decode 不新增 collective。旧手动 import 保留逐步投票。
-Remote 租约期间，D 对 batch 1/2/4 选择插件分段图，其他 batch 为 eager；
+Remote 租约期间，D 对 batch 1/2/4/8/16 选择插件分段图，其他 batch 为 eager；
 `HANDOFF_REMOTE_SEGMENTED_GRAPH=0` 可重启为 Remote eager 对照。分段图增加独立 graph pool，
 须在实际模型上验收显存与收益，详见[分段验证](validation/REMOTE-SEGMENTED-GRAPHS.md)。
 启动及 eager→graph 验证见[单 pair 说明](SINGLE-PAIR-ZH.md#验证-eager--graph-恢复)，

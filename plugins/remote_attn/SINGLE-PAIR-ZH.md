@@ -12,7 +12,7 @@ DSV4.1 Flash 的纯文本 layerwise 路径见 [专用接入说明](DSV41-LAYERWI
 
 当前范围是同机 Qwen3 dense NHD MHA BF16/FP16、同 TP、PP=DP=CP=1、page size 1、
 early allocation、mooncake_tcp。P 可开启设备内 dense FULL radix cache；D 仍关闭 radix cache。P 关闭 scheduler overlap；D 支持 Remote 串行、全部 Local 后恢复原生 overlap。
-CUDA graphs 沿用原生 full decode 配置：D 的 Remote 阶段对 batch 1/2/4 使用分段图，
+CUDA graphs 沿用原生 full decode 配置：D 的 Remote 阶段对 batch 1/2/4/8/16 使用分段图，
 其他 batch 为 eager；完成 GPU scatter 并经 TP 一致回收后恢复原生 full graph。
 P 普通 prefill 保留原生 graph，最终 chunk 的分层 prefill 和 P 端 Remote RPC 仍为 eager。
 容器中的 P/D 必须共享同一份本机目录及可互通的 loopback 网络。
@@ -157,7 +157,8 @@ D 的其他线上参数同样保留。默认每个 D rank 需要 4 GiB pinned ho
 
 当前 Remote 分段功能默认开启，D 必须使用 `--cuda-graph-backend-decode full`，
 原生实际 capture buckets 须包含 1、2、4，最大运行请求数至少为 4。
-沿用线上完整桶列表；需要时补入这三个值，不要把线上列表替换为仅 1/2/4。
+沿用线上完整桶列表；最小 1/2/4 要求不变。启用 Remote 8/16 时，原生列表也须包含相应值；
+插件只捕获原生已有桶，不修改 max-running 或服务中重新捕获。
 若线上 `--cuda-graph-config` 已设置 decode backend，以其中的 full 配置为准。
 分段功能需要 `cuda-python`，暂不支持 torch.compile、debug-eager、memory saver 或自定义 full backend。
 只在 D 设置 `HANDOFF_REMOTE_SEGMENTED_GRAPH=0` 并重启，可恢复“Remote eager、Local full”对照；
@@ -233,8 +234,8 @@ A'→layerwise 同时包含 staging 改变；layerwise→remote 还包含提前�
 `HANDOFF_GRAPH_DISABLE_ANY_STATE=1` 覆盖，确认启动日志已完成 graph capture。
 通过 SMG 发足够长的输出请求，让同一请求覆盖 Remote 和 Local 两个阶段：
 
-1. 启动时各 D rank 应有 `captured remote batch=1/2/4 attention_breaks=层数`。
-   Remote batch 1/2/4 应出现 `path=remote-segmented all_local=False`，实际执行日志为
+1. 启动时各 D rank 对原生已配置的 1/2/4/8/16 应有 `captured remote batch=N attention_breaks=层数`。
+   Remote batch 1/2/4/8/16 应出现 `path=remote-segmented all_local=False`，实际执行日志为
    `[remote-attn-graph] replay bank=remote batch=...`；未覆盖 batch 出现 `path=eager`。
 2. 最慢 shard 的所有层完成 GPU scatter、原生传输完成且接收租约统一回收后，各 rank 应出现
    `path=graph-eligible all_local=True`；实际执行日志应为 `replay bank=full`。

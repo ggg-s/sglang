@@ -3,7 +3,7 @@
 `HANDOFF_PRE_LAYERWISE=remote` 现在允许 D 在 **global KV 尚未传完**时开始 decode。
 先完成 indexer、SWA/carry 和 metadata 屏障，再由 P 提供缺失 global 前缀的 sparse
 attention；每个 physical global 资源复制完成并经过 TP 有序共识后独立切 Local。
-SMG 无新增修改。D Remote 支持 batch 1/2/4 分段 CUDA graph；稳定 QKV 投影通过少量
+SMG 无新增修改。D Remote 支持 batch 1/2/4/8/16 分段 CUDA graph；稳定 QKV 投影通过少量
 SGL 模型接口进入图内，动态状态更新、sparse、RPC 和 merge 留图外。
 动态 sparse、RPC、merge 仍走 eager 参考计算，未证明生产性能收益。
 Q/O/LSE 可启用 [Mooncake GPU 数据通道](REMOTE-GPU-TRANSPORT-ZH.md)，控制消息继续走 TCP；
@@ -104,9 +104,10 @@ export HANDOFF_REMOTE_SEGMENTED_GRAPH=1  # 默认开启；设 0 并重启可做 
 
 P 不需要开启分段图。原生 graph 若已关闭，仍走 eager；启用分段图的 D 需要原生 full
 backend、1/2/4 buckets、cuda-python，且不使用 torch.compile、debug-eager、memory saver
-或自定义 full backend。更大 buckets 可保留供 Local full graph 使用。
+或自定义 full backend。Remote 8/16 需要原生列表包含相应桶；插件不扩大原生 capture
+范围。其他更大 buckets 继续保留给 Local full graph。
 
-- 只额外捕获 batch **1/2/4**；Remote batch 3/8 等回退 eager，不 padding 到其他 Remote
+- 只为原生列表中已有的 batch **1/2/4/8/16** 额外捕获；Remote batch 3/12/32 等回退 eager，不 padding 到其他 Remote
   bucket。Local 继续原生 full bank 的 buckets/padding 策略。不是每个请求重新捕获。
 - 原生 `candidate_all/candidate_c2_all/candidate_unfiltered/candidate_filtered` full variants
   全部保留。同一 batch 的 Remote native keys 复用一套分段图；图外按本轮原生标签设置
@@ -135,7 +136,7 @@ backend、1/2/4 buckets、cuda-python，且不使用 torch.compile、debug-eager
   prepare 异常可能缺失侧流 join，标记 unsafe、保留 graph storage，拒绝仅凭主流 event 回收。
 
 日志可用原生 `SGLANG_LOG_DECODE_GRAPH_KEY=1`：Remote 看到
-`path=remote-segmented` / `replay bank=remote batch=1/2/4`；全部退休后为
+`path=remote-segmented` / `replay bank=remote batch=1/2/4/8/16`；全部退休后为
 `path=graph-eligible all_local=True` / `replay bank=full`。仅有 full graph 日志不证明 overlap
 已经恢复，还需原有 scheduler policy 日志。
 

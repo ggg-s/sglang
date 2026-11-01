@@ -289,7 +289,7 @@ def run(root, allow_strong_refs, dtype, logits_output=False):
             sg.install_attention(mr)
             stream = torch.cuda.Stream()
             with backend.capture_session(stream):
-                for size in (8, 4, 2, 1):
+                for size in (32, 16, 8, 4, 2, 1):
                     inputs[size] = torch.randn(size, width, device="cuda", dtype=dtype)
                     dummy = batch(size)
                     backend.capture_one(
@@ -305,9 +305,11 @@ def run(root, allow_strong_refs, dtype, logits_output=False):
                 "1": layers + 1,
                 "2": layers + 1,
                 "4": layers + 1,
+                "8": layers + 1,
+                "16": layers + 1,
             }, segment_counts
             controller.targets.append(object())
-            for size in (1, 2, 4, 1):
+            for size in (16, 8, 4, 1, 2, 16, 8, 1):
                 for marker, local in ((11, ()), (12, (0,)), (13, (0, 1, 2))):
                     live = batch(size, marker, local)
                     inputs[size].normal_()
@@ -315,12 +317,14 @@ def run(root, allow_strong_refs, dtype, logits_output=False):
                     with backend.execution(live), backend.replay_session():
                         output = backend.replay(shape(size), live)
                     check_output(output, expected)
-            assert not backend.supports_remote(
-                batch(3)
-            ) and not backend.supports_remote(batch(8))
+            assert (
+                not backend.supports_remote(batch(3))
+                and not backend.supports_remote(batch(12))
+                and not backend.supports_remote(batch(32))
+            )
             controller.targets.clear()
             before = len(callbacks)
-            for size in (1, 2, 4, 8):
+            for size in (16, 8, 4, 2, 1, 32):
                 live = batch(size, 21)
                 inputs[size].normal_()
                 expected = model(inputs[size], live, reference=True)

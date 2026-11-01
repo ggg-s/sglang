@@ -1582,7 +1582,10 @@ def dsv41_graph_settings(args):
     import importlib.util
 
     from sglang_remote_attn.dsv41_graph import capture_signature
-    from sglang_remote_attn.segmented_graph import agree_capture_settings
+    from sglang_remote_attn.segmented_graph import (
+        REMOTE_BATCHES,
+        agree_capture_settings,
+    )
 
     spec = importlib.util.spec_from_file_location(
         "dsv41_graph_probe_support",
@@ -1604,6 +1607,7 @@ def dsv41_graph_settings(args):
         "same",
         "flag",
         "buckets",
+        "policy",
         "abi",
         "variants",
         "fusion",
@@ -1623,6 +1627,7 @@ def dsv41_graph_settings(args):
         report = (
             False if scenario == "flag" and args.rank == 1 else True,
             (1, 2) if scenario == "buckets" and args.rank == 1 else (1, 2, 4),
+            (1, 2, 4) if scenario == "policy" and args.rank == 1 else REMOTE_BATCHES,
             abi,
         )
         try:
@@ -1630,12 +1635,12 @@ def dsv41_graph_settings(args):
             outcomes.append(True)
         except RuntimeError:
             outcomes.append(False)
-    assert outcomes == [True, False, False, False, False, False, False]
+    assert outcomes == [True] + [False] * 7
     from sglang_remote_attn import hooks
     from sglang_remote_attn.dsv41_graph import DSV41GraphBackend
 
     backend = DSV41GraphBackend.__new__(DSV41GraphBackend)
-    backend.remote_keys = {n: SimpleNamespace(size=n) for n in (1, 2, 4)}
+    backend.remote_keys = {n: SimpleNamespace(size=n) for n in (1, 2, 4, 8, 16)}
     backend.remote = SimpleNamespace(can_run=lambda *a: True)
     f.runner.backend = backend
     policies = []
@@ -1659,11 +1664,11 @@ def dsv41_graph_settings(args):
             policies.append(
                 [
                     hooks._decode_graph(lambda *a: True, f.runner, f.batch(n))
-                    for n in (1, 2, 3, 4, 8)
+                    for n in (1, 2, 3, 4, 8, 16, 32)
                 ]
             )
         assert not votes
-    assert policies == [[True, True, False, True, False]] * 3 + [[True] * 5]
+    assert policies == [[True, True, False, True, True, True, False]] * 3 + [[True] * 7]
     return dict(settings=outcomes, policies=policies, per_decode_votes=len(votes))
 
 
@@ -1825,17 +1830,21 @@ def main():
                     )
         leases = progressive_graph_leases(args, context)
         from sglang_remote_attn.segmented_graph import (
+            REMOTE_BATCHES,
             RemoteGraphBackend,
             agree_capture_settings,
         )
 
         startup = []
-        for scenario in ("same", "flag-mismatch", "bucket-mismatch"):
+        for scenario in ("same", "flag-mismatch", "bucket-mismatch", "policy-mismatch"):
             report = (
                 not (scenario == "flag-mismatch" and args.rank == 1),
                 (1, 2)
                 if scenario == "bucket-mismatch" and args.rank == 1
                 else (1, 2, 4),
+                (1, 2, 4)
+                if scenario == "policy-mismatch" and args.rank == 1
+                else REMOTE_BATCHES,
             )
             try:
                 agree_capture_settings(report, group=dist.group.WORLD, world_size=2)
@@ -1849,7 +1858,7 @@ def main():
         backend = RemoteGraphBackend.__new__(RemoteGraphBackend)
         backend.runner, backend.remote_keys = (
             runner,
-            {size: SimpleNamespace(size=size) for size in (1, 2, 4)},
+            {size: SimpleNamespace(size=size) for size in (1, 2, 4, 8, 16)},
         )
         backend.remote = SimpleNamespace(can_run=lambda *a: True)
         runner.backend = backend
@@ -1865,7 +1874,7 @@ def main():
             for remote_active in (False, True, False, True):
                 controller.targets = [object()] if remote_active else []
                 row = []
-                for size in (1, 2, 3, 4, 8):
+                for size in (1, 2, 3, 4, 8, 16, 32):
                     batch = SimpleNamespace(
                         batch_size=size,
                         input_ids=torch.zeros(size, dtype=torch.int64),
