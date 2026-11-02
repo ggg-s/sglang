@@ -366,7 +366,10 @@ class DSV41Controller(Controller):
                 self.config.recv_host_staging
                 and s.disaggregation_mode.value != "decode"
             )
-            or (s.enable_staging and not getattr(self, "receive_installed", False))
+            or (
+                getattr(s, "enable_staging", False)
+                and not getattr(self, "receive_installed", False)
+            )
             or s.enable_pdmux
             or get_memory().enable_unified_memory
             or get_memory().enable_hierarchical_cache

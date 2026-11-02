@@ -395,7 +395,7 @@ def install_attention(model_runner):
 def resolve_backend(original, runner):
     from sglang.srt.runtime_context import get_disagg, get_exec, get_parallel
 
-    from . import dsv41_graph
+    from . import dsv41_graph, dsv41_remote
 
     dsv41 = dsv41_graph.is_model(runner)
     parallel = get_parallel()
@@ -418,6 +418,10 @@ def resolve_backend(original, runner):
         and (controller.targets or controller.sources)
     )
     abi = dsv41_graph.capture_signature(mr, runner) if dsv41 else None
+    dsv41_remote_decode = dsv41 and settings[:2] == ("decode", "remote")
+    # Exchange the actual pool layout, not the requested env setting. Join the
+    # TP vote before rejecting so another rank cannot enter capture alone.
+    kv_layout = mr.token_to_kv_pool.kv_layout.value if dsv41_remote_decode else None
     report = (
         settings,
         tuple(runner.capture_bs),
@@ -436,6 +440,7 @@ def resolve_backend(original, runner):
         abi,
         live,
         cuda_python if settings == ("decode", "remote", "1") else True,
+        kv_layout,
     )
     # This vote precedes all extra capture barriers. Even a disabled rank joins,
     # so asymmetric plugin settings cannot hang a peer in segmented capture.
@@ -446,6 +451,11 @@ def resolve_backend(original, runner):
     )
     if option not in ("0", "1"):
         raise ValueError("HANDOFF_REMOTE_SEGMENTED_GRAPH must be 0 or 1")
+    if dsv41_remote_decode:
+        # Scheduler/controller validation happens after runner initialization.
+        # Reject before even constructing the native backend: it may capture
+        # or warm up kernels before DSV41Controller.validate can run.
+        dsv41_remote.validate_layout(mr.token_to_kv_pool)
     if settings == ("decode", "remote", "1") and dsv41 and not abi[0]:
         raise ValueError(
             "DSV Remote graph native metadata/prepare/attention ABI is incompatible"

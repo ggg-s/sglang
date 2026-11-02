@@ -16,6 +16,8 @@ def fixture(
     on_attention=None,
     fused=False,
     bf16_source=False,
+    multi_stream=True,
+    kv_layout="v41",
 ):
     controller = SimpleNamespace(
         graph_fast_path=True, dsv41_remote=True, remote_targets={}, targets=[]
@@ -85,7 +87,15 @@ def fixture(
         value = (kv.float() * 0.5 + positions.float()[:, None] * 0.03125).to(dtype)
         cache[layer_id].index_copy_(0, swa_loc, value)
 
-    pool = SimpleNamespace(set_swa_key_buffer_radix_fused_norm_rope=store)
+    layouts = support.load(
+        root,
+        "python/sglang/kernels/ops/attention/dsv4/kv_layout.py",
+        "split_native_layout",
+    ).KVLayout
+    pool = SimpleNamespace(
+        set_swa_key_buffer_radix_fused_norm_rope=store,
+        kv_layout=layouts.parse(kv_layout),
+    )
     globals_ = Core._compute_kv_to_cache.__globals__
     globals_.update(
         envs=SimpleNamespace(
@@ -278,8 +288,8 @@ def fixture(
                     positions,
                     fb,
                     attn,
-                    enable_multi_stream=layer.layer_id == 1,
-                    low_ratio_multi_stream=layer.layer_id == 2,
+                    enable_multi_stream=multi_stream and layer.layer_id == 1,
+                    low_ratio_multi_stream=multi_stream and layer.layer_id == 2,
                 )
                 if isinstance(q, tuple):
                     q = q[0]
@@ -308,6 +318,7 @@ def fixture(
             ),
         ),
         attn_backend=attn,
+        token_to_kv_pool=pool,
         _pre_layerwise=controller,
         device_timer=None,
     )

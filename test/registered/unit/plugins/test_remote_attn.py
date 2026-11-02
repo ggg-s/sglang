@@ -9260,6 +9260,174 @@ class TestRemoteAttn(CustomTestCase):
             with self.assertRaisesRegex(ValueError, "without mega"):
                 f.controller.validate()
 
+    def _dsv41_layout_startup_fixture(self):
+        layout = self._dsv41_remote_support().fixture(ROOT, "cpu").layout
+        runner = SimpleNamespace(
+            model_runner=SimpleNamespace(
+                token_to_kv_pool=SimpleNamespace(kv_layout=layout.V4),
+                model=SimpleNamespace(),
+                model_config=SimpleNamespace(
+                    num_hidden_layers=40,
+                    hf_config=SimpleNamespace(model_type="deepseek_v41"),
+                ),
+                lora_manager=None,
+            ),
+            capture_bs=(1, 2, 4),
+            enable_torch_compile=False,
+        )
+        context = SimpleNamespace(
+            get_exec=lambda: SimpleNamespace(
+                graph=SimpleNamespace(
+                    cuda_graph_config=SimpleNamespace(
+                        decode=SimpleNamespace(backend="full")
+                    ),
+                    debug_cuda_graph=False,
+                ),
+                features=SimpleNamespace(enable_memory_saver=False),
+            ),
+            get_disagg=lambda: SimpleNamespace(disaggregation_mode="decode"),
+            get_parallel=lambda: SimpleNamespace(
+                tp_size=2, tp_group=SimpleNamespace(cpu_group=None)
+            ),
+        )
+        stack = self.enterContext(ExitStack())
+        stack.enter_context(
+            patch.dict(sys.modules, {"sglang.srt.runtime_context": context})
+        )
+        stack.enter_context(
+            patch.dict(
+                os.environ,
+                {
+                    "HANDOFF_PRE_LAYERWISE": "remote",
+                    "HANDOFF_REMOTE_SEGMENTED_GRAPH": "1",
+                },
+            )
+        )
+        sg = self.hooks.segmented_graph
+        stack.enter_context(
+            patch.object(
+                sg,
+                "_runtime",
+                return_value=SimpleNamespace(has_target_states=lambda: False),
+            )
+        )
+        stack.enter_context(
+            patch.object(sg.importlib.util, "find_spec", return_value=object())
+        )
+        from sglang_remote_attn import dsv41_graph
+
+        stack.enter_context(
+            patch.object(dsv41_graph, "capture_signature", return_value=(True, ()))
+        )
+        original = unittest.mock.Mock(return_value=object())
+        return SimpleNamespace(sg=sg, runner=runner, layout=layout, original=original)
+
+    def test_dsv41_remote_rejects_unsupported_layout_before_backend_creation_with_or_without_segments(
+        self,
+    ):
+        f = self._dsv41_layout_startup_fixture()
+        f.runner.model_runner.token_to_kv_pool.kv_layout = f.layout.V41_FP4
+        with patch.object(f.sg, "agree_capture_settings") as agree:
+            for option in ("1", "0"):
+                with (
+                    self.subTest(segmented_graph=option),
+                    patch.dict(os.environ, {"HANDOFF_REMOTE_SEGMENTED_GRAPH": option}),
+                ):
+                    with self.assertRaisesRegex(ValueError, "got kv_layout=v41_fp4"):
+                        f.sg.resolve_backend(f.original, f.runner)
+                    self.assertEqual(agree.call_args.args[0][-1], "v41_fp4")
+                    f.original.assert_not_called()
+            # Both V41 arrangements pass the shared guard. Layerwise also keeps
+            # the native V4 backend; it does not use the Remote sparse reader.
+            for layout, mode in (
+                (f.layout.V4, "remote"),
+                (f.layout.V41, "remote"),
+                (f.layout.V41_NEW, "remote"),
+                (f.layout.V4, "layerwise"),
+            ):
+                with (
+                    self.subTest(layout=layout, mode=mode),
+                    patch.dict(
+                        os.environ,
+                        {
+                            "HANDOFF_PRE_LAYERWISE": mode,
+                            "HANDOFF_REMOTE_SEGMENTED_GRAPH": "0",
+                        },
+                    ),
+                ):
+                    f.runner.model_runner.token_to_kv_pool.kv_layout = layout
+                    self.assertIs(
+                        f.sg.resolve_backend(f.original, f.runner),
+                        f.original.return_value,
+                    )
+            self.assertEqual(f.original.call_count, 4)
+
+    def test_dsv41_remote_layout_disagreement_rejects_all_ranks_before_backend_creation(
+        self,
+    ):
+        f = self._dsv41_layout_startup_fixture()
+
+        def gather(reports, report, group):
+            reports[0] = report
+            reports[1] = (*report[:-1], "v41" if report[-1] == "v4" else "v4")
+
+        with patch.object(torch.distributed, "all_gather_object", side_effect=gather):
+            for layout in (f.layout.V4, f.layout.V41):
+                with self.subTest(local_layout=layout):
+                    f.runner.model_runner.token_to_kv_pool.kv_layout = layout
+                    with self.assertRaisesRegex(RuntimeError, "settings differ"):
+                        f.sg.resolve_backend(f.original, f.runner)
+                    f.original.assert_not_called()
+
+    def test_dsv41_v4_sparse_reader_matches_native_oracle_and_ignores_padding(self):
+        from sglang_remote_attn.dsv41_sparse_math import read_slots
+
+        support = self._dsv41_remote_support()
+        f = support.fixture(ROOT, "cpu", kv_layout="v4")
+        for page in (1, 3, 4, 64, 128):
+            with self.subTest(page_size=page):
+                raw = support.encoded(f.layout.V4, 3, page, "cpu")
+                slots = torch.tensor([3 * page - 1, 0, page, 1, 0], dtype=torch.int64)
+                expected = f.v4_oracle.dequantize_k_cache_paged_ref(
+                    raw, slots, page
+                ).reshape(-1, 512)
+                for cache in (raw, raw.view(torch.bfloat16)):
+                    got = read_slots(cache, slots, page, f.layout.V4)
+                    self.assertTrue(
+                        torch.equal(got.view(torch.int16), expected.view(torch.int16))
+                    )
+                self.assertEqual(
+                    read_slots(
+                        raw, torch.tensor([], dtype=torch.int64), page, f.layout.V4
+                    ).shape,
+                    (0, 512),
+                )
+                for bad in (-1, 3 * page):
+                    with self.assertRaisesRegex(ValueError, "outside"):
+                        read_slots(raw, torch.tensor([bad]), page, f.layout.V4)
+
+        raw = support.encoded(f.layout.V4, 1, 4, "cpu")
+        # UE8M0 byte 0 follows the native V4 FTZ rule. RoPE signed zero is
+        # copied verbatim, and the eighth scale/padding byte is never decoded.
+        raw[0, 4 * 576] = 0
+        raw[0, 448:450] = torch.tensor([-0.0], dtype=torch.bfloat16).view(torch.uint8)
+        got = read_slots(raw, torch.tensor([0]), 4, f.layout.V4)
+        expected = f.v4_oracle.dequantize_k_cache_paged_ref(
+            raw, torch.tensor([0]), 4
+        ).reshape(-1, 512)
+        self.assertTrue(torch.equal(got.view(torch.int16), expected.view(torch.int16)))
+        self.assertTrue(torch.signbit(got[0, 448]))
+        for column, value in ((0, 127), (4 * 576, 255), (448, 192)):
+            invalid = raw.clone()
+            invalid[0, column] = value
+            if column == 448:
+                invalid[0, 449] = 127  # BF16 NaN in the RoPE region.
+            with self.assertRaisesRegex(ValueError, "nonfinite"):
+                read_slots(invalid, torch.tensor([0]), 4, f.layout.V4)
+        for invalid in (raw[:, :16], raw.reshape(-1), raw[:, ::2]):
+            with self.assertRaisesRegex(ValueError, "shape/stride"):
+                read_slots(invalid, torch.tensor([0]), 4, f.layout.V4)
+
     def test_dsv41_remote_reads_native_fp4_fp8_layouts_byte_exact(self):
         from sglang_remote_attn.dsv41_sparse_math import read_slots
 
@@ -9298,10 +9466,16 @@ class TestRemoteAttn(CustomTestCase):
                 )
 
     def test_dsv41_remote_sparse_split_matches_union_and_keeps_odd_carry_local(self):
+        self._check_dsv41_sparse_union("v41")
+
+    def test_dsv41_v4_remote_sparse_union_matches_native_dequantization(self):
+        self._check_dsv41_sparse_union("v4")
+
+    def _check_dsv41_sparse_union(self, kv_layout):
         from sglang_remote_attn import dsv41_sparse_math as math
 
         support = self._dsv41_remote_support()
-        f = support.fixture(ROOT, "cpu")
+        f = support.fixture(ROOT, "cpu", kv_layout=kv_layout)
         calls = []
         originals = [t.clone() for t in f.p_swa] + [
             p.kv_buffer[0].clone() for p in f.p_pool.kv_pools.values()
@@ -9315,7 +9489,7 @@ class TestRemoteAttn(CustomTestCase):
             cpp = f.page // ratio
             ids = torch.tensor([f.p_pages[p // cpp] * cpp + p % cpp for p in positions])
             keys = math.read_slots(
-                f.p_pool.get_extra_key_buffer(layer), ids, cpp, f.layout.V41_FP4
+                f.p_pool.get_extra_key_buffer(layer), ids, cpp, f.extra_layout
             )
             return math.partial(query, keys, scale)
 
@@ -9336,15 +9510,27 @@ class TestRemoteAttn(CustomTestCase):
             f.d_pool.get_swa_key_buffer_radix(3),
             torch.tensor([13, 14]),
             8,
-            f.layout.V41,
+            f.main_layout,
         )
         selected = index[0, :4]
         extra = math.read_slots(
-            f.d_pool.get_extra_key_buffer(3), selected, 4, f.layout.V41_FP4
+            f.d_pool.get_extra_key_buffer(3), selected, 4, f.extra_layout
         )
-        expected = math.partial(q[0], torch.cat((swa, extra)), 512**-0.5, f.sink)[0].to(
-            q.dtype
-        )
+        if kv_layout == "v4":
+            # Expected keys come from the independent native V4 dequantizer,
+            # never the plugin reader under test.
+            swa = f.v4_oracle.dequantize_k_cache_paged_ref(
+                f.d_pool.get_swa_key_buffer_radix(3), torch.tensor([13, 14]), 8
+            ).reshape(-1, 512)
+            extra = f.v4_oracle.dequantize_k_cache_paged_ref(
+                f.d_pool.get_extra_key_buffer(3), selected, 4
+            ).reshape(-1, 512)
+        keys = torch.cat((swa, extra)).float()
+        logits = q[0].float() @ keys.T * 512**-0.5
+        logits = torch.cat((logits, f.sink[:, None]), dim=-1)
+        expected = (
+            torch.softmax(logits, dim=-1) @ torch.cat((keys, torch.zeros(1, 512)))
+        ).to(q.dtype)
         torch.testing.assert_close(got[0], expected, atol=0.015625, rtol=0.01)
         self.assertEqual(calls, [([0, 15, 15], 2)])  # Consumer 3 reads source 2.
         self.assertEqual(f.stores, [3])
@@ -9882,6 +10068,74 @@ class TestRemoteAttn(CustomTestCase):
             )
             with self.assertRaisesRegex(ValueError, "P send / D receive roles"):
                 f.controller.validate()
+
+    def test_dsv41_decode_staging_does_not_require_prefill_scheduler_attribute(self):
+        f = self._dsv41_fixture()
+        f.scheduler.disaggregation_mode = SimpleNamespace(value="decode")
+        del f.scheduler.enable_staging
+        f.controller.config = dataclasses.replace(
+            f.controller.config, recv_host_staging=True
+        )
+        with (
+            patch.dict(sys.modules, {"sglang.srt.runtime_context": f.context}),
+            patch("sglang_remote_attn.dsv41_receive.install") as receive,
+        ):
+            f.controller.validate()
+            receive.assert_called_once_with(f.controller, f.manager, "decode")
+            # A missing scheduler flag must not bypass the manager's native
+            # MHA staging guard.
+            f.controller.receive_installed = False
+            f.manager.enable_staging = True
+            with self.assertRaisesRegex(
+                ValueError, "native MHA staging must be disabled"
+            ):
+                f.controller.validate()
+
+    def test_dsv41_host_staging_mismatch_identifies_entry_and_failed_checks(self):
+        f = self._dsv41_fixture()
+        self._dsv41_stage_fixture(f)
+        stage = f.ds.dsv41_staging
+        args = f.manager.kv_args
+        # Exercise an indexer entry, whose logical item spans physical rows.
+        entry = next(
+            i for i, item in enumerate(f.schema["entries"]) if item[0] == "index"
+        )
+        size, stride = args.kv_data_lens[entry], args.kv_item_lens[entry]
+        for bad_size, bad_stride, reason in (
+            (size, size + 1, "size_not_divisible_by_item_stride"),
+            (size - 1, stride, "registered_size_mismatch"),
+            (size, 0, "nonpositive_item_stride"),
+            (size, -1, "nonpositive_item_stride"),
+            (0, stride, "nonpositive_registered_size"),
+        ):
+            with self.subTest(size=bad_size, stride=bad_stride):
+                args.kv_data_lens[entry], args.kv_item_lens[entry] = (
+                    bad_size,
+                    bad_stride,
+                )
+                with self.assertRaisesRegex(ValueError, reason) as error:
+                    stage.buffers(f.pool, f.manager)
+                message = str(error.exception)
+                for text in (
+                    f"entry={entry} kind=index ratio=",
+                    "buffer_index=",
+                    "pointer=0x",
+                    "kv_layout=",
+                    "page_size=8",
+                    "shape=",
+                    "dtype=",
+                    "device=cuda:0",
+                    "expected_device=cuda:0",
+                    "tensor_stride=",
+                    "contiguous=True",
+                    f"tensor_nbytes={size}",
+                    f"registered_size={bad_size}",
+                    f"item_stride={bad_stride}",
+                    f"size_mod_stride={bad_size % bad_stride if bad_stride > 0 else None}",
+                ):
+                    self.assertIn(text, message)
+        args.kv_data_lens[entry], args.kv_item_lens[entry] = size, stride
+        self.assertEqual(len(stage.buffers(f.pool, f.manager)), len(args.kv_data_ptrs))
 
     def test_dsv41_host_staging_layout_and_callback_fail_closed(self):
         f = self._dsv41_fixture()
@@ -10647,6 +10901,7 @@ class TestRemoteAttn(CustomTestCase):
         support = self._dsv41_remote_support()
         f = support.fixture(ROOT, "cpu")
         for layout in (
+            f.layout.V4,
             f.layout.V41,
             f.layout.V41_NEW,
             f.layout.V41_FP4,
@@ -10750,11 +11005,17 @@ class TestRemoteAttn(CustomTestCase):
     def test_dsv41_progressive_eager_survives_multiple_tokens_and_mixed_unready_global(
         self,
     ):
+        self._check_dsv41_progressive_sparse("v41")
+
+    def test_dsv41_v4_progressive_preserves_remote_until_resource_is_local(self):
+        self._check_dsv41_progressive_sparse("v4")
+
+    def _check_dsv41_progressive_sparse(self, kv_layout):
         """No whole-batch native attention may read a still-missing global page."""
         from sglang_remote_attn import dsv41_remote as remote
         from sglang_remote_attn import dsv41_sparse_math as math
 
-        f = self._dsv41_remote_support().fixture(ROOT, "cpu")
+        f = self._dsv41_remote_support().fixture(ROOT, "cpu", kv_layout=kv_layout)
         schema = dict(entries=[["kv", 1, 1], ["kv", 2, 2]])
         f.controller._schema = lambda m: schema
         f.controller.scheduler.disagg_decode_prealloc_queue = SimpleNamespace(
@@ -10770,7 +11031,7 @@ class TestRemoteAttn(CustomTestCase):
             cpp = 8 // ratio
             ids = torch.tensor([f.p_pages[p // cpp] * cpp + p % cpp for p in positions])
             keys = math.read_slots(
-                f.p_pool.get_extra_key_buffer(layer), ids, cpp, f.layout.V41_FP4
+                f.p_pool.get_extra_key_buffer(layer), ids, cpp, f.extra_layout
             )
             return math.partial(q, keys, scale)
 
@@ -11210,7 +11471,7 @@ class TestRemoteAttn(CustomTestCase):
             complete[0] = True
             self.assertTrue(target.gpu_ready())
 
-    def _dsv41_graph_fixture(self, variants=(None,)):
+    def _dsv41_graph_fixture(self, variants=(None,), **options):
         from sglang_remote_attn import dsv41_graph as dg
 
         name = "dsv41_graph_probe_support"
@@ -11219,7 +11480,7 @@ class TestRemoteAttn(CustomTestCase):
         )
         support = importlib.util.module_from_spec(spec)
         spec.loader.exec_module(support)
-        f = support.fixture()
+        f = support.fixture(**options)
         f.runner.attention_graph_variants = SimpleNamespace(
             capture_labels=variants, graph_limits=()
         )
@@ -11790,6 +12051,151 @@ class TestRemoteAttn(CustomTestCase):
         self.assertTrue(torch.equal(lora, x * 3))
         self.assertTrue(torch.equal(kv, x * 9 + 0.125))
         self.assertTrue(all(torch.is_tensor(v) for v in (q, lora, kv)))
+
+    def test_dsv41_hopper_serial_split_matches_native_state_without_repeating_projection(
+        self,
+    ):
+        # H20 uses the non-fused compressor and serial low-ratio prepare. Keep
+        # the source-loaded native projection/state methods, with kernel calls
+        # at the existing small fixture boundary.
+        for bf16_source in (False, True):
+            f = self._dsv41_split_core(
+                kv_layout="v4", multi_stream=False, bf16_source=bf16_source
+            )
+            self.hooks.dsv41_remote.validate_layout(f.mr.token_to_kv_pool)
+            for layer in f.layers:
+                fb = f.batch(3, 5)
+                x, positions = torch.ones(3, 4), torch.tensor([4.0, 5.0, 8.0])
+                f.attn.init_forward_metadata_in_graph(fb)
+                for buf in f.cache:
+                    buf.fill_(-99)
+                for buf in f.carry:
+                    buf.zero_()
+                expected_q = layer._native_prepare(x, positions, fb, f.attn)[0].clone()
+                expected_cache, expected_carry = (
+                    f.cache[layer.layer_id].clone(),
+                    f.carry[layer.layer_id].clone(),
+                )
+                for buf in f.cache:
+                    buf.fill_(-99)
+                for buf in f.carry:
+                    buf.zero_()
+                f.projections.clear()
+                q, lora, kv = layer.project_decode_qkv(x, positions)
+                projections = list(f.projections)
+                layer.update_decode_state(x, lora, kv, positions, fb, f.attn)
+                self.assertEqual(f.projections, projections)
+                self.assertTrue(torch.equal(q, expected_q))
+                self.assertTrue(torch.equal(f.cache[layer.layer_id], expected_cache))
+                self.assertTrue(torch.equal(f.carry[layer.layer_id], expected_carry))
+
+    def test_dsv41_hopper_segments_keep_live_state_and_fingerprint_compressor_policy(
+        self,
+    ):
+        from sglang_remote_attn import dsv41_graph as dg
+
+        f = self._dsv41_graph_fixture(kv_layout="v4", multi_stream=False)
+        self.hooks.dsv41_remote.validate_layout(f.mr.token_to_kv_pool)
+        for layer in f.layers:
+            layer._forward_prepare_multi_stream = lambda *a, **kw: self.fail(
+                "Hopper entered multi-stream prepare"
+            )
+            layer._forward_prepare_low_ratio_multi_stream = (
+                layer._forward_prepare_multi_stream
+            )
+            layer.compressor = (
+                SimpleNamespace(use_fused_compress=False, use_fused_gate=False)
+                if layer.compress_ratio
+                else None
+            )
+        before = dg.capture_signature(f.mr, f.runner)
+        self.assertTrue(before[0])
+        f.layers[2].compressor.use_fused_compress = True
+        self.assertNotEqual(before, dg.capture_signature(f.mr, f.runner))
+        f.layers[2].compressor.use_fused_compress = False
+        f.controller.targets = [object()]
+        for size in (1, 3, 7):
+            live = f.batch(size, 7)
+            for cache, carry in zip(f.cache, f.carry):
+                cache.fill_(-99)
+                carry.zero_()
+            with f.backend.execution(live):
+                f.backend.replay(f.backend.remote_key(live), live)
+            unused = torch.ones(32, dtype=torch.bool)
+            unused[live.out_cache_loc] = False
+            for cache, carry in zip(f.cache, f.carry):
+                self.assertTrue(torch.all(cache[unused] == -99))
+                self.assertTrue(torch.all(carry[unused] == 0))
+            self.assertEqual(f.metadata[-1], 7)
+
+    def test_dsv41_hopper_compressor_dispatch_avoids_sm100_fused_path(self):
+        supported = _source_function(
+            "layers/attention/dsv4/dsv41_sparse.py",
+            "fused_low_ratio_compress_supported",
+        )
+        supported.__globals__.update(torch=torch, is_gfx95_supported=lambda: False)
+        with (
+            patch.object(torch.cuda, "is_available", return_value=True),
+            patch.object(torch.version, "hip", None),
+        ):
+            for major, expected in ((8, False), (9, False), (10, True)):
+                with patch.object(
+                    torch.cuda, "get_device_capability", return_value=(major, 0)
+                ):
+                    self.assertEqual(supported(), expected)
+        backend_cls = _source_class(
+            "layers/attention/deepseek_v4_backend.py",
+            "DeepseekV4AttnBackend",
+            {"_low_ratio_compress_decode"},
+        )
+        backend_cls._low_ratio_compress_decode.__globals__.update(
+            is_sm100_or_newer=lambda: False
+        )
+        calls = []
+        backend = backend_cls()
+        core = SimpleNamespace(
+            c1_out_loc=torch.tensor([7, -1]),
+            raw_out_loc=torch.tensor([9, 0]),
+            c2_out_loc=torch.tensor([3, -1]),
+        )
+        backend.forward_metadata = SimpleNamespace(core_metadata=core)
+        backend._low_ratio_compress_fused = lambda *a, **kw: self.fail(
+            "SM100 fused compressor"
+        )
+        backend._low_ratio_write_group = lambda *a, **kw: calls.append((a, kw))
+        kv, score = torch.ones(2, 512), torch.zeros(2, 512)
+        compressor = SimpleNamespace(
+            use_fused_compress=False, project=lambda x: (kv, score)
+        )
+        layer = SimpleNamespace(compress_ratio=1, compressor=compressor, layer_id=2)
+        positions, req = torch.tensor([7, 8]), torch.tensor([1, 0])
+        x = SimpleNamespace(is_cuda=True)
+        state = SimpleNamespace(
+            kv_score_buffer=SimpleNamespace(kv=kv, score=score, shape=(17, 1024)),
+            ring_size=8,
+        )
+        backend.token_to_kv_pool = SimpleNamespace(
+            get_attention_compress_states=lambda i: state
+        )
+        pool_kernel = unittest.mock.Mock(return_value=(kv, positions, core.c2_out_loc))
+        with (
+            patch.object(torch.version, "cuda", "13.0"),
+            patch.dict(
+                sys.modules,
+                {
+                    "sglang.kernels.ops.attention.dsv4.c2_decode_pool": SimpleNamespace(
+                        c2_decode_pool=pool_kernel
+                    )
+                },
+            ),
+        ):
+            backend._low_ratio_compress_decode(layer, x, req, positions)
+            self.assertFalse(calls[-1][1]["fuse_index_store"])
+            layer.compress_ratio = 2
+            backend._low_ratio_compress_decode(layer, x, req, positions)
+            self.assertEqual(pool_kernel.call_count, 1)
+            self.assertEqual(pool_kernel.call_args.kwargs, {"ring_size": 8})
+            self.assertFalse(calls[-1][1]["fuse_index_store"])
 
     def test_dsv41_native_prepare_router_preserves_all_original_dispatch_branches(self):
         """Extracted routing must retain native HIP/NPU/CUDA/low-ratio/serial calls."""

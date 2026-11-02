@@ -1,4 +1,4 @@
-"""Eager sparse MLA reference operations over native V4.1 paged bytes.
+"""Eager sparse MLA reference operations over native V4 / V4.1 paged bytes.
 
 Only selected slots are decoded. Top-k/candidate selection remains native on D;
 these operations never independently select, sort, deduplicate or truncate it.
@@ -11,10 +11,19 @@ def read_slots(cache, slots, page_size, layout):
     import torch
 
     encoding = layout.encoding.value
-    if encoding not in ("v41", "v41_fp4"):
-        raise ValueError("Remote eager requires V4.1 fp8/fp4 cache encoding")
+    if encoding not in ("v4", "v41", "v41_fp4"):
+        raise ValueError(
+            "Remote eager requires native V4 or V4.1 fp8/fp4 cache encoding"
+        )
     ids = slots.to(device=cache.device, dtype=torch.int64).reshape(-1)
     raw = cache.view(torch.uint8)
+    if (
+        page_size <= 0
+        or raw.ndim != 2
+        or not raw.is_contiguous()
+        or raw.shape[1] < layout.page_bytes(page_size)
+    ):
+        raise ValueError("sparse cache shape/stride cannot hold the native page layout")
     if ids.numel() == 0:
         return torch.empty((0, 512), dtype=torch.bfloat16, device=cache.device)
     if bool(((ids < 0) | (ids >= raw.shape[0] * page_size)).any()):
@@ -30,11 +39,26 @@ def read_slots(cache, slots, page_size, layout):
         pages[:, None],
         scale_base
         + rows[:, None] * scale_stride
-        + torch.arange(layout.scale_bytes, device=raw.device),
+        + torch.arange(
+            7 if encoding == "v4" else layout.scale_bytes, device=raw.device
+        ),
     ].contiguous()
-    if encoding == "v41":
+    if encoding == "v4":
+        # V4 data rows are 448 e4m3 NoPE bytes followed by 64 BF16 RoPE
+        # values. Only NoPE has scales: seven UE8M0 bytes per row, plus one
+        # unused byte. The scales live after all data rows in the page.
+        nope = data[:, :448].contiguous().view(torch.float8_e4m3fn).float()
+        rope = data[:, 448:].contiguous().view(torch.bfloat16)
+        scales = torch.exp2(scales.float() - 127)
+        # Match the native V4 dequantizer's FP32 flush-to-zero semantics.
+        scales = torch.where(scales < 2.0**-126, 0.0, scales)
+        values = torch.cat(
+            (nope * scales.repeat_interleave(64, dim=-1), rope.float()), dim=-1
+        )
+    elif encoding == "v41":
         values = data.view(torch.float8_e4m3fn).float()
         scales = torch.exp2(scales.float() - 127)
+        values = values * scales.repeat_interleave(layout.tile_size, dim=-1)
     else:
         lut = torch.tensor(
             [
@@ -60,7 +84,7 @@ def read_slots(cache, slots, page_size, layout):
         nibbles = torch.stack((data & 15, data >> 4), dim=-1).reshape(-1, 512)
         values = lut[nibbles.long()]
         scales = scales.view(torch.float8_e4m3fn).float()
-    values = values * scales.repeat_interleave(layout.tile_size, dim=-1)
+        values = values * scales.repeat_interleave(layout.tile_size, dim=-1)
     if not bool(torch.isfinite(values).all()):
         raise ValueError("nonfinite sparse cache payload/scale")
     return values.to(torch.bfloat16)

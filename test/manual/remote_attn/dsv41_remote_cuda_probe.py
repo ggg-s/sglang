@@ -31,6 +31,7 @@ def main():
     parser.add_argument("--sglang-root", type=Path, required=True)
     parser.add_argument("--output", type=Path, required=True)
     parser.add_argument("--progressive", action="store_true")
+    parser.add_argument("--kv-layout", choices=("v4", "v41"), default="v41")
     args = parser.parse_args()
     root = args.sglang_root.resolve()
     torch.cuda.set_device(0)
@@ -49,12 +50,13 @@ def main():
     sys.modules["sglang.srt.runtime_context"] = SimpleNamespace(
         get_parallel=lambda: SimpleNamespace(tp_size=1, tp_rank=0)
     )
-    f = fixture(root, "cuda")
+    f = fixture(root, "cuda", kv_layout=args.kv_layout)
     f.p_controller.dsv41_remote = True
     f.controller.dsv41_layerwise = f.controller.graph_fast_path = True
     f.controller.plan = f.controller.executing = None
     layout_cases = []
     for layout in (
+        f.layout.V4,
         f.layout.V41,
         f.layout.V41_NEW,
         f.layout.V41_FP4,
@@ -62,9 +64,17 @@ def main():
     ):
         split = encoded(layout.encoding, 5, 4, "cuda")
         reader = (
-            f.oracle.dequantize_k_cache_v41_fp4
-            if layout.is_fp4
-            else f.oracle.dequantize_k_cache_v41
+            (
+                lambda raw, page: f.v4_oracle.dequantize_k_cache_paged_ref(
+                    raw, torch.arange(raw.shape[0] * page), page
+                )
+            )
+            if layout is f.layout.V4
+            else (
+                f.oracle.dequantize_k_cache_v41_fp4
+                if layout.is_fp4
+                else f.oracle.dequantize_k_cache_v41
+            )
         )
         expected = reader(split.cpu(), 4).reshape(-1, 512)[
             torch.tensor([7, 1, 19, 0, 7])
@@ -185,7 +195,7 @@ def main():
                 f.d_pool.get_swa_key_buffer_radix(layer.layer_id),
                 torch.tensor([13, 14], device="cuda"),
                 8,
-                f.layout.V41,
+                f.main_layout,
             )
             return (
                 math.partial(q[0], keys, 512**-0.5, f.sink)[0].to(q.dtype).unsqueeze(0)
@@ -205,9 +215,16 @@ def main():
                     ratio,
                     attn_sink=f.sink,
                 )
-                swa = f.oracle.dequantize_k_cache_v41(
-                    f.d_pool.get_swa_key_buffer_radix(layer_id).cpu(), 8
-                ).reshape(-1, 512)[[13, 14]]
+                raw_swa = f.d_pool.get_swa_key_buffer_radix(layer_id).cpu()
+                swa = (
+                    f.v4_oracle.dequantize_k_cache_paged_ref(
+                        raw_swa, torch.tensor([13, 14]), 8
+                    ).reshape(-1, 512)
+                    if args.kv_layout == "v4"
+                    else f.oracle.dequantize_k_cache_v41(raw_swa, 8).reshape(-1, 512)[
+                        [13, 14]
+                    ]
+                )
                 rows = [swa]
                 if ratio:
                     ids = (
@@ -217,14 +234,20 @@ def main():
                         .cpu()
                         .long()
                     )
-                    extra = f.oracle.dequantize_k_cache_v41_fp4(
-                        (
-                            progressive_state.saved[ratio]
-                            if args.progressive
-                            else f.d_pool.get_extra_key_buffer(layer_id)
-                        ).cpu(),
-                        8 // ratio,
-                    ).reshape(-1, 512)[ids]
+                    raw_extra = (
+                        progressive_state.saved[ratio]
+                        if args.progressive
+                        else f.d_pool.get_extra_key_buffer(layer_id)
+                    ).cpu()
+                    extra = (
+                        f.v4_oracle.dequantize_k_cache_paged_ref(
+                            raw_extra, ids, 8 // ratio
+                        ).reshape(-1, 512)
+                        if args.kv_layout == "v4"
+                        else f.oracle.dequantize_k_cache_v41_fp4(
+                            raw_extra, 8 // ratio
+                        ).reshape(-1, 512)[ids]
+                    )
                     rows.append(extra)
                 keys = torch.cat(rows).float()
                 logits = f.query[0].cpu().float() @ keys.T * 512**-0.5
@@ -342,6 +365,7 @@ def main():
             device=torch.cuda.get_device_name(),
             torch=torch.__version__,
             layouts_bit_exact=layout_cases,
+            kv_layout=args.kv_layout,
             remote_calls=target.calls,
             rejected_before_pd=rejected_before_pd if not args.progressive else None,
             rejected_before_sparse_barrier=rejected_before_pd

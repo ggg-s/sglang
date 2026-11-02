@@ -21,9 +21,20 @@ def runtime():
     return handoff_control
 
 
+def validate_layout(pool):
+    """Also called before D graph construction, before a controller exists."""
+    layout = pool.kv_layout
+    if layout.encoding.value not in ("v4", "v41") or getattr(
+        pool, "uniform_fp8", False
+    ):
+        raise ValueError(
+            "DSV4.1 Remote eager requires native V4 or V4.1 fp8 SWA layout; "
+            f"got kv_layout={layout.value}, uniform_fp8={getattr(pool, 'uniform_fp8', False)}"
+        )
+
+
 def validate(controller, runner, role):
-    if controller.pool.kv_layout.encoding.value != "v41":
-        raise ValueError("DSV4.1 Remote eager requires native V4.1 fp8 SWA layout")
+    validate_layout(controller.pool)
     if role == "prefill":
         return
     backends = [

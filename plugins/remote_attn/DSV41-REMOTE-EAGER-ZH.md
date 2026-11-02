@@ -56,6 +56,35 @@ optimistic prefill、chunk 和 transfer batch 的线上原值；D radix cache �
 纯文本、同机单 pair、同 TP、PP=DP=CP=1，关闭 DSpark/HiCache；使用 `flashmla`，
 不启用 mega/TRTLLM、LoRA、unified KV、whole-prefix checksum 或 mixed chunk。
 
+H20/Hopper 保留原生 `KVLayout.V4` 池，两端使用 `SGLANG_DSV4_KV_LAYOUT=auto`
+或 `v4`，不要强制 `v41`。Remote sparse reader 支持 V4 的 448 维 FP8 NoPE +
+64 维 BF16 RoPE：按原生页地址读取七个 per-64 UE8M0 scale，忽略第八个 padding
+字节和页尾 padding。V41 的 FP8/FP4 reader 继续保留；TRTLLM uniform-FP8 不在此
+适配范围。P/D 实际 wire schema 必须一致，不能混用 V4 与 V41 池。
+
+Hopper 的状态更新沿用核心现有实现：C1 非融合写入、C2 独立 pair-pooling/ring
+kernel，indexer 使用非 SM100 融合写入分支。分段图只捕获投影，SWA、C2 carry、
+indexer/top-k 仍在图外用 live metadata 更新，裁掉 graph bucket 的虚拟行。
+实际 KV layout 和 compressor fused/gate 策略进入 TP 启动共识；不支持的 layout
+在原生图后端构建前拒绝。V4 支持不代表已经完成 H20 整模或生产性能验收。
+
+不依赖 SM100 的 CUDA 正确性探针（可在 4060/Hopper 上运行）：
+
+```bash
+PYTHONPATH=plugins/remote_attn python test/manual/remote_attn/dsv41_hopper_cuda_probe.py \
+  --source-root . --output /tmp/hopper-kernels.json
+PYTHONPATH=plugins/remote_attn python test/manual/remote_attn/dsv41_remote_cuda_probe.py \
+  --sglang-root . --kv-layout v4 --progressive --output /tmp/hopper-remote.json
+PYTHONPATH=plugins/remote_attn python test/manual/remote_attn/dsv41_segmented_graph_probe.py \
+  --source-root . --kv-layout v4 --serial-prepare --output /tmp/hopper-graphs.json
+```
+
+[V4/Hopper 本地与 4060 验证记录](validation/dsv41-hopper-v4-4060.md) 含原始结果和源码哈希。
+
+第一个探针运行原生 V4 Triton quantize/store/dequant 和 C2 ring kernel；后两个
+探针验证真实 RemoteHub/CUDA graph，但模型投影、norm/store 以及 indexer 规划仍有
+小型 fixture 边界，不替代 H20 checkpoint、FlashMLA、SMG/P/D 或多 GPU NCCL 验收。
+
 两端公共环境：
 
 ```bash

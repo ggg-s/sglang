@@ -316,6 +316,14 @@ def capture_signature(model_runner, runner):
                 and not owner.use_fused_qk_norm_rope
             )
             rows.append(("projection_policy", owner.fuse_wqa_wkv, owner.compress_ratio))
+            compressor = getattr(owner, "compressor", None)
+            rows.append(
+                (
+                    "compression_policy",
+                    getattr(compressor, "use_fused_compress", None),
+                    getattr(compressor, "use_fused_gate", None),
+                )
+            )
             owners.extend(
                 (owner, name, required)
                 for name, required in (

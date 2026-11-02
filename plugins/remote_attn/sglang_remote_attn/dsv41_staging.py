@@ -8,18 +8,21 @@ def buffers(pool, manager):
     # Preserve native registration order and *native* strides: FP4 index scales
     # and payload can span several physical rows for one logical global page.
     tensors = {}
+    owners = {}
     for ratio, buffers in pool.kv_pools.items():
         if buffers is None:
             continue
-        entries = list(buffers.kv_buffer)
+        groups = [("kv", buffers.kv_buffer)]
         index = pool.index_pools.get(ratio)
         if index is not None:
-            entries += list(index.contiguous_page_row_buffers())
-        for tensor in entries:
-            pointer = tensor.data_ptr()
-            if pointer in tensors:
-                raise ValueError("aliased DSV4.1 host staging entries")
-            tensors[pointer] = tensor
+            groups.append(("index", index.contiguous_page_row_buffers()))
+        for kind, entries in groups:
+            for buffer_index, tensor in enumerate(entries):
+                pointer = tensor.data_ptr()
+                if pointer in tensors:
+                    raise ValueError("aliased DSV4.1 host staging entries")
+                tensors[pointer] = tensor
+                owners[pointer] = (kind, ratio, buffer_index)
     args = manager.kv_args
     pointers = list(args.kv_data_ptrs)
     if (
@@ -32,17 +35,40 @@ def buffers(pool, manager):
         raise ValueError("DSV4.1 host staging registration mismatch")
     ordered = [tensors[p] for p in pointers]
     device = ordered[0].device
-    for tensor, size, stride in zip(ordered, args.kv_data_lens, args.kv_item_lens):
-        if (
-            tensor.device.type != "cuda"
-            or tensor.device != device
-            or not tensor.is_contiguous()
-            or tensor.numel() * tensor.element_size() != size
-            or stride <= 0
-            or size <= 0
-            or size % stride
-        ):
-            raise ValueError("DSV4.1 host staging tensor/stride mismatch")
+    for entry, (tensor, size, stride) in enumerate(
+        zip(ordered, args.kv_data_lens, args.kv_item_lens)
+    ):
+        nbytes = tensor.numel() * tensor.element_size()
+        contiguous = tensor.is_contiguous()
+        remainder = size % stride if stride > 0 else None
+        failed = [
+            name
+            for name, invalid in (
+                ("not_cuda", tensor.device.type != "cuda"),
+                ("device_mismatch", tensor.device != device),
+                ("not_contiguous", not contiguous),
+                ("registered_size_mismatch", nbytes != size),
+                ("nonpositive_item_stride", stride <= 0),
+                ("nonpositive_registered_size", size <= 0),
+                ("size_not_divisible_by_item_stride", stride > 0 and remainder != 0),
+            )
+            if invalid
+        ]
+        if failed:
+            pointer = tensor.data_ptr()
+            kind, ratio, buffer_index = owners[pointer]
+            layout = getattr(pool, "kv_layout", None)
+            raise ValueError(
+                "DSV4.1 host staging tensor/stride mismatch: "
+                f"entry={entry} kind={kind} ratio={ratio} buffer_index={buffer_index} "
+                f"pointer={pointer:#x} kv_layout={getattr(layout, 'value', layout)} "
+                f"page_size={pool.page_size} failed_checks={','.join(failed)}; "
+                f"shape={tuple(tensor.shape)} dtype={tensor.dtype} "
+                f"device={tensor.device} expected_device={device} "
+                f"tensor_stride={tuple(tensor.stride())} contiguous={contiguous} "
+                f"tensor_nbytes={nbytes} registered_size={size} "
+                f"item_stride={stride} size_mod_stride={remainder}"
+            )
     ranges = sorted(zip(pointers, args.kv_data_lens))
     if any(a + n > b for (a, n), (b, _) in zip(ranges, ranges[1:])):
         raise ValueError("overlapping DSV4.1 host staging entries")

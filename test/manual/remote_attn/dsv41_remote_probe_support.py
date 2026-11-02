@@ -6,6 +6,7 @@ import enum
 import functools
 import importlib.util
 import sys
+from pathlib import Path
 from types import SimpleNamespace
 
 import torch
@@ -49,7 +50,65 @@ def definitions(root, relative, *, owner=None, members=None):
     return namespace[owner] if owner else SimpleNamespace(**namespace)
 
 
+def v4_reference(root):
+    """Load the independent native V4 torch writer/reader without Triton imports."""
+    path = root / "python/sglang/test/kernels/deepseek_v4/k_cache_reference.py"
+    names = {"set_k_and_s_torch", "dequantize_k_cache_paged_ref"}
+    nodes = [
+        n for n in ast.parse(path.read_text()).body if getattr(n, "name", None) in names
+    ]
+    tree = ast.Module(
+        body=[
+            ast.ImportFrom(
+                module="__future__", names=[ast.alias(name="annotations")], level=0
+            ),
+            *nodes,
+        ],
+        type_ignores=[],
+    )
+    namespace = dict(
+        torch=torch,
+        fp8_dtype=torch.float8_e4m3fn,
+        DIM_NOPE=448,
+        DIM_ROPE=64,
+        NOPE_ROPE_BYTES=576,
+        NUM_SCALE_TILES=7,
+        PADDED_SCALE_PER_TOKEN=8,
+        TILE_SIZE=64,
+    )
+    exec(compile(ast.fix_missing_locations(tree), str(path), "exec"), namespace)
+    return SimpleNamespace(**namespace)
+
+
 def encoded(layout, pages, page_size, device):
+    if layout.value == "v4":
+        tokens = pages * page_size
+        # Deliberately nonzero page padding and scale padding (255 is NaN if
+        # misread as a scale). Negative NoPE and BF16-only RoPE values expose
+        # mistakes that a zero/positive FP8 fixture cannot detect.
+        raw = torch.full(
+            (pages, layout.page_bytes(page_size)), 253, dtype=torch.uint8, device=device
+        )
+        nope = (
+            ((torch.arange(tokens * 448, device=device).reshape(tokens, 448) % 81) - 40)
+            .float()
+            .to(torch.float8_e4m3fn)
+        )
+        rope = (
+            torch.sin(torch.arange(tokens * 64, device=device).float())
+            .reshape(tokens, 64)
+            .to(torch.bfloat16)
+        )
+        scales = (
+            torch.arange(tokens * 7, device=device).reshape(tokens, 7) % 11 + 120
+        ).to(torch.uint8)
+        pack = SimpleNamespace(
+            k_nope_fp8=nope, k_rope_bf16=rope, scale_k_nope_ue8m0=scales
+        )
+        v4_reference(Path(__file__).resolve().parents[3]).set_k_and_s_torch(
+            raw, torch.arange(tokens, device=device), pack, page_size
+        )
+        return raw
     raw = torch.zeros(
         (pages, layout.page_bytes(page_size)), dtype=torch.uint8, device=device
     )
@@ -76,7 +135,7 @@ def encoded(layout, pages, page_size, device):
     return raw
 
 
-def fixture(root, device):
+def fixture(root, device, *, kv_layout="v41"):
     from sglang_remote_attn import dsv41_remote as remote
 
     layout = load(
@@ -84,6 +143,12 @@ def fixture(root, device):
         "python/sglang/kernels/ops/attention/dsv4/kv_layout.py",
         "dsv41_probe_layout",
     ).KVLayout
+    main_layout = layout.parse(kv_layout)
+    extra_layout = (
+        layout.V4
+        if main_layout is layout.V4
+        else layout.V41_FP4.with_interleaved(main_layout.is_interleaved)
+    )
     oracle = definitions(
         root, "python/sglang/test/kernels/deepseek_v4/dsv41_kv_quant_reference.py"
     )
@@ -113,7 +178,7 @@ def fixture(root, device):
     def pool(physical_pages):
         pool = pool_cls()
         pool.page_size = pool.swa_page_size = page
-        pool.kv_layout = layout.V41
+        pool.kv_layout = main_layout
         pool.sources_by_ratio = {1: [1], 2: [2]}
         pool.compression_ratios = [0, 1, 2, 2]
         pool.request_window = None
@@ -122,20 +187,20 @@ def fixture(root, device):
         pool.swa_kv_pool = SimpleNamespace(
             page_size=page, get_key_buffer=lambda layer: swa[layer]
         )
-        swa = [encoded(layout.V41, 8, page, device) for _ in range(4)]
+        swa = [encoded(main_layout, 8, page, device) for _ in range(4)]
         pool.kv_pools = {}
         for ratio in (1, 2):
             cpp = page // ratio
-            logical = encoded(layout.V41_FP4, len(physical_pages), cpp, device)
+            logical = encoded(extra_layout, len(physical_pages), cpp, device)
             raw = torch.zeros(
-                (8, layout.V41_FP4.page_bytes(cpp)), dtype=torch.uint8, device=device
+                (8, extra_layout.page_bytes(cpp)), dtype=torch.uint8, device=device
             )
             for i, physical in enumerate(physical_pages):
                 raw[physical].copy_(logical[i])
             pool.kv_pools[ratio] = SimpleNamespace(
                 kv_buffer=[raw],
                 page_size=cpp,
-                kv_layout=layout.V41_FP4,
+                kv_layout=extra_layout,
                 get_key_buffer=lambda index, raw=raw: raw,
             )
         pool.layer_mapping = [
@@ -217,6 +282,9 @@ def fixture(root, device):
     return SimpleNamespace(
         remote=remote,
         layout=layout,
+        main_layout=main_layout,
+        extra_layout=extra_layout,
+        v4_oracle=v4_reference(root),
         oracle=oracle,
         page=page,
         prefix=prefix,

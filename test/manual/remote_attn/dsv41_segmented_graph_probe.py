@@ -39,7 +39,15 @@ def load_native_backends(root, namespace):
 
 
 def main(
-    root, output, *, fused=False, bf16_source=False, mesh=False, gpu_transfer=False
+    root,
+    output,
+    *,
+    fused=False,
+    bf16_source=False,
+    mesh=False,
+    gpu_transfer=False,
+    kv_layout="v41",
+    serial_prepare=False,
 ):
     torch.cuda.set_device(0)
     native = root / "python/sglang/srt/model_executor"
@@ -142,7 +150,7 @@ def main(
         )
         load_native_backends(root, ns)
         ShapeKey = load("dsv_segment_shape", native / "runner/shape_key.py").ShapeKey
-        sf = sparse_fixture(root, "cuda")
+        sf = sparse_fixture(root, "cuda", kv_layout=kv_layout)
         sf.p_controller.dsv41_remote = True
         transport = None
         if gpu_transfer:
@@ -200,7 +208,7 @@ def main(
             from pd_mesh_probe_support import Cluster
 
             cluster = Cluster(root, Path(temp) / "mesh")
-            second = sparse_fixture(root, "cuda")
+            second = sparse_fixture(root, "cuda", kv_layout=kv_layout)
             second.p_controller.dsv41_remote = True
             # Distinct native bytes ensure a mixed-source row cannot silently
             # read another P's cache and still pass the numerical comparison.
@@ -244,7 +252,7 @@ def main(
                 device="cuda",
             )
             return math.read_slots(
-                sf.p_pool.get_extra_key_buffer(layer), ids, cpp, sf.layout.V41_FP4
+                sf.p_pool.get_extra_key_buffer(layer), ids, cpp, sf.extra_layout
             )
 
         def attention(q, layer, fb):
@@ -283,6 +291,8 @@ def main(
             on_attention=attention,
             fused=fused,
             bf16_source=bf16_source,
+            multi_stream=not serial_prepare,
+            kv_layout=kv_layout,
         )
         if transport:
             d_engine = transport.attach(f.controller, "decode")
@@ -569,6 +579,8 @@ def main(
             native_projection_state_source_loaded=True,
             fused_projection=fused,
             bf16_kv_source=bf16_source,
+            kv_layout=kv_layout,
+            serial_prepare=serial_prepare,
             live_swa_and_carry_verified=True,
             unsupported_remote_eager=[3, 12, 32],
             local_full_restored=True,
@@ -600,6 +612,8 @@ if __name__ == "__main__":
     parser.add_argument("--bf16-kv-source", action="store_true")
     parser.add_argument("--mesh", action="store_true")
     parser.add_argument("--gpu-transfer", action="store_true")
+    parser.add_argument("--kv-layout", choices=("v4", "v41"), default="v41")
+    parser.add_argument("--serial-prepare", action="store_true")
     args = parser.parse_args()
     main(
         args.source_root.resolve(),
@@ -608,4 +622,6 @@ if __name__ == "__main__":
         bf16_source=args.bf16_kv_source,
         mesh=args.mesh,
         gpu_transfer=args.gpu_transfer,
+        kv_layout=args.kv_layout,
+        serial_prepare=args.serial_prepare,
     )
