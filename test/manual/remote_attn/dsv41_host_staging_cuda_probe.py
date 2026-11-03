@@ -18,6 +18,7 @@ from pathlib import Path
 
 import numpy as np
 import torch
+from dsv41_staging_probe_support import allocated_pool
 from sglang_remote_attn import dsv41_layerwise as ds
 from sglang_remote_attn import dsv41_staging as staging
 
@@ -47,6 +48,7 @@ def main():
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--sglang-root", type=Path, required=True)
     parser.add_argument("--output", type=Path, required=True)
+    parser.add_argument("--native-index-allocation", action="store_true")
     args = parser.parse_args()
     os.environ["MC_FORCE_TCP"] = "1"
     torch.cuda.set_device(0)
@@ -121,7 +123,14 @@ def main():
         ]
         pool.index_pools[ratio] = index
         tensors += kv + index.contiguous_page_row_buffers()
+    if args.native_index_allocation:
+        pool = allocated_pool(root, device="cuda", full_size=2048, page_size=256)
+        tensors = []
+        for ratio, kv_pool in pool.kv_pools.items():
+            tensors.extend(kv_pool.kv_buffer)
+            tensors.extend(pool.index_pools[ratio].contiguous_page_row_buffers())
     ptrs, lengths, strides = pool.get_contiguous_buf_infos()
+    assert all(size % stride == 0 for size, stride in zip(lengths, strides))
     assert ptrs == [t.data_ptr() for t in tensors]
     destinations = [
         torch.zeros(t.nbytes, dtype=torch.uint8, device="cuda") for t in tensors
@@ -178,7 +187,12 @@ def main():
     }
     entries = []
     for ratio, sources in pool.sources_by_ratio.items():
-        for kind in ("kv", "index", "index"):
+        kinds = (
+            ("kv", "index")
+            if args.native_index_allocation
+            else ("kv", "index", "index")
+        )
+        for kind in kinds:
             for producer in sources:
                 entries.append(
                     [kind, ratio, producer, "fp4", "torch.uint8", strides[len(entries)]]
@@ -187,7 +201,7 @@ def main():
     stager = staging.bind(pool, manager)
     slot = stager.buffer.slot
     assert slot.host.is_pinned()
-    assert len(stager.regions) == 12
+    assert len(stager.regions) == len(tensors)
     assert stager.capacity == 257
     assert slot.stream.cuda_stream != torch.cuda.default_stream().cuda_stream
     stream = torch.cuda.Stream()
@@ -237,6 +251,42 @@ def main():
                 dst[dp * stride : (dp + 1) * stride],
             )
         assert not dst[:stride].any()
+    # Send each entry's last complete logical item through the same native
+    # selected-entry planner, D2H staging and TE path. Tail guards stay intact.
+    for entry, (src, dst, size, stride) in enumerate(
+        zip(tensors, destinations, lengths, strides)
+    ):
+        last = size // stride - 1
+        assert (
+            ds.send_selected(
+                None,
+                manager,
+                receiver.session,
+                np.array([last], dtype=np.int32),
+                dst_ptrs,
+                np.array([last], dtype=np.int32),
+                None,
+                dst_attn_tp_size=1,
+                kv_buffer_indices=(entry,),
+                transfer_fn=staging.transfer(manager),
+            )
+            == 0
+        )
+    torch.cuda.synchronize()
+    for src, dst, size, stride in zip(tensors, destinations, lengths, strides):
+        assert torch.equal(
+            src.view(torch.uint8).reshape(-1)[size - stride : size],
+            dst[size - stride : size],
+        )
+        end = src.data_ptr() + size
+        # CUDA may place the next registered region immediately after this
+        # one. Its base is a valid address, not an overrun of this tensor.
+        if stager.resolve(end, stride) is not None:
+            assert any(
+                base == end and capacity >= stride
+                for base, capacity, _, _ in stager.regions
+            )
+        assert stager.resolve(src.data_ptr() + size - stride, stride + 1) is None
     staged_calls = list(sender.calls)
     assert all(
         slot.ptr <= p and p + n <= slot.ptr + slot.capacity
@@ -291,6 +341,7 @@ def main():
     paths = list((root / "plugins/remote_attn/sglang_remote_attn").glob("*.py")) + [
         Path(__file__).resolve()
     ]
+    paths.append(Path(__file__).with_name("dsv41_staging_probe_support.py"))
     paths += [
         native / p
         for p in (
@@ -308,6 +359,13 @@ def main():
         torch=torch.__version__,
         entries=len(tensors),
         native_strides=strides,
+        native_index_allocation=args.native_index_allocation,
+        page_size=pool.page_size,
+        registered_size_remainders=[
+            size % stride for size, stride in zip(lengths, strides)
+        ],
+        terminal_items_exact=True,
+        out_of_bounds_resolve_rejected=True,
         producer_pending=pending,
         bytes_exact=True,
         bounded_host_batches=len(staged_calls),

@@ -1640,6 +1640,10 @@ class DeepSeekV4TokenToKVPool(BaseSWAKVPool):
                 device,
                 enable_memory_saver,
                 force_fp4=True,
+                # PD groups physical index pages into FULL-page items. Reserve
+                # a complete logical guard page, rather than the default single
+                # physical index page that leaves an incomplete wire item.
+                global_page_size=page_size,
                 # only the candidate consumers (ratio 1) score a subset of blocks
                 index_k_page8=ratio == 1 and index_k_page8,
             )

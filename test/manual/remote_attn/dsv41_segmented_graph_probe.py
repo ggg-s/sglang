@@ -21,7 +21,7 @@ from unittest.mock import patch
 import torch
 from dsv41_graph_probe_support import fixture
 from dsv41_remote_probe_support import fixture as sparse_fixture
-from segmented_graph_probe import definitions, load
+from segmented_graph_probe import definitions, load, workspace_namespace
 from sglang_remote_attn import dsv41_graph as dg
 from sglang_remote_attn import dsv41_remote as sparse
 from sglang_remote_attn import dsv41_sparse_math as math
@@ -33,6 +33,7 @@ from sglang_remote_attn.dsv41_layerwise import DSV41Source
 def load_native_backends(root, namespace):
     """Source-loaded methods need their original dataclasses dependency too."""
     namespace["dataclasses"] = dataclasses
+    namespace.update(workspace_namespace(root))
     native = root / "python/sglang/srt/model_executor"
     definitions(native / "runner_backend/full_cuda_graph_backend.py", namespace)
     definitions(native / "runner_backend/breakable_cuda_graph_backend.py", namespace)
@@ -309,7 +310,9 @@ def main(
             capture_labels=labels, graph_limits=()
         )
         full = ns["FullCudaGraphBackend"](f.runner)
-        remote = ns["BreakableCudaGraphBackend"](f.runner)
+        remote = ns["BreakableCudaGraphBackend"](
+            f.runner, capture_error_mode="thread_local", preallocate_workspaces=True
+        )
         remote._pool = torch.cuda.graph_pool_handle()
         backend = dg.DSV41GraphBackend(
             f.runner,

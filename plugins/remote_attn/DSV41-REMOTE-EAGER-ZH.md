@@ -8,6 +8,10 @@ attention；每个 physical global 资源复制完成并经过 TP 有序共识�
 SMG 无新增修改。D Remote 支持 batch 1/2/4/8/16 分段 CUDA graph；稳定 QKV 投影通过少量
 SGL 模型接口进入图内，动态状态更新、sparse、RPC 和 merge 留图外。
 动态 sparse、RPC、merge 仍走 eager 参考计算，未证明生产性能收益。
+Remote capture 显式使用 `thread_local`，Marlin reduction workspace 按图和调用在
+warmup 预分配，保留 bs=1；见 [H20 捕获修复及验证边界](validation/H20-REMOTE-CAPTURE-FIX.md)。
+低压缩率 index 池现按完整逻辑 guard 页分配，解决 staging 尾条不对齐；
+见 [分配、末页传输及边界验证](validation/DSV41-STAGING-ITEM-ALIGNMENT.md)。
 Q/O/LSE 可启用 [Mooncake GPU 数据通道](REMOTE-GPU-TRANSPORT-ZH.md)，控制消息继续走 TCP；
 默认仍保留旧传输作为对照。
 

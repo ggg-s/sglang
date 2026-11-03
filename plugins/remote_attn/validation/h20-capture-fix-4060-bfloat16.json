@@ -1,0 +1,134 @@
+{
+  "device": "NVIDIA GeForce RTX 4060 Laptop GPU",
+  "torch": "2.13.0+cu130",
+  "dtype": "torch.bfloat16",
+  "output_type": "LogitsProcessorOutput",
+  "layers": 3,
+  "remote_segments": {
+    "16": 4,
+    "8": 4,
+    "4": 4,
+    "2": 4,
+    "1": 4
+  },
+  "replays": {
+    "remote": 42,
+    "full": 6
+  },
+  "padded_replays": [
+    [
+      3,
+      4
+    ],
+    [
+      3,
+      4
+    ],
+    [
+      3,
+      4
+    ],
+    [
+      5,
+      8
+    ],
+    [
+      5,
+      8
+    ],
+    [
+      5,
+      8
+    ],
+    [
+      6,
+      8
+    ],
+    [
+      6,
+      8
+    ],
+    [
+      6,
+      8
+    ],
+    [
+      7,
+      8
+    ],
+    [
+      7,
+      8
+    ],
+    [
+      7,
+      8
+    ],
+    [
+      13,
+      16
+    ],
+    [
+      13,
+      16
+    ],
+    [
+      13,
+      16
+    ],
+    [
+      14,
+      16
+    ],
+    [
+      14,
+      16
+    ],
+    [
+      14,
+      16
+    ],
+    [
+      15,
+      16
+    ],
+    [
+      15,
+      16
+    ],
+    [
+      15,
+      16
+    ],
+    [
+      3,
+      4
+    ],
+    [
+      3,
+      4
+    ],
+    [
+      3,
+      4
+    ]
+  ],
+  "marlin_workspace_allocations": 15,
+  "remote_capture_error_mode": "thread_local",
+  "background_allocation_during_capture": true,
+  "rpc_calls": 72,
+  "capture_rpc_calls": 0,
+  "max_allocated_bytes": 17120768,
+  "strong_ref_boundary": false,
+  "source_sha256": {
+    "plugins/remote_attn/sglang_remote_attn/segmented_graph.py": "429749a54d0da01600e6dcd346a1377bc5c290d8ce5493dff198fec9b242d9e3",
+    "test/manual/remote_attn/segmented_graph_probe.py": "1a567d9ebfb1b3dc7930c1bb52be11d6275bc134fee82544318be132a5691cb0",
+    "python/sglang/srt/model_executor/runner_backend/full_cuda_graph_backend.py": "4cdf861b6dbf61d2875598602c77855df06910784fcec43c89fc132cc99bf217",
+    "python/sglang/srt/model_executor/runner_backend/breakable_cuda_graph_backend.py": "2b6b65698ada60bdea1042d204b5396913d22c25eade3379e5d547639e4b0fab",
+    "python/sglang/srt/model_executor/runner_backend_utils/capture_workspace.py": "895ecba22b90bacc56d0a9a8c18f92950aab053905a7e1319fa4126b299b4c00",
+    "python/sglang/srt/layers/quantization/marlin_utils.py": "ad3f5904171715c521acc0a375401ed3cbad35c63e5dc64dfd46e3d77472da43",
+    "python/sglang/srt/layers/logits_processor.py": "4a7f68237afee41031df7f32d61f301e414052b89393996baec997b3dc12fc2e",
+    "python/sglang/srt/model_executor/runner_backend_utils/breakable_cuda_graph/breakable_cuda_graph.py": "596adf3e0e806e3f6a1964582a33f1c655254e3ba3939824e71a156543c76d51"
+  },
+  "scope": "real CUDA; source-loaded native backends; toy attention/RPC; TP1; no pool borrowing/precarving"
+}

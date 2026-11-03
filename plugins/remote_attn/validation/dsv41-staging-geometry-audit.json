@@ -1,0 +1,34 @@
+{
+  "before": [
+    {
+      "ratio": 1,
+      "registered_bytes": 42166528,
+      "item_stride": 17408,
+      "remainder": 4352,
+      "physical_pages": 9689
+    },
+    {
+      "ratio": 2,
+      "registered_bytes": 21085440,
+      "item_stride": 8704,
+      "remainder": 4352,
+      "physical_pages": 4845
+    }
+  ],
+  "after": [
+    {
+      "ratio": 1,
+      "registered_bytes": 42179584,
+      "item_stride": 17408,
+      "remainder": 0,
+      "physical_pages": 9692
+    },
+    {
+      "ratio": 2,
+      "registered_bytes": 21098496,
+      "item_stride": 8704,
+      "remainder": 0,
+      "physical_pages": 4848
+    }
+  ]
+}

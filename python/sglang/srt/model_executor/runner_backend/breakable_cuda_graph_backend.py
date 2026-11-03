@@ -19,7 +19,7 @@ No torch.compile.
 from __future__ import annotations
 
 import dataclasses
-from contextlib import contextmanager
+from contextlib import contextmanager, nullcontext
 from typing import TYPE_CHECKING, Any, Callable, Dict, Optional
 
 import torch
@@ -39,6 +39,9 @@ from sglang.srt.model_executor.runner_backend_utils.breakable_cuda_graph import 
     BreakableCUDAGraphCapture,
     eager_on_graph,
     enable_breakable_cuda_graph,
+)
+from sglang.srt.model_executor.runner_backend_utils.capture_workspace import (
+    CaptureWorkspacePool,
 )
 from sglang.srt.model_executor.runner_utils.pool import (
     GraphPoolPrecarve,
@@ -69,12 +72,17 @@ class BreakableCudaGraphBackend(DedupedCudaGraphMixin, BaseCudaGraphBackend):
         *,
         enable_memory_saver: bool = False,
         debug_eager: bool = False,
+        capture_error_mode: str = "global",
+        preallocate_workspaces: bool = False,
     ) -> None:
         self._cuda_graph_runner = cuda_graph_runner
         self._model_runner = cuda_graph_runner.model_runner
         self._graphs: Dict[Any, BreakableCUDAGraph] = {}
         self._outputs: Dict[Any, Any] = {}
         self._capture_inputs: Dict[Any, Any] = {}
+        self._capture_workspaces: Dict[Any, CaptureWorkspacePool] = {}
+        self._capture_error_mode = capture_error_mode
+        self._preallocate_workspaces = preallocate_workspaces
         self._pool = None
         self._device_module = cuda_graph_runner.device_module
         self._tp_group = get_parallel().tp_group
@@ -118,11 +126,18 @@ class BreakableCudaGraphBackend(DedupedCudaGraphMixin, BaseCudaGraphBackend):
         capture_inputs: Optional[Any] = None,
         post_warmup_hook: Optional[Callable[[], None]] = None,
     ) -> None:
+        workspaces = CaptureWorkspacePool() if self._preallocate_workspaces else None
+        if workspaces is not None:
+            # Retain scratch even if warmup/capture raises after queuing work.
+            self._capture_workspaces[shape_key] = workspaces
         warmup_out = None
         for _ in range(2):
             self._device_module.synchronize()
             self._tp_group.barrier()
-            with self._precarve.measure():
+            with (
+                self._precarve.measure(),
+                workspaces.scope() if workspaces is not None else nullcontext(),
+            ):
                 warmup_out = forward_fn()
             if post_warmup_hook is not None:
                 post_warmup_hook()
@@ -141,11 +156,15 @@ class BreakableCudaGraphBackend(DedupedCudaGraphMixin, BaseCudaGraphBackend):
             )
         with (
             graph_pool_capture_scope(),
+            workspaces.scope(capturing=True)
+            if workspaces is not None
+            else nullcontext(),
             BreakableCUDAGraphCapture(
                 cuda_graph=graph,
                 pool=self._pool,
                 stream=self._capture_stream,
                 barrier_fn=self._tp_group.barrier,
+                capture_error_mode=self._capture_error_mode,
             ),
         ):
             self._precarve.mint()
@@ -318,5 +337,6 @@ class BreakableCudaGraphBackend(DedupedCudaGraphMixin, BaseCudaGraphBackend):
         self._graphs.clear()
         self._outputs.clear()
         self._capture_inputs.clear()
+        self._capture_workspaces.clear()
         self._pool = None
         self._shared_output_buffer = None

@@ -3214,7 +3214,7 @@ class TestRemoteAttn(CustomTestCase):
                 FullCudaGraphBackend=type(f.full)
             ),
             "sglang.srt.model_executor.runner_backend.breakable_cuda_graph_backend": SimpleNamespace(
-                BreakableCudaGraphBackend=lambda runner: SimpleNamespace()
+                BreakableCudaGraphBackend=lambda runner, **kw: SimpleNamespace(**kw)
             ),
             "sglang.srt.model_executor.runner_backend_utils.breakable_cuda_graph": SimpleNamespace(
                 eager_on_graph=lambda fn: fn
@@ -3257,6 +3257,8 @@ class TestRemoteAttn(CustomTestCase):
             backend = sg.resolve_backend(original, f.runner)
             self.assertIsInstance(backend, sg.RemoteGraphBackend)
             self.assertIs(backend.full, f.full)
+            self.assertEqual(backend.remote.capture_error_mode, "thread_local")
+            self.assertTrue(backend.remote.preallocate_workspaces)
             f.runner.capture_bs = (1, 4, 8, 16)
             with self.assertRaisesRegex(ValueError, "must include 1, 2, 4"):
                 sg.resolve_backend(original, f.runner)
@@ -10137,6 +10139,81 @@ class TestRemoteAttn(CustomTestCase):
         args.kv_data_lens[entry], args.kv_item_lens[entry] = size, stride
         self.assertEqual(len(stage.buffers(f.pool, f.manager)), len(args.kv_data_ptrs))
 
+    def test_dsv41_native_index_allocation_stages_complete_terminal_items(self):
+        spec = importlib.util.spec_from_file_location(
+            "staging_geometry",
+            ROOT / "test/manual/remote_attn/dsv41_staging_probe_support.py",
+        )
+        support = importlib.util.module_from_spec(spec)
+        spec.loader.exec_module(support)
+        core_spec = importlib.util.spec_from_file_location(
+            "staging_geometry_core",
+            ROOT / "python/sglang/srt/disaggregation/mooncake/pinned_staging_core.py",
+        )
+        core = importlib.util.module_from_spec(core_spec)
+        core_spec.loader.exec_module(core)
+
+        class Boundary:
+            device = torch.device("cuda:0")
+
+            def __init__(self, tensor):
+                self.tensor = tensor
+
+            def __getattr__(self, name):
+                return getattr(self.tensor, name)
+
+            def __getitem__(self, key):
+                return self.tensor[key]
+
+            def view(self, *args):
+                return Boundary(self.tensor.view(*args))
+
+        manager_cls = _source_class(
+            "disaggregation/mooncake/conn.py",
+            "MooncakeKVManager",
+            {"ensure_host_stager", "set_kv_buffer_tensors"},
+        )
+        for page_size, full_size in ((128, 640), (256, 619776), (512, 2560)):
+            with self.subTest(page_size=page_size):
+                pool = support.allocated_pool(
+                    ROOT, page_size=page_size, full_size=full_size
+                )
+                for ratio, index in pool.index_pools.items():
+                    self.assertEqual(index.global_page_size, page_size)
+                    if page_size == 256 and ratio == 1:
+                        legacy_bytes = ((index.size + 64 + 63) // 64) * 4352
+                        self.assertEqual(legacy_bytes, 42166528)
+                        self.assertEqual(legacy_bytes % 17408, 4352)
+                    index.index_k_with_scale_buffer = [
+                        Boundary(t) for t in index.index_k_with_scale_buffer
+                    ]
+                    kv = pool.kv_pools[ratio]
+                    kv.kv_buffer = [Boundary(t) for t in kv.kv_buffer]
+                ptrs, sizes, strides = pool.get_contiguous_buf_infos()
+                manager = manager_cls()
+                manager.kv_args = SimpleNamespace(
+                    kv_data_ptrs=ptrs, kv_data_lens=sizes, kv_item_lens=strides
+                )
+                manager._host_staging_all = False
+                stager = core.CorePinnedStager(SimpleNamespace(), capacity=257)
+                manager._core_stager = stager
+                stager.reserve = lambda device: None
+                bound = self.hooks.dsv41_layerwise.dsv41_staging.bind(pool, manager)
+                self.assertIs(bound, stager)
+                for ptr, size, stride in zip(ptrs, sizes, strides):
+                    self.assertEqual(size % stride, 0)
+                    tail = stager.resolve(ptr + size - stride, stride)
+                    self.assertIsNotNone(tail)
+                    self.assertEqual(tail.numel(), stride)
+                    self.assertIsNone(stager.resolve(ptr + size - stride, stride + 1))
+                    if stager.resolve(ptr + size, stride) is not None:
+                        self.assertTrue(
+                            any(
+                                base == ptr + size and capacity >= stride
+                                for base, capacity, _, _ in stager.regions
+                            )
+                        )
+
     def test_dsv41_host_staging_layout_and_callback_fail_closed(self):
         f = self._dsv41_fixture()
         stager, calls = self._dsv41_stage_fixture(f)
@@ -10478,6 +10555,25 @@ class TestRemoteAttn(CustomTestCase):
 
     def test_hook_targets_match_current_main(self):
         self.check.check_sources(ROOT)
+
+    def test_preflight_compares_literal_defaults_by_value_and_type(self):
+        import inspect
+
+        kind = inspect.Parameter.KEYWORD_ONLY
+        expected = "".join(("thread", "_local"))
+        actual = "thread_local".encode().decode()
+        self.interfaces.check_parameters(
+            "capture", {"mode": (kind, actual)}, {"mode": expected}
+        )
+        for value in ("global", None, False):
+            with self.assertRaisesRegex(RuntimeError, "unexpected default"):
+                self.interfaces.check_parameters(
+                    "capture", {"mode": (kind, value)}, {"mode": expected}
+                )
+        with self.assertRaisesRegex(RuntimeError, "unexpected default"):
+            self.interfaces.check_parameters(
+                "capture", {"flag": (kind, 0)}, {"flag": False}
+            )
 
     def _preflight_checkout(self, root):
         api = self.interfaces

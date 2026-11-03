@@ -14,6 +14,7 @@ import hashlib
 import importlib.util
 import json
 import sys
+import threading
 import types
 import typing
 from contextlib import contextmanager, nullcontext
@@ -50,7 +51,72 @@ def definitions(path, namespace, names=None):
     exec(compile(ast.fix_missing_locations(tree), str(path), "exec"), namespace)
 
 
-def run(root, allow_strong_refs, dtype, logits_output=False):
+def workspace_namespace(root):
+    module = load(
+        "sglang.srt.model_executor.runner_backend_utils.capture_workspace",
+        root
+        / "python/sglang/srt/model_executor/runner_backend_utils/capture_workspace.py",
+    )
+    return {
+        "CaptureWorkspacePool": module.CaptureWorkspacePool,
+        "get_capture_workspace": module.get_capture_workspace,
+        "nullcontext": nullcontext,
+    }
+
+
+def background_allocation_probe(primitive):
+    """Allocate unrelated device memory on another thread during capture."""
+    ready, start, done, release = (threading.Event() for _ in range(4))
+    errors = []
+    device = torch.cuda.current_device()
+
+    def worker():
+        pointer = None
+        try:
+            primitive.checkCudaErrors(primitive.rt.cudaSetDevice(device))
+            ready.set()
+            if not start.wait(10):
+                raise TimeoutError("background CUDA allocation did not start")
+            pointer = primitive.checkCudaErrors(primitive.rt.cudaMalloc(4096))
+        except BaseException as error:
+            errors.append(repr(error))
+        finally:
+            ready.set()
+            done.set()
+            release.wait(10)
+            if pointer is not None:
+                try:
+                    primitive.checkCudaErrors(primitive.rt.cudaFree(pointer))
+                except BaseException as error:
+                    errors.append(repr(error))
+
+    thread = threading.Thread(target=worker, daemon=True)
+    thread.start()
+    graph = primitive.BreakableCUDAGraph()
+    try:
+        if not ready.wait(10) or errors:
+            raise RuntimeError(f"background CUDA setup failed: {errors}")
+        x = torch.ones(4, device="cuda")
+        with primitive.BreakableCUDAGraphCapture(
+            graph, stream=torch.cuda.Stream(), capture_error_mode="thread_local"
+        ):
+            output = x + 1
+            start.set()
+            if not done.wait(10) or errors:
+                raise RuntimeError(f"background CUDA allocation failed: {errors}")
+        x.fill_(4)
+        graph.replay()
+        torch.cuda.synchronize()
+        torch.testing.assert_close(output, torch.full_like(x, 5))
+    finally:
+        start.set()
+        release.set()
+        thread.join(timeout=10)
+    if thread.is_alive() or errors:
+        raise RuntimeError(f"background CUDA worker failed: {errors}")
+
+
+def run(root, allow_strong_refs, dtype, logits_output=False, marlin_workspaces=False):
     if not torch.cuda.is_available():
         raise RuntimeError("CUDA is required")
     prefix = "sglang.srt.model_executor.runner_backend_utils.breakable_cuda_graph"
@@ -89,6 +155,8 @@ def run(root, allow_strong_refs, dtype, logits_output=False):
         primitive = load(
             prefix + ".breakable_cuda_graph", primitive_dir / "breakable_cuda_graph.py"
         )
+        if marlin_workspaces:
+            background_allocation_probe(primitive)
 
         class Precarve:
             def measure(self):
@@ -140,6 +208,7 @@ def run(root, allow_strong_refs, dtype, logits_output=False):
             BreakableCUDAGraphCapture=primitive.BreakableCUDAGraphCapture,
             enable_breakable_cuda_graph=nullcontext,
         )
+        namespace.update(workspace_namespace(root))
         definitions(
             root / "python/sglang/srt/layers/logits_processor.py",
             namespace,
@@ -158,6 +227,38 @@ def run(root, allow_strong_refs, dtype, logits_output=False):
         inputs = {}
         layers = 3
         width = 8
+        marlin_allocations = []
+
+        def marlin_properties(device):
+            if backend.capture_remote and primitive.is_capturing():
+                raise AssertionError("Marlin device query during Remote capture")
+            return torch.cuda.get_device_properties(device)
+
+        def marlin_zeros(*args, **kwargs):
+            if backend.capture_remote and primitive.is_capturing():
+                raise AssertionError("Marlin allocation during Remote capture")
+            tensor = torch.zeros(*args, **kwargs)
+            if backend.capture_remote:
+                # Keep only addresses: the backend, not this probe's log,
+                # must retain the scratch tensors until all replay is done.
+                marlin_allocations.append(tensor.data_ptr())
+            return tensor
+
+        marlin_namespace = {
+            "torch": types.SimpleNamespace(
+                device=torch.device,
+                Tensor=torch.Tensor,
+                int=torch.int,
+                cuda=types.SimpleNamespace(get_device_properties=marlin_properties),
+                zeros=marlin_zeros,
+            ),
+            "get_capture_workspace": namespace["get_capture_workspace"],
+        }
+        definitions(
+            root / "python/sglang/srt/layers/quantization/marlin_utils.py",
+            marlin_namespace,
+            names={"marlin_make_workspace"},
+        )
 
         class Attention(torch.nn.Module):
             def __init__(self, index):
@@ -181,6 +282,12 @@ def run(root, allow_strong_refs, dtype, logits_output=False):
             def forward(self, x, batch, reference=False):
                 for module, weight in zip(self.attentions, self.weights):
                     q = torch.nn.functional.linear(x, weight) + 0.1
+                    if marlin_workspaces:
+                        scratch = marlin_namespace["marlin_make_workspace"](x.device, 4)
+                        q = q + scratch[0].to(q.dtype)
+                        # Simulate dirty reduction locks. Repeated replay must
+                        # execute the captured reset before reading this slot.
+                        scratch.fill_(7)
                     x = q if reference else module(q, q, q, batch)
                     x = torch.relu(x) + 0.2
                 if logits_output:
@@ -233,7 +340,9 @@ def run(root, allow_strong_refs, dtype, logits_output=False):
             cuda_graph_output_rows=lambda output: tensor_output(output).shape[0],
         )
         full = namespace["FullCudaGraphBackend"](runner)
-        remote = namespace["BreakableCudaGraphBackend"](runner)
+        remote = namespace["BreakableCudaGraphBackend"](
+            runner, capture_error_mode="thread_local", preallocate_workspaces=True
+        )
         remote._pool = torch.cuda.graph_pool_handle()
         backend = sg.RemoteGraphBackend(
             runner,
@@ -300,6 +409,9 @@ def run(root, allow_strong_refs, dtype, logits_output=False):
                         lambda size=size, dummy=dummy: model(inputs[size], dummy),
                     )
             assert not callbacks, "capture performed an RPC"
+            if marlin_workspaces:
+                assert len(marlin_allocations) == layers * 5
+                assert len(set(marlin_allocations)) == layers * 5
             segment_counts = {
                 str(key.size): len(graph._segments)
                 for key, graph in remote._graphs.items()
@@ -373,6 +485,9 @@ def run(root, allow_strong_refs, dtype, logits_output=False):
             "remote_segments": segment_counts,
             "replays": replay_counts,
             "padded_replays": padded_replays,
+            "marlin_workspace_allocations": len(marlin_allocations),
+            "remote_capture_error_mode": remote._capture_error_mode,
+            "background_allocation_during_capture": marlin_workspaces,
             "rpc_calls": len(callbacks),
             "capture_rpc_calls": 0,
             "max_allocated_bytes": torch.cuda.max_memory_allocated(),
@@ -386,6 +501,8 @@ def run(root, allow_strong_refs, dtype, logits_output=False):
                     Path(__file__),
                     native / "runner_backend/full_cuda_graph_backend.py",
                     native / "runner_backend/breakable_cuda_graph_backend.py",
+                    native / "runner_backend_utils/capture_workspace.py",
+                    root / "python/sglang/srt/layers/quantization/marlin_utils.py",
                     root / "python/sglang/srt/layers/logits_processor.py",
                     primitive_dir / "breakable_cuda_graph.py",
                 )
@@ -401,6 +518,7 @@ if __name__ == "__main__":
     )
     parser.add_argument("--allow-strong-refs", action="store_true")
     parser.add_argument("--logits-output", action="store_true")
+    parser.add_argument("--marlin-workspaces", action="store_true")
     parser.add_argument(
         "--dtype", choices=("bfloat16", "float16", "float32"), default="bfloat16"
     )
@@ -412,6 +530,7 @@ if __name__ == "__main__":
                 args.allow_strong_refs,
                 getattr(torch, args.dtype),
                 args.logits_output,
+                args.marlin_workspaces,
             ),
             indent=2,
         )

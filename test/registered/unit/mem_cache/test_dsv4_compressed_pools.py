@@ -384,6 +384,24 @@ class TestV41KVPoolLayouts(CustomTestCase):
         self.assertNotEqual(names[KVLayout.V41], names[KVLayout.V41_NEW])
         self.assertIn("v41_fp4_new", names[KVLayout.V41_NEW])
 
+    def test_low_ratio_indexer_registration_contains_complete_logical_items(self):
+        for layout in (KVLayout.V4, KVLayout.V41):
+            with self.subTest(layout=layout):
+                pool = self.make_pool([0, 2, 1], [1, 2], layout)
+                pointers, lengths, strides = pool.get_contiguous_buf_infos()
+                self.assertEqual(len(pointers), 4)
+                for size, stride in zip(lengths, strides):
+                    self.assertEqual(size % stride, 0)
+                for ratio, index in pool.index_pools.items():
+                    self.assertEqual(index.global_page_size, PAGE_SIZE)
+                    capacity = (
+                        index.contiguous_page_row_buffers()[0].shape[0]
+                        * index.page_size
+                    )
+                    self.assertGreaterEqual(
+                        capacity, (FULL_SIZE + PAGE_SIZE) // ratio + PAGE_SIZE
+                    )
+
     def test_pd_entries_cover_the_c4_kv_page_count(self):
         """The PD transfer walks every registered entry with the c4 KV pool's
         page count, so the c4 indexer must reserve the same FULL logical page."""

@@ -503,7 +503,12 @@ def resolve_backend(original, runner):
         )
     if live:
         raise RuntimeError("Cannot recapture Remote graphs with live handoff leases")
-    remote = BreakableCudaGraphBackend(runner)
+    # Remote breaks coexist with background CUDA workers. Keep unrelated
+    # threads out of this capture's error scope, and reserve per-call Marlin
+    # reduction locks before capture (including the bs=1 graph).
+    remote = BreakableCudaGraphBackend(
+        runner, capture_error_mode="thread_local", preallocate_workspaces=True
+    )
     remote._pool = runner.device_module.graph_pool_handle()
     cls = dsv41_graph.DSV41GraphBackend if dsv41 else RemoteGraphBackend
     backend = cls(

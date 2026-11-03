@@ -16,6 +16,9 @@ from sglang.srt.layers.quantization.utils import (
     pack_cols,
     unpack_cols,
 )
+from sglang.srt.model_executor.runner_backend_utils.capture_workspace import (
+    get_capture_workspace,
+)
 from sglang.srt.utils import get_device_capability, is_cuda
 from sglang.srt.utils.custom_op import register_custom_op
 
@@ -268,9 +271,14 @@ def marlin_make_workspace(
 ) -> torch.Tensor:
     # In the new marlin kernel, we use the num of threadblocks as workspace
     # size. The num of threadblocks is sms_count * max_blocks_per_sm.
-    sms = torch.cuda.get_device_properties(device).multi_processor_count
-    return torch.zeros(
-        sms * max_blocks_per_sm, dtype=torch.int, device=device, requires_grad=False
+    def allocate():
+        sms = torch.cuda.get_device_properties(device).multi_processor_count
+        return torch.zeros(
+            sms * max_blocks_per_sm, dtype=torch.int, device=device, requires_grad=False
+        )
+
+    return get_capture_workspace(
+        ("marlin", torch.device(device), max_blocks_per_sm), allocate
     )
 
 

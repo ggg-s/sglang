@@ -191,6 +191,17 @@ CORE_CALLS = {
         "capture_inputs": None,
         "post_warmup_hook": None,
     },
+    "sglang.srt.model_executor.runner_backend.breakable_cuda_graph_backend.BreakableCudaGraphBackend.__init__": {
+        "capture_error_mode": "global",
+        "preallocate_workspaces": False,
+    },
+    "sglang.srt.model_executor.runner_backend_utils.capture_workspace.get_capture_workspace": {
+        "key": inspect.Parameter.empty,
+        "allocate": inspect.Parameter.empty,
+    },
+    "sglang.srt.model_executor.runner_backend_utils.capture_workspace.CaptureWorkspacePool.scope": {
+        "capturing": False,
+    },
     "sglang.srt.model_executor.runner_backend.breakable_cuda_graph_backend.BreakableCudaGraphBackend.capture_session": {
         "stream": inspect.Parameter.empty
     },
@@ -410,7 +421,7 @@ def check_parameters(target, actual, expected):
             incompatible(
                 target, f"{name} must be an explicit keyword-compatible parameter"
             )
-        if value is not default:
+        if type(value) is not type(default) or value != default:
             incompatible(target, f"unexpected default for {name}; expected {default!r}")
 
 
