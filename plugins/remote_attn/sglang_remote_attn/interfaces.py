@@ -183,6 +183,9 @@ CORE_CALLS = {
         "enable": None,
     },
     "sglang.srt.model_executor.runner_backend_utils.breakable_cuda_graph.breakable_cuda_graph.is_capturing": {},
+    "sglang.srt.model_executor.runner_backend.full_cuda_graph_backend.FullCudaGraphBackend.__init__": {
+        "capture_error_mode": "global",
+    },
     "sglang.srt.model_executor.runner_backend.full_cuda_graph_backend.FullCudaGraphBackend.capture_one": {
         "capture_inputs": None,
         "post_warmup_hook": None,
@@ -314,7 +317,7 @@ CORE_STATE = {
     ),
     "sglang.srt.model_executor.runner_backend.full_cuda_graph_backend.FullCudaGraphBackend.__init__": (
         "self",
-        ("_pool",),
+        ("_pool", "_capture_error_mode"),
     ),
     "sglang.srt.model_executor.runner_backend.breakable_cuda_graph_backend.BreakableCudaGraphBackend.__init__": (
         "self",

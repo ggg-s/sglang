@@ -107,7 +107,9 @@ class FullCudaGraphBackend(BaseCudaGraphBackend):
         *,
         enable_memory_saver: bool = False,
         reuse_output_buffer: bool = False,
+        capture_error_mode: str = "global",
     ) -> None:
+        self._capture_error_mode = capture_error_mode
         self._graphs: Dict[Any, torch.cuda.CUDAGraph] = {}
         self._outputs: Dict[Any, Any] = {}
         self._pool = None
@@ -195,9 +197,17 @@ class FullCudaGraphBackend(BaseCudaGraphBackend):
         else:
             graph_ctx = self._device_module.graph
 
+        capture_options = {}
+        if self._capture_error_mode != "global":
+            capture_options["capture_error_mode"] = self._capture_error_mode
         with (
             graph_pool_capture_scope(),
-            graph_ctx(cuda_graph=graph, pool=self._pool, stream=self._capture_stream),
+            graph_ctx(
+                cuda_graph=graph,
+                pool=self._pool,
+                stream=self._capture_stream,
+                **capture_options,
+            ),
         ):
             self._precarve.mint()
             out = forward_fn()

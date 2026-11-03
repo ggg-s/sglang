@@ -106,6 +106,10 @@ class RemoteGraphBackend:
     ):
         self.runner = runner
         self.full = full
+        # Both banks coexist with native background CUDA workers. In particular,
+        # a full capture for the next bucket must have the same error scope as
+        # the preceding Remote capture. Keep ordinary native callers unchanged.
+        self.full._capture_error_mode = "thread_local"
         self.remote = remote
         self.is_capturing = is_capturing
         self.restore_pool = restore_pool

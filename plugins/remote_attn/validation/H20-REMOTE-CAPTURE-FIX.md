@@ -76,4 +76,6 @@ CUDA 分配；模型、MoE 数学、attention/FlashMLA 与调度仍有小型 fix
 
 V4 index staging 末条不足完整 item 也已修复：补齐原生低压缩率 index 池的逻辑
 guard 页分配，保留全部 staging 边界校验，见 [完整 item 对齐修复](DSV41-STAGING-ITEM-ALIGNMENT.md)。
-三处已定位代码阻塞均已处理；H20 整模和服务性能仍需在目标部署上验收。
+H20 后续仍报告连续 Remote buckets 后的原生 full bs=1 capture invalidated；
+此前只给 Remote bank 设置 thread_local，full bank 未覆盖。补齐与验证状态见
+[full capture 作用域核查](H20-FULL-CAPTURE-SCOPE.md)。H20 整模问题尚未闭环。
