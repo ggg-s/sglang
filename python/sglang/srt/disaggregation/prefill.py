@@ -222,16 +222,9 @@ class PrefillBootstrapQueue:
             page_size = self.scheduler.token_to_kv_pool_allocator.page_size
             # Same source as send_kv_chunk's staging grid below, so validation
             # and the grid cannot disagree after a post-publish override.
-            chunked_prefill_size = get_schedule().chunked_prefill_size
-            cps = chunked_prefill_size or 8192
-            # Staging slices each send into a fixed page-aligned grid, so an
-            # unbounded (-1) or non-page-aligned chunk size has no valid grid.
-            if cps <= 0 or cps % page_size != 0:
-                raise RuntimeError(
-                    f"SGLANG_DISAGG_STAGING_BUFFER requires a positive "
-                    f"chunked_prefill_size that is a multiple of page_size "
-                    f"({page_size}); got {chunked_prefill_size}."
-                )
+            # With compute chunking disabled, transport still uses a bounded
+            # page-aligned grid shared by buffer sizing, prefetch and sends.
+            staging_grid_tokens(get_schedule().chunked_prefill_size, page_size)
             if self.pp_size > 1 and self.transfer_backend != TransferBackend.MOONCAKE:
                 raise RuntimeError(
                     "SGLANG_DISAGG_STAGING_BUFFER with pp_size > 1 is only "

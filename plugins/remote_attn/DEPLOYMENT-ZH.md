@@ -47,6 +47,12 @@ optimistic prefill、chunk 和 Batch，不需要 JSON 配置或启动包装器�
 如果现有生产模型或拓扑不满足这些条件，需要先完成适配，不能仅添加环境变量上线。
 **保留模型部署自己的 token chunk 配置**；不新增 Pre-Layerwise chunk size。
 中间 token chunk 走原生整层发送，只有实际最终 token chunk 按层组发送。
+
+`--chunked-prefill-size -1` 可以与 `SGLANG_DISAGG_STAGING_BUFFER=1` 同时使用。
+关闭计算分块后，原生 staging 传输仍按 8192 tokens 向上对齐到 KV page 的有限网格
+切片；P buffer、D 预取槽位和发送切片使用相同宽度，不会把整个长请求塞进单个
+staging buffer。scheduler 归一化后的 `None` 和其他非正数使用同一规则；计算分块
+保持关闭。正数 chunk 仍须是 page size 的整数倍，不能只满足大于 page size。
 层分组默认 auto；不足 3072 个合格计算 token 时，`layerwise` 回退原生，`remote` 合为一组并保留提前解码。这种请求不应要求跨层重叠。
 
 ## 2. 发布制品与依赖

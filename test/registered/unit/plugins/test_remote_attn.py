@@ -6564,6 +6564,308 @@ class TestRemoteAttn(CustomTestCase):
         self.assertEqual(payloads, [b"aaaa", b"bbbb"])
         self.assertTrue(stager.close())
 
+    def test_staging_grid_preserves_disabled_compute_chunking(self):
+        grid = _source_function(
+            "disaggregation/common/staging_buffer.py", "staging_grid_tokens"
+        )
+        for page in (1, 256, 300, 16384):
+            for size in (None, -1, 0, -2):
+                with self.subTest(page=page, size=size):
+                    tokens = grid(size, page)
+                    self.assertGreaterEqual(tokens, 8192)
+                    self.assertEqual(tokens % page, 0)
+                    self.assertLess(tokens - 8192, page)
+            self.assertEqual(grid(4 * page, page), 4 * page)
+        with self.assertRaisesRegex(RuntimeError, "multiple of page_size"):
+            grid(8193, 256)
+        with self.assertRaisesRegex(ValueError, "page_size must be positive"):
+            grid(-1, 0)
+
+    def test_staging_bootstrap_accepts_disabled_chunking(self):
+        cls = _source_class(
+            "disaggregation/prefill.py", "PrefillBootstrapQueue", {"__init__"}
+        )
+        grid = _source_function(
+            "disaggregation/common/staging_buffer.py", "staging_grid_tokens"
+        )
+        capacity = _source_function(
+            "disaggregation/prefill.py", "max_bootstrap_input_len"
+        )
+        schedule = SimpleNamespace(chunked_prefill_size=-1)
+        cls.__init__.__globals__.update(
+            get_parallel=lambda: SimpleNamespace(tp_rank=0, pp_rank=0, pp_size=1),
+            is_mla_backend=lambda pool: False,
+            envs=SimpleNamespace(
+                SGLANG_DISAGG_STAGING_BUFFER=SimpleNamespace(get=lambda: True)
+            ),
+            get_schedule=lambda: schedule,
+            staging_grid_tokens=grid,
+            max_bootstrap_input_len=capacity,
+        )
+        scheduler = SimpleNamespace(
+            tp_worker=SimpleNamespace(
+                model_runner=SimpleNamespace(
+                    effective_logical_max_total_num_tokens=65536
+                )
+            ),
+            kv_shard_widening=1,
+            token_to_kv_pool_allocator=SimpleNamespace(page_size=256),
+        )
+
+        class ManagerInitReached(Exception):
+            pass
+
+        def manager_init(self):
+            raise ManagerInitReached
+
+        cls._init_kv_manager = manager_init
+        args = (None, None, None, None, 0, 8998, 65536, scheduler, None, None)
+        for size in (-1, None, 0, 8192):
+            with self.subTest(size=size):
+                schedule.chunked_prefill_size = size
+                with self.assertRaises(ManagerInitReached):
+                    cls(*args)
+                self.assertEqual(schedule.chunked_prefill_size, size)
+        schedule.chunked_prefill_size = 8193
+        with self.assertRaisesRegex(RuntimeError, "multiple of page_size"):
+            cls(*args)
+
+    def test_unchunked_staging_prefetch_buffer_and_send_use_same_grid(self):
+        import numpy as np
+
+        grid = _source_function(
+            "disaggregation/common/staging_buffer.py", "staging_grid_tokens"
+        )
+        segments = _source_function(
+            "disaggregation/common/staging_buffer.py", "compute_grid_segments"
+        )
+        init_buffers = _source_function(
+            "disaggregation/common/staging_handler.py", "init_staging_buffers"
+        )
+        prefetch = _source_function(
+            "disaggregation/common/staging_handler.py", "prefetch_staging_reqs"
+        )
+        strategy_cls = _source_class(
+            "disaggregation/common/staging_handler.py", "PrefillStagingStrategy"
+        )
+        sender_cls = _source_class(
+            "disaggregation/common/conn.py",
+            "CommonKVSender",
+            {
+                "send",
+                "_prepare_send_indices",
+                "_record_transfer_indices",
+                "should_send_kv_chunk",
+            },
+        )
+        scheduler_cls = _source_class(
+            "disaggregation/prefill.py",
+            "SchedulerDisaggregationPrefillMixin",
+            {"_send_kv_chunk"},
+        )
+        page_indices = _source_function("mem_cache/common.py", "kv_to_page_indices")
+        page_indices.__globals__.update(torch=torch, np=np)
+        state_types = SimpleNamespace(
+            **{
+                name: name
+                for name in (
+                    "MAMBA",
+                    "QSA_PENDING",
+                    "QSA_COMPRESSED",
+                    "SWA",
+                    "DSA",
+                    "DSA_TAIL",
+                    "MINIMAX_INDEX_K",
+                    "MINIMAX_DENSE_KV",
+                    "SWA_RING",
+                    "DSV4_REQUEST_STATE",
+                    "REQUEST_ROW",
+                    "BLOCK_SCALE",
+                    "BLOCK_SCALE_SWA",
+                )
+            }
+        )
+        schedule = SimpleNamespace(chunked_prefill_size=-1)
+        scheduler_cls._send_kv_chunk.__globals__.update(
+            get_schedule=lambda: schedule,
+            staging_grid_tokens=grid,
+            compute_grid_segments=segments,
+            kv_to_page_indices=page_indices,
+            torch=torch,
+            np=np,
+            StateType=state_types,
+            _is_npu=False,
+        )
+        strategy_cls.__init__.__globals__["get_schedule"] = lambda: schedule
+        polls = SimpleNamespace(
+            Success="success", Failed="failed", Transferring="transferring"
+        )
+        sender_cls.send.__globals__.update(KVPoll=polls, time=time)
+
+        class Buffer:
+            def __init__(self, size, device, gpu_id, **kw):
+                self.size = size
+
+            def get_ptr(self):
+                return id(self)
+
+            def get_size(self):
+                return self.size
+
+        init_buffers.__globals__.update(
+            _bare_device_type=lambda device: device,
+            _get_custom_mem_pool=lambda device: (None, None),
+        )
+        modules = {
+            "sglang.srt.disaggregation.common.staging_buffer": SimpleNamespace(
+                StagingBuffer=Buffer, staging_grid_tokens=grid
+            ),
+            "sglang.srt.utils.network": SimpleNamespace(
+                NetworkAddress=lambda *a: SimpleNamespace(to_tcp=lambda: "tcp://peer:1")
+            ),
+        }
+        with patch.dict(sys.modules, modules):
+            for page in (1, 256, 300):
+                for size in (-1, None, 0, 4 * page):
+                    with self.subTest(page=page, size=size):
+                        schedule.chunked_prefill_size = size
+                        width = grid(size, page)
+                        # D already owns a nonzero prefix; the transfer spans
+                        # two complete slots plus a partial final page.
+                        prefix, count = 3 * page, 2 * width + page + 1
+                        length = prefix + count
+                        total_pages = (count + page - 1) // page
+                        kv_args = SimpleNamespace(
+                            page_size=page, gpu_id=0, kv_item_lens=[2 * page, 3 * page]
+                        )
+                        registrations = []
+                        buffers = init_buffers(
+                            lambda *a: registrations.append(a),
+                            kv_args,
+                            2,
+                            size,
+                            device_type="cuda",
+                        )
+                        self.assertEqual(
+                            [b.get_size() for b in buffers], [5 * width] * 2
+                        )
+                        self.assertEqual(len(registrations), 2)
+                        messages, requested = [], set()
+                        info = SimpleNamespace(
+                            is_dummy=False,
+                            dst_kv_indices=range(total_pages),
+                            endpoint="peer",
+                            dst_port=1,
+                        )
+                        sockets = {
+                            "tcp://peer:1": SimpleNamespace(
+                                send_multipart=messages.append
+                            )
+                        }
+                        for _ in range(2):
+                            prefetch(
+                                7,
+                                {7: {"peer": info}},
+                                {"page_size": page},
+                                size,
+                                requested,
+                                sockets,
+                            )
+                        self.assertEqual([int(m[2]) for m in messages], [0, 1, 2])
+                        expected_pages = [
+                            width // page,
+                            width // page,
+                            total_pages - 2 * (width // page),
+                        ]
+                        self.assertEqual([int(m[3]) for m in messages], expected_pages)
+                        manager = SimpleNamespace(
+                            kv_buffer_tensors={"page_size": page},
+                            enable_all_cp_ranks_for_transfer=False,
+                            kv_shard_size=1,
+                            is_dummy_cp_rank=False,
+                            prepare_send_state_indices=lambda state: state,
+                        )
+                        strategy = strategy_cls(manager, None)
+                        self.assertEqual(strategy.full_chunk_pages, width // page)
+                        sends = []
+                        manager.add_transfer_request = (
+                            lambda room, indices, index_slice, last, **kw: sends.append(
+                                (indices, index_slice, last, kw)
+                            )
+                        )
+                        sender = sender_cls()
+                        sender.kv_mgr, sender.bootstrap_room, sender.curr_idx = (
+                            manager,
+                            7,
+                            0,
+                        )
+                        sender.num_kv_indices, sender.aux_index = total_pages, 9
+                        sender._transfer_num_kv_indices = (
+                            sender._transfer_num_state_indices
+                        ) = 0
+                        sender._transfer_start_time = sender._early_send_wait_event = (
+                            sender.conclude_state
+                        ) = None
+                        sender.trace_ctx = SimpleNamespace(copy_for_thread=lambda: None)
+                        sender.get_max_transfer_tokens = lambda: None
+                        sender.poll = lambda: polls.Transferring
+                        req = SimpleNamespace(
+                            rid="unchunked",
+                            start_send_idx=prefix,
+                            disagg_decode_prefix_len=prefix,
+                            origin_input_ids=range(length),
+                            extend_end=length,
+                            kv=SimpleNamespace(req_pool_idx=0),
+                            disagg_kv_sender=sender,
+                        )
+                        scheduler = scheduler_cls()
+                        scheduler.enable_staging = True
+                        scheduler.token_to_kv_pool_allocator = SimpleNamespace(
+                            page_size=page,
+                            translate_kv_indices_for_transfer=lambda x: x,
+                        )
+                        scheduler.req_to_token_pool = SimpleNamespace(
+                            req_to_token=torch.arange(length).reshape(1, -1)
+                        )
+                        scheduler.disagg_metadata_buffers = SimpleNamespace(
+                            set_buf=lambda r: None
+                        )
+                        scheduler.disagg_prefill_bootstrap_queue = SimpleNamespace(
+                            kv_manager=SimpleNamespace(
+                                kv_args=SimpleNamespace(
+                                    state_types=[state_types.REQUEST_ROW]
+                                )
+                            )
+                        )
+                        scheduler.disagg_prefill_pending_chunk_rids = {req.rid}
+                        scheduler._send_kv_chunk(req, last_chunk=True)
+                        self.assertEqual([len(s[0]) for s in sends], expected_pages)
+                        self.assertEqual([s[2] for s in sends], [False, False, True])
+                        self.assertEqual(
+                            [s[1].start // strategy.full_chunk_pages for s in sends],
+                            [0, 1, 2],
+                        )
+                        for indices, _, last, extra in sends:
+                            self.assertLessEqual(
+                                len(indices) * sum(kv_args.kv_item_lens),
+                                buffers[0].get_size(),
+                            )
+                            self.assertEqual(extra["aux_index"], 9 if last else None)
+                            if last:
+                                np.testing.assert_array_equal(
+                                    extra["state_indices"][0], [0]
+                                )
+                            else:
+                                self.assertIsNone(extra["state_indices"])
+                        np.testing.assert_array_equal(
+                            np.concatenate([s[0] for s in sends]),
+                            np.arange(prefix // page, prefix // page + total_pages),
+                        )
+                        self.assertEqual(req.start_send_idx, length)
+                        self.assertNotIn(
+                            req.rid, scheduler.disagg_prefill_pending_chunk_rids
+                        )
+
     def _native_ring_fixture(self, *, rank=0, pinned=True, capacity=24):
         """Real allocator, wire allocation and scatter handler; CUDA is the boundary."""
         import logging

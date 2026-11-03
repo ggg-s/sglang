@@ -792,18 +792,24 @@ def init_staging_buffers(
     register_fn,
     kv_args,
     count: int,
-    chunked_prefill_size: int,
+    chunked_prefill_size: Optional[int],
     *,
     device_type: str,
 ) -> list:
-    """Create prefill-side staging buffers, each sized to one prefill chunk.
+    """Create prefill-side buffers sized to one page-aligned transport slot.
 
-    Sizing to one chunk (``chunked_prefill_size`` tokens of this rank's KV) means
-    a chunk can never be too large for the buffer.
+    The sender splits transfers on this same grid even when compute chunking
+    is disabled, so an unchunked prompt cannot overflow a staging buffer.
     """
-    from sglang.srt.disaggregation.common.staging_buffer import StagingBuffer
+    from sglang.srt.disaggregation.common.staging_buffer import (
+        StagingBuffer,
+        staging_grid_tokens,
+    )
 
-    full_chunk_pages = max(1, chunked_prefill_size // kv_args.page_size)
+    full_chunk_pages = (
+        staging_grid_tokens(chunked_prefill_size, kv_args.page_size)
+        // kv_args.page_size
+    )
     size_bytes = full_chunk_pages * sum(kv_args.kv_item_lens)
     gpu_id = kv_args.gpu_id
     device = f"{_bare_device_type(device_type)}:{gpu_id}"
@@ -1043,7 +1049,7 @@ def prefetch_staging_reqs(
     room: int,
     transfer_infos: dict,
     kv_buffer_tensors: dict,
-    chunked_prefill_size: int,
+    chunked_prefill_size: Optional[int],
     staging_requested: set,
     prefetch_sockets: dict,
     requester_pp_rank: Optional[int] = None,

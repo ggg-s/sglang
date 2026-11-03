@@ -873,10 +873,24 @@ def resolve_total_kv_heads(
 
 
 def staging_grid_tokens(chunked_prefill_size: Optional[int], page_size: int) -> int:
-    """Token width of one staging grid slot; shared by prefetch and the
-    sender's grid alignment."""
-    cps = chunked_prefill_size or 8192
-    return max(1, cps // page_size) * page_size
+    """Page-aligned transport grid shared by allocation, prefetch and sends.
+
+    Disabling compute chunking (None or a non-positive size) still needs a
+    bounded staging slot. Split the resulting transfer on an 8192-token grid,
+    rounded up to a whole page, without changing the scheduler's chunk size.
+    """
+    if page_size <= 0:
+        raise ValueError(f"Staging page_size must be positive; got {page_size}.")
+    if chunked_prefill_size is None or chunked_prefill_size <= 0:
+        return ((8192 + page_size - 1) // page_size) * page_size
+    if chunked_prefill_size % page_size != 0:
+        raise RuntimeError(
+            "SGLANG_DISAGG_STAGING_BUFFER requires a positive "
+            "chunked_prefill_size to be a multiple of page_size "
+            f"({page_size}); got {chunked_prefill_size}. "
+            "Use a non-positive size to disable compute chunking."
+        )
+    return chunked_prefill_size
 
 
 def compute_grid_segments(
