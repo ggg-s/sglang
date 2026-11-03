@@ -1442,21 +1442,19 @@ class PrefillCudaGraphRunner(BaseCudaGraphRunner):
         dp_flags.capturing_prefill_graph = True
         try:
             with freeze_gc(get_exec().graph.enable_cudagraph_gc):
-                original_stream_idx = get_current_stream_idx()
-                original_pdmux_status = is_pdmux_prefill_enabled()
-                try:
-                    capture_stream = get_or_create_global_graph_capture_stream()
-                    if self.pdmux_split:
+                capture_stream = get_or_create_global_graph_capture_stream()
+                if self.pdmux_split:
+                    original_stream_idx = get_current_stream_idx()
+                    original_pdmux_status = is_pdmux_prefill_enabled()
+                    try:
                         set_current_stream_idx(0)
                         set_pdmux_status(True)
-                        capture_stream = get_stream_groups()[0][0]
-                    with graph_capture(stream=capture_stream) as graph_capture_context:
-                        self.stream = graph_capture_context.stream
-                        with self.backend.capture_session(self.stream):
-                            self._capture_one_stream()
-                finally:
-                    set_pdmux_status(original_pdmux_status)
-                    set_current_stream_idx(original_stream_idx)
+                        self._capture_on_stream(get_stream_groups()[0][0])
+                    finally:
+                        set_pdmux_status(original_pdmux_status)
+                        set_current_stream_idx(original_stream_idx)
+                else:
+                    self._capture_on_stream(capture_stream)
         finally:
             dp_flags.capturing_prefill_graph = False
         if dp_flags.prefill_graph_has_dp_gather:
@@ -1464,6 +1462,12 @@ class PrefillCudaGraphRunner(BaseCudaGraphRunner):
                 "Prefill CUDA graph captured a DP gather/scatter; "
                 "DP ranks will replay a shared MAX_LEN bucket."
             )
+
+    def _capture_on_stream(self, capture_stream) -> None:
+        with graph_capture(stream=capture_stream) as graph_capture_context:
+            self.stream = graph_capture_context.stream
+            with self.backend.capture_session(self.stream):
+                self._capture_one_stream()
 
     def _capture_one_stream(self) -> None:
         avail_mem = get_available_gpu_memory(

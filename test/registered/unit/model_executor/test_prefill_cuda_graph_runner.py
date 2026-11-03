@@ -1,8 +1,9 @@
 """CPU coverage for chunked-prefix Full prefill CUDA-graph state."""
 
 import unittest
+from contextlib import contextmanager, nullcontext
 from types import SimpleNamespace
-from unittest.mock import patch
+from unittest.mock import call, patch
 
 import torch
 
@@ -576,6 +577,113 @@ class TestPrefillCudaGraphRunnerChunkedPrefix(CustomTestCase):
         )
         forward_batch.extend_prefix_lens_cpu = [9, 1]
         self.assertFalse(runner.can_run_graph(forward_batch))
+
+
+@contextmanager
+def _fake_graph_capture(stream=None):
+    yield SimpleNamespace(stream=stream)
+
+
+class TestPrefillCudaGraphCaptureState(CustomTestCase):
+    def _runner(self, *, pdmux_split):
+        runner = PrefillCudaGraphRunner.__new__(PrefillCudaGraphRunner)
+        runner.pdmux_split = pdmux_split
+        runner.warmup = lambda: None
+        runner._capture_one_stream = lambda: None
+        runner.backend = SimpleNamespace(capture_session=lambda _stream: nullcontext())
+        return runner
+
+    def test_capture_without_pdmux_does_not_touch_stream_state(self):
+        """Without PDMux, STREAM_GROUPS is empty; restoring the default stream
+        index then raises "Invalid stream index: 0" during capture."""
+        runner = self._runner(pdmux_split=False)
+        dp_flags = SimpleNamespace(
+            capturing_prefill_graph=False,
+            prefill_graph_has_dp_gather=False,
+        )
+        capture_stream = object()
+
+        with (
+            patch.object(
+                runner_module,
+                "get_flags",
+                return_value=SimpleNamespace(dp=dp_flags),
+            ),
+            patch.object(runner_module, "freeze_gc", lambda _enable: nullcontext()),
+            patch.object(
+                runner_module,
+                "get_exec",
+                return_value=SimpleNamespace(
+                    graph=SimpleNamespace(enable_cudagraph_gc=False)
+                ),
+            ),
+            patch.object(
+                runner_module,
+                "get_or_create_global_graph_capture_stream",
+                return_value=capture_stream,
+            ),
+            patch.object(runner_module, "graph_capture", _fake_graph_capture),
+            patch.object(runner_module, "get_current_stream_idx") as get_idx,
+            patch.object(runner_module, "set_current_stream_idx") as set_idx,
+            patch.object(runner_module, "set_pdmux_status") as set_status,
+        ):
+            runner.capture()
+
+        get_idx.assert_not_called()
+        set_idx.assert_not_called()
+        set_status.assert_not_called()
+        self.assertIs(runner.stream, capture_stream)
+        self.assertFalse(dp_flags.capturing_prefill_graph)
+
+    def test_capture_with_pdmux_restores_stream_and_status(self):
+        runner = self._runner(pdmux_split=True)
+        dp_flags = SimpleNamespace(
+            capturing_prefill_graph=False,
+            prefill_graph_has_dp_gather=False,
+        )
+        groups = [(object(), object()) for _ in range(4)]
+        captured_streams = []
+
+        @contextmanager
+        def record_capture(stream=None):
+            captured_streams.append(stream)
+            yield SimpleNamespace(stream=stream)
+
+        with (
+            patch.object(
+                runner_module,
+                "get_flags",
+                return_value=SimpleNamespace(dp=dp_flags),
+            ),
+            patch.object(runner_module, "freeze_gc", lambda _enable: nullcontext()),
+            patch.object(
+                runner_module,
+                "get_exec",
+                return_value=SimpleNamespace(
+                    graph=SimpleNamespace(enable_cudagraph_gc=False)
+                ),
+            ),
+            patch.object(
+                runner_module,
+                "get_or_create_global_graph_capture_stream",
+                return_value=object(),
+            ),
+            patch.object(runner_module, "get_stream_groups", return_value=groups),
+            patch.object(runner_module, "get_current_stream_idx", return_value=3),
+            patch.object(
+                runner_module, "is_pdmux_prefill_enabled", return_value=False
+            ),
+            patch.object(runner_module, "graph_capture", record_capture),
+            patch.object(runner_module, "set_current_stream_idx") as set_idx,
+            patch.object(runner_module, "set_pdmux_status") as set_status,
+        ):
+            runner.capture()
+
+        self.assertEqual(set_idx.call_args_list, [call(0), call(3)])
+        self.assertEqual(set_status.call_args_list, [call(True), call(False)])
+        self.assertEqual(captured_streams, [groups[0][0]])
+        self.assertIs(runner.stream, groups[0][0])
+        self.assertFalse(dp_flags.capturing_prefill_graph)
 
 
 if __name__ == "__main__":
