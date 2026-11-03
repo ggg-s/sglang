@@ -11,7 +11,12 @@ from dataclasses import dataclass, field
 
 from . import dsv41_remote, prefill_overlap
 from .pre_layerwise import Target as NativeTarget
-from .pre_layerwise import _poll_success, read_json, write_json
+from .pre_layerwise import (
+    _check_transport_failure,
+    _poll_success,
+    read_json,
+    write_json,
+)
 
 
 def groups(schema, group_size):
@@ -161,7 +166,9 @@ def completed(queue, dr):
     handler = queue.staging_handler
     handler.advance_scatter(dr)
     if handler.is_failed(dr):
-        raise RuntimeError("DSV4.1 receive scatter failed; retaining KV")
+        from .transport_failure import TransportFailure
+
+        raise TransportFailure("DSV4.1 receive scatter failed; retaining KV")
     return {i for entries, _, _ in dr._staging_completed_layers for i in entries}
 
 
@@ -217,6 +224,7 @@ class Resource:
 
         if self.parent.closed:
             return True
+        _check_transport_failure(getattr(self.decode_req, "kv_receiver", None))
         if header(self.parent) is not None:
             return self.parent.gpu_ready()
         return self.transport_ready()
@@ -254,6 +262,7 @@ class ProgressiveTarget(NativeTarget):
     def refresh(self):
         if self.closed:
             return
+        _poll_success(self.decode_req.kv_receiver)
         self.rpc.check()
         if self.cache_lease is not None:
             self.cache_lease.check()
@@ -290,16 +299,30 @@ class ProgressiveTarget(NativeTarget):
 
 
 def early_targets(controller, queue, rids_to_check):
+    from .transport_failure import TransportFailure, quarantine
+
     offered = [controller.offer(queue, dr) for dr in queue.queue]
     candidates = []
+    failed = []
     for offer in offered:
         ready = None
-        if offer is not None and (
-            rids_to_check is None or offer.decode_req.req.rid in rids_to_check
-        ):
-            ready = barrier_ready(offer)
+        try:
+            if offer is not None:
+                _poll_success(offer.decode_req.kv_receiver)
+                if rids_to_check is None or offer.decode_req.req.rid in rids_to_check:
+                    ready = barrier_ready(offer)
+            failed.append(0)
+        except TransportFailure:
+            failed.append(1)
         candidates.append(ready)
-    accepted = controller.agree([int(c is not None) for c in candidates])
+    n = len(candidates)
+    votes = controller.agree(
+        [*(1 - x for x in failed), *(int(c is not None) for c in candidates)]
+    )
+    accepted = votes[n:]
+    for offer, healthy in zip(offered, votes[:n]):
+        if offer is not None and not healthy:
+            quarantine(controller, offer, "native receive failed before admission")
     admitted, removed = [], set()
     retirement = controller.decode_overlap.retirement
     for offer, data, take in zip(offered, candidates, accepted):

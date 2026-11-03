@@ -7,7 +7,10 @@ from types import SimpleNamespace
 
 import torch
 
-from sglang.srt.disaggregation.pinned_staging_buffer import PinnedKVStager
+from sglang.srt.disaggregation.pinned_staging_buffer import (
+    PinnedKVStager,
+    StagingTransportError,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -21,6 +24,8 @@ class CorePinnedStager:
         self.lock = threading.Lock()
         self.regions = []
         self.starts = []
+        self.retired = []
+        self.disabled = False
         # A failed TE call may still reference pinned storage after returning.
         owners = getattr(engine, "_core_staging_owners", None)
         if owners is None:
@@ -78,6 +83,23 @@ class CorePinnedStager:
             if not isinstance(device, int)
             else torch.device("cuda", device)
         )
+        if self.disabled:
+            return False
+        if self.buffer is not None and self.buffer.poisoned:
+            # The engine owns each retired stager strongly until process exit.
+            # A failed sync call can leave TCP reads outstanding: never retry,
+            # deregister, close, or reuse that slot based on a peer probe.
+            self.retired.append(self.buffer)
+            self.buffer = None
+            logger.error(
+                "Retiring unsettled Mooncake staging slot (%d/8)", len(self.retired)
+            )
+            if len(self.retired) >= 8:
+                self.disabled = True
+                logger.error(
+                    "Mooncake staging retirement budget exhausted; staged sends fail without changing transport paths"
+                )
+                return False
         if self.buffer is None:
             proxy = SimpleNamespace(
                 engine=self.engine, _remote_attn_send_lock=threading.Lock()
@@ -87,6 +109,7 @@ class CorePinnedStager:
         if self.device != device:
             raise RuntimeError("Mooncake staging device changed")
         self.buffer.reserve(self.capacity)
+        return True
 
     def send(self, blocks, transfer):
         # Worker has waited for the producer event. Serial slot ownership covers
@@ -95,6 +118,12 @@ class CorePinnedStager:
             resolved = [self.resolve(src, length) for src, _, length in blocks]
             if all(t is None for t in resolved):
                 return transfer(blocks)
+            if self.disabled:
+                raise StagingTransportError("staging retirement budget exhausted")
+            # Decide availability before sending any part of a mixed plan.
+            if self.buffer is not None and self.buffer.poisoned:
+                if self._reserve(self.device) is False:
+                    raise StagingTransportError("staging retirement budget exhausted")
             pending = []
             used = 0
 
@@ -123,7 +152,8 @@ class CorePinnedStager:
                     if rc != 0:
                         return rc
                     continue
-                self._reserve(tensor.device)
+                if self._reserve(tensor.device) is False:
+                    raise StagingTransportError("staging retirement budget exhausted")
                 offset = 0
                 while offset < length:
                     n = min(length - offset, self.capacity - used)

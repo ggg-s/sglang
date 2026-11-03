@@ -885,6 +885,10 @@ class Layer:
         return self.parent.gpu_ready()
 
     def transport_ready(self):
+        from .pre_layerwise import _poll_success
+
+        if not self.parent.closed:
+            _poll_success(self.decode_req.kv_receiver)
         return self.parent.closed or update(self.parent).ready(self.entry)
 
     def ready_to_finish(self):

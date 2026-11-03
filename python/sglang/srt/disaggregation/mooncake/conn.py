@@ -991,14 +991,37 @@ class MooncakeKVManager(StagingManagerMixin, CommonKVManager):
         return self._core_stager
 
     def _transfer_data(self, mooncake_session_id, transfer_blocks, *, stage=False):
+        import os
+
         if not transfer_blocks:
             return 0
 
         def transfer(blocks):
-            src_addrs, dst_addrs, lengths = zip(*blocks)
-            return self.engine.batch_transfer_sync(
-                mooncake_session_id, list(src_addrs), list(dst_addrs), list(lengths)
-            )
+            # Limit descriptors, not just bytes/tokens: a fragmented layer group
+            # can overflow TCP lane admission even with a small pinned payload.
+            limit = len(blocks)
+            if os.environ.get("MC_FORCE_TCP") == "1":
+                for name, default in (
+                    ("SGLANG_MOONCAKE_MAX_TRANSFER_BATCH_DESCRIPTORS", 256),
+                    ("MC_TCP_MAX_QUEUED_TRANSFERS_PER_PEER", 8192),
+                    ("MC_TCP_MAX_PENDING_ADMISSIONS_PER_PEER", 8192),
+                ):
+                    configured = int(os.environ.get(name, default))
+                    if configured > 0:
+                        limit = min(
+                            limit,
+                            max(1, configured // 2)
+                            if name.startswith("MC_")
+                            else configured,
+                        )
+            for start in range(0, len(blocks), limit):
+                src_addrs, dst_addrs, lengths = zip(*blocks[start : start + limit])
+                rc = self.engine.batch_transfer_sync(
+                    mooncake_session_id, list(src_addrs), list(dst_addrs), list(lengths)
+                )
+                if rc != 0:
+                    return rc
+            return 0
 
         if self._core_stager is not None and (self._host_staging_all or stage):
             return self._core_stager.send(transfer_blocks, transfer)
@@ -2683,6 +2706,10 @@ class MooncakeKVManager(StagingManagerMixin, CommonKVManager):
         staging_buffer=None,
         worker_index=0,
     ):
+        from sglang.srt.disaggregation.pinned_staging_buffer import (
+            StagingTransportError,
+        )
+
         staging_strategy = None
         reference_reaper = None
         if self.enable_trace:
@@ -3148,6 +3175,20 @@ class MooncakeKVManager(StagingManagerMixin, CommonKVManager):
                     # bookkeeping for a subsequent transfer using the same room.
                     self._staging_outstanding.pop(kv_chunk.room, None)
 
+            except StagingTransportError as e:
+                # Preserve uncertain-write fencing and native request failure /
+                # session recovery; a quarantined slot must not kill the worker.
+                if kv_chunk is None:
+                    raise
+                self._poison_unsettled_send(kv_chunk.room)
+                self.conclude_failure(
+                    bootstrap_room=kv_chunk.room,
+                    failure_reason=f"Staged KV send dropped: {e}",
+                )
+                self._staging_outstanding[kv_chunk.room] -= 1
+                logger.warning(
+                    "Staged KV send dropped for room %s: %s", kv_chunk.room, e
+                )
             except Exception as e:
                 worker_failed = True
                 # NOTE(shangming): Remove this when we make sure the transfer thread is bug-free

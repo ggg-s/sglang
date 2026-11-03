@@ -473,9 +473,24 @@ class DSV41Controller(Controller):
     def early_targets(self, queue, rids_to_check):
         if self.dsv41_remote:
             return dsv41_progressive.early_targets(self, queue, rids_to_check)
+        from .pre_layerwise import _poll_success
+        from .transport_failure import TransportFailure, quarantine
+
+        offered = [self.offer(queue, dr) for dr in queue.queue]
+        failed = []
+        for target in offered:
+            try:
+                if target is not None:
+                    _poll_success(target.decode_req.kv_receiver)
+                failed.append(0)
+            except TransportFailure:
+                failed.append(1)
+        for target, healthy in zip(offered, self.agree([1 - x for x in failed])):
+            if target is not None and not healthy:
+                quarantine(self, target, "native layerwise receive failed")
         # Physical global entries are not dense model layers. Native staging
         # polling supplies the H2D+metadata+TP barrier; never run Target.refresh.
-        return [], [self.offer(queue, dr) for dr in queue.queue]
+        return [], offered
 
     def candidates(self, batch, *, allow_middle=False):
         from sglang.srt.disaggregation.mooncake.conn import MooncakeKVSender
@@ -526,7 +541,6 @@ class DSV41Controller(Controller):
                 mgr = sender.kv_mgr
                 if self.stager is not None and (
                     self.stager is not getattr(mgr, "_core_stager", None)
-                    or self.stager.poisoned
                 ):
                     raise RuntimeError("DSV4.1 host staging unavailable; retaining KV")
                 from .pd_mesh import source_root

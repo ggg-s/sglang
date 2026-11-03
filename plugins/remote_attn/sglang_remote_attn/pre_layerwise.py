@@ -156,10 +156,19 @@ def _poll_success(receiver):
 
     poll = receiver.poll()
     if poll == KVPoll.Failed:
-        raise RuntimeError(
+        from .transport_failure import TransportFailure
+
+        raise TransportFailure(
             "pre-layerwise transport failed; KV reuse is not proven safe"
         )
     return poll == KVPoll.Success
+
+
+def _check_transport_failure(receiver):
+    # Advisory failure check, including partially constructed/cleared offers.
+    # This never supplies the positive completion proof required for retirement.
+    if receiver is not None and hasattr(receiver, "poll"):
+        _poll_success(receiver)
 
 
 @dataclass
@@ -281,6 +290,11 @@ class Source:
                             peer, sender.aux_index, registration.dst_aux_ptrs
                         )
                         if rc != 0:
+                            sender.kv_mgr._poison_unsettled_send(sender.bootstrap_room)
+                            sender.kv_mgr.conclude_failure(
+                                bootstrap_room=sender.bootstrap_room,
+                                failure_reason=f"early metadata transfer failed: {rc}",
+                            )
                             raise RuntimeError(f"early metadata transfer failed: {rc}")
                 write_json(
                     self.path / "ready.json",
@@ -311,12 +325,13 @@ class Source:
     def poll(self):
         if self.released:
             return True
+        # Observe native failure before a pending range callback can mask it.
+        native_complete = _poll_success(self.req.disagg_kv_sender)
         stream = getattr(self, "prefix_stream", None)
         if stream is not None:
             stream.check()
         if stream is not None and not self.finalized:
             return stream.aborted and self.release is not None and stream.drained()
-        native_complete = _poll_success(self.req.disagg_kv_sender)
         if self.error:
             raise RuntimeError(f"pre-layerwise source failed: {self.error}")
         if time.monotonic() - self.created_at > self.owner.config.drain_timeout:
@@ -418,6 +433,7 @@ class Target:
     def refresh(self):
         if self.closed:
             return
+        _check_transport_failure(getattr(self.decode_req, "kv_receiver", None))
         if self.cache_lease is not None:
             self.cache_lease.check()
         from .prefix_stream import update
@@ -429,7 +445,11 @@ class Target:
             handler = self.queue.staging_handler
             handler.advance_scatter(self.decode_req)
             if handler.is_failed(self.decode_req):
-                raise RuntimeError("native scatter failed; retaining destination KV")
+                from .transport_failure import TransportFailure
+
+                raise TransportFailure(
+                    "native scatter failed; retaining destination KV"
+                )
             for layers, start, pages in self.decode_req._staging_completed_layers:
                 if self.decode_prefix_len + start + pages != self.coverage.prefix_len:
                     raise RuntimeError(
@@ -736,7 +756,9 @@ class Controller:
             dr.req._pre_layerwise_native_target = target
             # An ordinary small request can already have concluded before its
             # first offer. Registration must not lose that terminal notification.
-            if _poll_success(dr.kv_receiver):
+            from sglang.srt.disaggregation.base.conn import KVPoll
+
+            if dr.kv_receiver.poll() == KVPoll.Success:
                 queue.staging_handler.submit_last_scatter_async(dr.req.bootstrap_room)
         write_json(
             root / "offer.json",
@@ -985,6 +1007,8 @@ class Controller:
             fb.forward_mode = old_mode
 
     def retire_targets(self):
+        from .transport_failure import TransportFailure, quarantine
+
         if not self.targets:
             return
         overlap = getattr(self, "decode_overlap", None)
@@ -992,16 +1016,26 @@ class Controller:
             overlap.retirement.observe()
             return
         targets = list(self.targets)
-        finished = [
-            int(target.closed or target.ready_to_finish()) for target in targets
-        ]
+        finished, healthy = [], []
+        for target in targets:
+            try:
+                finished.append(int(target.closed or target.ready_to_finish()))
+                healthy.append(1)
+            except TransportFailure:
+                finished.append(0)
+                healthy.append(0)
         # Cancellation/result processing may reach ranks at different times.
         # Retire only if all ranks have queued release, or none has: no rank
         # may free a row while its peer retains the corresponding request.
         n = len(targets)
         release = [int(target.release is not None) for target in targets]
-        votes = self.agree(finished + release + [1 - value for value in release])
+        votes = self.agree(
+            finished + release + [1 - value for value in release] + healthy
+        )
         for i, target in enumerate(targets):
+            if not votes[3 * n + i]:
+                quarantine(self, target, "native receive failed")
+                continue
             if votes[i] and (votes[n + i] or votes[2 * n + i]):
                 target.finish(wait=False)
                 self.targets.remove(target)
@@ -1038,6 +1072,7 @@ class Controller:
 
     def early_targets(self, queue, rids_to_check):
         from .prefix_stream import header as range_header
+        from .transport_failure import TransportFailure, quarantine
 
         # Retired receivers are not in queue.queue but still own metadata and
         # prefix writes. Reap them before considering new admissions.
@@ -1045,9 +1080,16 @@ class Controller:
             self.retire_targets()
         offered = [self.offer(queue, dr) for dr in queue.queue]
         candidates = []
+        failed = []
         for target in offered:
-            if target is not None:
-                target.refresh()
+            try:
+                if target is not None:
+                    target.refresh()
+            except TransportFailure:
+                failed.append(1)
+                candidates.append(None)
+                continue
+            failed.append(0)
             ready = None
             if target is not None and self.config.mode == "remote":
                 data = read_json(target.path / "ready.json")
@@ -1072,7 +1114,14 @@ class Controller:
                 ):
                     ready = data
             candidates.append(ready)
-        accepted = self.agree([int(c is not None) for c in candidates])
+        n = len(candidates)
+        votes = self.agree(
+            [*(1 - x for x in failed), *(int(c is not None) for c in candidates)]
+        )
+        accepted = votes[n:]
+        for target, healthy in zip(offered, votes[:n]):
+            if target is not None and not healthy:
+                quarantine(self, target, "native receive failed")
         admitted = []
         removed = set()
         for target, ready, take in zip(offered, candidates, accepted):
@@ -1145,6 +1194,8 @@ class Controller:
         # queue, with its original KVPoll state and KV ownership intact.
         from sglang.srt.managers.schedule_batch import FINISH_LENGTH
 
+        from .transport_failure import TransportFailure, quarantine
+
         sources = list(self.sources)
         ready = [
             int(
@@ -1155,6 +1206,7 @@ class Controller:
             for src in sources
         ]
         retired = []
+        failed = []
         prefix_error = False
         for src, respond in zip(sources, self.agree(ready)):
             if respond:
@@ -1167,7 +1219,13 @@ class Controller:
                 src.responded = True
             try:
                 complete = src.poll()
+                failed.append(0)
+            except TransportFailure:
+                failed.append(1)
+                retired.append(0)
+                continue
             except Exception as exc:
+                failed.append(0)
                 stream = getattr(src, "prefix_stream", None)
                 if stream is None:
                     raise
@@ -1186,12 +1244,18 @@ class Controller:
             retired.append(int(complete))
         # Do not change the collective's vector size independently by rank.
         if any(getattr(src, "prefix_stream", None) is not None for src in sources):
-            votes = self.agree([int(not prefix_error), *retired])
+            votes = self.agree(
+                [int(not prefix_error), *(1 - x for x in failed), *retired]
+            )
             if not votes[0]:
                 raise RuntimeError("prefix source proof failed across TP; retaining KV")
-            retired = votes[1:]
+            healthy, retired = votes[1 : 1 + len(sources)], votes[1 + len(sources) :]
         else:
-            retired = self.agree(retired)
+            votes = self.agree([*(1 - x for x in failed), *retired])
+            healthy, retired = votes[: len(sources)], votes[len(sources) :]
+        for src, ok in zip(sources, healthy):
+            if not ok:
+                quarantine(self, src, "native send failed")
         for src, retire in zip(sources, retired):
             if retire:
                 src.retire()
@@ -1328,6 +1392,20 @@ def pop_transferred(original, queue, rids_to_check=None):
 
 
 def defer_release(req, release, *, checkpoint=None):
+    from .transport_failure import TransportFailure, hold_release, retain_release
+
+    if hold_release(req, release):
+        return True
+    source = getattr(req, "_pre_layerwise_source", None)
+    sender = getattr(req, "disagg_kv_sender", None)
+    if sender is not None and (
+        source is not None or getattr(req, "_dsv41_p_lease", None) is not None
+    ):
+        try:
+            _check_transport_failure(sender)
+        except TransportFailure:
+            retain_release(req, source or req._dsv41_p_lease, release)
+            return True
     from .dsv41_remote import release as release_remote
 
     release_remote(req)
@@ -1338,10 +1416,7 @@ def defer_release(req, release, *, checkpoint=None):
     if cert is not None:
         cert.admission.retired(req)
     source = getattr(req, "_pre_layerwise_source", None)
-    if source is not None and (
-        source.error is not None
-        or (source.stager is not None and source.stager.poisoned)
-    ):
+    if source is not None and source.error is not None:
         raise RuntimeError("pre-layerwise staging is unsettled; retaining source KV")
     lease = getattr(source, "cache_lease", None)
     stream = getattr(source, "prefix_stream", None)
@@ -1413,6 +1488,7 @@ def is_fully_idle(original, scheduler, for_health_check=False, ignore_waiting=Fa
         and (
             controller.sources
             or controller.targets
+            or bool(getattr(controller, "transport_quarantine", None))
             or bool(getattr(getattr(controller, "prefill_overlap", None), "leases", []))
         )
     ):

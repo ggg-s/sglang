@@ -150,6 +150,8 @@ class Retirement:
         self.reports.setdefault(index, {})[rank] = notice
 
     def observe(self):
+        from .transport_failure import TransportFailure
+
         # Empty Local does not query events, touch sockets, or enter a collective.
         for target in self.owner.targets:
             entry = self.registered.get(target.admission_id)
@@ -158,6 +160,7 @@ class Retirement:
                     "progressive target lacks ordered retirement registration"
                 )
             error = cache = None
+            transport_failure = False
             try:
                 gpu_ready = target.gpu_ready()  # Advisory; never retires KV.
                 ready = target.transport_ready()
@@ -166,9 +169,10 @@ class Retirement:
                     continue
             except Exception as exc:
                 error, ready = f"{type(exc).__name__}: {str(exc)[:256]}", True
+                transport_failure = isinstance(exc, TransportFailure)
             if not ready:
                 continue
-            state = (target.release is not None, error, cache)
+            state = (target.release is not None, error, cache, transport_failure)
             index = target.admission_id
             if self.sent.get(index) == state:
                 continue
@@ -183,6 +187,7 @@ class Retirement:
                     "release": state[0],
                     "error": error,
                     "cache": state[2],
+                    "transport_failure": state[3],
                     "version": self.revisions[index],
                 }
                 self.outbox[index] = (state, notice)
@@ -219,6 +224,22 @@ class Retirement:
         for index, target in self._active().items():
             reports = self.reports.get(index, {})
             failed = any(n.get("error") for n in reports.values())
+            if failed and all(
+                not n.get("error") or n.get("transport_failure")
+                for n in reports.values()
+            ):
+                return self._command(
+                    [
+                        {
+                            **self.identity(target),
+                            "generations": [
+                                reports[r]["generation"] if r in reports else None
+                                for r in range(self.size)
+                            ],
+                        }
+                    ],
+                    "quarantine",
+                )
             if not failed and (
                 len(reports) != self.size
                 or len({n["release"] for n in reports.values()}) != 1
@@ -270,7 +291,7 @@ class Retirement:
             and command.get("epoch") == self.epoch
             and type(command.get("seq")) is int
             and command["seq"] == self.last_seq + 1
-            and command.get("kind") in ("retire", "drain", "abort")
+            and command.get("kind") in ("retire", "drain", "abort", "quarantine")
             and bool(entries)
             and not self.arm_error
         )
@@ -301,7 +322,7 @@ class Retirement:
                             and len(generations) == self.size
                             and (
                                 generations[self.rank] == entry[2]
-                                or command.get("kind") == "abort"
+                                or command.get("kind") in ("abort", "quarantine")
                             )
                         )
                     )
@@ -312,7 +333,9 @@ class Retirement:
             local_ready = False
             if valid:
                 try:
-                    local_ready = target.ready_to_finish()
+                    local_ready = (
+                        command.get("kind") == "quarantine" or target.ready_to_finish()
+                    )
                     while wait and not local_ready:
                         if time.monotonic() >= deadline:
                             raise RuntimeError("D GPU/PD lifetime did not drain")
@@ -321,9 +344,10 @@ class Retirement:
                     # A checkpoint/ABORT may have changed since the ordered
                     # proposal. Consume it but wait for a new state edge; never
                     # publish different radix ownership on different ranks.
-                    local_ready = local_ready and cache_intent(target) == item.get(
-                        "cache"
-                    )
+                    if command.get("kind") != "quarantine":
+                        local_ready = local_ready and cache_intent(target) == item.get(
+                            "cache"
+                        )
                 except Exception:
                     error_free = False
             ready.append(int(local_ready))
@@ -349,6 +373,16 @@ class Retirement:
             raise RuntimeError(
                 "ordered D retirement validation failed; proof unproven, retaining KV"
             )
+        if command["kind"] == "quarantine":
+            from .transport_failure import quarantine, request_of
+
+            for target in selected:
+                req = request_of(target)
+                quarantine(self.owner, target, "TP-agreed transport failure")
+                for index, entry in list(self.registered.items()):
+                    if request_of(entry[0]) is req:
+                        self.registered.pop(index)
+            return
         n = len(entries)
         accepted = all(
             votes[2 + i] and (votes[2 + n + i] or votes[2 + 2 * n + i])

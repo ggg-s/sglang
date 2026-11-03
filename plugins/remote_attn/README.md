@@ -76,6 +76,12 @@ require the **scatter** event to complete. Set the receive flag to `0` for the
 GPU-ring control. There is no separate receive journal handshake or group ACK.
 The [P5.19 guide](P5.19-PRE-LAYERWISE-ZH.md) details fixed host/GPU ring memory costs
 and the receiver GPU probe.
+TCP admission now bounds descriptor batches. An uncertain send retains its slot;
+later sends use fresh storage, with at most eight retired slots. Exhaustion fails
+staged requests without switching to GPU source addresses. A TP-agreed transport
+failure quarantines only the affected request; the configured mode stays unchanged.
+Unknown writes are not retried or treated as completed by a successful peer probe.
+See [failure isolation and validation](validation/STAGING-FAILURE-RECOVERY-ZH.md).
 The [functional parity checklist](FUNCTIONAL-PARITY.md) maps the supplied
 P0–P5.18 features to this port and distinguishes code coverage from deployment acceptance.
 

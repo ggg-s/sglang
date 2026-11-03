@@ -13,6 +13,10 @@ import threading
 logger = logging.getLogger(__name__)
 
 
+class StagingTransportError(RuntimeError):
+    """A request's staging storage cannot be reused; not a worker failure."""
+
+
 class CudaPinnedSlot:
     """One pinned allocation and an explicitly nonblocking copy stream."""
 
@@ -116,7 +120,9 @@ class PinnedKVStager:
 
     def _check_live(self):
         if self.poisoned or self.closed:
-            raise RuntimeError("pre-layerwise staging is quarantined or closed")
+            raise StagingTransportError(
+                "pre-layerwise staging is quarantined or closed"
+            )
 
     def _release_slot(self):
         if self.slot is not None:
@@ -166,13 +172,19 @@ class PinnedKVStager:
                 offset += length
             try:
                 self.slot.copy(blocks, ready_event)
+            except Exception:
+                # CUDA failures retain the existing fatal path; a sticky device
+                # error must not be disguised as a recoverable network failure.
+                self.poisoned = True
+                raise
+            try:
                 # Keep the existing send-lock hook and the same TE/session.
                 rc = self.manager._transfer_data(session, host_blocks)
-            except Exception:
+            except Exception as exc:
                 # Copies or writes may still reference storage. Do not free it,
                 # unregister it, or fall back to a second GPU-pointer send.
                 self.poisoned = True
-                raise
+                raise StagingTransportError("staged KV copy/transport failed") from exc
             if rc != 0:
                 self.poisoned = True
             return rc

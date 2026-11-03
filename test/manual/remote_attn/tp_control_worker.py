@@ -1129,7 +1129,7 @@ def prefill_certificate_lifetimes(args, *, prefix_cache=False):
 
 
 def prefill_staging_failure(args):
-    """An asymmetric poisoned slot must reach the same ordered abort vote."""
+    """An asymmetric transport failure is isolated by one shared quarantine vote."""
     import time
 
     from sglang_remote_attn.pre_layerwise import Config, Controller
@@ -1138,13 +1138,24 @@ def prefill_staging_failure(args):
 
     owner = Controller.__new__(Controller)
     owner.rank, owner.tp_size = args.rank, 2
-    owner.scheduler = SimpleNamespace(attn_tp_cpu_group=dist.group.WORLD)
+    outputs = []
+    owner.scheduler = SimpleNamespace(
+        attn_tp_cpu_group=dist.group.WORLD,
+        output_streamer=SimpleNamespace(
+            stream_output=lambda *args: outputs.append(args)
+        ),
+    )
     owner.config = Config("layerwise", Path(args.output).with_suffix(".staging"))
     slot = SimpleNamespace(poisoned=False)
     manager = SimpleNamespace(_dsv41_host_stager=slot)
     chunk = SimpleNamespace(
-        req=SimpleNamespace(rid="staged", bootstrap_room=501),
-        sender=SimpleNamespace(kv_mgr=manager),
+        req=SimpleNamespace(
+            rid="staged",
+            bootstrap_room=501,
+            return_logprob=False,
+            finished=lambda: False,
+        ),
+        sender=SimpleNamespace(kv_mgr=manager, poll=lambda: 0 if slot.poisoned else 3),
         check=lambda: None,
     )
     lease = SourceLease(None, chunk, 1, f"stage-{args.rank}")
@@ -1161,7 +1172,20 @@ def prefill_staging_failure(args):
         return actual_reduce(tensor, *a, **kw)
 
     try:
-        with patch.object(dist, "all_reduce", counted):
+        with (
+            patch.object(dist, "all_reduce", counted),
+            patch.dict(
+                sys.modules,
+                {
+                    "sglang.srt.disaggregation.base.conn": SimpleNamespace(
+                        KVPoll=SimpleNamespace(Success=4, Failed=0)
+                    ),
+                    "sglang.srt.disaggregation.utils": SimpleNamespace(
+                        prepare_abort=lambda req, reason, status_code: None
+                    ),
+                },
+            ),
+        ):
             for _ in range(32):
                 protocol.observe()
                 assert protocol.poll_command() is None
@@ -1178,15 +1202,12 @@ def prefill_staging_failure(args):
                     command = message[0]
                     break
                 time.sleep(0.005)
-            assert command is not None and command["kind"] == "abort"
+            assert command is not None and command["kind"] == "quarantine"
             protocol.arm(command)
-            rejected = False
-            try:
-                protocol.finalize()
-            except RuntimeError as exc:
-                rejected = "retaining KV" in str(exc)
-            assert rejected and votes == [5]
-            assert owner.targets == [lease] and not lease.closed
+            protocol.finalize()
+            assert votes == [5]
+            assert owner.targets == [] and not lease.closed
+            assert len(owner.transport_quarantine) == 1 and len(outputs) == 1
             assert lease.ledger.pending == {1}
             return dict(
                 stable_votes=0,

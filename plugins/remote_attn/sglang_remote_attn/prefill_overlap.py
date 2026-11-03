@@ -14,7 +14,7 @@ from dataclasses import dataclass, field
 from types import SimpleNamespace
 
 from .decode_overlap import BatchProof
-from .pre_layerwise import _poll_success, write_json
+from .pre_layerwise import _check_transport_failure, _poll_success, write_json
 from .retirement import Retirement, wrap_receiver
 
 logger = logging.getLogger(__name__)
@@ -104,6 +104,8 @@ class SourceLease:
                 )
 
     def gpu_ready(self):
+        if not self.cancelling:
+            _check_transport_failure(self.chunk.sender)
         self.check()
         for plan in self.plans:
             # Aborted outputs are discarded by the native path. Delayed
@@ -126,10 +128,11 @@ class SourceLease:
         # Failed TE sends leave their completion callbacks pending. Observe the
         # rank-owned slot here (including middle chunks with no Source yet),
         # inside the ordered retirement protocol, before the pending fast exit.
-        stager = getattr(self.chunk.sender.kv_mgr, "_dsv41_host_stager", None)
-        if stager is not None and stager.poisoned:
-            raise RuntimeError("P host staging failed; retaining KV and pinned slot")
-        if getattr(self.chunk.sender.kv_mgr, "_dsv41_receive_sender_ready", False):
+        if not self.cancelling:
+            _check_transport_failure(self.chunk.sender)
+        if not self.cancelling and getattr(
+            self.chunk.sender.kv_mgr, "_dsv41_receive_sender_ready", False
+        ):
             # An oversized/lost receive allocation can fail native PD without
             # poisoning P's optional D2H slot. Observe failure before pending
             # successful callbacks can mask it indefinitely. No collective.
@@ -200,6 +203,7 @@ class SourceLease:
 class SourceOwner:
     def __init__(self, overlap):
         controller = overlap.controller
+        self.controller = controller
         self.scheduler, self.config = controller.scheduler, controller.config
         self.rank, self.tp_size = controller.rank, controller.tp_size
         self.targets = overlap.leases
@@ -573,6 +577,8 @@ def after_sample(original, scheduler, *args, **kwargs):
 
 
 def before_mutation(original, scheduler, req, *args, **kwargs):
+    if getattr(req, "_remote_attn_transport_quarantine", None) is not None:
+        return original(scheduler, req, *args, **kwargs)
     lease = getattr(req, "_dsv41_p_lease", None)
     if lease is not None:
         lease.overlap.drain(req)

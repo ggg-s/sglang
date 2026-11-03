@@ -1,0 +1,21 @@
+{
+  "gpu": "NVIDIA GeForce RTX 4060 Laptop GPU",
+  "torch": "2.13.0+cu130",
+  "transport": "Mooncake TCP",
+  "queue_limit": 8,
+  "input_descriptors": 2048,
+  "bounded_calls": 512,
+  "max_descriptors": 4,
+  "injected_failures": 8,
+  "retired_slots": 8,
+  "retired_bytes": 524288,
+  "retained_bytes_unchanged": true,
+  "budget_rejected_without_send": true,
+  "exact_data_match": true,
+  "source_sha256": {
+    "python/sglang/srt/disaggregation/pinned_staging_buffer.py": "dc484b3d66bba9c3ab5403331c14ad78e619b07408289814f63cc0276cbb61df",
+    "python/sglang/srt/disaggregation/mooncake/pinned_staging_core.py": "88853d9ec526774e5405c21747ea666a75e455be4d29caba7ac01eb943745e59",
+    "python/sglang/srt/disaggregation/mooncake/conn.py": "899655b016b336973a55b59c4124bfac2669b32bf556deb8b0899a789fb4b5f9",
+    "test/manual/remote_attn/staging_recovery_cuda_probe.py": "2c195dd58cb9d831d94ac5d0eecce104c2a40f3235c67fd154254f7b3658d3e8"
+  }
+}

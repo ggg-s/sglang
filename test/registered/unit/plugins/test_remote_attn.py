@@ -168,6 +168,16 @@ class TestRemoteAttn(CustomTestCase):
         cls.compat = importlib.import_module("sglang_remote_attn.compat")
         cls.check = importlib.import_module("sglang_remote_attn.check")
         cls.interfaces = importlib.import_module("sglang_remote_attn.interfaces")
+        cls.stack.enter_context(
+            patch.dict(
+                sys.modules,
+                {
+                    "sglang.srt.disaggregation.base.conn": SimpleNamespace(
+                        KVPoll=_source_class("disaggregation/base/conn.py", "KVPoll")
+                    )
+                },
+            )
+        )
         cls.Kv = _source_class("managers/schedule_batch.py", "ReqKvInfo")
         cls.Pool = _source_class(
             "mem_cache/memory_pool.py",
@@ -5854,6 +5864,7 @@ class TestRemoteAttn(CustomTestCase):
             "failed_peer",
             "cancelled",
             "short_destination",
+            "transport_error",
         ):
             with self.subTest(outcome=outcome):
                 events = []
@@ -5893,6 +5904,7 @@ class TestRemoteAttn(CustomTestCase):
                     manager.request_status.update({bootstrap_room: polls.Failed})
                 )
                 manager.poison_deferred_ack_room = lambda room: None
+                manager._poison_unsettled_send = lambda room: events.append("uncertain")
                 manager.decode_kv_args_table = {
                     session: SimpleNamespace(
                         requires_dcp_relayout=False,
@@ -5917,7 +5929,16 @@ class TestRemoteAttn(CustomTestCase):
                     }
                 }
 
+                dropped = []
+
                 def send(session, *args, **kwargs):
+                    if outcome == "transport_error" and not dropped:
+                        from sglang.srt.disaggregation.pinned_staging_buffer import (
+                            StagingTransportError,
+                        )
+
+                        dropped.append(True)
+                        raise StagingTransportError("injected TCP failure")
                     if outcome == "staged_success":
                         self.assertIsInstance(kwargs["transfer_fn"], functools.partial)
                     else:
@@ -5954,6 +5975,13 @@ class TestRemoteAttn(CustomTestCase):
                     )
                 tasks = queue.Queue()
                 tasks.put(chunk)
+                if outcome == "transport_error":
+                    manager.request_status[8] = polls.Transferring
+                    manager.transfer_infos[8] = manager.transfer_infos[7]
+                    healthy = copy.copy(chunk)
+                    healthy.room, healthy.staging_counted = 8, False
+                    healthy.on_complete = lambda: events.append("healthy-proof")
+                    tasks.put(healthy)
                 del chunk
                 tasks.put(None)
                 try:
@@ -5974,6 +6002,179 @@ class TestRemoteAttn(CustomTestCase):
                     self.assertEqual(events, ["gpu-ready", "a", "b", "proof"])
                 else:
                     self.assertNotIn("proof", events)
+                if outcome == "transport_error":
+                    self.assertEqual(manager.request_status[7], polls.Failed)
+                    self.assertEqual(manager.request_status[8], polls.Transferring)
+                    self.assertIn("healthy-proof", events)
+                    self.assertEqual(manager._staging_outstanding[7], 0)
+                    self.assertTrue(tasks.empty())
+
+    def test_staging_recovery_retains_failed_slots_and_rejects_exhausted_budget(self):
+        from sglang.srt.disaggregation import pinned_staging_buffer as pinned
+
+        spec = importlib.util.spec_from_file_location(
+            "recovery_core",
+            ROOT / "python/sglang/srt/disaggregation/mooncake/pinned_staging_core.py",
+        )
+        module = importlib.util.module_from_spec(spec)
+        spec.loader.exec_module(module)
+        manager = _host_staging_manager()
+        stager = module.CorePinnedStager(manager.engine, capacity=8)
+        stager.resolve = lambda *a: SimpleNamespace(device=torch.device("cuda:0"))
+        source, destination = (
+            ctypes.create_string_buffer(4),
+            ctypes.create_string_buffer(4),
+        )
+        blocks = [(ctypes.addressof(source), ctypes.addressof(destination), 4)]
+        host = ctypes.create_string_buffer(b"H")
+        mixed = [
+            (ctypes.addressof(host), ctypes.addressof(destination), 1),
+            (ctypes.addressof(source), ctypes.addressof(destination) + 1, 3),
+        ]
+        retired, calls = [], []
+
+        def healthy(plan):
+            calls.append(list(plan))
+            for src, dst, n in plan:
+                ctypes.memmove(dst, src, n)
+            return 0
+
+        factory = functools.partial(
+            pinned.PinnedKVStager, slot_factory=_HostStagingSlot
+        )
+        with patch.object(module, "PinnedKVStager", factory):
+            for index in range(8):
+                source.raw = index.to_bytes(4, "little")
+                attempts = []
+                self.assertEqual(
+                    stager.send(blocks, lambda plan: attempts.append(list(plan)) or -1),
+                    -1,
+                )
+                self.assertEqual(len(attempts), 1)  # Unknown writes are never retried.
+                old = stager.buffer.slot
+                retired.append((old, source.raw))
+                source.raw = b"next"
+                if index == 7:
+                    stager.resolve = lambda addr, n: (
+                        None
+                        if addr == ctypes.addressof(host)
+                        else SimpleNamespace(device=torch.device("cuda:0"))
+                    )
+                if index == 7:
+                    with self.assertRaisesRegex(
+                        pinned.StagingTransportError, "budget exhausted"
+                    ):
+                        stager.send(mixed, healthy)
+                else:
+                    self.assertEqual(stager.send(blocks, healthy), 0)
+                    self.assertEqual(destination.raw, b"next")
+                for slot, content in retired:
+                    self.assertFalse(slot.closed)
+                    self.assertEqual(ctypes.string_at(slot.ptr, 4), content)
+            self.assertTrue(stager.disabled)
+            self.assertEqual(len(stager.retired), 8)
+            self.assertEqual(len(manager.engine._pre_layerwise_staging_owners), 8)
+            self.assertEqual(len(manager.registrations), 8)
+            self.assertEqual(len(calls), 7)  # No host prefix or GPU-pointer fallback.
+            with self.assertRaisesRegex(
+                pinned.StagingTransportError, "budget exhausted"
+            ):
+                stager.send(blocks, healthy)
+            self.assertEqual(len(calls), 7)
+            self.assertEqual(len(manager.engine._pre_layerwise_staging_owners), 8)
+
+    def test_tcp_descriptor_admission_is_bounded_and_failure_stops_tail(self):
+        cls = _source_class(
+            "disaggregation/mooncake/conn.py", "MooncakeKVManager", {"_transfer_data"}
+        )
+        manager = cls()
+        manager._core_stager, manager._host_staging_all = None, False
+        plans = []
+        manager.engine = SimpleNamespace(
+            batch_transfer_sync=lambda peer, src, dst, n: (
+                plans.append(list(zip(src, dst, n))) or 0
+            )
+        )
+        blocks = [(i * 8, 1000 + i * 8, 8) for i in range(11)]
+        with patch.dict(
+            os.environ,
+            MC_FORCE_TCP="1",
+            MC_TCP_MAX_QUEUED_TRANSFERS_PER_PEER="8",
+            MC_TCP_MAX_PENDING_ADMISSIONS_PER_PEER="16",
+        ):
+            self.assertEqual(manager._transfer_data("peer", blocks), 0)
+            self.assertEqual([len(p) for p in plans], [4, 4, 3])
+            self.assertEqual(sum(plans, []), blocks)
+            plans.clear()
+            manager.engine.batch_transfer_sync = lambda peer, src, dst, n: (
+                plans.append(list(zip(src, dst, n))) or (-1 if len(plans) == 2 else 0)
+            )
+            self.assertEqual(manager._transfer_data("peer", blocks), -1)
+            self.assertEqual([len(p) for p in plans], [4, 4])
+
+    def test_drained_cancel_is_not_classified_as_transport_failure(self):
+        from sglang_remote_attn.prefill_overlap import SourceLease
+
+        chunk = SimpleNamespace(
+            req=SimpleNamespace(),
+            check=lambda: None,
+            sender=SimpleNamespace(kv_mgr=SimpleNamespace(), poll=lambda: 0),
+        )
+        lease = SourceLease(None, chunk, 1, "cancel", cancelling=True)
+        lease.ledger.pending.add(1)
+        self.assertFalse(lease.transport_ready())
+        lease.ledger.pending.clear()
+        self.assertTrue(lease.transport_ready())
+
+    def test_ordered_transport_failure_isolates_request_without_free_or_local_switch(
+        self,
+    ):
+        from sglang_remote_attn.transport_failure import hold_release
+
+        with tempfile.TemporaryDirectory() as directory:
+            req = SimpleNamespace(
+                rid="bad",
+                bootstrap_room=7,
+                return_logprob=False,
+                finished=lambda: False,
+            )
+            owner, target, freed = self._overlap_target(directory, req)
+            target.queue.queue = [target.decode_req]
+            outputs = []
+            owner.scheduler.output_streamer = SimpleNamespace(
+                stream_output=lambda *args: outputs.append(args)
+            )
+            receiver = target.decode_req.kv_receiver
+            receiver.poll = lambda: 0
+            healthy = copy.copy(target)
+            healthy.decode_req = SimpleNamespace(
+                req=SimpleNamespace(rid="good", bootstrap_room=8)
+            )
+            healthy.admission_id, healthy.generation = 2, "healthy"
+            healthy.gpu_ready = healthy.transport_ready = lambda: False
+            owner.targets.append(healthy)
+            owner.decode_overlap.retirement.register(healthy)
+            utils = SimpleNamespace(
+                prepare_abort=lambda req, reason, status_code: setattr(
+                    req, "finished_reason", (reason, status_code)
+                )
+            )
+            with patch.dict(sys.modules, {"sglang.srt.disaggregation.utils": utils}):
+                command = self._retire_step(owner)
+            self.assertEqual(command["kind"], "quarantine")
+            self.assertEqual(owner.targets, [healthy])
+            self.assertFalse(target.closed)
+            self.assertEqual(freed, [])
+            self.assertIs(target.decode_req.kv_receiver, receiver)
+            self.assertEqual(target.queue.queue, [])
+            self.assertEqual(req.finished_reason[1], 503)
+            self.assertEqual(len(outputs), 1)
+            self.assertTrue(hold_release(req, lambda: freed.append("unsafe")))
+            self.assertEqual(freed, [])
+            self.assertEqual(len(owner.transport_quarantine), 1)
+            self.assertIsNone(owner.decode_overlap.retirement.poll_command())
+            self.assertFalse(hasattr(owner, "transport_degraded"))
+            self.assertEqual(owner.config.mode, "remote")
 
     def test_prelayer_reaper_bounds_pending_destructors(self):
         """A blocked destructor cannot create an unbounded overflow or inline free."""
@@ -6498,7 +6699,9 @@ class TestRemoteAttn(CustomTestCase):
                     stager.reserve(16)
                 pl = self.hooks.pre_layerwise
                 req = SimpleNamespace(
-                    _pre_layerwise_source=SimpleNamespace(stager=stager, error=None)
+                    _pre_layerwise_source=SimpleNamespace(
+                        stager=stager, error="unproven copy"
+                    )
                 )
                 with self.assertRaisesRegex(RuntimeError, "retaining source KV"):
                     pl.defer_release(req, lambda: self.fail("unsafe KV release"))
@@ -10560,16 +10763,19 @@ class TestRemoteAttn(CustomTestCase):
         self.assertFalse(stager.close())
         self.assertIn(stager, stager.engine._core_staging_owners)
         with patch.dict(sys.modules, f.modules):
-            with self.assertRaisesRegex(RuntimeError, "unavailable"):
-                f.controller.candidates(f.batch, allow_middle=True)
+            self.assertEqual(
+                len(f.controller.candidates(f.batch, allow_middle=True)),
+                len(f.batch.reqs),
+            )
         from sglang_remote_attn.prefill_overlap import SourceLease
 
         lease = SourceLease.__new__(SourceLease)
         lease.check = lambda: None
         lease.chunk = SimpleNamespace(sender=f.sender, req=SimpleNamespace())
+        f.sender.poll = lambda: 0
         # Poison is observed before the outstanding-IO early exit; this method
         # is polled by ordered TP retirement, not by rank-local KV free hooks.
-        with self.assertRaisesRegex(RuntimeError, "retaining KV and pinned slot"):
+        with self.assertRaisesRegex(RuntimeError, "transport failed"):
             lease.transport_ready()
 
     def test_dsv41_startup_rejects_invalid_mode_multimodal_speculation_and_unsafe_storage(
