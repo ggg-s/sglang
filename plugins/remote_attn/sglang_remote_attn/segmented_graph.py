@@ -402,6 +402,10 @@ def resolve_backend(original, runner):
     from . import dsv41_graph, dsv41_remote
 
     dsv41 = dsv41_graph.is_model(runner)
+    flash = (
+        getattr(runner.model_runner.model_config.hf_config, "model_type", None)
+        == "deepseek_v4"
+    )
     parallel = get_parallel()
     option = os.environ.get("HANDOFF_REMOTE_SEGMENTED_GRAPH", "1")
     settings = (
@@ -425,7 +429,11 @@ def resolve_backend(original, runner):
     dsv41_remote_decode = dsv41 and settings[:2] == ("decode", "remote")
     # Exchange the actual pool layout, not the requested env setting. Join the
     # TP vote before rejecting so another rank cannot enter capture alone.
-    kv_layout = mr.token_to_kv_pool.kv_layout.value if dsv41_remote_decode else None
+    kv_layout = (
+        mr.token_to_kv_pool.kv_layout.value
+        if dsv41_remote_decode or flash and settings[:2] == ("decode", "remote")
+        else None
+    )
     report = (
         settings,
         tuple(runner.capture_bs),
@@ -437,9 +445,11 @@ def resolve_backend(original, runner):
         config.features.enable_memory_saver,
         mr.model_config.num_hidden_layers,
         mr.lora_manager is not None,
-        getattr(mr.model_config.hf_config, "model_type", None) if dsv41 else None,
+        getattr(mr.model_config.hf_config, "model_type", None)
+        if dsv41 or flash
+        else None,
         tuple(getattr(mr.model_config.hf_config, "compress_ratios", ()))
-        if dsv41
+        if dsv41 or flash
         else None,
         abi,
         live,
@@ -455,7 +465,7 @@ def resolve_backend(original, runner):
     )
     if option not in ("0", "1"):
         raise ValueError("HANDOFF_REMOTE_SEGMENTED_GRAPH must be 0 or 1")
-    if dsv41_remote_decode:
+    if dsv41_remote_decode or flash and settings[:2] == ("decode", "remote"):
         # Scheduler/controller validation happens after runner initialization.
         # Reject before even constructing the native backend: it may capture
         # or warm up kernels before DSV41Controller.validate can run.
@@ -465,6 +475,11 @@ def resolve_backend(original, runner):
             "DSV Remote graph native metadata/prepare/attention ABI is incompatible"
         )
     full = original(runner)
+    if flash:
+        # C4/C128 native prepare has no split projection/state ABI. The
+        # controller dispatches eager while Remote; native full graphs resume
+        # after the existing GPU/PD/TP retirement boundary.
+        return full
     if settings != ("decode", "remote", "1"):
         return full
     if not cuda_python:

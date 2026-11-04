@@ -47,7 +47,8 @@ def validate(controller, runner, role):
         selected = [
             i
             for i, layer in enumerate(layers)
-            if getattr(getattr(layer, "self_attn", None), "compress_ratio", 0) in (1, 2)
+            if getattr(getattr(layer, "self_attn", None), "compress_ratio", 0)
+            in (1, 2, 4, 128)
         ]
         if selected:
             from .dsv41_paged import warmup
@@ -70,7 +71,13 @@ def validate(controller, runner, role):
     backends.extend(getattr(runner, "decode_attn_backend_group", None) or [])
     backends = [backend for backend in backends if backend is not None]
     if not backends or any(
-        not getattr(b, "is_dsv41", False) or b.trtllm_attn or b.mega_attn
+        not (
+            getattr(b, "is_dsv41", False)
+            or runner.model_config.hf_config.model_type == "deepseek_v4"
+            and type(b).__name__ == "DeepseekV4AttnBackend"
+        )
+        or b.trtllm_attn
+        or b.mega_attn
         for b in backends
     ):
         raise ValueError(
@@ -203,12 +210,18 @@ def execute(job, stream, cache):
     header = job.header
     layer_id, ratio = int(header["layer"]), int(header["ratio"])
     pool = source.owner.pool
-    if layer_id < 0 or layer_id >= source.owner.layers or ratio not in (1, 2):
+    if layer_id < 0 or layer_id >= source.owner.layers or ratio not in (1, 2, 4, 128):
         raise ValueError("invalid Remote sparse layer/ratio")
     if source.owner.hf_config.compress_ratios[layer_id] != ratio:
         raise ValueError("Remote sparse producer/ratio changed")
     positions = header["positions"]
-    if len(positions) > source.owner.hf_config.index_topk or any(
+    # C128 attends all completed blocks, not an index_topk selection.
+    limit = (
+        source.prefix_len // ratio
+        if ratio == 128
+        else source.owner.hf_config.index_topk
+    )
+    if len(positions) > limit or any(
         type(p) is not int or not 0 <= p < source.prefix_len // ratio for p in positions
     ):
         raise ValueError("Remote selection exceeds immutable completed prefix")
@@ -507,6 +520,15 @@ def attention(
             attn_sink=attn_sink,
             cos_sin_cache=cos_sin_cache,
             **kwargs,
+        )
+    # V4 native FlashMLA may leave padded TP heads uninitialized. They are
+    # discarded by the model; sanitize only that padding before Remote kernels.
+    if compress_ratio in (4, 128):
+        heads = getattr(layer, "tp_q_head_num", q.shape[-2])
+        if not 0 < heads <= q.shape[-2]:
+            raise ValueError("invalid native query head count")
+        q = torch.where(
+            (torch.arange(q.shape[-2], device=q.device) < heads)[:, None], q, 0
         )
     if q.is_cuda and os.environ.get("HANDOFF_DSV41_FAST", "1") == "1":
         from .dsv41_fast import attention as fast_attention

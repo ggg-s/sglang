@@ -126,7 +126,7 @@ def partition(
     A ratio-2 pending half-pair belongs to D, even if its raw first token was
     prefetched. Shared producer layers use this same position/ownership map.
     """
-    if ratio not in (1, 2) or full_page_size % ratio:
+    if ratio not in (1, 2, 4, 128) or full_page_size % ratio:
         raise ValueError("unsupported sparse ownership ratio/page")
     cpp = full_page_size // ratio
     inverse = {int(page): logical for logical, page in enumerate(full_pages)}

@@ -13618,7 +13618,7 @@ class TestRemoteAttn(CustomTestCase):
             with self.subTest(cancel=cancel):
                 self._check_dsv41_progressive_retirement(with_cache=True, cancel=cancel)
 
-    def _check_dsv41_progressive_retirement(self, *, with_cache, cancel):
+    def _check_dsv41_progressive_retirement(self, *, with_cache, cancel, flash=False):
         from sglang_remote_attn import dsv41_progressive as pg
         from sglang_remote_attn.decode_overlap import BatchProof, DecodeOverlap
         from sglang_remote_attn.pre_layerwise import Controller, write_json
@@ -13632,7 +13632,11 @@ class TestRemoteAttn(CustomTestCase):
             owner.targets, owner.remote_targets, owner.early_admissions = [], {}, 0
             owner.agree = lambda flags: flags
             owner._schema = lambda manager: dict(
-                entries=[["kv", 1, 1], ["index", 2, 2], ["kv", 2, 2]]
+                entries=(
+                    [["kv", 4, 1], ["index", 4, 1], ["kv", 128, 2]]
+                    if flash
+                    else [["kv", 1, 1], ["index", 2, 2], ["kv", 2, 2]]
+                )
             )
             overlap = DecodeOverlap(owner)
             owner.decode_overlap = overlap
@@ -15036,6 +15040,197 @@ class TestRemoteAttn(CustomTestCase):
             self.addCleanup(b.mesh.close)
             self.assertNotEqual(old, b.config.directory)
             self.assertTrue((directory / "control/P0/instance.lock").exists())
+
+    def test_flash0731_startup_routes_native_backend_and_keeps_full_graph(self):
+        from sglang_remote_attn import dsv41_remote as remote, dsv41_layerwise
+
+        f = self._dsv41_layout_startup_fixture()
+        cfg = f.runner.model_runner.model_config.hf_config
+        cfg.model_type, cfg.compress_ratios = "deepseek_v4", [0, 0, 4, 128]
+        self.assertTrue(dsv41_layerwise.is_dsv41(f.runner.model_runner))
+        with patch.object(f.sg, "agree_capture_settings") as agree:
+            self.assertIs(
+                f.sg.resolve_backend(f.original, f.runner), f.original.return_value
+            )
+            report = agree.call_args.args[0]
+            self.assertIn("deepseek_v4", report)
+            self.assertIn((0, 0, 4, 128), report)
+            self.assertEqual(report[-1], "v4")
+
+        class DeepseekV4AttnBackend:
+            is_dsv41 = trtllm_attn = mega_attn = False
+
+            def _forward_attention(
+                self,
+                q,
+                k,
+                v,
+                layer,
+                forward_batch,
+                compress_ratio,
+                save_kv_cache=True,
+                attn_sink=None,
+                cos_sin_cache=None,
+                **kw,
+            ):
+                return "native"
+
+        backend = DeepseekV4AttnBackend()
+        mr = f.runner.model_runner
+        mr.attn_backend, mr.decode_attn_backend = backend, backend
+        controller = SimpleNamespace(pool=mr.token_to_kv_pool, remote_targets={})
+        remote.validate(controller, mr, "decode")
+        self.assertIs(backend._dsv41_remote, controller)
+        self.assertEqual(
+            backend._forward_attention(
+                None,
+                None,
+                None,
+                None,
+                SimpleNamespace(forward_mode=SimpleNamespace(is_decode=lambda: True)),
+                4,
+            ),
+            "native",
+        )
+        backend.trtllm_attn = True
+        with self.assertRaisesRegex(ValueError, "flashmla backend"):
+            remote.validate(controller, mr, "decode")
+
+    def test_flash0731_native_c4_and_c128_state_registration_and_pending_ring(self):
+        import numpy as np
+
+        f = self._dsv41_fixture()
+        cls = type(f.pool.compress_state_pools[0])
+        transfer = _source_function(
+            "mem_cache/deepseek_v4_compress_state.py",
+            "request_scoped_state_transfer_indices",
+        )
+        transfer.__globals__["np"] = np
+        cls.transfer_indices.__globals__["request_scoped_state_transfer_indices"] = (
+            transfer
+        )
+        c4 = SimpleNamespace(
+            ratio=4,
+            request_scoped=False,
+            ring_size=8,
+            kv_score_buffer=SimpleNamespace(kv_score=torch.zeros((32, 16))),
+        )
+        f.pool.indexer_compress_state_pools = [c4]
+        for online in (False, True):
+            c128 = cls()
+            c128.ratio, c128.online, c128.request_scoped, c128.ring_size = (
+                128,
+                online,
+                True,
+                256,
+            )
+            c128.kv_score_buffer = SimpleNamespace(kv_score=torch.zeros((1024, 24)))
+            f.pool.compress_state_pools = [c4, c128]
+            with patch.dict(
+                f.pool.get_request_state_buf_infos.__globals__, {"ONLINE_C128": online}
+            ):
+                ptrs, _, lens = f.pool.get_request_state_buf_infos()
+            self.assertEqual(ptrs, [c128.kv_score_buffer.kv_score.data_ptr()])
+            self.assertEqual(lens, [96 if online else 96 * 128])
+            ptrs, _, lens = f.pool.get_state_buf_infos()
+            self.assertNotIn(c128.kv_score_buffer.kv_score.data_ptr(), ptrs)
+            self.assertEqual(ptrs.count(c4.kv_score_buffer.kv_score.data_ptr()), 2)
+            self.assertEqual(lens[-2:], [16 * 4 * 8] * 2)
+            for end in (0, 1, 127, 128, 129, 255, 256, 257):
+                expected = (
+                    []
+                    if end % 128 == 0
+                    else ([3] if online else [6 + ((end - 1) % 256) // 128])
+                )
+                self.assertEqual(
+                    f.pool.request_state_transfer_indices(3, end).tolist(), expected
+                )
+
+    def test_flash0731_progressive_overlap_cancel_and_normal_retirement(self):
+        for cancel in (False, True):
+            with self.subTest(cancel=cancel):
+                self._check_dsv41_progressive_retirement(
+                    with_cache=False, cancel=cancel, flash=True
+                )
+
+    def test_flash0731_partition_c4_c128_native_metadata_and_tail_ownership(self):
+        import importlib.util
+
+        spec = importlib.util.spec_from_file_location(
+            "flash_support", ROOT / "test/manual/remote_attn/flash0731_probe_support.py"
+        )
+        support = importlib.util.module_from_spec(spec)
+        # The support module shares the source-loaded native metadata fixture.
+        with patch.dict(
+            sys.modules, {"dsv41_remote_probe_support": self._dsv41_remote_support()}
+        ):
+            spec.loader.exec_module(support)
+        from sglang_remote_attn import dsv41_sparse_math as math, dsv41_paged as paged
+
+        for ratio in (4, 128):
+            f = support.flash_fixture(ROOT, "cpu", ratio)
+            ids = f.core.sparse_page_indices(ratio)[0]
+            length = f.core.sparse_topk_lengths(ratio)
+            remote, local = math.partition(
+                ids[: int(length[0])].tolist(),
+                (f.d_row[0, ::256] // 256).tolist(),
+                f.prefix,
+                256,
+                ratio,
+            )
+            self.assertEqual(remote, [p for p in f.positions if p < f.prefix // ratio])
+            self.assertEqual(len(local), 1)
+            if ratio == 128:
+                self.assertGreater(len(remote), 512)
+            target = SimpleNamespace(
+                row=0,
+                handle="a",
+                prefix_len=f.prefix,
+                decode_prefix_len=0,
+                check=lambda: None,
+            )
+            mapping = paged.page_map(
+                target,
+                f.d_row,
+                256,
+                f.d_pool.get_extra_key_buffer(3).shape[0],
+                f.prefix + ratio,
+            )
+            li, re = torch.empty_like(ids), torch.empty_like(ids)
+            mapping.partition(ids, length, ratio, li, re)
+            self.assertEqual(re[re >= 0].tolist(), remote)
+            self.assertEqual(li[li >= 0].tolist(), local)
+
+    def test_flash0731_manifest_has_owning_c4_c128_layers_and_no_c128_indexer(self):
+        f = self._dsv41_fixture()
+        # Reuse real native buffers/strides with the two high-ratio owners.
+        f.controller.hf_config.model_type = "deepseek_v4"
+        f.controller.hf_config.compress_ratios = [0] * 2 + [128] * 18 + [4] * 20
+        f.controller.hf_config.kv_source_layer_ids = []
+        f.pool.sources_by_ratio = {4: [20], 128: [2, 8, 14]}
+        f.pool.kv_pools = {4: f.pool.kv_pools[1], 128: f.pool.kv_pools[2]}
+        f.pool.index_pools = (
+            {4: f.pool.index_pools[1]} if 1 in f.pool.index_pools else {}
+        )
+        # Native registration order includes only buffers actually present.
+        tensors = []
+        for ratio, pool in f.pool.kv_pools.items():
+            tensors.extend(pool.kv_buffer)
+            if ratio in f.pool.index_pools:
+                tensors.extend(f.pool.index_pools[ratio].contiguous_page_row_buffers())
+        f.manager.kv_args.kv_data_ptrs = [t.data_ptr() for t in tensors]
+        f.manager.kv_args.kv_item_lens = [t[0].nbytes for t in tensors]
+        f.pool.get_contiguous_buf_infos = lambda: (
+            f.manager.kv_args.kv_data_ptrs,
+            [t.nbytes for t in tensors],
+            f.manager.kv_args.kv_item_lens,
+        )
+        schema = f.ds.manifest(f.pool, f.manager.kv_args, f.controller.hf_config)
+        self.assertTrue(any(e[:3] == ["kv", 4, 20] for e in schema["entries"]))
+        self.assertTrue(any(e[:3] == ["kv", 128, 2] for e in schema["entries"]))
+        self.assertFalse(
+            any(e[0] == "index" and e[1] == 128 for e in schema["entries"])
+        )
 
     def test_fast_transfer_priority_is_bounded_and_keeps_native_exclusion(self):
         from sglang_remote_attn.transfer_priority import TransferLock

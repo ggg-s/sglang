@@ -174,7 +174,7 @@ class PageMap:
 
     def partition(self, ids, length, ratio, local, remote):
         cpp = self.page // ratio
-        if ratio not in (1, 2) or self.page % ratio:
+        if ratio not in (1, 2, 4, 128) or self.page % ratio:
             raise ValueError("unsupported sparse ownership geometry")
         lo, hi = self.target.decode_prefix_len // ratio, self.target.prefix_len // ratio
         if ids.is_cuda:

@@ -244,3 +244,9 @@ forward event 进入现有 indexer/state/global 交接。串行路径保留原�
 尾窗 CUDA graph，overlap 路径继续使用自己的完整 forward 证明。独立 `layerwise`
 模式仍保留逐层 hook。Remote window 内的传输分组、RPC 与逐资源 Local 不变。
 见 [4060 完成事件验证](validation/remote-final-forward-4060.md)。
+
+## DSV4 Flash-0731
+
+现支持 `deepseek_v4` 的 C4/C128 Remote、原生状态交接及生命周期保护。
+Flash 的 Remote 阶段使用 eager，退休后恢复 native full graph。
+详见 [Flash-0731 适配与 4060 验证](DSV4-FLASH-0731-REMOTE-ZH.md)。

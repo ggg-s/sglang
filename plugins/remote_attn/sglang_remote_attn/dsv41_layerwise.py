@@ -17,7 +17,7 @@ logger = logging.getLogger(__name__)
 
 
 def is_dsv41(runner):
-    return runner.model_config.hf_config.model_type == "deepseek_v41"
+    return runner.model_config.hf_config.model_type in ("deepseek_v41", "deepseek_v4")
 
 
 def manifest(pool, kv_args, config):
@@ -32,15 +32,18 @@ def manifest(pool, kv_args, config):
             "DSV4.1 layerwise requires the native non-unified FlashMLA pools"
         )
     if any(
-        r not in (0, 1, 2) for r in config.compress_ratios[: config.num_hidden_layers]
+        r not in (0, 1, 2, 4, 128)
+        for r in config.compress_ratios[: config.num_hidden_layers]
     ):
-        raise ValueError("DSV4.1 layerwise supports compression ratios 0/1/2 only")
+        raise ValueError(
+            "DSV4.1 layerwise supports compression ratios 0/1/2/4/128 only"
+        )
     owners = {}
     for ratio, buffers in pool.kv_pools.items():
         if buffers is None:
             continue
         sources = list(pool.sources_by_ratio.get(ratio, ()))
-        if ratio not in (1, 2) or len(buffers.kv_buffer) != len(sources):
+        if ratio not in (1, 2, 4, 128) or len(buffers.kv_buffer) != len(sources):
             raise ValueError("unsupported DSV4.1 compressed KV ownership")
         layout = buffers.kv_layout.value
         entries = [("kv", buffers.kv_buffer)]
@@ -56,7 +59,9 @@ def manifest(pool, kv_args, config):
                 raise ValueError("incomplete DSV4.1 native buffer entries")
             for i, tensor in enumerate(tensors):
                 producer = sources[i % len(sources)]
-                if producer not in config.kv_source_layer_ids:
+                if (ratio in (1, 2) and producer not in config.kv_source_layer_ids) or (
+                    ratio in (4, 128) and config.compress_ratios[producer] != ratio
+                ):
                     raise ValueError("DSV4.1 pool and model producer maps differ")
                 pointer = tensor.data_ptr()
                 if pointer in owners:
@@ -283,7 +288,9 @@ class DSV41Source(dsv41_progressive.SourceMixin, Source):
             self.path / "prefill.json",
             {
                 "generation": self.generation,
-                "model_type": "deepseek_v41",
+                "model_type": getattr(
+                    self.owner.hf_config, "model_type", "deepseek_v41"
+                ),
                 "prefix_len": self.prefix_len,
                 "final_chunk_start_page": self.index_slice.start,
                 "final_chunk_end_page": self.index_slice.stop,
