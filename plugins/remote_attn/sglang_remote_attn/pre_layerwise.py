@@ -661,6 +661,11 @@ class Controller:
             getattr(self, "schema_signature", None),
             startup_signature(self.config),
             ("destination-cache-v1", "prefix-range-v1", prefix_enabled()),
+            (
+                "sparse-fast-v1",
+                os.environ.get("HANDOFF_DSV41_FAST", "1"),
+                os.environ.get("HANDOFF_PREFIX_INFLIGHT", "2"),
+            ),
         )
         clean = not _runtime().has_target_states()
         if self.tp_size > 1:
@@ -675,6 +680,10 @@ class Controller:
                     "remote_attn TP graph/cache config or captures differ"
                 )
             clean = all(item[1] for item in reports)
+        if os.environ.get("HANDOFF_DSV41_FAST", "1") not in ("0", "1"):
+            raise ValueError("HANDOFF_DSV41_FAST must be 0 or 1")
+        if os.environ.get("HANDOFF_PREFIX_INFLIGHT", "2") not in ("1", "2", "3", "4"):
+            raise ValueError("HANDOFF_PREFIX_INFLIGHT must be 1..4")
         # An existing legacy import has no TP-agreed progressive lifetime.
         self.graph_fast_path = clean
 
@@ -1559,6 +1568,8 @@ def shutdown(scheduler):
         raise RuntimeError("pre-layerwise staging remains quarantined during shutdown")
     if getattr(controller, "mesh", None) is not None:
         controller.mesh.close()
+    if getattr(controller, "dsv41_rpc_batches", None) is not None:
+        controller.dsv41_rpc_batches.close()
     if getattr(controller, "gpu_data_plane", None) is not None:
         controller.gpu_data_plane.close()
 

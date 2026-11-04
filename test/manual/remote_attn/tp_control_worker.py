@@ -147,6 +147,18 @@ def progressive_graph_leases(args, context):
                 except RuntimeError:
                     mesh_rejected.append(True)
         assert mesh_rejected == [True] * 4
+        fast_rejected = []
+        for key, normal, different in (
+            ("HANDOFF_DSV41_FAST", "1", "0"),
+            ("HANDOFF_PREFIX_INFLIGHT", "2", "1"),
+        ):
+            with patch.dict(os.environ, {key: different if args.rank == 1 else normal}):
+                try:
+                    controller.validate_graphs()
+                    fast_rejected.append(False)
+                except RuntimeError:
+                    fast_rejected.append(True)
+        assert fast_rejected == [True, True]
         previous_config = controller.config
         controller.config = Config("remote", Path(args.rendezvous).parent / "mesh-tp")
         scheduler.disaggregation_mode = SimpleNamespace(value="prefill")
@@ -326,6 +338,7 @@ def progressive_graph_leases(args, context):
         "mismatch_rejected": mismatch_rejected,
         "sparse_mode_mismatch_rejected": sparse_mode_mismatch_rejected,
         "mesh_settings_rejected": mesh_rejected,
+        "fast_settings_rejected": fast_rejected,
         "cache_mismatch_rejected": cache_mismatch_rejected,
         "overlap_mismatch_rejected": overlap_mismatch_rejected,
         "existing_state_fallback": existing_state_fallback,

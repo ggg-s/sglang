@@ -529,7 +529,9 @@ def _eager_execute(original, runner, forward_batch, *args, **kwargs):
 
 def _mooncake_init(original, manager, *args, **kwargs):
     # The constructor starts sender threads, so install the mutex first.
-    manager._remote_attn_send_lock = threading.Lock()
+    from .transfer_priority import TransferLock
+
+    manager._remote_attn_send_lock = TransferLock()
     return original(manager, *args, **kwargs)
 
 

@@ -7,7 +7,8 @@ P 缓存前缀（Qwen3/DSV4.1）：[统一 Remote progressive 与 A/B 对照](PR
 attention；每个 physical global 资源复制完成并经过 TP 有序共识后独立切 Local。
 SMG 无新增修改。D Remote 支持 batch 1/2/4/8/16 分段 CUDA graph；稳定 QKV 投影通过少量
 SGL 模型接口进入图内，动态状态更新、sparse、RPC 和 merge 留图外。
-动态 sparse、RPC、merge 仍走 eager 参考计算，未证明生产性能收益。
+动态 sparse、RPC、merge 仍在图外；默认使用 GPU 分区/融合计算与异步批量 RPC。
+参考路径保留为对照；4060 算子验证不代表 H20 整模性能收益。
 Remote capture 显式使用 `thread_local`，Marlin reduction workspace 按图和调用在
 warmup 预分配，保留 bs=1；见 [H20 捕获修复及验证边界](validation/H20-REMOTE-CAPTURE-FIX.md)。
 低压缩率 index 池现按完整逻辑 guard 页分配，解决 staging 尾条不对齐；
@@ -196,3 +197,42 @@ SGL 核心接口，不能只把新插件复制到旧 SGL；启动前先执行核
 [本地/TP2/4060 验证记录](validation/dsv41-progressive-4060.md) 区分真实运行部分与 fixture。
 4060 不支持完整模型的 SM100 FlashMLA/indexer/compressor kernels；尚未运行完整 checkpoint、
 SMG/P/D、多 GPU NCCL，也未证明 token/logprob 一致性或生产 TTFT/吞吐收益。
+
+## Remote 热路径优化（2026-11-04）
+
+默认 `HANDOFF_DSV41_FAST=1`，包含以下行为：
+
+- 一层的所有 live rows 都经 TP 确认其 physical producer 为 Local 后，该层直接调用
+  原生 attention（包含原生 store-cache 行为）。共享消费者按 source-layer 映射判断，
+  不以本 rank 的 DMA 完成代替 TP 共识。
+- 请求自己的 FULL 物理页逆表在 GPU 增量构建，top-k 分区与本地 SWA 索引留在 GPU。
+  每层只回读一份合并后的 Remote logical positions 与错误标志；保持重复项、
+  D 缓存前缀和 ratio-2 half-pair 的原始归属。
+- P 的选中行读取、反量化和 partial attention 融合为 Triton kernel；D 的本地
+  SWA/global partial 与 LSE merge 同样在 GPU 完成。支持原生 V4、V41、V41 FP4
+  的独立/交错布局，动态 sparse 长度不引入逐长度 JIT 编译。启动时使用全 masked
+  索引按池几何预热；预热不读取有效 KV、不写 KV。
+- 同 endpoint、layer、query shape/dtype 的请求每组最多 4 行，复用一个 RPC。
+  每 worker 最多 2 个执行线程、16 个已接纳 batch。IO 持有在提交线程中建立，
+  Q producer event 在 D local partial 前记录；线程流等待该 event，主计算流等待
+  reply event 并登记结果 tensor 的 stream lifetime。
+- 前缀传输默认允许 2 个有界 payload 在途；Remote GPU Q/回复优先争用原生
+  Mooncake send lock，连续 4 次优先任务后允许已排队的 bulk 前进。TE 访问仍串行，
+  staging slot、native credit 和完成回调继续限制实际并发。
+
+`HANDOFF_PREFIX_INFLIGHT=1..4` 可调整前缀流水线，默认 2。
+P/D 的同 TP ranks 必须使用相同配置，启动共识会拒绝不一致。
+`HANDOFF_DSV41_FAST=0 HANDOFF_PREFIX_INFLIGHT=1` 可对照旧 sparse 计算与单批流水线；
+公平 send lock 仍生效。GPU payload 通道仍由 `HANDOFF_REMOTE_GPU_TRANSFER` 单独控制，
+不会因开启 FAST 自动切换传输模式。
+
+失败或 quarantine 不凭 timeout 释放 IO：未知 DMA 使请求 IO 保持 poisoned，
+对应 pipeline 停止新增提交并保留未证实完成的 ticket。只有自己的完成证明才能
+退还 credit；请求结束仍经过原有 overlap、source reader、checkpoint/TP 退休门槛。
+这些优化没有绕过 source-cache 的窗口预算、checkpoint 回放或 allocator。
+
+`remote-done.json` 增加 worker 累计的 sparse/RPC 统计，包括 native-layer 次数、
+索引回读次数、batch/row 数、队列等待及 RPC 时间；GPU plane 统计包含 bulk/urgent
+send-lock 等待时间。这些 worker 累计值不能当作单请求 TTFT。
+
+验证见 [4060 优化验证记录](validation/dsv41-fast-4060.md)。

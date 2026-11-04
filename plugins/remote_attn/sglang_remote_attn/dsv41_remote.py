@@ -7,6 +7,7 @@ The native-complete one-forward window remains a compatibility fallback.
 
 import functools
 import inspect
+import os
 import secrets
 import time
 from dataclasses import dataclass, field
@@ -35,6 +36,31 @@ def validate_layout(pool):
 
 def validate(controller, runner, role):
     validate_layout(controller.pool)
+    if os.environ.get("HANDOFF_DSV41_FAST", "1") == "1" and not getattr(
+        controller, "_fast_warmed", False
+    ):
+        # Keep compilation off the first cache-hit request's critical path.
+        # Native projection width may be padded independently of TP head count.
+        layers = getattr(
+            getattr(getattr(runner, "model", None), "model", None), "layers", ()
+        )
+        selected = [
+            i
+            for i, layer in enumerate(layers)
+            if getattr(getattr(layer, "self_attn", None), "compress_ratio", 0) in (1, 2)
+        ]
+        if selected:
+            from .dsv41_paged import warmup
+
+            attn = layers[selected[0]].self_attn
+            warmup(
+                controller.pool,
+                selected,
+                {attn.n_local_heads, attn._kernel_num_heads(1)},
+                runner.dtype,
+                role,
+            )
+            controller._fast_warmed = True
     if role == "prefill":
         return
     backends = [
@@ -192,7 +218,9 @@ def execute(job, stream, cache):
         or job.q_cpu.shape[1] != 512
     ):
         raise ValueError("Remote query shape exceeds sparse MLA contract")
-    if not bool(torch.isfinite(job.q_cpu).all()):
+    if (
+        not job.q_cpu.is_cuda or os.environ.get("HANDOFF_DSV41_FAST", "1") != "1"
+    ) and not bool(torch.isfinite(job.q_cpu).all()):
         raise ValueError("nonfinite Remote sparse query")
     device = pool.get_extra_key_buffer(layer_id).device
     with torch.cuda.device(device), torch.cuda.stream(stream):
@@ -202,14 +230,31 @@ def execute(job, stream, cache):
             [ctx.dsv41_pages[p // cpp] * cpp + p % cpp for p in positions],
             device=device,
         )
-        keys = sparse.read_slots(
-            pool.get_extra_key_buffer(layer_id),
-            ids,
-            pool.get_extra_key_page_size(layer_id),
-            pool.get_extra_key_layout(layer_id),
-        )
         query = job.q_cpu.to(device=device)
-        out, lse = sparse.partial(query, keys, float(header["scale"]))
+        if query.is_cuda and os.environ.get("HANDOFF_DSV41_FAST", "1") == "1":
+            from . import dsv41_paged
+
+            out, lse, error = dsv41_paged.partial(
+                query,
+                [
+                    (
+                        pool.get_extra_key_buffer(layer_id),
+                        ids,
+                        pool.get_extra_key_page_size(layer_id),
+                        pool.get_extra_key_layout(layer_id),
+                    )
+                ],
+                float(header["scale"]),
+            )
+            dsv41_paged.check([error])
+        else:
+            keys = sparse.read_slots(
+                pool.get_extra_key_buffer(layer_id),
+                ids,
+                pool.get_extra_key_page_size(layer_id),
+                pool.get_extra_key_layout(layer_id),
+            )
+            out, lse = sparse.partial(query, keys, float(header["scale"]))
         if not getattr(job, "gpu_transport", False):
             out, lse = out.cpu(), lse.cpu()  # Real GPU completion before reply.
     return (
@@ -322,6 +367,9 @@ class Target:
 
         if not ready(self.req):
             raise RuntimeError("Remote GPU transport has not drained")
+        batches = getattr(self.controller, "dsv41_rpc_batches", None)
+        if batches is not None:
+            batches.detach(self)
         if self.client is not None:
             self.client.detach(self.route["handoff_id"])
             self.client.close()
@@ -332,10 +380,13 @@ class Target:
                 reason=reason,
                 remote_calls=self.calls,
                 layers=sorted(self.touched),
+                worker_sparse_stats=dict(getattr(self.controller, "sparse_stats", {})),
+                worker_rpc_stats=dict(batches.stats) if batches is not None else {},
                 at=time.monotonic(),
             ),
         )
         self.closed = True
+        getattr(self, "_sparse_page_maps", {}).clear()
         if self.controller.remote_targets.get(self.row) is self:
             self.controller.remote_targets.pop(self.row)
         if getattr(self.req, "_dsv41_remote", None) is self:
@@ -445,6 +496,23 @@ def attention(
         or not forward_batch.forward_mode.is_decode()
     ):
         return original(
+            backend,
+            q,
+            k,
+            v,
+            layer,
+            forward_batch,
+            compress_ratio,
+            save_kv_cache=save_kv_cache,
+            attn_sink=attn_sink,
+            cos_sin_cache=cos_sin_cache,
+            **kwargs,
+        )
+    if q.is_cuda and os.environ.get("HANDOFF_DSV41_FAST", "1") == "1":
+        from .dsv41_fast import attention as fast_attention
+
+        return fast_attention(
+            original,
             backend,
             q,
             k,

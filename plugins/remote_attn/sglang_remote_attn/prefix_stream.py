@@ -1,7 +1,7 @@
 """Request-owned prefix/middle/final PD ranges over native Mooncake tasks.
 
-Only a device cache hit opts in, before its first native send. One bounded
-payload per manager is in flight; index entries and metadata precede queued
+Only a device cache hit opts in, before its first native send. A bounded number of
+payloads per manager is in flight; index entries and metadata precede queued
 global work. Worker callbacks never enter a TP collective or free cache pages.
 """
 
@@ -27,11 +27,17 @@ def enabled():
 
 
 class Pump:
-    def __init__(self):
+    def __init__(self, limit=None):
+        if limit is None:
+            limit = int(os.environ.get("HANDOFF_PREFIX_INFLIGHT", "2"))
+        if limit not in (1, 2, 3, 4):
+            raise ValueError("HANDOFF_PREFIX_INFLIGHT must be 1..4")
+        self.limit = limit
         self.lock = threading.RLock()
         self.urgent, self.bulk = deque(), deque()
-        self.active = None
+        self.active = {}
         self.controls = 0
+        self.failed = False
 
     def submit(self, task, urgent):
         with self.lock:
@@ -39,27 +45,35 @@ class Pump:
         self.drive()
 
     def drive(self):
-        with self.lock:
-            if self.active is not None:
-                return
-            queue = self.urgent if self.urgent else self.bulk
-            if not queue or (queue is self.bulk and self.controls):
-                return
-            task = queue.popleft()
-            self.active = task
-        try:
-            task()
-        except Exception as exc:
-            # Native submission may already own DMA. Never retry or clear active.
-            task.plan.fail(exc)
-            raise
+        while True:
+            with self.lock:
+                if self.failed or len(self.active) >= self.limit:
+                    return
+                queue = self.urgent if self.urgent else self.bulk
+                if not queue or (queue is self.bulk and self.controls):
+                    return
+                task = queue.popleft()
+                self.active[id(task)] = task
+            try:
+                task()
+            except Exception as exc:
+                # Submission can already own DMA. Freeze this pump; preserve
+                # every active ticket until its own completion is known.
+                with self.lock:
+                    self.failed = True
+                task.plan.fail(exc)
+                raise
 
     def done(self, task):
         with self.lock:
-            if self.active is not task:
+            if self.active.get(id(task)) is not task:
                 raise RuntimeError("prefix task completion identity changed")
-            self.active = None
+            del self.active[id(task)]
         self.drive()
+
+    def quarantine(self):
+        with self.lock:
+            self.failed = True
 
 
 @dataclass
@@ -115,6 +129,7 @@ class Task:
                 p.flush_callbacks()
                 p.flush_final()
         except Exception as exc:
+            p.pump.quarantine()
             p.fail(exc)
             raise
         finally:

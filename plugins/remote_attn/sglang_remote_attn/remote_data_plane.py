@@ -258,6 +258,8 @@ class Plane:
 
     def send_guard(self):
         lock = getattr(self.manager, "_remote_attn_send_lock", None)
+        if lock is not None and hasattr(lock, "priority"):
+            return lock.priority()
         return lock if lock is not None else nullcontext()
 
     def stats(self):
@@ -269,6 +271,13 @@ class Plane:
                 lanes=len(self.lanes),
                 quarantined=len(self.quarantine),
                 tcp_tensor_payloads=0,
+                send_lock_wait_ns=list(
+                    getattr(
+                        getattr(self.manager, "_remote_attn_send_lock", None),
+                        "wait_ns",
+                        (),
+                    )
+                ),
             )
 
     def write(self, slab, remote, session, entries):

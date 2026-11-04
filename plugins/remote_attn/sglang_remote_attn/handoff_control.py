@@ -1711,6 +1711,15 @@ def _execute_hub_job(job, stream, cache):
 
         return execute(job, stream, cache)
     if getattr(job, "is_batch", False):
+        sparse_rows = [bool(item.header.get("dsv41_sparse")) for item in job.items]
+        if any(sparse_rows):
+            if not all(sparse_rows):
+                raise ValueError("RPC batch spans different model contracts")
+            from .dsv41_remote import execute
+
+            return {"batch_size": len(job.items)}, [
+                execute(item, stream, cache) for item in job.items
+            ]
         return execute_remote_attention_batch(job, stream, cache)
     return execute_remote_attention(job, stream, cache)
 

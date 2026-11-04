@@ -36,8 +36,8 @@ sender、peer 注册发生变化则保留页并报错，不能中途切回普通
 
 1. 复用原生 bootstrap、destination 页表与 sender cursor，先取得 P 缓存读 pin。
    首次范围/请求摘要在 TP 内确认一次；后续 middle/final 复用该生命周期。
-2. cached-prefix 的物理发送拆成有界资源子批次。每个 manager 同时只提交一个
-   已接管 payload；按4 MiB目标、原生正的 max-transfer-batch 和 receive ring 容量
+2. cached-prefix 的物理发送拆成有界资源子批次。每个 manager 默认最多提交两个
+   已接管 payload（`HANDOFF_PREFIX_INFLIGHT=1..4`，默认2）；每个按4 MiB目标、原生正的 max-transfer-batch 和 receive ring 容量
    划分，最小单位是一页资源组。逻辑 chunk 参数不变；staging 的最小物理页/资源组
    必须能放入上述字节预算，direct 路径的单页组可能超过4 MiB。
 3. Qwen 的独立 metadata 发送期间暂停继续提交 global；当前有界批次完成后即可

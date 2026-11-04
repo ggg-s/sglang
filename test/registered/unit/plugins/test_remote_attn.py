@@ -1544,7 +1544,9 @@ class TestRemoteAttn(CustomTestCase):
             ],
         )
 
-    def _prefix_stream_fixture(self, *, dsv=False, staged=False, enabled=True):
+    def _prefix_stream_fixture(
+        self, *, dsv=False, staged=False, enabled=True, inflight=1
+    ):
         from collections import deque
 
         from sglang_remote_attn import prefix_stream as ps
@@ -1695,7 +1697,8 @@ class TestRemoteAttn(CustomTestCase):
                 return ps.cached_prefix(cached, f.scheduler, req)
 
         f.activate = activate
-        f.activate()
+        with patch.dict(os.environ, {"HANDOFF_PREFIX_INFLIGHT": str(inflight)}):
+            f.activate()
         f.plan = ps.stream_for(req)
         if enabled:
             self.assertIsNotNone(f.plan)
@@ -5127,6 +5130,7 @@ class TestRemoteAttn(CustomTestCase):
         self.assertTrue(rows[0]["leases"]["mismatch_rejected"])
         self.assertTrue(rows[0]["leases"]["sparse_mode_mismatch_rejected"])
         self.assertEqual(rows[0]["leases"]["mesh_settings_rejected"], [True] * 4)
+        self.assertEqual(rows[0]["leases"]["fast_settings_rejected"], [True, True])
         self.assertTrue(rows[0]["leases"]["cache_mismatch_rejected"])
         self.assertTrue(rows[0]["leases"]["overlap_mismatch_rejected"])
         self.assertEqual(rows[0]["d_overlap"], rows[1]["d_overlap"])
@@ -14672,6 +14676,264 @@ class TestRemoteAttn(CustomTestCase):
             self.addCleanup(b.mesh.close)
             self.assertNotEqual(old, b.config.directory)
             self.assertTrue((directory / "control/P0/instance.lock").exists())
+
+    def test_fast_transfer_priority_is_bounded_and_keeps_native_exclusion(self):
+        from sglang_remote_attn.transfer_priority import TransferLock
+
+        lock = TransferLock(urgent_burst=2)
+        order, busy = [], [0]
+        lock.acquire()
+
+        def run(name, urgent):
+            with lock.priority() if urgent else lock:
+                busy[0] += 1
+                self.assertEqual(busy[0], 1)
+                order.append(name)
+                busy[0] -= 1
+
+        threads = []
+        for name, urgent in (("bulk", False), ("u0", True), ("u1", True), ("u2", True)):
+            t = threading.Thread(target=run, args=(name, urgent))
+            threads.append(t)
+            t.start()
+            self._mesh_wait(lambda: len(lock.bulk) + len(lock.urgent) == len(threads))
+        lock.release()
+        for t in threads:
+            t.join(2)
+            self.assertFalse(t.is_alive())
+        self.assertEqual(order, ["u0", "u1", "bulk", "u2"])
+
+    def test_fast_prefix_pipeline_is_bounded_handles_reordered_completions_and_priority(
+        self,
+    ):
+        f = self._prefix_stream_fixture(dsv=True, inflight=2)
+        self.assertEqual(len(f.wire), 2)
+        peak, completed = 0, []
+        with f.plan.priority():
+            # Already submitted tasks can finish; queued bulk cannot replace them.
+            while f.wire:
+                peak = max(peak, len(f.plan.pump.active))
+                task = f.wire.pop()
+                completed.append(task.kwargs["staging_chunk_idx"])
+                task.kwargs["on_complete"]()
+            self.assertTrue(f.plan.pump.bulk)
+            self.assertFalse(f.plan.drained())
+        while f.wire:
+            peak = max(peak, len(f.plan.pump.active))
+            task = f.wire.pop()
+            completed.append(task.kwargs["staging_chunk_idx"])
+            task.kwargs["on_complete"]()
+        self.assertLessEqual(peak, 2)
+        self.assertTrue(f.plan.drained())
+        self.assertEqual(len(set(completed)), len(f.plan.pieces))
+        self.assertTrue(f.guard.leases)  # Neither DMA callback frees a read lease.
+
+    def test_fast_prefix_pipeline_failure_does_not_recycle_active_tickets(self):
+        f = self._prefix_stream_fixture(dsv=True, inflight=2)
+        active = dict(f.plan.pump.active)
+        task = f.wire.pop()
+        f.req.cache_request_handle = "different-attempt"
+        with self.assertRaises(RuntimeError):
+            task.kwargs["on_complete"]()
+        self.assertTrue(f.plan.pump.failed)
+        self.assertEqual(f.plan.pump.active, active)
+        self.assertTrue(f.guard.leases)
+        f.plan.pump.drive()
+        self.assertEqual(f.plan.pump.active, active)
+
+    def test_fast_native_layer_requires_tp_local_and_preserves_shared_producer(self):
+        from sglang_remote_attn import dsv41_fast as fast
+        from sglang_remote_attn import dsv41_remote as remote
+        from sglang_remote_attn import dsv41_paged as paged
+
+        f = self._dsv41_remote_support().fixture(ROOT, "cpu", kv_layout="v4")
+        f.controller._schema = lambda m: dict(entries=[["kv", 1, 1], ["kv", 2, 2]])
+        f.controller.scheduler.disagg_decode_prealloc_queue = SimpleNamespace(
+            kv_manager=None
+        )
+        target = remote.Target(
+            f.controller, f.req, Path("/tmp/unused"), "g", {}, 33, progressive=True
+        )
+        f.controller.remote_targets[0] = target
+        kv = torch.zeros(1, 512)
+        calls = []
+
+        def native(*args, **kwargs):
+            calls.append(True)
+            self.assertTrue(kwargs["save_kv_cache"])
+            return f.query
+
+        with patch.object(paged, "page_map", side_effect=RuntimeError("still remote")):
+            with self.assertRaisesRegex(RuntimeError, "still remote"):
+                fast.attention(
+                    native,
+                    f.backend,
+                    f.query,
+                    kv,
+                    kv,
+                    SimpleNamespace(layer_id=3),
+                    f.fb,
+                    2,
+                    attn_sink=f.sink,
+                )
+            self.assertFalse(calls)
+            target.local_entries.add(1)  # Consumer layer 3 shares producer layer 2.
+            result = fast.attention(
+                native,
+                f.backend,
+                f.query,
+                kv,
+                kv,
+                SimpleNamespace(layer_id=3),
+                f.fb,
+                2,
+                attn_sink=f.sink,
+            )
+            self.assertIs(result, f.query)
+            self.assertEqual(calls, [True])
+
+    def test_fast_page_map_extension_preserves_duplicates_cached_prefix_and_odd_tail(
+        self,
+    ):
+        from sglang_remote_attn import dsv41_paged as paged
+
+        table = torch.tensor([[16, 17, 18, 19, 4, 5, 6, 7, 24, 25, 26, 27]])
+        target = SimpleNamespace(
+            row=0, handle="a", prefix_len=9, decode_prefix_len=4, check=lambda: None
+        )
+        m = paged.page_map(target, table, 4, 8, 8)
+        self.assertIs(paged.page_map(target, table, 4, 8, 10), m)
+        ids = torch.tensor([8, 3, 3, 12, -1])
+        local, remote = torch.empty_like(ids), torch.empty_like(ids)
+        m.partition(ids, torch.tensor([5]), 2, local, remote)
+        self.assertEqual(remote.tolist(), [-1, 3, 3, -1, -1])
+        self.assertEqual(local.tolist(), [8, -1, -1, 12, -1])
+        with self.assertRaisesRegex(RuntimeError, "extent changed"):
+            m.extend(4)
+        with self.assertRaisesRegex(ValueError, "outside request"):
+            m.partition(torch.tensor([0]), torch.tensor([1]), 2, local[:1], remote[:1])
+        target.handle = "b"
+        with self.assertRaisesRegex(RuntimeError, "attempt/extent"):
+            m.extend(10)
+
+    def test_fast_batched_attention_matches_union_and_reduces_five_rpcs_to_two(self):
+        from sglang_remote_attn import dsv41_fast as fast
+        from sglang_remote_attn import dsv41_remote as remote
+        from sglang_remote_attn import dsv41_paged as paged
+
+        net = self._gpu_transport_fixture()
+        f = self._dsv41_remote_support().fixture(ROOT, "cpu", kv_layout="v4")
+        f.controller.gpu_data_plane = net.dd
+        f.controller._schema = lambda m: dict(entries=[["kv", 1, 1], ["kv", 2, 2]])
+        f.controller.scheduler.disagg_decode_prealloc_queue = SimpleNamespace(
+            kv_manager=None
+        )
+        count = 5
+        f.controller.scheduler.req_to_token_pool.req_to_token = f.d_row.repeat(count, 1)
+        f.fb.req_pool_indices = torch.arange(count)
+        f.fb.req_pool_indices_cpu = list(range(count))
+        f.fb.seq_lens = torch.full((count,), 34)
+        for name in ("swa_page_indices", "c2_sparse_page_indices"):
+            setattr(f.core, name, getattr(f.core, name).repeat(count, 1))
+        for name in ("swa_topk_lengths", "c2_sparse_topk_lengths"):
+            setattr(f.core, name, getattr(f.core, name).repeat(count))
+        for i in range(count):
+            req = SimpleNamespace(kv=SimpleNamespace(req_pool_idx=i))
+            f.controller.remote_targets[i] = remote.Target(
+                f.controller,
+                req,
+                Path("/tmp/unused"),
+                str(i),
+                net.route,
+                33,
+                progressive=True,
+            )
+        query = f.query.repeat(count, 1, 1)
+        kv = torch.zeros(count, 512)
+        got = fast.attention(
+            lambda *a, **k: self.fail("unready native read"),
+            f.backend,
+            query,
+            kv,
+            kv,
+            SimpleNamespace(layer_id=3),
+            f.fb,
+            2,
+            attn_sink=f.sink,
+        )
+        batches = f.controller.dsv41_rpc_batches
+        self.addCleanup(batches.close)
+        local = paged.partial(
+            query[0],
+            [
+                (
+                    f.d_pool.get_swa_key_buffer_radix(3),
+                    torch.tensor([13, 14]),
+                    8,
+                    f.main_layout,
+                ),
+                (
+                    f.d_pool.get_extra_key_buffer(3),
+                    torch.tensor([24]),
+                    4,
+                    f.extra_layout,
+                ),
+            ],
+            512**-0.5,
+            f.sink,
+        )
+        expected = paged.merge(
+            local[:2], (query[0].float() * 3, torch.zeros(query.shape[1])), query.dtype
+        )
+        torch.testing.assert_close(got, expected[None].repeat(count, 1, 1))
+        self.assertEqual(batches.stats["batches"], 2)
+        self.assertEqual(batches.stats["rows"], 5)
+        self.assertEqual(len(net.d.calls), 2)
+        self.assertEqual(len(net.p.calls), 2)
+        self.assertTrue(
+            all(net.dp.ready(t.req) for t in f.controller.remote_targets.values())
+        )
+        self.assertEqual(f.stores, [3])
+
+    def test_fast_queued_rpc_holds_io_before_worker_and_unknown_dma_poison_is_sticky(
+        self,
+    ):
+        from sglang_remote_attn import dsv41_rpc as rpc
+        from sglang_remote_attn import dsv41_remote as remote
+
+        f = self._gpu_transport_fixture()
+        controller = SimpleNamespace(gpu_data_plane=f.dd, remote_targets={})
+        batch = rpc.pool(controller)
+        self.addCleanup(batch.close)
+        req = SimpleNamespace(kv=SimpleNamespace(req_pool_idx=0))
+        target = remote.Target(controller, req, Path("/tmp/unused"), "g", f.route, 8)
+        row = rpc.Row(0, target, torch.ones(2, 8, dtype=torch.bfloat16), [0], 1, 1, 1.0)
+        started, proceed = threading.Event(), threading.Event()
+
+        def delayed(*args):
+            started.set()
+            if not proceed.wait(3):
+                raise TimeoutError("compute gate")
+            return f.compute(*args)
+
+        with patch.object(f.dsv, "execute", delayed):
+            pending = batch.submit([row])
+            self.assertFalse(f.dp.ready(req))
+            self.assertTrue(started.wait(2))
+            with self.assertRaisesRegex(RuntimeError, "has not drained"):
+                target.close("cancel")
+            proceed.set()
+            self.assertEqual(pending.result()[0][0], 0)
+        self.assertTrue(f.dp.ready(req))
+        f.d.fail = True
+        with self.assertRaisesRegex(RuntimeError, "unknown"):
+            batch.submit([row]).result()
+        with self.assertRaisesRegex(RuntimeError, "unproven"):
+            f.dp.ready(req)
+        before = len(f.d.calls)
+        with self.assertRaisesRegex(RuntimeError, "quarantined"):
+            batch.submit([row])
+        self.assertEqual(len(f.d.calls), before)
 
     def _gpu_transport_fixture(self):
         """Real control sockets and tensor copies; only TE/CUDA boundaries are CPU."""
