@@ -1288,7 +1288,9 @@ def initialize(scheduler):
         getattr(controller, "dsv41_layerwise", False)
         and scheduler.disaggregation_mode.value == "prefill"
     ):
-        controller.cache_guard = install(scheduler.tree_cache, allow_swa=True)
+        controller.cache_guard = install(
+            scheduler.tree_cache, allow_swa=True, scheduler=scheduler
+        )
         from .prefill_overlap import install as install_prefill_overlap
 
         controller.prefill_overlap = install_prefill_overlap(controller)

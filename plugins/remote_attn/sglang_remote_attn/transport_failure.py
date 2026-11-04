@@ -73,6 +73,23 @@ def quarantine(owner, item, reason):
             controller.scheduler.output_streamer.stream_output(
                 [req], req.return_logprob, None
             )
+    # Stop future chunk scheduling through the native ordered abort boundary.
+    # Quarantine may be entered after prepare_abort already marked the request.
+    scheduler = getattr(controller, "scheduler", None)
+    if (
+        scheduler is not None
+        and getattr(scheduler, "chunked_req", None) is req
+        and getattr(scheduler, "_pending_chunked_abort_req", None) is None
+    ):
+        scheduler._pending_chunked_abort_req = req
+    # Retirement and admission commands are serialized on the TP scheduler.
+    # A quarantined certificate must not subsequently enter revoke/drain:
+    # unknown IO cannot produce that drain proof. Preserve its peer/cache pins.
+    certificate = getattr(req, "_dsv41_p_certificate", None)
+    if certificate is not None:
+        certificate.done = True
+        if not any(x is certificate for x in record["items"]):
+            record["items"].append(certificate)
     logger.error(
         "Remote-attn request %s quarantined; transfer mode unchanged: %s",
         req.rid,

@@ -114,7 +114,7 @@ def _source_class(relative, owner, members=None, *, strip_method_decorators=Fals
     return namespace[owner]
 
 
-def _source_function(relative, name):
+def _source_function(relative, name, *, namespace=None):
     path = ROOT / "python" / "sglang" / "srt" / relative
     tree = ast.parse(path.read_text())
     node = next(
@@ -129,7 +129,7 @@ def _source_function(relative, name):
         ],
         type_ignores=[],
     )
-    namespace = {}
+    namespace = dict(namespace or {})
     exec(compile(ast.fix_missing_locations(module), str(path), "exec"), namespace)
     return namespace[name]
 
@@ -6126,6 +6126,356 @@ class TestRemoteAttn(CustomTestCase):
         lease.ledger.pending.clear()
         self.assertTrue(lease.transport_ready())
 
+    @staticmethod
+    def _swa_scheduler():
+        return SimpleNamespace(
+            schedule_stream=SimpleNamespace(wait_stream=lambda stream: None),
+            forward_stream=object(),
+            device_module=SimpleNamespace(stream=lambda stream: nullcontext()),
+        )
+
+    def test_source_deferred_checkpoint_reclaims_long_prompt_swa_only(self):
+        from sglang_remote_attn.source_cache import CacheGuard
+
+        tree = ast.parse((ROOT / "python/sglang/srt/mem_cache/common.py").read_text())
+        node = next(
+            n
+            for n in tree.body
+            if getattr(n, "name", None) == "free_swa_out_of_window_slots"
+        )
+        namespace = dict(
+            ComponentType=SimpleNamespace(SWA="swa"),
+            ceil_align=lambda n, p: (n + p - 1) // p * p,
+        )
+        module = ast.Module(
+            body=[
+                ast.ImportFrom(
+                    module="__future__", names=[ast.alias(name="annotations")], level=0
+                ),
+                node,
+            ],
+            type_ignores=[],
+        )
+        exec(
+            compile(ast.fix_missing_locations(module), "<native-swa-free>", "exec"),
+            namespace,
+        )
+        native_free = namespace["free_swa_out_of_window_slots"]
+        for protected in (0, 2048):
+            with self.subTest(protected=protected):
+                freed, published = [], []
+                cursor = [protected]
+                rows = torch.arange(131072).reshape(1, -1)
+                kv = SimpleNamespace(
+                    holds_kv=True,
+                    cache_protected_len=protected,
+                    req_pool_idx=0,
+                    get_evicted_seqlen=lambda c: cursor[0],
+                    set_evicted_seqlen=lambda c, n: cursor.__setitem__(0, n),
+                    swa_dead_lo=lambda p: protected,
+                )
+                req = SimpleNamespace(
+                    kv=kv,
+                    origin_input_ids=range(131072),
+                    cache_request_handle="attempt",
+                    lock=object(),
+                    last_node=object(),
+                    finished=lambda: False,
+                )
+                cache = SimpleNamespace(
+                    supports_swa=lambda: True,
+                    checkpoint=lambda *a, **k: published.append(k),
+                    finish=lambda *a: None,
+                    reset=lambda: None,
+                    lock=lambda n: object(),
+                )
+                cache.evict_sliding_windows = lambda req, end: native_free(
+                    req,
+                    end,
+                    sliding_window_size=512,
+                    page_size=128,
+                    req_to_token_pool=SimpleNamespace(req_to_token=rows),
+                    token_to_kv_pool_allocator=SimpleNamespace(
+                        free_swa_segment=lambda indices, **kw: freed.extend(
+                            indices.tolist()
+                        )
+                    ),
+                )
+                guard = CacheGuard(
+                    cache, allow_swa=True, scheduler=self._swa_scheduler()
+                )
+                lease = guard.hold(req)
+                for end in range(protected + 2048, 131073, 2048):
+                    # Same checkpoint-before-next-chunk boundary as native P.
+                    cache.checkpoint(req, up_to=end)
+                    self.assertLessEqual(end - protected - len(freed), 640)
+                    self.assertLessEqual(end - len(freed) + 2048, protected + 2688)
+                before_final_dma = list(freed)
+                cache.checkpoint(req, up_to=131072 + 2048)
+                self.assertEqual(freed, before_final_dma)
+                self.assertEqual(len(freed), len(set(freed)))
+                self.assertTrue(all(protected <= i < 131072 - 512 for i in freed))
+                self.assertEqual(published, [])
+                self.assertFalse(lease.closed)
+                self.assertTrue(torch.equal(rows, torch.arange(131072).reshape(1, -1)))
+
+    def test_source_swa_131k_fits_35072_pool_with_native_accounting(self):
+        from sglang_remote_attn.source_cache import CacheGuard
+
+        # Source-load the real freeing and footprint code. The fake allocator
+        # records physical returns separately, so merely advancing a cursor
+        # without returning SWA pages cannot make this test pass.
+        native_free = _source_function(
+            "mem_cache/common.py",
+            "free_swa_out_of_window_slots",
+            namespace={"ComponentType": SimpleNamespace(SWA="swa")},
+        )
+        footprint = _source_function(
+            "managers/scheduler_components/pool_stats_observer.py",
+            "kv_private_swa_tokens",
+        )
+        ceil_align = lambda n, p: (n + p - 1) // p * p
+        component = SimpleNamespace(SWA="swa")
+        native_free.__globals__.update(ComponentType=component, ceil_align=ceil_align)
+        footprint.__globals__.update(ComponentType=component, ceil_align=ceil_align)
+        self.Kv.swa_dead_lo.__globals__["ceil_align"] = ceil_align
+        prompt, page, capacity, chunk = 131076, 256, 35072, 8192
+        rows = torch.arange(ceil_align(prompt, page)).reshape(1, -1)
+        for window in (128, 512, 8192):
+            for protected in (0, 30720):
+                for shield in (0, 2048):
+                    for reclaim in (False, True):
+                        with self.subTest(
+                            window=window,
+                            protected=protected,
+                            shield=shield,
+                            reclaim=reclaim,
+                        ):
+                            freed, published = set(), []
+                            kv = self.Kv(
+                                req_pool_idx=0,
+                                cache_protected_len=protected,
+                                kv_allocated_len=protected,
+                                swa_evict_floor=protected + shield,
+                            )
+                            req = SimpleNamespace(
+                                kv=kv,
+                                cache_request_handle="capacity-attempt",
+                                origin_input_ids=range(prompt),
+                                last_node=object(),
+                                lock=object(),
+                                finished=lambda: False,
+                            )
+                            cache = SimpleNamespace(
+                                supports_swa=lambda: True,
+                                checkpoint=lambda *a, **k: published.append(k),
+                                finish=lambda *a: None,
+                                reset=lambda: None,
+                                lock=lambda node: object(),
+                            )
+
+                            def free_segment(indices, *, start_pos):
+                                slots = set(indices.tolist())
+                                self.assertFalse(slots & freed)
+                                self.assertTrue(
+                                    all(i >= kv.swa_dead_lo(page) for i in slots)
+                                )
+                                self.assertEqual(start_pos % page, 0)
+                                freed.update(slots)
+
+                            cache.evict_sliding_windows = lambda req, end: native_free(
+                                req,
+                                end,
+                                sliding_window_size=window,
+                                page_size=page,
+                                req_to_token_pool=SimpleNamespace(req_to_token=rows),
+                                token_to_kv_pool_allocator=SimpleNamespace(
+                                    free_swa_segment=free_segment
+                                ),
+                            )
+                            guard = CacheGuard(
+                                cache,
+                                allow_swa=reclaim,
+                                scheduler=self._swa_scheduler(),
+                            )
+                            lease = guard.hold(req)
+                            # A warm hit owns only its resident tree SWA tail;
+                            # its FULL prefix is still held for transfer/Remote.
+                            cached_live = min(
+                                protected, ceil_align(window, page) + page
+                            )
+                            end, peak = protected, cached_live
+                            sizes = iter([chunk] * 4 + [2048])
+                            while end < prompt:
+                                take = min(next(sizes, chunk), prompt - end)
+                                allocation = ceil_align(end + take, page) - protected
+                                used = cached_live + allocation - len(freed)
+                                if used > capacity:
+                                    break
+                                end += take
+                                kv.kv_allocated_len = end
+                                peak = max(peak, used)
+                                cache.checkpoint(req, up_to=end)
+                                private = ceil_align(end, page) - protected - len(freed)
+                                self.assertEqual(footprint(kv, page), private)
+                                if reclaim:
+                                    self.assertLessEqual(
+                                        private,
+                                        shield + ceil_align(window, page) + 2 * page,
+                                    )
+                            if reclaim:
+                                self.assertEqual(end, prompt)
+                                self.assertLessEqual(peak, capacity)
+                                tail_start = (prompt - window) // page * page
+                                self.assertTrue(all(i < tail_start for i in freed))
+                                self.assertGreater(
+                                    kv.get_evicted_seqlen(component.SWA), protected
+                                )
+                            else:
+                                self.assertLess(end, prompt)
+                                self.assertEqual(freed, set())
+                                if protected == 0:
+                                    self.assertEqual(end, 34816)
+                                    self.assertEqual(prompt - end, 96260)
+                            self.assertFalse(lease.closed)
+                            self.assertEqual(published, [])
+                            self.assertTrue(
+                                torch.equal(
+                                    rows, torch.arange(rows.numel()).reshape(1, -1)
+                                )
+                            )
+
+    def test_source_swa_reclaim_waits_for_forward_and_keeps_final_transfer_window(self):
+        from sglang_remote_attn.source_cache import CacheGuard
+
+        # Model device queues, not CPU completion: checkpoint must return while
+        # the current chunk still reads its SWA, with the free queued behind it.
+        for overlap in (False, True):
+            with self.subTest(overlap=overlap):
+                forward = SimpleNamespace(issued=1, completed=0)
+                queue, reclaimed, active = [], [], []
+                schedule = SimpleNamespace(
+                    wait_stream=lambda stream: queue.append(
+                        ("wait", stream, stream.issued)
+                    )
+                )
+
+                @contextmanager
+                def stream_context(stream):
+                    active.append(stream)
+                    try:
+                        yield
+                    finally:
+                        active.pop()
+
+                def evict(req, pre_len):
+                    self.assertIs(active[-1], schedule)
+                    queue.append(("free", pre_len))
+
+                def drain():
+                    while queue:
+                        op = queue[0]
+                        if op[0] == "wait" and op[1].completed < op[2]:
+                            break
+                        queue.pop(0)
+                        if op[0] == "free":
+                            reclaimed.append(op[1])
+
+                scheduler = SimpleNamespace(
+                    enable_overlap=overlap,
+                    schedule_stream=schedule,
+                    forward_stream=forward,
+                    device_module=SimpleNamespace(stream=stream_context),
+                )
+                cache = SimpleNamespace(
+                    checkpoint=lambda *a, **k: self.fail("published live FULL KV"),
+                    finish=lambda *a: self.fail("finished live source"),
+                    reset=lambda: None,
+                    lock=lambda node: object(),
+                    supports_swa=lambda: True,
+                    evict_sliding_windows=evict,
+                )
+                req = SimpleNamespace(
+                    cache_request_handle="attempt",
+                    kv=SimpleNamespace(cache_protected_len=0),
+                    last_node=object(),
+                    origin_input_ids=range(8192),
+                    finished=lambda: False,
+                )
+                guard = CacheGuard(cache, allow_swa=True, scheduler=scheduler)
+                lease = guard.hold(req)
+                cache.checkpoint(req, up_to=2048)
+                drain()
+                self.assertEqual(reclaimed, [])
+                forward.completed = 1
+                drain()
+                self.assertEqual(reclaimed, [2047])
+
+                # Final SWA DMA may still be running. The final prompt window
+                # remains protected even if a caller supplies a larger frontier.
+                forward.issued = 2
+                cache.checkpoint(req, up_to=8192)
+                cache.checkpoint(req, up_to=8192 + 2048)
+                drain()
+                self.assertEqual(reclaimed, [2047])
+                forward.completed = 2
+                drain()
+                self.assertEqual(reclaimed, [2047, 8191, 8191])
+                self.assertFalse(lease.closed)
+                self.assertIsNotNone(lease.lock)
+
+                # Unknown stream owner and aborted requests cannot reclaim.
+                guard.scheduler = None
+                cache.checkpoint(req, up_to=8192)
+                guard.scheduler = scheduler
+                req.finished = lambda: True
+                cache.checkpoint(req, up_to=8192)
+                self.assertEqual(queue, [])
+
+    def test_quarantine_chunk_abort_and_admission_stop_preserve_pins(self):
+        from sglang_remote_attn.transport_failure import quarantine, hold_release
+
+        for already_finished in (False, True):
+            state = [already_finished]
+            req = SimpleNamespace(
+                rid="failed-chunk", return_logprob=False, finished=lambda: state[0]
+            )
+            pin = object()
+            cert = SimpleNamespace(done=False, cache_lease=pin, candidate=object())
+            req._dsv41_p_certificate = cert
+            scheduler = SimpleNamespace(
+                chunked_req=req,
+                _pending_chunked_abort_req=None,
+                output_streamer=SimpleNamespace(stream_output=lambda *a: None),
+            )
+            owner = SimpleNamespace(scheduler=scheduler, sources=[], targets=[])
+            item = SimpleNamespace(req=req)
+
+            def abort(*args, **kwargs):
+                state[0] = True
+
+            with patch.dict(
+                sys.modules,
+                {
+                    "sglang.srt.disaggregation.utils": SimpleNamespace(
+                        prepare_abort=abort
+                    )
+                },
+            ):
+                quarantine(owner, item, "timeout")
+                quarantine(owner, item, "repeat")
+            self.assertIs(scheduler._pending_chunked_abort_req, req)
+            self.assertTrue(cert.done)
+            self.assertIs(cert.cache_lease, pin)
+            self.assertTrue(hold_release(req, lambda: self.fail("unsafe free")))
+            # Admission observe skips a quarantined certificate before examining
+            # failed peers or trying a revoke/drain with no completion proof.
+            from sglang_remote_attn.prefill_admission import Admission
+
+            admission = Admission.__new__(Admission)
+            admission.records = {"failed": cert}
+            admission.observe()
+
     def test_ordered_transport_failure_isolates_request_without_free_or_local_switch(
         self,
     ):
@@ -7943,6 +8293,9 @@ class TestRemoteAttn(CustomTestCase):
         )
         cache.cache_controller = cache.linker = None
         cache.enable_session_radix_cache = False
+        slides = []
+        cache.supports_swa = lambda: True
+        cache.evict_sliding_windows = lambda req, end: slides.append(end)
         operations = []
         cache.checkpoint = lambda req, **kw: operations.append("checkpoint")
         cache.finish = lambda *a: operations.append("finish")
@@ -7961,7 +8314,7 @@ class TestRemoteAttn(CustomTestCase):
                 ),
             },
         ):
-            guard = install(cache, allow_swa=True)
+            guard = install(cache, allow_swa=True, scheduler=self._swa_scheduler())
         return SimpleNamespace(
             cache=cache,
             guard=guard,
@@ -7970,6 +8323,7 @@ class TestRemoteAttn(CustomTestCase):
             node=node,
             components=components,
             operations=operations,
+            slides=slides,
             native=r,
         )
 
@@ -8395,6 +8749,8 @@ class TestRemoteAttn(CustomTestCase):
     def test_dsv41_prefix_cache_pin_keeps_full_swa_receipt_valid_across_split(self):
         f = self._dsv41_cache()
         req = SimpleNamespace(
+            finished=lambda: False,
+            origin_input_ids=range(8),
             cache_request_handle=f.native.CacheRequestHandle("prefix", 0),
             last_node=1,
             lock=f.cache.lock(1),
@@ -8415,6 +8771,7 @@ class TestRemoteAttn(CustomTestCase):
             self.assertEqual(parent.component_data[ct].lock_ref, 1)
         f.cache.checkpoint(req, up_to=8)
         self.assertEqual(f.operations, [])
+        self.assertEqual(f.slides, [7])
         lease.retire(lambda: f.cache.checkpoint(req, up_to=8))
         self.assertEqual(f.operations, ["checkpoint"])
         for ct in f.cache.tree_components:

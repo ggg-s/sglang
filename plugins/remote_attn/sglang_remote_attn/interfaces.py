@@ -208,6 +208,11 @@ CORE_CALLS = {
     "sglang.srt.model_executor.runner_backend.breakable_cuda_graph_backend.BreakableCudaGraphBackend.capture_session": {
         "stream": inspect.Parameter.empty
     },
+    "sglang.srt.mem_cache.base_prefix_cache.BasePrefixCache.evict_sliding_windows": {
+        "req": inspect.Parameter.empty,
+        "pre_len": inspect.Parameter.empty,
+        "eviction_interval": 1,
+    },
     "sglang.srt.mem_cache.base_prefix_cache.BasePrefixCache.lock": {
         "node": inspect.Parameter.empty
     },

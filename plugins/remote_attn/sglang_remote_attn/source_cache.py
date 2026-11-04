@@ -63,7 +63,9 @@ class ReadLease:
 
 
 class CacheGuard:
-    def __init__(self, cache):
+    def __init__(self, cache, *, allow_swa=False, scheduler=None):
+        self.allow_swa = allow_swa
+        self.scheduler = scheduler
         self.cache = cache
         self.leases = {}
         self.by_req = {}
@@ -98,9 +100,33 @@ class CacheGuard:
                 )
             lease.check()
             if not lease.retiring:
+                self._evict_swa(req, up_to)
                 lease.checkpoints += 1
                 return
         return self.checkpoint(req, up_to=up_to, **kwargs)
+
+    def _evict_swa(self, req, up_to):
+        scheduler = self.scheduler
+        if (
+            not self.allow_swa
+            or scheduler is None
+            or not self.cache.supports_swa()
+            or req.finished()
+        ):
+            return
+        # Only request-owned, out-of-window SWA is released. FULL/indexer
+        # storage and the cached-prefix pin stay live for DMA/Remote readers.
+        # Clamp to the prompt so even a repeated/late checkpoint cannot reclaim
+        # the final SWA payload while its independent transfer is in flight.
+        pre_len = min(up_to, len(req.origin_input_ids)) - 1
+        # A scheduler checkpoint is NOT proof of GPU completion under overlap.
+        # The core WAR fastpath may fence only metadata reads. Fence the entire
+        # already-enqueued forward before clearing SWA mappings/reusing pages;
+        # the next forward already waits on schedule_stream. No CPU sync, and
+        # no dependency on a future forward (which would create a stream cycle).
+        with scheduler.device_module.stream(scheduler.schedule_stream):
+            scheduler.schedule_stream.wait_stream(scheduler.forward_stream)
+            self.cache.evict_sliding_windows(req, pre_len)
 
     def _finish(self, handle, outcome):
         lease = self.leases.get(handle)
@@ -119,7 +145,7 @@ class CacheGuard:
         return self.reset()
 
 
-def install(cache, *, allow_swa=False):
+def install(cache, *, allow_swa=False, scheduler=None):
     if cache.disable:
         return None
     from sglang.srt.mem_cache.radix_cache import RadixCache
@@ -148,7 +174,7 @@ def install(cache, *, allow_swa=False):
         )
     if hasattr(cache, "_remote_attn_source_cache"):
         return cache._remote_attn_source_cache
-    guard = CacheGuard(cache)
+    guard = CacheGuard(cache, allow_swa=allow_swa, scheduler=scheduler)
     cache._remote_attn_source_cache = guard
     return guard
 
