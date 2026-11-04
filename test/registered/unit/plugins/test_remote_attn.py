@@ -8946,6 +8946,121 @@ class TestRemoteAttn(CustomTestCase):
         self.assertFalse(f.handler.submit_chunk_scatter(7, 2, 1, 3))
         self.assertEqual(f.dr._staging_completed_layers, [])
 
+    def _whole_prefill_fixture(self, mode):
+        import numpy as np
+
+        pl = self.hooks.pre_layerwise
+        controller = pl.Controller.__new__(pl.Controller)
+        controller.config = pl.Config(mode, Path("/tmp/unused"))
+        trace, tasks = [], []
+
+        class Event:
+            def record(self, stream):
+                trace.append("proof")
+
+        def submit(*args, **kwargs):
+            trace.append("send")
+            tasks.append((args, kwargs))
+
+        sender = SimpleNamespace(
+            bootstrap_room=7,
+            kv_mgr=SimpleNamespace(add_transfer_request=submit),
+            trace_ctx=SimpleNamespace(copy_for_thread=lambda: "trace"),
+        )
+        source = SimpleNamespace(
+            req=SimpleNamespace(disagg_kv_sender=sender),
+            indices=np.array([3, 4]),
+            index_slice=slice(2, 4),
+            complete=lambda layers: trace.append(tuple(layers)),
+            stager=None,
+            native_staging=True,
+        )
+        controller.plan = [(source, [((0, 1), (0, 1, 4, 5)), ((2, 3), (2, 3, 6, 7))])]
+        fb = SimpleNamespace(forward_mode="extend", split_index=17)
+        self.enterContext(patch.object(torch.cuda, "Event", Event))
+        self.enterContext(patch.object(torch.cuda, "current_stream", lambda: None))
+        self.enterContext(
+            patch.dict(
+                sys.modules,
+                {
+                    "sglang.srt.model_executor.forward_batch_info": SimpleNamespace(
+                        ForwardMode=SimpleNamespace(SPLIT_PREFILL="split")
+                    )
+                },
+            )
+        )
+        return SimpleNamespace(controller=controller, fb=fb, trace=trace, tasks=tasks)
+
+    def test_remote_final_chunk_runs_native_once_before_any_group_submission(self):
+        f = self._whole_prefill_fixture("remote")
+        result, marker = object(), object()
+
+        def compute(runner, fb, positional, **kwargs):
+            self.assertIs(positional, marker)
+            self.assertEqual(kwargs, {"native_option": True})
+            self.assertEqual((fb.forward_mode, fb.split_index), ("extend", 17))
+            self.assertFalse(f.tasks)
+            f.trace.extend(["layer0", "layer1", "layer2", "layer3", "forward-end"])
+            return result
+
+        self.assertIs(
+            f.controller.forward(compute, None, f.fb, marker, native_option=True),
+            result,
+        )
+        self.assertEqual(
+            f.trace,
+            [
+                "layer0",
+                "layer1",
+                "layer2",
+                "layer3",
+                "forward-end",
+                "proof",
+                "send",
+                "send",
+            ],
+        )
+        self.assertIs(f.tasks[0][1]["wait_event"], f.tasks[1][1]["wait_event"])
+        self.assertEqual([t[1]["staging_chunk_idx"] for t in f.tasks], [0, 1])
+        self.assertEqual([t[1]["staging_layer_ids"] for t in f.tasks], [(0, 1), (2, 3)])
+        self.assertEqual(
+            [t[1]["kv_buffer_indices"] for t in f.tasks], [(0, 1, 4, 5), (2, 3, 6, 7)]
+        )
+        for _, kw in f.tasks:
+            kw["on_complete"]()
+        self.assertEqual(f.trace[-2:], [(0, 1), (2, 3)])
+        self.assertIsNone(f.controller.plan)
+        self.assertEqual((f.fb.forward_mode, f.fb.split_index), ("extend", 17))
+
+    def test_remote_failed_final_forward_never_submits_partial_kv(self):
+        f = self._whole_prefill_fixture("remote")
+
+        def fail(runner, fb):
+            f.trace.append("partial-forward")
+            raise RuntimeError("compute failed")
+
+        with self.assertRaisesRegex(RuntimeError, "compute failed"):
+            f.controller.forward(fail, None, f.fb)
+        self.assertEqual(f.trace, ["partial-forward"])
+        self.assertFalse(f.tasks)
+        self.assertEqual((f.fb.forward_mode, f.fb.split_index), ("extend", 17))
+
+    def test_layerwise_mode_keeps_compute_send_interleaving(self):
+        f = self._whole_prefill_fixture("layerwise")
+
+        def compute(runner, fb, *, split_forward_count):
+            self.assertEqual(fb.forward_mode, "split")
+            self.assertEqual(split_forward_count, 2)
+            f.trace.append("compute")
+            return len(f.tasks)
+
+        self.assertEqual(f.controller.forward(compute, None, f.fb), 1)
+        self.assertEqual(
+            f.trace, ["compute", "proof", "send", "compute", "proof", "send"]
+        )
+        self.assertIsNot(f.tasks[0][1]["wait_event"], f.tasks[1][1]["wait_event"])
+        self.assertEqual(f.fb.forward_mode, "extend")
+
     def test_prelayer_auto_grouping_uses_chunk_work_not_prompt_length(self):
         """Small tails keep Remote; long chunks use fewer, larger transfers."""
         pl = self.hooks.pre_layerwise
@@ -11266,6 +11381,31 @@ class TestRemoteAttn(CustomTestCase):
             f.controller.validate()
         self.assertTrue(f.controller.dsv41_remote)
         self.assertTrue(f.scheduler.enable_overlap)
+        self.assertTrue(
+            all(not layer._forward_hooks for layer in f.runner.model.model.layers)
+        )
+        trace = []
+        source = SimpleNamespace(enqueue=lambda *a, **kw: trace.append((a, kw)))
+        f.controller.plan = [source]
+        tail = f.runner.model.model.decoder_replay_tail
+
+        def full_forward(runner, fb):
+            self.assertIs(runner.model.model.decoder_replay_tail, tail)
+            for layer in runner.model.model.layers:
+                layer(torch.zeros(1))
+            self.assertFalse(trace)
+            return "full-forward"
+
+        event = SimpleNamespace(record=lambda stream: None)
+        with (
+            patch.object(torch.cuda, "Event", lambda: event),
+            patch.object(torch.cuda, "current_stream", lambda: None),
+        ):
+            self.assertEqual(
+                f.controller.forward(full_forward, f.runner, f.batch), "full-forward"
+            )
+        self.assertEqual(trace, [((f.controller.layers - 1, event), {"flush": True})])
+        self.assertIs(f.runner.model.model.decoder_replay_tail, tail)
         for handle in f.controller._layer_handles:
             handle.remove()
 

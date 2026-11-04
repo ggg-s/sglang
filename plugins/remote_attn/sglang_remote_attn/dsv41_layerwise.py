@@ -434,12 +434,13 @@ class DSV41Controller(Controller):
             layers = runner.model.model.layers
             if len(layers) != self.layers:
                 raise ValueError("DSV4.1 layerwise requires a complete PP=1 model")
-            for index, layer in enumerate(layers):
-                self._layer_handles.append(
-                    layer.register_forward_hook(
-                        functools.partial(self._after_layer, index)
+            if not self.dsv41_remote:
+                for index, layer in enumerate(layers):
+                    self._layer_handles.append(
+                        layer.register_forward_hook(
+                            functools.partial(self._after_layer, index)
+                        )
                     )
-                )
 
     def _schema(self, manager):
         return manifest(self.pool, manager.kv_args, self.hf_config)
@@ -787,9 +788,10 @@ class DSV41Controller(Controller):
         model = runner.model.model
         tail = model.decoder_replay_tail
         self.executing = jobs
-        # Native bounded-replay math stays enabled. Only its optional nested
-        # tail graph is bypassed so Python completion hooks run on this pass.
-        model.decoder_replay_tail = None
+        # Only layerwise needs Python producer callbacks. Remote uses one
+        # full-forward proof, including writes from native bounded-replay graphs.
+        if not self.dsv41_remote:
+            model.decoder_replay_tail = None
         try:
             result = original(runner, fb, *args, **kwargs)
             event = torch.cuda.Event()
@@ -811,5 +813,6 @@ class DSV41Controller(Controller):
                 )
             raise
         finally:
-            model.decoder_replay_tail = tail
+            if not self.dsv41_remote:
+                model.decoder_replay_tail = tail
             self.executing = None

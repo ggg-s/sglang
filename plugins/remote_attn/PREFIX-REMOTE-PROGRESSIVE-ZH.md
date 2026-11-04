@@ -119,3 +119,10 @@ TTFT/ITL/E2E、吞吐、KV高水位与回收。必须证明 **D首次decode早�
 
 本次仅本地测试，尚无真实 CUDA/RDMA PD 或性能验收；见
 [本地验证记录](validation/PREFIX-REMOTE-PROGRESSIVE-LOCAL.md)。
+
+## 最后 chunk 的计算边界
+
+`remote` 模式下，Qwen 与 DSV4.1 均完整执行最后 chunk，再进入该 chunk 的交接；
+Qwen 不再使用 split-prefill，DSV 不再安装逐层生产者 hook。历史前缀的有界传输
+仍可并行进行。Remote window 的传输分组和逐层/资源 Local 切换保持。
+详见 [计算边界与验证](validation/remote-final-forward-4060.md)。

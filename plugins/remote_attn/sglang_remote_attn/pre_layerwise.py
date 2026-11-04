@@ -662,7 +662,7 @@ class Controller:
             startup_signature(self.config),
             ("destination-cache-v1", "prefix-range-v1", prefix_enabled()),
             (
-                "sparse-fast-v1",
+                "sparse-fast-v2-full-prefill",
                 os.environ.get("HANDOFF_DSV41_FAST", "1"),
                 os.environ.get("HANDOFF_PREFIX_INFLIGHT", "2"),
             ),
@@ -704,7 +704,9 @@ class Controller:
             raise ValueError("pre-layerwise first supports Qwen3ForCausalLM only")
         if runner.lora_manager is not None:
             raise ValueError("pre-layerwise does not yet support LoRA")
-        if not callable(getattr(runner.model, "forward_split_prefill", None)):
+        if self.config.mode == "layerwise" and not callable(
+            getattr(runner.model, "forward_split_prefill", None)
+        ):
             raise ValueError("model has no split-prefill entry point")
         if s.kv_checksum_computer is not None:
             raise ValueError("pre-layerwise does not support whole-prefix KV checksums")
@@ -993,16 +995,29 @@ class Controller:
             return original(runner, fb, *args, **kwargs)
         jobs, self.plan = self.plan, None
         old_mode = fb.forward_mode
-        fb.forward_mode = ForwardMode.SPLIT_PREFILL
-        fb.split_index = 0
+        remote = self.config.mode == "remote"
+        if not remote:
+            fb.forward_mode = ForwardMode.SPLIT_PREFILL
+            fb.split_index = 0
         try:
-            for group_index in range(len(jobs[0][1])):
-                layers = jobs[0][1][group_index][0]
-                result = original(
-                    runner, fb, *args, **{**kwargs, "split_forward_count": len(layers)}
-                )
+            if remote:
+                # Remote overlaps decode with transfer, not this final forward
+                # with per-layer sends. Keep native execution and one proof for
+                # all final-chunk K/V; transfer grouping/receipts stay unchanged.
+                result = original(runner, fb, *args, **kwargs)
                 event = torch.cuda.Event()
                 event.record(torch.cuda.current_stream())
+            for group_index in range(len(jobs[0][1])):
+                layers = jobs[0][1][group_index][0]
+                if not remote:
+                    result = original(
+                        runner,
+                        fb,
+                        *args,
+                        **{**kwargs, "split_forward_count": len(layers)},
+                    )
+                    event = torch.cuda.Event()
+                    event.record(torch.cuda.current_stream())
                 for source, groups in jobs:
                     sender = source.req.disagg_kv_sender
                     sender.kv_mgr.add_transfer_request(
@@ -1026,7 +1041,8 @@ class Controller:
                     )
             return result
         finally:
-            fb.forward_mode = old_mode
+            if not remote:
+                fb.forward_mode = old_mode
 
     def retire_targets(self):
         from .transport_failure import TransportFailure, quarantine

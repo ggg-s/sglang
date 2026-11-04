@@ -236,3 +236,11 @@ P/D 的同 TP ranks 必须使用相同配置，启动共识会拒绝不一致。
 send-lock 等待时间。这些 worker 累计值不能当作单请求 TTFT。
 
 验证见 [4060 优化验证记录](validation/dsv41-fast-4060.md)。
+
+## 最后 chunk 完整计算
+
+Remote P 不安装逐层生产者 forward hook；最后 chunk 完整计算后，通过统一的
+forward event 进入现有 indexer/state/global 交接。串行路径保留原生 bounded-replay
+尾窗 CUDA graph，overlap 路径继续使用自己的完整 forward 证明。独立 `layerwise`
+模式仍保留逐层 hook。Remote window 内的传输分组、RPC 与逐资源 Local 不变。
+见 [4060 完成事件验证](validation/remote-final-forward-4060.md)。
