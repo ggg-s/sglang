@@ -1028,6 +1028,28 @@ class ReqKvInfo:
             lo = ceil_align(lo, page_size)
         return lo
 
+    def swa_live_ranges(self, page_size: int, end: int) -> list[tuple[int, int]]:
+        """Page-aligned private SWA actually owned below an insertion frontier.
+
+        Retention metadata can be trimmed without freeing the current native
+        window; neither it nor the eviction cursor alone describes ownership.
+        """
+        end = end // page_size * page_size
+        protected = self.cache_protected_len
+        dead_lo = self.swa_dead_lo(page_size)
+        dead_hi = max(dead_lo, self.get_evicted_seqlen(ComponentType.SWA))
+        candidates = [(protected, dead_lo), (dead_hi, end), *self.swa_retained_ranges]
+        merged = []
+        for lo, hi in sorted(candidates):
+            lo, hi = max(protected, lo), min(end, hi)
+            if lo >= hi:
+                continue
+            if merged and lo <= merged[-1][1]:
+                merged[-1] = (merged[-1][0], max(hi, merged[-1][1]))
+            else:
+                merged.append((lo, hi))
+        return merged
+
     @property
     def holds_kv(self) -> bool:
         return self.req_pool_idx is not None

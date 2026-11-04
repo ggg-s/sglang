@@ -1128,6 +1128,158 @@ def prefill_certificate_lifetimes(args, *, prefix_cache=False):
         overlap.retirement.close()
 
 
+def prefill_swa_quarantine(args):
+    """Real tree/allocator ownership with an asymmetric failure and TP quarantine."""
+    import importlib.util
+    import unittest
+    from contextlib import nullcontext
+
+    import torch
+    from sglang_remote_attn.pre_layerwise import Config, Controller
+    from sglang_remote_attn.prefill_overlap import SourceLease
+    from sglang_remote_attn.retirement import Retirement
+    from sglang_remote_attn.source_cache import CacheGuard
+    from sglang_remote_attn.transport_failure import quarantine, retain_release
+
+    root = Path(__file__).resolve().parents[3]
+    case = unittest.TestCase()
+
+    def load(name, path):
+        spec = importlib.util.spec_from_file_location(name, root / path)
+        mod = importlib.util.module_from_spec(spec)
+        case.enterContext(patch.dict(sys.modules, {name: mod}))
+        spec.loader.exec_module(mod)
+        return mod
+
+    load("sglang.srt.environ", "python/sglang/srt/environ.py")
+    fixture = load(
+        "remote_attn_native_cache",
+        "test/registered/unit/plugins/remote_attn_native_cache.py",
+    )
+    f = fixture.fixture(root, case)
+    owner = Controller.__new__(Controller)
+    owner.rank, owner.tp_size = args.rank, 2
+    owner.config = Config("layerwise", Path(args.output).with_suffix(".swa"))
+    outputs = []
+    owner.scheduler = SimpleNamespace(
+        attn_tp_cpu_group=dist.group.WORLD,
+        output_streamer=SimpleNamespace(stream_output=lambda *a: outputs.append(a)),
+        schedule_stream=SimpleNamespace(wait_stream=lambda stream: None),
+        forward_stream=object(),
+        device_module=SimpleNamespace(stream=lambda stream: nullcontext()),
+    )
+    guard = CacheGuard(f.cache, allow_swa=True, scheduler=owner.scheduler)
+    a = f.request(8192, finished=False)
+    a.bootstrap_room, a.return_logprob = 501, False
+    la = guard.hold(a)
+    f.extend(a, 8192)
+    f.cache.checkpoint(a, up_to=8192)
+    owner.scheduler.chunked_req = a
+    b = f.request(131332, finished=False)
+    lb = guard.hold(b)
+    for end in range(8192, 131073, 8192):
+        f.extend(b, end)
+        f.cache.checkpoint(b, up_to=end)
+    # This notification can occur between two TP scheduler boundaries.
+    if args.rank == 1:
+        retain_release(a, la, lambda: f.release(a))
+    ids = f.pool.req_to_token[a.kv.req_pool_idx, :8192]
+    saved = f.allocator.full_to_swa_index_mapping[ids].clone()
+    f.extend(b, 131332)
+    f.cache.checkpoint(b, up_to=131332)
+    assert torch.equal(saved, f.allocator.full_to_swa_index_mapping[ids])
+    states = [None, None]
+    dist.all_gather_object(
+        states,
+        (
+            a.kv.swa_retained_ranges,
+            b.kv.swa_retained_ranges,
+            f.allocator.swa_available_size(),
+        ),
+    )
+    assert states[0] == states[1], states
+    chunk = SimpleNamespace(
+        req=a,
+        sender=SimpleNamespace(
+            kv_mgr=SimpleNamespace(), poll=lambda: 0 if args.rank == 1 else 3
+        ),
+        check=lambda: None,
+    )
+    lease = SourceLease(None, chunk, 1, f"swa-{args.rank}", cache_lease=la)
+    lease.ledger.pending.add("unknown DMA")
+    owner.targets = [lease]
+    protocol = Retirement(owner)
+    protocol.register(lease)
+
+    def abort(req, *args, **kwargs):
+        req.finished = lambda: True
+
+    try:
+        with patch.dict(
+            sys.modules,
+            {
+                "sglang.srt.disaggregation.base.conn": SimpleNamespace(
+                    KVPoll=SimpleNamespace(Success=4, Failed=0)
+                ),
+                "sglang.srt.disaggregation.utils": SimpleNamespace(prepare_abort=abort),
+            },
+        ):
+            command = None
+            for _ in range(100):
+                protocol.observe()
+                message = [protocol.poll_command()]
+                dist.broadcast_object_list(message, src=0)
+                if message[0] is not None:
+                    command = message[0]
+                    break
+                time.sleep(0.005)
+            assert command is not None and command["kind"] == "quarantine"
+            before = (
+                set(f.allocator.full_attn_allocator.live),
+                set(f.allocator.swa_attn_allocator.live),
+            )
+            protocol.arm(command)
+            protocol.finalize()
+            # Repeated quarantine is not a retirement/completion proof either.
+            quarantine(owner, lease, "repeated quarantine")
+            assert before == (
+                f.allocator.full_attn_allocator.live,
+                f.allocator.swa_attn_allocator.live,
+            )
+            assert owner.scheduler._pending_chunked_abort_req is a
+            assert len(outputs) == 1 and not la.closed and not lease.closed
+            assert lease.ledger.pending == {"unknown DMA"}
+            b.finished = lambda: True
+            lb.retire(lambda: f.release(b, checkpoint=True))
+            f.ownership()
+            tree = sorted(
+                (
+                    len(n.key),
+                    None
+                    if n.component_data[1].value is None
+                    else len(n.component_data[1].value),
+                )
+                for n in f.cache.tree_core._node_arena.values()
+                if n.parent is not None
+            )
+            dist.all_gather_object(states, tree)
+            assert states[0] == states[1], states
+            f.cache.evict(f.ns["EvictParams"](num_tokens=300000, swa_num_tokens=35072))
+            f.ownership()
+            # Only A's explicitly quarantined pages remain; B leaked no pages.
+            assert len(f.allocator.full_attn_allocator.live) == 8192 // 256
+            assert torch.equal(saved, f.allocator.full_to_swa_index_mapping[ids])
+            return dict(
+                rank_states_agree=True,
+                healthy_fully_reclaimed=True,
+                quarantine_full_pages=len(f.allocator.full_attn_allocator.live),
+                quarantine_swa_pages=len(f.allocator.swa_attn_allocator.live),
+            )
+    finally:
+        protocol.close()
+        case.doCleanups()
+
+
 def prefill_staging_failure(args):
     """An asymmetric transport failure is isolated by one shared quarantine vote."""
     import time
@@ -2424,6 +2576,7 @@ def main():
         p_overlap = prefill_overlap_lifetimes(args)
         p_certificates = prefill_certificate_lifetimes(args)
         p_cached_certificates = prefill_certificate_lifetimes(args, prefix_cache=True)
+        p_swa_quarantine = prefill_swa_quarantine(args)
         p_staging_failure = prefill_staging_failure(args)
         d_receive_staging = receive_staging_consensus(args)
         sparse_remote = sparse_remote_lifetimes(args)
@@ -2448,6 +2601,7 @@ def main():
                     "p_overlap": p_overlap,
                     "p_certificates": p_certificates,
                     "p_cached_certificates": p_cached_certificates,
+                    "p_swa_quarantine": p_swa_quarantine,
                     "p_staging_failure": p_staging_failure,
                     "d_receive_staging": d_receive_staging,
                     "sparse_remote": sparse_remote,

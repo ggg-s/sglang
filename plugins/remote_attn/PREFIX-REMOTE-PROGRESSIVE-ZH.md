@@ -80,19 +80,30 @@ sender、peer 注册发生变化则保留页并报错，不能中途切回普通
 P 读租约期间不执行会去重、重绑定 FULL 页的 checkpoint。每个已计算 chunk
 保留页对齐的 SWA 尾窗（含一页回退余量），其余窗口外 SWA 仍可回收。暂存窗口由
 `ReqKvInfo.swa_retained_ranges` 记录；原生池计数、abort 和最终行释放都计入这些页。
-所有活跃 source 共用一个不超过 SWA 池四分之一的保留预算，超预算丢弃较旧窗口。
-缓存收益仍取决于窗口是否保留；不保证任意分叉点都命中。quarantine 和发布失败的
-所有者不会因其他请求的预算压力被回收。
+所有活跃 source 共用一个不超过 SWA 池四分之一的保留预算。其他 source 已记录的
+窗口先占预算，当前 source 只裁剪自己的较旧窗口；不按 rank 本地的 quarantine 或
+失败标记选择其他请求作淘汰对象。预算裁剪只释放已在原生驱逐游标之前的私有页，
+仍在原生窗口内的页即使移除了保留标记也继续存活。缓存收益取决于可用预算：已有
+source 占满预算时，新 source 可能无法保留中间窗口，不保证任意分叉点都命中。
 
 只有 GPU、native IO、Remote reader 与有序退休证明满足后，才按窗口终点顺序
 回放原生 checkpoint，再执行最终发布与行释放。这样保留中间分叉窗口，也避免
 `decoder_swa_bounded_replay` 裁剪匹配 key 后落在唯一最终尾窗之前：例如 N=32772、
 page=256、window=128，匹配终点是 32512，需要保留该位置之前的 SWA。
-无需关闭 bounded replay，也不绕过原生 FULL/SWA 组件校验。
+回放采用 `ReqKvInfo.swa_live_ranges` 合并原生存活区与保留窗口，通过显式
+`swa_checkpoint_start` 传入原生 checkpoint；不伪造请求的真实驱逐游标。核心验证
+该次插入接管范围内的全部私有 SWA，并阻止 unfinished checkpoint 再次滑动这个
+窗口。原生去重、锁转移和 FULL/SWA 组件插入继续执行。无需关闭 bounded replay。
+部分发布失败后保留剩余页和读租约，禁止重试释放；quarantine 同样不是完成证明，
+在未知 DMA 状态下保留的页不会被其他请求的预算淘汰当成可回收页。
 
-新插件依赖核心的暂存窗口计数与释放支持，预检会检查 `swa_retained_ranges` 字段；
-部署时一起更新核心与插件。本地覆盖原样重发、24K 分叉、131K、多 source 预算、
-overlap/在途 DMA/Remote 屏障、abort 与发布失败；H20 数值和性能仍需实机验收。
+新插件依赖核心的暂存窗口计数、释放和显式发布接口，预检检查字段、方法及参数；
+部署时一起更新核心与插件。CPU 回归直接执行原生 checkpoint/insert、FULL/SWA
+组件、去重修复与淘汰，以物理页账本核对树和请求行所有权，覆盖原样重发、24K
+分叉、131K、预算裁剪、overlap/DMA/Remote 屏障、abort 和部分回放失败。双进程
+Gloo 测试覆盖单 rank 提前观察到失败、预算压力与 TP quarantine，确认健康请求
+发布和回收一致、隔离请求的页仍保留。GPU 事件和 RDMA 在 CPU 测试中为受控边界；
+H20 实际流依赖、数值和性能仍需实机验收。
 
 ## 验收
 

@@ -14,6 +14,13 @@ STAGING = DISAGG + "common.staging_handler."
 # Explicit optional parameters are required: **kwargs can silently discard them.
 # Values pin the native, feature-disabled defaults as well as keyword support.
 CORE_CALLS = {
+    "sglang.srt.mem_cache.unified_radix_cache.UnifiedRadixCache.checkpoint_into_tree": {
+        "swa_checkpoint_start": None
+    },
+    "sglang.srt.managers.schedule_batch.ReqKvInfo.swa_live_ranges": {
+        "page_size": inspect.Parameter.empty,
+        "end": inspect.Parameter.empty,
+    },
     "sglang.srt.mem_cache.common.free_kv_row_segments": {"swa_retained_ranges": ()},
     DISAGG + "decode.DecodeTransferQueue._commit_transfer_to_req": {
         "keep_receiver": False

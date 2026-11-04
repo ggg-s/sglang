@@ -1154,7 +1154,14 @@ class UnifiedRadixCache(BasePrefixCache):
             return
         self.checkpoint_into_tree(req, up_to=up_to, **kwargs)
 
-    def checkpoint_into_tree(self, req: Req, *, up_to: int, **kwargs) -> None:
+    def checkpoint_into_tree(
+        self,
+        req: Req,
+        *,
+        up_to: int,
+        swa_checkpoint_start: Optional[int] = None,
+        **kwargs,
+    ) -> None:
         """Insert ``[cache_protected_len, up_to)`` of the request's record and
         move its tree lock onto the node the insert ended on."""
         # A finished request hands its component state (mamba) to the tree
@@ -1201,8 +1208,28 @@ class UnifiedRadixCache(BasePrefixCache):
             cache_salt=req.cache_salt,
         )
 
+        if swa_checkpoint_start is not None:
+            # Explicit source-retirement publication: the caller has fenced all
+            # GPU/IO readers and selected one contiguous PRIVATE live interval.
+            # Never change the request's real eviction cursor or slide this
+            # interval before insertion. Otherwise live pages can become FULL
+            # tree-owned without their SWA being adopted or freed as duplicates.
+            page_end = len(radix_key) // self.page_size * self.page_size
+            if (
+                self.tree_components != (ComponentType.FULL, ComponentType.SWA)
+                or swa_checkpoint_start < req.kv.cache_protected_len
+                or swa_checkpoint_start % self.page_size
+                or req.kv.swa_live_ranges(self.page_size, page_end)
+                != [(swa_checkpoint_start, page_end)]
+            ):
+                raise ValueError(
+                    "SWA checkpoint must cover every private live page below its frontier"
+                )
+            insert_params.set_evicted_seqlen(ComponentType.SWA, swa_checkpoint_start)
+
         if (
             not is_finished
+            and swa_checkpoint_start is None
             and envs.SGLANG_OPT_UNIFIED_CACHE_FREE_OUT_OF_WINDOW_SLOTS.get()
         ):
             # The frontier lands a page below page_floor(pre_len + 1), which has to

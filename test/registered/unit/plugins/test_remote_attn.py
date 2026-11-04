@@ -5218,6 +5218,16 @@ class TestRemoteAttn(CustomTestCase):
             rows[0]["d_receive_staging"],
             dict(polls=[[3], [3], [4], [0]], native_collective_shapes=[1, 1, 1, 1]),
         )
+        self.assertEqual(rows[0]["p_swa_quarantine"], rows[1]["p_swa_quarantine"])
+        self.assertEqual(
+            rows[0]["p_swa_quarantine"],
+            dict(
+                rank_states_agree=True,
+                healthy_fully_reclaimed=True,
+                quarantine_full_pages=32,
+                quarantine_swa_pages=2,
+            ),
+        )
         self.assertEqual(rows[0]["p_staging_failure"], rows[1]["p_staging_failure"])
         self.assertEqual(
             rows[0]["p_staging_failure"],
@@ -6148,6 +6158,232 @@ class TestRemoteAttn(CustomTestCase):
             device_module=SimpleNamespace(stream=lambda stream: nullcontext()),
         )
 
+    def _native_source_swa(self):
+        path = ROOT / "test/registered/unit/plugins/remote_attn_native_cache.py"
+        spec = importlib.util.spec_from_file_location("remote_attn_native_cache", path)
+        module = importlib.util.module_from_spec(spec)
+        sys.modules[spec.name] = module
+        spec.loader.exec_module(module)
+        return module.fixture(ROOT, self)
+
+    def test_source_native_swa_merged_windows_publish_then_return_all_pages(self):
+        from sglang_remote_attn.source_cache import CacheGuard
+
+        for finished in (False, True):
+            for prompt in (32772, 33028):
+                with self.subTest(finished=finished, prompt=prompt):
+                    f = self._native_source_swa()
+                    guard = CacheGuard(
+                        f.cache, allow_swa=True, scheduler=self._swa_scheduler()
+                    )
+                    req = f.request(prompt, finished=False)
+                    lease = guard.hold(req)
+                    for end in (8192, 16384, 24576, 32768, prompt):
+                        f.extend(req, end)
+                        f.cache.checkpoint(req, up_to=end)
+                        f.ownership()
+                        self.assertEqual(f.cache.tree_core.root_node.children, {})
+                    cursor = req.kv.max_evicted_seqlen
+                    req.finished = lambda: finished
+                    lease.retire(lambda: None)
+                    self.assertGreaterEqual(req.kv.max_evicted_seqlen, cursor)
+                    f.ownership()
+                    f.release(req)
+                    identical = f.request(prompt, match=True)
+                    self.assertEqual(identical.prefix_len, (prompt - 128) // 256 * 256)
+                    f.extend(identical, prompt)
+                    f.release(identical, checkpoint=True)
+                    ids = list(range(24576)) + list(
+                        range(100000, 100000 + prompt - 24576)
+                    )
+                    branch = f.request(prompt, tokens=ids, match=True)
+                    self.assertEqual(branch.prefix_len, 24576)
+                    f.extend(branch, prompt)
+                    f.release(branch, checkpoint=True)
+                    f.evict_all()
+
+    def test_source_native_swa_abort_and_partial_replay_failure(self):
+        from sglang_remote_attn.source_cache import CacheGuard
+
+        for abort in (True, False):
+            with self.subTest(abort=abort):
+                f = self._native_source_swa()
+                guard = CacheGuard(
+                    f.cache, allow_swa=True, scheduler=self._swa_scheduler()
+                )
+                req = f.request(finished=False)
+                lease = guard.hold(req)
+                for end in (8192, 16384, 24576, 32768, 32772):
+                    f.extend(req, end)
+                    f.cache.checkpoint(req, up_to=end)
+                if abort:
+                    f.cache.finish(
+                        req.cache_request_handle, f.ns["CacheRequestOutcome"].ABORT
+                    )
+                    lease.retire(lambda: f.release(req, checkpoint=True))
+                    f.evict_all()
+                else:
+                    original = guard.checkpoint
+
+                    def checkpoint(req, **kwargs):
+                        if kwargs["up_to"] == 16384:
+                            raise RuntimeError("injected second insert failure")
+                        return original(req, **kwargs)
+
+                    guard.checkpoint = checkpoint
+                    cursor = req.kv.max_evicted_seqlen
+                    with self.assertRaisesRegex(RuntimeError, "second insert failure"):
+                        lease.retire(lambda: self.fail("released failed replay"))
+                    self.assertTrue(lease.failed)
+                    self.assertEqual(req.kv.cache_protected_len, 8192)
+                    self.assertEqual(req.kv.max_evicted_seqlen, cursor)
+                    f.ownership()
+                before = (
+                    set(f.allocator.full_attn_allocator.live),
+                    set(f.allocator.swa_attn_allocator.live),
+                )
+                with self.assertRaisesRegex(RuntimeError, "no longer usable"):
+                    lease.retire(lambda: self.fail("retried release"))
+                self.assertEqual(
+                    before,
+                    (
+                        f.allocator.full_attn_allocator.live,
+                        f.allocator.swa_attn_allocator.live,
+                    ),
+                )
+
+    def test_source_native_swa_budget_trim_keeps_unmarked_live_native_tail(self):
+        from sglang_remote_attn.source_cache import CacheGuard
+
+        f = self._native_source_swa()
+        guard = CacheGuard(f.cache, allow_swa=True, scheduler=self._swa_scheduler())
+        # Reserve 33 pages in another owner, leaving one page in the global
+        # 34-page budget. Its SWA is physically alive, not synthetic metadata.
+        req = f.request(8192, finished=False)
+        lease = guard.hold(req)
+        other = f.request(8448, finished=False)
+        held = guard.hold(other)
+        f.extend(other, 8448)
+        other.kv.swa_retained_ranges = [(0, 8448)]
+        f.extend(req, 8192)
+        f.cache.checkpoint(req, up_to=8192)
+        self.assertEqual(req.kv.swa_retained_ranges, [(7936, 8192)])
+        self.assertEqual(req.kv.max_evicted_seqlen, 7680)
+        req.finished = lambda: True
+        lease.retire(lambda: f.release(req, checkpoint=True))
+        held.abort = True
+        held.retire(lambda: f.release(other))
+        f.evict_all()
+
+    def test_source_native_swa_dedup_and_locked_full_repair_return_every_page(self):
+        from sglang_remote_attn.source_cache import CacheGuard
+
+        f = self._native_source_swa()
+        guard = CacheGuard(f.cache, allow_swa=True, scheduler=self._swa_scheduler())
+
+        def run():
+            req = f.request(32772, finished=False)
+            lease = guard.hold(req)
+            for end in (8192, 16384, 24576, 32768, 32772):
+                f.extend(req, end)
+                f.cache.checkpoint(req, up_to=end)
+            req.finished = lambda: True
+            lease.retire(lambda: f.release(req, checkpoint=True))
+            return req
+
+        cold = run()
+        baseline = set(f.allocator.full_attn_allocator.live)
+        run()  # A pipelined miss computed a duplicate of an already inserted key.
+        self.assertEqual(f.allocator.full_attn_allocator.live, baseline)
+        lock = f.cache.lock(cold.last_node)
+        f.cache.evict(f.ns["EvictParams"](swa_num_tokens=35072))
+        f.ownership()
+        run()  # Repair SWA tombstones without replacing another reader's FULL.
+        self.assertEqual(f.allocator.full_attn_allocator.live, baseline)
+        f.cache.unlock(lock)
+        f.evict_all()
+
+    def test_source_native_swa_explicit_checkpoint_rejects_omitted_live_pages(self):
+        from sglang_remote_attn.source_cache import CacheGuard
+
+        f = self._native_source_swa()
+        guard = CacheGuard(f.cache, allow_swa=True, scheduler=self._swa_scheduler())
+        req = f.request(8192, finished=False)
+        lease = guard.hold(req)
+        f.extend(req, 8192)
+        f.cache.checkpoint(req, up_to=8192)
+        before = (
+            set(f.allocator.full_attn_allocator.live),
+            set(f.allocator.swa_attn_allocator.live),
+        )
+        with self.assertRaisesRegex(ValueError, "every private live page"):
+            guard.checkpoint(req, up_to=8192, swa_checkpoint_start=7936)
+        self.assertEqual(
+            before,
+            (f.allocator.full_attn_allocator.live, f.allocator.swa_attn_allocator.live),
+        )
+        lease.abort = True
+        lease.retire(lambda: f.release(req))
+        f.evict_all()
+
+    def test_source_native_swa_rank_local_quarantine_does_not_change_budget_or_tree(
+        self,
+    ):
+        from sglang_remote_attn.source_cache import CacheGuard
+        from sglang_remote_attn.transport_failure import retain_release
+
+        states = []
+        for rank in (0, 1):
+            f = self._native_source_swa()
+            guard = CacheGuard(f.cache, allow_swa=True, scheduler=self._swa_scheduler())
+            a = f.request(8192, finished=False)
+            la = guard.hold(a)
+            f.extend(a, 8192)
+            f.cache.checkpoint(a, up_to=8192)
+            b = f.request(131332, finished=False)
+            lb = guard.hold(b)
+            for end in range(8192, 131073, 8192):
+                f.extend(b, end)
+                f.cache.checkpoint(b, up_to=end)
+            a_pages = set(f.pool.req_to_token[a.kv.req_pool_idx, :8192].tolist())
+            a_mapping = f.allocator.full_to_swa_index_mapping[
+                list(sorted(a_pages))
+            ].clone()
+            if rank == 0:
+                retain_release(a, la, lambda: None)
+            f.extend(b, 131332)
+            f.cache.checkpoint(b, up_to=131332)
+            self.assertTrue(
+                torch.equal(
+                    a_mapping,
+                    f.allocator.full_to_swa_index_mapping[list(sorted(a_pages))],
+                )
+            )
+            states.append(
+                (
+                    list(a.kv.swa_retained_ranges),
+                    list(b.kv.swa_retained_ranges),
+                    f.allocator.swa_available_size(),
+                )
+            )
+            b.finished = lambda: True
+            lb.retire(lambda: f.release(b, checkpoint=True))
+            f.ownership()
+            tree = sorted(
+                (
+                    len(n.key),
+                    None
+                    if n.component_data[1].value is None
+                    else len(n.component_data[1].value),
+                )
+                for n in f.cache.tree_core._node_arena.values()
+                if n.parent is not None
+            )
+            states[-1] += (tree,)
+            # A remains quarantined/held; do not invent a completion to release it.
+            self.assertFalse(la.closed)
+        self.assertEqual(states[0], states[1])
+
     def _source_swa_windows(self, prompt=32772, capacity=35072):
         """Real core eviction/accounting/row free; observe publication at retirement."""
         from sglang_remote_attn.source_cache import CacheGuard
@@ -6155,6 +6391,7 @@ class TestRemoteAttn(CustomTestCase):
 
         ceil_align = lambda n, p: (n + p - 1) // p * p
         self.Kv.swa_dead_lo.__globals__["ceil_align"] = ceil_align
+        self.Kv.swa_live_ranges.__globals__["ComponentType"] = ComponentType
         native_free = _source_function(
             "mem_cache/common.py",
             "free_swa_out_of_window_slots",
@@ -6221,12 +6458,15 @@ class TestRemoteAttn(CustomTestCase):
 
         cache.evict_sliding_windows = evict
 
-        def checkpoint(req, *, up_to):
-            # Native final checkpoint independently evicts before inserting.
-            evict(req, up_to - 1)
+        def checkpoint(req, *, up_to, swa_checkpoint_start=None):
+            if swa_checkpoint_start is None:
+                evict(req, up_to - 1)
             end = up_to // 256 * 256
             start = max(
-                req.kv.cache_protected_len, req.kv.get_evicted_seqlen(ComponentType.SWA)
+                req.kv.cache_protected_len,
+                req.kv.get_evicted_seqlen(ComponentType.SWA)
+                if swa_checkpoint_start is None
+                else swa_checkpoint_start,
             )
             live = rows[req.kv.req_pool_idx, start:end]
             self.assertFalse(set(live.tolist()) & freed, "publishing already freed SWA")
@@ -6484,10 +6724,10 @@ class TestRemoteAttn(CustomTestCase):
         old_cursor = req.kv.max_evicted_seqlen
         native = f.guard.checkpoint
 
-        def fail(req, *, up_to):
+        def fail(req, *, up_to, **kwargs):
             if up_to == 16384:
                 raise RuntimeError("insertion failed")
-            return native(req, up_to=up_to)
+            return native(req, up_to=up_to, **kwargs)
 
         f.guard.checkpoint = fail
         with self.assertRaisesRegex(RuntimeError, "insertion failed"):
@@ -6498,6 +6738,86 @@ class TestRemoteAttn(CustomTestCase):
         self.assertEqual(f.footprint(req.kv, 256), actual)
         with self.assertRaisesRegex(RuntimeError, "no longer usable"):
             lease.retire(lambda: self.fail("retried failed publication"))
+
+    def test_source_native_swa_windows_wait_for_overlap_dma_remote_and_retirement(self):
+        from sglang_remote_attn.source_cache import CacheGuard
+
+        f = self._native_source_swa()
+        guard = CacheGuard(f.cache, allow_swa=True, scheduler=self._swa_scheduler())
+        req = f.request(finished=False)
+        cache_lease = guard.hold(req)
+        for end in (8192, 16384, 24576, 32768, 32772):
+            f.extend(req, end)
+            f.cache.checkpoint(req, up_to=end)
+        native = self._dsv41_overlap_fixture()
+        req.rid, req.bootstrap_room = native.req.rid, native.req.bootstrap_room
+        req.disagg_kv_sender = native.req.disagg_kv_sender
+        gpu, remote = threading.Event(), threading.Event()
+        source = SimpleNamespace(
+            error=None,
+            finalized=True,
+            owner=SimpleNamespace(dsv41_remote=True),
+            service=None,
+            remote_closed=remote,
+            indices_keepalive=object(),
+        )
+        source.retire = lambda: cache_lease.retire(source.release)
+        lease = native.po.SourceLease(
+            native.overlap,
+            native.po.Chunk(
+                req, req.disagg_kv_sender, req.cache_request_handle, 0, 0, 32772, True
+            ),
+            1,
+            "swa-window-proof",
+            source=source,
+            cache_lease=cache_lease,
+            finalized=True,
+            release=lambda: f.release(req),
+        )
+        plan = SimpleNamespace(
+            error=None,
+            proof=SimpleNamespace(ready=lambda: True),
+            forward_done=SimpleNamespace(query=gpu.is_set),
+            indices_refs=[],
+        )
+        lease.plans.append(plan)
+        lease.ledger.pending.add("dma")
+        native.overlap.leases.append(lease)
+        native.overlap.retirement.register(lease)
+        native.native_status[0] = native.polls.Success
+
+        def snapshot():
+            f.ownership()
+            return (
+                set(f.allocator.full_attn_allocator.live),
+                set(f.allocator.swa_attn_allocator.live),
+            )
+
+        before = snapshot()
+        with patch.dict(sys.modules, native.modules):
+            for complete in (lambda: None, gpu.set, lease.ledger.pending.clear):
+                complete()
+                self.assertFalse(lease.ready_to_finish())
+                with self.assertRaisesRegex(RuntimeError, "proof is incomplete"):
+                    lease.finish()
+                self.assertEqual(snapshot(), before)
+                self.assertEqual(f.cache.tree_core.root_node.children, {})
+            remote.set()
+            self.assertTrue(lease.ready_to_finish())
+            self.assertEqual(f.cache.tree_core.root_node.children, {})
+            native.overlap.poll()
+            command = native.overlap.retirement.poll_command()
+            self.assertIsNotNone(command)
+            self.assertEqual(f.cache.tree_core.root_node.children, {})
+            native.overlap.retirement.arm(command)
+            native.overlap.retirement.finalize()
+        self.assertTrue(cache_lease.closed)
+        self.assertTrue(lease.closed)
+        self.assertFalse(req.kv.holds_kv)
+        f.ownership()
+        # Repeated finalization cannot replay checkpoints or release twice.
+        native.overlap.retirement.finalize()
+        f.evict_all()
 
     def test_source_swa_windows_wait_for_overlap_dma_remote_and_retirement(self):
         f = self._source_swa_windows()
@@ -12349,6 +12669,11 @@ class TestRemoteAttn(CustomTestCase):
                 "up_to",
             ),
             ("sglang.srt.mem_cache.base_prefix_cache.BasePrefixCache.finish", "handle"),
+            (
+                "sglang.srt.mem_cache.unified_radix_cache.UnifiedRadixCache.checkpoint_into_tree",
+                "swa_checkpoint_start",
+            ),
+            ("sglang.srt.managers.schedule_batch.ReqKvInfo.swa_live_ranges", "end"),
             ("decode.DecodeTransferQueue._commit_transfer_to_req", "keep_receiver"),
             ("decode.DecodePreallocQueue._match_prefix_and_lock", "req"),
             ("decode.DecodePreallocQueue._pre_alloc", "prefix_indices"),
@@ -12496,7 +12821,18 @@ class TestRemoteAttn(CustomTestCase):
 
         for function in (discards_flag, changes_native_default, positional_only):
             with self.subTest(function=function.__name__):
-                with self.assertRaisesRegex(RuntimeError, "keep_receiver"):
+                with (
+                    patch.dict(
+                        self.interfaces.CORE_CALLS,
+                        {
+                            "sglang.srt.disaggregation.decode.DecodeTransferQueue._commit_transfer_to_req": {
+                                "keep_receiver": False
+                            }
+                        },
+                        clear=True,
+                    ),
+                    self.assertRaisesRegex(RuntimeError, "keep_receiver"),
+                ):
                     self.check.check_runtime_interfaces(resolve=lambda target: function)
 
     def test_prelayer_runtime_preflight_checks_loaded_fields_and_state(self):
