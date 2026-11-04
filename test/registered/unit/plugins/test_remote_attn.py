@@ -15041,6 +15041,480 @@ class TestRemoteAttn(CustomTestCase):
             self.assertNotEqual(old, b.config.directory)
             self.assertTrue((directory / "control/P0/instance.lock").exists())
 
+    def _d2d_env(self, ratio=2, **kwargs):
+        import importlib.util
+        import sys
+
+        folder = ROOT / "test/manual/remote_attn"
+        self.enterContext(
+            patch.dict(
+                sys.modules,
+                {"dsv41_remote_probe_support": self._dsv41_remote_support()},
+            )
+        )
+        for name in ("flash0731_probe_support", "dsv_d2d_probe_support"):
+            spec = importlib.util.spec_from_file_location(name, folder / (name + ".py"))
+            module = importlib.util.module_from_spec(spec)
+            self.enterContext(patch.dict(sys.modules, {name: module}))
+            spec.loader.exec_module(module)
+        env = module.Environment(ROOT, "cpu", ratio, **kwargs)
+        self.addCleanup(env.close)
+        return env
+
+    def test_dsv_d2d_remote_commit_before_bulk_and_source_released_only_after_readers(
+        self,
+    ):
+        from sglang_remote_attn import dsv_d2d as d2d
+
+        e = self._d2d_env()
+        meta = e.freeze()
+        self.assertEqual(meta["sampling"]["stop_token_ids"], [999])
+        e.import_(meta)
+        self.assertTrue(e.blocked.wait(3))
+        source = e.source.d2d_sources[e.epoch]
+        target = e.target.d2d_targets[e.epoch]
+        self.assertFalse(target.copied)
+        self.assertIsNot(target.bulk_reader, target.reader)
+        self.assertFalse(source.poll())
+        self.assertEqual(e.command(e.target, "d2d_commit")["admitted"], True)
+        self.assertEqual(e.resumed[-1][1][0].output_ids, meta["output_ids"])
+        self.assertTrue(source.committed)
+        with self.assertRaisesRegex(ValueError, "owns generation"):
+            e.command(e.source, "d2d_resume")
+        self.assertFalse(e.freed)
+        proof = [False]
+        target.forward_proofs.append(SimpleNamespace(ready=lambda: proof[0]))
+        e.gate.set()
+        e.wait_copy()
+        self.assertFalse(target.ready_to_finish())
+        self.assertFalse(source.poll())
+        proof[0] = True
+        e.target.drain_targets(required=target)
+        deadline = time.monotonic() + 3
+        while not source.poll():
+            self.assertLess(time.monotonic(), deadline)
+            time.sleep(0.001)
+        self.assertFalse(e.freed)
+        source.retire()
+        source.retire()
+        self.assertEqual(e.freed, ["source"])
+        self.assertFalse(
+            target.rpc._sparse_page_maps
+            if hasattr(target.rpc, "_sparse_page_maps")
+            else {}
+        )
+
+    def test_dsv_d2d_native_scheduler_poll_and_shutdown_reap_source_once(self):
+        from sglang_remote_attn import dsv_d2d as d2d
+
+        e = self._d2d_env()
+        e.import_(e.freeze())
+        target = e.target.d2d_targets[e.epoch]
+        e.command(e.target, "d2d_commit")
+        e.gate.set()
+        e.wait_copy()
+        e.target.drain_targets(required=target)
+        with patch.dict(
+            sys.modules,
+            {
+                "sglang.srt.managers.schedule_batch": SimpleNamespace(
+                    FINISH_LENGTH=object
+                )
+            },
+        ):
+            d2d.drain_sources(e.source)
+            d2d.drain_sources(e.source)
+        self.assertEqual(e.freed, ["source"])
+        self.assertFalse(e.source.sources)
+        self.assertFalse(e.target.targets)
+        self.assertFalse(e.target.decode_overlap.retirement.registered)
+
+    def test_dsv_d2d_parent_retirement_supersedes_resource_events_safely(self):
+        e = self._d2d_env()
+        e.import_(e.freeze())
+        target = e.target.d2d_targets[e.epoch]
+        e.command(e.target, "d2d_commit")
+        e.gate.set()
+        e.wait_copy()
+        # A canonical parent-only command can supersede resource notifications.
+        e.target.decode_overlap.retirement.drain(target)
+        self.assertTrue(target.closed)
+        self.assertFalse(target.events)
+        self.assertIsNone(target.copy_stream)
+        for resource in target.resources:
+            self.assertTrue(resource.ready_to_finish())
+            e.target.decode_overlap.retirement.drain(resource)
+        self.assertFalse(e.target.targets)
+        self.assertFalse(e.target.decode_overlap.retirement.registered)
+
+    def test_dsv_d2d_prepared_cancel_then_source_resume_never_double_frees(self):
+        e = self._d2d_env()
+        meta = e.freeze()
+        e.import_(meta)
+        target = e.target.d2d_targets[e.epoch]
+        e.gate.set()
+        e.wait_copy()
+        result = e.command(e.target, "d2d_abort")
+        self.assertTrue(result["aborted"])
+        e.target.drain_targets(required=target)
+        self.assertEqual(e.freed, ["target"])
+        self.assertTrue(e.command(e.target, "d2d_abort")["closed"])
+        deadline = time.monotonic() + 3
+        while not e.command(e.source, "d2d_resume")["resumed"]:
+            self.assertLess(time.monotonic(), deadline)
+            time.sleep(0.001)
+        self.assertFalse(e.req._handoff_frozen)
+        self.assertTrue(e.req.kv.holds_kv)
+        self.assertEqual(e.freed, ["target"])
+        with self.assertRaisesRegex(ValueError, "aborted"):
+            e.command(e.target, "d2d_commit")
+
+    def test_dsv_d2d_rejects_schema_or_epoch_before_allocating_target(self):
+        e = self._d2d_env()
+        meta = e.freeze()
+        bad = copy.deepcopy(meta)
+        bad["schema"]["page_size"] += 1
+        with self.assertRaisesRegex(ValueError, "schema mismatch"):
+            e.import_(bad)
+        self.assertFalse(e.target.d2d_targets)
+        bad = copy.deepcopy(meta)
+        bad["epoch"] = "stale"
+        with self.assertRaisesRegex(ValueError, "epoch/TP"):
+            e.import_(bad)
+        e.import_(meta)
+        self.assertTrue(e.import_(meta)["duplicate"])
+
+    def test_dsv_d2d_native_state_handoff_preserves_pending_blocks(self):
+        from sglang_remote_attn.dsv_d2d import state_rows
+
+        for ratio in (2, 4, 128):
+            with self.subTest(ratio=ratio):
+                e = self._d2d_env(ratio)
+                meta = e.freeze()
+                src = state_rows(e.source, e.req, e.prefix)
+                e.import_(meta)
+                target = e.target.d2d_targets[e.epoch]
+                dst = state_rows(e.target, target.decode_req.req, e.prefix)
+                self.assertEqual([d for d, _, _ in src], [d for d, _, _ in dst])
+                for (_, a, ai), (_, b, bi) in zip(src, dst):
+                    self.assertTrue(torch.equal(a[ai.long()], b[bi.long()]))
+                self.assertTrue(e.blocked.wait(3))
+                self.assertFalse(target.copied)
+                self.assertTrue(e.command(e.target, "d2d_commit")["admitted"])
+                e.gate.set()
+                e.wait_copy()
+
+    def test_dsv_d2d_raw_c128_ring_handoff_uses_native_request_page(self):
+        from sglang_remote_attn.dsv_d2d import state_rows
+
+        e = self._d2d_env(128, online_c128=False)
+        meta = e.freeze()
+        e.import_(meta)
+        req = e.target.d2d_targets[e.epoch].decode_req.req
+        src = [
+            x
+            for x in state_rows(e.source, e.req, e.prefix)
+            if x[0]["kind"] == "request"
+        ]
+        dst = [
+            x for x in state_rows(e.target, req, e.prefix) if x[0]["kind"] == "request"
+        ]
+        self.assertEqual(src[0][0]["stride"], 128 * 16 * 4)
+        self.assertEqual(src[0][2].tolist(), [0])
+        self.assertEqual(dst[0][2].tolist(), [1])
+        self.assertTrue(torch.equal(src[0][1][0], dst[0][1][1]))
+
+    def test_dsv_d2d_native_incremental_detokenization_keeps_output_cursor(self):
+        e = self._d2d_env()
+        e.req.decoded_text = "already emitted"
+        e.req.surr_offset, e.req.read_offset = 2, 4
+        e.req.cur_decode_ids_len = len(e.req.output_ids)
+        e.req.surr_and_decode_ids = array("q", [7, 8, *e.req.output_ids])
+        e.import_(e.freeze())
+        req = e.target.d2d_targets[e.epoch].decode_req.req
+        req.output_ids.append(34)
+        req.output_ids_through_stop = req.output_ids
+        cls = _source_class(
+            "managers/schedule_batch.py", "Req", {"init_incremental_detokenize"}
+        )
+        ids, offset = cls.init_incremental_detokenize(req)
+        self.assertEqual(req.decoded_text, "already emitted")
+        self.assertEqual(list(ids), [7, 8, 31, 32, 33, 34])
+        self.assertEqual(offset, 2)
+        self.assertEqual(req.cur_decode_ids_len, 4)
+
+    def test_dsv_d2d_native_prebuilt_replays_pending_token_without_resampling(self):
+        e = self._d2d_env()
+        e.import_(e.freeze())
+        req = e.target.d2d_targets[e.epoch].decode_req.req
+        req.skip_radix_cache_insert = False
+        req.extend_end = e.prefix
+        req.swa_branching_seqlen = None
+        checkpoint = _source_function("mem_cache/common.py", "checkpoint_kv_cache")
+        cls = _source_class(
+            "disaggregation/decode_schedule_batch_mixin.py",
+            "ScheduleBatchDisaggregationDecodeMixin",
+            {"process_prebuilt"},
+        )
+        cls.process_prebuilt.__globals__.update(
+            checkpoint_kv_cache=checkpoint,
+            async_h2d=lambda data, **kw: torch.tensor(data, dtype=kw["dtype"]),
+            RelayPayload=SimpleNamespace,
+        )
+        batch = cls()
+        batch.reqs, batch.device = [req], "cpu"
+        batch.req_pool_indices = torch.tensor([1])
+        checkpoints, relays = [], []
+        batch.tree_cache = SimpleNamespace(
+            checkpoint=lambda r, **kw: checkpoints.append((r, kw["up_to"]))
+        )
+        batch.spec_algorithm = SimpleNamespace(build_disagg_draft_input=lambda *a: None)
+        outputs = list(req.output_ids)
+        batch.process_prebuilt(
+            SimpleNamespace(stash=lambda rows, payload: relays.append((rows, payload)))
+        )
+        self.assertEqual(req.output_ids, outputs)
+        self.assertEqual(checkpoints, [(req, e.prefix)])
+        self.assertEqual(relays[0][1].bonus_tokens.tolist(), [outputs[-1]])
+        self.assertEqual(req.prefix_len, e.prefix)
+        self.assertIsNone(batch.input_ids)
+
+    def test_dsv_d2d_quarantine_cannot_bypass_source_or_target_fences(self):
+        from sglang_remote_attn import dsv_d2d as d2d
+
+        e = self._d2d_env()
+        e.import_(e.freeze())
+        target = e.target.d2d_targets[e.epoch]
+        e.req._remote_attn_transport_quarantine = {"items": []}
+        target.decode_req.req._remote_attn_transport_quarantine = {"items": []}
+        with self.assertRaisesRegex(d2d.TransportFailure, "quarantine"):
+            e.command(e.target, "d2d_abort")
+        with self.assertRaisesRegex(ValueError, "owns generation"):
+            e.command(e.source, "d2d_resume")
+        with self.assertRaises(d2d.TransportFailure):
+            e.source.d2d_sources[e.epoch].poll()
+        self.assertFalse(e.freed)
+        self.assertTrue(e.req.kv.holds_kv)
+        e.gate.set()
+
+    def test_dsv_d2d_cancel_waits_for_source_reader_without_false_quarantine(self):
+        e = self._d2d_env()
+        meta = e.freeze()
+        source = e.source.d2d_sources[e.epoch]
+        ctx = e.hub.registry.acquire(
+            meta["route"]["handoff_id"], meta["route"]["epoch"]
+        )
+        source.aborted = True
+        e.hub.registry.release(ctx.handoff_id, expected_req=e.req)
+        self.assertFalse(source.poll())
+        self.assertFalse(e.freed)
+        e.hub.registry.release_ref(ctx.handoff_id, ctx.owner_epoch)
+        self.assertTrue(source.remote_closed.is_set())
+        self.assertFalse(source.poll())
+        e.req._handoff_transfer_unsafe = True
+        from sglang_remote_attn import dsv_d2d as d2d
+
+        with self.assertRaises(d2d.TransportFailure):
+            source.poll()
+        self.assertFalse(e.freed)
+
+    def test_dsv_d2d_resume_and_cancel_wait_for_real_socket_copy_reader(self):
+        from sglang_remote_attn import dsv_d2d as d2d
+
+        e = self._d2d_env()
+        meta = e.freeze()
+        entered, release = threading.Event(), threading.Event()
+        self.addCleanup(release.set)
+        actual = d2d.execute
+
+        def execute(job, stream, cache):
+            if (
+                job.header.get("dsv_d2d") == "read"
+                and job.header.get("kind") == "global"
+                and job.ctx.dsv41_source.schema["entries"][job.header["entry"]][0]
+                == "kv"
+            ):
+                entered.set()
+                if not release.wait(5):
+                    raise TimeoutError("actual D2D read gate")
+            return actual(job, stream, cache)
+
+        with patch.object(d2d, "execute", execute):
+            e.import_(meta)
+            target = e.target.d2d_targets[e.epoch]
+            source = e.source.d2d_sources[e.epoch]
+            e.gate.set()
+            self.assertTrue(entered.wait(3))
+            self.assertTrue(e.command(e.source, "d2d_resume")["pending_reader"])
+            self.assertFalse(source.poll())
+            self.assertTrue(e.command(e.target, "d2d_abort")["pending_reader"])
+            self.assertFalse(e.freed)
+            release.set()
+            target.worker.join(3)
+            self.assertFalse(target.worker.is_alive())
+        self.assertTrue(e.command(e.target, "d2d_abort")["aborted"])
+        e.target.drain_targets(required=target)
+        self.assertEqual(e.freed, ["target"])
+        self.assertTrue(e.command(e.source, "d2d_resume")["resumed"])
+        self.assertTrue(e.req.kv.holds_kv)
+        self.assertEqual(e.freed, ["target"])
+
+    def test_dsv_d2d_failed_partial_free_cannot_be_retried_by_abort(self):
+        e = self._d2d_env()
+        e.import_(e.freeze())
+        e.gate.set()
+        target = e.wait_copy()
+        e.command(e.target, "d2d_abort")
+        calls = []
+
+        def partial_free():
+            calls.append(True)
+            raise RuntimeError("partial native free")
+
+        target.release = partial_free
+        with self.assertRaisesRegex(RuntimeError, "partial native free"):
+            target.finish()
+        with self.assertRaisesRegex(RuntimeError, "refusing abort retry"):
+            e.command(e.target, "d2d_abort")
+        with self.assertRaisesRegex(RuntimeError, "unproven/failed"):
+            target.finish()
+        self.assertEqual(calls, [True])
+
+    def test_dsv_d2d_finished_requests_cannot_resume_or_commit_prebuilt(self):
+        e = self._d2d_env()
+        e.import_(e.freeze())
+        target = e.target.d2d_targets[e.epoch]
+        e.req.finished = lambda: True
+        target.decode_req.req.finished = lambda: True
+        with self.assertRaisesRegex(ValueError, "owns generation"):
+            e.command(e.source, "d2d_resume")
+        with self.assertRaisesRegex(ValueError, "finished"):
+            e.command(e.target, "d2d_commit")
+        self.assertFalse(e.resumed)
+        self.assertFalse(e.freed)
+        self.assertFalse(target.admitted)
+
+    def test_dsv_d2d_budget_rejection_has_no_allocation_or_invalid_free(self):
+        e = self._d2d_env()
+        meta = e.freeze()
+        prealloc = e.target.scheduler.disagg_decode_prealloc_queue
+        prealloc._prealloc_reservation_fits = lambda *a, **kw: False
+        with self.assertRaisesRegex(ValueError, "budget unavailable"):
+            e.import_(meta)
+        target = e.target.d2d_targets[e.epoch]
+        self.assertIsNone(target.decode_req.req.kv.req_pool_idx)
+        self.assertFalse(target.allocation_complete)
+        self.assertTrue(e.command(e.target, "d2d_abort")["aborted"])
+        e.target.drain_targets(required=target)
+        self.assertFalse(e.freed)
+
+    def test_dsv_d2d_partial_allocator_failure_is_retained_not_freed_by_length(self):
+        from sglang_remote_attn import dsv_d2d as d2d
+
+        e = self._d2d_env()
+        meta = e.freeze()
+
+        def partial(req):
+            req.kv.req_pool_idx = 1
+            req.kv.kv_committed_len = e.prefix
+            raise RuntimeError("native allocation failed before row publication")
+
+        e.target.scheduler.disagg_decode_prealloc_queue._pre_alloc = partial
+        with self.assertRaisesRegex(RuntimeError, "native allocation failed"):
+            e.import_(meta)
+        with self.assertRaisesRegex(d2d.TransportFailure, "partial native"):
+            e.command(e.target, "d2d_abort")
+        self.assertFalse(e.freed)
+
+    def test_dsv_d2d_tp2_asymmetric_completion_and_quarantine(self):
+        worker = ROOT / "test/manual/remote_attn/dsv_d2d_tp_worker.py"
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            env = dict(
+                os.environ,
+                PYTHONDONTWRITEBYTECODE="1",
+                PYTHONPATH=os.pathsep.join(
+                    [str(PLUGIN), os.environ.get("PYTHONPATH", "")]
+                ),
+            )
+            processes = [
+                subprocess.Popen(
+                    [
+                        sys.executable,
+                        str(worker),
+                        str(rank),
+                        str(root / "rendezvous"),
+                        str(root / f"rank{rank}.json"),
+                    ],
+                    env=env,
+                    stdout=subprocess.PIPE,
+                    stderr=subprocess.STDOUT,
+                    text=True,
+                )
+                for rank in range(2)
+            ]
+            try:
+                outputs = [p.communicate(timeout=45)[0] for p in processes]
+                for p in processes:
+                    self.assertEqual(p.returncode, 0, "\n".join(outputs))
+                rows = [
+                    json.loads((root / f"rank{r}.json").read_text()) for r in range(2)
+                ]
+                self.assertEqual(
+                    rows,
+                    [
+                        dict(
+                            asymmetric_gpu_blocks_both=True,
+                            decode_before_copy=True,
+                            source_free_count=1,
+                            tp_quarantine_retains_both=True,
+                        )
+                    ]
+                    * 2,
+                )
+            finally:
+                for p in processes:
+                    if p.poll() is None:
+                        p.kill()
+                        p.communicate(timeout=5)
+
+    def test_dsv_d2d_freeze_drains_only_a_native_decode_result_once(self):
+        from sglang_remote_attn.dsv_d2d import quiesce
+        from collections import deque
+
+        req = SimpleNamespace(
+            origin_input_ids=[1, 2],
+            output_ids=[3],
+            kv=SimpleNamespace(kv_committed_len=2),
+            finished=lambda: False,
+        )
+        batch = SimpleNamespace(
+            reqs=[req], forward_mode=SimpleNamespace(is_decode=lambda: True)
+        )
+        calls = []
+
+        def process(b, r):
+            calls.append(r)
+            req.output_ids.append(4)
+            req.kv.kv_committed_len += 1
+
+        scheduler = SimpleNamespace(
+            result_queue=deque([(batch, "result")]),
+            running_batch=batch,
+            last_batch=batch,
+            process_batch_result=process,
+        )
+        quiesce(scheduler, req)
+        quiesce(scheduler, req)
+        self.assertEqual(calls, ["result"])
+        self.assertIsNone(scheduler.last_batch)
+        batch.forward_mode.is_decode = lambda: False
+        scheduler.result_queue.append((batch, "extend"))
+        scheduler.last_batch = batch
+        with self.assertRaisesRegex(RuntimeError, "native extend/prebuilt"):
+            quiesce(scheduler, req)
+        self.assertEqual(len(scheduler.result_queue), 1)
+
     def test_flash0731_mixed_ratio_page_maps_keep_native_guard_capacities(self):
         from sglang_remote_attn import dsv41_paged as paged
 

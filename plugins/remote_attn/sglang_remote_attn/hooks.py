@@ -208,6 +208,14 @@ def _process_requests(original, scheduler, recv_reqs):
         overlap.retirement.arm(intent)
     for control in controls:
         controller = getattr(scheduler, "_pre_layerwise", None)
+        from .dsv_d2d import COMMANDS as d2d_commands
+
+        if (
+            getattr(controller, "dsv41_layerwise", False)
+            and control.get("cmd") in d2d_commands
+        ):
+            runtime.execute_handoff_control(scheduler, control)
+            continue
         if getattr(controller, "dsv41_layerwise", False) and control.get("cmd") not in {
             "status",
             "status_lite",

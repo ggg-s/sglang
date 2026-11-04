@@ -17,7 +17,7 @@ from sglang_remote_attn import remote_data_plane as dp
 
 
 class Transport:
-    def __init__(self, root):
+    def __init__(self, root, *, allow_tcp_snapshot=False):
         from mooncake.engine import TransferEngine
 
         os.environ["MC_FORCE_TCP"] = "1"
@@ -41,6 +41,8 @@ class Transport:
         self.engines = []
         self.calls = []
         self.stack = ExitStack()
+        if allow_tcp_snapshot:
+            return  # D2D snapshots use bounded TCP; Q/O still use the GPU lane.
         self.stack.enter_context(
             patch.object(
                 rt, "_send_tensor", side_effect=AssertionError("TCP tensor payload")
@@ -91,7 +93,7 @@ class Transport:
 
     def close(self):
         for role in ("decode", "prefill"):
-            for owner, plane in self.planes:
+            for owner, plane in reversed(self.planes):
                 if owner == role:
                     plane.close()
         assert not any(plane.quarantine for _, plane in self.planes)

@@ -92,6 +92,16 @@ def owned_requests(controller):
         record["req"]
         for record in tuple(getattr(controller, "transport_quarantine", {}).values())
     )
+    reqs.extend(
+        source.req
+        for source in getattr(controller, "d2d_sources", {}).values()
+        if not source.released
+    )
+    reqs.extend(
+        target.decode_req.req
+        for target in getattr(controller, "d2d_targets", {}).values()
+        if not target.closed
+    )
     return reqs
 
 

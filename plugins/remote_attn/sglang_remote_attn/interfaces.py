@@ -33,6 +33,22 @@ CORE_CALLS = {
         "prefix_len": None,
         "total_prefix_len": None,
     },
+    DISAGG + "decode.DecodePreallocQueue._prealloc_required_tokens": {
+        "req": inspect.Parameter.empty
+    },
+    DISAGG + "decode.DecodePreallocQueue._allocatable_token_budgets": {
+        "retractable_tokens": None
+    },
+    DISAGG + "decode.DecodePreallocQueue._swa_tail_allocatable_token_budget": {
+        "retractable_tokens": None
+    },
+    DISAGG + "decode.DecodePreallocQueue._uses_swa_reservation": {},
+    DISAGG + "decode.DecodePreallocQueue._prealloc_reservation_fits": {
+        "full_tokens": inspect.Parameter.empty,
+        "swa_tokens": inspect.Parameter.empty,
+        "full_allocatable_tokens": inspect.Parameter.empty,
+        "swa_allocatable_tokens": inspect.Parameter.empty,
+    },
     "sglang.srt.managers.schedule_batch.Req.owned_kv_len": {},
     "sglang.srt.managers.schedule_batch.Req.refresh_fill_ids": {},
     "sglang.srt.managers.schedule_batch.Req.advance_cache_request_handle": {},

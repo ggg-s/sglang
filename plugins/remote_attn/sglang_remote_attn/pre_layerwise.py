@@ -677,7 +677,7 @@ class Controller:
             startup_signature(self.config),
             ("destination-cache-v1", "prefix-range-v1", prefix_enabled()),
             (
-                "sparse-fast-v2-full-prefill",
+                "sparse-fast-v3-d2d",
                 os.environ.get("HANDOFF_DSV41_FAST", "1"),
                 os.environ.get("HANDOFF_PREFIX_INFLIGHT", "2"),
             ),
@@ -1582,6 +1582,10 @@ def shutdown(scheduler):
     else:
         for target in controller.targets:
             target.finish(wait=True)
+    if any(getattr(source, "is_d2d", False) for source in controller.sources):
+        from .dsv_d2d import drain_sources
+
+        drain_sources(controller)
     for source in controller.sources:
         if source.thread is not None:
             source.thread.join(timeout=controller.config.drain_timeout)

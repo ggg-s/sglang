@@ -257,6 +257,8 @@ def _frozen_watchdog_loop(scheduler) -> None:
                 continue
             tracked = dict(_tracked(scheduler))
             for rid, req in tracked.items():
+                if getattr(req, "_dsv_d2d_source", None) is not None:
+                    continue  # D2D ownership uses its TP scheduler protocol.
                 if not getattr(req, "_handoff_frozen", False):
                     # A request resumed by this watchdog (or completed after a
                     # dead controller) has no gateway left to release it.  It
@@ -342,6 +344,8 @@ def _drain_watchdog_actions(scheduler) -> None:
     hub = getattr(scheduler, "_handoff_hub", None)
     for rid, (action, req) in list(_FROZEN_WD_ACTIONS.items()):
         _FROZEN_WD_ACTIONS.pop(rid, None)
+        if getattr(req, "_dsv_d2d_source", None) is not None:
+            continue
         try:
             if action == "resume":
                 if not getattr(req, "_handoff_frozen", False):
@@ -1702,6 +1706,12 @@ def execute_remote_attention_batch(job, stream, cache):
 
 
 def _execute_hub_job(job, stream, cache):
+    if not getattr(job, "is_batch", False) and getattr(job, "header", {}).get(
+        "dsv_d2d"
+    ):
+        from .dsv_d2d import execute
+
+        return execute(job, stream, cache)
     if getattr(job, "gpu_transport", False):
         return job.execute(stream, cache)
     if not getattr(job, "is_batch", False) and getattr(job, "header", {}).get(
@@ -7926,6 +7936,10 @@ def _handle(scheduler, data):
     from sglang.srt.runtime_context import get_schedule
 
     cmd = data.get("cmd")
+    if str(cmd).startswith("d2d_"):
+        from .dsv_d2d import handle
+
+        return handle(scheduler._pre_layerwise, data)
     tracked = _tracked(scheduler)
     if cmd in ("import", "import_wave"):
         # Failure-injection only: leave the target import command in flight

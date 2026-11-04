@@ -6,6 +6,7 @@ The native-complete one-forward window remains a compatibility fallback.
 """
 
 import functools
+from contextlib import nullcontext
 import inspect
 import os
 import secrets
@@ -196,7 +197,9 @@ def execute(job, stream, cache):
     if source.cache_lease is not None:
         source.cache_lease.check()
     progressive = bool(getattr(source, "schema", None))
-    if progressive:
+    if getattr(source, "is_d2d", False):
+        source.check_read()
+    elif progressive:
         from sglang.srt.disaggregation.base.conn import KVPoll
 
         if (
@@ -205,7 +208,11 @@ def execute(job, stream, cache):
             or not source.barrier_ready
         ):
             raise RuntimeError("Remote read before native indexer/state barrier")
-    if not progressive and not _poll_success(source.req.disagg_kv_sender):
+    if (
+        not progressive
+        and not getattr(source, "is_d2d", False)
+        and not _poll_success(source.req.disagg_kv_sender)
+    ):
         raise RuntimeError("Remote read before native PD completion")
     header = job.header
     layer_id, ratio = int(header["layer"]), int(header["ratio"])
@@ -236,8 +243,14 @@ def execute(job, stream, cache):
     ) and not bool(torch.isfinite(job.q_cpu).all()):
         raise ValueError("nonfinite Remote sparse query")
     device = pool.get_extra_key_buffer(layer_id).device
-    with torch.cuda.device(device), torch.cuda.stream(stream):
-        stream.wait_event(ctx.dsv41_ready)
+    with (
+        torch.cuda.device(device) if device.type == "cuda" else nullcontext(),
+        torch.cuda.stream(stream) if stream is not None else nullcontext(),
+    ):
+        if stream is not None:
+            stream.wait_event(ctx.dsv41_ready)
+        else:
+            ctx.dsv41_ready.synchronize()
         cpp = pool.page_size // ratio
         ids = torch.tensor(
             [ctx.dsv41_pages[p // cpp] * cpp + p % cpp for p in positions],
