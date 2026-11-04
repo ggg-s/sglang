@@ -19,6 +19,54 @@ from sglang_remote_attn.dsv41_receive import scatter_prefix
 from sglang_remote_attn.source_cache import CacheGuard
 
 
+def mixed_maps(root):
+    f = flash_fixture(root, "cuda", 128)
+    table = f.d_row
+    pages = table.shape[1] // 256
+    target = NS(
+        row=0,
+        handle="mixed",
+        prefix_len=f.prefix,
+        decode_prefix_len=0,
+        check=lambda: None,
+    )
+    by_ratio = {}
+    for ratio in (4, 128, 4, 128):
+        capacity = pages + ratio
+        m = paged.page_map(target, table, 256, capacity, f.prefix + 128, ratio=ratio)
+        if ratio in by_ratio:
+            assert m is by_ratio[ratio]
+        by_ratio[ratio] = m
+        cpp = 256 // ratio
+        positions = torch.tensor(
+            [0, f.prefix // ratio - 1, f.prefix // ratio], device="cuda"
+        )
+        physical = table[0, positions // cpp * 256] // 256
+        ids = (physical * cpp + positions % cpp).to(torch.int32)
+        li, re = torch.empty_like(ids), torch.empty_like(ids)
+        m.partition(ids, torch.tensor([3], device="cuda"), ratio, li, re)
+        paged.check([m.error])
+        assert re.tolist() == [0, f.prefix // ratio - 1, -1]
+        assert li.tolist() == [-1, -1, int(ids[-1])]
+    assert len(target._sparse_page_maps) == 2
+    for ratio in (4, 128):
+        try:
+            paged.page_map(
+                target, table, 256, pages + ratio + 1, f.prefix + 128, ratio=ratio
+            )
+            raise AssertionError("pool drift accepted")
+        except RuntimeError:
+            pass
+    torch.cuda.synchronize()
+    target._sparse_page_maps.clear()
+    return dict(
+        alternating_ratios=True,
+        native_guard_capacities=[pages + 4, pages + 128],
+        incomplete_blocks_stay_local=True,
+        same_ratio_capacity_drift_rejected=True,
+    )
+
+
 def run(root, ratio, gpu):
     from remote_gpu_probe_support import Transport
 
@@ -200,45 +248,60 @@ def run(root, ratio, gpu):
             torch.cuda.synchronize()
             assert dp.ready(f.req) and pins == [1]
             # Short/tail range scatter cannot touch D's new block or padding.
-            for prefix in (ratio - 1, ratio, ratio + 1, 256 + ratio - 1, 256 + ratio):
-                dst = torch.full(
-                    (4, f.layout.V4.page_bytes(cpp)),
-                    253,
-                    dtype=torch.uint8,
-                    device="cuda",
-                )
-                before = dst.clone()
-                source = torch.zeros(
-                    (2, dst.shape[1]), dtype=torch.uint8, device="cuda"
-                )
-                page_ids = torch.tensor([2, 1], device="cuda")
-                scatter_prefix(
-                    dst, source, page_ids, 0, prefix, 256, ratio, f.layout.V4
-                )
-                immutable = prefix // ratio
-                # Exact byte oracle, including page-tail and scale padding.
-                oracle = before.clone()
-                for p in range(2):
-                    if p < prefix // 256:
-                        oracle[page_ids[p]] = source[p]
-                    else:
-                        rows = min(cpp, max(0, immutable - p * cpp))
-                        for off, stride, width in (
-                            (0, data, f.layout.V4.data_bytes),
-                            (base, scale, f.layout.V4.scale_bytes),
-                        ):
-                            for row in range(rows):
-                                oracle[
-                                    page_ids[p],
-                                    off + row * stride : off + row * stride + width,
-                                ] = 0
-                assert torch.equal(dst, oracle)
+            for start_page in (0, 1):
+                for prefix in (
+                    ratio - 1,
+                    ratio,
+                    ratio + 1,
+                    256 + ratio - 1,
+                    256 + ratio,
+                ):
+                    dst = torch.full(
+                        (4, f.layout.V4.page_bytes(cpp)),
+                        253,
+                        dtype=torch.uint8,
+                        device="cuda",
+                    )
+                    before = dst.clone()
+                    source = torch.zeros(
+                        (2, dst.shape[1]), dtype=torch.uint8, device="cuda"
+                    )
+                    page_ids = torch.tensor([2, 1], device="cuda")
+                    scatter_prefix(
+                        dst,
+                        source,
+                        page_ids,
+                        start_page,
+                        prefix,
+                        256,
+                        ratio,
+                        f.layout.V4,
+                    )
+                    immutable = prefix // ratio
+                    # Exact byte oracle, including page-tail and scale padding.
+                    oracle = before.clone()
+                    for p in range(2):
+                        if p + start_page < prefix // 256:
+                            oracle[page_ids[p]] = source[p]
+                        else:
+                            rows = min(cpp, max(0, immutable - (p + start_page) * cpp))
+                            for off, stride, width in (
+                                (0, data, f.layout.V4.data_bytes),
+                                (base, scale, f.layout.V4.scale_bytes),
+                            ):
+                                for row in range(rows):
+                                    oracle[
+                                        page_ids[p],
+                                        off + row * stride : off + row * stride + width,
+                                    ] = 0
+                    assert torch.equal(dst, oracle)
             target.local_entries.add(0)
             remote.attention(
                 native, f.backend, f.query, kv, kv, layer, f.fb, ratio, attn_sink=f.sink
             )
             assert native_calls == [True] and target.calls == 2
             target.close("gpu-proven")
+            assert not target._sparse_page_maps
             assert remote.source_ready(src)
             src.cache_lease.retire(lambda: None)
             assert pins == [0]
@@ -251,6 +314,7 @@ def run(root, ratio, gpu):
                 native_metadata=True,
                 padded_heads_safe=True,
                 tail_scatter_exact=True,
+                nonzero_scatter_start=True,
                 local_restored=True,
                 pins_closed=True,
                 early_close_rejected=True,
@@ -278,6 +342,7 @@ def main():
     result = dict(
         device=torch.cuda.get_device_name(),
         scope=__doc__,
+        mixed_maps=mixed_maps(root),
         cases=[run(root, r, g) for r in (4, 128) for g in (False, True)],
     )
     files = list((root / "plugins/remote_attn/sglang_remote_attn").glob("*.py")) + [

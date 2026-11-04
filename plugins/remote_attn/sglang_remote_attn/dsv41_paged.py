@@ -212,17 +212,23 @@ class PageMap:
                 )
 
 
-def page_map(target, table, page, capacity, length):
-    key = (id(table), page, capacity)
+def page_map(target, table, page, capacity, length, *, ratio=None):
+    if ratio not in (None, 1, 2, 4, 128):
+        raise ValueError("unsupported page-map ratio")
+    key = (id(table), page, ratio)
     maps = getattr(target, "_sparse_page_maps", None)
     if maps is None:
         maps = target._sparse_page_maps = {}
     result = maps.get(key)
     if result is None:
-        if maps:
-            # An active target never changes request table/pool geometry.
+        if any(k[:2] != key[:2] for k in maps):
             raise RuntimeError("sparse page-map storage changed")
+        # Native C4/C128 pools have different guard-page capacities. Keep a
+        # request-owned inverse per ratio, never reinterpret a changed pool
+        # for the same ratio or change the request's FULL table identity.
         result = maps[key] = PageMap(target, table, page, capacity)
+    elif result.inverse.numel() != capacity:
+        raise RuntimeError("sparse page-map storage changed")
     result.extend(length)
     return result
 

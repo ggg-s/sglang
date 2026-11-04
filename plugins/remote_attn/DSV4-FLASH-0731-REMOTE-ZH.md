@@ -67,3 +67,9 @@ TP4 GPU、文本精度或整模 TTFT/吞吐**。这是适配层与真实 CUDA/�
 PYTHONPATH=plugins/remote_attn python test/manual/remote_attn/flash0731_cuda_probe.py \
   --source-root . --output /tmp/flash0731.json
 ```
+
+## 后续生命周期审阅
+
+已修复混合 C4/C128（及 C1/C2）native guard 容量不同导致的逆页表冲突。
+逆页表按 ratio 持有，仍拒绝同 ratio 容量漂移和请求身份变化；成功退休统一清理。
+详见 [状态、尾块与 KV 生命周期审阅](validation/flash0731-lifetime-review.md)。

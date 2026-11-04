@@ -97,6 +97,7 @@ def attention(
             pool.page_size,
             pool.get_extra_key_buffer(layer.layer_id).shape[0],
             int(seqs[i]),
+            ratio=compress_ratio,
         )
         mapping.partition(
             ids[i], lengths[i : i + 1], compress_ratio, local_ids[i], remote_ids[i]

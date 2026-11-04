@@ -11,7 +11,9 @@ def flash_fixture(root, device, ratio, prefix=None):
     page = 256
     prefix = prefix if prefix is not None else (66687 if ratio == 128 else 1031)
     pages = math.ceil((prefix + ratio) / page)
-    capacity = pages + 2
+    # Native guard is one FULL logical page worth of compressed slots.
+    # In compressed physical pages this adds `ratio` pages, not one.
+    capacity = pages + ratio
     p_pages = list(range(1, pages + 1))
     d_pages = list(reversed(p_pages))
     cpp = page // ratio

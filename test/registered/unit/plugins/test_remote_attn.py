@@ -15041,6 +15041,46 @@ class TestRemoteAttn(CustomTestCase):
             self.assertNotEqual(old, b.config.directory)
             self.assertTrue((directory / "control/P0/instance.lock").exists())
 
+    def test_flash0731_mixed_ratio_page_maps_keep_native_guard_capacities(self):
+        from sglang_remote_attn import dsv41_paged as paged
+
+        native = _source_function(
+            "mem_cache/deepseek_v4_memory_pool.py", "_num_dsv4_physical_kv_pages"
+        )
+        native.__globals__["ceil_div"] = lambda a, b: (a + b - 1) // b
+        capacities = {r: native(65536 // r, 256 // r, 256) for r in (1, 2, 4, 128)}
+        self.assertNotEqual(capacities[4], capacities[128])
+        table = torch.arange(256, 768).reshape(1, -1)
+        target = SimpleNamespace(
+            row=0,
+            handle="mixed",
+            prefix_len=383,
+            decode_prefix_len=0,
+            check=lambda: None,
+        )
+        maps = {}
+        for ratio in (1, 2, 4, 128, 4, 128, 1, 2):
+            mapping = paged.page_map(
+                target, table, 256, capacities[ratio], 384, ratio=ratio
+            )
+            if ratio in maps:
+                self.assertIs(mapping, maps[ratio])
+            maps[ratio] = mapping
+            ids = torch.tensor([256 // ratio, 2 * 256 // ratio])
+            li, re = torch.empty_like(ids), torch.empty_like(ids)
+            mapping.partition(ids, torch.tensor([2]), ratio, li, re)
+            self.assertEqual(
+                re.tolist(), [0, -1] if ratio == 128 else [0, 256 // ratio]
+            )
+            self.assertEqual(li.tolist(), [-1, 4] if ratio == 128 else [-1, -1])
+        with self.assertRaisesRegex(RuntimeError, "storage changed"):
+            paged.page_map(target, table, 256, capacities[4] + 1, 384, ratio=4)
+        with self.assertRaisesRegex(RuntimeError, "storage changed"):
+            paged.page_map(target, table.clone(), 256, capacities[128], 384, ratio=128)
+        target.handle = "reused"
+        with self.assertRaisesRegex(RuntimeError, "attempt/extent changed"):
+            paged.page_map(target, table, 256, capacities[128], 384, ratio=128)
+
     def test_flash0731_startup_routes_native_backend_and_keeps_full_graph(self):
         from sglang_remote_attn import dsv41_remote as remote, dsv41_layerwise
 
@@ -15122,7 +15162,7 @@ class TestRemoteAttn(CustomTestCase):
                 128,
                 online,
                 True,
-                256,
+                1 if online else 128,
             )
             c128.kv_score_buffer = SimpleNamespace(kv_score=torch.zeros((1024, 24)))
             f.pool.compress_state_pools = [c4, c128]
@@ -15137,11 +15177,7 @@ class TestRemoteAttn(CustomTestCase):
             self.assertEqual(ptrs.count(c4.kv_score_buffer.kv_score.data_ptr()), 2)
             self.assertEqual(lens[-2:], [16 * 4 * 8] * 2)
             for end in (0, 1, 127, 128, 129, 255, 256, 257):
-                expected = (
-                    []
-                    if end % 128 == 0
-                    else ([3] if online else [6 + ((end - 1) % 256) // 128])
-                )
+                expected = [] if end % 128 == 0 else [3]
                 self.assertEqual(
                     f.pool.request_state_transfer_indices(3, end).tolist(), expected
                 )
