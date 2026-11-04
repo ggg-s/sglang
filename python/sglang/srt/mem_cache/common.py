@@ -127,13 +127,25 @@ def free_swa_out_of_window_slots(
         new_evicted_seqlen = (new_evicted_seqlen // page_size) * page_size
 
     if new_evicted_seqlen > evicted_seqlen:
-        free_slots = req_to_token_pool.req_to_token[
-            req.kv.req_pool_idx, evicted_seqlen:new_evicted_seqlen
-        ]
         if free_segment is None:
             assert component_type == ComponentType.SWA
             free_segment = token_to_kv_pool_allocator.free_swa_segment
-        free_segment(free_slots, start_pos=evicted_seqlen)
+        retained = (
+            getattr(req.kv, "swa_retained_ranges", ())
+            if component_type == ComponentType.SWA
+            else ()
+        )
+        start = evicted_seqlen
+        row = req_to_token_pool.req_to_token[req.kv.req_pool_idx]
+        for lo, hi in retained:
+            end = min(lo, new_evicted_seqlen)
+            if start < end:
+                free_segment(row[start:end], start_pos=start)
+            start = max(start, hi)
+            if start >= new_evicted_seqlen:
+                break
+        if start < new_evicted_seqlen:
+            free_segment(row[start:new_evicted_seqlen], start_pos=start)
         req.kv.set_evicted_seqlen(component_type, new_evicted_seqlen)
 
 
@@ -154,9 +166,11 @@ def free_kv_row_segments(
     *,
     swa_evicted_seqlen: int,
     swa_dead_lo: int = 0,
+    swa_retained_ranges: list[tuple[int, int]] | tuple = (),
 ) -> None:
     """Free ascending disjoint ``(kv_indices, start_pos)`` segments of one
-    request's kv row; ``[swa_dead_lo, swa_evicted_seqlen)`` goes back full-side only."""
+    request's kv row. The dead interval goes back full-side only, except for
+    retained SWA windows, which still own both allocations."""
     dead_lo, dead_hi = swa_dead_lo, max(swa_evicted_seqlen, swa_dead_lo)
     swa_dead: list[tuple[torch.Tensor, int]] = []
     swa_alive: list[tuple[torch.Tensor, int]] = []
@@ -169,7 +183,19 @@ def free_kv_row_segments(
         if hi <= lo:
             swa_alive.append((kv_indices, start_pos))
             continue
-        swa_dead.append((kv_indices[lo - start_pos : hi - start_pos], lo))
+        cursor = lo
+        for keep_lo, keep_hi in swa_retained_ranges:
+            a, b = max(cursor, keep_lo), min(hi, keep_hi)
+            if a >= b:
+                continue
+            if cursor < a:
+                swa_dead.append(
+                    (kv_indices[cursor - start_pos : a - start_pos], cursor)
+                )
+            swa_alive.append((kv_indices[a - start_pos : b - start_pos], a))
+            cursor = b
+        if cursor < hi:
+            swa_dead.append((kv_indices[cursor - start_pos : hi - start_pos], cursor))
 
         if lo > start_pos:
             swa_alive.append((kv_indices[: lo - start_pos], start_pos))
@@ -186,6 +212,7 @@ def free_kv_row_segments(
     if swa_dead:
         allocator.free_full_segments(swa_dead)
     if swa_alive:
+        swa_alive.sort(key=lambda segment: segment[1])
         allocator.free_segments(swa_alive)
 
 

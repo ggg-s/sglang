@@ -39,7 +39,15 @@ def kv_private_swa_tokens(kv: ReqKvInfo, page_size: int) -> int:
     window_freed = max(
         0, kv.get_evicted_seqlen(ComponentType.SWA) - kv.swa_dead_lo(page_size)
     )
-    return allocated - kv.cache_protected_len - window_freed
+    retained = sum(
+        max(
+            0,
+            min(hi, kv.get_evicted_seqlen(ComponentType.SWA), allocated)
+            - max(lo, kv.swa_dead_lo(page_size)),
+        )
+        for lo, hi in getattr(kv, "swa_retained_ranges", ())
+    )
+    return allocated - kv.cache_protected_len - window_freed + retained
 
 
 def kv_mamba_slots(kv: ReqKvInfo) -> int:

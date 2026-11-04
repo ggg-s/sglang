@@ -509,6 +509,7 @@ class BasePrefixCache(ABC, PrefixCacheTrait):
             [(row[start:end], start) for start, end in coalesce_ranges(ranges)],
             swa_evicted_seqlen=kv.get_evicted_seqlen(ComponentType.SWA),
             swa_dead_lo=kv.swa_dead_lo(allocator.page_size),
+            swa_retained_ranges=getattr(kv, "swa_retained_ranges", ()),
         )
 
     @abstractmethod

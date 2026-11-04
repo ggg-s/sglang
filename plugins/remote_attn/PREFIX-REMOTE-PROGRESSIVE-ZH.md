@@ -75,6 +75,25 @@ sender、peer 注册发生变化则保留页并报错，不能中途切回普通
 `chunk_id_base=0`、`stream_generation=None`。默认编号及原有8帧消息保持；新范围
 调用额外带 attempt tag。源和安装态预检会拒绝旧核心缺少这两个参数的构建。
 
+## DSV4.1 延迟 checkpoint 的 SWA 窗口
+
+P 读租约期间不执行会去重、重绑定 FULL 页的 checkpoint。每个已计算 chunk
+保留页对齐的 SWA 尾窗（含一页回退余量），其余窗口外 SWA 仍可回收。暂存窗口由
+`ReqKvInfo.swa_retained_ranges` 记录；原生池计数、abort 和最终行释放都计入这些页。
+所有活跃 source 共用一个不超过 SWA 池四分之一的保留预算，超预算丢弃较旧窗口。
+缓存收益仍取决于窗口是否保留；不保证任意分叉点都命中。quarantine 和发布失败的
+所有者不会因其他请求的预算压力被回收。
+
+只有 GPU、native IO、Remote reader 与有序退休证明满足后，才按窗口终点顺序
+回放原生 checkpoint，再执行最终发布与行释放。这样保留中间分叉窗口，也避免
+`decoder_swa_bounded_replay` 裁剪匹配 key 后落在唯一最终尾窗之前：例如 N=32772、
+page=256、window=128，匹配终点是 32512，需要保留该位置之前的 SWA。
+无需关闭 bounded replay，也不绕过原生 FULL/SWA 组件校验。
+
+新插件依赖核心的暂存窗口计数与释放支持，预检会检查 `swa_retained_ranges` 字段；
+部署时一起更新核心与插件。本地覆盖原样重发、24K 分叉、131K、多 source 预算、
+overlap/在途 DMA/Remote 屏障、abort 与发布失败；H20 数值和性能仍需实机验收。
+
 ## 验收
 
 P `prefill.json` 的 `range_stream=true`、`cached_prefix_tokens>0` 和 `range_pieces`

@@ -6148,6 +6148,436 @@ class TestRemoteAttn(CustomTestCase):
             device_module=SimpleNamespace(stream=lambda stream: nullcontext()),
         )
 
+    def _source_swa_windows(self, prompt=32772, capacity=35072):
+        """Real core eviction/accounting/row free; observe publication at retirement."""
+        from sglang_remote_attn.source_cache import CacheGuard
+        from sglang.srt.mem_cache.unified_cache.component_type import ComponentType
+
+        ceil_align = lambda n, p: (n + p - 1) // p * p
+        self.Kv.swa_dead_lo.__globals__["ceil_align"] = ceil_align
+        native_free = _source_function(
+            "mem_cache/common.py",
+            "free_swa_out_of_window_slots",
+            namespace=dict(ComponentType=ComponentType, ceil_align=ceil_align),
+        )
+        row_free = _source_function("mem_cache/common.py", "free_kv_row_segments")
+        footprint = _source_function(
+            "managers/scheduler_components/pool_stats_observer.py",
+            "kv_private_swa_tokens",
+            namespace=dict(ComponentType=ComponentType, ceil_align=ceil_align),
+        )
+        allocated = ceil_align(prompt, 256)
+        rows = torch.arange(allocated * 4).reshape(4, allocated)
+        freed, full_freed, published = set(), set(), []
+
+        def free_swa(indices, *, start_pos):
+            self.assertEqual(start_pos % 256, 0)
+            slots = set(indices.tolist())
+            self.assertFalse(slots & freed, "double SWA free")
+            freed.update(slots)
+
+        def free_segments(segments, full_only=False):
+            self.assertEqual([p for _, p in segments], sorted(p for _, p in segments))
+            for indices, start in segments:
+                slots = set(indices.tolist())
+                self.assertFalse(slots & full_freed, "double FULL free")
+                full_freed.update(slots)
+                if not full_only:
+                    free_swa(indices, start_pos=start)
+
+        allocator = SimpleNamespace(
+            page_size=256,
+            swa_attn_allocator=SimpleNamespace(size=capacity),
+            free_swa_segment=free_swa,
+            free_segments=free_segments,
+            free_full_segments=lambda segments: free_segments(segments, full_only=True),
+        )
+        cache = SimpleNamespace(
+            page_size=256,
+            tree_core=SimpleNamespace(is_eagle=False),
+            components={
+                ComponentType.SWA: SimpleNamespace(
+                    sliding_window_size=128, gates_prefix_match=True
+                )
+            },
+            token_to_kv_pool_allocator=allocator,
+            req_to_token_pool=SimpleNamespace(req_to_token=rows),
+            finish=lambda *a: None,
+            reset=lambda: None,
+            lock=lambda n: object(),
+            unlock=lambda pin: None,
+            supports_swa=lambda: True,
+        )
+
+        def evict(req, pre_len):
+            native_free(
+                req,
+                pre_len,
+                sliding_window_size=128,
+                page_size=256,
+                req_to_token_pool=cache.req_to_token_pool,
+                token_to_kv_pool_allocator=allocator,
+            )
+
+        cache.evict_sliding_windows = evict
+
+        def checkpoint(req, *, up_to):
+            # Native final checkpoint independently evicts before inserting.
+            evict(req, up_to - 1)
+            end = up_to // 256 * 256
+            start = max(
+                req.kv.cache_protected_len, req.kv.get_evicted_seqlen(ComponentType.SWA)
+            )
+            live = rows[req.kv.req_pool_idx, start:end]
+            self.assertFalse(set(live.tolist()) & freed, "publishing already freed SWA")
+            if start < end:
+                published.append((start, end))
+            req.kv.cache_protected_len = end
+
+        cache.checkpoint = checkpoint
+        guard = CacheGuard(cache, allow_swa=True, scheduler=self._swa_scheduler())
+
+        def request(index=0):
+            req = SimpleNamespace(
+                kv=self.Kv(req_pool_idx=index, kv_allocated_len=0),
+                cache_request_handle=("windows", index),
+                lock=None,
+                last_node=0,
+                origin_input_ids=range(prompt),
+                finished=lambda: False,
+            )
+            return req, guard.hold(req)
+
+        def release(req):
+            end = ceil_align(req.kv.kv_allocated_len, 256)
+            row_free(
+                allocator,
+                [
+                    (
+                        rows[req.kv.req_pool_idx, req.kv.cache_protected_len : end],
+                        req.kv.cache_protected_len,
+                    )
+                ],
+                swa_evicted_seqlen=req.kv.get_evicted_seqlen(ComponentType.SWA),
+                swa_dead_lo=req.kv.swa_dead_lo(256),
+                swa_retained_ranges=req.kv.swa_retained_ranges,
+            )
+            req.kv.mark_kv_released()
+
+        return SimpleNamespace(**locals())
+
+    def _match_swa_windows(self, ranges, *, shared=None, replay=True):
+        """Run native key construction, tree walk and FULL/SWA validators."""
+        r = self._radix()
+        tree = _source_class(
+            "mem_cache/unified_cache/unified_tree_core.py",
+            "UnifiedTreeCore",
+            {
+                "match_prefix",
+                "_create_match_validators",
+                "_match_prefix_helper",
+                "_match_post_processor",
+            },
+        )()
+        tree.match_prefix.__globals__.update(
+            BASE_COMPONENT_TYPE=0,
+            MatchResult=r.MatchResult,
+            get_and_increase_time_counter=lambda: 1.0,
+            LRURefreshPhase=SimpleNamespace(MATCH_END=1),
+        )
+        tokens = array("q", range(32772))
+
+        def node(start, end, parent):
+            live = any(lo <= start and end <= hi for lo, hi in ranges)
+            return SimpleNamespace(
+                id=end,
+                key=r.RadixKey(tokens[start:end]),
+                parent=parent,
+                children={},
+                evicted=False,
+                backuped=False,
+                component_data=[
+                    SimpleNamespace(value=torch.arange(start, end), host_value=None),
+                    SimpleNamespace(
+                        value=torch.arange(start, end) if live else None,
+                        host_value=None,
+                    ),
+                ],
+            )
+
+        tree.root_node = previous = node(0, 0, None)
+        for start in range(0, 32768, 256):
+            child = node(start, start + 256, previous)
+            previous.children[child.key.child_key(256)] = child
+            previous = child
+        tree.is_eagle, tree.page_size, tree.enable_hicache = False, 256, False
+        components = []
+        for filename, name, ct in (
+            ("full", "FullComponent", 0),
+            ("swa", "SWAComponent", 1),
+        ):
+            comp = _source_class(
+                f"mem_cache/unified_cache/components/{filename}.py",
+                name,
+                {"create_match_validator", "finalize_match_result_in_tree_core"},
+            )()
+            comp.component_type, comp.tree_core = ct, tree
+            comp.sliding_window_size, comp.gates_prefix_match = 128, True
+            comp.refresh_lru = lambda *a: None
+            components.append(comp)
+        tree.components = components
+        key_fn = _source_function(
+            "mem_cache/common.py", "_req_radix_key", namespace={"RadixKey": r.RadixKey}
+        )
+        ids = (
+            tokens
+            if shared is None
+            else tokens[:shared]
+            + array("q", range(100000, 100000 + len(tokens) - shared))
+        )
+        key = key_fn(
+            SimpleNamespace(swa_reprefill_tail_tokens=lambda req: 128 if replay else 0),
+            SimpleNamespace(extra_key=None, cache_salt=None),
+            ids,
+            max_prefix_len=len(ids) - 1,
+        )
+        return tree.match_prefix(SimpleNamespace(key=key))
+
+    def test_source_swa_windows_restore_identical_and_shared_prefix_hits(self):
+        f = self._source_swa_windows()
+        req, lease = f.request()
+        for end in (8192, 16384, 24576, 32768, 32772):
+            req.kv.kv_allocated_len = end
+            f.cache.checkpoint(req, up_to=end)
+            self.assertEqual(f.published, [])
+            self.assertEqual(
+                f.footprint(req.kv, 256), f.ceil_align(end, 256) - len(f.freed)
+            )
+        self.assertEqual(
+            req.kv.swa_retained_ranges,
+            [(7680, 8192), (15872, 16384), (24064, 24576), (32256, 32768)],
+        )
+        lease.retire(lambda: f.cache.checkpoint(req, up_to=32772))
+        self.assertEqual(
+            f.published, [(7680, 8192), (15872, 16384), (24064, 24576), (32256, 32768)]
+        )
+        self.assertEqual(req.kv.swa_retained_ranges, [])
+        self.assertEqual(self._match_swa_windows(f.published).device_prefix_len, 32512)
+        self.assertEqual(
+            self._match_swa_windows(f.published, shared=24576).device_prefix_len, 24576
+        )
+        # Reproduce the deployed failure with the same native matching code.
+        self.assertEqual(self._match_swa_windows([(32512, 32768)]).device_prefix_len, 0)
+        self.assertEqual(
+            self._match_swa_windows([(32512, 32768)], replay=False).device_prefix_len,
+            32768,
+        )
+        f.release(req)
+        self.assertEqual(len(f.freed) + sum(b - a for a, b in f.published), f.allocated)
+
+    def test_source_swa_window_abort_returns_every_private_page_once(self):
+        f = self._source_swa_windows()
+        req, lease = f.request()
+        for end in (8192, 16384, 24576, 32768, 32772):
+            req.kv.kv_allocated_len = end
+            f.cache.checkpoint(req, up_to=end)
+        lease.abort = True
+        lease.retire(lambda: f.release(req))
+        self.assertEqual(f.published, [])
+        self.assertEqual(f.freed, set(range(f.allocated)))
+        self.assertEqual(f.full_freed, set(range(f.allocated)))
+        self.assertEqual(req.kv.swa_retained_ranges, [])
+        with self.assertRaisesRegex(RuntimeError, "no longer usable"):
+            lease.retire(lambda: f.release(req))
+
+    def test_source_swa_window_budget_is_global_and_131k_stays_bounded(self):
+        f = self._source_swa_windows(prompt=131076)
+        owners = [f.request(i) for i in range(4)]
+        for end in [*range(8192, 131073, 8192), 131076]:
+            for req, lease in owners:
+                req.kv.kv_allocated_len = end
+                f.cache.checkpoint(req, up_to=end)
+                retained = sum(
+                    b - a
+                    for request, _ in owners
+                    for a, b in request.kv.swa_retained_ranges
+                )
+                self.assertLessEqual(retained, 35072 // 1024 * 256)
+                actual = f.ceil_align(end, 256) - sum(
+                    i // f.allocated == req.kv.req_pool_idx for i in f.freed
+                )
+                self.assertEqual(f.footprint(req.kv, 256), actual)
+                self.assertLessEqual(actual + 8192, 35072)
+        for req, lease in owners:
+            lease.abort = True
+            lease.retire(lambda req=req: f.release(req))
+        self.assertEqual(len(f.freed), f.rows.numel())
+        self.assertEqual(len(f.full_freed), f.rows.numel())
+
+    def test_source_swa_budget_never_reclaims_quarantined_or_failed_owner(self):
+        for failed in (False, True):
+            with self.subTest(failed=failed):
+                f = self._source_swa_windows(prompt=131076, capacity=8192)
+                req, lease = f.request(0)
+                for end in (8192, 16384, 24576, 32768):
+                    req.kv.kv_allocated_len = end
+                    f.cache.checkpoint(req, up_to=end)
+                saved = list(req.kv.swa_retained_ranges)
+                before = {i for i in f.freed if i < f.allocated}
+                if failed:
+                    lease.failed = True
+                else:
+                    req._remote_attn_transport_quarantine = {"reason": "unknown DMA"}
+                other, _ = f.request(1)
+                for end in range(8192, 131073, 8192):
+                    other.kv.kv_allocated_len = end
+                    f.cache.checkpoint(other, up_to=end)
+                self.assertEqual(req.kv.swa_retained_ranges, saved)
+                self.assertEqual({i for i in f.freed if i < f.allocated}, before)
+                self.assertEqual(f.published, [])
+
+    def test_source_swa_retained_segment_free_preserves_other_rows_and_shields(self):
+        free = _source_function("mem_cache/common.py", "free_kv_row_segments")
+        for dead_lo in (0, 4, 12):
+            for dead_hi in (12, 24, 32):
+                full, swa = set(), set()
+                row = torch.arange(32)
+                kept = [(8, 12), (16, 20)]
+                segments = [(row[:8], 0), (row[12:28], 12), (row[28:], 28)]
+
+                def apply(parts, full_only=False):
+                    self.assertEqual([p for _, p in parts], sorted(p for _, p in parts))
+                    for indices, start in parts:
+                        self.assertFalse(full.intersection(indices.tolist()))
+                        full.update(indices.tolist())
+                        if not full_only:
+                            self.assertFalse(swa.intersection(indices.tolist()))
+                            swa.update(indices.tolist())
+
+                allocator = SimpleNamespace(
+                    page_size=4,
+                    free_segments=apply,
+                    free_full_segments=lambda parts: apply(parts, full_only=True),
+                )
+                free(
+                    allocator,
+                    segments,
+                    swa_evicted_seqlen=dead_hi,
+                    swa_dead_lo=dead_lo,
+                    swa_retained_ranges=kept,
+                )
+                expected_full = set(range(32)) - set(range(8, 12))
+                expected_swa = {
+                    i
+                    for i in expected_full
+                    if not dead_lo <= i < dead_hi or any(a <= i < b for a, b in kept)
+                }
+                self.assertEqual(full, expected_full)
+                self.assertEqual(swa, expected_swa)
+
+    def test_source_swa_window_replay_failure_restores_quarantine_accounting(self):
+        f = self._source_swa_windows()
+        req, lease = f.request()
+        for end in (8192, 16384, 24576, 32768, 32772):
+            req.kv.kv_allocated_len = end
+            f.cache.checkpoint(req, up_to=end)
+        old_cursor = req.kv.max_evicted_seqlen
+        native = f.guard.checkpoint
+
+        def fail(req, *, up_to):
+            if up_to == 16384:
+                raise RuntimeError("insertion failed")
+            return native(req, up_to=up_to)
+
+        f.guard.checkpoint = fail
+        with self.assertRaisesRegex(RuntimeError, "insertion failed"):
+            lease.retire(lambda: self.fail("released failed publication"))
+        self.assertTrue(lease.failed)
+        self.assertEqual(req.kv.max_evicted_seqlen, old_cursor)
+        actual = f.allocated - len(f.freed) - sum(b - a for a, b in f.published)
+        self.assertEqual(f.footprint(req.kv, 256), actual)
+        with self.assertRaisesRegex(RuntimeError, "no longer usable"):
+            lease.retire(lambda: self.fail("retried failed publication"))
+
+    def test_source_swa_windows_wait_for_overlap_dma_remote_and_retirement(self):
+        f = self._source_swa_windows()
+        req, cache_lease = f.request()
+        for end in (8192, 16384, 24576, 32768, 32772):
+            req.kv.kv_allocated_len = end
+            f.cache.checkpoint(req, up_to=end)
+        native = self._dsv41_overlap_fixture()
+        req.rid, req.bootstrap_room = native.req.rid, native.req.bootstrap_room
+        req.disagg_kv_sender = native.req.disagg_kv_sender
+        gpu, remote = threading.Event(), threading.Event()
+        source = SimpleNamespace(
+            error=None,
+            finalized=True,
+            owner=SimpleNamespace(dsv41_remote=True),
+            service=None,
+            remote_closed=remote,
+            indices_keepalive=object(),
+        )
+        source.retire = lambda: cache_lease.retire(source.release)
+        lease = native.po.SourceLease(
+            native.overlap,
+            native.po.Chunk(
+                req, req.disagg_kv_sender, req.cache_request_handle, 0, 0, 32772, True
+            ),
+            1,
+            "swa-window-proof",
+            source=source,
+            cache_lease=cache_lease,
+            finalized=True,
+            release=lambda: f.release(req),
+        )
+        plan = SimpleNamespace(
+            error=None,
+            proof=SimpleNamespace(ready=lambda: True),
+            forward_done=SimpleNamespace(query=gpu.is_set),
+            indices_refs=[],
+        )
+        lease.plans.append(plan)
+        lease.ledger.pending.add("dma")
+        native.overlap.leases.append(lease)
+        native.overlap.retirement.register(lease)
+        native.native_status[0] = native.polls.Success
+        before = set(f.freed)
+        with patch.dict(sys.modules, native.modules):
+            for complete in (lambda: None, gpu.set, lease.ledger.pending.clear):
+                complete()
+                self.assertFalse(lease.ready_to_finish())
+                with self.assertRaisesRegex(RuntimeError, "proof is incomplete"):
+                    lease.finish()
+                self.assertEqual(f.freed, before)
+                self.assertEqual(f.published, [])
+            remote.set()
+            self.assertTrue(lease.ready_to_finish())
+            self.assertEqual(f.published, [])
+            native.overlap.poll()
+            command = native.overlap.retirement.poll_command()
+            self.assertIsNotNone(command)
+            self.assertEqual(f.published, [])
+            native.overlap.retirement.arm(command)
+            native.overlap.retirement.finalize()
+        self.assertTrue(cache_lease.closed)
+        self.assertTrue(lease.closed)
+        self.assertEqual(len(f.published), 4)
+        self.assertEqual(len(f.freed) + sum(b - a for a, b in f.published), f.allocated)
+
+    def test_source_swa_window_declined_insert_releases_without_final_retry(self):
+        f = self._source_swa_windows()
+        req, lease = f.request()
+        for end in (8192, 16384, 24576, 32768, 32772):
+            req.kv.kv_allocated_len = end
+            f.cache.checkpoint(req, up_to=end)
+        calls = []
+        f.guard.checkpoint = lambda req, **kw: calls.append(kw["up_to"])
+        lease.retire(lambda: (f.cache.checkpoint(req, up_to=32772), f.release(req)))
+        self.assertEqual(calls, [8192])
+        self.assertTrue(lease.publication_declined)
+        self.assertEqual(len(f.freed), f.allocated)
+        self.assertEqual(len(f.full_freed), f.allocated)
+
     def test_source_replays_pending_checkpoint_before_row_release_and_warm_hit(self):
         from sglang_remote_attn.source_cache import CacheGuard
 

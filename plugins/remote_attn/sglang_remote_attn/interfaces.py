@@ -14,6 +14,7 @@ STAGING = DISAGG + "common.staging_handler."
 # Explicit optional parameters are required: **kwargs can silently discard them.
 # Values pin the native, feature-disabled defaults as well as keyword support.
 CORE_CALLS = {
+    "sglang.srt.mem_cache.common.free_kv_row_segments": {"swa_retained_ranges": ()},
     DISAGG + "decode.DecodeTransferQueue._commit_transfer_to_req": {
         "keep_receiver": False
     },
@@ -281,6 +282,7 @@ CORE_CALLS = {
 }
 CORE_PROPERTIES = (DISAGG + "mooncake.pinned_staging_core.CorePinnedStager.poisoned",)
 CORE_FIELDS = {
+    "sglang.srt.managers.schedule_batch.ReqKvInfo": ("swa_retained_ranges",),
     "sglang.srt.managers.scheduler_components.invariant_checker.SchedulerInvariantChecker": (
         "get_external_kv_owners",
     ),

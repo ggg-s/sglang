@@ -986,7 +986,12 @@ class ReqKvInfo:
     kv_committed_len: int = 0  # KV content committed up to here, <= kv_allocated_len
     kv_allocated_len: int = 0
 
-    # SWA slots in [swa_dead_lo(page_size), get_evicted_seqlen(SWA)) are freed.
+    # SWA slots in [swa_dead_lo(page_size), get_evicted_seqlen(SWA)) are freed,
+    # except for swa_retained_ranges below.
+    # Page-aligned request-owned exceptions to the SWA dead interval. A source
+    # read lease can retain bounded checkpoint windows without publishing or
+    # rebinding its FULL row while DMA/Remote readers still use that row.
+    swa_retained_ranges: list[tuple[int, int]] = dataclasses.field(default_factory=list)
     swa_evict_floor: int = 0  # [0, here) never window-evicted (prefill-aware SWA)
     component_evicted_seqlens: dict[ComponentType, int] = dataclasses.field(
         default_factory=dict
@@ -1052,6 +1057,7 @@ class ReqKvInfo:
     def mark_kv_released(self) -> None:
         self.kv_allocated_len = 0
         self.component_evicted_seqlens.clear()
+        self.swa_retained_ranges.clear()
 
 
 class Req(ReqDllmMixin):

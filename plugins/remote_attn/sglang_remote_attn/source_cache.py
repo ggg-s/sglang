@@ -33,6 +33,7 @@ class ReadLease:
     published_checkpoint: tuple | None = None
     replayed_checkpoint: bool = False
     published_tokens: int = 0
+    publication_declined: bool = False
     finish_call: object = None
     abort: bool = False
     retiring: bool = False
@@ -59,8 +60,11 @@ class ReadLease:
             if self.pending_checkpoint is not None and not self.abort:
                 up_to, kwargs = self.pending_checkpoint
                 if not getattr(self.req, "skip_radix_cache_insert", False):
+                    from .swa_checkpoints import replay
+
+                    replay(self, up_to)
                     self.guard._checkpoint(self.req, up_to=up_to, **kwargs)
-                    self.replayed_checkpoint = True
+                    self.replayed_checkpoint = not self.publication_declined
             release()
             if self.finish_call is not None:
                 self.finish_call()
@@ -120,7 +124,7 @@ class CacheGuard:
                 lease.checkpoints += 1
                 lease.defer_checkpoint(up_to, kwargs)
                 return
-            if lease.abort:
+            if lease.abort or lease.publication_declined:
                 return
             if lease.published_checkpoint == (up_to, kwargs):
                 return  # Native final release may request the same checkpoint.
@@ -159,6 +163,9 @@ class CacheGuard:
         # no dependency on a future forward (which would create a stream cycle).
         with scheduler.device_module.stream(scheduler.schedule_stream):
             scheduler.schedule_stream.wait_stream(scheduler.forward_stream)
+            from .swa_checkpoints import retain
+
+            retain(self, req, min(up_to, len(req.origin_input_ids)))
             self.cache.evict_sliding_windows(req, pre_len)
 
     def _finish(self, handle, outcome):
