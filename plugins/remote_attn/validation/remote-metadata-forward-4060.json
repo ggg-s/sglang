@@ -1,0 +1,33 @@
+{
+  "device": "NVIDIA GeForce RTX 4060 Laptop GPU",
+  "torch": "2.13.0+cu130",
+  "scope": "Full final-forward ordering on CUDA; tiny Qwen/DSV ABI fixtures, no model load.",
+  "qwen": [
+    {
+      "dtype": "torch.bfloat16",
+      "native_calls": 1,
+      "transfers": 2,
+      "shared_full_forward_event": true,
+      "event_pending_at_submission": true,
+      "consumer_wait_correct": true
+    },
+    {
+      "dtype": "torch.float16",
+      "native_calls": 1,
+      "transfers": 2,
+      "shared_full_forward_event": true,
+      "event_pending_at_submission": true,
+      "consumer_wait_correct": true
+    }
+  ],
+  "dsv": {
+    "native_tail_graph_preserved": true,
+    "full_forward_proof_covers_graph_writes": true
+  },
+  "source_sha256": {
+    "plugins/remote_attn/sglang_remote_attn/pre_layerwise.py": "4415b1c9abd4343aa3679298332f026ea7e3c823ce75da10b4efb314800de7e2",
+    "plugins/remote_attn/sglang_remote_attn/dsv41_layerwise.py": "cd6e8cd292946598f0ab28f30dc151139902d5b9aebf39103aaade9ae22714a5",
+    "plugins/remote_attn/sglang_remote_attn/prefill_overlap.py": "8528da51b28ed4621d439b13dd9d2f621256fea73f8f32f8f304028b54f0edd0",
+    "test/manual/remote_attn/remote_final_forward_cuda_probe.py": "f4a3b0c2021915f2501fb2b923353df1629494e14d1bf7803ee4adf2690165f2"
+  }
+}

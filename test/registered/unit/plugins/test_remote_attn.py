@@ -5724,6 +5724,226 @@ class TestRemoteAttn(CustomTestCase):
         with self.assertRaises(ValueError):
             pl.buffer_groups([0, 1, 2], 3, 2)
 
+    def test_remote_metadata_bypasses_bulk_lock_and_admits_before_kv_success(self):
+        from sglang_remote_attn.transfer_priority import TransferLock
+        from sglang.srt.environ import envs
+
+        pl = self.hooks.pre_layerwise
+        with tempfile.TemporaryDirectory() as directory:
+            path = Path(directory)
+            lock = TransferLock()
+            bulk_started, drain = threading.Event(), threading.Event()
+            calls, frees = [], []
+            room = torch.zeros((1, 1), dtype=torch.int64)
+            manager = SimpleNamespace(_remote_attn_send_lock=lock)
+
+            def aux(peer, idx, pointers):
+                def write(*args):
+                    calls.append("metadata")
+                    room[0, 0] = 7
+                    return 0
+
+                return self.hooks._transfer(write, manager, "peer", [(1, 2, 8)])
+
+            manager.send_aux = aux
+            sender = SimpleNamespace(
+                kv_mgr=manager,
+                aux_index=0,
+                done=False,
+                send=lambda indices: calls.append("canonical-enqueued"),
+            )
+            req = SimpleNamespace(
+                rid="p", kv=SimpleNamespace(kv_committed_len=3), disagg_kv_sender=sender
+            )
+            owner = SimpleNamespace(
+                config=pl.Config("remote", path),
+                scheduler=SimpleNamespace(
+                    disagg_metadata_buffers=SimpleNamespace(set_buf=lambda req: None)
+                ),
+            )
+            source = pl.Source(
+                owner,
+                req,
+                path,
+                "g",
+                [],
+                slice(0, 3),
+                ((object(), SimpleNamespace(dst_aux_ptrs=[2])),),
+                3,
+            )
+            req._pre_layerwise_source = source
+            registry = SimpleNamespace(
+                register_handoff=lambda *a, **kw: {"handoff_id": "h", "epoch": 1}
+            )
+
+            def bulk():
+                with lock:
+                    bulk_started.set()
+                    if not drain.wait(5):
+                        raise TimeoutError("bulk test gate")
+                    calls.append("kv-complete")
+
+            def queued(which):
+                deadline = time.monotonic() + 3
+                with lock.condition:
+                    while not getattr(lock, which):
+                        remaining = deadline - time.monotonic()
+                        if remaining <= 0:
+                            raise TimeoutError(which)
+                        lock.condition.wait(min(remaining, 0.01))
+
+            event = SimpleNamespace(
+                record=lambda stream: None, synchronize=lambda: None
+            )
+            lock.acquire()
+            worker = threading.Thread(target=bulk)
+            worker.start()
+            with (
+                envs.SGLANG_MOONCAKE_SEND_LOCK.override(True),
+                patch.object(torch.cuda, "Event", lambda: event),
+                patch.object(torch.cuda, "current_stream", lambda: None),
+                patch.object(torch.cuda, "current_device", lambda: 0),
+                patch.object(torch.cuda, "set_device", lambda device: None),
+                patch.object(self.runtime, "get_remote_hub", return_value=registry),
+                patch.object(
+                    pl, "_poll_success", side_effect=lambda receiver: receiver.done
+                ),
+            ):
+                try:
+                    queued("bulk")
+                    source.finalize()
+                    queued("urgent")
+                    lock.release()
+                    source.thread.join(3)
+                    self.assertFalse(source.thread.is_alive())
+                    self.assertIsNone(source.error)
+                    self.assertTrue(bulk_started.wait(3))
+                    self.assertEqual(calls, ["metadata", "canonical-enqueued"])
+                    self.assertTrue(pl.defer_release(req, lambda: frees.append("KV")))
+                    self.assertTrue(
+                        pl.defer_release(req, lambda: frees.append("duplicate"))
+                    )
+                    self.assertFalse(source.poll())
+                    self.assertFalse(frees)
+
+                    d = pl.Controller.__new__(pl.Controller)
+                    d.config, d.targets, d.early_admissions = owner.config, [], 0
+                    d.agree = lambda flags: flags
+                    d.layers, d.rank, d.scheduler = 2, 0, object()
+                    dreq = SimpleNamespace(
+                        rid="d",
+                        bootstrap_room=7,
+                        kv=SimpleNamespace(req_pool_idx=0),
+                        output_ids=[],
+                        finished=lambda: False,
+                    )
+                    receiver = SimpleNamespace(done=False)
+                    dr = SimpleNamespace(
+                        req=dreq, kv_receiver=receiver, metadata_buffer_index=0
+                    )
+                    commits = []
+                    queue = SimpleNamespace(
+                        queue=[dr],
+                        metadata_buffers=SimpleNamespace(bootstrap_room=room),
+                        _commit_transfer_to_req=lambda dr, **kw: commits.append(kw),
+                    )
+                    target = pl.Target(d, queue, dr, path, "g", pl.LayerCoverage(3, 2))
+                    d.offer = lambda queue, dr: target
+
+                    def state(*args, **kw):
+                        return SimpleNamespace(
+                            events=args[2],
+                            layer_ready_at=[None] * 2,
+                            import_done_at=None,
+                        )
+
+                    with (
+                        patch.object(
+                            self.runtime, "_TargetHandoffState", side_effect=state
+                        ),
+                        patch.object(self.runtime, "_install_attention_wrappers"),
+                    ):
+                        admitted, _ = d.early_targets(queue, None)
+                    self.assertEqual(admitted, [dreq])
+                    self.assertEqual(commits, [{"keep_receiver": True}])
+                    self.assertIs(dr.kv_receiver, receiver)
+                    self.assertFalse(receiver.done)
+                    self.assertNotIn("kv-complete", calls)
+                finally:
+                    if lock.busy and not bulk_started.is_set():
+                        lock.release()
+                    drain.set()
+                    worker.join(3)
+                    if source.thread is not None:
+                        source.thread.join(3)
+            self.assertEqual(calls[-1], "kv-complete")
+            self.assertFalse(frees)
+
+    def test_source_retirement_failure_after_free_is_never_retried(self):
+        pl = self.hooks.pre_layerwise
+        with tempfile.TemporaryDirectory() as directory:
+            path = Path(directory)
+            freed = []
+            req = SimpleNamespace()
+            source = pl.Source(
+                SimpleNamespace(config=pl.Config("remote", path)),
+                req,
+                path,
+                "g",
+                [],
+                slice(0, 1),
+                (),
+                1,
+            )
+            source.release = lambda: freed.append("KV")
+            with patch(
+                "sglang_remote_attn.source_resources.retire_metadata",
+                side_effect=RuntimeError("metadata allocator failed"),
+            ):
+                with self.assertRaisesRegex(RuntimeError, "allocator failed"):
+                    source.retire()
+                with self.assertRaisesRegex(RuntimeError, "refusing release retry"):
+                    source.retire()
+            self.assertEqual(freed, ["KV"])
+            self.assertFalse(source.released)
+
+    def test_target_metadata_partial_free_blocks_retirement_retry(self):
+        pl = self.hooks.pre_layerwise
+        with tempfile.TemporaryDirectory() as directory:
+            path = Path(directory)
+            freed = []
+
+            def free(idx):
+                freed.append(idx)
+                raise RuntimeError("partial allocator mutation")
+
+            receiver = SimpleNamespace(clear=lambda: freed.append("receiver"))
+            req = SimpleNamespace()
+            dr = SimpleNamespace(req=req, kv_receiver=receiver, metadata_buffer_index=0)
+            queue = SimpleNamespace(
+                metadata_buffers=SimpleNamespace(bootstrap_room=torch.tensor([[7]])),
+                req_to_metadata_buffer_idx_allocator=SimpleNamespace(free=free),
+            )
+            target = pl.Target(
+                SimpleNamespace(config=pl.Config("remote", path)),
+                queue,
+                dr,
+                path,
+                "g",
+                pl.LayerCoverage(1, 1),
+            )
+            with (
+                patch.object(target, "ready_to_finish", return_value=True),
+                patch.object(target, "refresh"),
+                patch.object(self.runtime, "_drop_target_state_for"),
+            ):
+                with self.assertRaisesRegex(RuntimeError, "allocator mutation"):
+                    target.finish(wait=False)
+                with self.assertRaisesRegex(RuntimeError, "refusing retirement retry"):
+                    target.finish(wait=False)
+            self.assertEqual(freed, ["receiver", 0])
+            self.assertFalse(target.closed)
+
     def test_prelayer_source_release_requires_native_and_rpc_drain(self):
         pl = self.hooks.pre_layerwise
         with tempfile.TemporaryDirectory() as directory:

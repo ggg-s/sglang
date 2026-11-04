@@ -3,13 +3,14 @@
 import threading
 import time
 from collections import deque
-from contextlib import contextmanager
+from contextlib import contextmanager, nullcontext
 
 
 class TransferLock:
     def __init__(self, urgent_burst=4):
         self.condition = threading.Condition()
         self.urgent, self.bulk = deque(), deque()
+        self.local = threading.local()
         self.busy = False
         self.burst = 0
         self.urgent_burst = urgent_burst
@@ -24,7 +25,17 @@ class TransferLock:
         finally:
             self.release()
 
+    @contextmanager
+    def control(self):
+        previous = getattr(self.local, "control", False)
+        self.local.control = True
+        try:
+            yield
+        finally:
+            self.local.control = previous
+
     def acquire(self, *, urgent=False):
+        urgent = urgent or getattr(self.local, "control", False)
         queue = self.urgent if urgent else self.bulk
         ticket = object()
         started = time.perf_counter_ns()
@@ -64,3 +75,10 @@ class TransferLock:
 
     def __exit__(self, *args):
         self.release()
+
+
+def control(manager):
+    # Mark priority without taking the mutex: send_aux -> _transfer takes it.
+    # Taking it here would deadlock the non-reentrant native send guard.
+    lock = getattr(manager, "_remote_attn_send_lock", None)
+    return lock.control() if hasattr(lock, "control") else nullcontext()

@@ -189,6 +189,7 @@ class Source:
     responded: bool = False
     finalized: bool = False
     released: bool = False
+    retirement_failed: bool = False
     created_at: float = field(default_factory=time.monotonic)
     group_size: int = 0
     prefill_chunk_tokens: int | None = None
@@ -284,7 +285,12 @@ class Source:
                 from contextlib import nullcontext
 
                 stream = getattr(self, "prefix_stream", None)
-                with stream.priority() if stream is not None else nullcontext():
+                from .transfer_priority import control
+
+                with (
+                    stream.priority() if stream is not None else nullcontext(),
+                    control(sender.kv_mgr),
+                ):
                     for peer, registration in self.peers:
                         rc = sender.kv_mgr.send_aux(
                             peer, sender.aux_index, registration.dst_aux_ptrs
@@ -357,6 +363,8 @@ class Source:
         # Allocator mutations must occur only after every TP rank is ready.
         if self.released:
             return
+        if self.retirement_failed:
+            raise RuntimeError("source retirement failed; refusing release retry")
         if self.thread is not None:
             self.thread.join(timeout=self.owner.config.drain_timeout)
             if self.thread.is_alive():
@@ -370,6 +378,9 @@ class Source:
             self.cache_lease.check()
             if release is None:
                 raise RuntimeError("P radix source has no deferred release")
+        # Any callback may mutate allocator state before raising. A partial
+        # retirement is quarantined locally; never replay its destructive steps.
+        self.retirement_failed = True
         if release is not None:
             if self.cache_lease is not None:
                 self.cache_lease.retire(release)
@@ -381,6 +392,7 @@ class Source:
         self.release = None
         self.req._pre_layerwise_source = None
         self.released = True
+        self.retirement_failed = False
         write_json(
             self.path / "released.json",
             {
@@ -534,6 +546,8 @@ class Target:
             self.coverage.ready(i) for i in range(self.coverage.layers)
         ):
             raise RuntimeError("canonical completion without all layer proofs")
+        # receiver/metadata cleanup can mutate state before raising too.
+        self.release_failed = True
         if self.native_staging:
             self.queue.staging_handler.unregister_decode_req(
                 self.decode_req.req.bootstrap_room
@@ -587,6 +601,7 @@ class Target:
                 )
                 raise
         self.closed = True
+        self.release_failed = False
         self.decode_req.req._pre_layerwise_target = None
         self.decode_req.req._pre_layerwise_native_target = None
 

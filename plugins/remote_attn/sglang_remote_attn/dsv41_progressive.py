@@ -38,6 +38,13 @@ def track_transfer(original, manager, room, indices, index_slice, last, *args, *
     source.enqueue_index()
 
 
+def send_metadata(manager, peer, index, pointers):
+    from .transfer_priority import control
+
+    with control(manager):
+        return manager.send_aux(peer, index, pointers)
+
+
 def send_states(source):
     """Runs inside a counted native worker callback, including abort ACK fence."""
     sender = source.req.disagg_kv_sender
@@ -50,8 +57,8 @@ def send_states(source):
                     peer, payload.get("state_indices") or [], executor, registration
                 )
                 != 0
-                or manager.send_aux(
-                    peer, payload["aux_index"], registration.dst_aux_ptrs
+                or send_metadata(
+                    manager, peer, payload["aux_index"], registration.dst_aux_ptrs
                 )
                 != 0
             ):
@@ -238,6 +245,8 @@ class Resource:
         return self.gpu_ready() and self.transport_ready()
 
     def finish(self, *, wait=False):
+        if self.closed:
+            return
         if not self.ready_to_finish():
             raise RuntimeError("unproven resource switch")
         self.parent.rpc.local_entries.add(self.entry)
@@ -287,6 +296,10 @@ class ProgressiveTarget(NativeTarget):
         )
 
     def finish(self, *, wait=False):
+        if self.closed:
+            return
+        if self.release_failed:
+            raise RuntimeError("D target release failed; refusing retirement retry")
         if not self.ready_to_finish():
             raise RuntimeError("unproven final DSV4.1 GPU/PD retirement")
         self.rpc.close("progressive-tp-local")
