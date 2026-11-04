@@ -874,6 +874,8 @@ class TestRemoteAttn(CustomTestCase):
     def test_p_radix_checkpoint_waits_for_native_and_rpc_readers_then_dedups(self):
         from sglang_remote_attn.source_cache import CacheGuard, checkpoint_allowed
 
+        from sglang_remote_attn.source_resources import release_metadata
+
         f = self._radix()
         warm, _ = f.request([1, 2], "warm")
         f.release_kv_cache(warm, f.cache, checkpoint=True)
@@ -898,6 +900,15 @@ class TestRemoteAttn(CustomTestCase):
                 cache_lease=lease,
             )
             req._pre_layerwise_source = source
+            req.metadata_buffer_index = 5
+            metadata_frees = []
+            release_metadata(
+                _source_function(
+                    "disaggregation/prefill.py", "maybe_release_metadata_buffer"
+                ),
+                req,
+                SimpleNamespace(free=metadata_frees.append),
+            )
             registry = self.runtime.HandoffRegistry()
             ctx = registry.register(
                 "cache-reader",
@@ -933,6 +944,7 @@ class TestRemoteAttn(CustomTestCase):
                 ),
             ):
                 self.assertFalse(source.poll())
+                self.assertEqual(metadata_frees, [])
                 registry.release_ref("cache-reader", ctx.owner_epoch)
                 self.assertFalse(source.poll())
                 f.cache.evict(f.EvictParams(num_tokens=32))
@@ -945,10 +957,12 @@ class TestRemoteAttn(CustomTestCase):
                 self.assertTrue(
                     set(original.tolist()).isdisjoint(f.allocator.free_pages.tolist())
                 )
+                self.assertEqual(metadata_frees, [])
                 status.done = True
                 self.assertTrue(source.poll())
                 source.retire()
                 source.retire()
+                self.assertEqual(metadata_frees, [5])
             hit = f.cache.match_prefix(
                 f.MatchPrefixParams(f.RadixKey(array("q", [1, 2, 3, 4])))
             )
@@ -6134,6 +6148,432 @@ class TestRemoteAttn(CustomTestCase):
             device_module=SimpleNamespace(stream=lambda stream: nullcontext()),
         )
 
+    def test_source_replays_pending_checkpoint_before_row_release_and_warm_hit(self):
+        from sglang_remote_attn.source_cache import CacheGuard
+
+        for callback_checkpoint in (False, True):
+            with self.subTest(callback_checkpoint=callback_checkpoint):
+                f = self._radix()
+                req, original = f.request([1, 2, 3, 4, 5, 6], "cold")
+                calls = []
+                native = f.cache.checkpoint
+                f.cache.checkpoint = lambda req, **kw: (
+                    calls.append(kw["up_to"]),
+                    native(req, **kw),
+                )[-1]
+                lease = CacheGuard(f.cache).hold(req)
+                for end in (2, 4, 6, 3):
+                    f.cache.checkpoint(req, up_to=end)
+                self.assertEqual(calls, [])
+                self.assertEqual(f.cache.total_size(), 0)
+                self.assertEqual(lease.pending_checkpoint[0], 6)
+                lease.retire(
+                    lambda: f.release_kv_cache(
+                        req, f.cache, checkpoint=callback_checkpoint
+                    )
+                )
+                self.assertEqual(calls, [6])
+                self.assertTrue(lease.replayed_checkpoint)
+                hit, indices = f.request([1, 2, 3, 4, 5, 6, 7], "warm")
+                self.assertEqual(hit.kv.cache_protected_len, 6)
+                self.assertEqual(indices[:6].tolist(), original.tolist())
+                f.release_kv_cache(hit, f.cache, checkpoint=True)
+                f.cache.evict(f.EvictParams(num_tokens=32))
+                self.assertEqual(f.allocator.available_size(), 32)
+                self.assertEqual(len(set(f.allocator.free_pages.tolist())), 32)
+                with self.assertRaisesRegex(RuntimeError, "no longer usable"):
+                    lease.retire(lambda: self.fail("duplicate row free"))
+
+    def test_source_pending_checkpoint_abort_and_publish_failure_never_free_twice(self):
+        from sglang_remote_attn.source_cache import CacheGuard, checkpoint_allowed
+
+        for abort in (False, True):
+            f = self._radix()
+            req, _ = f.request([1, 2, 3], "attempt")
+            calls = []
+
+            def fail(req, **kwargs):
+                calls.append("checkpoint")
+                raise RuntimeError("partial publication")
+
+            if not abort:
+                f.cache.checkpoint = fail
+            lease = CacheGuard(f.cache).hold(req)
+            req._pre_layerwise_source = SimpleNamespace(cache_lease=lease)
+            f.cache.checkpoint(req, up_to=3)
+            if abort:
+                f.cache.finish(req.cache_request_handle, f.CacheRequestOutcome.ABORT)
+                lease.retire(
+                    lambda: f.release_kv_cache(
+                        req, f.cache, checkpoint=checkpoint_allowed(req, True)
+                    )
+                )
+                self.assertEqual(f.cache.total_size(), 0)
+                self.assertEqual(f.allocator.available_size(), 32)
+            else:
+                with self.assertRaisesRegex(RuntimeError, "partial publication"):
+                    lease.retire(lambda: self.fail("free after failed publication"))
+                with self.assertRaisesRegex(RuntimeError, "no longer usable"):
+                    lease.retire(lambda: self.fail("retry free"))
+                self.assertEqual(calls, ["checkpoint"])
+                self.assertEqual(f.allocator.available_size(), 29)
+
+    def test_source_retirement_publishes_live_swa_tail_past_stale_branch(self):
+        from sglang_remote_attn.source_cache import CacheGuard
+
+        component = _source_class(
+            "mem_cache/unified_cache/components/swa.py",
+            "SWAComponent",
+            {"prepare_for_caching_req", "_clip_to_window"},
+        )()
+        component.component_type = "swa"
+        component.cache = SimpleNamespace(is_mamba_enabled=False)
+        component.tree_core = SimpleNamespace(is_eagle=False, page_size=256)
+        req = SimpleNamespace(
+            cache_request_handle="swa-branch",
+            last_node=0,
+            lock=None,
+            kv=SimpleNamespace(
+                cache_protected_len=0, get_evicted_seqlen=lambda ct: 7424
+            ),
+            swa_branching_seqlen=2048,
+        )
+        published = []
+
+        def checkpoint(req, *, up_to):
+            cursors = {}
+            params = SimpleNamespace(
+                set_evicted_seqlen=lambda c, n: cursors.update({c: n})
+            )
+            shortened = component.prepare_for_caching_req(req, params, up_to, True)
+            end = min(up_to, shortened) if shortened is not None else up_to
+            node = SimpleNamespace(component_data={"swa": SimpleNamespace(value=None)})
+            # Only the live final window is published. The old 2K branch's
+            # SWA was reclaimed, so truncating here would cache no usable tail.
+            component.tree_core._split_node = lambda *a: (None, None)
+            node.key = range(end)
+            live = component._clip_to_window(
+                node=node,
+                start=0,
+                end=end,
+                window_start=cursors["swa"],
+                cache_actions=[],
+            )
+            published.append((end, live))
+
+        cache = SimpleNamespace(
+            checkpoint=checkpoint,
+            finish=lambda *a: None,
+            reset=lambda: None,
+            lock=lambda node: object(),
+            unlock=lambda pin: None,
+        )
+        guard = CacheGuard(cache, allow_swa=True)
+        lease = guard.hold(req)
+        cache.checkpoint(req, up_to=8192)
+        self.assertEqual(published, [])
+        lease.retire(lambda: cache.checkpoint(req, up_to=8192))
+        self.assertEqual(published, [(8192, 7424)])
+        self.assertIsNone(req.swa_branching_seqlen)
+
+    def test_source_metadata_waits_overlap_gpu_io_and_ordered_retirement(self):
+        from sglang_remote_attn.source_resources import release_metadata
+
+        f, c = self._dsv41_overlap_fixture(), self._dsv41_cache()
+        f.controller.cache_guard = c.guard
+        f.req.cache_request_handle = c.native.CacheRequestHandle(f.req.rid, 0)
+        f.req.kv.cache_protected_len = 8
+        f.req.last_node, f.req.lock = 1, c.cache.lock(1)
+        completed = [False]
+
+        class Event:
+            def record(self, stream):
+                pass
+
+            def query(self):
+                return completed[0]
+
+        def launch(scheduler, batch):
+            f.controller.forward(lambda *a: None, f.runner, batch)
+            return SimpleNamespace(delay_sample_func=None, copy_done=Event())
+
+        native_meta = _source_function(
+            "disaggregation/prefill.py", "maybe_release_metadata_buffer"
+        )
+        frees = []
+        allocator = SimpleNamespace(free=frees.append)
+        f.req.metadata_buffer_index = 7
+        f.req.extend_end, f.req.extend_len = 33, 33
+        with (
+            patch.dict(sys.modules, f.modules),
+            patch.object(torch.cuda, "Event", Event),
+            patch.object(torch.cuda, "current_stream", lambda: None),
+            patch.object(
+                f.po,
+                "page_indices",
+                lambda raw, page: (
+                    (raw[::page] // page).numpy().copy(),
+                    Event(),
+                    (raw,),
+                ),
+            ),
+        ):
+            result = f.overlap.run_batch(launch, f.scheduler, f.batch)
+            lease = f.req._dsv41_p_lease
+            f.po.after_result(
+                lambda scheduler, *a: scheduler.send_kv_chunk(f.req, last_chunk=True),
+                f.scheduler,
+                f.batch,
+                result,
+            )
+            release_metadata(native_meta, f.req, allocator)
+            release_metadata(native_meta, f.req, allocator)
+            f.overlap.defer_release(f.req, lambda: c.cache.unlock(f.req.lock))
+            f.overlap.defer_release(f.req, lambda: self.fail("duplicate KV free"))
+            f.native_status[0] = f.polls.Success
+            self.assertFalse(lease.ready_to_finish())
+            self.assertEqual(frees, [])
+            completed[0] = True
+            self.assertFalse(lease.ready_to_finish())  # transfer callbacks pending
+            for _ in range(f.tasks.qsize()):
+                f.tasks.get_nowait().on_complete()
+            self.assertTrue(lease.ready_to_finish())
+            f.overlap.poll()
+            self.assertEqual(frees, [])  # local proof alone cannot release
+            f.overlap.retirement.arm(f.overlap.retirement.poll_command())
+            f.overlap.retirement.finalize()
+            self.assertEqual(frees, [7])
+            release_metadata(native_meta, f.req, allocator)
+            self.assertEqual(frees, [7])
+
+    def test_source_quarantine_failed_inflight_keeps_metadata_and_kv(self):
+        from sglang_remote_attn.source_resources import (
+            release_metadata,
+            retire_metadata,
+        )
+        from sglang_remote_attn.transport_failure import quarantine
+        from sglang_remote_attn.pre_layerwise import defer_release
+        import logging
+
+        native = _source_class(
+            "disaggregation/prefill.py",
+            "SchedulerDisaggregationPrefillMixin",
+            {
+                "process_disagg_prefill_inflight_queue",
+                "handle_inflight_transfer_failure",
+            },
+            strip_method_decorators=True,
+        )
+
+        class Aborted:
+            pass
+
+        def failure():
+            raise RuntimeError("unsettled DMA")
+
+        freed, kv_freed = [], []
+        req = SimpleNamespace(
+            rid="failed",
+            bootstrap_room=9,
+            metadata_buffer_index=7,
+            cache_request_handle="attempt",
+            return_logprob=False,
+            pending_bootstrap=False,
+            finished_reason=Aborted(),
+            finished=lambda: True,
+            time_stats=SimpleNamespace(
+                set_completion_time=lambda: None,
+                trace_ctx=SimpleNamespace(abort=lambda **kw: None),
+            ),
+            disagg_kv_sender=SimpleNamespace(failure_exception=failure),
+        )
+        req.kv = self.Kv(req_pool_idx=0, kv_allocated_len=8)
+        source = SimpleNamespace(
+            req=req,
+            released=False,
+            final_payload=([], slice(0, 0), {"aux_index": 7}),
+            ledger=SimpleNamespace(pending={"aux"}),
+            cache_lease=SimpleNamespace(
+                abort=False,
+                defer_checkpoint=lambda *a: self.fail(
+                    "checkpoint on quarantined lease"
+                ),
+            ),
+        )
+        req._pre_layerwise_source = source
+        scheduler = SimpleNamespace(
+            chunked_req=None,
+            disagg_prefill_inflight_queue=[req],
+            attn_cp_cpu_group=None,
+            attn_tp_cpu_group=None,
+            tree_cache=SimpleNamespace(finish=lambda *a: None),
+            metrics_reporter=SimpleNamespace(enable_metrics=False),
+            output_streamer=SimpleNamespace(stream_output=lambda *a: None),
+            _release_aborted_request=lambda req: None,
+            req_to_metadata_buffer_idx_allocator=SimpleNamespace(free=freed.append),
+        )
+        scheduler.handle_inflight_transfer_failure = lambda req: (
+            native.handle_inflight_transfer_failure(scheduler, req)
+        )
+        native_meta = _source_function(
+            "disaggregation/prefill.py", "maybe_release_metadata_buffer"
+        )
+        native.handle_inflight_transfer_failure.__globals__.update(
+            maybe_release_metadata_buffer=lambda req, alloc: release_metadata(
+                native_meta, req, alloc
+            ),
+            FINISH_ABORT=Aborted,
+            logger=logging.getLogger(__name__),
+            get_parallel=lambda: SimpleNamespace(tp_rank=0),
+            KVPoll=SimpleNamespace(
+                Success="success",
+                Failed="failed",
+                WaitingForInput="waiting",
+                Transferring="transferring",
+            ),
+            poll_and_all_reduce_attn_cp_tp_group=lambda *a: ["failed"],
+            release_kv_cache=lambda req, cache, **kw: defer_release(
+                req, lambda: kv_freed.append(req), checkpoint=kw["checkpoint"]
+            ),
+        )
+        owner = SimpleNamespace(scheduler=scheduler, sources=[source], targets=[])
+        with patch.dict(
+            sys.modules,
+            {
+                "sglang.srt.disaggregation.utils": SimpleNamespace(
+                    prepare_abort=lambda *a, **kw: None
+                )
+            },
+        ):
+            quarantine(owner, source, "pending metadata DMA")
+            native.process_disagg_prefill_inflight_queue(scheduler)
+        retire_metadata(req)  # quarantine never supplies retirement proof
+        release_metadata(
+            native_meta, req, scheduler.req_to_metadata_buffer_idx_allocator
+        )
+        self.assertEqual(freed, [])
+        self.assertEqual(kv_freed, [])
+        self.assertEqual(req.metadata_buffer_index, 7)
+        self.assertEqual(source.final_payload[2]["aux_index"], 7)
+
+    def test_source_metadata_attempt_reuse_and_failed_free_are_not_retried(self):
+        from sglang_remote_attn.source_resources import (
+            release_metadata,
+            retire_metadata,
+        )
+
+        native = _source_function(
+            "disaggregation/prefill.py", "maybe_release_metadata_buffer"
+        )
+        frees = []
+        allocator = SimpleNamespace(free=frees.append)
+        req = SimpleNamespace(cache_request_handle="a", metadata_buffer_index=2)
+        release_metadata(native, req, allocator)
+        self.assertEqual(frees, [2])  # ordinary native path
+        req._pre_layerwise_source = SimpleNamespace(released=False, cache_lease=None)
+        for attempt in ("b", "c"):
+            req.cache_request_handle, req.metadata_buffer_index = attempt, 3
+            release_metadata(native, req, allocator)
+            self.assertEqual(frees.count(3), int(attempt == "c"))
+            retire_metadata(req)
+            retire_metadata(req)
+        self.assertEqual(frees, [2, 3, 3])  # two distinct allocations
+        req.cache_request_handle, req.metadata_buffer_index = "d", 4
+
+        def fail(index):
+            frees.append(index)
+            raise RuntimeError("free completion unknown")
+
+        release_metadata(native, req, SimpleNamespace(free=fail))
+        with self.assertRaisesRegex(RuntimeError, "completion unknown"):
+            retire_metadata(req)
+        with self.assertRaisesRegex(RuntimeError, "refusing retry"):
+            retire_metadata(req)
+        self.assertEqual(frees.count(4), 1)
+
+    def test_source_external_owners_are_counted_without_hiding_actual_leaks(self):
+        from sglang_remote_attn.source_resources import owned_requests
+        from sglang.srt.environ import envs
+        from types import MethodType
+
+        names = {
+            "_external_kv_owners",
+            "_requests_owning_rows",
+            "_get_total_uncached_sizes",
+            "_check_all_pools",
+            "_check_req_pool",
+            "_check_pool_invariant",
+        }
+        cls = _source_class(
+            "managers/scheduler_components/invariant_checker.py",
+            "SchedulerInvariantChecker",
+            names,
+        )
+        private = _source_function(
+            "managers/scheduler_components/pool_stats_observer.py", "kv_private_tokens"
+        )
+        swa = _source_function(
+            "managers/scheduler_components/pool_stats_observer.py",
+            "kv_private_swa_tokens",
+        )
+        ceil_align = lambda n, p: (n + p - 1) // p * p
+        private.__globals__["ceil_align"] = swa.__globals__["ceil_align"] = ceil_align
+        swa.__globals__["ComponentType"] = SimpleNamespace(SWA="swa")
+        self.Kv.swa_dead_lo.__globals__["ceil_align"] = ceil_align
+        cls._get_total_uncached_sizes.__globals__.update(
+            kv_private_tokens=private,
+            kv_private_swa_tokens=swa,
+            envs=envs,
+            raise_error_or_warn=_source_function(
+                "utils/common.py", "raise_error_or_warn"
+            ),
+        )
+        kv = self.Kv(req_pool_idx=0, kv_allocated_len=16, cache_protected_len=4)
+        kv.set_evicted_seqlen("swa", 12)
+        req = SimpleNamespace(kv=kv, beam_group=None)
+        source = SimpleNamespace(req=req)
+        owner = SimpleNamespace(
+            sources=[source],
+            targets=[],
+            transport_quarantine={1: {"req": req}},
+            cache_guard=SimpleNamespace(leases={1: SimpleNamespace(req=req)}),
+        )
+        checker = SimpleNamespace(
+            page_size=4,
+            is_hybrid_swa=True,
+            is_hybrid_ssm=False,
+            tree_cache=SimpleNamespace(
+                session_records=lambda: {}, swa_transient_size=lambda: 0
+            ),
+            get_external_kv_owners=lambda: owned_requests(owner),
+            get_last_batch=lambda: SimpleNamespace(reqs=[req]),
+            get_running_batch=lambda: None,
+            get_chunked_req=lambda: req,
+            req_to_token_pool=SimpleNamespace(size=2, pre_alloc_size=0, free_slots=[1]),
+            pool_stats_observer=SimpleNamespace(session_held_req_count=lambda: 0),
+        )
+        for name in names - {"_check_pool_invariant"}:
+            setattr(checker, name, MethodType(getattr(cls, name), checker))
+        self.assertEqual(checker._get_total_uncached_sizes(), (12, 4))
+        checker.get_last_batch, checker.get_chunked_req = lambda: None, lambda: None
+        checker._check_full_pool = lambda ps, uncached=0: cls._check_pool_invariant(
+            "full", ps.full_free, 0, 4, 0, 32, uncached
+        )
+        checker._check_swa_pool = lambda ps, uncached=0: cls._check_pool_invariant(
+            "swa", ps.swa_free, 0, 4, 0, 32, uncached
+        )
+        stats = SimpleNamespace(full_free=16, swa_free=24)
+        with envs.SGLANG_ENABLE_STRICT_MEM_CHECK_DURING_IDLE.override(True):
+            self.assertFalse(checker._check_all_pools(stats)[0])
+            checker._check_req_pool()
+            stats.full_free -= 4
+            self.assertTrue(checker._check_all_pools(stats)[0])
+            checker.req_to_token_pool.free_slots.clear()
+            with self.assertRaisesRegex(ValueError, "memory leak"):
+                checker._check_req_pool()
+        self.assertTrue(req.kv.holds_kv)
+        self.assertEqual(kv.get_evicted_seqlen("swa"), 12)
+
     def test_source_deferred_checkpoint_reclaims_long_prompt_swa_only(self):
         from sglang_remote_attn.source_cache import CacheGuard
 
@@ -8042,6 +8482,7 @@ class TestRemoteAttn(CustomTestCase):
             kv_to_page_indices=kv_to_page,
         )
         scheduler = scheduler_cls()
+        scheduler.invariant_checker = SimpleNamespace()
         scheduler.kv_checksum_computer = None
         scheduler.enable_staging = scheduler.enable_pdmux = False
         scheduler.sliding_window_size = 128
@@ -8833,6 +9274,7 @@ class TestRemoteAttn(CustomTestCase):
                 f.batch,
                 final,
             )
+            c.cache.checkpoint(f.req, up_to=33)
             f.overlap.defer_release(
                 f.req,
                 lambda: (

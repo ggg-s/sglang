@@ -20,6 +20,7 @@ from . import (
     prefix_stream,
     segmented_graph,
     source_cache,
+    source_resources,
 )
 
 logger = logging.getLogger(__name__)
@@ -592,6 +593,7 @@ def _publish_peer_now(original, manager, mooncake_session_id, decode_kv_args):
 
 
 HOOKS = {
+    "sglang.srt.disaggregation.prefill.maybe_release_metadata_buffer": source_resources.release_metadata,
     "sglang.srt.disaggregation.prefill.SchedulerDisaggregationPrefillMixin.maybe_send_cached_prefix_chunk": prefix_stream.cached_prefix,
     "sglang.srt.disaggregation.decode.DecodePreallocQueue._match_prefix_and_lock": destination_cache.match_prefix,
     "sglang.srt.disaggregation.decode.DecodePreallocQueue._send_kv_metadata": destination_cache.send_metadata,

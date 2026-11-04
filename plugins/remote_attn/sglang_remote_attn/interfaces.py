@@ -281,6 +281,9 @@ CORE_CALLS = {
 }
 CORE_PROPERTIES = (DISAGG + "mooncake.pinned_staging_core.CorePinnedStager.poisoned",)
 CORE_FIELDS = {
+    "sglang.srt.managers.scheduler_components.invariant_checker.SchedulerInvariantChecker": (
+        "get_external_kv_owners",
+    ),
     "sglang.srt.managers.scheduler_components.request_receiver.SchedulerRequestReceiver": (
         "get_last_batch",
         "recv_from_tokenizer",

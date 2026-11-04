@@ -375,6 +375,9 @@ class Source:
                 self.cache_lease.retire(release)
             else:
                 release()
+        from .source_resources import retire_metadata
+
+        retire_metadata(self.req)
         self.release = None
         self.req._pre_layerwise_source = None
         self.released = True
@@ -385,6 +388,16 @@ class Source:
                 "at": time.monotonic(),
                 "p_radix_lease_closed": self.cache_lease.closed
                 if self.cache_lease is not None
+                else None,
+                "replayed_cache_checkpoint": self.cache_lease.replayed_checkpoint
+                if self.cache_lease is not None
+                else False,
+                "published_cache_tokens": self.cache_lease.published_tokens
+                if self.cache_lease is not None
+                else 0,
+                "published_cache_frontier": self.cache_lease.published_checkpoint[0]
+                if self.cache_lease is not None
+                and self.cache_lease.published_checkpoint
                 else None,
                 "deferred_cache_checkpoints": self.cache_lease.checkpoints
                 if self.cache_lease is not None
@@ -1316,6 +1329,9 @@ def initialize(scheduler):
             force=controller.config.mode == "remote"
             or controller.destination_cache is not None,
         )
+    from .source_resources import install_accounting
+
+    install_accounting(controller)
     scheduler._pre_layerwise = controller
     scheduler.tp_worker.model_runner._pre_layerwise = controller
 
@@ -1396,8 +1412,18 @@ def pop_transferred(original, queue, rids_to_check=None):
 def defer_release(req, release, *, checkpoint=None):
     from .transport_failure import TransportFailure, hold_release, retain_release
 
+    from .source_cache import lease_for
+
+    cache_lease = lease_for(req)
+    if cache_lease is not None and checkpoint is False:
+        cache_lease.abort = True
     if hold_release(req, release):
         return True
+    if cache_lease is not None and checkpoint is True:
+        # Native release's checkpoint runs inside the deferred callback.
+        # Coalesce its authoritative final frontier before replaying, so
+        # an intermediate checkpoint is not published and deduped first.
+        cache_lease.defer_checkpoint(req.owned_kv_len())
     source = getattr(req, "_pre_layerwise_source", None)
     sender = getattr(req, "disagg_kv_sender", None)
     if sender is not None and (

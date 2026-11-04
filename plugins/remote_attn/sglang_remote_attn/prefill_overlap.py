@@ -183,6 +183,9 @@ class SourceLease:
                 self.cache_lease.retire(self.release or (lambda: None))
             elif self.release is not None:
                 self.release()
+            from .source_resources import retire_metadata
+
+            retire_metadata(req)
         except BaseException as exc:
             # An allocator callback may have mutated ownership before failing.
             # Never retry it during another drain or shutdown.
@@ -372,7 +375,7 @@ class PrefillOverlap:
             return False
         lease.check()
         if lease.release is not None:
-            raise RuntimeError("duplicate P native release callback")
+            return True  # Native abort/result cleanup may repeat the same free.
         lease.release = release
         return True
 

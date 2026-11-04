@@ -29,6 +29,10 @@ class ReadLease:
     lock: object
     cached_tokens: int
     checkpoints: int = 0
+    pending_checkpoint: tuple | None = None
+    published_checkpoint: tuple | None = None
+    replayed_checkpoint: bool = False
+    published_tokens: int = 0
     finish_call: object = None
     abort: bool = False
     retiring: bool = False
@@ -41,10 +45,22 @@ class ReadLease:
                 "P radix read lease changed attempt or is no longer usable"
             )
 
+    def defer_checkpoint(self, up_to, kwargs=None):
+        self.check()
+        if self.pending_checkpoint is None or up_to >= self.pending_checkpoint[0]:
+            self.pending_checkpoint = (up_to, dict(kwargs or {}))
+
     def retire(self, release):
         self.check()
         self.retiring = True
         try:
+            # Publish before the callback can release/reuse the request row.
+            # All callers must already hold the GPU/IO/Remote retirement proof.
+            if self.pending_checkpoint is not None and not self.abort:
+                up_to, kwargs = self.pending_checkpoint
+                if not getattr(self.req, "skip_radix_cache_insert", False):
+                    self.guard._checkpoint(self.req, up_to=up_to, **kwargs)
+                    self.replayed_checkpoint = True
             release()
             if self.finish_call is not None:
                 self.finish_call()
@@ -102,7 +118,24 @@ class CacheGuard:
             if not lease.retiring:
                 self._evict_swa(req, up_to)
                 lease.checkpoints += 1
+                lease.defer_checkpoint(up_to, kwargs)
                 return
+            if lease.abort:
+                return
+            if lease.published_checkpoint == (up_to, kwargs):
+                return  # Native final release may request the same checkpoint.
+            if self.allow_swa:
+                # The deferred intermediate branch may no longer have SWA.
+                # At retirement publish the completed frontier and its live
+                # tail, rather than truncating back to that obsolete branch.
+                branch = getattr(req, "swa_branching_seqlen", None)
+                if branch is not None and branch <= up_to:
+                    req.swa_branching_seqlen = None
+            result = self.checkpoint(req, up_to=up_to, **kwargs)
+            lease.published_tokens = int(req.kv.cache_protected_len)
+            lease.published_checkpoint = (up_to, dict(kwargs))
+            lease.pending_checkpoint = None
+            return result
         return self.checkpoint(req, up_to=up_to, **kwargs)
 
     def _evict_swa(self, req, up_to):
@@ -179,9 +212,16 @@ def install(cache, *, allow_swa=False, scheduler=None):
     return guard
 
 
-def checkpoint_allowed(req, requested):
+def lease_for(req):
     source = getattr(req, "_pre_layerwise_source", None)
     lease = getattr(source, "cache_lease", None)
     if lease is None:
         lease = getattr(getattr(req, "_dsv41_p_lease", None), "cache_lease", None)
+    if lease is None:
+        lease = getattr(getattr(req, "_dsv41_p_certificate", None), "cache_lease", None)
+    return lease
+
+
+def checkpoint_allowed(req, requested):
+    lease = lease_for(req)
     return requested and not (lease is not None and lease.abort)

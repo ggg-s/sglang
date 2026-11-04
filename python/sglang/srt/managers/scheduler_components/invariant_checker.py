@@ -69,6 +69,9 @@ class SchedulerInvariantChecker:
     # The chunked-prefill request parked between chunks is in neither batch;
     # it still owns its KV row.
     get_chunked_req: Callable = field(default=lambda: None)
+    # Owners retained by an extension after leaving native scheduling queues.
+    # They remain allocated; counting them must never make their pages free.
+    get_external_kv_owners: Callable = field(default=lambda: ())
     count_req_pool_leak_warnings: int = 0
     count_memory_leak_warnings: int = 0
     recent_busy_msgs: Deque[str] = field(
@@ -271,6 +274,15 @@ class SchedulerInvariantChecker:
         )
         return active_leak or int8_leak, active_msg + "\n" + int8_msg
 
+    def _external_kv_owners(self):
+        session_kvs = {id(kv) for kv in self.tree_cache.session_records().values()}
+        owners, seen = [], set(session_kvs)
+        for req in self.get_external_kv_owners():
+            if req.kv.holds_kv and id(req.kv) not in seen:
+                seen.add(id(req.kv))
+                owners.append(req)
+        return owners
+
     def _requests_owning_rows(self) -> List[Req]:
         last_batch = self.get_last_batch()
         running_batch = self.get_running_batch()
@@ -283,13 +295,14 @@ class SchedulerInvariantChecker:
         if chunked_req is not None:
             reqs.append(chunked_req)
 
+        reqs.extend(self._external_kv_owners())
         # A request running on a session's record does not own that row.
         session_kvs = {id(kv) for kv in self.tree_cache.session_records().values()}
         owners, seen = [], set()
         for req in reqs:
-            if id(req) in seen:
+            if id(req.kv) in seen:
                 continue
-            seen.add(id(req))
+            seen.add(id(req.kv))
             if req.kv.holds_kv and id(req.kv) not in session_kvs:
                 owners.append(req)
         return owners
@@ -435,11 +448,17 @@ class SchedulerInvariantChecker:
         )
 
         session_req_count = self.pool_stats_observer.session_held_req_count()
-        if len(self.req_to_token_pool.free_slots) + session_req_count != req_total_size:
+        external_req_count = len(self._external_kv_owners())
+        if (
+            len(self.req_to_token_pool.free_slots)
+            + session_req_count
+            + external_req_count
+            != req_total_size
+        ):
             msg = (
                 "req_to_token_pool memory leak detected!"
                 f"available_size={len(self.req_to_token_pool.free_slots)}, "
-                f"session_held={session_req_count}, "
+                f"session_held={session_req_count}, external_held={external_req_count}, "
                 f"total_size={self.req_to_token_pool.size}\n"
             )
             raise_error_or_warn(
@@ -465,12 +484,21 @@ class SchedulerInvariantChecker:
         has_leak = False
         messages = []
 
-        full_leak, full_msg = self._check_full_pool(ps, uncached=uncached)
+        external = self._external_kv_owners()
+        external_full = sum(
+            kv_private_tokens(req.kv, self.page_size) for req in external
+        )
+        full_leak, full_msg = self._check_full_pool(
+            ps, uncached=uncached + external_full
+        )
         has_leak |= full_leak
         messages.append(full_msg)
 
         if self.is_hybrid_swa:
-            swa_leak, swa_msg = self._check_swa_pool(ps)
+            external_swa = sum(
+                kv_private_swa_tokens(req.kv, self.page_size) for req in external
+            )
+            swa_leak, swa_msg = self._check_swa_pool(ps, uncached=external_swa)
             has_leak |= swa_leak
             messages.append(swa_msg)
 
