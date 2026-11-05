@@ -15041,6 +15041,295 @@ class TestRemoteAttn(CustomTestCase):
             self.assertNotEqual(old, b.config.directory)
             self.assertTrue((directory / "control/P0/instance.lock").exists())
 
+    def test_dsv_d2d_bulk_uses_registered_mooncake_bytes_without_tcp_payload(self):
+        from sglang_remote_attn import dsv_d2d as d2d
+
+        e = self._d2d_env()
+        envelopes = []
+        client = d2d.remote.runtime().TargetClient
+        call = client.call
+
+        def capture(client, header, *args, **kwargs):
+            result = call(client, header, *args, **kwargs)
+            if header.get("dsv_d2d") == "read":
+                response, out, lse = result
+                envelopes.append((out.numel() + lse.numel(), response["bulk_bytes"]))
+            return result
+
+        with patch.object(client, "call", capture):
+            meta = e.freeze()
+            e.import_(meta)
+            target = e.target.d2d_targets[e.epoch]
+            self.assertTrue(e.blocked.wait(3))
+            self.assertTrue(e.command(e.target, "d2d_commit")["admitted"])
+            self.assertFalse(target.copied)
+            e.gate.set()
+            e.wait_copy()
+        engine = d2d.manager(e.source).engine
+        self.assertEqual(meta["bulk_transport"], "mooncake-host-v1")
+        self.assertTrue(engine.calls)
+        self.assertTrue(envelopes)
+        self.assertTrue(all(n == 0 and size > 0 for n, size in envelopes))
+        self.assertEqual(len(engine.calls), len(envelopes))
+        self.assertTrue(
+            all(size <= d2d.LIMIT + 32 for _, sizes in engine.calls for size in sizes)
+        )
+
+    def test_dsv_d2d_bulk_unknown_write_quarantines_both_registered_slots(self):
+        from sglang_remote_attn import dsv_d2d as d2d
+
+        e = self._d2d_env()
+        e.import_(e.freeze())
+        self.assertTrue(e.blocked.wait(3))
+        source = e.source.d2d_sources[e.epoch]
+        target = e.target.d2d_targets[e.epoch]
+        engine = d2d.manager(e.source).engine
+        transfer = engine.batch_transfer_sync
+
+        def failed(*args):
+            transfer(*args)  # A negative return does not imply nothing was written.
+            return -1
+
+        engine.batch_transfer_sync = failed
+        e.gate.set()
+        target.worker.join(5)
+        self.assertFalse(target.worker.is_alive())
+        self.assertIsNotNone(target.error)
+        self.assertTrue(source.bulk_sender.unsafe)
+        self.assertTrue(target.bulk_reader.bulk.unsafe)
+        self.assertIn(source.bulk_sender, engine._d2d_bulk_owners)
+        self.assertTrue(engine.regions)
+        with self.assertRaises(d2d.TransportFailure):
+            e.command(e.target, "d2d_abort")
+        with self.assertRaises(ValueError):
+            e.command(e.source, "d2d_resume")
+        self.assertEqual(e.freed, [])
+        self.assertTrue(target.decode_req.req.kv.holds_kv)
+
+    def test_dsv_d2d_bulk_lost_ack_retains_receiver_even_after_successful_write(self):
+        from sglang_remote_attn import dsv_d2d as d2d
+
+        e = self._d2d_env()
+        e.import_(e.freeze())
+        self.assertTrue(e.blocked.wait(3))
+        target = e.target.d2d_targets[e.epoch]
+        call = target.bulk_reader.client.call
+
+        def lost_ack(header, *args, **kwargs):
+            result = call(header, *args, **kwargs)
+            if header.get("dsv_d2d") == "read":
+                raise TimeoutError("lost successful bulk ACK")
+            return result
+
+        target.bulk_reader.client.call = lost_ack
+        e.gate.set()
+        target.worker.join(5)
+        self.assertFalse(target.worker.is_alive())
+        slot = target.bulk_reader.bulk
+        self.assertTrue(slot.unsafe)
+        self.assertFalse(slot.closed)
+        self.assertIn(slot, d2d.manager(e.target).engine._d2d_bulk_owners)
+        with self.assertRaises(d2d.TransportFailure):
+            e.command(e.target, "d2d_abort")
+        self.assertEqual(e.freed, [])
+
+    def test_dsv_d2d_bulk_host_arrival_and_sequence_gate_h2d(self):
+        from sglang_remote_attn import d2d_bulk as bulk
+        from sglang_remote_attn import dsv_d2d as d2d
+
+        e = self._d2d_env()
+        req = SimpleNamespace()
+        slot = bulk.Receiver(d2d.manager(e.target).engine, req, "cpu")
+        self.addCleanup(slot.close)
+        region = slot.prepare()
+        header = dict(
+            bulk_protocol=bulk.PROTOCOL,
+            bulk_nonce=region["nonce"],
+            bulk_sequence=slot.sequence,
+            bytes=4,
+        )
+        slot.tensor.fill_(0)
+        slot.tensor[:4] = torch.tensor([1, 2, 3, 4], dtype=torch.uint8)
+        # A successful native send/ACK with no arrival footer is insufficient.
+        with self.assertRaisesRegex(TimeoutError, "arrival"):
+            slot.consume(header, 4, 0)
+        footer = bulk.marker(slot.nonce, slot.sequence, 4)
+        slot.tensor[4 : 4 + bulk.FOOTER] = torch.tensor(list(footer), dtype=torch.uint8)
+        self.assertEqual(slot.consume(header, 4, 1).tolist(), [1, 2, 3, 4])
+        slot.prepare()
+        with self.assertRaisesRegex(ValueError, "completion"):
+            slot.consume(header, 4, 0)
+
+    def test_dsv_d2d_bulk_rejects_old_wire_before_target_allocation(self):
+        e = self._d2d_env()
+        meta = e.freeze()
+        meta["version"] = "dsv-d2d-v1"
+        with self.assertRaisesRegex(ValueError, "epoch/TP"):
+            e.import_(meta)
+        self.assertFalse(e.target.d2d_targets)
+
+    def test_dsv_d2d_bulk_rejects_replay_or_changed_peer_before_native_write(self):
+        from sglang_remote_attn import d2d_bulk as bulk
+        from sglang_remote_attn import dsv_d2d as d2d
+
+        e = self._d2d_env()
+        e.freeze()
+        sender = e.source.d2d_sources[e.epoch].bulk_sender
+        receiver = bulk.Receiver(d2d.manager(e.target).engine, SimpleNamespace(), "cpu")
+        self.addCleanup(receiver.close)
+        region = receiver.prepare()
+        value = torch.arange(16, dtype=torch.uint8)
+        ready = d2d.dp.event("cpu")
+        sender.write(value, ready, region, 1)
+        with self.assertRaisesRegex(ValueError, "sequence"):
+            sender.write(value, ready, region, 1)
+        with self.assertRaisesRegex(ValueError, "region"):
+            sender.write(value, ready, dict(region, base=region["base"] + 1), 2)
+        with self.assertRaisesRegex(ValueError, "session"):
+            sender.write(value, ready, dict(region, session="changed-peer"), 2)
+        self.assertEqual(len(sender.engine.calls), 1)
+        self.assertFalse(sender.unsafe)
+
+    def test_dsv_d2d_bulk_failed_deregister_blocks_prepared_free(self):
+        from sglang_remote_attn import dsv_d2d as d2d
+
+        e = self._d2d_env()
+        e.import_(e.freeze())
+        self.assertTrue(e.blocked.wait(3))
+        e.gate.set()
+        target = e.wait_copy()
+        slot = target.reader.bulk
+        d2d.manager(e.target).engine.batch_deregister = lambda ptrs: -1
+        with self.assertRaisesRegex(RuntimeError, "deregistration"):
+            e.command(e.target, "d2d_abort")
+        self.assertTrue(slot.unsafe)
+        self.assertFalse(slot.closed)
+        self.assertEqual(e.freed, [])
+        with self.assertRaises(d2d.TransportFailure):
+            e.command(e.target, "d2d_abort")
+
+    def test_dsv_d2d_bulk_disconnect_cannot_retry_or_release_pending_destination(self):
+        from sglang_remote_attn import dsv_d2d as d2d
+
+        e = self._d2d_env()
+        e.import_(e.freeze())
+        self.assertTrue(e.blocked.wait(3))
+        source = e.source.d2d_sources[e.epoch]
+        target = e.target.d2d_targets[e.epoch]
+        engine = d2d.manager(e.source).engine
+        peer = d2d.manager(e.target).engine
+        client = target.bulk_reader.client
+        rt = d2d.remote.runtime()
+        started, proceed, completed = (
+            threading.Event(),
+            threading.Event(),
+            threading.Event(),
+        )
+        original_transfer, original_wait = (
+            engine.batch_transfer_sync,
+            rt.TargetClient._wait,
+        )
+        attempts = []
+
+        def transfer(*args):
+            started.set()
+            try:
+                if not proceed.wait(8):
+                    raise TimeoutError("test bulk gate")
+                return original_transfer(*args)
+            finally:
+                completed.set()
+
+        def wait(self, fut, deadline):
+            if self is client:
+                attempts.append(fut.rpc_id)
+                if not started.wait(3):
+                    raise TimeoutError("test native write did not start")
+                raise rt._RemoteDisconnected("injected ambiguous bulk disconnect")
+            return original_wait(self, fut, deadline)
+
+        with (
+            patch.object(engine, "batch_transfer_sync", transfer),
+            patch.object(rt.TargetClient, "_wait", wait),
+        ):
+            try:
+                e.gate.set()
+                self.assertTrue(started.wait(3))
+                target.worker.join(3)
+                self.assertFalse(target.worker.is_alive())
+                slot = target.bulk_reader.bulk
+                self.assertEqual(len(attempts), 1)
+                self.assertEqual(client.stats()["rpc_retried"], 0)
+                self.assertTrue(slot.unsafe)
+                self.assertFalse(slot.closed)
+                self.assertIn(slot.tensor.data_ptr(), peer.regions)
+                self.assertTrue(e.command(e.source, "d2d_resume")["pending_reader"])
+                with self.assertRaises(d2d.TransportFailure):
+                    e.command(e.target, "d2d_abort")
+                self.assertEqual(e.freed, [])
+                self.assertFalse(source.remote_closed.is_set())
+            finally:
+                proceed.set()
+                self.assertTrue(completed.wait(5))
+
+    def test_dsv_d2d_bulk_failed_copy_retains_gpu_input_owner(self):
+        from sglang_remote_attn import d2d_bulk as bulk, dsv_d2d as d2d
+
+        e = self._d2d_env()
+        e.freeze()
+        sender = e.source.d2d_sources[e.epoch].bulk_sender
+        receiver = bulk.Receiver(d2d.manager(e.target).engine, SimpleNamespace(), "cpu")
+        self.addCleanup(receiver.close)
+        region = receiver.prepare()
+        proof = SimpleNamespace()
+
+        def invoke():
+            data = torch.arange(32, dtype=torch.uint8)
+            ref = weakref.ref(data)
+            try:
+                sender.write(data, proof, region, 1)
+            except RuntimeError:
+                pass
+            return ref
+
+        with patch.object(
+            sender.slot,
+            "copy",
+            side_effect=RuntimeError("D2H submitted without completion proof"),
+        ):
+            ref = invoke()
+        gc.collect()
+        self.assertIsNotNone(ref())
+        self.assertIs(sender.copy_owner[0], ref())
+        self.assertIs(sender.copy_owner[1], proof)
+        self.assertTrue(sender.unsafe)
+        self.assertIn(sender, sender.engine._d2d_bulk_owners)
+        with self.assertRaises(RuntimeError):
+            sender.close()
+        self.assertIsNotNone(ref())
+
+    def test_dsv_d2d_bulk_completed_copy_releases_input_owner(self):
+        from sglang_remote_attn import d2d_bulk as bulk, dsv_d2d as d2d
+
+        e = self._d2d_env()
+        e.freeze()
+        sender = e.source.d2d_sources[e.epoch].bulk_sender
+        receiver = bulk.Receiver(d2d.manager(e.target).engine, SimpleNamespace(), "cpu")
+        self.addCleanup(receiver.close)
+        region = receiver.prepare()
+
+        def invoke():
+            data = torch.arange(32, dtype=torch.uint8)
+            ref = weakref.ref(data)
+            sender.write(data, d2d.dp.event("cpu"), region, 1)
+            return ref
+
+        ref = invoke()
+        gc.collect()
+        self.assertIsNone(ref())
+        self.assertIsNone(sender.copy_owner)
+        self.assertFalse(sender.unsafe)
+
     def _d2d_env(self, ratio=2, **kwargs):
         import importlib.util
         import sys
@@ -15064,7 +15353,6 @@ class TestRemoteAttn(CustomTestCase):
     def test_dsv_d2d_remote_commit_before_bulk_and_source_released_only_after_readers(
         self,
     ):
-        from sglang_remote_attn import dsv_d2d as d2d
 
         e = self._d2d_env()
         meta = e.freeze()

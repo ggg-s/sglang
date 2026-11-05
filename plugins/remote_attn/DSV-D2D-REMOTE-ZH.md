@@ -22,9 +22,15 @@ transfer overlap 不变；没有把最后 chunk 改回 layerwise forward。原�
 - 保留原生 sampling 参数、完整 prompt/output token 历史及最后一个尚未写 KV 的
   sampled token。通过原生 `prepare_for_prebuilt/process_prebuilt` 和 FutureMap
   恢复 pending token，禁止迁移两端同时采样。
-- 当前 bulk KV/state 使用独立连接上的最多 4 MiB TCP 帧；这是实际实现的传输
-  方式，不是 native KV RDMA。Q/O/LSE 可通过 `HANDOFF_REMOTE_GPU_TRANSFER=1`
-  使用现有原生 Mooncake GPU 通道。跨机地址沿用 `HANDOFF_PD_NETWORK=1` 和
+- 当前 `dsv-d2d-v2` 的 bulk KV/state 复用该 Decode rank 的原生 Mooncake 引擎，
+  源端使用独立 non-blocking D2H stream 和注册 pinned Host slot，目标端接收到
+  注册 pinned Host slot 后，在 setup/copy stream 上执行 H2D 和原有 scatter。
+  每次 payload 最多 4 MiB，另带 32 字节到达标记。此路径强制启用，不依赖
+  `SGLANG_MOONCAKE_HOST_STAGING_ALL` 或 `HANDOFF_REMOTE_GPU_TRANSFER`；不自动
+  回退 socket KV payload，D0/D1 必须同时升级，旧 v1 manifest 在分配前拒绝。
+  Mooncake 的实际传输沿用部署配置（TCP/RDMA 等），本实现始终以 Host slot
+  为 bulk 接收区，不宣称是 GPU Direct KV 传输。Q/O/LSE 可独立通过
+  `HANDOFF_REMOTE_GPU_TRANSFER=1` 使用现有原生 Mooncake GPU 通道。跨机地址沿用 `HANDOFF_PD_NETWORK=1` 和
   `HANDOFF_NETWORK_*`；控制文件通过现有受控通道送到各实例。
 
 ## 数据与 KV 所有权
@@ -51,9 +57,26 @@ transfer overlap 不变；没有把最后 chunk 改回 layerwise forward。原�
    copy/commit 证明及各源 TP rank 的最终投票全部通过，才执行一次原生 KV free。
    D0 不能仅因 D1 已开始生成而释放历史 KV。
 
-控制消息和 bulk KV 使用不同 TCP 连接，bulk 一次最多发出一个有界读取；不会
-把全部历史 KV 先入队再发送 commit。实际带宽仍会影响迁移窗口，当前不承诺 TCP
-bulk 能达到原生 RDMA 的速度。
+控制消息保留独立 TCP 连接，bulk 字节由 Mooncake 搬运，一次最多一个有界读取，
+不把全部历史 KV 先入队再发送 commit。每个迁移持有一个源发送 slot，目标 setup
+reader 和后台 reader 各持有一个独立接收 slot，不占用 Q/O/LSE slot 或其优先锁。
+引擎最多保留 32 个 bulk slot（每个约 4 MiB），包括隔离的失败 slot；耗尽后拒绝
+新分配。当前为单 slot 串行 D2H/发送，不是双缓冲流水线。
+
+每次读校验 migration epoch、接收 session、slot nonce、地址和单调序号。源端等待
+生产 event 后 D2H，完成后才提交 Mooncake；接收端同时校验 ACK 和同一连续传输
+末尾的到达标记，不能仅依赖 TCP 后端的发送完成状态。下一次写入前等待上次 H2D
+读完 Host slot。原有逐 entry copy event、`scatter_prefix` 尾页保护和 TP 有序退休
+不变。所有 DMA/RPC 完成状态不确定、到达超时、注册或注销失败均隔离并保留存储，
+禁止用 abort/resume 绕过。bulk RPC 显式禁用断连自动重试，首次不确定断连即隔离
+接收区，避免第二次请求的拒绝被误当作第一次写入的完成证明；明确未提交写入的
+单次读取仍可安全取消。源端在提交 D2H 前由 engine-owned sender 强引用 GPU 输入
+和生产 event，只有拷贝完成 event 同步成功才清除引用；异常时与 Host slot 一起保留。
+
+v2 安全修复后验证：完整 CPU 合同 301 项通过，4060 CUDA 正向 8 组通过，两个
+故障回归各 3 次通过，见 [修复后复测](validation/dsv-d2d-bulk-v2-4060-fixed.md)。
+覆盖真实 CUDA、pinned memory、Mooncake TCP 和 socket；scheduler/分配仍使用
+native ABI 夹具，不等同于完整模型或 RDMA 验收。下方历史 4060 记录对应此前 v1。
 
 ## 控制命令
 

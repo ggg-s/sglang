@@ -3,17 +3,17 @@
 import ast
 import tempfile
 import threading
-import time
 from contextlib import ExitStack
 from pathlib import Path
 from types import SimpleNamespace as NS
 from unittest.mock import patch
 
 import torch
-from dsv41_remote_probe_support import fixture, definitions, encoded
+from dsv41_remote_probe_support import definitions, encoded, fixture
 from flash0731_probe_support import flash_fixture
-from sglang_remote_attn import dsv_d2d as d2d, dsv41_remote as remote
-from sglang_remote_attn import handoff_control as rt, pre_layerwise as pl
+from sglang_remote_attn import dsv_d2d as d2d
+from sglang_remote_attn import handoff_control as rt
+from sglang_remote_attn import pre_layerwise as pl
 from sglang_remote_attn.decode_overlap import DecodeOverlap
 
 
@@ -244,7 +244,6 @@ class Environment:
                     + (2 if n == 0 else 1) * page
                 )
             )
-            from sglang_remote_attn.dsv41_staging import buffers
 
             # Registration mirrors the pool's native global pointer order.
             tensors = []
@@ -410,7 +409,7 @@ class Environment:
         self.stack.enter_context(patch.object(d2d.Reader, "call", read))
         self.stack.callback(self.gate.set)
         self.transport = None
-        if gpu:
+        if device == "cuda":
             from remote_gpu_probe_support import Transport
 
             self.transport = Transport(root, allow_tcp_snapshot=True)
@@ -420,7 +419,67 @@ class Environment:
                 prealloc.kv_manager = controller.gpu_data_plane.manager
                 controller.scheduler.disagg_decode_prealloc_queue = prealloc
                 prealloc.kv_manager.kv_args = controller._d2d_kv_args
+            if not gpu:
+                self.stack.enter_context(
+                    patch.dict(
+                        __import__("os").environ, {"HANDOFF_REMOTE_GPU_TRANSFER": "0"}
+                    )
+                )
         else:
+            # Real registered byte copies at the native transport boundary.
+            # CUDA probes use the actual Mooncake engine and pinned CUDA slot.
+            import ctypes
+
+            from sglang_remote_attn import d2d_bulk
+
+            engines = {}
+
+            class Slot:
+                def __init__(self, capacity, device):
+                    self.host = torch.empty(capacity, dtype=torch.uint8)
+                    self.stream = NS(synchronize=lambda: None)
+
+                def copy(self, blocks, ready):
+                    if ready is not None:
+                        ready.synchronize()
+                    offset = 0
+                    for src, _, size in blocks:
+                        ctypes.memmove(self.host.data_ptr() + offset, src, size)
+                        offset += size
+
+                def close(self):
+                    pass
+
+            self.stack.enter_context(patch.object(d2d_bulk, "new_slot", Slot))
+            for n, controller in enumerate(self.nodes):
+                engine = NS(regions={}, calls=[], session=f"cpu-d2d-{n}")
+                engines[engine.session] = engine
+
+                def register(ptrs, sizes, engine=engine):
+                    engine.regions.update(zip(ptrs, sizes))
+                    return 0
+
+                def deregister(ptrs, engine=engine):
+                    for ptr in ptrs:
+                        del engine.regions[ptr]
+                    return 0
+
+                def transfer(session, sources, targets, sizes, engine=engine):
+                    peer = engines[session]
+                    for src, dst, size in zip(sources, targets, sizes):
+                        assert engine.regions[src] >= size
+                        assert peer.regions[dst] >= size
+                        ctypes.memmove(dst, src, size)
+                    engine.calls.append((session, list(sizes)))
+                    return 0
+
+                engine.batch_register = register
+                engine.batch_deregister = deregister
+                engine.batch_transfer_sync = transfer
+                engine.get_session_id = lambda engine=engine: engine.session
+                controller.scheduler.disagg_decode_prealloc_queue.kv_manager.engine = (
+                    engine
+                )
             self.stack.enter_context(
                 patch.dict(
                     __import__("os").environ, {"HANDOFF_REMOTE_GPU_TRANSFER": "0"}
@@ -471,6 +530,14 @@ class Environment:
                     t.reader.close()
             if hasattr(controller, "dsv41_rpc_batches"):
                 controller.dsv41_rpc_batches.close()
+        # No readers or producers may outlive test teardown. Successful slots
+        # are deregistered; uncertain ones deliberately remain engine-owned.
         if self.transport is not None:
             self.transport.close()
+        self.hub.close()
+        for controller in self.nodes:
+            engine = d2d.manager(controller).engine
+            for slot in list(getattr(engine, "_d2d_bulk_owners", ())):
+                if not slot.unsafe:
+                    slot.close()
         self.stack.close()

@@ -1,6 +1,7 @@
 """DSV Decode-to-Decode ownership over a frozen native request.
 
-The bulk reader uses bounded TCP frames; attention reuses DSV sparse Remote.
+Bulk bytes use native Mooncake with private pinned slots; TCP carries control.
+Attention reuses DSV sparse Remote.
 All allocator mutations and ownership decisions stay on TP scheduler commands.
 """
 
@@ -9,18 +10,20 @@ import re
 import threading
 import time
 from array import array
-from dataclasses import dataclass, field
 from contextlib import nullcontext
+from dataclasses import dataclass, field
 from pathlib import Path
 from types import SimpleNamespace as NS
 
 import torch
 
-from . import dsv41_remote as remote, remote_data_plane as dp
+from . import d2d_bulk as bulk
+from . import dsv41_remote as remote
+from . import remote_data_plane as dp
 from .transport_failure import TransportFailure
 
-VERSION = "dsv-d2d-v1"
-LIMIT = 4 * 1024 * 1024
+VERSION = "dsv-d2d-v2"
+LIMIT = bulk.CAPACITY
 COMMANDS = {
     "d2d_freeze",
     "d2d_import",
@@ -208,6 +211,7 @@ def sampling(req):
     # Recreate native SamplingParams, including penalties/seed, from its public
     # constructor inputs. Grammar/custom processors carry additional live state.
     import inspect
+
     from sglang.srt.sampling.sampling_params import SamplingParams
 
     if (
@@ -263,6 +267,7 @@ class Source:
     row: object = None
     peers: tuple = ()
     gpu_session: object = None
+    bulk_sender: object = None
     created: float = field(default_factory=time.monotonic)
     remote_closed: object = field(default_factory=threading.Event)
     lock: object = field(default_factory=threading.RLock)
@@ -291,9 +296,13 @@ class Source:
             )
         ]
         self.final_event = dp.event(self.pages.device)
+        self.bulk_sender = bulk.Sender(
+            manager(self.owner).engine, req, self.pages.device
+        )
         remote.register(self)
         self.meta = dict(
             version=VERSION,
+            bulk_transport=bulk.PROTOCOL,
             epoch=self.epoch,
             destination=self.destination,
             target_rid=self.target_rid,
@@ -323,6 +332,7 @@ class Source:
         if (
             getattr(self.req, "_remote_attn_transport_quarantine", None) is not None
             or self.error
+            or getattr(self.req, "_d2d_bulk_unsafe", False)
             or self.released
             or (self.aborted and not allow_aborted)
             or getattr(self.req, "_handoff_transfer_unsafe", False)
@@ -344,6 +354,7 @@ class Source:
             raise TransportFailure("D2D source GPU reader fence failed")
         if not (self.committed and self.copied and self.remote_closed.is_set()):
             return False
+        self.bulk_sender.close()
         if self.release is None:
             from sglang.srt.mem_cache.common import release_kv_cache
 
@@ -358,6 +369,7 @@ class Source:
         if self.retirement_failed or not self.poll():
             raise RuntimeError("D2D source retirement is unproven or failed")
         self.retirement_failed = True
+        self.bulk_sender.close()
         self.release()
         self.release = None
         self.released = True
@@ -405,7 +417,14 @@ def execute(job, stream, cache):
         raise ValueError("D2D destination/epoch changed")
     action = h.get("dsv_d2d")
     with source.lock:
-        source.check_read()
+        try:
+            source.check_read()
+        except TransportFailure:
+            if action == "read":
+                # Positive proof for prepared cancellation: this invocation
+                # never reached a native write. A socket error is NOT this proof.
+                return reply(torch.empty(0, dtype=torch.uint8), bulk_rejected=True)
+            raise
         if action == "abort":
             if source.committed:
                 raise ValueError("cannot abort committed D2D owner")
@@ -452,26 +471,38 @@ def execute(job, stream, cache):
         or count * table.shape[1] > LIMIT
     ):
         raise ValueError("D2D read range exceeds frozen ownership/budget")
+    region = bulk.descriptor(h.get("bulk_region"))
+    sequence = h.get("bulk_sequence")
     device = table.device
     with on_device(device), on_stream(device, stream):
         if stream is not None:
             stream.wait_event(source.final_event)
-        data = (
-            table.index_select(0, indices[lo : lo + count].to(torch.int64))
-            .contiguous()
-            .cpu()
-        )
-    return reply(data)
+        data = table.index_select(
+            0, indices[lo : lo + count].to(torch.int64)
+        ).contiguous()
+        ready = dp.event(device)
+        size = source.bulk_sender.write(data, ready, region, sequence)
+    # Empty tensor envelope preserves the authenticated RemoteHub request lease;
+    # Receiver checks the host arrival footer before consuming any KV bytes.
+    return reply(
+        torch.empty(0, dtype=torch.uint8),
+        bulk_protocol=bulk.PROTOCOL,
+        bulk_nonce=region["nonce"],
+        bulk_sequence=sequence,
+        bulk_bytes=size,
+    )
 
 
 class Reader:
-    def __init__(self, route, destination, epoch, timeout=600):
+    def __init__(self, route, destination, epoch, timeout=600, *, owner, req):
         self.route, self.destination, self.epoch = route, destination, epoch
         self.client = remote.runtime().TargetClient(route["host"], route["port"])
         self.client.attach(route["handoff_id"], route["token"], route["epoch"])
         self.query = bytes(1024)
         self.timeout = timeout
         self.closed = False
+        self.owner, self.req = owner, req
+        self.bulk = None
 
     def call(self, action, **fields):
         if self.closed:
@@ -486,17 +517,52 @@ class Reader:
             q_bytes=1024,
             **fields,
         )
-        response, out, _lse = self.client.call(h, self.query, deadline_s=self.timeout)
-        if not response.get("ok"):
-            raise RuntimeError(response.get("error", "D2D snapshot failed"))
-        return response, out.view(torch.uint8)[: response["bytes"]]
+        if action != "read":
+            response, out, _lse = self.client.call(
+                h, self.query, deadline_s=self.timeout
+            )
+            if not response.get("ok"):
+                raise RuntimeError(response.get("error", "D2D snapshot failed"))
+            return response, out.view(torch.uint8)[: response["bytes"]]
+        if self.bulk is None:
+            device = self.owner.pool.get_swa_key_buffer_radix(0).device
+            self.bulk = bulk.Receiver(manager(self.owner).engine, self.req, device)
+        with self.bulk.lock:
+            try:
+                h["bulk_region"] = self.bulk.prepare()
+                h["bulk_sequence"] = self.bulk.sequence
+                response, out, lse = self.client.call(
+                    h, self.query, deadline_s=self.timeout, retry_on_disconnect=False
+                )
+                if not response.get("ok"):
+                    raise RuntimeError(response.get("error", "D2D snapshot failed"))
+                if response.get("bulk_rejected") is True:
+                    raise bulk.ReadRejected("D2D read rejected before native write")
+                if out.numel() or lse.numel() or response.get("bytes") != 0:
+                    raise ValueError("D2D bulk unexpectedly returned TCP tensor bytes")
+                size = response.get("bulk_bytes")
+                # Existing callers validate row counts against their own schema.
+                header = dict(response, bytes=size)
+                data = self.bulk.consume(header, size, self.timeout)
+                return header, data
+            except bulk.ReadRejected:
+                raise
+            except BaseException:
+                # Even an RPC timeout after a successful send is uncertain to
+                # this receiver: never reuse/deregister its slot or free target KV.
+                self.bulk.poison()
+                raise
 
     def close(self):
         if self.closed:
             return
         self.closed = True
-        self.client.detach(self.route["handoff_id"])
-        self.client.close()
+        try:
+            self.client.detach(self.route["handoff_id"])
+        finally:
+            self.client.close()
+            if self.bulk is not None and not self.bulk.unsafe:
+                self.bulk.close()
 
 
 def copy_rows(reader, kind, entry, dst, indices, rows):
@@ -630,8 +696,8 @@ class Target(NativeTarget):
         if self.rpc is not None:
             if self.cancelled:
                 # Prepared imports have never entered model execution. The
-                # copy-stream fence proves their TCP-only writes, even when a
-                # copy error poisoned the ordinary request IO ledger.
+                # Copy-stream fences prove local writes only; uncertain native
+                # bulk writes are rejected by abort_import before retirement.
                 if self.rpc.calls or self.forward_proofs:
                     raise RuntimeError("prepared D2D abort has model consumers")
                 self.rpc.closed = True
@@ -654,8 +720,8 @@ class Target(NativeTarget):
         self.worker = None
 
     def transfer(self):
-        from .dsv41_staging import buffers
         from .dsv41_receive import scatter_prefix
+        from .dsv41_staging import buffers
 
         req, pool = self.decode_req.req, self.owner.pool
         try:
@@ -664,6 +730,8 @@ class Target(NativeTarget):
                 self.reader.destination,
                 self.reader.epoch,
                 self.reader.timeout,
+                owner=self.owner,
+                req=req,
             )
             device = pool.get_swa_key_buffer_radix(0).device
             self.copy_stream = new_stream(device)
@@ -879,10 +947,11 @@ def allocation_preflight(controller, req):
 
 
 def import_request(controller, data):
-    from .dsv41_staging import buffers
-    from .handoff_control import _select_transfer, _new_req, _tracked
-    from .pre_layerwise import LayerCoverage
     from sglang.srt.sampling.sampling_params import SamplingParams
+
+    from .dsv41_staging import buffers
+    from .handoff_control import _new_req, _select_transfer, _tracked
+    from .pre_layerwise import LayerCoverage
 
     sources, targets = records(controller)
     epoch = str(data["migration_epoch"])
@@ -896,6 +965,7 @@ def import_request(controller, data):
     transfer = _select_transfer(data, controller.rank, controller.tp_size)
     if (
         transfer["version"] != VERSION
+        or transfer.get("bulk_transport") != bulk.PROTOCOL
         or transfer["epoch"] != epoch
         or transfer["tp_size"] != controller.tp_size
     ):
@@ -946,7 +1016,12 @@ def import_request(controller, data):
         if req.kv.kv_committed_len != transfer["kv_len"]:
             raise RuntimeError("native D2D committed length mismatch")
         reader = target.reader = Reader(
-            transfer["route"], destination, epoch, controller.config.drain_timeout
+            transfer["route"],
+            destination,
+            epoch,
+            controller.config.drain_timeout,
+            owner=controller,
+            req=req,
         )
         session = (
             dp.plane_for(controller).engine.get_session_id() if dp.enabled() else None
@@ -1025,6 +1100,7 @@ def resume_source(controller, source):
         not source.committed
         and not source.req.finished()
         and not source.released
+        and not getattr(source.req, "_d2d_bulk_unsafe", False)
         and source.release is None
         and getattr(source.req, "_remote_attn_transport_quarantine", None) is None
     )
@@ -1045,6 +1121,8 @@ def resume_source(controller, source):
     )
     if not controller.agree([int(safe)])[0]:
         return dict(resumed=False, pending_reader=True)
+    if source.bulk_sender is not None:
+        source.bulk_sender.close()
     req = source.req
     source.error = None
     source.released = True  # Retire the read lease, retaining the native KV row.
@@ -1065,7 +1143,9 @@ def abort_import(controller, target):
     if target.closed:
         return dict(aborted=target.cancelled, closed=True)
     req = target.decode_req.req
-    if getattr(req, "_remote_attn_transport_quarantine", None) is not None:
+    if getattr(req, "_remote_attn_transport_quarantine", None) is not None or getattr(
+        req, "_d2d_bulk_unsafe", False
+    ):
         raise TransportFailure("D2D quarantine cannot be bypassed by prepared abort")
     if not target.allocation_complete and req.kv.req_pool_idx is not None:
         raise TransportFailure(
@@ -1080,11 +1160,17 @@ def abort_import(controller, target):
         target.worker.join(timeout=1)
         if target.worker.is_alive():
             return dict(aborted=False, pending_reader=True)
-    # All target operations are CPU-framed H2D on these owned streams. No
-    # thread can submit another write after join; a CUDA error is not proof.
+    for reader in (target.reader, target.bulk_reader):
+        if reader is not None and reader.bulk is not None and reader.bulk.unsafe:
+            raise TransportFailure("D2D bulk completion unknown; retaining target KV")
+    # Join prevents new submissions. Prove H2D/scatter completion as well as
+    # native host writes before deregistering any slot or releasing target KV.
     for stream in (target.setup_stream, target.copy_stream):
         if stream is not None:
             stream.synchronize()
+    for reader in (target.reader, target.bulk_reader):
+        if reader is not None and reader.bulk is not None:
+            reader.bulk.close()
     if target.reader is not None:
         try:
             target.reader.call("abort")

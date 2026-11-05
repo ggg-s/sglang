@@ -5560,15 +5560,19 @@ class TargetClient:
             except OSError:
                 self._kill_conn_locked(conn)
 
-    def call(self, header, q_bytes, deadline_s=None):
-        return self._call(header, q_bytes, deadline_s, "attn")
+    def call(self, header, q_bytes, deadline_s=None, *, retry_on_disconnect=True):
+        # Attention reads are idempotent; native bulk writes are not. A caller
+        # that owns DMA storage must see the first ambiguous disconnect.
+        return self._call(
+            header, q_bytes, deadline_s, "attn", retry_on_disconnect=retry_on_disconnect
+        )
 
     def call_batch(self, header, q_bytes, deadline_s=None):
         return self._call(header, q_bytes, deadline_s, "attn_batch")
 
-    def _call(self, header, q_bytes, deadline_s, cmd):
+    def _call(self, header, q_bytes, deadline_s, cmd, *, retry_on_disconnect=True):
         deadline = float(deadline_s if deadline_s is not None else self.rpc_deadline_s)
-        for attempt in (0, 1):
+        for attempt in (0, 1) if retry_on_disconnect else (0,):
             conn = None
             try:
                 with self._conn_lock:
@@ -5606,7 +5610,7 @@ class TargetClient:
                     # of sending onto a half-closed socket.
                     with self._conn_lock:
                         self._kill_conn_locked(conn)
-                if attempt == 0:
+                if attempt == 0 and retry_on_disconnect:
                     with self._pending_lock:
                         self._stats["rpc_retried"] += 1
                     continue
