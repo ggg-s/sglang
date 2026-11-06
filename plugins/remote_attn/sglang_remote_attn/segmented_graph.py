@@ -150,6 +150,13 @@ class RemoteGraphBackend:
         if shape_key.size not in REMOTE_BATCHES:
             return
         self.validate_capture_key(shape_key)
+        # Full capture can leave lazily initialized attention metadata whose
+        # producer was recorded, not executed (FlashMLA split-KV schedules).
+        # Reset host metadata before the Remote bank's first eager warmup,
+        # just as between native warmups. The attention hook replaces wrappers
+        # and restores raw metadata; it must not zero captured tensor storage.
+        if post_warmup_hook is not None:
+            post_warmup_hook()
         self.capture_layers = []
         self.begin_remote_capture()
         self.capture_remote = True

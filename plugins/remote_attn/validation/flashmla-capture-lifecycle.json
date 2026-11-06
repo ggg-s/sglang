@@ -1,0 +1,62 @@
+{
+  "date": "2026-11-06",
+  "branch": "codex/remote-attn-pre-layerwise",
+  "base_commit": "5884814306731be4485f3fa7ef3666e8fbe1979e",
+  "uncommitted": true,
+  "cpu": {
+    "existing_regressions": 361,
+    "new_lifecycle_regressions": 8,
+    "status": "PASS"
+  },
+  "cuda": {
+    "device": "NVIDIA GeForce RTX 4060 Laptop GPU",
+    "torch": "2.13.0+cu130",
+    "negative_control": "rejected_first_remote_eager_read",
+    "lifecycle_cases": [
+      {
+        "buckets": [
+          1
+        ],
+        "graphs_replayed": 2
+      },
+      {
+        "buckets": [
+          2,
+          1
+        ],
+        "graphs_replayed": 4
+      },
+      {
+        "buckets": [
+          4,
+          1
+        ],
+        "graphs_replayed": 4
+      },
+      {
+        "buckets": [
+          8,
+          4,
+          2,
+          1
+        ],
+        "graphs_replayed": 8
+      }
+    ],
+    "sm90_flashmla_executed": false
+  },
+  "gpu_source_hashes": {
+    "plugins/remote_attn/sglang_remote_attn/segmented_graph.py": "91ddd744e28070860f4579b71ae0c7ba9c28bd3acad642f3366bf06a575226cf",
+    "python/sglang/srt/layers/attention/deepseek_v4_backend.py": "70498af7eafc15bbb9d9a6b6b995415766139233433851e0e3bbfc4635129ac9",
+    "test/manual/remote_attn/flashmla_capture_lifecycle_probe.py": "b4f59211cd26812e3509690556dfa283aa0a9e9eafca89b66f06fd955a03a611"
+  },
+  "local_test_source_hashes": {
+    "plugins/remote_attn/sglang_remote_attn/segmented_graph.py": "91ddd744e28070860f4579b71ae0c7ba9c28bd3acad642f3366bf06a575226cf",
+    "python/sglang/srt/layers/attention/deepseek_v4_backend.py": "70498af7eafc15bbb9d9a6b6b995415766139233433851e0e3bbfc4635129ac9",
+    "test/manual/remote_attn/flashmla_capture_lifecycle_probe.py": "b4f59211cd26812e3509690556dfa283aa0a9e9eafca89b66f06fd955a03a611",
+    "plugins/remote_attn/sglang_remote_attn/dsv41_graph.py": "8d26ac9eed337db0764aca93ce638b1e58bd34d19a6962b139c5f508d31fc946",
+    "test/registered/unit/plugins/test_flashmla_capture_lifecycle.py": "09faa7320d29148b75679c7cd7570ae222164d3b49819dabf371a4f98c30ce95",
+    "test/registered/unit/plugins/test_remote_attn.py": "bc6a86d5bd3d22b17aac68fe1a15aeebc96c4fdac51cc3dc5191f783bc08fc29"
+  },
+  "scope": "Synthetic schedule producer/consumer with real CUDA graphs and production orchestration/reset hook; no SM90 FlashMLA, model weights, TP4 or RDMA execution."
+}
