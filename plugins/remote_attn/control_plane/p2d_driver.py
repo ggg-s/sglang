@@ -23,9 +23,9 @@ except ImportError:  # local Windows mirrors never open the control channel
 from transformers import AutoTokenizer
 
 CTL = Path("/workspace/handoff_ctl")
-STATE = Path("/workspace/handoff_state")
+STATE = Path(os.environ.get("HANDOFF_STATE_DIR", "/workspace/handoff_state"))
 STATE.mkdir(parents=True, exist_ok=True)
-MODEL = "/workspace/models/Qwen3-8B"
+MODEL = os.environ.get("HANDOFF_MODEL", "/workspace/models/Qwen3-8B")
 _READY_WAIT_S = 60.0
 _BARE_LEGACY_WAIT_S = 2.0
 INPUT_LEN = int(os.environ.get("HANDOFF_INPUT_LEN", "4096"))

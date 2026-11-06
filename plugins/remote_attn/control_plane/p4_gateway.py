@@ -31,13 +31,13 @@ from urllib.parse import urlparse, parse_qs
 
 from transformers import AutoTokenizer
 
-sys.path.insert(0, "/workspace/5090_handoff_m1")
+sys.path.insert(0, str(Path(__file__).resolve().parent))
 import p2d_driver as d  # noqa: E402
 
 d.CTL = Path(os.environ.get("HANDOFF_CTL_DIR", "/workspace/handoff_ctl_p4"))
-STATE = Path("/workspace/handoff_state")
+STATE = Path(os.environ.get("HANDOFF_STATE_DIR", "/workspace/handoff_state"))
 STATE.mkdir(parents=True, exist_ok=True)
-MODEL = "/workspace/models/Qwen3-8B"
+MODEL = os.environ.get("HANDOFF_MODEL", "/workspace/models/Qwen3-8B")
 WAVE_DEFAULT = os.environ.get("HANDOFF_WAVE_DEFAULT", "1") == "1"
 WAVE_JOIN_TIMEOUT_S = float(
     os.environ.get("HANDOFF_WAVE_JOIN_TIMEOUT_S", "30")
@@ -4919,6 +4919,8 @@ class Handler(BaseHTTPRequestHandler):
 
     def do_GET(self):
         u = urlparse(self.path)
+        if getattr(self.gateway, "protocol", None) == "dsv-d2d-v2":
+            return self.gateway.http_get(self, u)
         if u.path == "/v1/attach":
             qs = parse_qs(u.query)
             rid = (qs.get("rid") or [""])[0]
@@ -4941,6 +4943,13 @@ class Handler(BaseHTTPRequestHandler):
         self.send_error(404)
 
     def do_POST(self):
+        if getattr(self.gateway, "protocol", None) == "dsv-d2d-v2":
+            n = int(self.headers.get("Content-Length", "0"))
+            try:
+                body = json.loads(self.rfile.read(n) or b"{}")
+            except ValueError:
+                return self.gateway.json_response(self, 400, {"error": "invalid JSON"})
+            return self.gateway.http_post(self, urlparse(self.path).path, body)
         if self.path == "/v1/drain":
             n = int(self.headers.get("Content-Length", "0"))
             body = json.loads(self.rfile.read(n) or b"{}")
@@ -5011,11 +5020,22 @@ class Handler(BaseHTTPRequestHandler):
 
 def main():
     p = argparse.ArgumentParser()
+    p.add_argument("--backend", choices=("qwen", "dsv"),
+                   default=os.environ.get("HANDOFF_GW_BACKEND", "qwen"))
     p.add_argument("--port", type=int, default=31080)
     p.add_argument("--poll-ms", type=float, default=3.0)
     p.add_argument("--out", default=str(STATE / "p4_gateway.jsonl"))
     args = p.parse_args()
-    gw = Gateway(Path(args.out), args.poll_ms)
+    if args.backend == "dsv":
+        from p4_dsv_gateway import DsvGateway
+
+        gw = DsvGateway(
+            d, TOK, STATE, prefill_url=PD_PREFILL_URL,
+            bootstrap_host=PD_BOOTSTRAP_HOST, bootstrap_port=PD_BOOTSTRAP_PORT,
+            poll_ms=args.poll_ms, out=args.out,
+        )
+    else:
+        gw = Gateway(Path(args.out), args.poll_ms)
     Handler.gateway = gw
     srv = ThreadingHTTPServer(("127.0.0.1", args.port), Handler)
     print(
@@ -5024,7 +5044,12 @@ def main():
         f"kill_at={KILL_AT or '-'} pid={os.getpid()}",
         flush=True,
     )
-    srv.serve_forever()
+    try:
+        srv.serve_forever()
+    finally:
+        srv.server_close()
+        if args.backend == "dsv":
+            gw.close()
 
 
 if __name__ == "__main__":

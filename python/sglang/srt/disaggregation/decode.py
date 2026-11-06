@@ -2216,6 +2216,7 @@ class DecodePreallocQueue(DecodeHiCachePreallocMixin):
         prefix_indices: Optional[torch.Tensor] = None,
         prefix_len: Optional[int] = None,
         total_prefix_len: Optional[int] = None,
+        swa_tail_start: Optional[int] = None,
     ) -> torch.Tensor:
         """Pre-allocate the memory for req_to_token and token_kv_pool.
 
@@ -2230,13 +2231,27 @@ class DecodePreallocQueue(DecodeHiCachePreallocMixin):
         if total_prefix_len is None:
             total_prefix_len = prefix_len
 
+        fill_len = self._pre_alloc_fill_len(req)
+        allocator = self.token_to_kv_pool_allocator
+        swa_tail_len = self._swa_tail_len(fill_len)
+        if swa_tail_start is not None:
+            # D2D reserves an interval before the source freezes. Bind the
+            # union of possible live windows, including an earlier freeze.
+            if (
+                prefix_len != 0
+                or total_prefix_len != 0
+                or not 0 <= swa_tail_start <= fill_len - swa_tail_len
+                or swa_tail_start % allocator.page_size
+            ):
+                raise ValueError("invalid preallocation SWA window reservation")
+            swa_tail_len = fill_len - swa_tail_start
+
         req_pool_indices = self.req_to_token_pool.alloc([req])
 
         assert req_pool_indices is not None, (
             "req_pool_indices is full! There is a bug in memory estimation."
         )
 
-        fill_len = self._pre_alloc_fill_len(req)
         req.kv.kv_committed_len = fill_len
 
         if prefix_len > 0:
@@ -2274,9 +2289,7 @@ class DecodePreallocQueue(DecodeHiCachePreallocMixin):
                     f"req={req.rid}"
                 )
 
-        allocator = self.token_to_kv_pool_allocator
         uses_swa_tail = self._uses_swa_tail_prealloc()
-        swa_tail_len = self._swa_tail_len(fill_len)
         swa_pages_charged = (
             uses_swa_tail
             and not is_swa_req_ring(allocator)

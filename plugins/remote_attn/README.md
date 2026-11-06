@@ -1,6 +1,7 @@
 # Remote attention / progressive KV handoff plugin
 
 DSV4.1 / Flash-0731 D0→D1 Remote 迁移：[后端协议、限制与 KV 生命周期](DSV-D2D-REMOTE-ZH.md)。
+P4 DSV 模式：[原生 PD、D2D 编排、SSE 接续与重启恢复](P4-DSV-GATEWAY-ZH.md)。
 
 P 缓存前缀（Qwen3/DSV4.1）：[统一 Remote progressive 与 A/B 对照](PREFIX-REMOTE-PROGRESSIVE-ZH.md)。
 

@@ -19,7 +19,12 @@ from sglang_remote_attn.decode_overlap import DecodeOverlap
 
 class Sampling:
     def __init__(
-        self, max_new_tokens=10000, temperature=0.0, top_k=1, stop_token_ids=None
+        self,
+        max_new_tokens=10000,
+        temperature=0.0,
+        top_k=1,
+        stop_token_ids=None,
+        ignore_eos=False,
     ):
         self.max_new_tokens, self.temperature, self.top_k = (
             max_new_tokens,
@@ -27,6 +32,7 @@ class Sampling:
             top_k,
         )
         self.stop_token_ids = stop_token_ids
+        self.ignore_eos = ignore_eos
 
     def normalize(self, tokenizer):
         self.stop_token_ids = set(self.stop_token_ids or ()) or None
@@ -285,7 +291,7 @@ class Environment:
             mgr = NS(kv_args=args)
             controller._d2d_kv_args = args
 
-            def alloc(req, n=node_index):
+            def alloc(req, n=node_index, swa_tail_start=None):
                 req.kv.req_pool_idx = 1
                 req.kv.kv_committed_len = req.kv.kv_allocated_len = (
                     len(req.origin_input_ids) + len(req.output_ids) - 1
@@ -296,7 +302,10 @@ class Environment:
             scheduler.disagg_decode_prealloc_queue = NS(
                 kv_manager=mgr,
                 _pre_alloc=alloc,
-                _prealloc_required_tokens=lambda req: (self.prefix, page),
+                _prealloc_required_tokens=lambda req: (
+                    len(req.origin_input_ids) + max(len(req.output_ids) - 1, 0),
+                    page,
+                ),
                 _allocatable_token_budgets=lambda **kw: 100000,
                 _uses_swa_reservation=lambda: True,
                 _swa_tail_allocatable_token_budget=lambda **kw: 100000,
@@ -492,6 +501,7 @@ class Environment:
             self.source,
             dict(
                 cmd="d2d_freeze",
+                allow_unreserved=True,
                 rid="source",
                 migration_epoch=epoch,
                 destination="D1",
@@ -499,6 +509,27 @@ class Environment:
             ),
         )
         return result["transfer"]
+
+    def reserve_and_freeze(self, epoch="migration", growth=0):
+        self.epoch = epoch
+        common = dict(migration_epoch=epoch, destination="D1", target_rid="target")
+        plan = d2d.handle(
+            self.source,
+            dict(cmd="d2d_plan", rid="source", growth_tokens=growth, **common),
+        )["plan"]
+        reserved = d2d.handle(
+            self.target, dict(cmd="d2d_reserve", migration_epoch=epoch, plan=plan)
+        )
+        assert reserved["reserved"] and not self.req._handoff_frozen
+        return d2d.handle(
+            self.source,
+            dict(
+                cmd="d2d_freeze",
+                rid="source",
+                reservation=reserved["reservation"],
+                **common,
+            ),
+        )["transfer"]
 
     def import_(self, transfer):
         return d2d.handle(

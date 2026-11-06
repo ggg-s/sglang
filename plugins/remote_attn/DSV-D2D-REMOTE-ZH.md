@@ -1,15 +1,16 @@
 # DSV4.1 / Flash-0731 Remote D2D
 
-本分支新增显式 D0→D1 后端迁移协议：D0 在完整 Decode 边界停算，D1 先接收
+本分支新增显式 D0→D1 后端迁移协议：D0 先提供增长范围，D1 真实预留原生
+FULL/SWA KV 和请求状态行，随后 D0 才在完整 Decode 边界停算。D1 先接收
 SWA、压缩器/indexer 状态和 indexer 历史，再接管 pending token。历史 global KV
 后台复制期间，D1 继续用现有 sparse Remote Attention 读取 D0 的不可变前缀。
 这不是等待全部 KV 复制完成后才恢复 Decode 的 copy-wait。
 
 这是实验性后端控制接口。现有 P→D 最后 chunk 完整 forward 后的 Decode–KV
 transfer overlap 不变；没有把最后 chunk 改回 layerwise forward。原有 Qwen3
-迁移命令也不变。现有 `p4_gateway` 的旧 `drain_prepare/import_wave` 流程没有自动
-切换到新 DSV D2D 协议，原生 HTTP/SSE 连接也不会自动改道；调用方须接管目标
-请求的输出路由。不要把算子/协议验证当作整模、网关或 H20 RDMA 性能验收。
+迁移命令也不变。P4 Gateway 可通过 `--backend dsv` 显式启用 DSV 编排、token SSE
+接续和持久化恢复，见 [P4 DSV 模式](P4-DSV-GATEWAY-ZH.md)。旧 Qwen 流程不自动
+识别 DSV；绕过 Gateway 的原生 HTTP/SSE 连接也不会自动改道。不要把算子/协议验证当作整模、网关或 H20 RDMA 性能验收。
 
 ## 范围和前置条件
 
@@ -35,14 +36,22 @@ transfer overlap 不变；没有把最后 chunk 改回 layerwise forward。原�
 
 ## 数据与 KV 所有权
 
-1. `d2d_freeze` 在 scheduler 线程消耗一条尚未处理的原生 Decode overlap result，
+1. `d2d_plan` 在 D0 读取当前历史和可增长范围，不停算；D1 的 `d2d_reserve`
+   先经 TP 共识检查容量，再用原生 `_pre_alloc` 占住 FULL、SWA 和请求状态行。
+   SWA 预留覆盖范围内所有冻结点的窗口并集。预留初始化的 GPU event 同步成功，
+   所有 rank 返回 `reserved=true` 后才能冻结；不是仅记录一个可被抢占的预算。
+   `d2d_freeze` 在 scheduler 线程消耗一条尚未处理的原生 Decode overlap result，
    等待其 readback 并提交输出一次，然后移除请求。遇到 extend/prebuilt merge
    边界则返回错误，要求在下一原生 Decode 边界重试，不猜测其合并语义。
+   完成 overlap result 后再次集体验证最终长度仍在预留范围内；超出范围时不移出
+   runnable batch、不冻结，取消旧预留后用新 epoch 重新规划。
 2. 冻结 D0 的 request handle/row、prefix length 和 FULL page map。SWA 只保留
    native live window；C2 pending half-pair、C4 page-scoped compressor/indexer
    state、C128 online row 或 raw pending-block ring 均按 native registration 的
    stride/index 寻址。整块边界没有 pending state 时不发送空洞行。
-3. `d2d_import` 复用 native Decode prealloc，先检查 FULL/SWA/request-row 预算。
+3. `d2d_import` 消费对应 epoch 的原生预留，复用已分配的 KV record，不再次
+   prealloc。按实际冻结长度释放完整的多余尾页，保留仍在使用的半页；沿用预留时
+   较早的 SWA eviction cursor，由原生 ratchet/释放路径回收多留的窗口页。
    同步复制 SWA、压缩状态和 indexer 字节，等待实际 GPU 完成后才允许提交。
    global KV 的后台线程此时可以尚未完成。
 4. `d2d_commit` 先向每个对应源 rank 确认接管，再将 D1 请求接入原生 prebuilt
@@ -84,24 +93,58 @@ native ABI 夹具，不等同于完整模型或 RDMA 验收。下方历史 4060 
 命令，由原生 request receiver 广播；等待所有 TP rank 返回，不要逐 rank 独立
 发起变更。现有控制工具的 `send` 可以发送以下 payload。
 
-```json
-{"cmd":"d2d_freeze","rid":"source-request","migration_epoch":"move-001","destination":"D1","target_rid":"target-request"}
-```
-
-每个 D0 rank 返回自己的 `transfer`。将所有 rank 的 `transfer` 按 rank 排列后发给 D1：
+先在 D0 规划。`growth_tokens` 表示规划到冻结期间允许增长的 token 数，默认 64；
+上限同时受 `max_new_tokens` 和原生请求行长度限制。每个请求使用独立 epoch。
 
 ```json
-{"cmd":"d2d_import","migration_epoch":"move-001","destination":"D1","transfers":["此处放各 rank 的 transfer 对象"]}
+{"cmd":"d2d_plan","rid":"source-request","migration_epoch":"move-001","destination":"D1","target_rid":"target-request","growth_tokens":64}
 ```
 
-TP1 可以用 `"transfer": {...}`。示例中的字符串必须替换为返回的对象，不要修改
-manifest、route、token 或 epoch。一次 migration epoch 只能绑定一对请求，不能
-用于重建已取消/失败/退休的分配。
+将所有源 rank 的 `plan` 按 rank 排列，在 D1 预留：
+
+```json
+{"cmd":"d2d_reserve","migration_epoch":"move-001","plans":["各源 rank 的 plan 对象"]}
+```
+
+必须确认所有目标 rank 都返回 `reserved=true`。将各目标 rank 返回的 `reservation`
+按 rank 排列，交回 D0 冻结：
+
+```json
+{"cmd":"d2d_freeze","rid":"source-request","migration_epoch":"move-001","destination":"D1","target_rid":"target-request","reservations":["各目标 rank 的 reservation 对象"]}
+```
+
+每个 D0 rank 返回自己的 `transfer`。将它们按 rank 排列后发给 D1：
+
+```json
+{"cmd":"d2d_import","migration_epoch":"move-001","destination":"D1","require_reservation":true,"transfers":["各源 rank 的 transfer 对象"]}
+```
+
+TP1 可分别使用 `"plan": {...}`、`"reservation": {...}`、`"transfer": {...}`。
+示例中的字符串必须替换为原始返回对象，不要修改 manifest、route、token 或 epoch。
+一次 migration epoch 只能绑定一对请求，不能重建已取消/失败/退休的分配。
+
+默认 `d2d_freeze` 拒绝没有预留凭据的请求。`allow_unreserved=true` 仅供已有隔离
+诊断探针显式复现旧后端路径；即使设置该选项，已经规划的 epoch 仍必须带预留。
+经过预留的 manifest 带 `reservation_required=true`，目标丢失预留时拒绝静默回退到
+重新分配。运行时预检同时要求原生 `_pre_alloc` 支持 `swa_tail_start`，避免混装旧代码。
 
 ```json
 {"cmd":"d2d_commit","migration_epoch":"move-001"}
 {"cmd":"d2d_status","migration_epoch":"move-001"}
 ```
+
+预留尚未消费时，在 D1 使用以下命令取消；D0 此时还在正常 Decode，无需 resume：
+
+```json
+{"cmd":"d2d_reserve_cancel","migration_epoch":"move-001"}
+```
+
+取消先于预留到达也会保留 epoch tombstone，后到的 reserve 不能复活分配。重复取消
+不再次 free。预留被导入消费后，reserve_cancel 拒绝释放，必须走 Target 的 abort 或
+原生请求取消。预留没有自动 TTL 回收；协调器失联不能成为复用 GPU 存储的依据。
+`d2d_status.reservation` 返回 `reserved/consumed/cancelled/error` 和长度范围，用于对账。
+TP 单侧实际分配失败时，完整分配的 rank 可以显式取消，部分分配/完成证明不确定的
+rank 保留其内存；释放已经开始后失败也禁止重试。
 
 commit 发 D1；status 可发两端。`target.admitted=true` 表示目标已接入 Decode，
 `target.local=true` 表示退休完成；`source.released=true` 表示源端 read lease 退休。
@@ -118,6 +161,13 @@ commit 发 D1；status 可发两端。`target.admitted=true` 表示目标已接�
 绕过它。原生 prealloc 中途异常可能留下未发布的 token map；此时保留 row，不按
 `kv_committed_len` 猜测 free 范围。部分 free 已执行后报错也禁止重试，避免重复释放。
 这些异常保留不是故障恢复能力，需要运维处理或重启实例。
+
+## 冻结前预留验证
+
+这一阶段的后端预留与消费协议验证记录见
+[冻结前预留的 CPU / TP2 / 4060 结果](validation/dsv-d2d-reservation-4060.md)。
+后续 P4 编排、SSE 和恢复验证见 [P4 DSV 验证](validation/p4-dsv-gateway-4060.md)；
+此集成仍是实验性 P4 模式，不是原生 SMG 接入。
 
 ## 验证
 

@@ -1555,6 +1555,10 @@ def is_fully_idle(original, scheduler, for_health_check=False, ignore_waiting=Fa
         and controller is not None
         and (
             controller.sources
+            or any(
+                ticket is not None and not ticket.cancelled and not ticket.consumed
+                for ticket in getattr(controller, "d2d_reservations", {}).values()
+            )
             or controller.targets
             or bool(getattr(controller, "transport_quarantine", None))
             or bool(getattr(getattr(controller, "prefill_overlap", None), "leases", []))

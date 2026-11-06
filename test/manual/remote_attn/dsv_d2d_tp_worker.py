@@ -38,8 +38,71 @@ def main():
             c.agree = Controller.agree.__get__(c)
             c.decode_overlap.retirement = Retirement(c)
             e.stack.callback(c.decode_overlap.retirement.close)
+
+        def prepare(epoch):
+            plan = d2d.handle(
+                e.source,
+                dict(
+                    cmd="d2d_plan",
+                    migration_epoch=epoch,
+                    rid="source",
+                    destination="D1",
+                    target_rid="target",
+                    growth_tokens=0,
+                ),
+            )["plan"]
+            plans = [None, None]
+            dist.all_gather_object(plans, plan)
+            return plans
+
+        # One rank lacks capacity: neither shard may freeze or allocate a row.
+        plans = prepare("no-capacity")
+        available = e.target.scheduler.req_to_token_pool.available_size
+        if args.rank == 1:
+            e.target.scheduler.req_to_token_pool.available_size = lambda: 0
+        try:
+            d2d.handle(
+                e.target,
+                dict(
+                    cmd="d2d_reserve",
+                    migration_epoch="no-capacity",
+                    plans=plans,
+                ),
+            )
+            raise AssertionError("asymmetric capacity accepted")
+        except ValueError as exc:
+            assert "reserve preflight" in str(exc)
+        finally:
+            e.target.scheduler.req_to_token_pool.available_size = available
+        assert not e.req._handoff_frozen and not e.freed
+        assert not e.target.d2d_reservations
+
+        e.epoch = "migration"
+        plans = prepare(e.epoch)
+        reserved = d2d.handle(
+            e.target,
+            dict(
+                cmd="d2d_reserve",
+                migration_epoch=e.epoch,
+                plans=plans,
+            ),
+        )
+        assert reserved["reserved"] and not e.req._handoff_frozen
+        certificates = [None, None]
+        dist.all_gather_object(certificates, reserved["reservation"])
+        meta = d2d.handle(
+            e.source,
+            dict(
+                cmd="d2d_freeze",
+                migration_epoch=e.epoch,
+                rid="source",
+                destination="D1",
+                target_rid="target",
+                reservations=certificates,
+            ),
+        )["transfer"]
         transfers = [None, None]
-        dist.all_gather_object(transfers, e.freeze())
+        dist.all_gather_object(transfers, meta)
         d2d.handle(
             e.target,
             dict(
@@ -49,8 +112,24 @@ def main():
                 transfers=transfers,
             ),
         )
-        e.command(e.target, "d2d_commit")
         target = e.target.d2d_targets[e.epoch]
+        call = target.reader.call
+
+        def partial_commit(action, **fields):
+            if args.rank == 1 and action == "commit":
+                raise ConnectionError("injected missing source confirmation")
+            return call(action, **fields)
+
+        target.reader.call = partial_commit
+        try:
+            e.command(e.target, "d2d_commit")
+            raise AssertionError("partial TP commit admitted")
+        except d2d.TransportFailure:
+            pass
+        assert not target.admitted and not e.resumed
+        target.reader.call = call
+        e.command(e.target, "d2d_commit")
+        assert len(e.resumed) == 1
         source = e.source.d2d_sources[e.epoch]
         assert not target.copied and not e.freed
         e.gate.set()
@@ -108,6 +187,7 @@ def main():
             dict(
                 cmd="d2d_freeze",
                 migration_epoch="failure",
+                allow_unreserved=True,
                 rid="source2",
                 destination="D1",
                 target_rid="target2",
@@ -158,6 +238,9 @@ def main():
         args.output.write_text(
             json.dumps(
                 dict(
+                    tp_partial_commit_never_admits=True,
+                    reserved_before_freeze=True,
+                    tp_preflight_rejected_before_freeze=True,
                     asymmetric_gpu_blocks_both=True,
                     decode_before_copy=True,
                     source_free_count=1,

@@ -32,6 +32,7 @@ CORE_CALLS = {
         "prefix_indices": None,
         "prefix_len": None,
         "total_prefix_len": None,
+        "swa_tail_start": None,
     },
     DISAGG + "decode.DecodePreallocQueue._prealloc_required_tokens": {
         "req": inspect.Parameter.empty

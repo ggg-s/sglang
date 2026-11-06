@@ -25,6 +25,12 @@ from .transport_failure import TransportFailure
 VERSION = "dsv-d2d-v2"
 LIMIT = bulk.CAPACITY
 COMMANDS = {
+    "d2d_worker_status",
+    "d2d_submit_pd",
+    "d2d_cancel",
+    "d2d_plan",
+    "d2d_reserve",
+    "d2d_reserve_cancel",
     "d2d_freeze",
     "d2d_import",
     "d2d_commit",
@@ -303,6 +309,7 @@ class Source:
         self.meta = dict(
             version=VERSION,
             bulk_transport=bulk.PROTOCOL,
+            reservation_required=self.epoch in getattr(self.owner, "d2d_plans", {}),
             epoch=self.epoch,
             destination=self.destination,
             target_rid=self.target_rid,
@@ -814,32 +821,31 @@ def handle(controller, data):
     epoch = str(data.get("migration_epoch", ""))
     if re.fullmatch(r"[A-Za-z0-9_-]{1,128}", epoch) is None:
         raise ValueError("D2D requires a safe explicit migration_epoch")
+    from . import dsv_d2d_reservation as reservation
+    from . import dsv_gateway_control as gateway
+
+    expected = data.get("expected_instances")
+    if expected is not None:
+        matches = (
+            isinstance(expected, list)
+            and len(expected) == controller.tp_size
+            and expected[controller.rank] == gateway.instance(controller)
+        )
+        if not controller.agree([int(matches)])[0]:
+            raise ValueError("D2D worker instance changed; refusing stale command")
+    if cmd in gateway.COMMANDS:
+        return gateway.handle(controller, data)
+    if cmd in {"d2d_plan", "d2d_reserve", "d2d_reserve_cancel"}:
+        return reservation.handle(controller, data)
     if cmd == "d2d_status":
-        src = sources.get(epoch)
-        target = targets.get(epoch)
         return dict(
             migration_epoch=epoch,
-            source=None
-            if src is None
-            else dict(
-                committed=src.committed,
-                copied=src.copied,
-                released=src.released,
-                error=src.error,
-                resumed=src.released and not src.committed,
-                kv_released=not src.req.kv.holds_kv,
-            ),
-            target=None
-            if target is None
-            else dict(
-                admitted=target.admitted,
-                copied=target.copied,
-                local=target.closed and not target.cancelled,
-                aborted=target.cancelled,
-                error=target.error,
-            ),
+            instance_id=gateway.instance(controller),
+            **gateway.migration_status(controller, epoch),
         )
     if cmd == "d2d_freeze":
+        if epoch in getattr(controller, "d2d_source_cancelled_epochs", ()):
+            raise ValueError("D2D source epoch was cancelled")
         if epoch in sources:
             source = sources[epoch]
             if source.released or source.aborted:
@@ -853,6 +859,8 @@ def handle(controller, data):
             raise ValueError("migration epoch was already used by a D2D import")
         error = None
         try:
+            if epoch in getattr(controller, "d2d_reservations", {}):
+                raise ValueError("migration epoch belongs to a target reservation")
             req = find_req(controller.scheduler, data["rid"])
             destination, target_rid = str(data["destination"]), str(data["target_rid"])
             if not destination or not target_rid:
@@ -871,6 +879,15 @@ def handle(controller, data):
                 f"TP D2D freeze preflight rejected: {error or 'peer rejected'}"
             )
         quiesce(controller.scheduler, req)
+        # Quiescing can commit one overlap result; validate the final length
+        # collectively before removing any rank from its runnable batches.
+        error = None
+        try:
+            reservation.check_freeze(controller, data, req)
+        except Exception as exc:
+            error = repr(exc)
+        if not controller.agree([int(error is None)])[0]:
+            raise ValueError(f"TP D2D reservation rejected: {error or 'peer rejected'}")
         remote.runtime()._remove_from_batches(controller.scheduler, req)
         req._handoff_frozen = True
         req._handoff_req = True
@@ -901,33 +918,110 @@ def handle(controller, data):
     if cmd == "d2d_import":
         return import_request(controller, data)
     if cmd == "d2d_abort":
-        return abort_import(controller, targets[epoch])
+        target = targets.get(epoch)
+        if not controller.agree([int(target is None or not target.admitted)])[0]:
+            raise ValueError(
+                "committed D2D target must use native request cancellation"
+            )
+        if not hasattr(controller, "d2d_cancelled_epochs"):
+            controller.d2d_cancelled_epochs = set()
+        controller.d2d_cancelled_epochs.add(epoch)
+        result = (
+            dict(aborted=True) if target is None else abort_import(controller, target)
+        )
+        ticket = getattr(controller, "d2d_reservations", {}).get(epoch)
+        if result.get("aborted") and (ticket is None or not ticket.consumed):
+            reservation.handle(
+                controller, dict(cmd="d2d_reserve_cancel", migration_epoch=epoch)
+            )
+        return result
     if cmd == "d2d_commit":
-        target = targets[epoch]
+        target = targets.get(epoch)
+        error = None
+        try:
+            if target is None:
+                raise ValueError("D2D target not prepared")
+            if epoch in getattr(controller, "d2d_cancelled_epochs", ()) or target.error:
+                raise ValueError("D2D commit epoch aborted/cancelled or target failed")
+            if not target.admitted:
+                if (
+                    target.cancelled
+                    or target.closed
+                    or target.decode_req.req.finished()
+                ):
+                    raise ValueError("cannot commit aborted/finished D2D import")
+                target.refresh()
+        except Exception as exc:
+            error = repr(exc)
+        if not controller.agree([int(error is None)])[0]:
+            raise ValueError(f"TP D2D commit rejected: {error or 'peer rejected'}")
+        confirmed = target.admitted or getattr(target, "source_confirmed", False)
+        if not confirmed:
+            try:
+                target.reader.call("commit")
+                target.source_confirmed = confirmed = True
+            except Exception as exc:
+                error = repr(exc)
+        # Never publish a rank-local Decode batch after only a subset of
+        # source shards acknowledged ownership. Partial confirmation can only
+        # roll forward; all target shards remain unadmitted until this vote.
+        if not controller.agree([int(confirmed)])[0]:
+            raise TransportFailure(
+                f"TP D2D commit confirmation pending: {error or 'peer pending'}"
+            )
+        error = None
+        req = target.decode_req.req
         if not target.admitted:
-            if target.cancelled or target.closed or target.decode_req.req.finished():
-                raise ValueError("cannot commit aborted/finished D2D import")
-            target.refresh()
-            target.reader.call("commit")
             target.admitted = True
-            req = target.decode_req.req
             from .handoff_control import _flush_decode_resume
 
-            _flush_decode_resume(controller.scheduler, [req])
-        return dict(admitted=True, rid=target.decode_req.req.rid)
+            try:
+                _flush_decode_resume(controller.scheduler, [req])
+            except BaseException as exc:
+                error = repr(exc)
+        if not controller.agree([int(error is None)])[0]:
+            target.error = f"native D2D admission failed: {error or 'peer failed'}"
+            dp.io_for(req).poison()
+            # The control was broadcast and this failure was TP-agreed. Use
+            # the existing native abort/quarantine boundary to stop every
+            # shard and retain rows, readers, registrations and free callbacks.
+            from .transport_failure import quarantine, request_of
+
+            quarantine(controller, target, target.error)
+            protocol = controller.decode_overlap.retirement
+            for index, entry in list(protocol.registered.items()):
+                if request_of(entry[0]) is req:
+                    protocol.registered.pop(index)
+            raise TransportFailure(target.error)
+        return dict(admitted=True, source_confirmed=True, rid=req.rid)
     if cmd == "d2d_release":
         source = sources[epoch]
         return dict(
             released=source.released, committed=source.committed, copied=source.copied
         )
     if cmd == "d2d_resume":
-        return resume_source(controller, sources[epoch])
+        source = sources.get(epoch)
+        present, absent = controller.agree(
+            [int(source is not None), int(source is None)]
+        )
+        if not present and not absent:
+            raise TransportFailure(
+                "asymmetric TP source preparation; retaining frozen rows"
+            )
+        if not hasattr(controller, "d2d_source_cancelled_epochs"):
+            controller.d2d_source_cancelled_epochs = set()
+        controller.d2d_source_cancelled_epochs.add(epoch)
+        if absent:
+            return dict(resumed=True, never_frozen=True)
+        return resume_source(controller, source)
     raise ValueError("unsupported D2D command")
 
 
-def allocation_preflight(controller, req):
+def allocation_preflight(controller, req, required=None):
     prealloc = controller.scheduler.disagg_decode_prealloc_queue
-    full, swa = prealloc._prealloc_required_tokens(req)
+    full, swa = (
+        required if required is not None else prealloc._prealloc_required_tokens(req)
+    )
     full_budget = prealloc._allocatable_token_budgets(retractable_tokens=0)
     swa_budget = (
         prealloc._swa_tail_allocatable_token_budget(retractable_tokens=0)
@@ -955,7 +1049,9 @@ def import_request(controller, data):
 
     sources, targets = records(controller)
     epoch = str(data["migration_epoch"])
-    if epoch in sources:
+    if epoch in getattr(controller, "d2d_cancelled_epochs", ()):
+        raise ValueError("D2D import epoch cancelled")
+    if epoch in sources or epoch in getattr(controller, "d2d_plans", {}):
         raise ValueError("migration epoch was already used by a D2D source")
     if epoch in targets:
         target = targets[epoch]
@@ -1010,8 +1106,11 @@ def import_request(controller, data):
             controller.pool.get_swa_key_buffer_radix(0).device
         )
         prealloc = controller.scheduler.disagg_decode_prealloc_queue
-        allocation_preflight(controller, req)
-        prealloc._pre_alloc(req)
+        from . import dsv_d2d_reservation as reservation
+
+        if not reservation.consume(controller, data, transfer, req):
+            allocation_preflight(controller, req)
+            prealloc._pre_alloc(req)
         target.allocation_complete = True
         if req.kv.kv_committed_len != transfer["kv_len"]:
             raise RuntimeError("native D2D committed length mismatch")
@@ -1096,7 +1195,8 @@ def import_request(controller, data):
 def resume_source(controller, source):
     # Revoke the service before looking for a positive final reader fence.
     # A concurrent destination commit is serialized by the same source lock.
-    can_resume = (
+    already_resumed = source.released and not source.committed
+    can_resume = already_resumed or (
         not source.committed
         and not source.req.finished()
         and not source.released
@@ -1121,6 +1221,8 @@ def resume_source(controller, source):
     )
     if not controller.agree([int(safe)])[0]:
         return dict(resumed=False, pending_reader=True)
+    if already_resumed:
+        return dict(resumed=True, rid=source.req.rid, duplicate=True)
     if source.bulk_sender is not None:
         source.bulk_sender.close()
     req = source.req

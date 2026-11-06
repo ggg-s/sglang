@@ -20,8 +20,9 @@ from sglang_remote_attn import dsv41_paged as paged, dsv41_sparse_math as math
 from sglang_remote_attn.decode_overlap import BatchProof
 
 
-def run(root, ratio, gpu, kv_layout="v4"):
+def run(root, ratio, gpu, kv_layout="v4", p4=False):
     e = Environment(root, "cuda", ratio, gpu, kv_layout=kv_layout)
+    gateway = None
     try:
         f = e.f
         pool = f.d_pool
@@ -29,8 +30,26 @@ def run(root, ratio, gpu, kv_layout="v4"):
         # byte formats are source-loaded native definitions.
         for p, role in ((f.p_pool, "prefill"), (pool, "decode")):
             paged.warmup(p, (3,), {2}, f.query.dtype, role)
-        meta = e.freeze()
-        e.import_(meta)
+        if p4:
+            from p4_dsv_probe_support import Driver, gateway as make_gateway, until
+
+            driver = Driver(e)
+            gateway = make_gateway(driver, root, Path(e.tmp) / "gateway")
+            gateway.tick()
+            rid = gateway.accept(
+                dict(
+                    rid="cuda-p4",
+                    prompt_ids=list(e.req.origin_input_ids),
+                    max_new_tokens=8,
+                    cut=2,
+                    growth_tokens=0,
+                )
+            )
+            until(gateway, rid, "COMMIT")
+            e.epoch = gateway.entry(rid)["epoch"]
+        else:
+            meta = e.reserve_and_freeze()
+            e.import_(meta)
         source = e.source.d2d_sources[e.epoch]
         target = e.target.d2d_targets[e.epoch]
         assert e.blocked.wait(5) and not target.copied
@@ -79,7 +98,18 @@ def run(root, ratio, gpu, kv_layout="v4"):
             )
             raw[(selected // cpp)[:, None], cols] = 0
         poisoned = raw.clone()
-        e.command(e.target, "d2d_commit")
+        if p4:
+            driver.after["d2d_commit"] = [TimeoutError("injected lost commit reply")]
+            gateway.tick()
+            assert gateway.entry(rid)["phase"] == "COMMIT" and source.committed
+            gateway.close()
+            gateway = make_gateway(driver, root, Path(e.tmp) / "gateway")
+            until(gateway, rid, "TARGET")
+            assert gateway.entry(rid)["owner"] == "dst" and len(e.resumed) == 1
+            assert not gateway.events(rid, after=2)[0]
+            assert driver.count("d2d_resume") == 0
+        else:
+            e.command(e.target, "d2d_commit")
         assert source.committed and not target.copied
         native_calls = []
 
@@ -142,7 +172,10 @@ def run(root, ratio, gpu, kv_layout="v4"):
         assert not e.freed
         source.retire()
         source.retire()
-        assert e.freed == ["source"]
+        assert e.freed == [source.req.rid]
+        if p4:
+            gateway.tick()
+            assert gateway.entry(rid)["phase"] == "LOCAL"
         local = remote.attention(
             native,
             f.backend,
@@ -160,6 +193,11 @@ def run(root, ratio, gpu, kv_layout="v4"):
             kv_layout=kv_layout,
             gpu_query_transport=gpu,
             bulk_transport=d2d.bulk.PROTOCOL,
+            p4_gateway=p4,
+            gateway_restart_after_lost_commit=p4,
+            native_decode_admissions=len(e.resumed),
+            reserved_before_freeze=True,
+            reserved_row_consumed=e.target.d2d_reservations[e.epoch].consumed,
             state_bytes_exact=True,
             decode_before_bulk_copy=True,
             remote_calls=target.rpc.calls,
@@ -171,6 +209,8 @@ def run(root, ratio, gpu, kv_layout="v4"):
             mooncake_transfers=0 if e.transport is None else len(e.transport.calls),
         )
     finally:
+        if gateway is not None:
+            gateway.close()
         e.close()
 
 
@@ -180,13 +220,14 @@ def main():
     parser.add_argument("--output", type=Path, required=True)
     parser.add_argument("--ratio", type=int, choices=(2, 4, 128))
     parser.add_argument("--gpu", action="store_true")
+    parser.add_argument("--p4", action="store_true")
     parser.add_argument("--kv-layout", choices=("v4", "v41"), default="v4")
     args = parser.parse_args()
     torch.cuda.set_device(0)
     torch.testing.assert_close(torch.zeros(1), torch.zeros(1))
     root = args.source_root.resolve()
     if args.ratio is not None:
-        results = [run(root, args.ratio, args.gpu, args.kv_layout)]
+        results = [run(root, args.ratio, args.gpu, args.kv_layout, p4=args.p4)]
     else:
         # Isolate module-import patches and native Mooncake engine ownership.
         results = []
@@ -209,12 +250,15 @@ def main():
                 ]
                 if gpu:
                     cmd.append("--gpu")
+                if args.p4:
+                    cmd.append("--p4")
                 subprocess.run(cmd, check=True, timeout=120)
                 results.extend(json.loads(output.read_text())["cases"])
 
     files = (
         list((root / "plugins/remote_attn/sglang_remote_attn").glob("*.py"))
         + list(Path(__file__).parent.glob("*probe_support.py"))
+        + [root / "plugins/remote_attn/control_plane/p4_dsv_gateway.py"]
         + [Path(__file__)]
     )
     report = dict(

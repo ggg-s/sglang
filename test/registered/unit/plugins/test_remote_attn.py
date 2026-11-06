@@ -31,7 +31,7 @@ from array import array
 from contextlib import ExitStack, contextmanager, nullcontext
 from pathlib import Path
 from types import SimpleNamespace
-from unittest.mock import patch
+from unittest.mock import Mock, patch
 
 import torch
 
@@ -13041,6 +13041,7 @@ class TestRemoteAttn(CustomTestCase):
             ("decode.DecodeTransferQueue._commit_transfer_to_req", "keep_receiver"),
             ("decode.DecodePreallocQueue._match_prefix_and_lock", "req"),
             ("decode.DecodePreallocQueue._pre_alloc", "prefix_indices"),
+            ("decode.DecodePreallocQueue._pre_alloc", "swa_tail_start"),
             (
                 "mooncake.conn.MooncakeKVManager.build_receiver_metadata_message",
                 "decode_prefix_len",
@@ -15752,6 +15753,9 @@ class TestRemoteAttn(CustomTestCase):
                     rows,
                     [
                         dict(
+                            tp_partial_commit_never_admits=True,
+                            reserved_before_freeze=True,
+                            tp_preflight_rejected_before_freeze=True,
                             asymmetric_gpu_blocks_both=True,
                             decode_before_copy=True,
                             source_free_count=1,
@@ -16564,6 +16568,1122 @@ class TestRemoteAttn(CustomTestCase):
             _, out, lse = f.dp.mha_call([prep])
         self.assertTrue(torch.equal(out, q.float().unsqueeze(0) * 3))
         self.assertEqual(tuple(lse.shape), (1, 2))
+
+    def _d2d_reserve(self, e, growth=0):
+        from sglang_remote_attn import dsv_d2d as d2d
+
+        e.epoch = "reserved-migration"
+        plan = d2d.handle(
+            e.source,
+            dict(
+                cmd="d2d_plan",
+                rid="source",
+                destination="D1",
+                target_rid="target",
+                migration_epoch=e.epoch,
+                growth_tokens=growth,
+            ),
+        )["plan"]
+        reserved = d2d.handle(
+            e.target,
+            dict(
+                cmd="d2d_reserve",
+                migration_epoch=e.epoch,
+                plan=plan,
+            ),
+        )
+        return plan, reserved
+
+    def _d2d_reserved_freeze(self, e, reserved):
+        from sglang_remote_attn import dsv_d2d as d2d
+
+        return d2d.handle(
+            e.source,
+            dict(
+                cmd="d2d_freeze",
+                rid="source",
+                destination="D1",
+                target_rid="target",
+                migration_epoch=e.epoch,
+                reservation=reserved["reservation"],
+            ),
+        )["transfer"]
+
+    def test_dsv_d2d_reserve_before_freeze_consumes_native_row_once(self):
+        from sglang_remote_attn import dsv_d2d as d2d
+
+        e = self._d2d_env()
+        alloc = e.target.scheduler.disagg_decode_prealloc_queue._pre_alloc
+        with patch.object(
+            e.target.scheduler.disagg_decode_prealloc_queue, "_pre_alloc", wraps=alloc
+        ) as native:
+            plan, reserved = self._d2d_reserve(e)
+            self.assertTrue(reserved["reserved"])
+            self.assertFalse(e.req._handoff_frozen)
+            self.assertEqual(e.source.scheduler.running_batch.reqs, [e.req])
+            ticket = e.target.d2d_reservations[e.epoch]
+            duplicate = d2d.handle(
+                e.target, dict(cmd="d2d_reserve", migration_epoch=e.epoch, plan=plan)
+            )
+            self.assertTrue(duplicate["duplicate"])
+            e.import_(self._d2d_reserved_freeze(e, reserved))
+            target = e.target.d2d_targets[e.epoch]
+            self.assertIs(target.decode_req.req.kv, ticket.req.kv)
+            self.assertTrue(ticket.consumed)
+            self.assertEqual(native.call_count, 1)
+            with self.assertRaisesRegex(ValueError, "consumed"):
+                e.command(e.target, "d2d_reserve_cancel")
+            e.command(e.target, "d2d_commit")
+            e.gate.set()
+            e.wait_copy()
+            e.target.drain_targets(required=target)
+            self.assertTrue(target.closed)
+            self.assertTrue(e.source.d2d_sources[e.epoch].committed)
+
+    def test_dsv_d2d_reserve_capacity_rejected_while_source_runs(self):
+        e = self._d2d_env()
+        e.target.scheduler.req_to_token_pool.available_size = lambda: 0
+        with self.assertRaisesRegex(ValueError, "reserve preflight"):
+            self._d2d_reserve(e)
+        self.assertFalse(e.req._handoff_frozen)
+        self.assertEqual(e.source.scheduler.running_batch.reqs, [e.req])
+        self.assertFalse(e.target.d2d_reservations)
+        self.assertFalse(e.freed)
+
+    def test_dsv_d2d_reserve_cancel_is_idempotent_and_cannot_resurrect(self):
+        from sglang_remote_attn import dsv_d2d as d2d
+
+        e = self._d2d_env()
+        plan, _ = self._d2d_reserve(e)
+        self.assertTrue(e.command(e.target, "d2d_reserve_cancel")["cancelled"])
+        self.assertTrue(e.command(e.target, "d2d_reserve_cancel")["duplicate"])
+        self.assertEqual(e.freed, ["target"])
+        with self.assertRaisesRegex(ValueError, "retired"):
+            d2d.handle(
+                e.target, dict(cmd="d2d_reserve", migration_epoch=e.epoch, plan=plan)
+            )
+        self.assertFalse(e.req._handoff_frozen)
+
+    def test_dsv_d2d_reserve_cancel_before_rpc_leaves_tombstone(self):
+
+        e = self._d2d_env()
+        e.epoch = "reserved-migration"
+        e.command(e.target, "d2d_reserve_cancel")
+        with self.assertRaisesRegex(ValueError, "retired"):
+            self._d2d_reserve(e)
+        self.assertTrue(e.command(e.target, "d2d_status")["reservation"]["cancelled"])
+        self.assertFalse(e.freed)
+
+    def test_dsv_d2d_planned_freeze_requires_certificate_and_bound(self):
+        from sglang_remote_attn import dsv_d2d as d2d
+
+        e = self._d2d_env()
+        plan, reserved = self._d2d_reserve(e)
+        with self.assertRaisesRegex(ValueError, "requires target reservation"):
+            d2d.handle(
+                e.source,
+                dict(
+                    cmd="d2d_freeze",
+                    rid="source",
+                    destination="D1",
+                    target_rid="target",
+                    migration_epoch=e.epoch,
+                ),
+            )
+        e.req.output_ids.append(34)
+        e.req.kv.kv_committed_len += 1
+        with self.assertRaisesRegex(ValueError, "outside reserved"):
+            self._d2d_reserved_freeze(e, reserved)
+        self.assertFalse(e.req._handoff_frozen)
+        self.assertEqual(e.source.scheduler.running_batch.reqs, [e.req])
+        self.assertFalse(e.source.d2d_sources)
+
+    def test_dsv_d2d_reservation_failed_native_allocation_is_quarantined(self):
+        from sglang_remote_attn import dsv_d2d as d2d
+
+        e = self._d2d_env()
+
+        def partial(req, **kwargs):
+            req.kv.req_pool_idx = 1
+            raise RuntimeError("allocation interrupted")
+
+        e.target.scheduler.disagg_decode_prealloc_queue._pre_alloc = partial
+        with self.assertRaisesRegex(d2d.TransportFailure, "allocation failed"):
+            self._d2d_reserve(e)
+        with self.assertRaisesRegex(d2d.TransportFailure, "unproven"):
+            e.command(e.target, "d2d_reserve_cancel")
+        self.assertFalse(e.freed)
+        self.assertFalse(e.req._handoff_frozen)
+
+    def test_dsv_d2d_reservation_cancel_cuda_proof_failure_retains_row(self):
+        e = self._d2d_env()
+        self._d2d_reserve(e)
+        ticket = e.target.d2d_reservations[e.epoch]
+
+        def fail():
+            raise RuntimeError("CUDA proof failed")
+
+        ticket.ready = SimpleNamespace(synchronize=fail)
+        with self.assertRaisesRegex(RuntimeError, "CUDA proof failed"):
+            e.command(e.target, "d2d_reserve_cancel")
+        with self.assertRaisesRegex(RuntimeError, "unproven"):
+            e.command(e.target, "d2d_reserve_cancel")
+        self.assertFalse(e.freed)
+        self.assertTrue(ticket.req.kv.holds_kv)
+
+    def test_dsv_d2d_reservation_import_mismatch_keeps_ticket_for_cancel(self):
+        e = self._d2d_env()
+        self._d2d_reserve(e)
+        ticket = e.target.d2d_reservations[e.epoch]
+        # A legacy freeze cannot change a planned source destination silently.
+        plan = e.source.d2d_plans.pop(e.epoch)
+        meta = e.freeze(e.epoch)
+        meta["output_ids"][0] += 1
+        with self.assertRaisesRegex(ValueError, "does not fit reservation"):
+            e.import_(meta)
+        self.assertFalse(ticket.consumed)
+        self.assertTrue(ticket.req.kv.holds_kv)
+        self.assertTrue(e.command(e.target, "d2d_reserve_cancel")["cancelled"])
+        self.assertEqual(e.freed, ["target"])
+
+    def test_dsv_d2d_reservation_union_window_budget_and_trim_pages(self):
+        e = self._d2d_env()
+        scheduler = e.target.scheduler
+        for node in e.nodes:
+            pool = node.scheduler.req_to_token_pool
+            rows = pool.req_to_token
+            pool.req_to_token = torch.cat((rows, rows[:, :24] + 100), dim=1)
+        fits = Mock(return_value=True)
+        queue = scheduler.disagg_decode_prealloc_queue
+        queue._prealloc_reservation_fits = fits
+        freed = []
+        scheduler.token_to_kv_pool_allocator.free = lambda indices: freed.append(
+            indices.clone()
+        )
+        plan, reserved = self._d2d_reserve(e, growth=15)
+        # lower=33, upper=48, SWA window=8: reserve [24,48), not [40,48).
+        self.assertEqual(plan["upper"], 48)
+        self.assertEqual(fits.call_args.args[1], 24)
+        meta = self._d2d_reserved_freeze(e, reserved)
+        e.import_(meta)
+        ticket = e.target.d2d_reservations[e.epoch]
+        self.assertEqual(ticket.req.kv.kv_allocated_len, 33)
+        self.assertEqual(len(freed), 1)
+        # Preserve the partial page containing positions [32,40).
+        self.assertTrue(
+            torch.equal(freed[0], scheduler.req_to_token_pool.req_to_token[1, 40:48])
+        )
+
+    def test_dsv_d2d_reservation_peer_preflight_rejects_before_allocation(self):
+        e = self._d2d_env()
+        e.target.agree = lambda flags: [0]
+        native = Mock()
+        e.target.scheduler.disagg_decode_prealloc_queue._pre_alloc = native
+        with self.assertRaisesRegex(ValueError, "peer rejected"):
+            self._d2d_reserve(e)
+        native.assert_not_called()
+        self.assertFalse(e.req._handoff_frozen)
+        self.assertFalse(e.freed)
+
+    def test_dsv_d2d_reservation_completed_peer_cancels_after_peer_allocation_failure(
+        self,
+    ):
+        from sglang_remote_attn import dsv_d2d as d2d
+
+        e = self._d2d_env()
+        e.target.agree = Mock(side_effect=[[1], [0]])
+        with self.assertRaisesRegex(d2d.TransportFailure, "peer failed"):
+            self._d2d_reserve(e)
+        self.assertTrue(e.target.d2d_reservations[e.epoch].complete)
+        self.assertTrue(e.command(e.target, "d2d_reserve_cancel")["cancelled"])
+        self.assertEqual(e.freed, ["target"])
+        self.assertFalse(e.req._handoff_frozen)
+
+    def test_dsv_d2d_native_prealloc_binds_union_window_and_validates_before_alloc(
+        self,
+    ):
+        cls = _source_class(
+            "disaggregation/decode.py", "DecodePreallocQueue", {"_pre_alloc"}
+        )
+        cls._pre_alloc.__globals__.update(
+            get_disagg=lambda: SimpleNamespace(
+                disaggregation_decode_enable_radix_cache=False
+            ),
+            ceil_align=lambda n, page: (n + page - 1) // page * page,
+            is_swa_req_ring=lambda allocator: False,
+        )
+        q = cls()
+        q._pre_alloc_fill_len = lambda req: 48
+        q._swa_tail_len = lambda length: 8
+        q._uses_swa_tail_prealloc = lambda: True
+        q.token_to_kv_pool_allocator = SimpleNamespace(page_size=8)
+
+        def alloc(reqs):
+            reqs[0].kv.req_pool_idx = 1
+            return [1]
+
+        q.req_to_token_pool = SimpleNamespace(
+            alloc=Mock(side_effect=alloc), write=Mock()
+        )
+        q._required_alloc_tokens = lambda **kw: 48
+        q.scheduler = SimpleNamespace(enable_hisparse=False)
+        q.tree_cache = SimpleNamespace(maybe_hand_to_session=lambda req: None)
+        q._alloc_for_decode_prealloc = Mock(return_value=torch.arange(48))
+        req = SimpleNamespace(
+            kv=SimpleNamespace(), origin_input_ids=[1], output_ids=[2]
+        )
+        with self.assertRaisesRegex(ValueError, "SWA window"):
+            q._pre_alloc(req, swa_tail_start=25)
+        q.req_to_token_pool.alloc.assert_not_called()
+        q._pre_alloc(req, swa_tail_start=24)
+        self.assertEqual(
+            q._alloc_for_decode_prealloc.call_args.kwargs["swa_tail_len"], 24
+        )
+        self.assertEqual(req.kv.kv_committed_len, 48)
+
+    def test_dsv_d2d_reserved_manifest_cannot_fallback_to_unreserved_import(self):
+        e = self._d2d_env()
+        _, reserved = self._d2d_reserve(e)
+        meta = self._d2d_reserved_freeze(e, reserved)
+        self.assertTrue(meta["reservation_required"])
+        ticket = e.target.d2d_reservations.pop(e.epoch)
+        native = e.target.scheduler.disagg_decode_prealloc_queue._pre_alloc
+        with patch.object(
+            e.target.scheduler.disagg_decode_prealloc_queue, "_pre_alloc", wraps=native
+        ) as alloc:
+            with self.assertRaisesRegex(
+                ValueError, "requires a live native reservation"
+            ):
+                e.import_(meta)
+            alloc.assert_not_called()
+        self.assertFalse(ticket.consumed)
+        self.assertFalse(e.freed)
+
+    def test_dsv_d2d_unreserved_freeze_is_rejected_by_default(self):
+        from sglang_remote_attn import dsv_d2d as d2d
+
+        e = self._d2d_env()
+        with self.assertRaisesRegex(ValueError, "requires target reservation"):
+            d2d.handle(
+                e.source,
+                dict(
+                    cmd="d2d_freeze",
+                    rid="source",
+                    destination="D1",
+                    target_rid="target",
+                    migration_epoch="unreserved",
+                ),
+            )
+        self.assertFalse(e.req._handoff_frozen)
+        self.assertEqual(e.source.scheduler.running_batch.reqs, [e.req])
+        self.assertFalse(e.freed)
+
+    def _p4_dsv_env(self, accept=True):
+        import importlib.util
+
+        e = self._d2d_env()
+        path = ROOT / "test/manual/remote_attn/p4_dsv_probe_support.py"
+        spec = importlib.util.spec_from_file_location("p4_dsv_probe_support", path)
+        support = importlib.util.module_from_spec(spec)
+        spec.loader.exec_module(support)
+        folder = self.enterContext(tempfile.TemporaryDirectory())
+        driver = support.Driver(e)
+        gw = support.gateway(driver, ROOT, folder)
+        self.addCleanup(gw.close)
+        gw.tick()
+        body = dict(
+            rid="logical-request",
+            prompt_ids=list(e.req.origin_input_ids),
+            max_new_tokens=8,
+            cut=2,
+            growth_tokens=2,
+        )
+        rid = gw.accept(body) if accept else None
+        return SimpleNamespace(
+            e=e, driver=driver, gw=gw, rid=rid, folder=folder, support=support
+        )
+
+    def _p4_dsv_restart(self, f):
+        f.gw.close()
+        f.gw = f.support.gateway(f.driver, ROOT, f.folder)
+        self.addCleanup(f.gw.close)
+        return f.gw
+
+    def test_p4_dsv_orders_native_reserve_before_freeze_and_sse_owner_switch(self):
+        f = self._p4_dsv_env()
+        f.support.until(f.gw, f.rid, "SOURCE")
+        f.gw.tick()
+        first, _ = f.gw.events(f.rid)
+        self.assertEqual([x["seq"] for x in first], [0, 1, 2])
+        self.assertEqual({x["owner"] for x in first}, {"src"})
+        f.support.until(f.gw, f.rid, "TARGET")
+        commands = [p["cmd"] for _, p in f.driver.calls]
+        self.assertLess(commands.index("d2d_reserve"), commands.index("d2d_freeze"))
+        self.assertLess(commands.index("d2d_import"), commands.index("d2d_commit"))
+        target = f.e.target.d2d_targets[f.gw.entry(f.rid)["epoch"]]
+        self.assertFalse(target.copied)
+        target.decode_req.req.output_ids.append(34)
+        target.decode_req.req.kv.kv_committed_len += 1
+        target.decode_req.req.kv.kv_allocated_len += 1
+        f.gw.tick()
+        events, _ = f.gw.events(f.rid, after=2)
+        self.assertEqual(
+            [(x["seq"], x["token_id"], x["owner"]) for x in events], [(3, 34, "dst")]
+        )
+        self.assertEqual(f.driver.count("d2d_submit_pd"), 1)
+        self.assertTrue(f.e.target.d2d_reservations[target.generation].consumed)
+        f.driver.finish_local()
+        f.gw.tick()
+        self.assertEqual(f.gw.entry(f.rid)["phase"], "LOCAL")
+
+    def test_p4_dsv_restart_reconciles_every_precommit_intent_and_commit(self):
+        for phase in (
+            "SUBMIT",
+            "SOURCE",
+            "PLAN",
+            "RESERVE",
+            "FREEZE",
+            "IMPORT",
+            "COMMIT",
+            "TARGET",
+        ):
+            with self.subTest(phase=phase):
+                f = self._p4_dsv_env()
+                f.support.until(f.gw, f.rid, phase)
+                self._p4_dsv_restart(f)
+                f.support.until(f.gw, f.rid, "TARGET")
+                self.assertEqual(f.gw.entry(f.rid)["owner"], "dst")
+                self.assertEqual(f.driver.count("d2d_submit_pd"), 1)
+                self.assertEqual(len(f.e.target.d2d_targets), 1)
+                self.assertEqual(len(f.e.resumed), 1)
+                self.assertFalse(
+                    any(p["cmd"] == "d2d_resume" for _, p in f.driver.calls)
+                )
+                f.gw.close()
+                f.e.close()
+
+    def test_p4_dsv_lost_commit_reply_rolls_forward_after_restart_without_resampling(
+        self,
+    ):
+        f = self._p4_dsv_env()
+        f.driver.after["d2d_commit"] = [TimeoutError("lost commit reply")]
+        f.support.until(f.gw, f.rid, "COMMIT")
+        f.gw.tick()
+        entry = f.gw.entry(f.rid)
+        self.assertEqual(entry["phase"], "COMMIT")
+        self.assertEqual(entry["owner"], "src")
+        self.assertTrue(f.e.source.d2d_sources[entry["epoch"]].committed)
+        self._p4_dsv_restart(f)
+        f.support.until(f.gw, f.rid, "TARGET")
+        self.assertEqual(len(f.e.resumed), 1)
+        self.assertEqual(f.driver.count("d2d_resume"), 0)
+        self.assertEqual(f.driver.count("d2d_abort"), 0)
+
+    def test_p4_dsv_lost_submit_and_import_replies_do_not_allocate_twice(self):
+        for command in ("d2d_submit_pd", "d2d_import", "d2d_freeze", "d2d_reserve"):
+            with self.subTest(command=command):
+                f = self._p4_dsv_env()
+                f.driver.after[command] = [TimeoutError("reply lost")]
+                for _ in range(8):
+                    f.gw.tick()
+                    if f.gw.entry(f.rid)["blocked"]:
+                        break
+                self.assertTrue(f.gw.entry(f.rid)["blocked"])
+                self._p4_dsv_restart(f)
+                f.support.until(f.gw, f.rid, "TARGET")
+                self.assertEqual(len(f.e.target.d2d_targets), 1)
+                self.assertEqual(len(f.e.resumed), 1)
+                self.assertEqual(len(f.e.source.d2d_submissions), 1)
+                f.gw.close()
+                f.e.close()
+
+    def test_p4_dsv_cancel_precommit_tombstones_late_import_and_freeze(self):
+        from sglang_remote_attn import dsv_d2d as d2d
+
+        f = self._p4_dsv_env()
+        f.support.until(f.gw, f.rid, "IMPORT")
+        frozen = f.gw.entry(f.rid)
+        f.gw.cancel(f.rid)
+        f.support.until(f.gw, f.rid, "SOURCE")
+        self.assertFalse(f.e.req._handoff_frozen)
+        self.assertTrue(f.e.req.kv.holds_kv)
+        epoch = frozen["epoch"]
+        with self.assertRaisesRegex(ValueError, "cancelled"):
+            d2d.handle(
+                f.e.target,
+                dict(
+                    cmd="d2d_import",
+                    migration_epoch=epoch,
+                    destination="D1",
+                    transfers=frozen["transfers"],
+                ),
+            )
+        with self.assertRaisesRegex(ValueError, "cancelled"):
+            d2d.handle(
+                f.e.source,
+                dict(
+                    cmd="d2d_freeze",
+                    migration_epoch=epoch,
+                    destination="D1",
+                    target_rid=frozen["target_rid"],
+                    rid=frozen["source_rid"],
+                    reservations=frozen["reservations"],
+                ),
+            )
+        f.support.until(f.gw, f.rid, "CANCELLED")
+        self.assertEqual(len(f.driver.cancels), 1)
+
+    def test_p4_dsv_cancel_at_commit_intent_never_resumes_source(self):
+        f = self._p4_dsv_env()
+        f.support.until(f.gw, f.rid, "COMMIT")
+        f.gw.cancel(f.rid)
+        f.support.until(f.gw, f.rid, "TARGET")
+        f.gw.tick()
+        self.assertEqual(f.driver.cancels[0][1], f.gw.entry(f.rid)["target_rid"])
+        self.assertEqual(f.driver.count("d2d_resume"), 0)
+        self.assertEqual(f.driver.count("d2d_abort"), 0)
+        self.assertTrue(f.e.req._handoff_frozen)
+        self.assertTrue(f.e.req.kv.holds_kv)
+        self.assertFalse(f.e.target.d2d_targets[f.gw.entry(f.rid)["epoch"]].copied)
+        f.driver.finish_local()
+        f.gw.tick()
+        self.assertEqual(f.gw.entry(f.rid)["phase"], "CANCELLED")
+
+    def test_p4_dsv_worker_restart_and_missing_status_never_restore_source(self):
+        f = self._p4_dsv_env()
+        f.support.until(f.gw, f.rid, "COMMIT")
+        f.e.target.d2d_instance_id = "replacement-worker"
+        self._p4_dsv_restart(f)
+        f.gw.tick()
+        self.assertTrue(f.gw.entry(f.rid)["blocked"])
+        self.assertEqual(f.gw.entry(f.rid)["phase"], "COMMIT")
+        self.assertEqual(f.driver.count("d2d_commit"), 0)
+        self.assertEqual(f.driver.count("d2d_resume"), 0)
+        self.assertTrue(f.e.req._handoff_frozen)
+
+    def test_p4_dsv_drain_fences_new_admission_and_waits_for_source_retirement(self):
+        f = self._p4_dsv_env()
+        f.support.until(f.gw, f.rid, "SOURCE")
+        state = f.gw.start_drain()
+        self.assertEqual(state["state"], "MIGRATING")
+        second = f.gw.accept(
+            dict(rid="new-target", prompt_ids=[1, 2], max_new_tokens=4)
+        )
+        self.assertEqual(f.gw.entry(second)["initial_owner"], "dst")
+        # Do not submit the second native request into this single-row fixture.
+        f.gw._update(second, phase="DONE")
+        f.support.until(f.gw, f.rid, "TARGET")
+        self.assertNotEqual(f.gw.drain_status()["state"], "SAFE_TO_STOP")
+        f.driver.finish_local()
+        f.gw.tick()
+        self.assertEqual(f.gw.drain_status()["state"], "SAFE_TO_STOP")
+        self._p4_dsv_restart(f)
+        f.gw.tick()
+        self.assertEqual(f.gw.drain_status()["state"], "SAFE_TO_STOP")
+        third = f.gw.accept(dict(rid="after-restart", prompt_ids=[1], max_new_tokens=2))
+        self.assertEqual(f.gw.entry(third)["owner"], "dst")
+
+    def test_p4_dsv_commit_journal_failure_prevents_commit_rpc(self):
+        f = self._p4_dsv_env()
+        f.support.until(f.gw, f.rid, "IMPORT")
+        persist = f.gw._persist
+
+        def fail_commit():
+            if f.gw.journal["entries"][f.rid]["phase"] == "COMMIT":
+                raise OSError("journal fsync failed")
+            persist()
+
+        with patch.object(f.gw, "_persist", side_effect=fail_commit):
+            f.gw.tick()
+        self.assertEqual(f.driver.count("d2d_commit"), 0)
+        self.assertFalse(f.e.source.d2d_sources[f.gw.entry(f.rid)["epoch"]].committed)
+
+    def test_p4_dsv_journal_single_writer_and_corruption_fail_closed(self):
+        f = self._p4_dsv_env()
+        with self.assertRaises(BlockingIOError):
+            f.support.gateway(f.driver, ROOT, f.folder)
+        f.gw.close()
+        Path(f.folder, "dsv_gateway_journal.json").write_text("{broken")
+        with self.assertRaises(ValueError):
+            f.support.gateway(f.driver, ROOT, f.folder)
+
+    def test_p4_dsv_resume_before_late_freeze_leaves_source_tombstone(self):
+        from sglang_remote_attn import dsv_d2d as d2d
+
+        f = self._p4_dsv_env()
+        f.support.until(f.gw, f.rid, "FREEZE")
+        before = f.gw.entry(f.rid)
+        f.gw.cancel(f.rid)
+        f.support.until(f.gw, f.rid, "SOURCE")
+        with self.assertRaisesRegex(ValueError, "cancelled"):
+            d2d.handle(
+                f.e.source,
+                dict(
+                    cmd="d2d_freeze",
+                    migration_epoch=before["epoch"],
+                    rid=before["source_rid"],
+                    destination="D1",
+                    target_rid=before["target_rid"],
+                    reservations=before["reservations"],
+                ),
+            )
+        self.assertFalse(f.e.req._handoff_frozen)
+
+    def test_p4_dsv_native_reservation_prevents_idle_allocator_reset(self):
+        from sglang_remote_attn.pre_layerwise import is_fully_idle
+
+        e = self._d2d_env()
+        self._d2d_reserve(e)
+        original = Mock(return_value=True)
+        self.assertFalse(is_fully_idle(original, e.target.scheduler))
+        original.assert_not_called()
+        e.command(e.target, "d2d_reserve_cancel")
+        self.assertTrue(is_fully_idle(original, e.target.scheduler))
+
+    def _p4_dsv_http_server(self, gw):
+        from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
+        from urllib.parse import parse_qs, urlparse
+
+        path = PLUGIN / "control_plane/p4_gateway.py"
+        node = next(
+            n
+            for n in ast.parse(path.read_text()).body
+            if isinstance(n, ast.ClassDef) and n.name == "Handler"
+        )
+        ns = dict(
+            BaseHTTPRequestHandler=BaseHTTPRequestHandler,
+            Gateway=object,
+            urlparse=urlparse,
+            parse_qs=parse_qs,
+            json=json,
+            uuid=uuid,
+        )
+        exec(
+            compile(
+                ast.fix_missing_locations(ast.Module(body=[node], type_ignores=[])),
+                str(path),
+                "exec",
+            ),
+            ns,
+        )
+        handler = ns["Handler"]
+        handler.gateway = gw
+        server = ThreadingHTTPServer(("127.0.0.1", 0), handler)
+        server.daemon_threads = True
+        thread = threading.Thread(target=server.serve_forever, daemon=True)
+        thread.start()
+
+        def close():
+            server.shutdown()
+            server.server_close()
+            thread.join(2)
+
+        self.addCleanup(close)
+        return server
+
+    def test_p4_dsv_real_http_sse_continues_across_cutover_without_duplicates(self):
+        import http.client
+
+        f = self._p4_dsv_env(accept=False)
+        from sglang.srt.mem_cache.common import release_kv_cache
+        server = self._p4_dsv_http_server(f.gw)
+        seen, errors = [], []
+        connected, initial, done = (
+            threading.Event(),
+            threading.Event(),
+            threading.Event(),
+        )
+
+        def client():
+            conn = http.client.HTTPConnection(
+                "127.0.0.1", server.server_port, timeout=5
+            )
+            try:
+                conn.request(
+                    "POST",
+                    "/v1/completions",
+                    json.dumps(
+                        dict(
+                            rid="http-request",
+                            prompt_ids=list(f.e.req.origin_input_ids),
+                            max_new_tokens=8,
+                            cut=2,
+                            growth_tokens=2,
+                        )
+                    ),
+                    {"Content-Type": "application/json"},
+                )
+                response = conn.getresponse()
+                self.assertEqual(response.status, 200)
+                connected.set()
+                while line := response.readline():
+                    if line.startswith(b"data: "):
+                        payload = line[6:].strip()
+                        if payload == b"[DONE]":
+                            done.set()
+                            break
+                        event = json.loads(payload)
+                        seen.append(event)
+                        if len(seen) == 3:
+                            initial.set()
+            except BaseException as exc:
+                errors.append(repr(exc))
+                connected.set()
+            finally:
+                conn.close()
+
+        thread = threading.Thread(target=client, daemon=True)
+        thread.start()
+        self.assertTrue(connected.wait(5), errors)
+        self.assertFalse(errors)
+        f.rid = "http-request"
+        f.support.until(f.gw, f.rid, "SOURCE")
+        f.gw.tick()
+        self.assertTrue(initial.wait(5), (seen, errors))
+        f.support.until(f.gw, f.rid, "TARGET")
+        req = f.e.target.d2d_targets[f.gw.entry(f.rid)["epoch"]].decode_req.req
+        req.output_ids.append(34)
+        req.kv.kv_committed_len += 1
+        req.kv.kv_allocated_len += 1
+        req.finished = lambda: True
+        release_kv_cache(req, f.e.target.scheduler.tree_cache, checkpoint=False)
+        f.gw.tick()
+        self.assertTrue(done.wait(5), (seen, errors))
+        thread.join(2)
+        self.assertFalse(errors)
+        self.assertEqual([e["seq"] for e in seen], [0, 1, 2, 3])
+        self.assertEqual([e["token_id"] for e in seen], [31, 32, 33, 34])
+        self.assertEqual(seen[-1]["owner"], "dst")
+        self.assertTrue(f.e.req.kv.holds_kv)
+        self.assertTrue(req.kv.holds_kv)
+        f.driver.finish_local()
+        f.gw.tick()
+        self.assertEqual(f.gw.entry(f.rid)["phase"], "DONE")
+
+    def test_p4_dsv_real_http_reconnect_uses_last_event_id_after_restart(self):
+        import http.client
+
+        f = self._p4_dsv_env()
+        f.support.until(f.gw, f.rid, "SOURCE")
+        f.gw.tick()
+        first = self._p4_dsv_http_server(f.gw)
+        conn = http.client.HTTPConnection("127.0.0.1", first.server_port, timeout=5)
+        conn.request("GET", "/v1/attach?rid=" + f.rid)
+        response = conn.getresponse()
+        seen = []
+        while len(seen) < 2:
+            line = response.readline()
+            if line.startswith(b"data: "):
+                seen.append(json.loads(line[6:]))
+        self.assertEqual([e["seq"] for e in seen], [0, 1])
+        conn.close()
+        self._p4_dsv_restart(f)
+        f.support.until(f.gw, f.rid, "TARGET")
+        req = f.e.target.d2d_targets[f.gw.entry(f.rid)["epoch"]].decode_req.req
+        req.output_ids.append(34)
+        req.finished = lambda: True
+        f.gw.tick()
+        second = self._p4_dsv_http_server(f.gw)
+        conn = http.client.HTTPConnection("127.0.0.1", second.server_port, timeout=5)
+        conn.request("GET", "/v1/attach?rid=" + f.rid, headers={"Last-Event-ID": "1"})
+        response = conn.getresponse()
+        self.assertEqual(response.status, 200)
+        resumed = []
+        for line in response:
+            if line.startswith(b"data: "):
+                payload = line[6:].strip()
+                if payload == b"[DONE]":
+                    break
+                resumed.append(json.loads(payload))
+        conn.close()
+        self.assertEqual([e["seq"] for e in resumed], [2, 3])
+        self.assertEqual([e["token_id"] for e in resumed], [33, 34])
+        self.assertEqual(f.driver.count("d2d_submit_pd"), 1)
+        self.assertEqual(len(f.e.resumed), 1)
+
+    def test_p4_dsv_backend_rejects_restart_between_status_and_mutation(self):
+        f = self._p4_dsv_env()
+        send = f.driver.send
+
+        def replace(role, payload, timeout):
+            if payload["cmd"] == "d2d_submit_pd":
+                f.e.source.d2d_instance_id = "replacement-during-rpc"
+            return send(role, payload, timeout)
+
+        with patch.object(f.driver, "send", side_effect=replace):
+            f.gw.tick()
+        self.assertTrue(f.gw.entry(f.rid)["blocked"])
+        self.assertFalse(hasattr(f.e.source, "d2d_submissions"))
+        self.assertFalse(f.e.req._handoff_frozen)
+
+    def test_p4_dsv_native_admission_exception_after_commit_cannot_resume_or_replay(
+        self,
+    ):
+        from sglang_remote_attn import handoff_control as rt
+
+        f = self._p4_dsv_env()
+        f.support.until(f.gw, f.rid, "COMMIT")
+        with patch.object(
+            rt,
+            "_flush_decode_resume",
+            side_effect=RuntimeError("native admission interrupted"),
+        ):
+            f.gw.tick()
+        entry = f.gw.entry(f.rid)
+        self.assertEqual(entry["phase"], "COMMIT")
+        self.assertTrue(entry["blocked"])
+        self.assertTrue(f.e.source.d2d_sources[entry["epoch"]].committed)
+        f.gw.cancel(f.rid)
+        self._p4_dsv_restart(f)
+        f.gw.tick()
+        self.assertEqual(f.driver.count("d2d_resume"), 0)
+        self.assertEqual(f.driver.count("d2d_abort"), 0)
+        self.assertTrue(f.e.req.kv.holds_kv)
+        self.assertTrue(
+            f.e.target.d2d_targets[entry["epoch"]].decode_req.req.kv.holds_kv
+        )
+
+    def test_p4_dsv_duplicate_source_resume_does_not_enqueue_twice(self):
+        f = self._p4_dsv_env()
+        f.support.until(f.gw, f.rid, "IMPORT")
+        entry = f.gw.entry(f.rid)
+        f.gw.cancel(f.rid)
+        f.support.until(f.gw, f.rid, "SOURCE")
+        self.assertEqual(len(f.e.resumed), 1)
+        result = f.driver.send(
+            "src", dict(cmd="d2d_resume", migration_epoch=entry["epoch"])
+        )
+        self.assertTrue(result["resumed"])
+        self.assertTrue(result["duplicate"])
+        self.assertEqual(len(f.e.resumed), 1)
+
+    def test_p4_dsv_waits_for_previous_native_pd_remote_before_planning(self):
+        f = self._p4_dsv_env()
+        f.support.until(f.gw, f.rid, "SOURCE")
+        f.e.req._dsv41_remote = object()
+        for _ in range(3):
+            f.gw.tick()
+        self.assertEqual(f.gw.entry(f.rid)["phase"], "SOURCE")
+        self.assertEqual(f.driver.count("d2d_plan"), 0)
+        f.e.req._dsv41_remote = None
+        f.support.until(f.gw, f.rid, "TARGET")
+
+    def test_p4_dsv_native_prefill_http_thread_survives_gateway_restart(self):
+        from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
+        from sglang_remote_attn import dsv_gateway_control as control
+
+        f = self._p4_dsv_env(accept=False)
+        arrived, release = threading.Event(), threading.Event()
+        bodies = []
+
+        class Prefill(BaseHTTPRequestHandler):
+            def do_POST(self):
+                bodies.append(
+                    json.loads(self.rfile.read(int(self.headers["Content-Length"])))
+                )
+                arrived.set()
+                release.wait(5)
+                self.send_response(200)
+                self.send_header("Content-Length", "2")
+                self.end_headers()
+                self.wfile.write(b"{}")
+
+            def log_message(self, *args):
+                pass
+
+        server = ThreadingHTTPServer(("127.0.0.1", 0), Prefill)
+        thread = threading.Thread(target=server.serve_forever, daemon=True)
+        thread.start()
+        self.addCleanup(server.server_close)
+        self.addCleanup(server.shutdown)
+        self.addCleanup(release.set)
+        f.gw.prefill_url = f"http://127.0.0.1:{server.server_port}/generate"
+        f.rid = f.gw.accept(
+            dict(
+                rid="native-p",
+                prompt_ids=list(f.e.req.origin_input_ids),
+                max_new_tokens=8,
+            )
+        )
+        with patch.object(control, "prefill", side_effect=f.driver.native_prefill):
+            f.gw.tick()
+            self.assertTrue(arrived.wait(5))
+            worker_thread = f.e.req._d2d_prefill_thread
+            self._p4_dsv_restart(f)
+            self.assertTrue(worker_thread.is_alive())
+            f.gw.tick()
+            self.assertEqual(f.driver.count("d2d_submit_pd"), 1)
+            release.set()
+            worker_thread.join(5)
+        self.assertFalse(worker_thread.is_alive())
+        self.assertFalse(getattr(f.e.req, "_d2d_submission_error", None))
+        self.assertEqual(len(bodies), 1)
+        self.assertEqual(
+            bodies[0]["bootstrap_room"], f.gw.entry(f.rid)["bootstrap_room"]
+        )
+        self.assertEqual(bodies[0]["sampling_params"]["max_new_tokens"], 1)
+
+    def test_p4_dsv_background_pollers_execute_native_migration(self):
+        f = self._p4_dsv_env(accept=False)
+        f.gw.close()
+        f.gw = f.support.gateway(f.driver, ROOT, f.folder, autostart=True)
+        self.addCleanup(f.gw.close)
+        deadline = time.monotonic() + 5
+        while len(f.gw.facts) < 2 and time.monotonic() < deadline:
+            time.sleep(0.01)
+        f.rid = f.gw.accept(
+            dict(
+                rid="background",
+                prompt_ids=list(f.e.req.origin_input_ids),
+                max_new_tokens=8,
+                cut=2,
+                growth_tokens=0,
+            )
+        )
+        while f.gw.entry(f.rid)["phase"] != "TARGET" and time.monotonic() < deadline:
+            time.sleep(0.01)
+        self.assertEqual(f.gw.entry(f.rid)["phase"], "TARGET", f.gw.entry(f.rid))
+        self.assertEqual(f.gw.entry(f.rid)["owner"], "dst")
+        self.assertEqual(len(f.e.resumed), 1)
+
+    def test_p4_dsv_drain_never_claims_safe_with_unmanaged_source_queue(self):
+        f = self._p4_dsv_env()
+        f.support.until(f.gw, f.rid, "TARGET")
+        f.gw.start_drain()
+        f.driver.finish_local()
+        foreign = SimpleNamespace(
+            rid="unmanaged",
+            output_ids=[],
+            kv=SimpleNamespace(kv_committed_len=0, holds_kv=False),
+            finished=lambda: False,
+        )
+        f.e.source.scheduler.waiting_queue.append(foreign)
+        f.gw.tick()
+        self.assertEqual(f.gw.entry(f.rid)["phase"], "LOCAL")
+        self.assertNotEqual(f.gw.drain_status()["state"], "SAFE_TO_STOP")
+        f.e.source.scheduler.waiting_queue.clear()
+        f.gw.tick()
+        self.assertEqual(f.gw.drain_status()["state"], "SAFE_TO_STOP")
+
+    def test_p4_dsv_stopped_source_is_not_polled_after_gateway_restart(self):
+        import http.client
+
+        f = self._p4_dsv_env()
+        f.support.until(f.gw, f.rid, "TARGET")
+        f.gw.start_drain()
+        f.driver.finish_local()
+        f.gw.tick()
+        self.assertEqual(f.gw.drain_status()["state"], "SAFE_TO_STOP")
+        server = self._p4_dsv_http_server(f.gw)
+        conn = http.client.HTTPConnection("127.0.0.1", server.server_port, timeout=5)
+        conn.request(
+            "POST", "/v1/drain/stop", "{}", {"Content-Type": "application/json"}
+        )
+        response = conn.getresponse()
+        self.assertEqual(response.status, 200)
+        self.assertEqual(json.loads(response.read())["state"], "STOPPED")
+        conn.close()
+        self._p4_dsv_restart(f)
+        send = f.driver.send
+
+        def stopped(role, payload, timeout):
+            if role == "src":
+                raise AssertionError("stopped source polled")
+            return send(role, payload, timeout)
+
+        with patch.object(f.driver, "send", side_effect=stopped):
+            f.gw.tick()
+        self.assertNotIn("src", f.gw.fact_errors)
+        self.assertEqual(f.gw.drain_status()["state"], "STOPPED")
+        self.assertFalse(f.gw.entry(f.rid)["blocked"])
+
+    def test_p4_dsv_finished_sse_history_survives_source_and_gateway_restart(self):
+        f = self._p4_dsv_env()
+        f.support.until(f.gw, f.rid, "SOURCE")
+        from sglang.srt.mem_cache.common import release_kv_cache
+
+        f.e.req.finished = lambda: True
+        release_kv_cache(f.e.req, f.e.source.scheduler.tree_cache, checkpoint=False)
+        f.gw.tick()
+        self.assertEqual(f.gw.entry(f.rid)["phase"], "DONE")
+        f.e.source.d2d_instance_id = "new-source-without-history"
+        f.e.source.scheduler.handoff_tracked_reqs.clear()
+        f.e.source.scheduler.running_batch.reqs.clear()
+        self._p4_dsv_restart(f)
+        f.gw.tick()
+        events, finished = f.gw.events(f.rid, after=1)
+        self.assertEqual([e["token_id"] for e in events], [33])
+        self.assertTrue(finished)
+
+    def test_p4_dsv_real_cli_sigkill_commit_recovery_and_sse_attach(self):
+        import http.client
+        from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
+
+        f = self._p4_dsv_env(accept=False)
+        f.gw.close()
+        commit_applied, release_reply = threading.Event(), threading.Event()
+        role_locks = {role: threading.Lock() for role in ("src", "dst")}
+
+        class Proxy(BaseHTTPRequestHandler):
+            def do_POST(self):
+                payload = json.loads(
+                    self.rfile.read(int(self.headers["Content-Length"]))
+                )
+                role = self.path.lstrip("/")
+                with role_locks[role]:
+                    try:
+                        result = f.driver.send(role, payload)
+                        if (
+                            payload["cmd"] == "d2d_commit"
+                            and not commit_applied.is_set()
+                        ):
+                            commit_applied.set()
+                            release_reply.wait(10)
+                        status = 200
+                    except Exception as exc:
+                        result, status = (
+                            dict(error=repr(exc), type=type(exc).__name__),
+                            500,
+                        )
+                    data = json.dumps(result).encode()
+                    try:
+                        self.send_response(status)
+                        self.send_header("Content-Length", str(len(data)))
+                        self.end_headers()
+                        self.wfile.write(data)
+                    except (BrokenPipeError, ConnectionResetError):
+                        pass
+
+            def log_message(self, *args):
+                pass
+
+        proxy = ThreadingHTTPServer(("127.0.0.1", 0), Proxy)
+        proxy.daemon_threads = True
+        thread = threading.Thread(target=proxy.serve_forever, daemon=True)
+        thread.start()
+        self.addCleanup(proxy.server_close)
+        self.addCleanup(proxy.shutdown)
+        self.addCleanup(release_reply.set)
+        worker = ROOT / "test/manual/remote_attn/p4_dsv_gateway_worker.py"
+        processes = []
+        state_dir = Path(f.folder)
+
+        def start(index):
+            ready = state_dir / f"ready-{index}.json"
+            process = subprocess.Popen(
+                [
+                    sys.executable,
+                    str(worker),
+                    "--source-root",
+                    str(ROOT),
+                    "--proxy-port",
+                    str(proxy.server_port),
+                    "--state",
+                    str(state_dir),
+                    "--ready",
+                    str(ready),
+                ],
+                stdout=subprocess.DEVNULL,
+                stderr=subprocess.PIPE,
+                text=True,
+                env=dict(os.environ, PYTHONDONTWRITEBYTECODE="1"),
+            )
+            processes.append(process)
+            deadline = time.monotonic() + 8
+            while (
+                not ready.exists()
+                and process.poll() is None
+                and time.monotonic() < deadline
+            ):
+                time.sleep(0.01)
+            self.assertTrue(
+                ready.exists(),
+                process.stderr.read()
+                if process.poll() is not None
+                else "startup timed out",
+            )
+            return process, json.loads(ready.read_text())["port"]
+
+        try:
+            process, port = start(1)
+            deadline = time.monotonic() + 5
+            while (
+                f.driver.count("d2d_worker_status") < 2 and time.monotonic() < deadline
+            ):
+                time.sleep(0.01)
+            time.sleep(0.05)
+            conn = http.client.HTTPConnection("127.0.0.1", port, timeout=8)
+            conn.request(
+                "POST",
+                "/v1/completions",
+                json.dumps(
+                    dict(
+                        rid="sigkill",
+                        prompt_ids=list(f.e.req.origin_input_ids),
+                        max_new_tokens=8,
+                        cut=2,
+                        growth_tokens=0,
+                    )
+                ),
+                {"Content-Type": "application/json"},
+            )
+            response = conn.getresponse()
+            self.assertEqual(response.status, 200)
+            first = []
+            while len(first) < 2:
+                line = response.readline()
+                if line.startswith(b"data: "):
+                    item = json.loads(line[6:])
+                    if "seq" in item:
+                        first.append(item["seq"])
+            self.assertTrue(commit_applied.wait(5))
+            self.assertEqual(first, [0, 1])
+            journal = json.loads((state_dir / "dsv_gateway_journal.json").read_text())
+            self.assertEqual(journal["entries"]["sigkill"]["phase"], "COMMIT")
+            process.kill()
+            process.wait(5)
+            conn.close()
+            release_reply.set()
+            _, port = start(2)
+            deadline = time.monotonic() + 8
+            entry = None
+            while time.monotonic() < deadline:
+                entry = json.loads(
+                    (state_dir / "dsv_gateway_journal.json").read_text()
+                )["entries"]["sigkill"]
+                if entry["phase"] == "TARGET":
+                    break
+                time.sleep(0.01)
+            self.assertEqual(entry["phase"], "TARGET", entry)
+            req = f.e.target.d2d_targets[entry["epoch"]].decode_req.req
+            req.output_ids.append(34)
+            req.kv.kv_committed_len += 1
+            req.kv.kv_allocated_len += 1
+            conn = http.client.HTTPConnection("127.0.0.1", port, timeout=8)
+            conn.request(
+                "GET", "/v1/attach?rid=sigkill", headers={"Last-Event-ID": "1"}
+            )
+            response = conn.getresponse()
+            self.assertEqual(response.status, 200)
+            resumed = []
+            while len(resumed) < 2:
+                line = response.readline()
+                if line.startswith(b"data: "):
+                    item = json.loads(line[6:])
+                    if "seq" in item:
+                        resumed.append((item["seq"], item["token_id"]))
+            conn.close()
+            self.assertEqual(resumed, [(2, 33), (3, 34)])
+            self.assertEqual(len(f.e.resumed), 1)
+            self.assertEqual(f.driver.count("d2d_resume"), 0)
+            self.assertEqual(f.driver.count("d2d_submit_pd"), 1)
+            self.assertTrue(f.e.req.kv.holds_kv)
+        finally:
+            release_reply.set()
+            for process in processes:
+                if process.poll() is None:
+                    process.kill()
+                process.communicate(timeout=5)
 
 
 if __name__ == "__main__":
