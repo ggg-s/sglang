@@ -65,6 +65,7 @@ class TestSplitInputLifetime(CustomTestCase):
             ["forward_batch_split_prefill"],
             CaptureHiddenMode=SimpleNamespace(FULL="full"),
             ForwardMode=SimpleNamespace(EXTEND=extend_mode),
+            draft_tp_context=lambda *args: contextlib.nullcontext(),
             speculative_moe_backend_context=contextlib.nullcontext,
             speculative_moe_a2a_backend_context=contextlib.nullcontext,
             spec_stage_span=lambda *args: contextlib.nullcontext(),
@@ -111,10 +112,11 @@ class TestSplitInputLifetime(CustomTestCase):
                             ),
                             next_token_ids=None if idle else "sampled",
                             next_draft_input=None,
+                            iteration_ids=None,
                             has_sampled_token_ids=final and not idle,
                         )
 
-                    def draft_extend(batch, *args):
+                    def draft_extend(batch, *args, iteration_ids=None):
                         self.assertIs(batch.input_ids, materialized[-1])
                         self.assertNotIn(-1, batch.input_ids)
                         self.assertIs(
@@ -133,6 +135,7 @@ class TestSplitInputLifetime(CustomTestCase):
                         ),
                         draft_worker=SimpleNamespace(
                             draft_runner=SimpleNamespace(tp_group=None),
+                            parallel_layout=None,
                             draft_tp_context=lambda *args: contextlib.nullcontext(),
                             prefill_lane_draft_extend_backend=contextlib.nullcontext,
                             _draft_extend_for_prefill=draft_extend,

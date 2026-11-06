@@ -35,6 +35,8 @@ def lane_namespace(decode, prefill, *, attention=None, moe=None):
         None,
         [
             "set_pdmux_status",
+            "is_pdmux_prefill_enabled",
+            "resolve_pdmux_group",
             "get_tp_group",
             "get_attn_tp_group",
             "get_attn_cp_group",
@@ -43,8 +45,20 @@ def lane_namespace(decode, prefill, *, attention=None, moe=None):
         ],
         **namespace,
     )
-    # load_methods gives every function the same globals dict.
-    return NS(**functions)
+    # RuntimeContext now owns the stamped handles. Each read resolves its lane.
+    resolve = functions["resolve_pdmux_group"]
+
+    def get_parallel():
+        return NS(
+            tp_group=resolve(decode),
+            attn_tp_group=resolve(decode if attention is None else attention),
+            attn_cp_group=resolve(decode),
+            moe_dp_group=resolve(decode),
+            moe_tp_group=resolve(decode if moe is None else moe),
+        )
+
+    functions["get_tp_group"].__globals__["get_parallel"] = get_parallel
+    return NS(**functions, get_parallel=get_parallel)
 
 
 def load_constructor(path, name, namespace, *, methods=()):
@@ -160,7 +174,7 @@ class TestPdmuxTPAdmission(unittest.TestCase):
             speculative_algorithm="DFLASH",
             enable_prefill_cp=False,
             tp_size=2,
-            enable_dp_attention=False,
+            attn_dp_size=1,
             ep_size=1,
             moe_dp_size=1,
             attn_cp_size=1,
@@ -168,7 +182,10 @@ class TestPdmuxTPAdmission(unittest.TestCase):
         )
         vars(cfg).update(overrides)
         check = load_methods(
-            "arg_groups/validation_hook.py", None, ["check_pdmux_overlap"]
+            "arg_groups/validation_hook.py",
+            None,
+            ["check_pdmux_overlap"],
+            attn_dp_enabled_of=lambda cfg: cfg.attn_dp_size > 1,
         )
         check["check_pdmux_overlap"](cfg)
 
@@ -200,7 +217,7 @@ class TestPdmuxTPAdmission(unittest.TestCase):
     def test_subgroup_parallelism_is_not_silently_enabled(self):
         for algorithm in ("DFLASH", "DSPARK"):
             for name in (
-                "enable_dp_attention",
+                "attn_dp_size",
                 "ep_size",
                 "moe_dp_size",
                 "attn_cp_size",
@@ -212,7 +229,7 @@ class TestPdmuxTPAdmission(unittest.TestCase):
                 ):
                     self.check(
                         speculative_algorithm=algorithm,
-                        **{name: True if name == "enable_dp_attention" else 2},
+                        **{name: 2},
                     )
 
 
@@ -225,7 +242,11 @@ class TestPdmuxTPSampling(unittest.TestCase):
             ),
             kernel=NS(sampling_backend="pytorch"),
             features=NS(
-                sampling_mask_max_tokens=0, enable_fp32_lm_head=False, enable_mis=False
+                sampling_mask_max_tokens=0,
+                enable_fp32_lm_head=False,
+                enable_mis=False,
+                aux_hidden_state_capture=None,
+                return_aux_hidden_state_layer_ids=None,
             ),
         )
 
@@ -239,7 +260,7 @@ class TestPdmuxTPSampling(unittest.TestCase):
                     "layers/sampler.py",
                     "Sampler",
                     dict(
-                        get_tp_group=lanes.get_tp_group,
+                        get_parallel=lanes.get_parallel,
                         get_disagg=lambda: NS(
                             enable_pdmux=True, pdmux_prefill_mode=mode
                         ),
@@ -272,7 +293,10 @@ class TestPdmuxTPSampling(unittest.TestCase):
             dict(
                 get_tp_group=lambda: NS(device_group=object()),
                 get_parallel=lambda: NS(
-                    attn_tp_group=attention, attn_cp_group=NS(device_group=object())
+                    tp_group=NS(device_group=object()),
+                    attn_tp_group=attention,
+                    attn_cp_group=NS(device_group=object()),
+                    attn_cp_size=1,
                 ),
                 get_disagg=lambda: NS(enable_pdmux=True),
                 is_dp_attention_enabled=lambda: True,
@@ -300,6 +324,7 @@ class TestPdmuxTPSampling(unittest.TestCase):
                             enable_dp_lm_head=False,
                             enable_tp_lm_head_all_to_all=False,
                             tp_size=2,
+                            tp_group=NS(cpu_group=object()),
                             attn_dp_size=1,
                         ),
                         get_disagg=lambda: NS(
@@ -310,7 +335,8 @@ class TestPdmuxTPSampling(unittest.TestCase):
                             MultimemAllGatherer=gatherer,
                             recommended_max_tokens=lambda **kw: 128,
                         ),
-                        InputLogprobProcessor=object,
+                        InputLogprobProcessor=lambda *args, **kwargs: object(),
+                        _runtime_optimized_vocab_shards_enabled=lambda: False,
                     ),
                 )
                 processor_cls(NS(vocab_size=128))

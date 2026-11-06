@@ -23,7 +23,10 @@ class TestPdmuxPrefillProgress(unittest.TestCase):
                     "SchedulerMetricsCollector",
                     ["init_new"],
                     get_observability=lambda: obs,
-                    get_disagg=lambda: NS(disaggregation_mode="null"),
+                    get_disagg=lambda: NS(
+                        disaggregation_mode="null", enable_pd_role_switch=False
+                    ),
+                    get_parallel=lambda: parallel,
                     get_serving=lambda: NS(
                         served_model_name="fixture", enable_streaming_session=False
                     ),
@@ -36,18 +39,17 @@ class TestPdmuxPrefillProgress(unittest.TestCase):
                     for dp_rank in (0, 1):
                         reporters = []
                         for cp_rank in range(cp_size):
+                            parallel = NS(
+                                attn_tp_rank=0,
+                                attn_cp_rank=cp_rank,
+                                pp_rank=0,
+                                moe_ep_rank=0,
+                                tp_rank=cp_rank,
+                                dp_rank=dp_rank,
+                            )
                             ctx = init(
                                 object,
                                 server_args=None,
-                                ps=NS(
-                                    attn_tp_rank=0,
-                                    attn_cp_rank=cp_rank,
-                                    pp_rank=0,
-                                    moe_ep_rank=0,
-                                ),
-                                tp_rank=cp_rank,
-                                pp_rank=0,
-                                dp_rank=dp_rank,
                                 enable_priority_scheduling=False,
                                 enable_lora=False,
                                 enable_hierarchical_cache=True,
@@ -148,6 +150,7 @@ class TestPdmuxPrefillProgress(unittest.TestCase):
             "multiplex/multiplexing_mixin.py",
             "SchedulerMultiplexMixin",
             ["_get_split_forward_count"],
+            get_parallel=lambda: scheduler.ps,
         )["_get_split_forward_count"]
         scheduler = NS(
             ps=NS(attn_dp_size=1),

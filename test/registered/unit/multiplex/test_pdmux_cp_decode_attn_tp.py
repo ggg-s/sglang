@@ -157,59 +157,55 @@ class TestPdmuxCPDecodeAttentionTP(unittest.TestCase):
                     with model.maybe_use_decode_attn_tp(batch) as view:
                         expected = view(x)
                     layer = NS(self_attn=model)
-                    if draft:
-                        layer.hc_attn_fn = layer.hc_attn_scale = layer.hc_attn_base = (
-                            None
+                    path = (
+                        "models/deepseek_v4_dspark.py"
+                        if draft
+                        else "models/deepseek_v4.py"
+                    )
+                    cls = "DSparkV4CudaStage" if draft else "DeepseekV4CudaDecoderLayer"
+                    attention_call = load_methods(
+                        path, cls, ["_run_boundary_attention"]
+                    )["_run_boundary_attention"]
+                    layer._run_boundary_attention = types.MethodType(
+                        attention_call, layer
+                    )
+                    layer.attn_boundary = NS(finish=lambda hidden, batch: hidden)
+                    # Execute the real CUDA decoder's dispatch, shared by DSpark.
+                    tree = ast.parse((SRT / "models/deepseek_v4.py").read_text())
+                    decoder = next(
+                        node
+                        for node in tree.body
+                        if isinstance(node, ast.ClassDef)
+                        and node.name == "DeepseekV4CudaDecoderLayer"
+                    )
+                    block = next(
+                        node
+                        for node in ast.walk(decoder)
+                        if isinstance(node, ast.With)
+                        and any(
+                            isinstance(item.context_expr, ast.Call)
+                            and isinstance(item.context_expr.func, ast.Attribute)
+                            and item.context_expr.func.attr
+                            == "maybe_use_decode_attn_tp"
+                            for item in node.items
                         )
-                        layer.hc_ffn_fn = layer.hc_ffn_scale = layer.hc_ffn_base = None
-                        layer._hc_pre_block = lambda x, *args: (x, None, None)
-                        layer._hc_post_block = lambda x, *args: x
-                        layer.input_layernorm = layer.post_attention_layernorm = (
-                            lambda x: x
-                        )
-                        layer._run_ffn = lambda x, batch: x
-                        forward = load_methods(
-                            "models/deepseek_v4_dspark.py", "DSparkV4Stage", ["forward"]
-                        )["forward"]
-                        actual = forward(layer, None, x, batch)
-                    else:
-                        # Execute the actual decoder's attention dispatch block;
-                        # its surrounding mHC/MoE kernels need CUDA dependencies.
-                        tree = ast.parse((SRT / "models/deepseek_v4.py").read_text())
-                        decoder = next(
-                            node
-                            for node in tree.body
-                            if isinstance(node, ast.ClassDef)
-                            and node.name == "DeepseekV4DecoderLayer"
-                        )
-                        block = next(
-                            node
-                            for node in ast.walk(decoder)
-                            if isinstance(node, ast.With)
-                            and any(
-                                isinstance(item.context_expr, ast.Call)
-                                and isinstance(item.context_expr.func, ast.Attribute)
-                                and item.context_expr.func.attr
-                                == "maybe_use_decode_attn_tp"
-                                for item in node.items
-                            )
-                        )
-                        ns = dict(
-                            self=layer,
-                            hidden_states=x,
-                            positions=None,
-                            forward_batch=batch,
-                            x_quant=None,
-                        )
-                        exec(
-                            compile(
-                                ast.Module(body=[block], type_ignores=[]),
-                                "dispatch",
-                                "exec",
-                            ),
-                            ns,
-                        )
-                        actual = ns["hidden_states"]
+                    )
+                    ns = dict(
+                        self=layer,
+                        hidden_states=x,
+                        positions=None,
+                        forward_batch=batch,
+                        quantized=None,
+                    )
+                    exec(
+                        compile(
+                            ast.Module(body=[block], type_ignores=[]),
+                            "dispatch",
+                            "exec",
+                        ),
+                        ns,
+                    )
+                    actual = ns["hidden_states"]
                     torch.testing.assert_close(actual, expected)
 
     def test_sharded_projections_sum_to_full_prefill_for_target_and_draft(self):

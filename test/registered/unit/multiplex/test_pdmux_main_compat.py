@@ -11,6 +11,7 @@ import contextlib
 import enum
 import importlib.util
 import sys
+import time
 import unittest
 from collections import deque
 from http import HTTPStatus
@@ -33,7 +34,11 @@ register_cpu_ci(est_time=1, suite="base-a-test-cpu")
 
 def load_method(path, owner, name, **namespace):
     tree = ast.parse((ROOT / path).read_text(encoding="utf-8"))
-    cls = next(node for node in tree.body if getattr(node, "name", None) == owner)
+    cls = (
+        tree
+        if owner is None
+        else next(node for node in tree.body if getattr(node, "name", None) == owner)
+    )
     method = next(node for node in cls.body if getattr(node, "name", None) == name)
     method.decorator_list = []
     module = ast.Module(
@@ -50,12 +55,29 @@ def load_method(path, owner, name, **namespace):
 
 
 class TestPdmuxMainCompat(unittest.TestCase):
+    @staticmethod
+    def bind_inflight_batches(scheduler):
+        method = load_method(
+            "python/sglang/srt/managers/scheduler.py",
+            "Scheduler",
+            "_collect_inflight_batches",
+            get_parallel=lambda: scheduler.ps,
+        )
+        scheduler.enable_continuous_input_polling = False
+        scheduler.enable_pdmux = True
+        scheduler.split_prefill_batch = None
+        scheduler._collect_inflight_batches = lambda: method(scheduler)
+
     def test_standard_loop_broadcasts_timeout_aborts_through_ingest(self):
         class InputProcessed(Exception):
             pass
 
         ingest = load_method(
-            "python/sglang/srt/managers/scheduler.py", "Scheduler", "ingest_requests"
+            "python/sglang/srt/managers/scheduler.py",
+            "Scheduler",
+            "ingest_requests",
+            time=time,
+            get_parallel=lambda: scheduler.ps,
         )
         loop = load_method(
             "python/sglang/srt/multiplex/multiplexing_mixin.py",
@@ -82,6 +104,8 @@ class TestPdmuxMainCompat(unittest.TestCase):
                     ps=SimpleNamespace(
                         pp_rank=ranks[0], attn_tp_rank=ranks[1], attn_cp_rank=ranks[2]
                     ),
+                    uocr_runtime=None,
+                    _deferred_input_requests=[],
                     tp_cpu_group=object(),
                     stream_groups=[(object(), object())],
                     enable_overlap=False,
@@ -125,6 +149,7 @@ class TestPdmuxMainCompat(unittest.TestCase):
             return SimpleNamespace(
                 rid=rid,
                 finished=lambda: done,
+                to_finish=None,
                 time_stats=SimpleNamespace(forward_entry_time=entry),
             )
 
@@ -143,6 +168,7 @@ class TestPdmuxMainCompat(unittest.TestCase):
                 SimpleNamespace(reqs=[inflight]),
             ],
         )
+        self.bind_inflight_batches(scheduler)
         aborts = poll(scheduler)
         self.assertCountEqual(
             [abort.rid for abort in aborts], ["decode", "pending", "inflight"]
@@ -154,7 +180,7 @@ class TestPdmuxMainCompat(unittest.TestCase):
     def test_split_mode_participates_in_cp(self):
         mode = enum.Enum("Mode", "EXTEND MIXED SPLIT_PREFILL DRAFT_EXTEND_V2 DECODE")
         active = load_method(
-            "python/sglang/srt/model_executor/forward_batch_info.py",
+            "python/sglang/srt/model_executor/forward_mode.py",
             "ForwardMode",
             "is_context_parallel_extend",
             ForwardMode=mode,
@@ -170,9 +196,9 @@ class TestPdmuxMainCompat(unittest.TestCase):
             prepare_cp_forward=lambda batch: journal.append("cp"),
         )
         forward = load_method(
-            "python/sglang/srt/model_executor/model_runner.py",
-            "ModelRunner",
-            "forward_split_prefill",
+            "python/sglang/srt/model_executor/runner_utils/pdmux.py",
+            None,
+            "run_split_prefill",
             device_timer_ctx=lambda *args: contextlib.nullcontext(),
         )
         runner = SimpleNamespace(
@@ -209,6 +235,7 @@ class TestPdmuxMainCompat(unittest.TestCase):
                 SimpleNamespace(reqs=[inflight, decode]),
             ],
         )
+        self.bind_inflight_batches(scheduler)
         self.assertEqual(collect(scheduler), {decode, pending, inflight})
 
     def test_standard_prefill_relays_with_batch_and_pins_worker_refs(self):
@@ -279,6 +306,7 @@ class TestPdmuxMainCompat(unittest.TestCase):
                 cache = SimpleNamespace(
                     linker=None,
                     _drain_async_work=Mock(),
+                    flush_pending_backups=Mock(),
                     cache_controller=SimpleNamespace(write_policy=policy),
                     _sync_hicache_ready_counts=lambda: (writes, 0, [], []),
                     writing_check=Mock(),

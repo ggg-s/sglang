@@ -14,10 +14,7 @@ from test_pdmux_sxf_port import load_methods, register_cpu_ci
 
 register_cpu_ci(est_time=5, suite="base-a-test-cpu")
 
-CACHES = (
-    ("mem_cache/hiradix_cache.py", "HiRadixCache"),
-    ("mem_cache/unified_radix_cache.py", "UnifiedRadixCache"),
-)
+CACHES = (("mem_cache/unified_radix_cache.py", "UnifiedRadixCache"),)
 
 
 def local_poll(path, owner):
@@ -48,7 +45,7 @@ class TestHiCacheLocalPolling(unittest.TestCase):
                     event.query.assert_called_once()
 
     def test_unified_without_a_controller_is_already_ready(self):
-        self.assertTrue(local_poll(*CACHES[1])(NS(cache_controller=None), 0))
+        self.assertTrue(local_poll(*CACHES[0])(NS(cache_controller=None), 0))
 
 
 class TestFusionWorkspaceSafety(unittest.TestCase):

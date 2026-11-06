@@ -20,7 +20,7 @@ class TestPDMuxDraftGraphs(CustomTestCase):
         self.groups = [(object(), object()) for _ in range(3)]
         self.worker = NS(
             server_args=object(),
-            draft_runner=object(),
+            draft_runner=NS(runner_ids=NS(bind_and_verify_backends=Mock())),
             topk=1,
             speculative_num_steps=3,
             seed_dsa_topk_from_draft_extend=False,
@@ -28,7 +28,7 @@ class TestPDMuxDraftGraphs(CustomTestCase):
         )
         self.original_backend = self.worker.draft_attn_backend
         self.factory = NS(
-            create_decode_backend=Mock(side_effect=lambda: object()),
+            create_decode_backend=Mock(side_effect=lambda: NS(attn_backends=[])),
             create_draft_extend_backend=Mock(side_effect=lambda: object()),
         )
         self.globals = dict(

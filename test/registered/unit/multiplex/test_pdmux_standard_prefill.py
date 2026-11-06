@@ -32,6 +32,8 @@ import unittest
 from types import SimpleNamespace
 from unittest.mock import Mock, patch
 
+from sglang.srt.runtime_context import get_context
+
 import sglang.srt.managers.scheduler as scheduler_module
 import sglang.srt.multiplex.multiplexing_mixin as multiplexing_mixin
 from sglang.srt.model_executor.forward_batch_info import ForwardMode
@@ -149,7 +151,7 @@ class _Batch:
     def batch_size(self):
         return 0 if self._empty else 1
 
-    def filter_batch(self, chunked_req_to_exclude=None):
+    def filter_batch(self, reqs_to_exclude=None):
         pass
 
     def merge_batch(self, other):
@@ -217,6 +219,8 @@ class _FakeScheduler(SchedulerMultiplexMixin):
                 penalizer_orchestrator=SimpleNamespace(is_required=True)
             )
         self.tree_cache = Mock()
+        self.prefill_launched_reqs = Mock()
+        self.running_reqs = Mock()
         self.future_map = SimpleNamespace(
             publish=lambda *args: self.journal.append(("future_seed", None, args))
         )
@@ -270,6 +274,9 @@ class _FakeScheduler(SchedulerMultiplexMixin):
 
     def process_pending_chunked_abort(self):
         pass
+
+    def _process_hicache_events(self):
+        self.check_hicache_events_if_enabled()
 
     def get_new_batch_prefill(self, running_batch):
         batch = self._prefill_batches.pop(0) if self._prefill_batches else None
@@ -328,6 +335,7 @@ class _FakeScheduler(SchedulerMultiplexMixin):
 def _stubbed_cuda():
     _STREAM_IDX[0] = 0
     with (
+        get_context().override_server_args(tp_size=2, enable_pdmux=True),
         patch("torch.cuda.stream", lambda _stream: contextlib.nullcontext()),
         patch("torch.cuda.empty_cache", lambda: None),
         patch(

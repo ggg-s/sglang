@@ -5,10 +5,12 @@ from __future__ import annotations
 import ast
 import contextlib
 import threading
+import sys
+from enum import Enum, auto
 import unittest
 from concurrent.futures import ThreadPoolExecutor
 from types import SimpleNamespace as NS
-from unittest.mock import Mock
+from unittest.mock import Mock, patch
 
 from test_pdmux_sxf_port import SRT, load_methods, register_cpu_ci
 from test_pdmux_tp_overlap import lane_namespace
@@ -41,7 +43,7 @@ class TestPdmuxPrefillCPAdmission(unittest.TestCase):
             tp_size=2,
             dp_size=1,
             enable_prefill_cp=True,
-            enable_dp_attention=True,
+            attn_dp_size=1,
             cp_strategy="interleave",
             attn_cp_size=2,
             ep_size=1,
@@ -59,6 +61,8 @@ class TestPdmuxPrefillCPAdmission(unittest.TestCase):
             "arg_groups/validation_hook.py",
             None,
             ["check_pdmux_overlap"],
+            num_dp_ranks_of=lambda cfg: cfg.dp_size * cfg.attn_dp_size,
+            attn_dp_enabled_of=lambda cfg: cfg.attn_dp_size > 1,
             model_config_of=lambda _: NS(hf_config=NS(architectures=[arch])),
             envs=NS(SGLANG_RAGGED_VERIFY_MODE=NS(get=lambda: ragged_mode)),
         )
@@ -83,7 +87,7 @@ class TestPdmuxPrefillCPAdmission(unittest.TestCase):
             dict(cp_strategy="zigzag"),
             dict(dp_size=2),
             dict(attn_cp_size=1),
-            dict(enable_dp_attention=False),
+            dict(attn_dp_size=2),
             dict(ep_size=2),
             dict(moe_dp_size=2),
             dict(dcp_size=2),
@@ -110,7 +114,8 @@ class TestPdmuxPrefillCPState(unittest.TestCase):
         active_group = [full]
 
         @contextlib.contextmanager
-        def draft_context(group):
+        def draft_context(layout):
+            group = layout.tp_group or active_group[0]
             old = active_group[0]
             active_group[0] = group
             try:
@@ -125,7 +130,32 @@ class TestPdmuxPrefillCPState(unittest.TestCase):
             def __getitem__(self, index):
                 return self.values[index[-1]]
 
-        parallel = NS(attn_cp_size=2, attn_tp_group=singleton)
+        parallel = NS(
+            attn_cp_size=2,
+            attn_tp_size=1,
+            attn_dp_size=1,
+            attn_dp_enabled=False,
+            attn_tp_group=singleton,
+            tp_group=full,
+            enable_prefill_cp=True,
+        )
+        draft_attn_group = load_methods(
+            "runtime_context.py",
+            None,
+            ["draft_attn_parallel_group"],
+            get_parallel=lambda: parallel,
+        )["draft_attn_parallel_group"]
+        execution = NS(SINGLE_GROUP=object(), TARGET_LAYOUT=object())
+        layout = load_methods(
+            "speculative/draft_parallel.py",
+            None,
+            ["resolve_draft_parallel_layout"],
+            get_parallel=lambda: parallel,
+            DraftTPExecution=execution,
+            DraftParallelLayout=NS,
+            draft_attn_parallel_group=draft_attn_group,
+        )["resolve_draft_parallel_layout"]
+
         context = load_methods(
             "speculative/dspark_components/dspark_draft.py",
             "DraftBlockProposer",
@@ -142,7 +172,9 @@ class TestPdmuxPrefillCPState(unittest.TestCase):
                 [10, 11, 20, 21] if active_group[0] is full else local.values
             ),
         )["gather_and_crop_vocab"]
-        proposer = NS(_dp_moe_sync=True)
+        proposer = NS(
+            _base_logits_layout=layout(NS(tp_execution=execution.SINGLE_GROUP))
+        )
         with context(proposer):
             logits = gather(Logits([10, 11]), NS(org_vocab_size=4))
         self.assertEqual(logits, [10, 11, 20, 21])
@@ -150,6 +182,9 @@ class TestPdmuxPrefillCPState(unittest.TestCase):
 
         # True DP still uses the singleton head holding its complete vocab.
         parallel.attn_cp_size = 1
+        parallel.attn_dp_size = 2
+        parallel.attn_dp_enabled = True
+        proposer._base_logits_layout = layout(NS(tp_execution=execution.SINGLE_GROUP))
         with context(proposer):
             self.assertIs(active_group[0], singleton)
         self.assertIs(active_group[0], full)
@@ -159,7 +194,7 @@ class TestPdmuxPrefillCPState(unittest.TestCase):
         sync = load_definitions(
             "speculative/spec_tp_sync.py",
             ["SpecTpSync"],
-            envs=NS(SGLANG_SPEC_TP_SYNC=NS(get=lambda: "all")),
+            envs=NS(SGLANG_SPEC_TP_SYNC=NS(get=lambda: "all", is_set=lambda: False)),
             parse_spec_tp_sync=lambda _: {"target", "accept"},
             _ALL={"target", "accept"},
         )
@@ -185,6 +220,16 @@ class TestPdmuxPrefillCPState(unittest.TestCase):
                     dict(
                         self=worker,
                         SpecTpSync=sync.SpecTpSync,
+                        get_dp_tp_group=load_methods(
+                            "layers/dp_attention.py",
+                            None,
+                            ["get_dp_tp_group"],
+                            get_parallel=lambda: NS(
+                                attn_dp_enabled=cp_size == 1,
+                                attn_tp_group=singleton,
+                                tp_group=full,
+                            ),
+                        )["get_dp_tp_group"],
                         parallel=NS(
                             enable_dp_attention=True,
                             attn_cp_size=cp_size,
@@ -270,11 +315,20 @@ class TestPdmuxPrefillCPState(unittest.TestCase):
         lanes = lane_namespace(object(), prefill)
         runtime = load_definitions(
             "runtime_context.py",
-            ["ForwardFlags", "get_forward"],
+            ["LoRABatchLayout", "ForwardFlags", "get_forward"],
+            Enum=Enum,
+            auto=auto,
             contextmanager=contextlib.contextmanager,
-            _ps=lambda: NS(
-                is_pdmux_prefill_enabled=lambda: lanes.get_tp_group() is prefill
-            ),
+        )
+        self.enterContext(
+            patch.dict(
+                sys.modules,
+                {
+                    "sglang.srt.distributed.parallel_state": NS(
+                        is_pdmux_prefill_enabled=lanes.is_pdmux_prefill_enabled
+                    )
+                },
+            )
         )
         context = NS(
             forward=runtime.ForwardFlags(), prefill_forward=runtime.ForwardFlags()
@@ -306,7 +360,12 @@ class TestPdmuxPrefillCPState(unittest.TestCase):
             "model_executor/model_runner.py",
             "ModelRunner",
             ["forward_split_prefill"],
-            device_timer_ctx=lambda *a: contextlib.nullcontext(),
+            run_split_prefill=load_methods(
+                "model_executor/runner_utils/pdmux.py",
+                None,
+                ["run_split_prefill"],
+                device_timer_ctx=lambda *a: contextlib.nullcontext(),
+            )["run_split_prefill"],
         )["forward_split_prefill"]
         # The production method imports CP helpers lazily.
         import sys
@@ -330,20 +389,30 @@ class TestPdmuxPrefillCPState(unittest.TestCase):
 
     def test_prefill_sync_uses_full_cp_group_even_with_dp_attention_flag(self):
         prefill, singleton = object(), object()
-        parallel = NS(enable_dp_attention=True, attn_cp_size=2, attn_tp_group=singleton)
+        parallel = NS(
+            attn_dp_enabled=False,
+            attn_cp_size=2,
+            attn_tp_group=singleton,
+            tp_group=prefill,
+        )
         sync = Mock()
         finalize = load_methods(
             "speculative/dspark_components/dspark_worker_v2.py",
             "DSparkWorkerV2",
             ["_finalize_prefill"],
             get_parallel=lambda: parallel,
-            get_tp_group=lambda: prefill,
+            get_dp_tp_group=load_methods(
+                "layers/dp_attention.py",
+                None,
+                ["get_dp_tp_group"],
+                get_parallel=lambda: parallel,
+            )["get_dp_tp_group"],
             SpecTpSyncSite=NS(DSPARK_TARGET="target"),
         )["_finalize_prefill"]
         output = NS(logits_output=NS(hidden_states=None), next_token_ids=object())
         worker = NS(_target_hidden_projection_enabled=False, _tp_sync=sync)
         with self.assertRaisesRegex(RuntimeError, "aux hidden capture"):
-            finalize(worker, NS(seq_lens=None), output, None)
+            finalize(worker, NS(seq_lens=None), output, None, None)
         sync.sync.assert_called_once_with(
             "target", output.next_token_ids, group=prefill
         )

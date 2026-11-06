@@ -13,7 +13,7 @@ import unittest
 import weakref
 from pathlib import Path
 from types import SimpleNamespace
-from unittest.mock import Mock, patch
+from unittest.mock import MagicMock, Mock, patch
 
 ROOT = Path(__file__).resolve().parents[4]
 SRT = ROOT / "python/sglang/srt"
@@ -79,6 +79,7 @@ class TestPdmuxSxfPort(unittest.TestCase):
                     batch_size=lambda: 1,
                     is_empty=lambda: False,
                     filter_batch=Mock(),
+                    reqs=[object()],
                 )
                 del owner
                 order = []
@@ -97,6 +98,8 @@ class TestPdmuxSxfPort(unittest.TestCase):
                     enable_overlap=False,
                     chunked_req=None,
                     process_batch_result=consume,
+                    prefill_launched_reqs=SimpleNamespace(leave=Mock()),
+                    running_reqs=SimpleNamespace(join=Mock()),
                 )
                 bind(
                     scheduler,
@@ -159,6 +162,7 @@ class TestPdmuxSxfPort(unittest.TestCase):
                 scheduler = SimpleNamespace(
                     split_prefill_batch=None,
                     process_pending_chunked_abort=Mock(),
+                    _process_hicache_events=Mock(),
                     get_new_batch_prefill=Mock(
                         return_value=SimpleNamespace(
                             batch_to_run=None, running_batch=running
@@ -176,30 +180,47 @@ class TestPdmuxSxfPort(unittest.TestCase):
 
     def test_dp_sync_resolves_the_current_lane_group(self):
         prefill_group, decode_group = object(), object()
-        get_group = Mock(side_effect=[prefill_group, decode_group])
-        prepare = Mock(return_value="prepared")
+        parallel = SimpleNamespace(num_dp_ranks=2, attn_tp_size=4, attn_cp_size=1)
+        gather = Mock()
+        info = SimpleNamespace(
+            all_gather=gather,
+            tp0_info_cpu=None,
+            global_num_tokens=[0, 0],
+            sync_wait_seconds=0.0,
+        )
         method = load_methods(
             "managers/scheduler_components/dp_attn.py",
-            "SchedulerDPAttnAdapter",
-            ["prepare_mlp_sync_batch"],
-            prepare_mlp_sync_batch_raw=prepare,
-            get_tp_group=get_group,
-            get_parallel=lambda: SimpleNamespace(dp_size=2, dwdp_size=1),
-            get_schedule=lambda: SimpleNamespace(disable_overlap_schedule=True),
-            cuda_graph_fully_disabled=lambda: False,
-            require_mlp_tp_gather=lambda: True,
-        )["prepare_mlp_sync_batch"]
-        adapter = SimpleNamespace(
-            model_runner=object(),
-            ps=SimpleNamespace(attn_tp_size=4, attn_cp_size=1),
-            get_idle_batch=Mock(),
-            server_args=object(),
-            offload_tags=set(),
-            tp_group=object(),
-        )
+            None,
+            ["prepare_mlp_sync_batch_raw"],
+            get_parallel=lambda: parallel,
+            get_disagg=lambda: SimpleNamespace(enable_pdmux=False),
+            _local_decode_cuda_graph_vote=lambda **kwargs: True,
+            _spec_input_cuda_graph_compatible=lambda batch: True,
+            _local_prefill_cuda_graph_vote=lambda **kwargs: False,
+            check_cuda_graph_backend=lambda *args: False,
+            Phase=SimpleNamespace(PREFILL="prefill"),
+            Backend=SimpleNamespace(BREAKABLE="breakable", FULL="full"),
+            TboDPAttentionPreparer=lambda: SimpleNamespace(
+                prepare_all_gather=lambda batch: (False, 0)
+            ),
+            world_dp_gather_enabled=lambda: False,
+            should_skip_scheduler_all_gather=lambda n: False,
+            MLPSyncBatchInfo=lambda **kwargs: info,
+            _local_attention_pairs=lambda batch: 0,
+            _ENABLE_METRICS_DP_ATTENTION=False,
+        )["prepare_mlp_sync_batch_raw"]
         for group in (prefill_group, decode_group):
-            self.assertEqual(method(adapter, None), "prepared")
-            self.assertIs(prepare.call_args.kwargs["tp_group"], group)
+            parallel.tp_group = SimpleNamespace(device_group=group, device="cuda")
+            method(
+                None,
+                model_runner=SimpleNamespace(spec_algorithm=None, model_config=None),
+                get_idle_batch=Mock(),
+                disable_cuda_graph=False,
+                require_mlp_tp_gather=True,
+                disable_overlap_schedule=True,
+                offload_tags=set(),
+            )
+            self.assertIs(gather.call_args.kwargs["group"], group)
 
     def test_intermediate_split_unpads_even_without_logits(self):
         method = load_methods(
@@ -217,6 +238,7 @@ class TestPdmuxSxfPort(unittest.TestCase):
             positions=[0, 1, 2, 0],
             seq_lens=[1, 2, 0, 0],
             req_pool_indices=[5, 6, 0, 0],
+            req_pool_indices_cpu=[5, 6, 0, 0],
             seq_lens_cpu=[1, 2, 0, 0],
         )
         method(batch, None)
@@ -261,12 +283,14 @@ class TestPdmuxSxfPort(unittest.TestCase):
                         batch.positions = [0] * padded_width
                         batch.seq_lens = [1] * padded_width
                         batch.req_pool_indices = [0] * padded_width
+                        batch.req_pool_indices_cpu = [0] * padded_width
                         batch.seq_lens_cpu = (
                             [1] * padded_width if has_cpu_lengths else None
                         )
                         logits = (
                             SimpleNamespace(
                                 next_token_logits=[[0.0] * 16] * padded_width,
+                                last_hidden_states=None,
                                 hidden_states=[[0.0] * 4] * padded_width,
                             )
                             if has_logits
@@ -300,7 +324,12 @@ class TestPdmuxSxfPort(unittest.TestCase):
             with self.subTest(idle=idle):
                 intermediate = SimpleNamespace(logits_output=None)
                 final = SimpleNamespace(logits_output=object())
+                placement = object()
                 worker = SimpleNamespace(
+                    _deferred_commit=lambda: None,
+                    _kv_injector=SimpleNamespace(
+                        place_prefill=Mock(return_value=placement)
+                    ),
                     target_worker=SimpleNamespace(
                         forward_batch_split_prefill=Mock(
                             side_effect=[intermediate, final]
@@ -326,7 +355,7 @@ class TestPdmuxSxfPort(unittest.TestCase):
                     worker._finalize_prefill.assert_not_called()
                 else:
                     worker._finalize_prefill.assert_called_once_with(
-                        batch, final, on_publish=None
+                        batch, final, None, placement
                     )
 
     def test_dspark_scheduler_proxy_reaches_target_prefill(self):
@@ -338,6 +367,10 @@ class TestPdmuxSxfPort(unittest.TestCase):
         )
         worker = bind(
             SimpleNamespace(
+                _hosts_draft=True,
+                enable_dp_spec_prefill_coordination=False,
+                _deferred_commit=lambda: None,
+                _kv_injector=SimpleNamespace(place_prefill=Mock(return_value=object())),
                 _verify_planner=SimpleNamespace(note_non_decode_step=Mock()),
                 _observers=SimpleNamespace(note_prefill_step=Mock()),
                 target_worker=SimpleNamespace(
@@ -373,7 +406,7 @@ class TestPdmuxSxfPort(unittest.TestCase):
             ["_finalize_prefill"],
             SpecTpSyncSite=SimpleNamespace(DSPARK_TARGET="target"),
             get_parallel=lambda: SimpleNamespace(enable_dp_attention=False),
-            get_tp_group=lambda: None,
+            get_dp_tp_group=lambda: None,
         )["_finalize_prefill"]
         batch = SimpleNamespace(seq_lens=object())
         output = SimpleNamespace(
@@ -387,18 +420,20 @@ class TestPdmuxSxfPort(unittest.TestCase):
                 batch,
                 output,
                 None,
+                object(),
             )
 
     def test_split_dspark_captures_use_current_cp_gather(self):
         stream = object()
-        hidden = Mock()
-        previous_aux, last_aux = object(), object()
-        hidden.mean.return_value = last_aux
+        hidden = MagicMock()
+        packed_aux, capture_slot = object(), object()
+        captures = SimpleNamespace(
+            slot=lambda like: capture_slot, finalize=lambda: packed_aux
+        )
         pre_head, normalized = object(), object()
         hidden.flatten.return_value = pre_head
-        gathered_hidden, gathered_pre_head = object(), object()
-        gathered_aux = [object(), object()]
-        gather = Mock(side_effect=[(gathered_hidden, gathered_pre_head), *gathered_aux])
+        gathered_hidden, gathered_pre_head, gathered_aux = object(), object(), object()
+        gather = Mock(side_effect=[(gathered_hidden, gathered_pre_head), gathered_aux])
         method = load_methods(
             "models/deepseek_v4.py",
             "DeepseekV4Model",
@@ -410,13 +445,21 @@ class TestPdmuxSxfPort(unittest.TestCase):
             Phase=SimpleNamespace(PREFILL="prefill"),
             Backend=SimpleNamespace(TC_PIECEWISE="piecewise"),
             nullcontext=contextlib.nullcontext,
+            _is_cuda=True,
+            residual_batch=SimpleNamespace(
+                read_output=lambda *args: hidden, clear=lambda batch: None
+            ),
+            hc_boundary=SimpleNamespace(
+                materialize=lambda *args, **kwargs: hidden, FinalRead=lambda: None
+            ),
         )["forward_split_prefill"]
-        layer = Mock(return_value=(hidden, None, None, None))
+        layer = Mock(return_value=hidden)
         model = SimpleNamespace(
             layers=[None, layer],
             end_layer=2,
             dspark_layers_to_capture=[0, 1],
             use_fused_mhc_post_pre=False,
+            hc_pre_from_prev_sublayer=False,
             hc_head=Mock(return_value=hidden),
             hc_head_fn=None,
             hc_head_scale=None,
@@ -432,20 +475,84 @@ class TestPdmuxSxfPort(unittest.TestCase):
                 positions=object(),
                 input_ids=object(),
                 input_ids_global=object(),
-                dspark_aux_hidden_states=[previous_aux],
+                dspark_aux_hidden_states=captures,
             ),
         )
-        result, captures = method(model, None, None, batch, (1, 2))
+        mhc = types.ModuleType("sglang.kernels.ops.layernorm.mhc")
+        mhc.mhc_stream_mean = Mock()
+        with patch.dict("sys.modules", {mhc.__name__: mhc}):
+            result, captures = method(model, None, None, batch, (1, 2))
         self.assertEqual(result, (gathered_hidden, gathered_pre_head))
-        self.assertEqual(captures, gathered_aux)
+        self.assertIs(captures, gathered_aux)
         self.assertEqual(
             [call.args for call in gather.call_args_list],
-            [
-                ((normalized, pre_head), batch, stream),
-                (previous_aux, batch, stream),
-                (last_aux, batch, stream),
-            ],
+            [((normalized, pre_head), batch, stream), (packed_aux, batch, stream)],
         )
+
+    def test_split_prefill_keeps_cuda_residual_state_across_segments(self):
+        """Yielding a split must retain the residual update owed by its last layer."""
+
+        class Hidden:
+            def unsqueeze(self, dim):
+                return self
+
+            def repeat(self, *shape):
+                return self
+
+            def flatten(self, dim):
+                return self
+
+        hidden = Hidden()
+        batch = SimpleNamespace(residual_stream=None)
+
+        def start(batch):
+            batch.residual_stream = []
+
+        def layer(*, hidden_states, forward_batch, **kwargs):
+            forward_batch.residual_stream.append(hidden_states)
+            return hidden_states
+
+        def read_output(value, batch, *args):
+            self.assertEqual(batch.residual_stream, [hidden, hidden])
+            return value
+
+        residual = SimpleNamespace(
+            start=start,
+            read_output=read_output,
+            clear=lambda batch: setattr(batch, "residual_stream", None),
+        )
+        method = load_methods(
+            "models/deepseek_v4.py",
+            "DeepseekV4Model",
+            ["forward_split_prefill"],
+            _is_cuda=True,
+            residual_batch=residual,
+            hc_boundary=SimpleNamespace(FinalRead=lambda: None),
+            get_parallel=lambda: SimpleNamespace(attn_dp_size=1),
+            is_cp_active=lambda batch: False,
+            check_cuda_graph_backend=lambda *args: True,
+            Phase=SimpleNamespace(PREFILL="prefill"),
+            Backend=SimpleNamespace(TC_PIECEWISE="piecewise"),
+            nullcontext=contextlib.nullcontext,
+        )["forward_split_prefill"]
+        model = SimpleNamespace(
+            layers=[layer, layer],
+            end_layer=2,
+            hc_mult=4,
+            embed_tokens=lambda ids: hidden,
+            dspark_layers_to_capture=None,
+            use_fused_mhc_post_pre=True,
+            hc_pre_from_prev_sublayer=False,
+            hc_head=lambda value, *args: value,
+            hc_head_fn=None,
+            hc_head_scale=None,
+            hc_head_base=None,
+            norm=lambda value: value,
+        )
+        self.assertIsNone(method(model, None, None, batch, (0, 1)))
+        self.assertEqual(batch.residual_stream, [hidden])
+        self.assertEqual(method(model, None, None, batch, (1, 2)), (hidden, hidden))
+        self.assertIsNone(batch.residual_stream)
 
     def test_standard_accepts_dp_and_retains_other_parallelism_guards(self):
         backend_module = types.ModuleType("sglang.srt.model_executor.cuda_graph_config")

@@ -12,6 +12,7 @@ import time
 from dataclasses import replace
 from pathlib import Path
 from types import SimpleNamespace
+from typing import Optional
 from unittest.mock import patch
 
 
@@ -100,7 +101,10 @@ def main():
     from sglang.kernels.ops.attention.dsv4.logits_budget import (
         paged_logits_rows_per_chunk,
     )
-    from sglang.srt.layers.attention.dsv4.metadata import PagedIndexerMetadata
+    from sglang.srt.layers.attention.dsv4.metadata import (
+        PagedIndexerMetadata,
+        iter_row_chunks,
+    )
 
     if not torch.cuda.is_available() or torch.version.hip:
         raise RuntimeError("Requires NVIDIA CUDA and the deployment's DeepGEMM build")
@@ -177,6 +181,8 @@ def main():
             topk_transform_paged=topk_transform_paged,
             topk_transform_paged_v2=topk_transform_paged_v2,
             is_pdmux_enabled=lambda: True,
+            Optional=Optional,
+            iter_row_chunks=iter_row_chunks,
             self=SimpleNamespace(
                 dsa_topk_backend=SimpleNamespace(
                     is_torch=lambda: False,

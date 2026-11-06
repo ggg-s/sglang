@@ -188,6 +188,7 @@ class TicketTests(unittest.TestCase):
             for name in names
         }
         self.relay = r = type("Relay", (), methods)()
+        r._relay = None
         r.device = d
         r.needs_cpu_seq_lens = True
         r.needs_confidence_relay = False
@@ -311,6 +312,7 @@ class ModeTests(unittest.TestCase):
         namespace = dict(
             envs=NS(SGLANG_PDMUX_DECODE_READY=NS(get=lambda: mode)),
             is_cuda=lambda: overrides.pop("cuda", True),
+            get_parallel=lambda: scheduler.ps,
             logger=Mock(),
         )
         exec(
@@ -406,6 +408,7 @@ class DispatcherTests(unittest.TestCase):
             NVTX_SCHEDULER_ENABLED=False,
             profile_range=lambda *a, **kw: contextlib.nullcontext(),
             get_current_stream_idx=lambda: 0 if temporal_layers else 1,
+            get_parallel=lambda: s.ps,
             set_pdmux_status=lambda _: None,
             publish_carried_tensors=lambda *a: None,
             dist=NS(ReduceOp=NS(SUM="sum")),

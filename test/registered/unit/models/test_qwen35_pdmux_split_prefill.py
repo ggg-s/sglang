@@ -33,11 +33,25 @@ fun = next(
 )
 fun.decorator_list = []
 
+
+def start_residual(batch):
+    batch.residual_stream = None
+
+
+def final_norm(hidden, batch, norm, *, skip_empty):
+    residual, batch.residual_stream = batch.residual_stream, None
+    return hidden if skip_empty and hidden.shape[0] == 0 else norm(hidden, residual)[0]
+
+
 ns = {
     "torch": torch,
     "Tuple": Tuple,
     "Optional": Optional,
     "ForwardBatch": object,
+    "residual_batch": types.SimpleNamespace(
+        start=start_residual, final_norm=final_norm
+    ),
+    "AuxHiddenStateList": list,
     "envs": types.SimpleNamespace(
         SGLANG_QWEN35_NATIVE_FINAL_NORM=types.SimpleNamespace(get=lambda: False)
     ),
@@ -65,11 +79,11 @@ class SplitTests(CustomTestCase):
             def go(
                 positions,
                 hidden_states,
-                residual,
                 forward_batch,
                 captured_last_layer_outputs=None,
             ):
                 calls.append((i, positions.clone()))
+                residual = forward_batch.residual_stream
                 if captured_last_layer_outputs is not None:
                     captured_last_layer_outputs.append(
                         hidden_states.clone()
@@ -77,10 +91,8 @@ class SplitTests(CustomTestCase):
                         else hidden_states + residual
                     )
                 r = hidden_states if residual is None else residual + hidden_states
-                return (
-                    torch.tanh(hidden_states * (i + 1) + positions[:, None] * 0.01),
-                    r,
-                )
+                forward_batch.residual_stream = r
+                return torch.tanh(hidden_states * (i + 1) + positions[:, None] * 0.01)
 
             return go
 
@@ -105,7 +117,7 @@ class SplitTests(CustomTestCase):
         batch = types.SimpleNamespace(
             mm_inputs=None,
             spec_info=None,
-            residual=torch.ones(3, 2),
+            residual_stream=None,
             mrope_positions=torch.arange(3.0) + 5,
         )
         return (obj, batch, calls)
@@ -116,10 +128,9 @@ class SplitTests(CustomTestCase):
         for step in [1, 2, 3, 4]:
             (o, b, calls) = self.fixture()
             h = o.model.embed_tokens(ids)
-            r = None
             for layer in o.model.layers:
-                (h, r) = layer(positions, h, r, b)
-            expected = o.model.norm(h, r)[0]
+                h = layer(positions, h, b)
+            expected = o.model.norm(h, b.residual_stream)[0]
             calls.clear()
             for a in range(0, 4, step):
                 out = run(o, ids, positions, b, (a, min(a + step, 4)))
@@ -127,6 +138,7 @@ class SplitTests(CustomTestCase):
                     self.assertIsNone(out)
             torch.testing.assert_close(out, expected)
             self.assertEqual([x[0] for x in calls], list(range(4)))
+            self.assertIsNone(b.residual_stream)
 
     def test_mrope_positions_are_preserved(self):
         (o, b, calls) = self.fixture()
@@ -154,23 +166,24 @@ class SplitTests(CustomTestCase):
         o.capture_aux_hidden_states = True
         for index in (1, 3):
             o.model.layers[index]._is_layer_to_capture = True
-        h, residual = o.model.embed_tokens(ids), None
+        h = o.model.embed_tokens(ids)
         expected = []
         for layer in o.model.layers:
-            h, residual = layer(
+            h = layer(
                 positions,
                 h,
-                residual,
                 first,
                 captured_last_layer_outputs=expected
                 if getattr(layer, "_is_layer_to_capture", False)
                 else None,
             )
+        expected_hidden = o.model.norm(h, first.residual_stream)[0]
         run(o, ids, positions, first, (0, 2))
         _, second, _ = self.fixture()
         run(o, ids + 10, positions, second, (0, 4))
         result, features = run(o, ids, positions, first, (2, 4))
-        torch.testing.assert_close(result, o.model.norm(h, residual)[0])
+        torch.testing.assert_close(result, expected_hidden)
+        self.assertIsNone(first.residual_stream)
         self.assertEqual(len(features), 2)
         for actual, reference in zip(features, expected):
             torch.testing.assert_close(actual, reference)

@@ -65,6 +65,11 @@ class PDMuxDraftCudaGraphRunner:
                     # draft_forward publishes the worker's per-step backends.
                     worker.draft_attn_backend = backend
                     kwargs = {"draft_attn_backend": backend}
+                runner_ids = worker.draft_runner.runner_ids
+                backends = [backend]
+                if not draft_extend:
+                    backends.extend(backend.attn_backends)
+                runner_ids.bind_and_verify_backends(backends)
                 runner = runner_cls(worker, capture_stream=decode_stream, **kwargs)
                 self.runners.append(runner)
                 logger.info(

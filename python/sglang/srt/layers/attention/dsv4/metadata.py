@@ -1,8 +1,9 @@
 from __future__ import annotations
 
+import logging
 import warnings
 from dataclasses import dataclass, field, fields, replace
-from typing import Any, List, Optional
+from typing import Any, Iterator, List, Optional
 
 import torch
 
@@ -11,7 +12,23 @@ from sglang.kernels.ops.attention.dsv4.logits_budget import (
     paged_logits_rows_per_chunk,
 )
 from sglang.srt.environ import envs
+from sglang.srt.layers.attention.mqa_logits_utils import (
+    mqa_logits_budget_bytes,
+    mqa_logits_needs_budget_check,
+    mqa_logits_row_bytes,
+    mqa_logits_rows_per_chunk,
+    mqa_logits_should_chunk,
+)
+from sglang.srt.model_executor.runner_backend_utils.breakable_cuda_graph.context import (
+    is_in_breakable_cuda_graph,
+)
+from sglang.srt.model_executor.runner_backend_utils.tc_piecewise_cuda_graph import (
+    is_in_tc_piecewise_cuda_graph,
+)
+from sglang.srt.model_executor.runner_utils.capture_mode import get_is_capture_mode
 from sglang.srt.utils import is_hip, is_sm120_supported, is_xpu
+
+logger = logging.getLogger(__name__)
 
 _IS_SM120 = is_sm120_supported()
 
@@ -52,7 +69,55 @@ Some other notes:
 """
 _LARGE_INDEXER_QUERY_THRESHOLD = 11673
 
+# DeepGEMM's paged-MQA metadata kernel cannot schedule more rows than this on
+# SM120 (shared-memory cap), so SM120 always splits larger batches.
 _SM120_INDEXER_M_CHUNK = 4096
+
+
+def plan_indexer_row_chunks(
+    *,
+    num_rows: int,
+    num_cols: int,
+    budget_bytes: Optional[int],
+    sm120_row_cap: Optional[int],
+) -> Optional[int]:
+    """Query rows per paged-indexer chunk; None runs the whole batch in one call.
+
+    The fp32 logits are [num_rows, num_cols] per layer, so the chunk is the
+    smaller of the SM120 kernel cap and what the memory budget allows.
+    """
+    rows_per_chunk = None
+    if sm120_row_cap is not None and num_rows > sm120_row_cap:
+        rows_per_chunk = sm120_row_cap
+    if budget_bytes is not None:
+        need_chunk, budget_bytes = mqa_logits_should_chunk(
+            num_rows=num_rows,
+            num_cols=num_cols,
+            get_budget_bytes=lambda: budget_bytes,
+            rocm=is_hip(),
+        )
+        by_budget = (
+            mqa_logits_rows_per_chunk(
+                num_rows=num_rows,
+                row_bytes=mqa_logits_row_bytes(num_cols),
+                budget_bytes=budget_bytes,
+            )
+            if need_chunk
+            else None
+        )
+        if by_budget is not None:
+            rows_per_chunk = (
+                by_budget if rows_per_chunk is None else min(rows_per_chunk, by_budget)
+            )
+    return rows_per_chunk
+
+
+def iter_row_chunks(*, num_rows: int, rows_per_chunk: Optional[int]) -> Iterator[slice]:
+    if rows_per_chunk is None or rows_per_chunk >= num_rows:
+        yield slice(0, num_rows)
+        return
+    for start in range(0, num_rows, rows_per_chunk):
+        yield slice(start, min(start + rows_per_chunk, num_rows))
 
 
 def copy_metadata(
@@ -79,8 +144,7 @@ def copy_metadata(
         if hasattr(dst_val, "copy_"):
             dst_val.copy_(src_val)
         elif isinstance(dst_val, list) and isinstance(src_val, list):
-            # Captured kernels retain these tensor addresses. Rebinding a list
-            # leaves graph replays reading the previous forward's plans.
+            # Captured kernels retain each schedule's tensor address.
             assert len(dst_val) == len(src_val), f"{field_name}: chunk count changed"
             for dst_item, src_item in zip(dst_val, src_val):
                 dst_item.copy_(src_item)
@@ -105,6 +169,11 @@ def copy_metadata(
     )
 
 
+DEEP_GEMM_VARLEN_MIN_ROWS = 96
+# DeepGEMM 0.2.6 varlen paged MQA scheduler: (2 * rows + 33) * 4 B of smem <= 232448
+DEEP_GEMM_VARLEN_MAX_ROWS = 29039
+
+
 @dataclass
 class NonPagedIndexerPlan:
     page_table: torch.Tensor
@@ -115,6 +184,8 @@ class NonPagedIndexerPlan:
     max_seq_len: int
     max_seqlen_k: int
     query_rows: int
+    # None runs all query rows in one fp8_mqa_logits call.
+    rows_per_chunk: Optional[int] = None
 
 
 @dataclass
@@ -127,15 +198,29 @@ class PagedIndexerMetadata:
     force_deep_gemm_metadata: bool = False
     use_prefill_cuda_graph: bool = False
     is_prefill: bool = False
-    logits_chunk_rows: int = field(init=False, default=0)
-    chunk_topk_metadata: Optional[List[torch.Tensor]] = field(
-        init=False, repr=False, default=None
-    )
+    # Indexer source compression ratio: 4 for c4, 1 or 2 for the dsv41 sources.
+    compress_ratio: int = 4
+    rows_per_request: int = 1
+    # Schedule DeepGEMM's current paged API: varlen rows grouped by request indices.
+    deep_gemm_varlen: bool = False
+    # A list when the dynamic-budget forward is row-chunked: one schedule per chunk.
     deep_gemm_metadata: Any = field(init=False, repr=False)
+    # The request of each query row of a chunk (all rows if unchunked) when the
+    # schedule is varlen, else None; a shorter last chunk takes its prefix.
+    deep_gemm_indices: Any = field(init=False, repr=False, default=None)
     topk_metadata: torch.Tensor = field(init=False, repr=False)
     nonpaged_plan: Optional[NonPagedIndexerPlan] = field(
         init=False, repr=False, default=None
     )
+    # Decided once per forward and shared by every layer's indexer call.
+    rows_per_chunk: Optional[int] = field(init=False, repr=False, default=None)
+    mqa_logits_budget_bytes: Optional[int] = field(init=False, repr=False, default=None)
+    # The top-k v2 plan routes rows by index within the batch it was built for,
+    # so a row-chunked forward needs one plan per chunk.
+    topk_metadata_chunks: Optional[List[torch.Tensor]] = field(
+        init=False, repr=False, default=None
+    )
+
     _aligned_query_cache: dict[int, PagedIndexerMetadata] = field(
         init=False, repr=False, compare=False, default_factory=dict
     )
@@ -148,9 +233,13 @@ class PagedIndexerMetadata:
         else:
             import deep_gemm
 
-            use_jit_indexer = not self.force_deep_gemm_metadata and (
-                envs.SGLANG_OPT_USE_JIT_INDEXER_METADATA.get()
-                or self.compressed_seq_lens.numel() > _LARGE_INDEXER_QUERY_THRESHOLD
+            use_jit_indexer = (
+                not self.force_deep_gemm_metadata
+                and self.rows_per_request == 1
+                and (
+                    envs.SGLANG_OPT_USE_JIT_INDEXER_METADATA.get()
+                    or self.compressed_seq_lens.numel() > _LARGE_INDEXER_QUERY_THRESHOLD
+                )
             )
             if use_jit_indexer:
                 from sglang.kernels.ops.attention.dsv4 import (
@@ -163,33 +252,80 @@ class PagedIndexerMetadata:
             if compressed_seq_lens.dim() == 1:
                 compressed_seq_lens = compressed_seq_lens.unsqueeze(-1)
             num_rows = compressed_seq_lens.shape[0]
-            chunk_rows = max(1, num_rows)
-            if self.is_prefill and not self.use_prefill_cuda_graph:
-                chunk_rows = min(
-                    chunk_rows,
-                    paged_logits_rows_per_chunk(
-                        self.max_compressed_seq_len, indexer_logits_budget_bytes()
-                    ),
+            group = self.rows_per_request
+            if group > 1:
+                assert compressed_seq_lens.shape[1] == 1 and num_rows % group == 0, (
+                    f"{num_rows} query rows do not group by {group}"
                 )
-            if _IS_SM120:
-                chunk_rows = min(chunk_rows, _SM120_INDEXER_M_CHUNK)
-            self.logits_chunk_rows = chunk_rows if num_rows > chunk_rows else 0
-            if num_rows > chunk_rows:
-                # Chunk metadata is shared by all indexer layers in this forward.
-                self.deep_gemm_metadata = [
-                    get_paged_mqa_logits_metadata(
-                        compressed_seq_lens[_s : _s + chunk_rows],
+            self.mqa_logits_budget_bytes = self._mqa_logits_budget(num_rows=num_rows)
+            self.rows_per_chunk = plan_indexer_row_chunks(
+                num_rows=num_rows,
+                num_cols=self.max_compressed_seq_len,
+                budget_bytes=self.mqa_logits_budget_bytes,
+                sm120_row_cap=_SM120_INDEXER_M_CHUNK if _IS_SM120 else None,
+            )
+            if self.is_prefill and not self.use_prefill_cuda_graph:
+                # Keep PDMux's per-lane cap independent of transient memory on
+                # the concurrent lane and limit the allocator's row variants.
+                static_rows = paged_logits_rows_per_chunk(
+                    self.max_compressed_seq_len, indexer_logits_budget_bytes()
+                )
+                if num_rows > static_rows:
+                    self.rows_per_chunk = min(
+                        self.rows_per_chunk or num_rows, static_rows
+                    )
+            if self.rows_per_chunk is not None and group > 1:
+                self.rows_per_chunk = max(group, self.rows_per_chunk // group * group)
+            if self.rows_per_chunk is not None:
+                logger.debug(
+                    "DSV4 indexer chunks %d query rows x %d compressed cols into "
+                    "%d-row chunks (logits budget %s bytes)",
+                    num_rows,
+                    self.max_compressed_seq_len,
+                    self.rows_per_chunk,
+                    self.mqa_logits_budget_bytes,
+                )
+            varlen = (
+                self.deep_gemm_varlen
+                and not use_jit_indexer
+                and num_rows >= DEEP_GEMM_VARLEN_MIN_ROWS
+                and (self.rows_per_chunk or num_rows) <= DEEP_GEMM_VARLEN_MAX_ROWS
+            )
+            if varlen:
+                assert compressed_seq_lens.shape[1] == 1, compressed_seq_lens.shape
+                self.deep_gemm_indices = (
+                    torch.arange(
+                        self.rows_per_chunk or num_rows,
+                        dtype=torch.int32,
+                        device=compressed_seq_lens.device,
+                    )
+                    // group
+                )
+
+            def schedule(lens: torch.Tensor):
+                if varlen:
+                    return get_paged_mqa_logits_metadata(
+                        lens.view(-1, 1),
                         self.compressed_page_size,
                         deep_gemm.get_num_sms(),
+                        self.deep_gemm_indices[: lens.shape[0]],
                     )
-                    for _s in range(0, num_rows, chunk_rows)
-                ]
-            else:
-                self.deep_gemm_metadata = get_paged_mqa_logits_metadata(
-                    compressed_seq_lens,
+                return get_paged_mqa_logits_metadata(
+                    lens.view(-1, group),
                     self.compressed_page_size,
                     deep_gemm.get_num_sms(),
                 )
+
+            if self.rows_per_chunk is not None:
+                # Chunk metadata is shared by all indexer layers in this forward.
+                self.deep_gemm_metadata = [
+                    schedule(compressed_seq_lens[rows])
+                    for rows in iter_row_chunks(
+                        num_rows=num_rows, rows_per_chunk=self.rows_per_chunk
+                    )
+                ]
+            else:
+                self.deep_gemm_metadata = schedule(compressed_seq_lens)
 
             assert isinstance(self.deep_gemm_metadata, (torch.Tensor, list))
 
@@ -197,19 +333,50 @@ class PagedIndexerMetadata:
             from sglang.kernels.ops.attention.dsv4 import plan_topk_v2
 
             self.topk_metadata = plan_topk_v2(self.compressed_seq_lens)
-            if isinstance(self.deep_gemm_metadata, list):
-                self.chunk_topk_metadata = [
-                    plan_topk_v2(
-                        self.compressed_seq_lens[start : start + self.logits_chunk_rows]
-                    )
-                    for start in range(
-                        0, self.compressed_seq_lens.shape[0], self.logits_chunk_rows
+            if self.rows_per_chunk is not None:
+                self.topk_metadata_chunks = [
+                    plan_topk_v2(self.compressed_seq_lens[rows])
+                    for rows in iter_row_chunks(
+                        num_rows=self.compressed_seq_lens.shape[0],
+                        rows_per_chunk=self.rows_per_chunk,
                     )
                 ]
         else:
             self.topk_metadata = torch.empty((0,))
 
         assert self.page_size == 256, "the system hardcodes page_size=256"
+        assert self.page_size % self.compress_ratio == 0, (
+            f"compress_ratio {self.compress_ratio} must divide page_size {self.page_size}"
+        )
+
+    def _mqa_logits_budget(self, *, num_rows: int) -> Optional[int]:
+        """Free-memory budget for this forward's logits; None disables chunking.
+
+        Graph-backed forwards keep a single call: their shapes are fixed at
+        capture and the free-memory read would sync the host mid-capture.
+        """
+        if (
+            self.is_prefill
+            or self.use_prefill_cuda_graph
+            or not self.compressed_seq_lens.is_cuda
+        ):
+            # Eager PDMux prefill uses the static cap applied in __post_init__;
+            # a free-memory query would synchronize the overlapping decode lane.
+            return None
+        if not mqa_logits_needs_budget_check(
+            num_rows=num_rows, num_cols=self.max_compressed_seq_len
+        ):
+            return None
+        if (
+            get_is_capture_mode()
+            or torch.cuda.is_current_stream_capturing()
+            or is_in_breakable_cuda_graph()
+            or is_in_tc_piecewise_cuda_graph()
+        ):
+            return None
+        return mqa_logits_budget_bytes(
+            device_index=self.compressed_seq_lens.device.index, allow_sync=True
+        )
 
     @property
     def max_seq_len(self) -> int:
@@ -249,33 +416,80 @@ class PagedIndexerMetadata:
             )
         return self._aligned_query_cache[query_rows]
 
-    def copy_(self, other: PagedIndexerMetadata):
-        if is_hip():
-            copy_fields = ["page_table", "compressed_seq_lens"]
-            assign_fields = ["deep_gemm_metadata", "nonpaged_plan"]
+    def row_chunks(self):
+        num_rows = self.compressed_seq_lens.shape[0]
+        if isinstance(self.deep_gemm_metadata, list):
+            assert self.rows_per_chunk is not None, (
+                "chunked DeepGEMM metadata requires rows_per_chunk"
+            )
+            rows_per_chunk = self.rows_per_chunk
         else:
-            copy_fields = ["page_table", "compressed_seq_lens", "deep_gemm_metadata"]
+            return [(slice(0, num_rows), self.deep_gemm_metadata)]
+
+        chunks = [
+            (slice(start, min(start + rows_per_chunk, num_rows)), plan)
+            for start, plan in zip(
+                range(0, num_rows, rows_per_chunk), self.deep_gemm_metadata
+            )
+        ]
+        assert chunks and chunks[-1][0].stop == num_rows, (
+            f"chunk schedules do not cover all rows: {num_rows=} {rows_per_chunk=} "
+            f"{len(chunks)=}"
+        )
+        return chunks
+
+    def copy_(self, other: PagedIndexerMetadata):
+        # A chunked schedule list has no in-place copy; rebind it instead.
+        chunked = isinstance(self.deep_gemm_metadata, list) or isinstance(
+            other.deep_gemm_metadata, list
+        )
+        same_chunk_layout = (
+            isinstance(self.deep_gemm_metadata, list)
+            and isinstance(other.deep_gemm_metadata, list)
+            and len(self.deep_gemm_metadata) == len(other.deep_gemm_metadata)
+        )
+        if self.use_prefill_cuda_graph and chunked:
+            assert same_chunk_layout, "captured indexer chunk count changed"
+        if is_hip() or (chunked and not same_chunk_layout):
+            copy_fields = ["page_table", "compressed_seq_lens"]
+            assign_fields = ["deep_gemm_metadata", "deep_gemm_indices", "nonpaged_plan"]
+        else:
+            copy_fields = [
+                "page_table",
+                "compressed_seq_lens",
+                "deep_gemm_metadata",
+                "deep_gemm_indices",
+            ]
             assign_fields = ["nonpaged_plan"]
-        copy_fields += ["topk_metadata", "chunk_topk_metadata"]
-        assign_fields += ["_aligned_query_cache"]
+        copy_fields += ["topk_metadata"]
+        if same_chunk_layout:
+            copy_fields += ["topk_metadata_chunks"]
+        else:
+            assign_fields += ["topk_metadata_chunks"]
+        assign_fields += [
+            "rows_per_chunk",
+            "mqa_logits_budget_bytes",
+            "_aligned_query_cache",
+        ]
         copy_metadata(
             src=other,
             dst=self,
             check_eq_fields=[
                 "page_size",
                 "compressed_page_size",
+                "compress_ratio",
                 "force_deep_gemm_metadata",
                 "use_prefill_cuda_graph",
-                "use_topk_v2",
                 "is_prefill",
-                "logits_chunk_rows",
+                "use_topk_v2",
+                "rows_per_request",
+                "deep_gemm_varlen",
             ],
             copy_fields=copy_fields,
             assign_fields=assign_fields,
         )
         self.nonpaged_plan = None
-        # copy_ refreshes this object for another forward. Never reuse (or
-        # clear in place) the source forward's derived alignment cache.
+        # A refreshed forward cannot reuse the previous forward's plans.
         self._aligned_query_cache = {}
 
 
@@ -283,3 +497,40 @@ def maybe_copy_inplace(dst, *, src) -> None:
     assert type(src) == type(dst)
     if dst is not None:
         dst.copy_(src)
+
+
+def expand_index_page_table(
+    page_table: torch.Tensor,
+    *,
+    full_page_size: int,
+    compress_ratio: int,
+    index_page_size: int,
+) -> torch.Tensor:
+    """Block table of a low-ratio indexer-K pool, which pages at `index_page_size`
+    slots: [bs, n] -> [bs, n * blocks_per_page] int32. The kernel reads compressed
+    slot j at page_table[b, j // index_page_size] * index_page_size + j %
+    index_page_size, which after this expansion is the c1/c2 pool slot of the same
+    position."""
+    slots_per_page = full_page_size // compress_ratio
+    assert slots_per_page % index_page_size == 0, (
+        f"{full_page_size = } / {compress_ratio = } must be a multiple of "
+        f"{index_page_size = }"
+    )
+    blocks_per_page = slots_per_page // index_page_size
+    if blocks_per_page == 1:
+        return page_table
+    if (
+        page_table.is_cuda
+        and page_table.stride(1) == 1
+        and blocks_per_page & (blocks_per_page - 1) == 0
+    ):
+        from sglang.kernels.ops.attention.dsv4.attn_glue_hip import (
+            expand_index_page_table as expand_index_page_table_triton,
+        )
+
+        return expand_index_page_table_triton(page_table, blocks_per_page)
+    bs, n = page_table.shape
+    base = page_table.to(torch.int64) * blocks_per_page
+    offsets = torch.arange(blocks_per_page, device=page_table.device, dtype=torch.int64)
+    expanded = base.unsqueeze(-1) + offsets  # [bs, n, blocks_per_page]
+    return expanded.reshape(bs, n * blocks_per_page).to(torch.int32)

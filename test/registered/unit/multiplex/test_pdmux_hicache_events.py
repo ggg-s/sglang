@@ -21,6 +21,8 @@ import unittest
 from types import SimpleNamespace
 from unittest.mock import Mock, patch
 
+from sglang.srt.runtime_context import get_context
+
 from sglang.srt.multiplex.multiplexing_mixin import SchedulerMultiplexMixin
 from sglang.test.ci.ci_register import register_cpu_ci
 from sglang.test.test_utils import CustomTestCase
@@ -90,6 +92,7 @@ class _SplitBatch:
         self.split_forward_count = 0
         self.split_prefill_finished = False
         self.chunked_req = None
+        self.reqs = []
         self.forward_mode = SimpleNamespace(is_idle=lambda: False)
         self.hicache_consumer_index = CONSUMER_INDEX
 
@@ -99,7 +102,7 @@ class _SplitBatch:
     def batch_size(self):
         return 1
 
-    def filter_batch(self, chunked_req_to_exclude=None):
+    def filter_batch(self, reqs_to_exclude=None):
         pass
 
 
@@ -122,6 +125,8 @@ class _FakeScheduler(SchedulerMultiplexMixin):
             allreduce=lambda tensor, op: SimpleNamespace(wait=lambda: None)
         )
         self.tree_cache = Mock()
+        self.prefill_launched_reqs = Mock()
+        self.running_reqs = Mock()
         self.pdmux_standard = False
         self.draft_worker = None
         self.spec_algorithm = SimpleNamespace(is_none=lambda: True)
@@ -158,10 +163,12 @@ class _FakeScheduler(SchedulerMultiplexMixin):
     def process_pending_chunked_abort(self):
         pass
 
+    def _process_hicache_events(self):
+        self.check_hicache_events_if_enabled()
+
     def get_new_batch_prefill(self, running_batch):
         # Stands in for `_get_new_batch_prefill_raw`, whose first act is to pump
         # HiCache events. Formation admits one request, then finds none.
-        self.check_hicache_events_if_enabled()
         batch, self.pending_split_batch = self.pending_split_batch, None
         return SimpleNamespace(batch_to_run=batch, running_batch=running_batch)
 
@@ -192,6 +199,7 @@ class _FakeScheduler(SchedulerMultiplexMixin):
 @contextlib.contextmanager
 def _stubbed_cuda():
     with (
+        get_context().override_server_args(tp_size=1, enable_pdmux=True),
         patch("torch.cuda.stream", lambda _stream: contextlib.nullcontext()),
         patch("torch.cuda.empty_cache", lambda: None),
         patch(

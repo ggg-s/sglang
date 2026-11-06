@@ -16,7 +16,7 @@ from torch.cuda.streams import ExternalStream
 
 from sglang.srt.distributed.parallel_state import set_pdmux_status
 from sglang.srt.environ import envs
-from sglang.srt.model_executor.forward_batch_info import ForwardMode
+from sglang.srt.model_executor.forward_mode import ForwardMode
 from sglang.srt.multiplex.pdmux_context import (
     get_current_stream_idx,
     get_sm_counts,
@@ -26,7 +26,7 @@ from sglang.srt.multiplex.pdmux_context import (
     set_current_stream_idx,
 )
 from sglang.srt.multiplex.pdmux_tensor_lifetime import publish_carried_tensors
-from sglang.srt.runtime_context import get_disagg
+from sglang.srt.runtime_context import get_device, get_disagg, get_parallel
 from sglang.srt.utils.nvtx_utils import NVTX_SCHEDULER_ENABLED, profile_range
 
 if TYPE_CHECKING:
@@ -82,7 +82,7 @@ class SchedulerMultiplexMixin:
         # needs nor should consume the prefill green context's partition, and
         # keeping it off the decode stream stops the copy from queueing behind
         # a decode step.
-        self.pdmux_prefill_copy_stream = torch.cuda.Stream(self.ps.gpu_id)
+        self.pdmux_prefill_copy_stream = torch.cuda.Stream(get_device().gpu_id)
         self.pdmux_prefill_copy_stream_ctx = torch.cuda.stream(
             self.pdmux_prefill_copy_stream
         )
@@ -110,7 +110,10 @@ class SchedulerMultiplexMixin:
                 and self.enable_overlap
                 and not self.pdmux_standard
                 and (self.spec_algorithm.is_dflash() or self.spec_algorithm.is_none())
-                and self.ps.tp_size == self.ps.pp_size == self.ps.attn_dp_size == 1
+                and get_parallel().tp_size
+                == get_parallel().pp_size
+                == get_parallel().attn_dp_size
+                == 1
                 and envs.SGLANG_PDMUX_DECODE_READY.get() == "off"
             ):
                 raise ValueError(
@@ -119,10 +122,8 @@ class SchedulerMultiplexMixin:
                     "decode-ready=off"
                 )
             if self.pdmux_temporal_adaptive and not self.spec_algorithm.is_dflash():
-                raise ValueError(
-                    "Adaptive temporal PDMux requires DFlash speculation."
-                )
-        initialize_stream_groups(self.ps.gpu_id, self.pdmux_config)
+                raise ValueError("Adaptive temporal PDMux requires DFlash speculation.")
+        initialize_stream_groups(get_device().gpu_id, self.pdmux_config)
         self.stream_groups = get_stream_groups()
         self.sm_counts = get_sm_counts()
         self.real_sm_group_num = len(self.stream_groups)
@@ -250,7 +251,7 @@ class SchedulerMultiplexMixin:
             # The adapter returns None only when the synchronized batch is
             # empty globally; no second emptiness vote is needed.
             decode_bs = 0
-        elif counts is not None and len(counts) == self.ps.attn_dp_size:
+        elif counts is not None and len(counts) == get_parallel().attn_dp_size:
             decode_bs = max(counts)
         else:
             # Local-only metadata (e.g. an A2A backend) cannot select a global
@@ -265,7 +266,7 @@ class SchedulerMultiplexMixin:
         )
 
     def _check_pdmux_dp_graph_capability(self):
-        if self.ps.attn_dp_size <= 1:
+        if get_parallel().attn_dp_size <= 1:
             return
         runner = self.tp_worker.model_runner.decode_cuda_graph_runner
         local = (
@@ -288,6 +289,7 @@ class SchedulerMultiplexMixin:
         # "top of the scheduling step" safe point for tearing down an aborted
         # chunked request before its next chunk is formed.
         self.process_pending_chunked_abort()
+        self._process_hicache_events()
 
         # add new request
         prefill_plan = self.get_new_batch_prefill(running_batch)
@@ -338,17 +340,19 @@ class SchedulerMultiplexMixin:
                 count = min(count, max_layers)
             return count
 
-        if self.ps.attn_dp_size > 1:
+        if get_parallel().attn_dp_size > 1:
             prefill_tokens = self.split_prefill_batch.global_num_tokens
             decode_tokens = (
                 decode_batch.global_num_tokens
                 if decode_batch is not None
-                else [0] * self.ps.attn_dp_size
+                else [0] * get_parallel().attn_dp_size
             )
             if (
                 prefill_tokens is not None
                 and decode_tokens is not None
-                and len(prefill_tokens) == len(decode_tokens) == self.ps.attn_dp_size
+                and len(prefill_tokens)
+                == len(decode_tokens)
+                == get_parallel().attn_dp_size
             ):
                 # TP-MoE processes the gathered tokens, not just this DP rank's
                 # chunk. Use its actual total so DP8 at 2048 tokens/rank retains
@@ -388,7 +392,7 @@ class SchedulerMultiplexMixin:
             )
             forward_count = limit_active_decode(forward_count)
 
-        if self.ps.attn_dp_size > 1:
+        if get_parallel().attn_dp_size > 1:
             # DP ranks can have different prefill lengths or no local work.
             # They must yield at the same layer: an early-finishing rank would
             # otherwise enter the completion collective while its peers start
@@ -559,7 +563,7 @@ class SchedulerMultiplexMixin:
             # Stash only when this chunk produced new KV beyond what is
             # already cached. A parked chunk (add_chunked_req hybrid-SWA
             # early-return) has nothing new to cache.
-            if self.chunked_req.extend_range.end > len(self.chunked_req.prefix_indices):
+            if self.chunked_req.extend_end > self.chunked_req.prefix_len:
                 # The stash rewrites the request's req_to_token row, which the
                 # sparse-prefill scaffolding cache snapshots at segment 0, so
                 # it is only legal once every split segment has run. A standard
@@ -575,11 +579,13 @@ class SchedulerMultiplexMixin:
         # already released. Merging them into the decode batch leaves a freed
         # req_pool_idx registered as a live owner until the next filter.
         last_bs = batch.batch_size()
-        batch.filter_batch(chunked_req_to_exclude=list(chunked_req_to_exclude))
+        batch.filter_batch(reqs_to_exclude=list(chunked_req_to_exclude))
         if batch.batch_size() < last_bs:
             running_batch.batch_is_full = False
 
         if not batch.is_empty():
+            self.prefill_launched_reqs.leave(batch.reqs)
+            self.running_reqs.join(batch.reqs)
             if running_batch and not running_batch.is_empty():
                 running_batch.merge_batch(batch)
             else:
@@ -922,7 +928,7 @@ class SchedulerMultiplexMixin:
                     stream_idx > 0 and running_batch.is_empty()
                 )
                 if (
-                    self.ps.attn_dp_size == 1
+                    get_parallel().attn_dp_size == 1
                     and running_batch.is_empty()
                     and self.split_prefill_batch is None
                 ):
@@ -937,7 +943,7 @@ class SchedulerMultiplexMixin:
                     else None
                 )
 
-            if self.ps.attn_dp_size > 1:
+            if get_parallel().attn_dp_size > 1:
                 next_stream_idx = self._get_pdmux_dp_stream_idx(
                     decode_batch, stream_idx
                 )
@@ -946,7 +952,7 @@ class SchedulerMultiplexMixin:
                     self.on_idle()
 
             if adjust_stream_group:
-                if self.ps.attn_dp_size > 1:
+                if get_parallel().attn_dp_size > 1:
                     stream_idx, stream_group = self._activate_pdmux_stream_group(
                         next_stream_idx
                     )
@@ -1118,7 +1124,7 @@ class SchedulerMultiplexMixin:
                     )
 
                     self.tp_cpu_group.allreduce(flags, dist.ReduceOp.SUM).wait()
-                    if flags.item() == self.ps.tp_size:
+                    if flags.item() == get_parallel().tp_size:
                         # Drain the current decode only once every rank is
                         # ready to merge, not on each local completion poll.
                         with torch.cuda.stream(decode_stream):
@@ -1152,7 +1158,7 @@ class SchedulerMultiplexMixin:
         """
         return (
             getattr(self.model_config, "is_deepseek_v4_arch", False)
-            and self.ps.attn_dp_size == 1
+            and get_parallel().attn_dp_size == 1
             and not self.waiting_queue
             and self.chunked_req is None
             and getattr(self, "_pending_chunked_abort_req", None) is None
@@ -1400,6 +1406,7 @@ class SchedulerMultiplexMixin:
                     # loop's safe point for tearing down an aborted chunked
                     # request before its next chunk is formed.
                     self.process_pending_chunked_abort()
+                    self._process_hicache_events()
                     prefill_plan = self.get_new_batch_prefill(running_batch)
                     running_batch = prefill_plan.running_batch
                     self.running_batch = running_batch

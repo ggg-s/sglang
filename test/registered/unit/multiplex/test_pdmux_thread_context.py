@@ -2,19 +2,51 @@
 
 from __future__ import annotations
 
+import ast
+import importlib.util
+import sys
 import threading
+import types
 import unittest
+from contextvars import ContextVar
 from unittest.mock import patch
 
-from sglang.srt.distributed import parallel_state
-from sglang.srt.model_executor.forward_context import (
-    ForwardContext,
-    get_forward_context,
-    has_forward_context,
-    forward_context,
+from test_pdmux_sxf_port import SRT, register_cpu_ci
+
+
+def _control_module(path, names, **state):
+    module = types.ModuleType("_pdmux_control_test")
+    module.__dict__.update(state)
+    tree = ast.parse((SRT / path).read_text())
+    definitions = [node for node in tree.body if getattr(node, "name", None) in names]
+    assert {node.name for node in definitions} == set(names)
+    tree.body = definitions
+    exec(compile(tree, str(SRT / path), "exec"), module.__dict__)
+    return module
+
+
+parallel_state = _control_module(
+    "distributed/parallel_state.py",
+    {"set_pdmux_status", "is_pdmux_prefill_enabled"},
+    _ENABLE_PDMUX_P_TP=ContextVar("test_prefill_lane", default=False),
 )
-from sglang.srt.multiplex import pdmux_context
-from sglang.test.ci.ci_register import register_cpu_ci
+pdmux_context = _control_module(
+    "multiplex/pdmux_context.py",
+    {"set_current_stream_idx", "get_current_stream_idx"},
+    STREAM_GROUPS=[],
+    CURRENT_STREAM_IDX=ContextVar("test_stream_idx", default=0),
+    CURRENT_STREAM_GROUP=None,
+)
+_spec = importlib.util.spec_from_file_location(
+    "_pdmux_forward_context_test", SRT / "model_executor/forward_context.py"
+)
+_forward = importlib.util.module_from_spec(_spec)
+sys.modules[_spec.name] = _forward
+_spec.loader.exec_module(_forward)
+ForwardContext = _forward.ForwardContext
+get_forward_context = _forward.get_forward_context
+has_forward_context = _forward.has_forward_context
+forward_context = _forward.forward_context
 
 register_cpu_ci(est_time=3, suite="base-a-test-cpu")
 

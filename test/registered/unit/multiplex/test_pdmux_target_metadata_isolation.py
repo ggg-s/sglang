@@ -31,7 +31,7 @@ class Backend:
         self.forward_metadata = None
         self.plans = 0
 
-    def prepare_prefill_shared_read_snapshot(self, batch, *, num_qo_tokens):
+    def resolve_prefill_shared_read_ends(self, batch, *, num_qo_tokens):
         pass
 
     def init_forward_metadata(self, batch):
@@ -47,6 +47,7 @@ class TestTargetMetadataIsolation(CustomTestCase):
             contextlib=contextlib,
             device_timer_ctx=lambda *args: contextlib.nullcontext(),
             is_cp_active=lambda batch: False,
+            get_parallel=lambda: SimpleNamespace(attn_dcp_size=1),
             _is_hip=False,
             torch=SimpleNamespace(get_device_module=lambda device: None),
             maybe_publish_prefill_shared_read_done=lambda *args: None,
@@ -71,11 +72,11 @@ class TestTargetMetadataIsolation(CustomTestCase):
         cp_patch.start()
         self.addCleanup(cp_patch.stop)
         self.split = load_methods(
-            "model_executor/model_runner.py",
-            "ModelRunner",
-            ["forward_split_prefill"],
+            "model_executor/runner_utils/pdmux.py",
+            None,
+            ["run_split_prefill"],
             device_timer_ctx=lambda *args: contextlib.nullcontext(),
-        )["forward_split_prefill"]
+        )["run_split_prefill"]
         self.prefill = Backend()
         self.decode = Backend()
         self.observed = []
@@ -120,6 +121,7 @@ class TestTargetMetadataIsolation(CustomTestCase):
             positions=None,
             idle=name == "idle",
             metadata=object(),
+            moe_num_token_non_padded=lambda: None,
             split_index=0,
             is_extend_in_batch=peer_prefill,
             needs_forward_metadata_init=lambda: not ready,

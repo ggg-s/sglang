@@ -8,6 +8,7 @@ import types
 import unittest
 from dataclasses import replace
 from pathlib import Path
+from typing import Optional
 from unittest.mock import patch
 
 import numpy as np
@@ -44,6 +45,11 @@ class Tensor:
     @property
     def shape(self):
         return self.value.shape
+
+    is_cuda = False
+
+    def view(self, *shape):
+        return Tensor(self.value.reshape(*shape))
 
     def numel(self):
         return self.value.size
@@ -140,6 +146,22 @@ class TestChunkMetadata(unittest.TestCase):
                 is_hip=lambda: False,
                 is_xpu=lambda: False,
                 is_sm120_supported=lambda: False,
+                get_device_module=lambda: None,
+            ),
+            "sglang.srt.utils.common": types.SimpleNamespace(
+                ceil_div=lambda x, y: (x + y - 1) // y,
+            ),
+            "sglang.srt.runtime_context": types.SimpleNamespace(
+                get_schedule=lambda: None
+            ),
+            "sglang.srt.model_executor.runner_backend_utils.breakable_cuda_graph.context": types.SimpleNamespace(
+                is_in_breakable_cuda_graph=lambda: False
+            ),
+            "sglang.srt.model_executor.runner_backend_utils.tc_piecewise_cuda_graph": types.SimpleNamespace(
+                is_in_tc_piecewise_cuda_graph=lambda: False
+            ),
+            "sglang.srt.model_executor.runner_utils.capture_mode": types.SimpleNamespace(
+                get_is_capture_mode=lambda: False
             ),
             "deep_gemm": types.SimpleNamespace(
                 get_num_sms=lambda: 8, get_paged_mqa_logits_metadata=dg_plan
@@ -155,6 +177,10 @@ class TestChunkMetadata(unittest.TestCase):
         self.env = patch.dict(os.environ, {"SGLANG_DSV4_INDEXER_LOGITS_BUDGET_MB": "1"})
         self.env.start()
         self.addCleanup(self.env.stop)
+        sys.modules["sglang.srt.layers.attention.mqa_logits_utils"] = load(
+            "_dsv4_mqa_logits_utils_test",
+            "python/sglang/srt/layers/attention/mqa_logits_utils.py",
+        )
         self.metadata = load(
             "_dsv4_chunk_metadata_test",
             "python/sglang/srt/layers/attention/dsv4/metadata.py",
@@ -173,9 +199,9 @@ class TestChunkMetadata(unittest.TestCase):
 
     def test_tail_and_matching_topk_plans(self):
         m = self.make()
-        self.assertEqual(m.logits_chunk_rows, 1024)
+        self.assertEqual(m.rows_per_chunk, 1024)
         self.assertEqual([x.shape[0] for x in self.dg_calls], [1024, 1024, 2])
-        self.assertEqual([x.shape[0] for x in m.chunk_topk_metadata], [1025, 1025, 3])
+        self.assertEqual([x.shape[0] for x in m.topk_metadata_chunks], [1025, 1025, 3])
         np.testing.assert_array_equal(
             np.concatenate(self.dg_calls).reshape(-1), m.compressed_seq_lens.value
         )
@@ -187,39 +213,39 @@ class TestChunkMetadata(unittest.TestCase):
             with self.subTest(prefill=prefill, graph=graph):
                 m = self.make(prefill=prefill, graph=graph)
                 self.assertIsInstance(m.deep_gemm_metadata, Tensor)
-                self.assertIsNone(m.chunk_topk_metadata)
-                self.assertEqual(m.logits_chunk_rows, 0)
+                self.assertIsNone(m.topk_metadata_chunks)
+                self.assertIsNone(m.rows_per_chunk)
 
     def test_empty_small_and_exact_budget_boundary(self):
         for rows in (0, 1, 1024):
             with self.subTest(rows=rows):
                 m = self.make(rows=rows)
                 self.assertIsInstance(m.deep_gemm_metadata, Tensor)
-                self.assertIsNone(m.chunk_topk_metadata)
+                self.assertIsNone(m.topk_metadata_chunks)
         m = self.make(rows=1025)
-        self.assertEqual(m.logits_chunk_rows, 1024)
-        self.assertEqual([x.shape[0] for x in m.chunk_topk_metadata], [1025, 2])
+        self.assertEqual(m.rows_per_chunk, 1024)
+        self.assertEqual([x.shape[0] for x in m.topk_metadata_chunks], [1025, 2])
 
     def test_sm120_respects_budget_below_hardware_cap(self):
         self.metadata._IS_SM120 = True
         m = self.make(rows=9000)
-        self.assertEqual(m.logits_chunk_rows, 1024)
+        self.assertEqual(m.rows_per_chunk, 1024)
         self.assertEqual(sum(x.shape[0] for x in self.dg_calls), 9000)
 
     def test_sm120_keeps_hard_row_cap(self):
         self.metadata._IS_SM120 = True
         m = self.make(rows=9000, prefill=False)
-        self.assertEqual(m.logits_chunk_rows, 4096)
+        self.assertEqual(m.rows_per_chunk, 4096)
         self.assertEqual([x.shape[0] for x in self.dg_calls], [4096, 4096, 808])
 
     def test_copy_preserves_plan_addresses_and_updates_contents(self):
         dst, src = self.make(value=1), self.make(value=2)
         dg_ids = [id(x) for x in dst.deep_gemm_metadata]
-        tk_ids = [id(x) for x in dst.chunk_topk_metadata]
+        tk_ids = [id(x) for x in dst.topk_metadata_chunks]
         dst.copy_(src)
         self.assertEqual(dg_ids, [id(x) for x in dst.deep_gemm_metadata])
-        self.assertEqual(tk_ids, [id(x) for x in dst.chunk_topk_metadata])
-        for a, b in zip(dst.chunk_topk_metadata, src.chunk_topk_metadata):
+        self.assertEqual(tk_ids, [id(x) for x in dst.topk_metadata_chunks])
+        for a, b in zip(dst.topk_metadata_chunks, src.topk_metadata_chunks):
             np.testing.assert_array_equal(a.value, b.value)
         for a, b in zip(dst.deep_gemm_metadata, src.deep_gemm_metadata):
             np.testing.assert_array_equal(a.value, b.value)
@@ -267,15 +293,15 @@ class TestChunkMetadata(unittest.TestCase):
                     )
                     np.testing.assert_array_equal(actual.page_table.value[2050:], 0)
                 if target_rows <= 1024:
-                    self.assertEqual(actual.logits_chunk_rows, 0)
-                    self.assertIsNone(actual.chunk_topk_metadata)
+                    self.assertIsNone(actual.rows_per_chunk)
+                    self.assertIsNone(actual.topk_metadata_chunks)
                 else:
                     expected = [
                         min(1024, target_rows - start)
                         for start in range(0, target_rows, 1024)
                     ]
                     self.assertEqual(
-                        [p.shape[0] - 1 for p in actual.chunk_topk_metadata], expected
+                        [p.shape[0] - 1 for p in actual.topk_metadata_chunks], expected
                     )
                     for idx, start in enumerate(range(0, target_rows, 1024)):
                         length_sum = int(
@@ -285,7 +311,8 @@ class TestChunkMetadata(unittest.TestCase):
                             int(actual.deep_gemm_metadata[idx].value[0, 0]), length_sum
                         )
                         self.assertEqual(
-                            int(actual.chunk_topk_metadata[idx].value[0, 0]), length_sum
+                            int(actual.topk_metadata_chunks[idx].value[0, 0]),
+                            length_sum,
                         )
 
     def test_alignment_cache_is_per_forward_and_per_row_count(self):
@@ -381,6 +408,8 @@ class TestChunkMetadata(unittest.TestCase):
             fn=scores,
             topk_transform_paged_v2=reduce,
             is_pdmux_enabled=lambda: True,
+            Optional=Optional,
+            iter_row_chunks=self.metadata.iter_row_chunks,
         )
         plan_count = len(self.dg_calls), len(self.topk_calls)
         for _ in range(2):
