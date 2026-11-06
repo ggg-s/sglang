@@ -3853,6 +3853,10 @@ class TestRemoteAttn(CustomTestCase):
             calls.append(("src", copy.deepcopy(payload)))
             if payload["cmd"] == "status":
                 return copy.deepcopy(gateway._src_facts)
+            if payload["cmd"] == "plan":
+                return {"plans":[dict(rid=x["rid"],target_rid=x["target_rid"],upper=32895) for x in payload["items"]]}
+            if payload["cmd"] == "reservation_ready":
+                return {"confirmed":True}
             raise AssertionError(f"unexpected source RPC {payload}")
 
         def target_send(payload, **kwargs):
@@ -3860,7 +3864,7 @@ class TestRemoteAttn(CustomTestCase):
             if payload["cmd"] == "status":
                 return {"reqs": [], "max_running": 8}
             if payload["cmd"] == "reserve":
-                return {"errors": {}}
+                return {"errors": {},"reservations":{x["target_rid"]:x for x in payload["plans"][0]}}
             if payload["cmd"] == "admit_ordinary":
                 return {"admitted": True}
             if payload["cmd"] in ("submit", "release", "capacity_cancel"):
@@ -3981,7 +3985,7 @@ class TestRemoteAttn(CustomTestCase):
                 self.assertEqual(
                     sum(role == "dst" and p["cmd"] == "submit" for role, p in calls), 8
                 )
-                self.assertFalse(any(role == "src" for role, p in calls))
+                self.assertFalse(any(role == "src" and p["cmd"] == "submit" for role, p in calls))
                 for handler in handlers:
                     self.assertIn(b'"token_id": 42', handler.wfile.getvalue())
                     events = [
@@ -4113,7 +4117,7 @@ class TestRemoteAttn(CustomTestCase):
             thread.join(3)
         self.assertFalse(thread.is_alive())
         self.assertEqual(errors, [])
-        self.assertFalse(any(role == "src" for role, p in calls))
+        self.assertFalse(any(role == "src" and p["cmd"] == "submit" for role, p in calls))
         target_commands = [p["cmd"] for role, p in calls]
         self.assertLess(
             target_commands.index("reserve"), target_commands.index("admit_ordinary")
@@ -4540,6 +4544,11 @@ class TestRemoteAttn(CustomTestCase):
         def send(payload, **kwargs):
             if payload["cmd"] == "status":
                 return {"max_running": 2, "reqs": []}
+            if payload["cmd"] == "reserve" and "plans" in payload:
+                certs = {x["target_rid"]:x for x in payload["plans"][0]}
+                payload = {"cmd":"reserve","items":payload["items"],"epoch":payload["epoch"]}
+                requests.append(payload)
+                return dict(self.runtime._handle(scheduler,payload),reservations=certs)
             requests.append(payload)
             return self.runtime._handle(scheduler, payload)
 
@@ -4555,7 +4564,7 @@ class TestRemoteAttn(CustomTestCase):
             return role.send(payload)
 
         gateway._send_timed = timed
-        gateway.src = SimpleNamespace()
+        gateway.src = SimpleNamespace(send=lambda p,**kw: {"plans":[dict(rid=x["rid"],target_rid=x["target_rid"],upper=5) for x in p["items"]]} if p["cmd"]=="plan" else {"confirmed":True})
         gateway._maybe_kill = lambda stage: None
         context = SimpleNamespace(
             get_schedule=lambda: SimpleNamespace(max_running_requests=2)
@@ -5289,7 +5298,7 @@ class TestRemoteAttn(CustomTestCase):
             with self.subTest(failure=failure):
                 self._fast_sender_contract(failure)
 
-    def _fast_sender_contract(self, failure=None):
+    def _fast_sender_contract(self, failure=None, group=1, slots=1, reuse=False, async_=True):
         device = threading.local()
         device.value = 1
         tensors = {}
@@ -5298,7 +5307,7 @@ class TestRemoteAttn(CustomTestCase):
         controls = []
         messages = queue.Queue()
         messages.put({"token": "regression"})
-        messages.put({"session": "peer", "addrs": [100, 200], "slots": 1})
+        messages.put({"session": "peer", "addrs": list(range(100, 100 + 2 * slots)), "slots": slots})
 
         class Stream:
             def wait_event(self, event):
@@ -5347,22 +5356,27 @@ class TestRemoteAttn(CustomTestCase):
             tensors[tensor.data_ptr()] = tensor
             return tensor
 
+        batches = []
         class Engine:
             def __init__(self):
                 self.next = 0
                 self.pending = {}
+                self.available = []
 
             def batch_transfer_async_write(self, session, addresses, peer, sizes):
                 if failure == "async":
                     raise RuntimeError("submission completion unknown")
                 self.next += 1
-                self.pending[self.next] = [
-                    (tensors[a], tensors[a].clone()) for a in addresses
-                ]
-                return self.next
+                bid = self.available.pop() if reuse and self.available else self.next
+                batches.append(len(addresses))
+                self.pending[bid] = [(tensors[a], tensors[a].clone()) for a in addresses]
+                return bid
 
-            def batch_transfer_sync_write(self, *args):
-                return -1
+            def batch_transfer_sync_write(self, session, addresses, peer, sizes):
+                if failure == "sync":
+                    return -1
+                batches.append(len(addresses))
+                return 0
 
             def get_batch_transfer_status(self, batches):
                 for batch in batches:
@@ -5372,6 +5386,7 @@ class TestRemoteAttn(CustomTestCase):
                                 "source staging reused before TE completion"
                             )
                     completed.append(batch)
+                    self.available.append(batch)
                 return 0
 
         engine = Engine()
@@ -5413,10 +5428,12 @@ class TestRemoteAttn(CustomTestCase):
         )
         original_empty = torch.empty
         with ExitStack() as stack:
+            # Frozen metadata wins even if the environment changes afterward.
+            stack.enter_context(patch.dict(os.environ, HANDOFF_D2D_GROUP_SIZE="invalid"))
             for name, value in {
                 "FAST_BUFFERS": 3,
                 "FAST_COPY_STREAMS": 2,
-                "FAST_ASYNC": failure != "sync",
+                "FAST_ASYNC": async_ and failure != "sync",
                 "_get_te": lambda: engine,
                 "_get_registration_manager": lambda: manager,
                 "_open_transfer_listener": lambda: (listener, 123),
@@ -5435,7 +5452,10 @@ class TestRemoteAttn(CustomTestCase):
                 )
             )
             self.runtime._start_layer_gpu_server(
-                scheduler, req, {"kv_committed_len": 3, "chunks": [[3]] * 5}, False
+                scheduler,
+                req,
+                {"kv_committed_len": 3, "chunks": [[3]] * 5, "d2d_group_size": group},
+                False,
             )
             try:
                 req._handoff_transfer_thread.join(timeout=4)
@@ -5450,7 +5470,13 @@ class TestRemoteAttn(CustomTestCase):
                 self.runtime.stop_source_transfer(req)
         if failure is None:
             self.assertEqual(controls, list(range(5)))
-            self.assertEqual(completed, list(range(1, 6)))
+            width = min(group, slots, max(3, group), 5)
+            expected = [2 * min(width, 5 - start) for start in range(0, 5, width)]
+            self.assertEqual(batches, expected)
+            if async_:
+                self.assertEqual(len(completed), len(expected))
+            else:
+                self.assertFalse(completed)
             self.assertEqual(unregistered, ["regression"])
         else:
             self.assertEqual(controls, [])
@@ -15052,7 +15078,7 @@ class TestRemoteAttn(CustomTestCase):
 
         def capture(client, header, *args, **kwargs):
             result = call(client, header, *args, **kwargs)
-            if header.get("dsv_d2d") == "read":
+            if header.get("dsv_d2d") in {"read", "read_group"}:
                 response, out, lse = result
                 envelopes.append((out.numel() + lse.numel(), response["bulk_bytes"]))
             return result
@@ -15118,7 +15144,7 @@ class TestRemoteAttn(CustomTestCase):
 
         def lost_ack(header, *args, **kwargs):
             result = call(header, *args, **kwargs)
-            if header.get("dsv_d2d") == "read":
+            if header.get("dsv_d2d") in {"read", "read_group"}:
                 raise TimeoutError("lost successful bulk ACK")
             return result
 
@@ -15618,7 +15644,8 @@ class TestRemoteAttn(CustomTestCase):
 
         def execute(job, stream, cache):
             if (
-                job.header.get("dsv_d2d") == "read"
+                job.header.get("dsv_d2d") == "read_group"
+                or job.header.get("dsv_d2d") == "read"
                 and job.header.get("kind") == "global"
                 and job.ctx.dsv41_source.schema["entries"][job.header["entry"]][0]
                 == "kv"
@@ -16302,10 +16329,14 @@ class TestRemoteAttn(CustomTestCase):
 
         class Engine:
             peers = {}
+            protocol = "tcp"
+            d2d_protocol_verified = True
 
             def __init__(self, name):
                 self.name, self.regions, self.calls, self.fail = name, {}, [], False
                 self.peers[name] = self
+                self.batches = {}
+                self.next_batch = 0
 
             def get_session_id(self):
                 return self.name
@@ -16319,10 +16350,15 @@ class TestRemoteAttn(CustomTestCase):
                     self.regions.pop(p)
                 return 0
 
-            def batch_transfer_sync(self, session, sources, targets, sizes):
+            def batch_transfer_sync(self, *args):
+                raise AssertionError("Q/O must not use hidden-retry sync API")
+
+            def batch_transfer_async_write(self, session, sources, targets, sizes):
                 self.calls.append(list(zip(sources, targets, sizes)))
+                self.next_batch += 1
+                self.batches[self.next_batch] = -1 if self.fail else 0
                 if self.fail:
-                    return -1
+                    return self.next_batch
                 peer = self.peers[session]
                 for a, b, n in zip(sources, targets, sizes):
                     assert any(
@@ -16332,7 +16368,10 @@ class TestRemoteAttn(CustomTestCase):
                         p <= b and b + n <= p + s for p, s in peer.regions.items()
                     )
                     ctypes.memmove(b, a, n)
-                return 0
+                return self.next_batch
+
+            def get_batch_transfer_status(self, ids):
+                return max((self.batches.pop(bid) for bid in ids), key=abs)
 
         p, d = Engine("P"), Engine("D")
         pm, dm = SimpleNamespace(engine=p), SimpleNamespace(engine=d)
@@ -16389,6 +16428,7 @@ class TestRemoteAttn(CustomTestCase):
         """Q/O/LSE must use registered regions; returned tensors cannot alias reuse."""
         f = self._gpu_transport_fixture()
         client = f.dd.client(f.route)
+        client.connect()
         address = client.slab.tensor.data_ptr()
         previous = []
         for size in (1, 2, 4, 1):
@@ -16475,6 +16515,7 @@ class TestRemoteAttn(CustomTestCase):
             f.dp.ready(req)
         f.d.fail = False
         new = f.dd.client(f.route)
+        new.connect()
         self.assertNotEqual(new.slab.tensor.data_ptr(), old.tensor.data_ptr())
         _, out, _ = new.call(
             [torch.ones(2, 8, dtype=torch.bfloat16)],
@@ -16485,7 +16526,7 @@ class TestRemoteAttn(CustomTestCase):
         self.assertTrue(torch.equal(out, torch.full_like(out, 3)))
         self.assertEqual(len(f.d.calls), 2)  # failed operation was never retried
         new.close()
-        self.assertIn(old.tensor.data_ptr(), f.d.regions)
+        self.assertIn(old.wire.data_ptr(), f.d.regions)
 
     def test_gpu_transport_slot_requires_ack_and_consumer_proof_before_retirement(self):
         """Sequence changes cannot replace a transfer/consumer completion proof."""
@@ -16500,7 +16541,9 @@ class TestRemoteAttn(CustomTestCase):
         pending[0] = False
         self.assertTrue(io.ready())
         f = self._gpu_transport_fixture()
-        lane = dp.Lane(f.pp, f.dd.client(f.route).slab.descriptor(), "D")
+        client = f.dd.client(f.route)
+        client.connect()
+        lane = dp.Lane(f.pp, client.slab.descriptor(), "D")
         self.addCleanup(lane.drop)
         lane.begin(1)
         with self.assertRaises(RuntimeError):
@@ -17684,6 +17727,490 @@ class TestRemoteAttn(CustomTestCase):
                 if process.poll() is None:
                     process.kill()
                 process.communicate(timeout=5)
+
+    def test_d2d_group_width_validation_and_bounded_native_frames(self):
+        from sglang_remote_attn import d2d_groups as groups
+
+        for value in (0, -1, True, 1.5, "bad"):
+            with self.assertRaises(ValueError):
+                groups.size(value)
+        entries = [
+            ["kv", 2, 0, "v4", "u8", 4],
+            ["index", 2, 0, "v4", "u8", 4],
+            ["kv", 4, 1, "v4", "u8", 4],
+            ["kv", 2, 4, "v4", "u8", 4],
+        ]
+        frames = list(groups.frames(entries, 2, 4, 12))
+        self.assertEqual(
+            frames,
+            [
+                [dict(entry=0, start=0, count=2), dict(entry=2, start=0, count=1)],
+                [dict(entry=2, start=1, count=1)],
+                [dict(entry=3, start=0, count=2)],
+            ],
+        )
+        self.assertTrue(
+            all(
+                sum(p["count"] * entries[p["entry"]][-1] for p in frame) <= 12
+                for frame in frames
+            )
+        )
+
+    def test_qwen_grouped_fast_batches_preserve_slot_ack_and_handle_reuse(self):
+        for slots in (1, 2, 3):
+            with self.subTest(slots=slots):
+                self._fast_sender_contract(group=2, slots=slots, reuse=True)
+        self._fast_sender_contract(group=3, slots=3, async_=False)
+
+    def test_qwen_grouped_fast_unknown_submit_retains_staging(self):
+        for failure in ("sync", "async"):
+            with self.subTest(failure=failure):
+                self._fast_sender_contract(failure, group=2, slots=2)
+
+    def test_dsv_grouped_bulk_packs_producers_and_preserves_forward_fence(self):
+        e = self._d2d_env()
+        with patch.dict(os.environ, HANDOFF_D2D_GROUP_SIZE="4"):
+            meta = e.reserve_and_freeze()
+        e.import_(meta)  # Target follows the frozen source config, not its env.
+        self.assertTrue(e.blocked.wait(3))
+        target = e.target.d2d_targets[e.epoch]
+        self.assertEqual(target.group_size, 4)
+        e.command(e.target, "d2d_commit")
+        pending = [False]
+        target.forward_proofs.append(SimpleNamespace(ready=lambda: pending[0]))
+        e.gate.set()
+        e.wait_copy()
+        self.assertEqual(target.group_frames, 1)
+        self.assertEqual(target.grouped_entries, 2)
+        self.assertEqual(len(target.events), 2)
+        self.assertFalse(target.ready_to_finish())
+        self.assertFalse(e.freed)
+        pending[0] = True
+        e.target.drain_targets(required=target)
+        self.assertTrue(target.closed)
+
+    def test_dsv_grouped_entry_can_become_local_before_its_group_peer(self):
+        from sglang_remote_attn import dsv41_receive as receive
+
+        e = self._d2d_env()
+        e.gate.set()
+        original = receive.scatter_prefix
+        second, release = threading.Event(), threading.Event()
+        self.addCleanup(release.set)
+        calls = []
+
+        def scatter(*args, **kw):
+            calls.append(True)
+            if len(calls) == 2:
+                second.set()
+                self.assertTrue(release.wait(5))
+            return original(*args, **kw)
+
+        with patch.dict(os.environ, HANDOFF_D2D_GROUP_SIZE="4"):
+            meta = e.reserve_and_freeze()
+        with patch.object(receive, "scatter_prefix", side_effect=scatter):
+            e.import_(meta)
+            target = e.target.d2d_targets[e.epoch]
+            self.assertTrue(second.wait(3))
+            e.command(e.target, "d2d_commit")
+            first, last = target.resources
+            self.assertTrue(first.ready_to_finish())
+            self.assertFalse(last.ready_to_finish())
+            e.target.decode_overlap.retirement.drain(first)
+            self.assertIn(first.entry, target.rpc.local_entries)
+            self.assertNotIn(last.entry, target.rpc.local_entries)
+            self.assertFalse(target.closed)
+            self.assertTrue(e.req.kv.holds_kv)
+            release.set()
+            e.wait_copy()
+        e.target.drain_targets(required=target)
+        self.assertTrue(target.closed)
+
+    def test_dsv_grouped_transport_failure_cannot_abort_or_resume_storage(self):
+        from sglang_remote_attn import dsv_d2d as d2d
+
+        e = self._d2d_env()
+        with patch.dict(os.environ, HANDOFF_D2D_GROUP_SIZE="4"):
+            meta = e.reserve_and_freeze()
+        e.import_(meta)
+        self.assertTrue(e.blocked.wait(3))
+        engine = d2d.manager(e.source).engine
+        with patch.object(engine, "batch_transfer_sync", return_value=-1):
+            e.gate.set()
+            target = e.target.d2d_targets[e.epoch]
+            target.worker.join(5)
+        self.assertTrue(target.error)
+        self.assertTrue(target.bulk_reader.bulk.unsafe)
+        self.assertFalse(target.events)
+        with self.assertRaises(d2d.TransportFailure):
+            e.command(e.target, "d2d_abort")
+        with self.assertRaises(ValueError):
+            e.command(e.source, "d2d_resume")
+        self.assertTrue(e.req.kv.holds_kv)
+        self.assertTrue(target.decode_req.req.kv.holds_kv)
+        self.assertFalse(e.freed)
+
+    def test_dsv_grouped_cancel_and_lost_commit_reply_preserve_p4_semantics(self):
+        with patch.dict(os.environ, HANDOFF_D2D_GROUP_SIZE="4"):
+            self.test_p4_dsv_lost_commit_reply_rolls_forward_after_restart_without_resampling()
+            self.test_p4_dsv_cancel_precommit_tombstones_late_import_and_freeze()
+
+    def test_dsv_grouped_invalid_config_rejects_before_freeze(self):
+        e = self._d2d_env()
+        with patch.dict(os.environ, HANDOFF_D2D_GROUP_SIZE="0"):
+            with self.assertRaisesRegex(ValueError, "GROUP_SIZE"):
+                e.freeze()
+        self.assertFalse(e.req._handoff_frozen)
+        self.assertEqual(e.source.scheduler.running_batch.reqs, [e.req])
+
+    def test_dsv_grouped_source_validates_all_segments_before_any_native_write(self):
+        from sglang_remote_attn import dsv_d2d as d2d, d2d_groups as groups
+
+        e = self._d2d_env()
+        with patch.dict(os.environ, HANDOFF_D2D_GROUP_SIZE="4"):
+            e.freeze()
+        source = e.source.d2d_sources[e.epoch]
+        entries = [
+            i for i, entry in enumerate(source.schema["entries"]) if entry[0] == "kv"
+        ]
+        with self.assertRaisesRegex(ValueError, "budget"):
+            groups.validate_segments(
+                source, [dict(entry=entries[0], start=0, count=1)], 1
+            )
+        with self.assertRaisesRegex(ValueError, "outside"):
+            groups.validate_segments(
+                source,
+                [dict(entry=entries[0], start=0, count=source.pages.numel() + 1)],
+                d2d.LIMIT,
+            )
+        source.group_size = 1
+        with self.assertRaisesRegex(ValueError, "crosses"):
+            groups.validate_segments(
+                source, [dict(entry=i, start=0, count=1) for i in entries], d2d.LIMIT
+            )
+
+
+    def _qwen_native_fixture(self, page=4, capacity=64):
+        path = ROOT / "test/manual/remote_attn/qwen_reservation_probe_support.py"
+        spec = importlib.util.spec_from_file_location(
+            "qwen_reservation_probe_support", path
+        )
+        module = importlib.util.module_from_spec(spec)
+        self.enterContext(patch.dict(sys.modules, {spec.name: module}))
+        spec.loader.exec_module(module)
+        f = module.Fixture(ROOT, page=page, capacity=capacity)
+        self.addCleanup(f.close)
+        req = f.new(
+            f.scheduler, "source", list(range(5)), [11, 12, 13], module.Sampling()
+        )
+        req.kv.req_pool_idx = 0
+        req.kv.kv_committed_len = req.kv.kv_allocated_len = 7
+        f.scheduler.handoff_tracked_reqs[req.rid] = req
+        return f, req
+
+    def _qwen_native_reserve(self, f, req, growth=8):
+        from sglang_remote_attn import qwen_reservation as reservation
+
+        data = dict(
+            epoch="range-epoch",
+            items=[dict(rid=req.rid, target_rid="target", growth_tokens=growth)],
+        )
+        planned = reservation.plan(f.scheduler, data)["plans"]
+        result = reservation.reserve(
+            f.scheduler, dict(epoch=data["epoch"], plans=[planned])
+        )
+        reservation.confirm(
+            f.scheduler,
+            dict(epoch=data["epoch"], certificates=[result["reservations"]]),
+        )
+        return planned[0]
+
+    def test_qwen_native_reservation_reuses_row_and_preserves_partial_tail_page(self):
+        from sglang_remote_attn import qwen_reservation as reservation
+
+        f, req = self._qwen_native_fixture()
+        before = f.allocator.available_size()
+        with patch.object(f.queue, "_pre_alloc", wraps=f.queue._pre_alloc) as allocate:
+            p = self._qwen_native_reserve(f, req)
+            self.assertEqual(allocate.call_count, 1)
+            self.assertEqual(p["upper"], 15)
+            self.assertEqual(before - f.allocator.available_size(), 16)
+            self.assertEqual(f.pool.available_size(), 2)
+            reservation.reserve(f.scheduler, dict(epoch=p["epoch"], plans=[[p]]))
+            self.assertEqual(allocate.call_count, 1)
+            meta = dict(p, kv_committed_len=7)
+            native, indices = reservation.consume(
+                f.scheduler, "target", meta, p["epoch"]
+            )
+            self.assertEqual(before - f.allocator.available_size(), 8)
+            self.assertEqual(indices.numel(), 7)
+            with self.assertRaisesRegex(ValueError,"consumed"):
+                self.runtime._handle(f.scheduler,dict(cmd="reserve_cancel",rids=["target"],epoch=p["epoch"]))
+            row = native.kv.req_pool_idx
+            self.runtime.bind_decode_prefix(native, f.pool, indices, 7)
+            self.assertEqual(native.kv.req_pool_idx, row)
+            self.assertEqual(f.pool.available_size(), 2)
+            self.assertEqual(allocate.call_count, 1)
+            self.runtime._free_source_request(f.scheduler, native)
+            self.runtime._free_source_request(f.scheduler, native)
+            self.assertEqual(f.allocator.available_size(), before)
+            self.assertEqual(f.pool.available_size(), 3)
+
+    def test_qwen_native_reservation_rejects_overflow_before_source_freeze(self):
+        from sglang_remote_attn import qwen_reservation as reservation
+
+        f, req = self._qwen_native_fixture()
+        with self.assertRaisesRegex(ValueError, "requires"):
+            reservation.check_freeze(f.scheduler, req, "range-epoch")
+        p = self._qwen_native_reserve(f, req, growth=1)
+        req.kv.kv_committed_len = p["upper"] + 1
+        with self.assertRaisesRegex(ValueError, "interval"):
+            reservation.check_freeze(f.scheduler, req, p["epoch"])
+        self.assertFalse(getattr(req, "_handoff_frozen", False))
+        self.assertIsNone(f.scheduler._handoff_reserved["target"].get("consumed_at"))
+
+    def test_qwen_native_reservation_failed_or_consumed_allocation_cannot_cancel(self):
+        from sglang_remote_attn import qwen_reservation as reservation
+
+        f, req = self._qwen_native_fixture()
+        actual = f.queue._pre_alloc
+
+        def fail(native):
+            actual(native)
+            raise RuntimeError("native allocation reply lost")
+
+        with patch.object(f.queue, "_pre_alloc", side_effect=fail):
+            with self.assertRaises(reservation.TransportFailure):
+                self._qwen_native_reserve(f, req)
+        rec = f.scheduler._handoff_reserved["target"]
+        self.assertTrue(rec["native_req"].kv.holds_kv)
+        with self.assertRaises(reservation.TransportFailure):
+            reservation.cancel(f.scheduler, "target", rec)
+        with self.assertRaises(ValueError):
+            reservation.reserve(
+                f.scheduler, dict(epoch="range-epoch", plans=[[rec["plan"]]])
+            )
+
+    def test_qwen_native_reservation_checks_real_paged_budget_before_allocating(self):
+        f, req = self._qwen_native_fixture(capacity=8)
+        before = f.pool.available_size()
+        with patch.object(f.queue, "_pre_alloc", wraps=f.queue._pre_alloc) as allocate:
+            with self.assertRaisesRegex(ValueError, "preflight"):
+                self._qwen_native_reserve(f, req)
+            self.assertEqual(allocate.call_count, 0)
+            self.assertEqual(f.pool.available_size(), before)
+            self.assertFalse(
+                f.scheduler._handoff_reserved
+                if hasattr(f.scheduler, "_handoff_reserved")
+                else {}
+            )
+
+    def test_d2d_rectangles_preserve_group_boundaries_and_reject_incomplete_coverage(
+        self,
+    ):
+        from sglang_remote_attn import d2d_ranges as ranges, qwen_ranges
+
+        meta = dict(
+            chunks=[[]] * 5, kv_committed_len=11, d2d_group_size=3, d2d_token_range=4
+        )
+        work = list(qwen_ranges.batches(meta, 2))
+        self.assertEqual(
+            work[:4], [((0, 1), 0, 4), ((2,), 0, 4), ((0, 1), 4, 8), ((2,), 4, 8)]
+        )
+        self.assertTrue(
+            all(len({layer // 3 for layer in g}) == 1 for g, lo, hi in work)
+        )
+        coverage = ranges.Coverage(5, 11)
+        for g, lo, hi in work:
+            for layer in g:
+                self.assertEqual(coverage.add(layer, lo, hi), hi == 11)
+        with self.assertRaises(ValueError):
+            coverage.add(0, 8, 11)
+        with self.assertRaises(ValueError):
+            ranges.Coverage(1, 11).add(0, 4, 8)
+        for bad in (0, -1, True, 1.5, "oops"):
+            with self.assertRaises(ValueError):
+                ranges.tokens(bad)
+
+    def test_dsv_rectangles_cover_every_entry_page_once_with_bounded_frames(self):
+        from sglang_remote_attn import d2d_groups as groups, d2d_ranges as ranges
+
+        entries = [
+            ["kv", 2, 1, "v4", "uint8", 7],
+            ["kv", 4, 2, "v4", "uint8", 13],
+            ["kv", 4, 4, "v4", "uint8", 13],
+        ]
+        frames = list(groups.range_frames(entries, 19, 4, 3, 9, 32))
+        coverage = ranges.Coverage(3, 5)
+        for rect in frames:
+            lo, hi = rect["token_range"]
+            self.assertEqual(lo % 4, 0)
+            self.assertLessEqual(
+                sum(p["count"] * entries[p["entry"]][-1] for p in rect["segments"]), 32
+            )
+            for seg in rect["segments"]:
+                self.assertEqual(entries[seg["entry"]][2] // 3, rect["layer_group"])
+                self.assertTrue(
+                    lo // 4
+                    <= seg["start"]
+                    < seg["start"] + seg["count"]
+                    <= (hi + 3) // 4
+                )
+                coverage.add(seg["entry"], seg["start"], seg["start"] + seg["count"])
+        self.assertEqual(coverage.ends, [5, 5, 5])
+
+    def test_qwen_native_reservation_manifest_mismatch_does_not_consume_row(self):
+        from sglang_remote_attn import qwen_reservation as reservation
+
+        f, req = self._qwen_native_fixture()
+        p = self._qwen_native_reserve(f, req)
+        bad = dict(p, kv_committed_len=7, origin_input_ids=[99])
+        with self.assertRaisesRegex(ValueError, "manifest|history"):
+            reservation.consume(f.scheduler, "target", bad, p["epoch"])
+        rec = f.scheduler._handoff_reserved["target"]
+        self.assertFalse(rec["consumed"])
+        wrong_geometry = dict(p,kv_committed_len=7,d2d_range_protocol="layer-token-range-v1",chunks=[[7]]*2,kv_heads=1,head_dim=8,dtype="float16")
+        with self.assertRaisesRegex(ValueError,"geometry"):
+            reservation.consume(f.scheduler,"target",wrong_geometry,p["epoch"])
+        self.assertFalse(rec["consumed"])
+        row = rec["native_req"].kv.req_pool_idx
+        reservation.cancel(f.scheduler, "target", rec)
+        self.assertIsNone(rec["native_req"].kv.req_pool_idx)
+        self.assertNotIn("target", f.scheduler._handoff_reserved)
+        self.assertIn(row, f.pool.free_slots)
+
+
+    def test_qwen_native_cancel_before_reserve_leaves_epoch_tombstone(self):
+        from sglang_remote_attn import qwen_reservation as reservation
+
+        f, req = self._qwen_native_fixture()
+        p = reservation.plan(
+            f.scheduler,
+            dict(
+                epoch="range-epoch",
+                items=[dict(rid="source", target_rid="target", growth_tokens=8)],
+            ),
+        )["plans"][0]
+        self.runtime._handle(
+            f.scheduler, dict(cmd="reserve_cancel", rids=["target"], epoch=p["epoch"])
+        )
+        with patch.object(f.queue, "_pre_alloc", wraps=f.queue._pre_alloc) as allocate:
+            with self.assertRaises(ValueError):
+                reservation.reserve(f.scheduler, dict(epoch=p["epoch"], plans=[[p]]))
+            self.assertEqual(allocate.call_count, 0)
+
+    def test_qwen_native_reservation_accounts_for_ordinary_leases(self):
+        f, req = self._qwen_native_fixture()
+        f.scheduler._handoff_ordinary_leases = {"ordinary": dict(tokens=60)}
+        with patch.object(f.queue, "_pre_alloc", wraps=f.queue._pre_alloc) as allocate:
+            with self.assertRaisesRegex(ValueError, "preflight"):
+                self._qwen_native_reserve(f, req)
+            self.assertEqual(allocate.call_count, 0)
+
+    def test_qwen_native_freeze_rejects_reused_source_request_identity(self):
+        from sglang_remote_attn import qwen_reservation as reservation
+
+        f, req = self._qwen_native_fixture()
+        p = self._qwen_native_reserve(f, req)
+        replacement = copy.copy(req)
+        with self.assertRaisesRegex(ValueError, "original source"):
+            reservation.check_freeze(f.scheduler, replacement, p["epoch"])
+        f.scheduler.handoff_tracked_reqs["source"] = replacement
+        with self.assertRaisesRegex(ValueError, "identity"):
+            reservation.plan(f.scheduler,dict(epoch=p["epoch"],items=[dict(rid="source",target_rid="target")]))
+
+    def test_qwen_native_tp2_rejects_partial_freeze_and_asymmetric_reservation(self):
+        worker = ROOT / "test/manual/remote_attn/qwen_reservation_tp_worker.py"
+        with tempfile.TemporaryDirectory() as directory:
+            folder = Path(directory)
+            env = dict(
+                os.environ,
+                PYTHONPATH=os.pathsep.join(
+                    [str(PLUGIN), os.environ.get("PYTHONPATH", "")]
+                ),
+                PYTHONDONTWRITEBYTECODE="1",
+            )
+            processes = [
+                subprocess.Popen(
+                    [
+                        sys.executable,
+                        str(worker),
+                        str(rank),
+                        str(ROOT),
+                        str(folder / "rendezvous"),
+                        str(folder / f"rank{rank}.json"),
+                    ],
+                    env=env,
+                    stdout=subprocess.PIPE,
+                    stderr=subprocess.STDOUT,
+                    text=True,
+                )
+                for rank in range(2)
+            ]
+            try:
+                output = [p.communicate(timeout=40)[0] for p in processes]
+                for p in processes:
+                    self.assertEqual(p.returncode, 0, "\n".join(output))
+                for rank in range(2):
+                    row = json.loads((folder / f"rank{rank}.json").read_text())
+                    self.assertTrue(
+                        row["asymmetric_freeze_rejected"]
+                        and row["asymmetric_ticket_rejected"]
+                        and row["unproven_row_retained"]
+                    )
+            finally:
+                for p in processes:
+                    if p.poll() is None:
+                        p.kill()
+                        p.communicate(timeout=5)
+
+
+    def test_qwen_range_registration_failure_keeps_host_backing_without_owner_handle(self):
+        from sglang_remote_attn import qwen_ranges, mooncake_backend as mb
+        runtime=self.runtime
+        engine=SimpleNamespace(protocol="tcp", d2d_protocol_verified=True, get_session_id=lambda: "test-registration")
+        meta=dict(d2d_capabilities=mb.tcp_offer(),chunks=[[4]],kv_committed_len=4,kv_heads=1,head_dim=1,dtype="float16",d2d_group_size=1,d2d_token_range=4,d2d_range_protocol="layer-token-range-v1")
+        original=torch.empty
+        def empty(*args,**kw):
+            kw.pop("pin_memory",None)
+            return original(*args,**kw)
+        manager=SimpleNamespace(register=Mock(side_effect=RuntimeError("registration result lost")),release_safe=Mock(return_value=True))
+        with patch.object(torch.cuda,"current_device",return_value=0),patch.object(runtime,"_get_te",return_value=engine),patch.object(runtime,"_TRANSFER_REGISTRATIONS",{}),patch.object(runtime,"_get_registration_manager",return_value=manager),patch.object(runtime,"_CTL_DIR",""),patch.object(runtime,"_TRANSFER_QUARANTINE",{}),patch.object(runtime,"_TRANSFER_RELEASES",{}),patch.object(torch,"empty",side_effect=empty),patch.object(qwen_ranges.secrets,"token_hex",return_value="reg-lost"):
+            with self.assertRaisesRegex(RuntimeError,"registration"):
+                qwen_ranges.source(None,SimpleNamespace(),meta,False)
+            self.assertIn("reg-lost",runtime._TRANSFER_QUARANTINE)
+            self.assertFalse(runtime._TRANSFER_RELEASES["reg-lost"]["gpu_safe"])
+            with self.assertRaisesRegex(RuntimeError,"registration"):
+                qwen_ranges.setup(None,meta,"target-lost")
+            self.assertIn("target-lost",runtime._TRANSFER_QUARANTINE)
+            self.assertFalse(runtime._TRANSFER_RELEASES["target-lost"]["gpu_safe"])
+            runtime.reap_transfer_buffers()
+            manager.release_safe.assert_not_called()
+
+
+    def test_d2d_history_and_reservation_bounds_reject_before_native_allocation(self):
+        from sglang_remote_attn import qwen_reservation as reservation
+
+        e = self._d2d_env()
+        meta = e.freeze()
+        meta["output_ids"].append(99)
+        with self.assertRaisesRegex(ValueError, "history"):
+            e.import_(meta)
+        self.assertFalse(e.target.d2d_targets)
+        f, req = self._qwen_native_fixture()
+        p = reservation.plan(
+            f.scheduler,
+            dict(
+                epoch="bad-history",
+                items=[dict(rid="source", target_rid="target", growth_tokens=8)],
+            ),
+        )["plans"][0]
+        p["lower"] += 1
+        with patch.object(f.queue, "_pre_alloc", wraps=f.queue._pre_alloc) as allocate:
+            with self.assertRaisesRegex(ValueError, "preflight"):
+                reservation.reserve(f.scheduler, dict(epoch=p["epoch"], plans=[[p]]))
+            self.assertEqual(allocate.call_count, 0)
+            self.assertEqual(f.pool.available_size(), 3)
 
 
 if __name__ == "__main__":

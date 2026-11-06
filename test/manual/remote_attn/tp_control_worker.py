@@ -6,6 +6,7 @@ import os
 import sys
 import threading
 import time
+import types
 from dataclasses import make_dataclass
 from datetime import timedelta
 from pathlib import Path
@@ -13,6 +14,11 @@ from types import SimpleNamespace
 from unittest.mock import patch
 
 import torch.distributed as dist
+
+# CPU/Gloo fixtures import only lightweight core contracts, not serving imports.
+_package = types.ModuleType("sglang")
+_package.__path__ = [str(Path(__file__).resolve().parents[3] / "python/sglang")]
+sys.modules.setdefault("sglang", _package)
 from sglang_remote_attn.tp import agree_control_result, inject_control
 
 

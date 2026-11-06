@@ -68,6 +68,9 @@ def migration_status(controller, epoch):
         else dict(
             rid=target.decode_req.req.rid,
             admitted=target.admitted,
+            group_size=target.group_size,
+            group_frames=target.group_frames,
+            max_entries_per_frame=target.grouped_entries,
             prepared=target.allocation_complete
             and target.rpc is not None
             and not target.error,

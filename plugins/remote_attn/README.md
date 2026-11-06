@@ -1,6 +1,8 @@
 # Remote attention / progressive KV handoff plugin
 
 DSV4.1 / Flash-0731 D0→D1 Remote 迁移：[后端协议、限制与 KV 生命周期](DSV-D2D-REMOTE-ZH.md)。
+Qwen3-8B / DSV4 / DSV4.1 D2D：[layer group × token range、原生预留与完成语义](D2D-LAYER-TOKEN-RANGE-ZH.md)。
+D2D RDMA：[共用 Mooncake engine、能力协商、GPU staging 与 TCP 回退](D2D-RDMA-ZH.md)。
 P4 DSV 模式：[原生 PD、D2D 编排、SSE 接续与重启恢复](P4-DSV-GATEWAY-ZH.md)。
 
 P 缓存前缀（Qwen3/DSV4.1）：[统一 Remote progressive 与 A/B 对照](PREFIX-REMOTE-PROGRESSIVE-ZH.md)。
@@ -393,3 +395,5 @@ vote rechecks current GPU/IO and release state. There is no retirement collectiv
 in ordinary Remote polling. Retraction/shutdown use explicit ordered drain
 commands. D TP workers must share the same host and `/tmp`; P and native admission
 synchronization are unchanged. See [verification](validation/ORDERED-RETIREMENT.md).
+
+Qwen3-8B、DSV4/4.1 的 Q/O/LSE 协商、GPU RDMA/Host TCP 路径、单次提交与异常回收见 [Remote Attention Mooncake 数据面](REMOTE-MOONCAKE-ZH.md)。

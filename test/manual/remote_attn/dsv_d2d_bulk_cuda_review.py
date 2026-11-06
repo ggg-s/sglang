@@ -74,7 +74,8 @@ def retry_cancel(root):
 
         def execute(job, stream, cache):
             if (
-                job.header.get("dsv_d2d") == "read"
+                job.header.get("dsv_d2d") == "read_group"
+                or job.header.get("dsv_d2d") == "read"
                 and job.header.get("kind") == "global"
             ):
                 state["reads"] += 1

@@ -18,6 +18,9 @@ from types import SimpleNamespace as NS
 import torch
 
 from . import d2d_bulk as bulk
+from . import mooncake_backend as transport
+from . import d2d_groups as grouping
+from . import d2d_ranges as ranges
 from . import dsv41_remote as remote
 from . import remote_data_plane as dp
 from .transport_failure import TransportFailure
@@ -274,6 +277,8 @@ class Source:
     peers: tuple = ()
     gpu_session: object = None
     bulk_sender: object = None
+    group_size: int = 1
+    token_range: int = 1024
     created: float = field(default_factory=time.monotonic)
     remote_closed: object = field(default_factory=threading.Event)
     lock: object = field(default_factory=threading.RLock)
@@ -302,13 +307,19 @@ class Source:
             )
         ]
         self.final_event = dp.event(self.pages.device)
+        catalog = transport.Catalog(manager(self.owner).engine, self.pages.device)
         self.bulk_sender = bulk.Sender(
-            manager(self.owner).engine, req, self.pages.device
+            manager(self.owner).engine, req, self.pages.device, catalog=catalog
         )
         remote.register(self)
         self.meta = dict(
             version=VERSION,
             bulk_transport=bulk.PROTOCOL,
+            bulk_capabilities=catalog.offer,
+            d2d_group_size=self.group_size,
+            d2d_group_protocol=grouping.PACKED,
+            d2d_range_protocol=ranges.PROTOCOL,
+            d2d_token_range=self.token_range,
             reservation_required=self.epoch in getattr(self.owner, "d2d_plans", {}),
             epoch=self.epoch,
             destination=self.destination,
@@ -427,7 +438,7 @@ def execute(job, stream, cache):
         try:
             source.check_read()
         except TransportFailure:
-            if action == "read":
+            if action in {"read", "read_group"}:
                 # Positive proof for prepared cancellation: this invocation
                 # never reached a native write. A socket error is NOT this proof.
                 return reply(torch.empty(0, dtype=torch.uint8), bulk_rejected=True)
@@ -461,39 +472,78 @@ def execute(job, stream, cache):
                 job.ctx.handoff_id, expected_req=source.req
             )
             return reply(torch.empty(0, dtype=torch.uint8))
-        if action != "read":
+        if action not in {"read", "read_group"}:
             raise ValueError("unknown D2D snapshot action")
-    kind, entry = h.get("kind"), int(h["entry"])
-    if kind == "global" and 0 <= entry < len(source.globals):
-        table, indices = source.globals[entry], source.pages
-    elif kind == "state" and 0 <= entry < len(source.states):
-        _desc, table, indices = source.states[entry]
+    selected = None
+    if action == "read_group":
+        selected = grouping.validate_segments(source, h.get("segments"), LIMIT)
+        rectangle = h.get("token_range")
+        if (
+            not isinstance(rectangle, list)
+            or len(rectangle) != 2
+            or not all(type(x) is int for x in rectangle)
+            or type(h.get("layer_group")) is not int
+        ):
+            raise ValueError("invalid D2D rectangle")
+        lo, hi = rectangle
+        page = source.owner.pool.page_size
+        step = max(page, source.token_range // page * page)
+        if lo < 0 or lo % step or hi != min(lo + step, source.prefix_len) or lo >= hi:
+            raise ValueError("D2D token range outside frozen plan")
+        for segment in h["segments"]:
+            if (
+                not lo // page
+                <= segment["start"]
+                < segment["start"] + segment["count"]
+                <= (hi + page - 1) // page
+            ):
+                raise ValueError("D2D segment outside token range")
+            entry = source.schema["entries"][segment["entry"]]
+            if entry[2] // source.group_size != h["layer_group"]:
+                raise ValueError("D2D segment outside layer group")
     else:
-        raise ValueError("invalid D2D tensor group")
-    lo, count = int(h["start"]), int(h["count"])
-    if (
-        lo < 0
-        or count <= 0
-        or lo + count > indices.numel()
-        or count * table.shape[1] > LIMIT
-    ):
-        raise ValueError("D2D read range exceeds frozen ownership/budget")
+        kind, entry = h.get("kind"), int(h["entry"])
+        if kind == "global" and 0 <= entry < len(source.globals):
+            table, indices = source.globals[entry], source.pages
+        elif kind == "state" and 0 <= entry < len(source.states):
+            _desc, table, indices = source.states[entry]
+        else:
+            raise ValueError("invalid D2D tensor group")
+        lo, count = int(h["start"]), int(h["count"])
+        if (
+            lo < 0
+            or count <= 0
+            or lo + count > indices.numel()
+            or count * table.shape[1] > LIMIT
+        ):
+            raise ValueError("D2D read range exceeds frozen ownership/budget")
     region = bulk.descriptor(h.get("bulk_region"))
     sequence = h.get("bulk_sequence")
-    device = table.device
+    device = source.globals[0].device if selected is not None else table.device
     with on_device(device), on_stream(device, stream):
         if stream is not None:
             stream.wait_event(source.final_event)
-        data = table.index_select(
-            0, indices[lo : lo + count].to(torch.int64)
-        ).contiguous()
+        if selected is None:
+            data = table.index_select(
+                0, indices[lo : lo + count].to(torch.int64)
+            ).contiguous()
+        else:
+            data = torch.cat(
+                [
+                    t.index_select(0, source.pages[start : start + n].to(torch.int64))
+                    .contiguous()
+                    .view(torch.uint8)
+                    .reshape(-1)
+                    for t, start, n in selected
+                ]
+            )
         ready = dp.event(device)
         size = source.bulk_sender.write(data, ready, region, sequence)
     # Empty tensor envelope preserves the authenticated RemoteHub request lease;
     # Receiver checks the host arrival footer before consuming any KV bytes.
     return reply(
         torch.empty(0, dtype=torch.uint8),
-        bulk_protocol=bulk.PROTOCOL,
+        bulk_protocol=region["protocol"],
         bulk_nonce=region["nonce"],
         bulk_sequence=sequence,
         bulk_bytes=size,
@@ -501,7 +551,7 @@ def execute(job, stream, cache):
 
 
 class Reader:
-    def __init__(self, route, destination, epoch, timeout=600, *, owner, req):
+    def __init__(self, route, destination, epoch, timeout=600, *, owner, req, offer=None):
         self.route, self.destination, self.epoch = route, destination, epoch
         self.client = remote.runtime().TargetClient(route["host"], route["port"])
         self.client.attach(route["handoff_id"], route["token"], route["epoch"])
@@ -509,6 +559,7 @@ class Reader:
         self.timeout = timeout
         self.closed = False
         self.owner, self.req = owner, req
+        self.offer = offer if offer is not None else transport.tcp_offer()
         self.bulk = None
 
     def call(self, action, **fields):
@@ -524,7 +575,7 @@ class Reader:
             q_bytes=1024,
             **fields,
         )
-        if action != "read":
+        if action not in {"read", "read_group"}:
             response, out, _lse = self.client.call(
                 h, self.query, deadline_s=self.timeout
             )
@@ -533,7 +584,9 @@ class Reader:
             return response, out.view(torch.uint8)[: response["bytes"]]
         if self.bulk is None:
             device = self.owner.pool.get_swa_key_buffer_radix(0).device
-            self.bulk = bulk.Receiver(manager(self.owner).engine, self.req, device)
+            catalog = transport.Catalog(manager(self.owner).engine, device)
+            backend = catalog.select(self.offer)
+            self.bulk = bulk.Receiver(catalog.engines[backend], self.req, device, backend=backend)
         with self.bulk.lock:
             try:
                 h["bulk_region"] = self.bulk.prepare()
@@ -654,6 +707,10 @@ class Target(NativeTarget):
     allocation_complete: bool = False
     created: float = field(default_factory=time.monotonic)
     resources: list = field(default_factory=list)
+    group_size: int = 1
+    token_range: int = 1024
+    group_frames: int = 0
+    grouped_entries: int = 0
 
     def refresh(self):
         if (
@@ -739,6 +796,7 @@ class Target(NativeTarget):
                 self.reader.timeout,
                 owner=self.owner,
                 req=req,
+                offer=self.reader.offer,
             )
             device = pool.get_swa_key_buffer_radix(0).device
             self.copy_stream = new_stream(device)
@@ -750,39 +808,88 @@ class Target(NativeTarget):
                     ]
                     // pool.page_size
                 ).long()
-                for i, (tensor, entry) in enumerate(
-                    zip(
-                        buffers(pool, manager(self.owner)),
-                        self.owner._schema(manager(self.owner))["entries"],
-                    )
-                ):
-                    if entry[0] != "kv":
-                        continue
-                    dst = matrix(tensor, entry[-1])
-                    chunk = LIMIT // dst.shape[1]
-                    if not chunk:
-                        raise ValueError("D2D global row exceeds budget")
-                    for lo in range(0, pages.numel(), chunk):
+                tensors = buffers(pool, manager(self.owner))
+                entries = self.owner._schema(manager(self.owner))["entries"]
+                if self.token_range:
+                    coverage = ranges.Coverage(len(entries), pages.numel())
+                    for rectangle in grouping.range_frames(
+                        entries,
+                        self.coverage.prefix_len,
+                        pool.page_size,
+                        self.group_size,
+                        self.token_range,
+                        LIMIT,
+                    ):
+                        frame = rectangle["segments"]
                         if self.stop.is_set():
                             raise RuntimeError("D2D prepared import cancelled")
-                        n = min(chunk, pages.numel() - lo)
-                        _h, data = self.bulk_reader.call(
-                            "read", kind="global", entry=i, start=lo, count=n
+                        _h, data = self.bulk_reader.call("read_group", **rectangle)
+                        expected = sum(
+                            segment["count"] * entries[segment["entry"]][-1]
+                            for segment in frame
                         )
-                        if data.numel() != n * dst.shape[1]:
-                            raise ValueError("truncated D2D global rows")
-                        src = data.reshape(n, -1).to(device, non_blocking=True)
-                        scatter_prefix(
-                            dst,
-                            src,
-                            pages[lo : lo + n],
-                            lo,
-                            self.coverage.prefix_len,
-                            pool.page_size,
-                            entry[1],
-                            pool.get_extra_key_layout(entry[2]),
+                        if data.numel() != expected:
+                            raise ValueError("truncated D2D packed frame")
+                        self.group_frames += 1
+                        self.grouped_entries = max(
+                            self.grouped_entries, len({p["entry"] for p in frame})
                         )
-                    self.events[i] = dp.event(device)
+                        offset = 0
+                        for segment in frame:
+                            i, lo, count = (
+                                segment[k] for k in ("entry", "start", "count")
+                            )
+                            entry = entries[i]
+                            dst = matrix(tensors[i], entry[-1])
+                            size = count * dst.shape[1]
+                            src = data[offset : offset + size].reshape(count, -1)
+                            scatter_prefix(
+                                dst,
+                                src,
+                                pages[lo : lo + count],
+                                lo,
+                                self.coverage.prefix_len,
+                                pool.page_size,
+                                entry[1],
+                                pool.get_extra_key_layout(entry[2]),
+                            )
+                            offset += size
+                            if coverage.add(i, lo, lo + count):
+                                self.events[i] = dp.event(device)
+                else:
+                    for i, (tensor, entry) in enumerate(
+                        zip(
+                            buffers(pool, manager(self.owner)),
+                            self.owner._schema(manager(self.owner))["entries"],
+                        )
+                    ):
+                        if entry[0] != "kv":
+                            continue
+                        dst = matrix(tensor, entry[-1])
+                        chunk = LIMIT // dst.shape[1]
+                        if not chunk:
+                            raise ValueError("D2D global row exceeds budget")
+                        for lo in range(0, pages.numel(), chunk):
+                            if self.stop.is_set():
+                                raise RuntimeError("D2D prepared import cancelled")
+                            n = min(chunk, pages.numel() - lo)
+                            _h, data = self.bulk_reader.call(
+                                "read", kind="global", entry=i, start=lo, count=n
+                            )
+                            if data.numel() != n * dst.shape[1]:
+                                raise ValueError("truncated D2D global rows")
+                            src = data.reshape(n, -1).to(device, non_blocking=True)
+                            scatter_prefix(
+                                dst,
+                                src,
+                                pages[lo : lo + n],
+                                lo,
+                                self.coverage.prefix_len,
+                                pool.page_size,
+                                entry[1],
+                                pool.get_extra_key_layout(entry[2]),
+                            )
+                        self.events[i] = dp.event(device)
                 self.final_event = dp.event(device)
                 self.final_event.synchronize()
                 if not self.stop.is_set():
@@ -866,6 +973,8 @@ def handle(controller, data):
             if not destination or not target_rid:
                 raise ValueError("D2D destination and target rid cannot be empty")
             params = sampling(req)
+            group_size = grouping.size()
+            token_range = ranges.tokens()
             if getattr(req, "_dsv_d2d_source", None) is not None or not can_quiesce(
                 controller.scheduler
             ):
@@ -904,6 +1013,8 @@ def handle(controller, data):
             / epoch
             / str(controller.rank)
             / "source",
+            group_size=group_size,
+            token_range=token_range,
         )
         req._dsv_d2d_source = req._pre_layerwise_source = source
         sources[epoch] = source
@@ -1066,8 +1177,19 @@ def import_request(controller, data):
         or transfer["tp_size"] != controller.tp_size
     ):
         raise ValueError("D2D transfer epoch/TP mismatch")
+    transport.validate(transfer.get("bulk_capabilities"))
+    transport.Catalog(manager(controller).engine, controller.pool.get_swa_key_buffer_radix(0).device).select(transfer["bulk_capabilities"])
+    ranges.check_history(
+        transfer["origin_input_ids"], transfer["output_ids"], transfer["kv_len"]
+    )
     if transfer["schema"] != controller._schema(manager(controller)):
         raise ValueError("D2D model/KV/state wire schema mismatch")
+    if transfer.get("d2d_range_protocol") != ranges.PROTOCOL:
+        raise ValueError("D2D requires layer/token range protocol")
+    token_range = ranges.tokens(transfer["d2d_token_range"])
+    group_size = grouping.size(transfer.get("d2d_group_size", 1))
+    if group_size > 1 and transfer.get("d2d_group_protocol") != grouping.PACKED:
+        raise ValueError("unsupported D2D packed group protocol")
     destination = str(data["destination"])
     if destination != transfer["destination"]:
         raise ValueError("D2D destination mismatch")
@@ -1096,6 +1218,8 @@ def import_request(controller, data):
         epoch,
         LayerCoverage(transfer["kv_len"], controller.layers),
     )
+    target.group_size = group_size
+    target.token_range = token_range
     target.queue = NS(queue=[])
     targets[epoch] = target
     _tracked(controller.scheduler)[rid] = req
@@ -1121,6 +1245,7 @@ def import_request(controller, data):
             controller.config.drain_timeout,
             owner=controller,
             req=req,
+            offer=transfer["bulk_capabilities"],
         )
         session = (
             dp.plane_for(controller).engine.get_session_id() if dp.enabled() else None

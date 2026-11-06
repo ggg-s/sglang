@@ -1,0 +1,1699 @@
+{
+  "date": "2026-11-06",
+  "status": "PASS",
+  "branch": "codex/remote-attn-pre-layerwise",
+  "baseline": "5884814306731be4485f3fa7ef3666e8fbe1979e",
+  "gpu_snapshot": "/tmp/d2d-layer-groups-4060.F6ilxd",
+  "device": "NVIDIA GeForce RTX 4060 Laptop GPU",
+  "torch": "2.13.0+cu130",
+  "cuda_cases": 28,
+  "scope": "Real RTX4060 CUDA streams/events, pinned D2H/H2D, native Mooncake TCP, FlashInfer Qwen RemoteDrop and DSV sparse kernels. Tiny pools and scheduler/allocator ABI fixtures; no model weights, production SMG, cross-host RDMA or throughput acceptance.",
+  "source_sha256": {
+    "plugins/remote_attn/control_plane/p2d_driver.py": "cd2af1cdd422f3d980fbd0625581e2bf4055f678ea5b817599484af8175ef5d5",
+    "plugins/remote_attn/control_plane/p4_dsv_gateway.py": "eea990484bb5cf6f40502e095b679b3416d8595e8fb9262df8137e00244dba15",
+    "plugins/remote_attn/control_plane/p4_gateway.py": "0bd33fc6ceab7f21b779bfe9849a5720a2a7d71a89dc1bccfcb67abca4a0133f",
+    "plugins/remote_attn/sglang_remote_attn/__init__.py": "f64e878600a7775c62cd79063dbd94d92ccfd6513909f6fed3a221758ebe067f",
+    "plugins/remote_attn/sglang_remote_attn/check.py": "a7e23c69b57df34ec943df1aad40e4a4e11171fc30cb0f7fcb8ee9072bada438",
+    "plugins/remote_attn/sglang_remote_attn/compat.py": "8772dd8af6143737b0ccbd53a3a88cc441259e9cadb374e66547abe8b420a971",
+    "plugins/remote_attn/sglang_remote_attn/d2d_bulk.py": "d623a568a2beb03d79702eb466e411e01f229af3a9f589e2694fda098530cda5",
+    "plugins/remote_attn/sglang_remote_attn/d2d_groups.py": "a2f7e0046ce825309020cda398184658862d99fae9c3652a3923abeb351c465e",
+    "plugins/remote_attn/sglang_remote_attn/decode_overlap.py": "cc946c7c27d3337a569e2d175f61dfc9546713887068db9570081ceb98745ea5",
+    "plugins/remote_attn/sglang_remote_attn/destination_cache.py": "3b6f693b02bb3b75c77ddf9d3f82f83a9c7dffc54f2b46c10ae7f76b64c9fb14",
+    "plugins/remote_attn/sglang_remote_attn/dsv41_fast.py": "fd894d78b27530a914cd72ed19d9abcaaf137f533c1e1643be280d0623b6c470",
+    "plugins/remote_attn/sglang_remote_attn/dsv41_graph.py": "8d26ac9eed337db0764aca93ce638b1e58bd34d19a6962b139c5f508d31fc946",
+    "plugins/remote_attn/sglang_remote_attn/dsv41_kernels.py": "5ae677e1f1c8f3a1bd06fa3127fecfa97bb414eca9dd196d7266605bb0877d9a",
+    "plugins/remote_attn/sglang_remote_attn/dsv41_layerwise.py": "b4c231d4d1e03234cf30e750435c5c7f5414cd5ecf38991410f90de8b68e4df5",
+    "plugins/remote_attn/sglang_remote_attn/dsv41_paged.py": "6b413fe3eeca846c51b800c32467b8779a384b91ee6765ee914987bde6412d2f",
+    "plugins/remote_attn/sglang_remote_attn/dsv41_progressive.py": "3573ab543f774425de4a440a59ca1fb25fd7443b73858a43537a49c24950eb13",
+    "plugins/remote_attn/sglang_remote_attn/dsv41_receive.py": "499cb18fb58dd4f4dac92b3121a4bd2c39d6a5ce9e76aa7ceddb6d26e8c944bf",
+    "plugins/remote_attn/sglang_remote_attn/dsv41_remote.py": "507430211aa9004520e33b10774764c3478b8c0b64411ee03cafffef96c5b77d",
+    "plugins/remote_attn/sglang_remote_attn/dsv41_rpc.py": "3e5da18fa8647120237ac0fc285a40a6bf486fb94a2b7bde2c5040de23cadb38",
+    "plugins/remote_attn/sglang_remote_attn/dsv41_sparse_math.py": "174980ce3bffac2e1791c0bfdce6c6f823275a47ad0be120f3a3a110d6c9f56e",
+    "plugins/remote_attn/sglang_remote_attn/dsv41_staging.py": "5b90acab85161dc63dc6ea50dee59a3c56f1eaf28b9dad92252a0fcba422a6df",
+    "plugins/remote_attn/sglang_remote_attn/dsv_d2d.py": "db986ef1d58991d8d2c05f0de12df3b675578c1cad1d1c84ed499ddde7cabe9a",
+    "plugins/remote_attn/sglang_remote_attn/dsv_d2d_reservation.py": "9bac09bf348f8ebb87f44da3d1523b9b8540141f347cef2228ca55dd0fbf5eb7",
+    "plugins/remote_attn/sglang_remote_attn/dsv_gateway_control.py": "354fe306823f7216cfb2b0814986045ae55e82a32ce258f6e7dad4e23a968740",
+    "plugins/remote_attn/sglang_remote_attn/handoff_control.py": "30616cfa420437c681772f6f52d5ed62bd91bb945a3872d57c7d0ef3f7bb1d6f",
+    "plugins/remote_attn/sglang_remote_attn/hooks.py": "230051690e9b4675dd06e17279adf6510b4daeae085fb1cd80c4abd2dfe1e5ed",
+    "plugins/remote_attn/sglang_remote_attn/interfaces.py": "d471a011bfd194f212713588fdd9deb635c7738cf80b08aa2cefa4e942f895c2",
+    "plugins/remote_attn/sglang_remote_attn/pd_mesh.py": "0c188d26f07f3a4626c14f1e5dbfd3b2352d39d481e13d48a93203d8513cd3ed",
+    "plugins/remote_attn/sglang_remote_attn/pre_layerwise.py": "d5b3f178e7f8932db6c51cda032fc65c71d0389081112093b587a8549f4d4e41",
+    "plugins/remote_attn/sglang_remote_attn/prefill_admission.py": "4894fb9d626dfd01f9a98b483f6febd4720653f95cb8fd4454f44cf9053a9e00",
+    "plugins/remote_attn/sglang_remote_attn/prefill_overlap.py": "8528da51b28ed4621d439b13dd9d2f621256fea73f8f32f8f304028b54f0edd0",
+    "plugins/remote_attn/sglang_remote_attn/prefix_stream.py": "d05526c327087a86fc9b93cf0095fa890c70de20cf11695e57cecedb96cdf26f",
+    "plugins/remote_attn/sglang_remote_attn/remote_data_plane.py": "8cc786588c5dc3361450ce1abdd915f3c6eef847e694dba93c9666be1b92daf2",
+    "plugins/remote_attn/sglang_remote_attn/retirement.py": "b8bff23a87fc6aa5b743589756dc18967fe160ccdf7de59672df178497f45f09",
+    "plugins/remote_attn/sglang_remote_attn/segmented_graph.py": "7fa3205eef1e7b044a972b40a4502671edefb5c3247c9e0deecffaccbbda389b",
+    "plugins/remote_attn/sglang_remote_attn/source_cache.py": "c60d91df378a70378893e436b9ec901f7cb8ada4d29a5bfb59578bf450bf5146",
+    "plugins/remote_attn/sglang_remote_attn/source_resources.py": "2e35ee2d617d45b44e3d32595f8b7a0b7434240d42349bab2ab906f004d0c418",
+    "plugins/remote_attn/sglang_remote_attn/swa_checkpoints.py": "e280dd79afcc5fbcef451e41bfd67c657b381b9f9c2e374753cbf6b89a5b2024",
+    "plugins/remote_attn/sglang_remote_attn/tp.py": "766b5028a3a08a801c2891580e406a40f1868d7d21cde8ef46be1d76b86b059c",
+    "plugins/remote_attn/sglang_remote_attn/transfer_priority.py": "ed9226f61d2b3612cffbd3e7b66f30a26bcd3feaaa654b61a43fa11612377aee",
+    "plugins/remote_attn/sglang_remote_attn/transport_failure.py": "37fff73986d65af4eb9bb546760529f739a63004c67a0b4581dc7586584332c4",
+    "python/sglang/kernels/ops/attention/dsv4/kv_layout.py": "85f012a8a5c3cd1a534e5250030b4085ebd9f2dfac83c1fca4b5d9cbc771a8a4",
+    "python/sglang/srt/disaggregation/decode.py": "8efea196e4d5facb7ecec504417a1ef0e57296de3a7270f3769e4d4b68bec328",
+    "python/sglang/srt/disaggregation/pinned_staging_buffer.py": "dc484b3d66bba9c3ab5403331c14ad78e619b07408289814f63cc0276cbb61df",
+    "python/sglang/srt/distributed/device_communicators/mooncake_transfer_engine.py": "3324cb41e0ef7e8b25aec46711b66f9ba3e3a68d4f010d1e11beaf610a9753ff",
+    "python/sglang/srt/layers/attention/deepseek_v4_backend.py": "70498af7eafc15bbb9d9a6b6b995415766139233433851e0e3bbfc4635129ac9",
+    "python/sglang/srt/mem_cache/deepseek_v4_compress_state.py": "20fe9fd0d022ad8ef0800da95c9956800187639abc8df853c607d0f7cc97247a",
+    "python/sglang/srt/mem_cache/deepseek_v4_memory_pool.py": "1782124ee47755cc77d3458be77bdae1c10153849d96f58ddca78aff7e4b21b3",
+    "python/sglang/test/kernels/deepseek_v4/dsv41_kv_quant_reference.py": "7370805c53323eaf0059fc4987688aac59a8ca4c80aefb673e87b002a31e3292",
+    "python/sglang/test/kernels/deepseek_v4/k_cache_reference.py": "5dbf65f377a6e0730162e1d9636375e9788838f75f054850de3e50d2879db55f",
+    "test/manual/remote_attn/cuda_handoff_probe.py": "1c86703a3a7380a844fc092acb7d04bbfce2df31677772ca98017b8e0c940e20",
+    "test/manual/remote_attn/dsv41_fast_cuda_probe.py": "6368e249ce1bb5de53af7c2fe034f7d28fa816b999baeade0db4ffbd2b8eaaa1",
+    "test/manual/remote_attn/dsv41_graph_probe_support.py": "058999d47890646d91496fb7172f44f6096535a65986f889bd6554fb68c30b9d",
+    "test/manual/remote_attn/dsv41_hopper_cuda_probe.py": "f8afb5e9242abd60fd564fbe815a70639b9d6e4ea9db7dfd8fe03d9f7cb5db66",
+    "test/manual/remote_attn/dsv41_host_staging_cuda_probe.py": "a6f3b419f4704b0a34a7a844ac014b1ad6f76fff2d6f97451d27944a034180cc",
+    "test/manual/remote_attn/dsv41_progressive_probe_support.py": "38426dc9de227cadf2e5cc5a5fcd11f64885277677fcbf05cd72fc285fa3a7f3",
+    "test/manual/remote_attn/dsv41_receive_staging_cuda_probe.py": "f09abc2c82d80f829f2256436dd380e2da9dd136292e52dc1e225c1549639274",
+    "test/manual/remote_attn/dsv41_remote_cuda_probe.py": "c1b91162846c2fea3578e409188b37a9919d896dd193d7ba341ea7e7f2311be0",
+    "test/manual/remote_attn/dsv41_remote_probe_support.py": "eda67756ba392faa9bba5f5f32cae68e8676547fc0838c2370bbacd32bde4bf2",
+    "test/manual/remote_attn/dsv41_segmented_graph_probe.py": "a8868538a8813972fcef5bcfcb5cd4d0fa800f7df3c84e160349c1a9db9c8978",
+    "test/manual/remote_attn/dsv41_staging_probe_support.py": "a6648119f94c48ab330128abcf5eab4b1c01abda00b43fcc5c27e2ef8087399d",
+    "test/manual/remote_attn/dsv_d2d_bulk_cuda_review.py": "d798c7bae275acc7c96c60e877c4408156de62e5cbbe15758497b87e4964cda8",
+    "test/manual/remote_attn/dsv_d2d_cuda_probe.py": "feaa3655244ff1a27b7d78abee3f1a8b73b52bfe566e9e688c257b93ea0d6f6a",
+    "test/manual/remote_attn/dsv_d2d_probe_support.py": "d1912f2a86e58e884028ed6b0ea28ccc227afd07c81f1acf696282afa40e3f89",
+    "test/manual/remote_attn/dsv_d2d_tp_worker.py": "112f92c6cfdd75feebc339c5d1c717c168a3667377f1191ba5a42a3253eac948",
+    "test/manual/remote_attn/flash0731_cuda_probe.py": "2bd4ffb50638d08680dc179aba225e08bb009d1f00df2d24e115aa81b6a7444e",
+    "test/manual/remote_attn/flash0731_probe_support.py": "baa2edee8dc696b279d1843fd10ea2359b0e0e711a1f28b693dc08b445cae178",
+    "test/manual/remote_attn/full_capture_scope_probe.py": "b0ec48e4ca1d27276cb43bdeba118c72fea81c803e66d423b40354733772d1ab",
+    "test/manual/remote_attn/group_layer_cuda_probe.py": "0cb500f7e59333e910a147359afe345dff8730183fb9271d4f34b77f66d43ca9",
+    "test/manual/remote_attn/p4_dsv_gateway_worker.py": "f46c9c8963b9e08e84743f893d903b75ecdfad7e06e193b16ec3f5dfeb2fae56",
+    "test/manual/remote_attn/p4_dsv_probe_support.py": "ea896130ede238d079ba3c31745f83f0a96df77e8b735faf432cd6acd1215e69",
+    "test/manual/remote_attn/pd_mesh_probe_support.py": "4e7be864e3b1531534693df11a23999027ed4df52bc50214155d9f0b4638cdc4",
+    "test/manual/remote_attn/pre_layerwise_report.py": "b99f02e4bc83f1aadea093925e8bee7d3c1dadee9552a0026cabbf6155f42280",
+    "test/manual/remote_attn/pre_layerwise_staging_probe.py": "9dbf366e251a051eb853b5338cf60255b783319cf2ffb174c7d90b0f1a8daa9c",
+    "test/manual/remote_attn/prefill_overlap_cuda_probe.py": "530197accd810c2c42e06e5a62cb4f10a78f6e40e1e6d33fa173aeb2e8320ce5",
+    "test/manual/remote_attn/remote_final_forward_cuda_probe.py": "f4a3b0c2021915f2501fb2b923353df1629494e14d1bf7803ee4adf2690165f2",
+    "test/manual/remote_attn/remote_gpu_lifetime_probe.py": "bd94aeb1f184f39d8e5697a783838e9bef3be4a1bd3290dbeac1c1b28a4362f3",
+    "test/manual/remote_attn/remote_gpu_probe_support.py": "021abaf8b36d0727e139c74b951d4f66ed9939b6793c1be09fc89d75aec027d4",
+    "test/manual/remote_attn/segmented_graph_probe.py": "1a567d9ebfb1b3dc7930c1bb52be11d6275bc134fee82544318be132a5691cb0",
+    "test/manual/remote_attn/staging_recovery_cuda_probe.py": "2c195dd58cb9d831d94ac5d0eecce104c2a40f3235c67fd154254f7b3658d3e8",
+    "test/manual/remote_attn/tp_control_worker.py": "947e6e65e91f36557369ae74c17a488b0d8b2f9c692a4af4f34437a97dda3ebd",
+    "test/manual/remote_attn/verify_dsv41_prepare_dispatch.py": "7a9975af2bd2fc83c91b583f203f0d4c7f358230807fdcdf8900fc3530df4c22",
+    "test/registered/unit/plugins/test_remote_attn.py": "65a1e804d29cf41c58b0eec2ec1f3b76ed5ab5fdc3030818df6d1c73762521c4"
+  },
+  "qwen": {
+    "status": "PASS",
+    "device": "NVIDIA GeForce RTX 4060 Laptop GPU",
+    "torch": "2.13.0+cu130",
+    "suite": "qwen",
+    "cases": [
+      {
+        "mode": "fast-async",
+        "dtype": "float16",
+        "slots": 2,
+        "source_buffers": 4,
+        "compute_steps": 190,
+        "overlap": null,
+        "layer_ready_at": [
+          1025936.951099474,
+          1025936.952353621,
+          1025936.963350498,
+          1025936.964548371,
+          1025936.974922352,
+          1025936.975314189
+        ],
+        "target_registration": {
+          "live": 0,
+          "owners": 0,
+          "bytes_live": 0,
+          "max_bytes_live": 2097152,
+          "registrations": 1,
+          "unregistrations": 1,
+          "overlap_rejections": 0,
+          "stale_rejections": 0,
+          "unregister_failures": 0,
+          "stale": 0,
+          "last_unregister_error": null
+        },
+        "source": {
+          "registration": {
+            "live": 0,
+            "owners": 0,
+            "bytes_live": 0,
+            "max_bytes_live": 4194304,
+            "registrations": 1,
+            "unregistrations": 1,
+            "overlap_rejections": 0,
+            "stale_rejections": 0,
+            "unregister_failures": 0,
+            "stale": 0,
+            "last_unregister_error": null
+          },
+          "native_batches": [
+            {
+              "kind": "async",
+              "descriptors": 4,
+              "bytes": 2097152
+            },
+            {
+              "kind": "async",
+              "descriptors": 4,
+              "bytes": 2097152
+            },
+            {
+              "kind": "async",
+              "descriptors": 4,
+              "bytes": 2097152
+            }
+          ],
+          "group_size": 2,
+          "stats": {
+            "de0c5c9ae478f8c9d6daa3b7786333dc": {
+              "bytes": 6291456,
+              "send_ms": 402.75827201548964,
+              "engine": "fast_gpu_layers",
+              "pipeline": 4,
+              "streams": 2,
+              "async": true,
+              "target_slots": 2,
+              "group_size": 2,
+              "effective_group_size": 2,
+              "submitted_groups": [
+                [
+                  0,
+                  1
+                ],
+                [
+                  2,
+                  3
+                ],
+                [
+                  4,
+                  5
+                ]
+              ],
+              "start_at": 1025936.644799126,
+              "accept_at": 1025936.635840981,
+              "done_at": 1025936.974276962,
+              "stage_alloc_ms": 4.023922025226057,
+              "stage_register_ms": 0.7604229031130672,
+              "thread_start_at": 1025936.571506995,
+              "layers": [
+                {
+                  "layer": 0,
+                  "copy_ms": 8.320785011164844,
+                  "te_ms": 14.196970965713263,
+                  "copy_start_at": 1025936.644817346,
+                  "te_done_at": 1025936.667482323,
+                  "ctrl_at": 1025936.667535649,
+                  "bytes": 1048576
+                },
+                {
+                  "layer": 1,
+                  "copy_ms": 0.6756340153515339,
+                  "te_ms": 298.18120202980936,
+                  "copy_start_at": 1025936.652607823,
+                  "te_done_at": 1025936.951469697,
+                  "ctrl_at": 1025936.951506314,
+                  "bytes": 1048576
+                },
+                {
+                  "layer": 2,
+                  "copy_ms": 0.3762500127777457,
+                  "te_ms": 9.848037967458367,
+                  "copy_start_at": 1025936.655677079,
+                  "te_done_at": 1025936.962426074,
+                  "ctrl_at": 1025936.962477883,
+                  "bytes": 1048576
+                },
+                {
+                  "layer": 3,
+                  "copy_ms": 295.56004307232797,
+                  "te_ms": 11.107995989732444,
+                  "copy_start_at": 1025936.655905568,
+                  "te_done_at": 1025936.963689188,
+                  "ctrl_at": 1025936.963782902,
+                  "bytes": 1048576
+                },
+                {
+                  "layer": 4,
+                  "copy_ms": 0.46325603034347296,
+                  "te_ms": 9.374484070576727,
+                  "copy_start_at": 1025936.952664201,
+                  "te_done_at": 1025936.974176418,
+                  "ctrl_at": 1025936.974230295,
+                  "bytes": 1048576
+                },
+                {
+                  "layer": 5,
+                  "copy_ms": 10.763250989839435,
+                  "te_ms": 9.42945689894259,
+                  "copy_start_at": 1025936.952923229,
+                  "te_done_at": 1025936.974234898,
+                  "ctrl_at": 1025936.974244847,
+                  "bytes": 1048576
+                }
+              ],
+              "rc": 0
+            }
+          },
+          "hub": null
+        },
+        "requested_group_size": 2,
+        "effective_group_size": 2,
+        "native_batches_count": 3,
+        "layers": 6
+      },
+      {
+        "mode": "fast-async",
+        "dtype": "bfloat16",
+        "slots": 3,
+        "source_buffers": 3,
+        "compute_steps": 201,
+        "overlap": null,
+        "layer_ready_at": [
+          1025939.930947769,
+          1025939.931523334,
+          1025939.931988214,
+          1025939.950496229,
+          1025939.950910699,
+          1025939.951545908
+        ],
+        "target_registration": {
+          "live": 0,
+          "owners": 0,
+          "bytes_live": 0,
+          "max_bytes_live": 3145728,
+          "registrations": 2,
+          "unregistrations": 2,
+          "overlap_rejections": 0,
+          "stale_rejections": 0,
+          "unregister_failures": 0,
+          "stale": 0,
+          "last_unregister_error": null
+        },
+        "source": {
+          "registration": {
+            "live": 0,
+            "owners": 0,
+            "bytes_live": 0,
+            "max_bytes_live": 3145728,
+            "registrations": 1,
+            "unregistrations": 1,
+            "overlap_rejections": 0,
+            "stale_rejections": 0,
+            "unregister_failures": 0,
+            "stale": 0,
+            "last_unregister_error": null
+          },
+          "native_batches": [
+            {
+              "kind": "async",
+              "descriptors": 6,
+              "bytes": 3145728
+            },
+            {
+              "kind": "async",
+              "descriptors": 6,
+              "bytes": 3145728
+            }
+          ],
+          "group_size": 3,
+          "stats": {
+            "1ee857a51b30c76deac362dc7eaebf3a": {
+              "bytes": 6291456,
+              "send_ms": 221.40050295274705,
+              "engine": "fast_gpu_layers",
+              "pipeline": 3,
+              "streams": 2,
+              "async": true,
+              "target_slots": 3,
+              "group_size": 3,
+              "effective_group_size": 3,
+              "submitted_groups": [
+                [
+                  0,
+                  1,
+                  2
+                ],
+                [
+                  3,
+                  4,
+                  5
+                ]
+              ],
+              "start_at": 1025939.737251998,
+              "accept_at": 1025939.731174815,
+              "done_at": 1025939.949641608,
+              "stage_alloc_ms": 4.635421093553305,
+              "stage_register_ms": 0.15819899272173643,
+              "thread_start_at": 1025939.728232541,
+              "layers": [
+                {
+                  "layer": 0,
+                  "copy_ms": 2.0736519945785403,
+                  "te_ms": 21.881088032387197,
+                  "copy_start_at": 1025939.737267201,
+                  "te_done_at": 1025939.761355715,
+                  "ctrl_at": 1025939.761407604,
+                  "bytes": 1048576
+                },
+                {
+                  "layer": 1,
+                  "copy_ms": 0.6149559048935771,
+                  "te_ms": 21.935297991149127,
+                  "copy_start_at": 1025939.738729619,
+                  "te_done_at": 1025939.761412344,
+                  "ctrl_at": 1025939.761420386,
+                  "bytes": 1048576
+                },
+                {
+                  "layer": 2,
+                  "copy_ms": 0.2559999702498317,
+                  "te_ms": 21.940044010989368,
+                  "copy_start_at": 1025939.739217511,
+                  "te_done_at": 1025939.761421944,
+                  "ctrl_at": 1025939.761427651,
+                  "bytes": 1048576
+                },
+                {
+                  "layer": 3,
+                  "copy_ms": 0.6395420059561729,
+                  "te_ms": 17.14070700109005,
+                  "copy_start_at": 1025939.761429236,
+                  "te_done_at": 1025939.949542769,
+                  "ctrl_at": 1025939.949597005,
+                  "bytes": 1048576
+                },
+                {
+                  "layer": 4,
+                  "copy_ms": 169.76741002872586,
+                  "te_ms": 17.195144086144865,
+                  "copy_start_at": 1025939.761796047,
+                  "te_done_at": 1025939.949600823,
+                  "ctrl_at": 1025939.949608089,
+                  "bytes": 1048576
+                },
+                {
+                  "layer": 5,
+                  "copy_ms": 170.08487007115036,
+                  "te_ms": 17.20301096793264,
+                  "copy_start_at": 1025939.761870176,
+                  "te_done_at": 1025939.949609454,
+                  "ctrl_at": 1025939.94961491,
+                  "bytes": 1048576
+                }
+              ],
+              "rc": 0
+            }
+          },
+          "hub": null
+        },
+        "requested_group_size": 3,
+        "effective_group_size": 3,
+        "native_batches_count": 2,
+        "layers": 6
+      },
+      {
+        "mode": "fast-sync",
+        "dtype": "float16",
+        "slots": 4,
+        "source_buffers": 4,
+        "compute_steps": 315,
+        "overlap": null,
+        "layer_ready_at": [
+          1025942.014926429,
+          1025942.01549175,
+          1025942.016075628,
+          1025942.017065885,
+          1025942.026354439,
+          1025942.026820064
+        ],
+        "target_registration": {
+          "live": 0,
+          "owners": 0,
+          "bytes_live": 0,
+          "max_bytes_live": 4194304,
+          "registrations": 3,
+          "unregistrations": 3,
+          "overlap_rejections": 0,
+          "stale_rejections": 0,
+          "unregister_failures": 0,
+          "stale": 0,
+          "last_unregister_error": null
+        },
+        "source": {
+          "registration": {
+            "live": 0,
+            "owners": 0,
+            "bytes_live": 0,
+            "max_bytes_live": 4194304,
+            "registrations": 1,
+            "unregistrations": 1,
+            "overlap_rejections": 0,
+            "stale_rejections": 0,
+            "unregister_failures": 0,
+            "stale": 0,
+            "last_unregister_error": null
+          },
+          "native_batches": [
+            {
+              "kind": "sync",
+              "descriptors": 8,
+              "bytes": 4194304
+            },
+            {
+              "kind": "sync",
+              "descriptors": 4,
+              "bytes": 2097152
+            }
+          ],
+          "group_size": 4,
+          "stats": {
+            "74ff5281688e10781bbb817efb9e22e1": {
+              "bytes": 6291456,
+              "send_ms": 46.81246099062264,
+              "engine": "fast_gpu_layers",
+              "pipeline": 4,
+              "streams": 1,
+              "async": false,
+              "target_slots": 4,
+              "group_size": 4,
+              "effective_group_size": 4,
+              "submitted_groups": [
+                [
+                  0,
+                  1,
+                  2,
+                  3
+                ],
+                [
+                  4,
+                  5
+                ]
+              ],
+              "start_at": 1025941.987164376,
+              "accept_at": 1025941.980742403,
+              "done_at": 1025942.025550604,
+              "stage_alloc_ms": 3.4002569736912847,
+              "stage_register_ms": 0.18893997184932232,
+              "thread_start_at": 1025941.978729925,
+              "layers": [
+                {
+                  "layer": 0,
+                  "copy_ms": 2.0175400422886014,
+                  "te_ms": 24.230671930126846,
+                  "copy_start_at": 1025941.98717909,
+                  "te_done_at": 1025942.01381798,
+                  "ctrl_at": 1025942.013875946,
+                  "bytes": 1048576
+                },
+                {
+                  "layer": 1,
+                  "copy_ms": 0.32664905302226543,
+                  "te_ms": 24.2860889993608,
+                  "copy_start_at": 1025941.988873478,
+                  "te_done_at": 1025942.013877703,
+                  "ctrl_at": 1025942.01388649,
+                  "bytes": 1048576
+                },
+                {
+                  "layer": 2,
+                  "copy_ms": 0.3754739882424474,
+                  "te_ms": 24.290855042636395,
+                  "copy_start_at": 1025941.989007102,
+                  "te_done_at": 1025942.013887062,
+                  "ctrl_at": 1025942.013893208,
+                  "bytes": 1048576
+                },
+                {
+                  "layer": 3,
+                  "copy_ms": 0.477310037240386,
+                  "te_ms": 24.29656300228089,
+                  "copy_start_at": 1025941.989109125,
+                  "te_done_at": 1025942.01389354,
+                  "ctrl_at": 1025942.013897876,
+                  "bytes": 1048576
+                },
+                {
+                  "layer": 4,
+                  "copy_ms": 0.47720596194267273,
+                  "te_ms": 9.457514039240777,
+                  "copy_start_at": 1025942.013902895,
+                  "te_done_at": 1025942.025455216,
+                  "ctrl_at": 1025942.025508466,
+                  "bytes": 1048576
+                },
+                {
+                  "layer": 5,
+                  "copy_ms": 1.0979489888995886,
+                  "te_ms": 9.498768020421267,
+                  "copy_start_at": 1025942.014240482,
+                  "te_done_at": 1025942.025511227,
+                  "ctrl_at": 1025942.0255212,
+                  "bytes": 1048576
+                }
+              ],
+              "rc": 0
+            }
+          },
+          "hub": null
+        },
+        "requested_group_size": 4,
+        "effective_group_size": 4,
+        "native_batches_count": 2,
+        "layers": 6
+      },
+      {
+        "mode": "fast-async",
+        "dtype": "float16",
+        "slots": 1,
+        "source_buffers": 3,
+        "compute_steps": 627,
+        "overlap": null,
+        "layer_ready_at": [
+          1025944.652719818,
+          1025944.661911289,
+          1025944.674090149,
+          1025944.682467879,
+          1025944.690804205,
+          1025944.699324021
+        ],
+        "target_registration": {
+          "live": 0,
+          "owners": 0,
+          "bytes_live": 0,
+          "max_bytes_live": 4194304,
+          "registrations": 4,
+          "unregistrations": 4,
+          "overlap_rejections": 0,
+          "stale_rejections": 0,
+          "unregister_failures": 0,
+          "stale": 0,
+          "last_unregister_error": null
+        },
+        "source": {
+          "registration": {
+            "live": 0,
+            "owners": 0,
+            "bytes_live": 0,
+            "max_bytes_live": 4194304,
+            "registrations": 1,
+            "unregistrations": 1,
+            "overlap_rejections": 0,
+            "stale_rejections": 0,
+            "unregister_failures": 0,
+            "stale": 0,
+            "last_unregister_error": null
+          },
+          "native_batches": [
+            {
+              "kind": "async",
+              "descriptors": 2,
+              "bytes": 1048576
+            },
+            {
+              "kind": "async",
+              "descriptors": 2,
+              "bytes": 1048576
+            },
+            {
+              "kind": "async",
+              "descriptors": 2,
+              "bytes": 1048576
+            },
+            {
+              "kind": "async",
+              "descriptors": 2,
+              "bytes": 1048576
+            },
+            {
+              "kind": "async",
+              "descriptors": 2,
+              "bytes": 1048576
+            },
+            {
+              "kind": "async",
+              "descriptors": 2,
+              "bytes": 1048576
+            }
+          ],
+          "group_size": 4,
+          "stats": {
+            "b907f5b99e70cbdb7995319a1528697a": {
+              "bytes": 6291456,
+              "send_ms": 76.80069690104574,
+              "engine": "fast_gpu_layers",
+              "pipeline": 4,
+              "streams": 2,
+              "async": true,
+              "target_slots": 1,
+              "group_size": 4,
+              "effective_group_size": 1,
+              "submitted_groups": [
+                [
+                  0
+                ],
+                [
+                  1
+                ],
+                [
+                  2
+                ],
+                [
+                  3
+                ],
+                [
+                  4
+                ],
+                [
+                  5
+                ]
+              ],
+              "start_at": 1025944.632593881,
+              "accept_at": 1025944.623549043,
+              "done_at": 1025944.698793061,
+              "stage_alloc_ms": 14.690138981677592,
+              "stage_register_ms": 0.18467602785676718,
+              "thread_start_at": 1025944.621965095,
+              "layers": [
+                {
+                  "layer": 0,
+                  "copy_ms": 5.345001933164895,
+                  "te_ms": 13.282374944537878,
+                  "copy_start_at": 1025944.632608306,
+                  "te_done_at": 1025944.651239,
+                  "ctrl_at": 1025944.651293724,
+                  "bytes": 1048576
+                },
+                {
+                  "layer": 1,
+                  "copy_ms": 1.2257280759513378,
+                  "te_ms": 7.9774390906095505,
+                  "copy_start_at": 1025944.641211327,
+                  "te_done_at": 1025944.661070914,
+                  "ctrl_at": 1025944.661114415,
+                  "bytes": 1048576
+                },
+                {
+                  "layer": 2,
+                  "copy_ms": 0.5222330801188946,
+                  "te_ms": 10.942013934254646,
+                  "copy_start_at": 1025944.653143381,
+                  "te_done_at": 1025944.673160858,
+                  "ctrl_at": 1025944.673205331,
+                  "bytes": 1048576
+                },
+                {
+                  "layer": 3,
+                  "copy_ms": 0.5244379863142967,
+                  "te_ms": 7.502743974328041,
+                  "copy_start_at": 1025944.662264352,
+                  "te_done_at": 1025944.681939171,
+                  "ctrl_at": 1025944.681975128,
+                  "bytes": 1048576
+                },
+                {
+                  "layer": 4,
+                  "copy_ms": 0.36297005135565996,
+                  "te_ms": 7.519761915318668,
+                  "copy_start_at": 1025944.674477867,
+                  "te_done_at": 1025944.690223596,
+                  "ctrl_at": 1025944.690267068,
+                  "bytes": 1048576
+                },
+                {
+                  "layer": 5,
+                  "copy_ms": 0.3524740459397435,
+                  "te_ms": 7.670414983294904,
+                  "copy_start_at": 1025944.68275284,
+                  "te_done_at": 1025944.69871516,
+                  "ctrl_at": 1025944.698748302,
+                  "bytes": 1048576
+                }
+              ],
+              "rc": 0
+            }
+          },
+          "hub": null
+        },
+        "requested_group_size": 4,
+        "effective_group_size": 1,
+        "native_batches_count": 6,
+        "layers": 6
+      },
+      {
+        "mode": "fast-async",
+        "dtype": "bfloat16",
+        "slots": 0,
+        "source_buffers": 6,
+        "compute_steps": 559,
+        "overlap": null,
+        "layer_ready_at": [
+          1025946.639975672,
+          1025946.640627364,
+          1025946.641073982,
+          1025946.652835977,
+          1025946.653244576,
+          1025946.653753747
+        ],
+        "target_registration": {
+          "live": 0,
+          "owners": 0,
+          "bytes_live": 0,
+          "max_bytes_live": 6291456,
+          "registrations": 5,
+          "unregistrations": 5,
+          "overlap_rejections": 0,
+          "stale_rejections": 0,
+          "unregister_failures": 0,
+          "stale": 0,
+          "last_unregister_error": null
+        },
+        "source": {
+          "registration": {
+            "live": 0,
+            "owners": 0,
+            "bytes_live": 0,
+            "max_bytes_live": 6291456,
+            "registrations": 1,
+            "unregistrations": 1,
+            "overlap_rejections": 0,
+            "stale_rejections": 0,
+            "unregister_failures": 0,
+            "stale": 0,
+            "last_unregister_error": null
+          },
+          "native_batches": [
+            {
+              "kind": "async",
+              "descriptors": 6,
+              "bytes": 3145728
+            },
+            {
+              "kind": "async",
+              "descriptors": 6,
+              "bytes": 3145728
+            }
+          ],
+          "group_size": 3,
+          "stats": {
+            "5c9b411d67979004e09b0222b848a697": {
+              "bytes": 6291456,
+              "send_ms": 49.6122760232538,
+              "engine": "fast_gpu_layers",
+              "pipeline": 6,
+              "streams": 2,
+              "async": true,
+              "target_slots": 0,
+              "group_size": 3,
+              "effective_group_size": 3,
+              "submitted_groups": [
+                [
+                  0,
+                  1,
+                  2
+                ],
+                [
+                  3,
+                  4,
+                  5
+                ]
+              ],
+              "start_at": 1025946.613825602,
+              "accept_at": 1025946.603727213,
+              "done_at": 1025946.652150783,
+              "stage_alloc_ms": 3.7931519327685237,
+              "stage_register_ms": 0.09905302431434393,
+              "thread_start_at": 1025946.602528083,
+              "layers": [
+                {
+                  "layer": 0,
+                  "copy_ms": 2.324129920452833,
+                  "te_ms": 22.46373298112303,
+                  "copy_start_at": 1025946.613839187,
+                  "te_done_at": 1025946.638813369,
+                  "ctrl_at": 1025946.638890069,
+                  "bytes": 1048576
+                },
+                {
+                  "layer": 1,
+                  "copy_ms": 0.6174599984660745,
+                  "te_ms": 22.543812985531986,
+                  "copy_start_at": 1025946.615560214,
+                  "te_done_at": 1025946.638896075,
+                  "ctrl_at": 1025946.638909216,
+                  "bytes": 1048576
+                },
+                {
+                  "layer": 2,
+                  "copy_ms": 0.30385598074644804,
+                  "te_ms": 22.5578109966591,
+                  "copy_start_at": 1025946.616044451,
+                  "te_done_at": 1025946.63891106,
+                  "ctrl_at": 1025946.638920679,
+                  "bytes": 1048576
+                },
+                {
+                  "layer": 3,
+                  "copy_ms": 0.3281600074842572,
+                  "te_ms": 33.16435602027923,
+                  "copy_start_at": 1025946.618301388,
+                  "te_done_at": 1025946.652059733,
+                  "ctrl_at": 1025946.652108674,
+                  "bytes": 1048576
+                },
+                {
+                  "layer": 4,
+                  "copy_ms": 0.3342899726703763,
+                  "te_ms": 33.21492508985102,
+                  "copy_start_at": 1025946.618450164,
+                  "te_done_at": 1025946.652112285,
+                  "ctrl_at": 1025946.652118436,
+                  "bytes": 1048576
+                },
+                {
+                  "layer": 5,
+                  "copy_ms": 0.36565109621733427,
+                  "te_ms": 33.22113398462534,
+                  "copy_start_at": 1025946.618529078,
+                  "te_done_at": 1025946.652119147,
+                  "ctrl_at": 1025946.652124582,
+                  "bytes": 1048576
+                }
+              ],
+              "rc": 0
+            }
+          },
+          "hub": null
+        },
+        "requested_group_size": 3,
+        "effective_group_size": 3,
+        "native_batches_count": 2,
+        "layers": 6
+      },
+      {
+        "mode": "cpu-layer",
+        "dtype": "bfloat16",
+        "slots": 0,
+        "source_buffers": 1,
+        "compute_steps": 355,
+        "overlap": null,
+        "layer_ready_at": [
+          1025948.990298695,
+          1025948.992433499,
+          1025948.999360162,
+          1025949.000096758,
+          1025949.009052462,
+          1025949.00957065
+        ],
+        "target_registration": {
+          "live": 0,
+          "owners": 0,
+          "bytes_live": 0,
+          "max_bytes_live": 6291456,
+          "registrations": 6,
+          "unregistrations": 6,
+          "overlap_rejections": 0,
+          "stale_rejections": 0,
+          "unregister_failures": 0,
+          "stale": 0,
+          "last_unregister_error": null
+        },
+        "source": {
+          "registration": {
+            "live": 0,
+            "owners": 0,
+            "bytes_live": 0,
+            "max_bytes_live": 6291456,
+            "registrations": 1,
+            "unregistrations": 1,
+            "overlap_rejections": 0,
+            "stale_rejections": 0,
+            "unregister_failures": 0,
+            "stale": 0,
+            "last_unregister_error": null
+          },
+          "native_batches": [
+            {
+              "kind": "sync",
+              "descriptors": 4,
+              "bytes": 2097152
+            },
+            {
+              "kind": "sync",
+              "descriptors": 4,
+              "bytes": 2097152
+            },
+            {
+              "kind": "sync",
+              "descriptors": 4,
+              "bytes": 2097152
+            }
+          ],
+          "group_size": 2,
+          "stats": {
+            "7372d117b29404d579b99c365af86ca6": {
+              "bytes": 6291456,
+              "send_ms": 36.966780899092555,
+              "engine": "mooncake_tcp_layers",
+              "pipeline": 1,
+              "group_size": 2,
+              "submitted_groups": [
+                [
+                  0,
+                  1
+                ],
+                [
+                  2,
+                  3
+                ],
+                [
+                  4,
+                  5
+                ]
+              ],
+              "rc": 0
+            }
+          },
+          "hub": null
+        },
+        "requested_group_size": 2,
+        "effective_group_size": 2,
+        "native_batches_count": 3,
+        "layers": 6
+      },
+      {
+        "mode": "cpu-layer",
+        "dtype": "float16",
+        "slots": 0,
+        "source_buffers": 1,
+        "compute_steps": 472,
+        "overlap": null,
+        "layer_ready_at": [
+          1025951.18715022,
+          1025951.187684524,
+          1025951.188314932,
+          1025951.188717757,
+          1025951.190386087,
+          1025951.190808625
+        ],
+        "target_registration": {
+          "live": 0,
+          "owners": 0,
+          "bytes_live": 0,
+          "max_bytes_live": 6291456,
+          "registrations": 7,
+          "unregistrations": 7,
+          "overlap_rejections": 0,
+          "stale_rejections": 0,
+          "unregister_failures": 0,
+          "stale": 0,
+          "last_unregister_error": null
+        },
+        "source": {
+          "registration": {
+            "live": 0,
+            "owners": 0,
+            "bytes_live": 0,
+            "max_bytes_live": 6291456,
+            "registrations": 1,
+            "unregistrations": 1,
+            "overlap_rejections": 0,
+            "stale_rejections": 0,
+            "unregister_failures": 0,
+            "stale": 0,
+            "last_unregister_error": null
+          },
+          "native_batches": [
+            {
+              "kind": "async",
+              "descriptors": 8,
+              "bytes": 4194304
+            },
+            {
+              "kind": "async",
+              "descriptors": 4,
+              "bytes": 2097152
+            }
+          ],
+          "group_size": 4,
+          "stats": {
+            "085cd75503ebc43defc4b1f79f2c00d6": {
+              "bytes": 6291456,
+              "send_ms": 39.521152968518436,
+              "engine": "mooncake_tcp_layers",
+              "pipeline": 2,
+              "group_size": 4,
+              "submitted_groups": [
+                [
+                  0,
+                  1,
+                  2,
+                  3
+                ],
+                [
+                  4,
+                  5
+                ]
+              ],
+              "rc": 0
+            }
+          },
+          "hub": null
+        },
+        "requested_group_size": 4,
+        "effective_group_size": 4,
+        "native_batches_count": 2,
+        "layers": 6
+      },
+      {
+        "mode": "fast-async",
+        "slots": 2,
+        "remote_drop": true,
+        "rpc_calls": 3,
+        "local_layers": 5,
+        "max_abs_errors": [
+          0.0002821981906890869,
+          0.0002359449863433838,
+          0.0002879500389099121
+        ],
+        "dropped_layer_still_remote": true,
+        "target_quarantined": false,
+        "host_registration_reclaimed": true,
+        "source": {
+          "registration": {
+            "live": 0,
+            "owners": 0,
+            "bytes_live": 0,
+            "max_bytes_live": 4194304,
+            "registrations": 1,
+            "unregistrations": 1,
+            "overlap_rejections": 0,
+            "stale_rejections": 0,
+            "unregister_failures": 0,
+            "stale": 0,
+            "last_unregister_error": null
+          },
+          "native_batches": [
+            {
+              "kind": "async",
+              "descriptors": 4,
+              "bytes": 2097152
+            },
+            {
+              "kind": "async",
+              "descriptors": 4,
+              "bytes": 2097152
+            },
+            {
+              "kind": "async",
+              "descriptors": 4,
+              "bytes": 2097152
+            }
+          ],
+          "group_size": 2,
+          "stats": {
+            "7919741d2740cff5a0ed6972a276a835": {
+              "bytes": 6291456,
+              "send_ms": 49.283912987448275,
+              "engine": "fast_gpu_layers",
+              "pipeline": 4,
+              "streams": 2,
+              "async": true,
+              "target_slots": 2,
+              "group_size": 2,
+              "effective_group_size": 2,
+              "submitted_groups": [
+                [
+                  0,
+                  1
+                ],
+                [
+                  2,
+                  3
+                ],
+                [
+                  4,
+                  5
+                ]
+              ],
+              "start_at": 1025953.365276226,
+              "accept_at": 1025953.359863636,
+              "done_at": 1025953.407623043,
+              "stage_alloc_ms": 2.5751610519364476,
+              "stage_register_ms": 0.08436699863523245,
+              "thread_start_at": 1025953.358336281,
+              "layers": [
+                {
+                  "layer": 0,
+                  "copy_ms": 4.433731897734106,
+                  "te_ms": 13.04481690749526,
+                  "copy_start_at": 1025953.365295429,
+                  "te_done_at": 1025953.382978806,
+                  "ctrl_at": 1025953.383032094,
+                  "bytes": 1048576
+                },
+                {
+                  "layer": 1,
+                  "copy_ms": 0.9423359297215939,
+                  "te_ms": 13.798226020298898,
+                  "copy_start_at": 1025953.368989397,
+                  "te_done_at": 1025953.383734756,
+                  "ctrl_at": 1025953.38376786,
+                  "bytes": 1048576
+                },
+                {
+                  "layer": 2,
+                  "copy_ms": 0.8791489526629448,
+                  "te_ms": 11.49789395276457,
+                  "copy_start_at": 1025953.372053532,
+                  "te_done_at": 1025953.396428748,
+                  "ctrl_at": 1025953.396476157,
+                  "bytes": 1048576
+                },
+                {
+                  "layer": 3,
+                  "copy_ms": 11.182787013240159,
+                  "te_ms": 13.037172961048782,
+                  "copy_start_at": 1025953.372546967,
+                  "te_done_at": 1025953.397971061,
+                  "ctrl_at": 1025953.39800238,
+                  "bytes": 1048576
+                },
+                {
+                  "layer": 4,
+                  "copy_ms": 0.492560095153749,
+                  "te_ms": 8.567168959416449,
+                  "copy_start_at": 1025953.384990397,
+                  "te_done_at": 1025953.407416021,
+                  "ctrl_at": 1025953.40752379,
+                  "bytes": 1048576
+                },
+                {
+                  "layer": 5,
+                  "copy_ms": 12.698304024524987,
+                  "te_ms": 8.676556986756623,
+                  "copy_start_at": 1025953.385270072,
+                  "te_done_at": 1025953.407528981,
+                  "ctrl_at": 1025953.407568018,
+                  "bytes": 1048576
+                }
+              ],
+              "rc": 0
+            }
+          },
+          "hub": {
+            "active_conns": 0,
+            "attached_handoffs": 0,
+            "in_flight": 0,
+            "idle_closes": 0,
+            "rpc_completed": 3,
+            "rpc_failed": 0,
+            "pool": {
+              "n": 2,
+              "busy": 0,
+              "queued": 0,
+              "max_parallel": 1,
+              "completed": 3,
+              "failed": 0,
+              "max_queue_ms": 0.144,
+              "avg_exec_ms": 471.078
+            }
+          }
+        }
+      },
+      {
+        "mode": "fast-async",
+        "cancelled": true,
+        "gpu_reuse_safe": true,
+        "initially_quarantined": true,
+        "target_quarantined": false,
+        "host_registration_reclaimed": true,
+        "source": {
+          "registration": {
+            "live": 0,
+            "owners": 0,
+            "bytes_live": 0,
+            "max_bytes_live": 4194304,
+            "registrations": 1,
+            "unregistrations": 1,
+            "overlap_rejections": 0,
+            "stale_rejections": 0,
+            "unregister_failures": 0,
+            "stale": 0,
+            "last_unregister_error": null
+          },
+          "native_batches": [
+            {
+              "kind": "async",
+              "descriptors": 4,
+              "bytes": 2097152
+            }
+          ],
+          "group_size": 2,
+          "stats": {},
+          "hub": null
+        }
+      }
+    ],
+    "scope": "Group-layer CUDA probes; real transport/kernels, explicit scheduler ABI fixtures."
+  },
+  "dsv_group4": {
+    "scope": "D2D commands + native state bytes + actual GPU Remote during blocked KV copy.\n\nSmall pools and scheduler/allocator ABI fixtures; no model weights, SM100\nFlashMLA, native HTTP stream rerouting, or H20 RDMA performance claim.\n",
+    "cases": [
+      {
+        "ratio": 2,
+        "kv_layout": "v4",
+        "gpu_query_transport": false,
+        "bulk_transport": "mooncake-host-v1",
+        "group_size": 4,
+        "group_frames": 1,
+        "max_entries_per_frame": 2,
+        "p4_gateway": true,
+        "gateway_restart_after_lost_commit": true,
+        "native_decode_admissions": 1,
+        "reserved_before_freeze": true,
+        "reserved_row_consumed": true,
+        "state_bytes_exact": true,
+        "decode_before_bulk_copy": true,
+        "remote_calls": 1,
+        "max_error": 0.0,
+        "tail_and_padding_exact": true,
+        "delayed_forward_retained_kv": true,
+        "source_free_count": 1,
+        "local_restored": true,
+        "mooncake_transfers": 7
+      },
+      {
+        "ratio": 2,
+        "kv_layout": "v4",
+        "gpu_query_transport": true,
+        "bulk_transport": "mooncake-host-v1",
+        "group_size": 4,
+        "group_frames": 1,
+        "max_entries_per_frame": 2,
+        "p4_gateway": true,
+        "gateway_restart_after_lost_commit": true,
+        "native_decode_admissions": 1,
+        "reserved_before_freeze": true,
+        "reserved_row_consumed": true,
+        "state_bytes_exact": true,
+        "decode_before_bulk_copy": true,
+        "remote_calls": 1,
+        "max_error": 0.0,
+        "tail_and_padding_exact": true,
+        "delayed_forward_retained_kv": true,
+        "source_free_count": 1,
+        "local_restored": true,
+        "mooncake_transfers": 9
+      },
+      {
+        "ratio": 2,
+        "kv_layout": "v41",
+        "gpu_query_transport": false,
+        "bulk_transport": "mooncake-host-v1",
+        "group_size": 4,
+        "group_frames": 1,
+        "max_entries_per_frame": 2,
+        "p4_gateway": true,
+        "gateway_restart_after_lost_commit": true,
+        "native_decode_admissions": 1,
+        "reserved_before_freeze": true,
+        "reserved_row_consumed": true,
+        "state_bytes_exact": true,
+        "decode_before_bulk_copy": true,
+        "remote_calls": 1,
+        "max_error": 0.0,
+        "tail_and_padding_exact": true,
+        "delayed_forward_retained_kv": true,
+        "source_free_count": 1,
+        "local_restored": true,
+        "mooncake_transfers": 7
+      },
+      {
+        "ratio": 2,
+        "kv_layout": "v41",
+        "gpu_query_transport": true,
+        "bulk_transport": "mooncake-host-v1",
+        "group_size": 4,
+        "group_frames": 1,
+        "max_entries_per_frame": 2,
+        "p4_gateway": true,
+        "gateway_restart_after_lost_commit": true,
+        "native_decode_admissions": 1,
+        "reserved_before_freeze": true,
+        "reserved_row_consumed": true,
+        "state_bytes_exact": true,
+        "decode_before_bulk_copy": true,
+        "remote_calls": 1,
+        "max_error": 0.0,
+        "tail_and_padding_exact": true,
+        "delayed_forward_retained_kv": true,
+        "source_free_count": 1,
+        "local_restored": true,
+        "mooncake_transfers": 9
+      },
+      {
+        "ratio": 4,
+        "kv_layout": "v4",
+        "gpu_query_transport": false,
+        "bulk_transport": "mooncake-host-v1",
+        "group_size": 4,
+        "group_frames": 1,
+        "max_entries_per_frame": 3,
+        "p4_gateway": true,
+        "gateway_restart_after_lost_commit": true,
+        "native_decode_admissions": 1,
+        "reserved_before_freeze": true,
+        "reserved_row_consumed": true,
+        "state_bytes_exact": true,
+        "decode_before_bulk_copy": true,
+        "remote_calls": 1,
+        "max_error": 0.00390625,
+        "tail_and_padding_exact": true,
+        "delayed_forward_retained_kv": true,
+        "source_free_count": 1,
+        "local_restored": true,
+        "mooncake_transfers": 8
+      },
+      {
+        "ratio": 4,
+        "kv_layout": "v4",
+        "gpu_query_transport": true,
+        "bulk_transport": "mooncake-host-v1",
+        "group_size": 4,
+        "group_frames": 1,
+        "max_entries_per_frame": 3,
+        "p4_gateway": true,
+        "gateway_restart_after_lost_commit": true,
+        "native_decode_admissions": 1,
+        "reserved_before_freeze": true,
+        "reserved_row_consumed": true,
+        "state_bytes_exact": true,
+        "decode_before_bulk_copy": true,
+        "remote_calls": 1,
+        "max_error": 0.00390625,
+        "tail_and_padding_exact": true,
+        "delayed_forward_retained_kv": true,
+        "source_free_count": 1,
+        "local_restored": true,
+        "mooncake_transfers": 10
+      },
+      {
+        "ratio": 128,
+        "kv_layout": "v4",
+        "gpu_query_transport": false,
+        "bulk_transport": "mooncake-host-v1",
+        "group_size": 4,
+        "group_frames": 1,
+        "max_entries_per_frame": 3,
+        "p4_gateway": true,
+        "gateway_restart_after_lost_commit": true,
+        "native_decode_admissions": 1,
+        "reserved_before_freeze": true,
+        "reserved_row_consumed": true,
+        "state_bytes_exact": true,
+        "decode_before_bulk_copy": true,
+        "remote_calls": 1,
+        "max_error": 0.125,
+        "tail_and_padding_exact": true,
+        "delayed_forward_retained_kv": true,
+        "source_free_count": 1,
+        "local_restored": true,
+        "mooncake_transfers": 7
+      },
+      {
+        "ratio": 128,
+        "kv_layout": "v4",
+        "gpu_query_transport": true,
+        "bulk_transport": "mooncake-host-v1",
+        "group_size": 4,
+        "group_frames": 1,
+        "max_entries_per_frame": 3,
+        "p4_gateway": true,
+        "gateway_restart_after_lost_commit": true,
+        "native_decode_admissions": 1,
+        "reserved_before_freeze": true,
+        "reserved_row_consumed": true,
+        "state_bytes_exact": true,
+        "decode_before_bulk_copy": true,
+        "remote_calls": 1,
+        "max_error": 0.125,
+        "tail_and_padding_exact": true,
+        "delayed_forward_retained_kv": true,
+        "source_free_count": 1,
+        "local_restored": true,
+        "mooncake_transfers": 9
+      }
+    ]
+  },
+  "dsv_additional_widths": [
+    {
+      "ratio": 2,
+      "kv_layout": "v4",
+      "gpu_query_transport": false,
+      "bulk_transport": "mooncake-host-v1",
+      "group_size": 1,
+      "group_frames": 0,
+      "max_entries_per_frame": 0,
+      "p4_gateway": false,
+      "gateway_restart_after_lost_commit": false,
+      "native_decode_admissions": 1,
+      "reserved_before_freeze": true,
+      "reserved_row_consumed": true,
+      "state_bytes_exact": true,
+      "decode_before_bulk_copy": true,
+      "remote_calls": 1,
+      "max_error": 0.0,
+      "tail_and_padding_exact": true,
+      "delayed_forward_retained_kv": true,
+      "source_free_count": 1,
+      "local_restored": true,
+      "mooncake_transfers": 8
+    },
+    {
+      "ratio": 2,
+      "kv_layout": "v41",
+      "gpu_query_transport": false,
+      "bulk_transport": "mooncake-host-v1",
+      "group_size": 2,
+      "group_frames": 2,
+      "max_entries_per_frame": 1,
+      "p4_gateway": false,
+      "gateway_restart_after_lost_commit": false,
+      "native_decode_admissions": 1,
+      "reserved_before_freeze": true,
+      "reserved_row_consumed": true,
+      "state_bytes_exact": true,
+      "decode_before_bulk_copy": true,
+      "remote_calls": 1,
+      "max_error": 0.0,
+      "tail_and_padding_exact": true,
+      "delayed_forward_retained_kv": true,
+      "source_free_count": 1,
+      "local_restored": true,
+      "mooncake_transfers": 8
+    },
+    {
+      "ratio": 4,
+      "kv_layout": "v4",
+      "gpu_query_transport": false,
+      "bulk_transport": "mooncake-host-v1",
+      "group_size": 3,
+      "group_frames": 2,
+      "max_entries_per_frame": 2,
+      "p4_gateway": false,
+      "gateway_restart_after_lost_commit": false,
+      "native_decode_admissions": 1,
+      "reserved_before_freeze": true,
+      "reserved_row_consumed": true,
+      "state_bytes_exact": true,
+      "decode_before_bulk_copy": true,
+      "remote_calls": 1,
+      "max_error": 0.00390625,
+      "tail_and_padding_exact": true,
+      "delayed_forward_retained_kv": true,
+      "source_free_count": 1,
+      "local_restored": true,
+      "mooncake_transfers": 9
+    }
+  ],
+  "dsv_independent_entry_local": {
+    "status": "PASS",
+    "device": "NVIDIA GeForce RTX 4060 Laptop GPU",
+    "torch": "2.13.0+cu130",
+    "suite": "dsv-local",
+    "cases": [
+      {
+        "layout": "v4",
+        "group_size": 4,
+        "entries_per_frame": 2,
+        "independent_entry_local": true,
+        "source_free_count": 1
+      },
+      {
+        "layout": "v41",
+        "group_size": 4,
+        "entries_per_frame": 2,
+        "independent_entry_local": true,
+        "source_free_count": 1
+      }
+    ],
+    "scope": "Group-layer CUDA probes; real transport/kernels, explicit scheduler ABI fixtures."
+  },
+  "faults": [
+    {
+      "device": "NVIDIA GeForce RTX 4060 Laptop GPU",
+      "torch": "2.13.0+cu130",
+      "case": "retry-cancel",
+      "scope": "D2D safety regressions: real CUDA/TE, injected faults, no model weights.\n\nA lost connection must retain the receive slot without retrying; an unproven\nD2H must retain its GPU input. Both cases assert safety after writing the report.\nThe retry probe never submits a deliberately stale destination pointer to TE.\n",
+      "result": {
+        "dropped": true,
+        "reads": 1,
+        "destination": 8690597888,
+        "resume": {
+          "resumed": false,
+          "pending_reader": true
+        },
+        "worker_stopped": true,
+        "original_bulk_call_unfinished": true,
+        "receiver_closed": false,
+        "receiver_quarantined": true,
+        "destination_registered": true,
+        "target_error": "ConnectionError('injected connection loss before bulk completion')",
+        "native_mooncake_setup_transfers": 6,
+        "real_pinned_host_memory": true,
+        "rpc_retries": 0,
+        "unsafe_reproduced": false,
+        "safety_pass": true,
+        "abort_blocked": true,
+        "native_write_completed": true
+      },
+      "status": "PASS"
+    },
+    {
+      "device": "NVIDIA GeForce RTX 4060 Laptop GPU",
+      "torch": "2.13.0+cu130",
+      "case": "retry-cancel",
+      "scope": "D2D safety regressions: real CUDA/TE, injected faults, no model weights.\n\nA lost connection must retain the receive slot without retrying; an unproven\nD2H must retain its GPU input. Both cases assert safety after writing the report.\nThe retry probe never submits a deliberately stale destination pointer to TE.\n",
+      "result": {
+        "dropped": true,
+        "reads": 1,
+        "destination": 8690597888,
+        "resume": {
+          "resumed": false,
+          "pending_reader": true
+        },
+        "worker_stopped": true,
+        "original_bulk_call_unfinished": true,
+        "receiver_closed": false,
+        "receiver_quarantined": true,
+        "destination_registered": true,
+        "target_error": "ConnectionError('injected connection loss before bulk completion')",
+        "native_mooncake_setup_transfers": 6,
+        "real_pinned_host_memory": true,
+        "rpc_retries": 0,
+        "unsafe_reproduced": false,
+        "safety_pass": true,
+        "abort_blocked": true,
+        "native_write_completed": true
+      },
+      "status": "PASS"
+    },
+    {
+      "device": "NVIDIA GeForce RTX 4060 Laptop GPU",
+      "torch": "2.13.0+cu130",
+      "case": "retry-cancel",
+      "scope": "D2D safety regressions: real CUDA/TE, injected faults, no model weights.\n\nA lost connection must retain the receive slot without retrying; an unproven\nD2H must retain its GPU input. Both cases assert safety after writing the report.\nThe retry probe never submits a deliberately stale destination pointer to TE.\n",
+      "result": {
+        "dropped": true,
+        "reads": 1,
+        "destination": 8690597888,
+        "resume": {
+          "resumed": false,
+          "pending_reader": true
+        },
+        "worker_stopped": true,
+        "original_bulk_call_unfinished": true,
+        "receiver_closed": false,
+        "receiver_quarantined": true,
+        "destination_registered": true,
+        "target_error": "ConnectionError('injected connection loss before bulk completion')",
+        "native_mooncake_setup_transfers": 6,
+        "real_pinned_host_memory": true,
+        "rpc_retries": 0,
+        "unsafe_reproduced": false,
+        "safety_pass": true,
+        "abort_blocked": true,
+        "native_write_completed": true
+      },
+      "status": "PASS"
+    },
+    {
+      "device": "NVIDIA GeForce RTX 4060 Laptop GPU",
+      "torch": "2.13.0+cu130",
+      "case": "d2h-input",
+      "scope": "D2D safety regressions: real CUDA/TE, injected faults, no model weights.\n\nA lost connection must retain the receive slot without retrying; an unproven\nD2H must retain its GPU input. Both cases assert safety after writing the report.\nThe retry probe never submits a deliberately stale destination pointer to TE.\n",
+      "result": {
+        "source_allocation_reused": false,
+        "source_ptr": 21518876672,
+        "d2h_pending_after_exception": true,
+        "input_retained_after_exception": true,
+        "sender_quarantined": true,
+        "engine_retains_sender": true,
+        "host_storage_retained": true,
+        "copied_original": true,
+        "copied_replacement": false,
+        "unsafe_reproduced": false,
+        "safety_pass": true
+      },
+      "status": "PASS"
+    },
+    {
+      "device": "NVIDIA GeForce RTX 4060 Laptop GPU",
+      "torch": "2.13.0+cu130",
+      "case": "d2h-input",
+      "scope": "D2D safety regressions: real CUDA/TE, injected faults, no model weights.\n\nA lost connection must retain the receive slot without retrying; an unproven\nD2H must retain its GPU input. Both cases assert safety after writing the report.\nThe retry probe never submits a deliberately stale destination pointer to TE.\n",
+      "result": {
+        "source_allocation_reused": false,
+        "source_ptr": 21518876672,
+        "d2h_pending_after_exception": true,
+        "input_retained_after_exception": true,
+        "sender_quarantined": true,
+        "engine_retains_sender": true,
+        "host_storage_retained": true,
+        "copied_original": true,
+        "copied_replacement": false,
+        "unsafe_reproduced": false,
+        "safety_pass": true
+      },
+      "status": "PASS"
+    },
+    {
+      "device": "NVIDIA GeForce RTX 4060 Laptop GPU",
+      "torch": "2.13.0+cu130",
+      "case": "d2h-input",
+      "scope": "D2D safety regressions: real CUDA/TE, injected faults, no model weights.\n\nA lost connection must retain the receive slot without retrying; an unproven\nD2H must retain its GPU input. Both cases assert safety after writing the report.\nThe retry probe never submits a deliberately stale destination pointer to TE.\n",
+      "result": {
+        "source_allocation_reused": false,
+        "source_ptr": 21518876672,
+        "d2h_pending_after_exception": true,
+        "input_retained_after_exception": true,
+        "sender_quarantined": true,
+        "engine_retains_sender": true,
+        "host_storage_retained": true,
+        "copied_original": true,
+        "copied_replacement": false,
+        "unsafe_reproduced": false,
+        "safety_pass": true
+      },
+      "status": "PASS"
+    }
+  ],
+  "cpu": {
+    "suite": "test/registered/unit/plugins/test_remote_attn.py",
+    "tests": 348,
+    "status": "PASS",
+    "group4_tp2": "PASS",
+    "ruff": "PASS",
+    "diff_check": "PASS"
+  },
+  "environment": {
+    "CUDA_HOME": "/workspace/conditional-graph-20261019/cuda13",
+    "extra_path": "/workspace/conditional-graph-20261019/cuda13/bin:/workspace/mixed-adapt-20261025/venv/bin",
+    "python": "/workspace/remote-attn-cuda-20261028/venv/bin/python"
+  }
+}

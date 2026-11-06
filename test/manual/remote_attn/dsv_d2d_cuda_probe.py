@@ -133,7 +133,11 @@ def run(root, ratio, gpu, kv_layout="v4", p4=False):
         torch.cuda.synchronize()
         assert not native_calls and target.rpc.calls == 1 and not e.freed
         error = float((got[0].float() - expected.float()).abs().max())
-        # Real delayed compute completion: finished copying is insufficient.
+        e.gate.set()
+        e.wait_copy()
+        # Start the delayed compute after the copy has drained. Otherwise a
+        # faster grouped copy or slow RPC/JIT scheduling can consume the entire
+        # delay before this assertion and turn the probe into a timing race.
         delayed = torch.cuda.Stream()
         with torch.cuda.stream(delayed):
             torch.cuda._sleep(500_000_000)
@@ -142,8 +146,7 @@ def run(root, ratio, gpu, kv_layout="v4", p4=False):
         target.forward_proofs.append(
             BatchProof(result=NS(delay_sample_func=None), serial_done=fence)
         )
-        e.gate.set()
-        e.wait_copy()
+        assert not fence.query(), "compute delay ended before the fence check"
         assert not target.ready_to_finish() and not source.poll() and not e.freed
         # Copy covers only completed prefix slots, leaving D1's new tail and
         # padding bitwise unchanged. Compare bytes outside those slot columns.
@@ -193,6 +196,9 @@ def run(root, ratio, gpu, kv_layout="v4", p4=False):
             kv_layout=kv_layout,
             gpu_query_transport=gpu,
             bulk_transport=d2d.bulk.PROTOCOL,
+            group_size=target.group_size,
+            group_frames=target.group_frames,
+            max_entries_per_frame=target.grouped_entries,
             p4_gateway=p4,
             gateway_restart_after_lost_commit=p4,
             native_decode_admissions=len(e.resumed),

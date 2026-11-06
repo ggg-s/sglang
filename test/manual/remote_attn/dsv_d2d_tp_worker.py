@@ -2,13 +2,21 @@
 
 import argparse
 import json
+import sys
 import time
+import types
 from datetime import timedelta
 from pathlib import Path
 from types import SimpleNamespace as NS
 from unittest.mock import patch
 
 import torch.distributed as dist
+
+# Load lightweight core transport contracts without importing SGLang's serving
+# package in these isolated CPU/Gloo pool fixtures.
+_package = types.ModuleType("sglang")
+_package.__path__ = [str(Path(__file__).resolve().parents[3] / "python/sglang")]
+sys.modules.setdefault("sglang", _package)
 from dsv_d2d_probe_support import Environment
 from sglang_remote_attn import dsv_d2d as d2d
 from sglang_remote_attn.pre_layerwise import Controller
@@ -168,7 +176,7 @@ def main():
         # Use a fresh prepared target so no previous Local transition can hide it.
         e.source.scheduler.running_batch.reqs = [e.req]
         # The separate request fixture makes this a new generation/row owner.
-        from dsv_d2d_probe_support import request, Sampling
+        from dsv_d2d_probe_support import Sampling, request
 
         e.req = request("source2", list(range(e.prefix - 2)), [31, 32, 33], Sampling())
         e.req.kv = NS(

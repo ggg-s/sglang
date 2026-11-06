@@ -1,11 +1,12 @@
-"""Actual Mooncake GPU buffers via source-loaded native SGL engine methods.
+"""Actual Mooncake Q/O transport with CUDA consumers and verified TCP fallback.
 
-4060 uses Mooncake TCP internally; NVLink/RDMA hardware is not emulated.
+4060 uses pinned Host staging over native Mooncake TCP. No RDMA HCA is emulated.
 """
 
 import logging
 import os
 import threading
+import time
 from contextlib import ExitStack
 from types import SimpleNamespace
 from unittest.mock import patch
@@ -56,14 +57,28 @@ class Transport:
         raw = self.Native()
         assert raw.initialize("127.0.0.1", "P2PHANDSHAKE", "tcp", "") == 0
         engine = self.Engine()
+        from sglang.srt.mooncake_contract import local_protocol
+
+        engine.protocol = local_protocol(raw, "127.0.0.1")
+        assert engine.protocol == "tcp"
+        engine.d2d_protocol_verified = True
         engine.engine, engine.session_id = raw, f"127.0.0.1:{raw.get_rpc_port()}"
-        native = engine.batch_transfer_sync
+        calls = self.calls
 
-        def transfer(session, sources, targets, lengths):
-            self.calls.append((role, list(lengths)))
-            return native(session, sources, targets, lengths)
+        class Capture:
+            def __getattr__(self, name):
+                return getattr(raw, name)
 
-        engine.batch_transfer_sync = transfer
+            def batch_transfer_async_write(self, session, sources, targets, lengths):
+                calls.append((role, list(lengths)))
+                return raw.batch_transfer_async_write(
+                    session, sources, targets, lengths
+                )
+
+            def batch_transfer_sync_write(self, *args):
+                raise AssertionError("native sync convenience API is forbidden")
+
+        engine.engine = Capture()
         manager = SimpleNamespace(
             engine=engine, _remote_attn_send_lock=threading.Lock(), local_ip="127.0.0.1"
         )
@@ -79,7 +94,7 @@ class Transport:
         setattr(scheduler, queue, SimpleNamespace(kv_manager=manager))
         scheduler._pre_layerwise = controller
         controller.gpu_data_plane = dp.Plane(manager, "cuda:0")
-        canary = torch.full((256,), len(self.engines) + 1.0, device="cuda")
+        canary = torch.full((256,), len(self.engines) + 1.0, pin_memory=True)
         torch.cuda.synchronize()
         assert (
             engine.batch_register(
@@ -99,8 +114,10 @@ class Transport:
         assert not any(plane.quarantine for _, plane in self.planes)
         source, x = self.engines[0]
         target, y = self.engines[-1]
+        from sglang_remote_attn import mooncake_backend as mb
+
         assert (
-            source.batch_transfer_sync(
+            mb.handle(source).batch_transfer_sync(
                 target.get_session_id(),
                 [x.data_ptr()],
                 [y.data_ptr()],
@@ -108,18 +125,21 @@ class Transport:
             )
             == 0
         )
-        torch.cuda.synchronize()
+        deadline = time.monotonic() + 5
+        while not torch.equal(x, y):
+            assert time.monotonic() < deadline, "TCP canary arrival unproven"
+            time.sleep(0.001)
         torch.testing.assert_close(x, y)
         for engine, tensor in self.engines:
             assert engine.batch_deregister([tensor.data_ptr()]) == 0
         self.stack.close()
         return dict(
-            native_mooncake_gpu=True,
-            physical_transport="mooncake-tcp",
+            native_mooncake=True,
+            physical_transport="mooncake-tcp-host-staging",
             tcp_tensor_payloads=0,
             q_transfers=sum(role == "decode" for role, _ in self.calls),
             result_transfers=sum(role == "prefill" for role, _ in self.calls) - 1,
-            registered_gpu_bytes=True,
+            registered_host_bytes=True,
             no_quarantined_slots=True,
             native_registration_survives_rpc_teardown=True,
         )

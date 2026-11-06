@@ -406,10 +406,10 @@ class Environment:
 
         def read(reader, action, **kw):
             if (
-                action == "read"
+                action == "read_group"
+                or action == "read"
                 and kw.get("kind") == "global"
-                and threading.current_thread().name == "dsv-d2d-copy"
-            ):
+            ) and threading.current_thread().name == "dsv-d2d-copy":
                 self.blocked.set()
                 if not self.gate.wait(30):
                     raise TimeoutError("D2D test transfer gate")
@@ -461,7 +461,13 @@ class Environment:
 
             self.stack.enter_context(patch.object(d2d_bulk, "new_slot", Slot))
             for n, controller in enumerate(self.nodes):
-                engine = NS(regions={}, calls=[], session=f"cpu-d2d-{n}")
+                engine = NS(
+                    protocol="tcp",
+                    d2d_protocol_verified=True,
+                    regions={},
+                    calls=[],
+                    session=f"cpu-d2d-{n}",
+                )
                 engines[engine.session] = engine
 
                 def register(ptrs, sizes, engine=engine):
@@ -485,6 +491,15 @@ class Environment:
                 engine.batch_register = register
                 engine.batch_deregister = deregister
                 engine.batch_transfer_sync = transfer
+
+                def submit(*args, engine=engine):
+                    engine.batch_result = engine.batch_transfer_sync(*args)
+                    return 1
+
+                engine.batch_transfer_async_write = submit
+                engine.get_batch_transfer_status = lambda ids, engine=engine: (
+                    engine.batch_result
+                )
                 engine.get_session_id = lambda engine=engine: engine.session
                 controller.scheduler.disagg_decode_prealloc_queue.kv_manager.engine = (
                     engine

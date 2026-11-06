@@ -11,6 +11,7 @@ import time
 
 import torch
 
+from . import mooncake_backend as transport
 from . import remote_data_plane as dp
 
 CAPACITY = 4 * 1024 * 1024
@@ -39,16 +40,21 @@ def new_slot(capacity, device):
 
 
 def owners(engine):
+    engine = transport.handle(engine)
     # Engine ownership outlives sockets, scheduler records and failed constructors.
-    if not hasattr(engine, "_d2d_bulk_owners"):
+    if "_d2d_bulk_owners" not in engine.__dict__:
         engine._d2d_bulk_owners = []
+        try:
+            engine.native._d2d_bulk_owners = engine._d2d_bulk_owners
+        except AttributeError:
+            pass  # Some pybind engines do not allow dynamic attributes.
     return engine._d2d_bulk_owners
 
 
 def descriptor(value):
     if (
         not isinstance(value, dict)
-        or value.get("protocol") != PROTOCOL
+        or value.get("protocol") not in (PROTOCOL, transport.GPU)
         or type(value.get("base")) is not int
         or value["base"] <= 0
         or value.get("size") != WIRE_CAPACITY
@@ -65,6 +71,7 @@ def descriptor(value):
 class Registered:
     def __init__(self, engine, req):
         self.engine, self.req = engine, req
+        self.ownership_engine = engine
         self.closed = self.unsafe = False
         self.tensor = None
         self.registered = False
@@ -111,7 +118,7 @@ class Registered:
             raise
         self.closed = True
         with _OWNERS_LOCK:
-            owners(self.engine).remove(self)
+            owners(self.ownership_engine).remove(self)
         self.tensor = None
 
     def dispose(self):
@@ -119,8 +126,12 @@ class Registered:
 
 
 class Sender(Registered):
-    def __init__(self, engine, req, device):
+    def __init__(self, engine, req, device, catalog=None):
         super().__init__(engine, req)
+        self.catalog = catalog
+        self.device = torch.device(device)
+        self.backend = None
+        self.stream = None
         self.lock = threading.Lock()
         self.lanes = {}
         self.session = None
@@ -128,9 +139,31 @@ class Sender(Registered):
         # The raw CUDA copy stream is invisible to the producer's allocator.
         # Engine ownership must retain BOTH endpoints if its fence fails.
         self.copy_owner = None
+        if catalog is None or list(catalog.engines) == [transport.TCP]:
+            self.configure(transport.TCP)
+
+    def configure(self, backend):
+        if self.backend is not None:
+            if self.backend != backend:
+                raise ValueError("D2D backend changed after registration")
+            return
+        if self.catalog is not None:
+            if backend not in self.catalog.engines:
+                raise ValueError("D2D source did not offer this backend")
+            self.engine = self.catalog.engines[backend]
+        elif backend != transport.TCP:
+            raise ValueError("D2D GPU backend was not negotiated")
+        self.backend = backend
         try:
-            self.slot = new_slot(WIRE_CAPACITY, device)
-            self.tensor = self.slot.host
+            if backend == transport.GPU:
+                self.tensor = torch.empty(
+                    WIRE_CAPACITY, dtype=torch.uint8, device=self.device
+                )
+                dp.event(self.device).synchronize()
+                self.stream = torch.cuda.Stream(device=self.device)
+            else:
+                self.slot = new_slot(WIRE_CAPACITY, self.device)
+                self.tensor = self.slot.host
             self.register()
         except BaseException:
             self.poison()
@@ -147,6 +180,9 @@ class Sender(Registered):
             raise ValueError("invalid D2D bulk size/sequence")
         with self.lock:
             self.check()
+            self.configure(
+                transport.GPU if region["protocol"] == transport.GPU else transport.TCP
+            )
             if self.session is not None and self.session != region["session"]:
                 raise ValueError("D2D bulk destination session changed")
             lane = self.lanes.get(region["nonce"])
@@ -163,22 +199,34 @@ class Sender(Registered):
                 # CudaPinnedSlot uses a private nonblocking D2H stream, waits
                 # only for the producing event and proves completion before TE.
                 self.copy_owner = (data, ready)
-                self.slot.copy([(data.data_ptr(), 0, size)], ready)
-                # copy() returns only after its completion event synchronized.
-                # A later TE failure still retains Host backing, but no longer
-                # needs the GPU input. An exception above keeps copy_owner.
-                self.copy_owner = None
-                footer = torch.tensor(
-                    list(marker(region["nonce"], sequence, size)),
-                    dtype=torch.uint8,
-                    device="cpu",
-                )
-                self.tensor[size : size + FOOTER].copy_(footer)
-                rc = self.engine.batch_transfer_sync(
+                if self.backend == transport.GPU:
+                    with torch.cuda.stream(self.stream):
+                        self.stream.wait_event(ready)
+                        self.tensor[:size].copy_(
+                            data.reshape(-1).view(torch.uint8), non_blocking=True
+                        )
+                        copied = dp.event(self.device)
+                    copied.synchronize()
+                    self.copy_owner = None
+                    wire_size = size
+                else:
+                    self.slot.copy([(data.data_ptr(), 0, size)], ready)
+                    # copy() returns only after its completion event synchronized.
+                    # A later TE failure still retains Host backing, but no longer
+                    # needs the GPU input. An exception above keeps copy_owner.
+                    self.copy_owner = None
+                    footer = torch.tensor(
+                        list(marker(region["nonce"], sequence, size)),
+                        dtype=torch.uint8,
+                        device="cpu",
+                    )
+                    self.tensor[size : size + FOOTER].copy_(footer)
+                    wire_size = size + FOOTER
+                rc = transport.handle(self.engine).batch_transfer_sync(
                     region["session"],
                     [self.tensor.data_ptr()],
                     [region["base"]],
-                    [size + FOOTER],
+                    [wire_size],
                 )
                 if rc != 0:
                     raise RuntimeError("D2D Mooncake write completion is unknown")
@@ -189,17 +237,24 @@ class Sender(Registered):
         return size
 
     def drain(self):
-        self.slot.stream.synchronize()
+        if self.stream is not None:
+            self.stream.synchronize()
+        if self.slot is not None:
+            self.slot.stream.synchronize()
 
     def dispose(self):
-        self.slot.close()
-        self.slot = None
+        if self.slot is not None:
+            self.slot.close()
+            self.slot = None
 
 
 class Receiver(Registered):
-    def __init__(self, engine, req, device):
+    def __init__(self, engine, req, device, backend=transport.TCP):
         super().__init__(engine, req)
         self.device = torch.device(device)
+        self.backend = backend
+        self.protocol = transport.GPU if backend == transport.GPU else PROTOCOL
+        self.visibility = None
         self.lock = threading.Lock()
         self.sequence = 0
         self.consumed = None
@@ -208,9 +263,12 @@ class Receiver(Registered):
             self.tensor = torch.empty(
                 WIRE_CAPACITY,
                 dtype=torch.uint8,
-                device="cpu",
-                pin_memory=self.device.type == "cuda",
+                device=self.device if backend == transport.GPU else "cpu",
+                pin_memory=backend == transport.TCP and self.device.type == "cuda",
             )
+            if backend == transport.GPU:
+                self.visibility = dp.Visibility(self.device, protocol="rdma")
+                dp.event(self.device).synchronize()
             self.register()
         except BaseException:
             self.poison()
@@ -221,7 +279,7 @@ class Receiver(Registered):
         self.drain()
         self.sequence += 1
         return dict(
-            protocol=PROTOCOL,
+            protocol=self.protocol,
             base=self.tensor.data_ptr(),
             size=WIRE_CAPACITY,
             session=self.engine.get_session_id(),
@@ -232,23 +290,28 @@ class Receiver(Registered):
         self.check()
         if (
             type(size) is not int
-            or header.get("bulk_protocol") != PROTOCOL
+            or header.get("bulk_protocol") != self.protocol
             or header.get("bulk_nonce") != self.nonce
             or header.get("bulk_sequence") != self.sequence
             or header.get("bytes") != size
             or not 0 < size <= CAPACITY
         ):
             raise ValueError("D2D bulk completion does not match receive slot")
-        # Some TCP TE versions report send completion before the peer applies
-        # the last bytes. The footer travels in the SAME contiguous descriptor,
-        # after the payload; an RPC ACK alone must never publish stale host data.
-        expected = marker(self.nonce, self.sequence, size)
-        deadline = time.monotonic() + timeout
-        while bytes(self.tensor[size : size + FOOTER].tolist()) != expected:
-            if time.monotonic() >= deadline:
-                raise TimeoutError("D2D bulk host arrival is unproven")
-            time.sleep(0.001)
-        # Receive backing is HOST memory, not a GPUDirect GPU allocation.
+        if self.backend == transport.GPU:
+            # Authenticated RPC result is emitted after every native write has
+            # completed. Flush external writes BEFORE launching CUDA consumers.
+            self.visibility.receive()
+        else:
+            # Some TCP TE versions report send completion before the peer applies
+            # the last bytes. The footer travels in the SAME contiguous descriptor,
+            # after the payload; an RPC ACK alone must never publish stale host data.
+            expected = marker(self.nonce, self.sequence, size)
+            deadline = time.monotonic() + timeout
+            while bytes(self.tensor[size : size + FOOTER].tolist()) != expected:
+                if time.monotonic() >= deadline:
+                    raise TimeoutError("D2D bulk host arrival is unproven")
+                time.sleep(0.001)
+        # Return independent GPU backing; slot reuse waits for this copy event.
         data = self.tensor[:size].to(self.device, non_blocking=True, copy=True)
         self.consumed = dp.event(self.device)
         return data

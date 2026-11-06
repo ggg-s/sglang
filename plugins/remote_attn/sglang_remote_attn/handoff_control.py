@@ -216,6 +216,8 @@ def _expire_stale_reservations(scheduler) -> None:
     reservations = _reservations(scheduler)
     now = time.monotonic()
     for rid in list(reservations):
+        if "native_req" in reservations[rid]:
+            continue
         if rid in tracked:
             continue
         res = reservations.get(rid) or {}
@@ -588,11 +590,15 @@ def _release_transfer_buffers(
                 pass
         if remote_complete and gpu_safe:
             try:
-                released = _get_registration_manager().release_safe(owner)
+                manager = _TRANSFER_REGISTRATIONS.get(owner)
+                if manager is None:
+                    manager = _get_registration_manager()
+                released = manager.release_safe(owner)
             except Exception as exc:
                 released = False
                 reason = f"host unregister failed: {exc!r}"
             if released:
+                _TRANSFER_REGISTRATIONS.pop(owner, None)
                 _TRANSFER_QUARANTINE.pop(owner, None)
                 _TRANSFER_RELEASES.pop(owner, None)
                 _TRANSFER_TICKETS.pop(owner, None)
@@ -728,6 +734,7 @@ class _HubConn:
         "last_rx",
         "dead",
         "gpu_lane",
+        "gpu_negotiation",
     )
 
     def __init__(self, sock):
@@ -739,6 +746,7 @@ class _HubConn:
         self.last_rx = time.monotonic()
         self.dead = False
         self.gpu_lane = None
+        self.gpu_negotiation = None
 
 
 @dataclass
@@ -994,6 +1002,14 @@ def _free_source_request(scheduler, req):
     stop_source_transfer(req)
     req._handoff_freed = True
     _remove_from_batches(scheduler, req)
+    if getattr(req, "_d2d_native_alloc", False):
+        from sglang.srt.mem_cache.common import release_kv_cache
+
+        release_kv_cache(req, scheduler.tree_cache, checkpoint=False)
+        from .qwen_reservation import retire_source
+
+        retire_source(scheduler, req)
+        return
     allocator = getattr(scheduler, "token_to_kv_pool_allocator", None)
     avail_before = _kv_available(scheduler)
     # A resumed request reuses its original prefix indices.  The scheduler's
@@ -1039,6 +1055,9 @@ def _free_source_request(scheduler, req):
     req._handoff_prefix_indices = None
     req.kv.mark_kv_released()
     req.kv.kv_committed_len = 0
+    from .qwen_reservation import retire_source
+
+    retire_source(scheduler, req)
     avail_after = _kv_available(scheduler)
     print(
         f"[kv-free] rid={req.rid} pool_idx={pool_idx} kv_len={kv_len} "
@@ -1993,7 +2012,7 @@ class RemoteHub:
                     pass
             hc.last_rx = time.monotonic()
             cmd = header.get("cmd")
-            if cmd in ("te_open", "te_attn", "te_ack", "te_close"):
+            if cmd in ("te_negotiate", "te_open", "te_attn", "te_ack", "te_close"):
                 from .remote_data_plane import handle
 
                 try:
@@ -2665,34 +2684,15 @@ def _gil_stats():
 
 
 def _get_te():
-    """Lazily create one Mooncake TransferEngine per scheduler process.
-
-    The 5090 host has no RDMA HCA, so use Mooncake's TCP transport. The API is
-    the same one used by the Mooncake PD connector; only the protocol differs.
-    """
+    """Reuse native PD's rank-local engine; standalone probes use shared TCP."""
     global _TE
-    if _TE is not None:
-        return _TE
-    with _TE_LOCK:
-        if _TE is None:
-            from mooncake.engine import TransferEngine
+    if _TE is None:
+        with _TE_LOCK:
+            if _TE is None:
+                from .mooncake_backend import shared_raw
 
-            # The scheduler child process does not always inherit MC_* from the
-            # launcher, so mirror the handoff knobs here (before TE init).
-            for dst, src in (
-                ("MC_TCP_LANES_PER_PEER", "HANDOFF_MC_TCP_LANES"),
-                ("MC_NUM_TCP_IO_THREADS", "HANDOFF_MC_TCP_IO_THREADS"),
-                ("MC_TCP_SLICE_SIZE", "HANDOFF_MC_TCP_SLICE"),
-            ):
-                val = os.environ.get(src)
-                if val:
-                    os.environ[dst] = str(val)
-            te = TransferEngine()
-            rc = te.initialize("127.0.0.1", "P2PHANDSHAKE", "tcp", "")
-            if rc != 0:
-                raise RuntimeError(f"Mooncake TransferEngine.initialize failed: {rc}")
-            _TE = te
-        return _TE
+                _TE = shared_raw()
+    return _TE
 
 
 class RegistrationError(RuntimeError):
@@ -2955,6 +2955,8 @@ class RegistrationManager:
             }
 
 
+_TRANSFER_REGISTRATIONS = {}
+_ENGINE_REGISTRATIONS = {}
 _REGISTRATION_MANAGER = None
 _REGISTRATION_MANAGER_LOCK = threading.Lock()
 
@@ -2965,6 +2967,21 @@ def _get_registration_manager(te=None):
         if _REGISTRATION_MANAGER is None:
             _REGISTRATION_MANAGER = RegistrationManager(te=te)
         return _REGISTRATION_MANAGER
+
+
+def _registration_for(owner, engine):
+    """Keep the chosen engine attached to an owner through quarantine/reaping."""
+    if engine.raw is _get_te():
+        manager = _get_registration_manager()
+    else:
+        with _REGISTRATION_MANAGER_LOCK:
+            manager = _ENGINE_REGISTRATIONS.get(id(engine))
+            if manager is None:
+                manager = _ENGINE_REGISTRATIONS[id(engine)] = RegistrationManager(te=engine)
+    existing = _TRANSFER_REGISTRATIONS.setdefault(owner, manager)
+    if existing is not manager:
+        raise RuntimeError("D2D registration owner changed engines")
+    return manager
 
 
 # ---------------------------------------------------------------------------
@@ -3029,7 +3046,7 @@ def _start_transfer_server(scheduler, meta: dict, kv_cpu) -> dict:
     listener = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
     listener.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
     listener.setsockopt(socket.SOL_SOCKET, socket.SO_RCVBUF, 16 * 1024 * 1024)
-    listener.bind(("127.0.0.1", 0))
+    listener.bind((os.environ.get("HANDOFF_TRANSFER_BIND_HOST", "127.0.0.1"), 0))
     listener.listen(1)
     listener.settimeout(180)
     port = listener.getsockname()[1]
@@ -3125,7 +3142,7 @@ def _open_transfer_listener(timeout_s=1.0):
     """Create the loopback control listener shared by the source servers."""
     listener = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
     listener.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
-    listener.bind(("127.0.0.1", 0))
+    listener.bind((os.environ.get("HANDOFF_TRANSFER_BIND_HOST", "127.0.0.1"), 0))
     listener.listen(1)
     listener.settimeout(timeout_s)
     return listener, int(listener.getsockname()[1])
@@ -3310,6 +3327,14 @@ def _start_layer_gpu_server(scheduler, req, meta, remote):
     advertise a bounded ring of layer slots (P5.2-B); the source reuses a
     target slot only after the target acknowledges its H2D copy.
     """
+    from . import d2d_groups as grouping
+
+    if meta.get("d2d_range_protocol"):
+        from .qwen_ranges import source
+
+        return source(scheduler, req, meta, remote)
+    group_size = grouping.size(meta.get("d2d_group_size"))
+    meta = dict(meta, d2d_group_size=group_size)
     source_device = torch.cuda.current_device()
     source_ready = torch.cuda.Event()
     source_ready.record(torch.cuda.current_stream(source_device))
@@ -3323,11 +3348,11 @@ def _start_layer_gpu_server(scheduler, req, meta, remote):
     k0 = pool.get_key_buffer(0)
     shape = (kv_len, int(k0.shape[1]), int(k0.shape[2]))
     dtype = k0.dtype
-    nbuf = max(1, min(int(FAST_BUFFERS), layer_num))
+    nbuf = max(1, min(max(int(FAST_BUFFERS), group_size), layer_num))
     nstreams = max(1, min(int(FAST_COPY_STREAMS), nbuf))
     if not FAST_ASYNC:
         # Without async TE a second staging buffer cannot overlap anything.
-        nbuf = 1
+        nbuf = min(group_size, layer_num)
         nstreams = 1
     t_stage0 = time.perf_counter()
     stage = [
@@ -3377,6 +3402,7 @@ def _start_layer_gpu_server(scheduler, req, meta, remote):
             free_cv = threading.Condition()
             freed = []
             pending = {}
+            submitted_groups = []
             streams = []
             safe_cleanup = True
             try:
@@ -3560,17 +3586,21 @@ def _start_layer_gpu_server(scheduler, req, meta, remote):
                 def complete_ctrl(layer):
                     nonlocal sent, safe_cleanup
                     rec = prof_rec(layer)
-                    bid = pending.pop(layer)
-                    try:
-                        rc = te.get_batch_transfer_status([bid])
-                    except Exception:
-                        safe_cleanup = False
-                        raise
-                    if rc != 0:
-                        safe_cleanup = False
-                        raise RuntimeError(
-                            f"Mooncake async fast layer {layer} failed: rc={rc}"
-                        )
+                    record = pending.pop(layer)
+                    bid = record["bid"] if isinstance(record, dict) else record
+                    if not isinstance(record, dict) or not record["done"]:
+                        try:
+                            rc = te.get_batch_transfer_status([bid])
+                        except Exception:
+                            safe_cleanup = False
+                            raise
+                        if rc != 0:
+                            safe_cleanup = False
+                            raise RuntimeError(
+                                f"Mooncake async fast layer {layer} failed: rc={rc}"
+                            )
+                        if isinstance(record, dict):
+                            record["done"] = True
                     rec["te_done_at"] = time.monotonic()
                     rec["te_done"] = time.perf_counter()
                     sent += sum(slot_sizes)
@@ -3580,7 +3610,79 @@ def _start_layer_gpu_server(scheduler, req, meta, remote):
                     _send_json(conn, msg)
                     rec["ctrl_at"] = time.monotonic()
 
-                if FAST_ASYNC:
+                effective_group = min(group_size, nbuf, relay_slots or layer_num)
+
+                def submit_group(group):
+                    nonlocal sent, safe_cleanup
+                    for layer in group:
+                        evs[layer % nbuf].synchronize()
+                        rec = prof_rec(layer)
+                        rec["copy_done_at"] = time.monotonic()
+                        rec["copy_done"] = time.perf_counter()
+                        if relay_slots:
+                            while ctrl_next_local[0] <= layer - relay_slots:
+                                complete_ctrl(ctrl_next_local[0])
+                                ctrl_next_local[0] += 1
+                        wait_target_slot(
+                            layer, layer % relay_slots if relay_slots else None
+                        )
+                    src, dst, sizes = [], [], []
+                    for layer in group:
+                        src.extend(slot_addrs[layer % nbuf])
+                        dst.extend(
+                            layer_peer[layer % relay_slots]
+                            if relay_slots
+                            else layer_peer[layer]
+                        )
+                        sizes.extend(slot_sizes)
+                        prof_rec(layer)["te_submit"] = time.perf_counter()
+                    safe_cleanup = False
+                    if FAST_ASYNC:
+                        bid = te.batch_transfer_async_write(session, src, dst, sizes)
+                        if not bid or int(bid) <= 0:
+                            raise RuntimeError("Mooncake grouped fast submit failed")
+                        record = dict(bid=int(bid), done=False)
+                        for layer in group:
+                            pending[layer] = record
+                        safe_cleanup = True
+                    else:
+                        rc = te.batch_transfer_sync_write(session, src, dst, sizes)
+                        if rc != 0:
+                            raise RuntimeError("Mooncake grouped fast write failed")
+                        safe_cleanup = True
+                        for layer in group:
+                            rec = prof_rec(layer)
+                            rec["te_done_at"] = time.monotonic()
+                            rec["te_done"] = time.perf_counter()
+                            sent += sum(slot_sizes)
+                            msg = {"layer": layer}
+                            if relay_slots:
+                                msg["slot"] = layer % relay_slots
+                            _send_json(conn, msg)
+                            rec["ctrl_at"] = time.monotonic()
+                            ctrl_next_local[0] = layer + 1
+                    submitted_groups.append(list(group))
+
+                if group_size > 1:
+                    # A group owns distinct source buffers and distinct target
+                    # relay slots. Never overwrite either endpoint to fill a batch.
+                    ctrl_next_local = [0]
+                    for group in grouping.layers(layer_num, effective_group):
+                        if cancel.is_set():
+                            return
+                        if FAST_ASYNC:
+                            for layer in group:
+                                while ctrl_next_local[0] <= layer - nbuf:
+                                    complete_ctrl(ctrl_next_local[0])
+                                    ctrl_next_local[0] += 1
+                        for layer in group:
+                            issue_copy(layer)
+                        submit_group(group)
+                    while ctrl_next_local[0] < layer_num:
+                        complete_ctrl(ctrl_next_local[0])
+                        ctrl_next_local[0] += 1
+                    ctrl_next = layer_num
+                elif FAST_ASYNC:
                     if nbuf == 1:
                         # Single buffer: the next copy needs the previous TE to
                         # finish, so submit immediately after each copy.
@@ -3649,6 +3751,9 @@ def _start_layer_gpu_server(scheduler, req, meta, remote):
                     "streams": nstreams,
                     "async": bool(FAST_ASYNC),
                     "target_slots": relay_slots,
+                    "group_size": group_size,
+                    "effective_group_size": effective_group,
+                    "submitted_groups": submitted_groups,
                     "start_at": t_start,
                     "accept_at": t_accept,
                     "done_at": time.monotonic(),
@@ -3672,10 +3777,15 @@ def _start_layer_gpu_server(scheduler, req, meta, remote):
                 _mark_source_transfer(scheduler, token, False)
                 try:
                     if pending:
+                        unfinished = {
+                            value["bid"] if isinstance(value, dict) else value
+                            for value in pending.values()
+                            if not isinstance(value, dict) or not value["done"]
+                        }
                         safe_cleanup = (
-                            te.get_batch_transfer_status(list(pending.values())) == 0
-                            and safe_cleanup
-                        )
+                            not unfinished
+                            or te.get_batch_transfer_status(list(unfinished)) == 0
+                        ) and safe_cleanup
                         pending.clear()
                 except Exception:
                     safe_cleanup = False
@@ -3750,6 +3860,7 @@ def _start_layer_gpu_server(scheduler, req, meta, remote):
         "fast_buffers": nbuf,
         "fast_streams": nstreams,
         "fast_async": bool(FAST_ASYNC),
+        "d2d_group_size": group_size,
         "timeline": dict(timeline, return_at=time.monotonic()),
     }
 
@@ -3763,6 +3874,14 @@ def _start_layer_mooncake_server(
     transfers one layer at a time and sends a control message after each layer.
     The target's receiver copies that layer to GPU and sets its layer event.
     """
+    from . import d2d_groups as grouping
+
+    if meta.get("d2d_range_protocol"):
+        from .qwen_ranges import source
+
+        return source(scheduler, req, meta, remote, snapshot=kv_cpu)
+    group_size = grouping.size(meta.get("d2d_group_size"))
+    meta = dict(meta, d2d_group_size=group_size)
     token = secrets.token_hex(16)
     meta = _with_transfer_ticket(token, meta)
     timeline = {"enter_at": time.monotonic()}
@@ -3797,6 +3916,11 @@ def _start_layer_mooncake_server(
             n = 2 * len(layer_chunks)
             layer_slices.append(slice(off, off + n))
             off += n
+        layer_groups = grouping.layers(len(layer_slices), group_size)
+        group_slices = [
+            slice(layer_slices[g[0]].start, layer_slices[g[-1]].stop)
+            for g in layer_groups
+        ]
         try:
             pipeline = max(1, int(os.environ.get("HANDOFF_TRANSFER_PIPELINE", "1")))
         except (TypeError, ValueError):
@@ -3843,7 +3967,7 @@ def _start_layer_mooncake_server(
                         f"address count mismatch: src={len(addrs)} dst={len(peer)}"
                     )
                 if pipeline <= 1:
-                    for layer, sl in enumerate(layer_slices):
+                    for ordinal, sl in enumerate(group_slices):
                         if cancel.is_set():
                             return
                         safe_cleanup = False
@@ -3852,16 +3976,17 @@ def _start_layer_mooncake_server(
                         )
                         if rc != 0:
                             raise RuntimeError(
-                                f"Mooncake layer {layer} transfer failed: rc={rc}"
+                                f"Mooncake group {ordinal} transfer failed: rc={rc}"
                             )
                         safe_cleanup = True
                         sent += sum(sizes[sl])
-                        _send_json(conn, {"layer": layer})
+                        for layer in layer_groups[ordinal]:
+                            _send_json(conn, {"layer": layer})
                 else:
 
                     def submit(layer):
                         nonlocal safe_cleanup
-                        sl = layer_slices[layer]
+                        sl = group_slices[layer]
                         try:
                             bid = te.batch_transfer_async_write(
                                 session, addrs[sl], peer[sl], sizes[sl]
@@ -3875,9 +4000,9 @@ def _start_layer_mooncake_server(
                             raise
                         outstanding[layer] = int(bid)
 
-                    for layer in range(min(pipeline, len(layer_slices))):
+                    for layer in range(min(pipeline, len(group_slices))):
                         submit(layer)
-                    for layer in range(len(layer_slices)):
+                    for layer in range(len(group_slices)):
                         if cancel.is_set():
                             return
                         bid = outstanding.pop(layer)
@@ -3890,10 +4015,11 @@ def _start_layer_mooncake_server(
                         except Exception:
                             safe_cleanup = False
                             raise
-                        sent += sum(sizes[layer_slices[layer]])
-                        _send_json(conn, {"layer": layer})
+                        sent += sum(sizes[group_slices[layer]])
+                        for member in layer_groups[layer]:
+                            _send_json(conn, {"layer": member})
                         nxt = layer + pipeline
-                        if nxt < len(layer_slices):
+                        if nxt < len(group_slices):
                             submit(nxt)
                 _send_json(conn, {"done": True})
                 _TRANSFER_STATS[token] = {
@@ -3901,6 +4027,8 @@ def _start_layer_mooncake_server(
                     "send_ms": (time.perf_counter() - t0) * 1000.0,
                     "engine": "mooncake_tcp_layers",
                     "pipeline": pipeline,
+                    "group_size": group_size,
+                    "submitted_groups": [list(g) for g in layer_groups],
                     "rc": 0,
                 }
             except Exception as exc:
@@ -4015,6 +4143,21 @@ def _recv_transfer_layer_setup(transfer: dict):
         meta = _recv_json(conn)
         _bind_transfer_ticket(owner, token, meta)
         t_meta = time.monotonic()
+        if meta.get("d2d_range_protocol"):
+            from .qwen_ranges import setup
+
+            buffers, addresses, byte_count = setup(conn, meta, owner)
+            return (
+                conn,
+                meta,
+                None,
+                te,
+                addresses,
+                owner,
+                buffers,
+                len(meta["chunks"]),
+                byte_count,
+            )
         dtype = {
             "bfloat16": torch.bfloat16,
             "float16": torch.float16,
@@ -4236,6 +4379,14 @@ def _reservations(scheduler):
 
 
 def _reservation_free(scheduler, rid) -> Optional[dict]:
+    res = _reservations(scheduler).get(str(rid))
+    if res is not None and "native_req" in res:
+        from .qwen_reservation import cancel
+
+        if res.get("consumed") and not res.get("error"):
+            return _reservations(scheduler).pop(str(rid))
+        cancel(scheduler, str(rid), res)
+        return res
     res = _reservations(scheduler).pop(str(rid), None)
     if res is not None:
         try:
@@ -4259,6 +4410,8 @@ def _take_reserved(scheduler, rid, kv_len: int):
     idx = res.get("indices")
     if idx is None:
         raise RuntimeError(f"reservation {rid!r} KV already consumed")
+    if "native_req" in res:
+        raise ValueError("native D2D reservation must be consumed with its manifest")
     n = int(idx.numel())
     if n < kv_len:
         _reservation_free(scheduler, rid)
@@ -4423,13 +4576,25 @@ def _capacity_reconcile(scheduler) -> None:
     """Convert leases/reservations into live rows, and expire abandoned ones."""
     now = time.monotonic()
     tracked = _tracked(scheduler)
+    from .qwen_reservation import retire_source
+
+    for source_req in list(getattr(scheduler, "_qwen_d2d_plan_owners", {}).values()):
+        if not source_req.kv.holds_kv and not getattr(
+            source_req, "_handoff_frozen", False
+        ):
+            retire_source(scheduler, source_req)
     # Migration reservations: once admit_decode allocated a real row, the
     # slot reservation has done its job.
     for rid, res in list(_reservations(scheduler).items()):
         req = tracked.get(rid)
         if req is not None and req.kv.req_pool_idx is not None:
             res["slot_consumed"] = True
-        if res.get("slot_consumed") and res.get("indices") is None:
+        if (
+            res.get("slot_consumed")
+            and res.get("indices") is None
+            and not res.get("error")
+            and ("native_req" not in res or res.get("consumed"))
+        ):
             _reservations(scheduler).pop(rid, None)
     # Ordinary leases: release the slot count when the scheduler allocated the
     # real row; free the lease when the request finishes or is abandoned.
@@ -5212,7 +5377,12 @@ def _freeze_request(
     scheduler, req, mode="mooncake", out=None, epoch=None, target_rid=None
 ):
     from sglang.srt.runtime_context import get_memory
+    from . import d2d_groups as grouping
 
+    group_size = grouping.size()
+    from . import d2d_ranges
+
+    token_range = d2d_ranges.tokens()
     t_entry = time.perf_counter()
     t_entry_mono = time.monotonic()
     # P4.4/P4.5 v1 assumes the request exclusively owns its prefix slots.
@@ -5302,6 +5472,9 @@ def _freeze_request(
         "head_dim": head_dim,
         "dtype": "bfloat16" if kv_dtype == torch.bfloat16 else "float16",
         "fast_freeze": bool(fast),
+        "d2d_group_size": group_size,
+        "d2d_range_protocol": d2d_ranges.PROTOCOL,
+        "d2d_token_range": token_range,
     }
 
     result = {
@@ -7611,6 +7784,12 @@ def _slot_layer_receiver(
     overwrite this slot only after the matching ``{"free": slot}`` ack, so a
     slot is never reused while a copy or an attention read could still use it.
     """
+    if meta.get("d2d_range_protocol"):
+        from .qwen_ranges import receive
+
+        return receive(
+            scheduler, state, conn, meta, slots, new_indices, reg_owner, device
+        )
     copy_stream = None
     transfer_done = False
     try:
@@ -7773,6 +7952,11 @@ def _install_attention_wrappers(scheduler, state):
 
 
 def _rollback_full_import(scheduler, tracked, rid, req, indices):
+    if req is not None and getattr(req, "_d2d_native_alloc", False):
+        record = _reservations(scheduler).get(rid)
+        if record is not None:
+            record["error"] = "native copy import failed; retaining allocation"
+        return
     if req is not None:
         stop_target_receivers(req)
         _remove_from_batches(scheduler, req)
@@ -7826,12 +8010,19 @@ def _full_import_one(
 
     allocator = scheduler.token_to_kv_pool_allocator
     t_alloc = time.perf_counter()
-    new_indices = _take_reserved(scheduler, rid, kv_len)
+    req = None
+    if "native_req" in (_reservations(scheduler).get(rid) or {}) or meta.get(
+        "d2d_range_protocol"
+    ):
+        from .qwen_reservation import consume
+
+        req, new_indices = consume(scheduler, rid, meta, epoch)
+    else:
+        new_indices = _take_reserved(scheduler, rid, kv_len)
     if new_indices is None:
         new_indices = allocator.alloc(kv_len)
     if new_indices is None:
         raise RuntimeError(f"target KV pool cannot allocate {kv_len} tokens")
-    req = None
     try:
         alloc_ms = (time.perf_counter() - t_alloc) * 1000.0
         t_load = time.perf_counter()
@@ -7842,7 +8033,8 @@ def _full_import_one(
         sp = _sampling_from(
             state_sampling, len(output) + int(remaining), scheduler.tokenizer
         )
-        req = _new_req(scheduler, rid, origin, output, sp, **(lp_kwargs or {}))
+        if req is None:
+            req = _new_req(scheduler, rid, origin, output, sp, **(lp_kwargs or {}))
         req.kv.kv_committed_len = kv_len
         req._handoff_prefix_indices = new_indices.to(dtype=torch.int64)
         req.handoff_prefix_indices = req._handoff_prefix_indices
@@ -7945,6 +8137,14 @@ def _handle(scheduler, data):
 
         return handle(scheduler._pre_layerwise, data)
     tracked = _tracked(scheduler)
+    if cmd in {"plan", "reservation_ready"} or cmd == "reserve" and "plans" in data:
+        from . import qwen_reservation as native_reservation
+
+        return {
+            "plan": native_reservation.plan,
+            "reservation_ready": native_reservation.confirm,
+            "reserve": native_reservation.reserve,
+        }[cmd](scheduler, data)
     if cmd in ("import", "import_wave"):
         # Failure-injection only: leave the target import command in flight
         # long enough for the controller to die and the source watchdog to
@@ -8269,13 +8469,22 @@ def _handle(scheduler, data):
             raise KeyError(f"unknown rid {rid!r}")
         if req.finished():
             raise RuntimeError(f"request {rid!r} already finished; cannot freeze")
+        from . import qwen_reservation as reservation
+
+        error = None
+        try:
+            certificate = reservation.check_freeze(scheduler, req, data.get("epoch"))
+        except Exception as exc:
+            error = repr(exc)
+        if not reservation.agree(scheduler, error is None):
+            raise ValueError(f"TP D2D freeze preflight rejected: {error}")
         return _freeze_request(
             scheduler,
             req,
             mode=data.get("transfer", "file"),
             out=data.get("out"),
             epoch=data.get("epoch"),
-            target_rid=data.get("target_rid"),
+            target_rid=certificate["target_rid"],
         )
 
     if cmd == "freeze_all":
@@ -8308,6 +8517,23 @@ def _handle(scheduler, data):
             short = {rid: n for rid, n in lens.items() if n < cut}
             if short:
                 return {"pending": True, "cut": cut, "lens": lens, "short": short}
+        from . import qwen_reservation as reservation
+
+        # Validate the whole set collectively before freezing the first member.
+        preflight_error = None
+        try:
+            for rid in rids:
+                certificate = reservation.check_freeze(scheduler, tracked[rid], epoch)
+                if (
+                    target_rids.get(rid, certificate["target_rid"])
+                    != certificate["target_rid"]
+                ):
+                    raise ValueError("D2D freeze destination changed")
+                target_rids[rid] = certificate["target_rid"]
+        except Exception as exc:
+            preflight_error = repr(exc)
+        if not reservation.agree(scheduler, preflight_error is None):
+            raise ValueError(f"TP D2D freeze preflight rejected: {preflight_error}")
         results = []
         errors = {}
         for rid in rids:
@@ -8400,7 +8626,13 @@ def _handle(scheduler, data):
 
                 allocator = scheduler.token_to_kv_pool_allocator
                 t_alloc = time.perf_counter()
-                new_indices = _take_reserved(scheduler, rid0, kv_len)
+                native_range = bool(meta.get("d2d_range_protocol"))
+                if native_range:
+                    from .qwen_reservation import consume
+
+                    req, new_indices = consume(scheduler, rid0, meta, epoch)
+                else:
+                    new_indices = _take_reserved(scheduler, rid0, kv_len)
                 if new_indices is None:
                     new_indices = allocator.alloc(kv_len)
                 if new_indices is None:
@@ -8418,9 +8650,10 @@ def _handle(scheduler, data):
                     state_sampling, len(output) + int(remaining), scheduler.tokenizer
                 )
                 rid = rid0
-                req = _new_req(
-                    scheduler, rid, origin, output, sp, **_logprob_kwargs(data)
-                )
+                if req is None:
+                    req = _new_req(
+                        scheduler, rid, origin, output, sp, **_logprob_kwargs(data)
+                    )
                 req.kv.kv_committed_len = kv_len
                 req._handoff_prefix_indices = new_indices.to(dtype=torch.int64)
                 req.handoff_prefix_indices = req._handoff_prefix_indices
@@ -8524,12 +8757,18 @@ def _handle(scheduler, data):
                         _remove_from_batches(scheduler, req)
                     except Exception:
                         pass
-                if new_indices is not None:
+                if new_indices is not None and not meta.get("d2d_range_protocol"):
                     try:
                         scheduler.token_to_kv_pool_allocator.free(new_indices)
                     except Exception:
                         pass
-                if req is not None:
+                if meta.get("d2d_range_protocol"):
+                    record = _reservations(scheduler).get(rid0)
+                    if record is not None:
+                        record["error"] = (
+                            "native D2D import failed; retaining allocation"
+                        )
+                if req is not None and not meta.get("d2d_range_protocol"):
                     try:
                         tracked.pop(rid0, None)
                     except Exception:
@@ -8573,12 +8812,22 @@ def _handle(scheduler, data):
 
         allocator = scheduler.token_to_kv_pool_allocator
         t_alloc = time.perf_counter()
-        new_indices = _take_reserved(scheduler, rid0, kv_len)
+        req = None
+        if "native_req" in (_reservations(scheduler).get(rid0) or {}) or (
+            transfer and meta.get("d2d_range_protocol")
+        ):
+            from .qwen_reservation import consume
+
+            frozen = meta if transfer else state
+            req, new_indices = consume(
+                scheduler, rid0, frozen, epoch0 or frozen.get("migration_epoch")
+            )
+        else:
+            new_indices = _take_reserved(scheduler, rid0, kv_len)
         if new_indices is None:
             new_indices = allocator.alloc(kv_len)
         if new_indices is None:
             raise RuntimeError(f"target KV pool cannot allocate {kv_len} tokens")
-        req = None
         try:
             alloc_ms = (time.perf_counter() - t_alloc) * 1000.0
             t_load = time.perf_counter()
@@ -8600,7 +8849,10 @@ def _handle(scheduler, data):
                 )
                 or ""
             )
-            req = _new_req(scheduler, rid, origin, output, sp, **_logprob_kwargs(data))
+            if req is None:
+                req = _new_req(
+                    scheduler, rid, origin, output, sp, **_logprob_kwargs(data)
+                )
             req.kv.kv_committed_len = kv_len
             req._handoff_prefix_indices = new_indices.to(dtype=torch.int64)
             req.handoff_prefix_indices = req._handoff_prefix_indices
@@ -8931,7 +9183,26 @@ def _handle(scheduler, data):
         rids = [str(x) for x in data.get("rids", [])]
         cancelled = []
         missing = []
+        if data.get("epoch") is not None:
+            if not hasattr(scheduler, "_qwen_d2d_retired"):
+                scheduler._qwen_d2d_retired = set()
+            scheduler._qwen_d2d_retired.update(
+                (str(data["epoch"]), rid) for rid in rids
+            )
         for rid in rids:
+            record = _reservations(scheduler).get(rid)
+            live = tracked.get(rid)
+            if (
+                record is not None
+                and "native_req" in record
+                and record.get("consumed")
+                or live is not None
+                and getattr(live, "_d2d_native_alloc", False)
+                and live.kv.holds_kv
+            ):
+                raise ValueError(
+                    "native D2D reservation consumed; use target abort/cancellation"
+                )
             if _reservation_free(scheduler, rid) is not None:
                 cancelled.append(rid)
             else:
@@ -9062,6 +9333,9 @@ def _handle(scheduler, data):
                         "pending": True,
                         "reason": "inflight_rpc",
                     }
+        from .qwen_reservation import retire_source
+
+        retire_source(scheduler, req)
         req._handoff_frozen = False
         req._handoff_freeze_result = None
         req._handoff_pause_after_prefill = False

@@ -1,0 +1,2649 @@
+{
+  "status": "PASS_WITH_REAL_RDMA_UNVERIFIED",
+  "date": "2026-11-06",
+  "branch": "codex/remote-attn-pre-layerwise",
+  "base_commit": "5884814306731be4485f3fa7ef3666e8fbe1979e",
+  "uncommitted": true,
+  "wire_protocol": "remote-mooncake-v1",
+  "capability_contract": "d2d-mooncake-v2",
+  "snapshot": "/tmp/qo-mooncake-4060",
+  "cpu": {
+    "total": 405,
+    "suites": {
+      "all-final": {
+        "tests": 361,
+        "seconds": 152.718,
+        "status": "PASS",
+        "log": "/private/tmp/qo-tests/all-final.log"
+      },
+      "backend-final": {
+        "tests": 26,
+        "seconds": 0.082,
+        "status": "PASS",
+        "log": "/private/tmp/qo-tests/backend-final.log"
+      },
+      "new-final": {
+        "tests": 18,
+        "seconds": 19.076,
+        "status": "PASS",
+        "log": "/private/tmp/qo-tests/new-final.log"
+      }
+    },
+    "test_source_sha256": {
+      "test/registered/unit/plugins/test_remote_mooncake_data_plane.py": "0af026583266d624c5e255583d58ae7cdf6e4b4468cfaa8f2e6eabe932beaabb",
+      "test/registered/unit/plugins/test_remote_attn.py": "bc6a86d5bd3d22b17aac68fe1a15aeebc96c4fdac51cc3dc5191f783bc08fc29",
+      "test/manual/remote_attn/tp_control_worker.py": "700357a1c9fc5d657d39ddbc7159e38afee390dcbde35ecf24a160c19bfbced7"
+    }
+  },
+  "gpu_environment_cases": 35,
+  "real_rdma": false,
+  "results": {
+    "qo": {
+      "status": "PASS",
+      "device": "NVIDIA GeForce RTX 4060 Laptop GPU",
+      "scope": "Qwen/DSV Q/O/LSE on real CUDA with native TCP or an explicit fake NIC.\n\nNo checkpoint is loaded. Qwen uses FlashInfer; DSV uses native byte layouts and\nsparse kernels. Fake NIC/visibility cases do not validate a real RDMA HCA/CQ.\n",
+      "real_rdma": false,
+      "cases": [
+        {
+          "model": "qwen",
+          "backend": "tcp-host-v1",
+          "real_cuda": true,
+          "native_tcp": true,
+          "mixed_capabilities": false,
+          "owned_results": true,
+          "pass_": true
+        },
+        {
+          "model": "qwen",
+          "backend": "tcp-host-v1",
+          "real_cuda": true,
+          "native_tcp": true,
+          "mixed_capabilities": true,
+          "owned_results": true,
+          "pass_": true
+        },
+        {
+          "model": "qwen",
+          "backend": "rdma-gpu-v1",
+          "real_cuda": true,
+          "native_tcp": false,
+          "mixed_capabilities": false,
+          "owned_results": true,
+          "pass_": true
+        },
+        {
+          "model": "qwen",
+          "backend": "rdma-gpu-v1",
+          "fault": "late",
+          "direction": "q",
+          "late_write_retained": true,
+          "pass_": true
+        },
+        {
+          "model": "qwen",
+          "backend": "rdma-gpu-v1",
+          "fault": "late",
+          "direction": "result",
+          "late_write_retained": true,
+          "pass_": true
+        },
+        {
+          "model": "qwen",
+          "backend": "rdma-gpu-v1",
+          "fault": "exception",
+          "direction": "result",
+          "late_write_retained": true,
+          "pass_": true
+        },
+        {
+          "model": "qwen",
+          "backend": "rdma-gpu-v1",
+          "fault": "cancel",
+          "direction": "result",
+          "late_write_retained": true,
+          "pass_": true
+        },
+        {
+          "model": "v4",
+          "backend": "tcp-host-v1",
+          "real_cuda": true,
+          "native_tcp": true,
+          "mixed_capabilities": false,
+          "owned_results": true,
+          "pass_": true
+        },
+        {
+          "model": "v4",
+          "backend": "tcp-host-v1",
+          "real_cuda": true,
+          "native_tcp": true,
+          "mixed_capabilities": true,
+          "owned_results": true,
+          "pass_": true
+        },
+        {
+          "model": "v4",
+          "backend": "rdma-gpu-v1",
+          "real_cuda": true,
+          "native_tcp": false,
+          "mixed_capabilities": false,
+          "owned_results": true,
+          "pass_": true
+        },
+        {
+          "model": "v4",
+          "backend": "rdma-gpu-v1",
+          "fault": "late",
+          "direction": "q",
+          "late_write_retained": true,
+          "pass_": true
+        },
+        {
+          "model": "v4",
+          "backend": "rdma-gpu-v1",
+          "fault": "late",
+          "direction": "result",
+          "late_write_retained": true,
+          "pass_": true
+        },
+        {
+          "model": "v4",
+          "backend": "rdma-gpu-v1",
+          "fault": "exception",
+          "direction": "result",
+          "late_write_retained": true,
+          "pass_": true
+        },
+        {
+          "model": "v4",
+          "backend": "rdma-gpu-v1",
+          "fault": "cancel",
+          "direction": "result",
+          "late_write_retained": true,
+          "pass_": true
+        },
+        {
+          "model": "v41",
+          "backend": "tcp-host-v1",
+          "real_cuda": true,
+          "native_tcp": true,
+          "mixed_capabilities": false,
+          "owned_results": true,
+          "pass_": true
+        },
+        {
+          "model": "v41",
+          "backend": "tcp-host-v1",
+          "real_cuda": true,
+          "native_tcp": true,
+          "mixed_capabilities": true,
+          "owned_results": true,
+          "pass_": true
+        },
+        {
+          "model": "v41",
+          "backend": "rdma-gpu-v1",
+          "real_cuda": true,
+          "native_tcp": false,
+          "mixed_capabilities": false,
+          "owned_results": true,
+          "pass_": true
+        },
+        {
+          "model": "v41",
+          "backend": "rdma-gpu-v1",
+          "fault": "late",
+          "direction": "q",
+          "late_write_retained": true,
+          "pass_": true
+        },
+        {
+          "model": "v41",
+          "backend": "rdma-gpu-v1",
+          "fault": "late",
+          "direction": "result",
+          "late_write_retained": true,
+          "pass_": true
+        },
+        {
+          "model": "v41",
+          "backend": "rdma-gpu-v1",
+          "fault": "exception",
+          "direction": "result",
+          "late_write_retained": true,
+          "pass_": true
+        },
+        {
+          "model": "v41",
+          "backend": "rdma-gpu-v1",
+          "fault": "cancel",
+          "direction": "result",
+          "late_write_retained": true,
+          "pass_": true
+        }
+      ]
+    },
+    "dsv-qo-local": {
+      "status": "PASS",
+      "cases": [
+        {
+          "gpu_transport": true,
+          "five_rows_two_rpcs": true,
+          "q_producer_excludes_local": true,
+          "local_remote_gpu_overlap": true,
+          "q_send_overlaps_local": true,
+          "native_layer_recovered": true,
+          "source_refs_drained": true,
+          "stats": {
+            "batches": 4,
+            "rows": 10,
+            "queue_ns": 712618,
+            "rpc_ns": 60416594,
+            "failed": 0
+          },
+          "transport": {
+            "native_mooncake": true,
+            "physical_transport": "mooncake-tcp-host-staging",
+            "tcp_tensor_payloads": 0,
+            "q_transfers": 4,
+            "result_transfers": 4,
+            "registered_host_bytes": true,
+            "no_quarantined_slots": true,
+            "native_registration_survives_rpc_teardown": true
+          }
+        },
+        {
+          "ratio": 4,
+          "gpu_transport": true,
+          "selected": 4,
+          "remote_rows": 3,
+          "poisoned_destination_prefix": true,
+          "native_metadata": true,
+          "padded_heads_safe": true,
+          "tail_scatter_exact": true,
+          "nonzero_scatter_start": true,
+          "local_restored": true,
+          "pins_closed": true,
+          "early_close_rejected": true,
+          "tombstone_waited_for_gpu_reader": true,
+          "transport": {
+            "native_mooncake": true,
+            "physical_transport": "mooncake-tcp-host-staging",
+            "tcp_tensor_payloads": 0,
+            "q_transfers": 2,
+            "result_transfers": 2,
+            "registered_host_bytes": true,
+            "no_quarantined_slots": true,
+            "native_registration_survives_rpc_teardown": true
+          }
+        },
+        {
+          "ratio": 128,
+          "gpu_transport": true,
+          "selected": 521,
+          "remote_rows": 520,
+          "poisoned_destination_prefix": true,
+          "native_metadata": true,
+          "padded_heads_safe": true,
+          "tail_scatter_exact": true,
+          "nonzero_scatter_start": true,
+          "local_restored": true,
+          "pins_closed": true,
+          "early_close_rejected": true,
+          "tombstone_waited_for_gpu_reader": true,
+          "transport": {
+            "native_mooncake": true,
+            "physical_transport": "mooncake-tcp-host-staging",
+            "tcp_tensor_payloads": 0,
+            "q_transfers": 2,
+            "result_transfers": 2,
+            "registered_host_bytes": true,
+            "no_quarantined_slots": true,
+            "native_registration_survives_rpc_teardown": true
+          }
+        }
+      ]
+    },
+    "reader-lifetime": {
+      "device": "NVIDIA GeForce RTX 4060 Laptop GPU",
+      "gpu_reader_cancel_retained": true,
+      "early_target_close_rejected": true,
+      "gpu_consumer_proven": true,
+      "source_cache_pins_closed": true,
+      "slot_reused_after_positive_completion": true,
+      "transport": {
+        "native_mooncake": true,
+        "physical_transport": "mooncake-tcp-host-staging",
+        "tcp_tensor_payloads": 0,
+        "q_transfers": 2,
+        "result_transfers": 2,
+        "registered_host_bytes": true,
+        "no_quarantined_slots": true,
+        "native_registration_survives_rpc_teardown": true
+      },
+      "scope": "4060: actual GPU reader fence, native Mooncake payloads and cache/slot lifetime.\n\nTiny native byte pools and cache lock boundary; no full model or RDMA hardware.\n",
+      "source_sha256": {
+        "plugins/remote_attn/sglang_remote_attn/dsv_d2d.py": "e8d19051bac200ab8e90ab0cba2373abee61db4ce689bf3c4ac5ee0cd70daf8e",
+        "plugins/remote_attn/sglang_remote_attn/dsv_d2d_reservation.py": "ba56bc55295d8aa38317ef05b8c48a70de3f6c5ecedbb9ec03f58905c8d12ed1",
+        "plugins/remote_attn/sglang_remote_attn/destination_cache.py": "3b6f693b02bb3b75c77ddf9d3f82f83a9c7dffc54f2b46c10ae7f76b64c9fb14",
+        "plugins/remote_attn/sglang_remote_attn/swa_checkpoints.py": "e280dd79afcc5fbcef451e41bfd67c657b381b9f9c2e374753cbf6b89a5b2024",
+        "plugins/remote_attn/sglang_remote_attn/decode_overlap.py": "cc946c7c27d3337a569e2d175f61dfc9546713887068db9570081ceb98745ea5",
+        "plugins/remote_attn/sglang_remote_attn/prefix_stream.py": "d05526c327087a86fc9b93cf0095fa890c70de20cf11695e57cecedb96cdf26f",
+        "plugins/remote_attn/sglang_remote_attn/prefill_overlap.py": "8528da51b28ed4621d439b13dd9d2f621256fea73f8f32f8f304028b54f0edd0",
+        "plugins/remote_attn/sglang_remote_attn/pre_layerwise.py": "d5b3f178e7f8932db6c51cda032fc65c71d0389081112093b587a8549f4d4e41",
+        "plugins/remote_attn/sglang_remote_attn/segmented_graph.py": "7fa3205eef1e7b044a972b40a4502671edefb5c3247c9e0deecffaccbbda389b",
+        "plugins/remote_attn/sglang_remote_attn/transfer_priority.py": "ed9226f61d2b3612cffbd3e7b66f30a26bcd3feaaa654b61a43fa11612377aee",
+        "plugins/remote_attn/sglang_remote_attn/mooncake_backend.py": "4a1e80d29e71210ff4e61bef1f80b236ae518c173f6fce23a3726d7a6542c7d1",
+        "plugins/remote_attn/sglang_remote_attn/dsv41_staging.py": "5b90acab85161dc63dc6ea50dee59a3c56f1eaf28b9dad92252a0fcba422a6df",
+        "plugins/remote_attn/sglang_remote_attn/source_cache.py": "c60d91df378a70378893e436b9ec901f7cb8ada4d29a5bfb59578bf450bf5146",
+        "plugins/remote_attn/sglang_remote_attn/dsv41_receive.py": "499cb18fb58dd4f4dac92b3121a4bd2c39d6a5ce9e76aa7ceddb6d26e8c944bf",
+        "plugins/remote_attn/sglang_remote_attn/pd_mesh.py": "0c188d26f07f3a4626c14f1e5dbfd3b2352d39d481e13d48a93203d8513cd3ed",
+        "plugins/remote_attn/sglang_remote_attn/dsv41_sparse_math.py": "174980ce3bffac2e1791c0bfdce6c6f823275a47ad0be120f3a3a110d6c9f56e",
+        "plugins/remote_attn/sglang_remote_attn/dsv41_remote.py": "507430211aa9004520e33b10774764c3478b8c0b64411ee03cafffef96c5b77d",
+        "plugins/remote_attn/sglang_remote_attn/qwen_ranges.py": "ccbf557c3fd469c21993507d042d563ebf0b2863ee933d24e4f06270d381f897",
+        "plugins/remote_attn/sglang_remote_attn/dsv41_kernels.py": "5ae677e1f1c8f3a1bd06fa3127fecfa97bb414eca9dd196d7266605bb0877d9a",
+        "plugins/remote_attn/sglang_remote_attn/source_resources.py": "2e35ee2d617d45b44e3d32595f8b7a0b7434240d42349bab2ab906f004d0c418",
+        "plugins/remote_attn/sglang_remote_attn/prefill_admission.py": "4894fb9d626dfd01f9a98b483f6febd4720653f95cb8fd4454f44cf9053a9e00",
+        "plugins/remote_attn/sglang_remote_attn/dsv41_layerwise.py": "b4c231d4d1e03234cf30e750435c5c7f5414cd5ecf38991410f90de8b68e4df5",
+        "plugins/remote_attn/sglang_remote_attn/remote_data_plane.py": "90fc86381c7b33c5524324f3909869854d7c07d2e93224a7ccd3515c7ff94fc0",
+        "plugins/remote_attn/sglang_remote_attn/interfaces.py": "d471a011bfd194f212713588fdd9deb635c7738cf80b08aa2cefa4e942f895c2",
+        "plugins/remote_attn/sglang_remote_attn/tp.py": "766b5028a3a08a801c2891580e406a40f1868d7d21cde8ef46be1d76b86b059c",
+        "plugins/remote_attn/sglang_remote_attn/d2d_ranges.py": "c85aa311e1fd7b8f7f9b435fc20cd82d138c023b4372733694984cb02576bfee",
+        "plugins/remote_attn/sglang_remote_attn/__init__.py": "f64e878600a7775c62cd79063dbd94d92ccfd6513909f6fed3a221758ebe067f",
+        "plugins/remote_attn/sglang_remote_attn/dsv41_paged.py": "6b413fe3eeca846c51b800c32467b8779a384b91ee6765ee914987bde6412d2f",
+        "plugins/remote_attn/sglang_remote_attn/compat.py": "8772dd8af6143737b0ccbd53a3a88cc441259e9cadb374e66547abe8b420a971",
+        "plugins/remote_attn/sglang_remote_attn/dsv41_graph.py": "8d26ac9eed337db0764aca93ce638b1e58bd34d19a6962b139c5f508d31fc946",
+        "plugins/remote_attn/sglang_remote_attn/check.py": "a7e23c69b57df34ec943df1aad40e4a4e11171fc30cb0f7fcb8ee9072bada438",
+        "plugins/remote_attn/sglang_remote_attn/qwen_reservation.py": "8efb487be2243cf3b10fbcaaf991e1e913984ced6443c59d12602ee9d8d75c6b",
+        "plugins/remote_attn/sglang_remote_attn/dsv41_progressive.py": "3573ab543f774425de4a440a59ca1fb25fd7443b73858a43537a49c24950eb13",
+        "plugins/remote_attn/sglang_remote_attn/dsv41_rpc.py": "3e5da18fa8647120237ac0fc285a40a6bf486fb94a2b7bde2c5040de23cadb38",
+        "plugins/remote_attn/sglang_remote_attn/hooks.py": "230051690e9b4675dd06e17279adf6510b4daeae085fb1cd80c4abd2dfe1e5ed",
+        "plugins/remote_attn/sglang_remote_attn/d2d_bulk.py": "d59c87bc25e8d8d6e2915a028b55fa4258d509ab12f2861efae2556244002aa6",
+        "plugins/remote_attn/sglang_remote_attn/handoff_control.py": "0c74a27b0c7d9fad9f9f63a296efceafea912d0c01711eef02128f9f67261453",
+        "plugins/remote_attn/sglang_remote_attn/retirement.py": "b8bff23a87fc6aa5b743589756dc18967fe160ccdf7de59672df178497f45f09",
+        "plugins/remote_attn/sglang_remote_attn/dsv_gateway_control.py": "354fe306823f7216cfb2b0814986045ae55e82a32ce258f6e7dad4e23a968740",
+        "plugins/remote_attn/sglang_remote_attn/transport_failure.py": "37fff73986d65af4eb9bb546760529f739a63004c67a0b4581dc7586584332c4",
+        "plugins/remote_attn/sglang_remote_attn/dsv41_fast.py": "fd894d78b27530a914cd72ed19d9abcaaf137f533c1e1643be280d0623b6c470",
+        "plugins/remote_attn/sglang_remote_attn/d2d_groups.py": "1b0760336fc1c0274fafc3419e9691e7efa2bbe0564cc3c0016ffdfc7ef99949",
+        "test/manual/remote_attn/remote_gpu_lifetime_probe.py": "bd94aeb1f184f39d8e5697a783838e9bef3be4a1bd3290dbeac1c1b28a4362f3",
+        "test/manual/remote_attn/remote_gpu_probe_support.py": "d57bf8cfa82447104d2968741e3b97195e6287be9ca55c21c694d6960b0e7e1f",
+        "test/manual/remote_attn/dsv41_remote_probe_support.py": "eda67756ba392faa9bba5f5f32cae68e8676547fc0838c2370bbacd32bde4bf2",
+        "python/sglang/srt/distributed/device_communicators/mooncake_transfer_engine.py": "ac7d5f2e543bfb01f3ae3de1ab8686c3eed6388c96d8ac00f7373bf106617126",
+        "python/sglang/kernels/ops/attention/dsv4/kv_layout.py": "85f012a8a5c3cd1a534e5250030b4085ebd9f2dfac83c1fca4b5d9cbc771a8a4",
+        "python/sglang/test/kernels/deepseek_v4/dsv41_kv_quant_reference.py": "7370805c53323eaf0059fc4987688aac59a8ca4c80aefb673e87b002a31e3292",
+        "python/sglang/srt/mem_cache/deepseek_v4_memory_pool.py": "1782124ee47755cc77d3458be77bdae1c10153849d96f58ddca78aff7e4b21b3",
+        "python/sglang/srt/layers/attention/deepseek_v4_backend.py": "70498af7eafc15bbb9d9a6b6b995415766139233433851e0e3bbfc4635129ac9"
+      }
+    },
+    "dsv-d2d-local": {
+      "status": "PASS",
+      "device": "NVIDIA GeForce RTX 4060 Laptop GPU",
+      "torch": "2.13.0+cu130",
+      "suite": "dsv-local",
+      "cases": [
+        {
+          "layout": "v4",
+          "group_size": 4,
+          "entries_per_frame": 2,
+          "independent_entry_local": true,
+          "source_free_count": 1
+        },
+        {
+          "layout": "v41",
+          "group_size": 4,
+          "entries_per_frame": 2,
+          "independent_entry_local": true,
+          "source_free_count": 1
+        }
+      ],
+      "scope": "Group-layer CUDA probes; real transport/kernels, explicit scheduler ABI fixtures."
+    },
+    "qwen-d2d-range": {
+      "status": "PASS",
+      "device": "NVIDIA GeForce RTX 4060 Laptop GPU",
+      "torch": "2.13.0+cu130",
+      "cases": [
+        {
+          "mode": "fast-async",
+          "dtype": "float16",
+          "slots": 2,
+          "source_buffers": 4,
+          "compute_steps": 971,
+          "overlap": null,
+          "layer_ready_at": [
+            1058493.788439628,
+            1058493.802557553,
+            1058493.816992636,
+            1058493.835154458,
+            1058493.849486703,
+            1058493.860535858
+          ],
+          "target_registration": {
+            "live": 0,
+            "owners": 0,
+            "bytes_live": 0,
+            "max_bytes_live": 524320,
+            "registrations": 1,
+            "unregistrations": 1,
+            "overlap_rejections": 0,
+            "stale_rejections": 0,
+            "unregister_failures": 0,
+            "stale": 0,
+            "last_unregister_error": null
+          },
+          "source": {
+            "registration": {
+              "live": 0,
+              "owners": 0,
+              "bytes_live": 0,
+              "max_bytes_live": 524320,
+              "registrations": 1,
+              "unregistrations": 1,
+              "overlap_rejections": 0,
+              "stale_rejections": 0,
+              "unregister_failures": 0,
+              "stale": 0,
+              "last_unregister_error": null
+            },
+            "native_batches": [
+              {
+                "kind": "async",
+                "descriptors": 1,
+                "bytes": 524320
+              },
+              {
+                "kind": "async",
+                "descriptors": 1,
+                "bytes": 524320
+              },
+              {
+                "kind": "async",
+                "descriptors": 1,
+                "bytes": 524320
+              },
+              {
+                "kind": "async",
+                "descriptors": 1,
+                "bytes": 524320
+              },
+              {
+                "kind": "async",
+                "descriptors": 1,
+                "bytes": 524320
+              },
+              {
+                "kind": "async",
+                "descriptors": 1,
+                "bytes": 524320
+              },
+              {
+                "kind": "async",
+                "descriptors": 1,
+                "bytes": 524320
+              },
+              {
+                "kind": "async",
+                "descriptors": 1,
+                "bytes": 524320
+              },
+              {
+                "kind": "async",
+                "descriptors": 1,
+                "bytes": 524320
+              },
+              {
+                "kind": "async",
+                "descriptors": 1,
+                "bytes": 524320
+              },
+              {
+                "kind": "async",
+                "descriptors": 1,
+                "bytes": 524320
+              },
+              {
+                "kind": "async",
+                "descriptors": 1,
+                "bytes": 524320
+              }
+            ],
+            "group_size": 1,
+            "unsafe_guard": false,
+            "stats": {
+              "b2b1a2a5766fcc2ac6d7e736d2ee454e": {
+                "backend": "tcp-host-v1",
+                "group_size": 1,
+                "token_range": 1024,
+                "submitted_groups": [
+                  {
+                    "layers": [
+                      0
+                    ],
+                    "token_range": [
+                      0,
+                      1024
+                    ]
+                  },
+                  {
+                    "layers": [
+                      0
+                    ],
+                    "token_range": [
+                      1024,
+                      2048
+                    ]
+                  },
+                  {
+                    "layers": [
+                      1
+                    ],
+                    "token_range": [
+                      0,
+                      1024
+                    ]
+                  },
+                  {
+                    "layers": [
+                      1
+                    ],
+                    "token_range": [
+                      1024,
+                      2048
+                    ]
+                  },
+                  {
+                    "layers": [
+                      2
+                    ],
+                    "token_range": [
+                      0,
+                      1024
+                    ]
+                  },
+                  {
+                    "layers": [
+                      2
+                    ],
+                    "token_range": [
+                      1024,
+                      2048
+                    ]
+                  },
+                  {
+                    "layers": [
+                      3
+                    ],
+                    "token_range": [
+                      0,
+                      1024
+                    ]
+                  },
+                  {
+                    "layers": [
+                      3
+                    ],
+                    "token_range": [
+                      1024,
+                      2048
+                    ]
+                  },
+                  {
+                    "layers": [
+                      4
+                    ],
+                    "token_range": [
+                      0,
+                      1024
+                    ]
+                  },
+                  {
+                    "layers": [
+                      4
+                    ],
+                    "token_range": [
+                      1024,
+                      2048
+                    ]
+                  },
+                  {
+                    "layers": [
+                      5
+                    ],
+                    "token_range": [
+                      0,
+                      1024
+                    ]
+                  },
+                  {
+                    "layers": [
+                      5
+                    ],
+                    "token_range": [
+                      1024,
+                      2048
+                    ]
+                  }
+                ],
+                "bytes": 6291840,
+                "rc": 0
+              }
+            },
+            "hub": null
+          },
+          "group": 1,
+          "token_range": 1024,
+          "native_batches_count": 12,
+          "bounded_host_slots": true
+        },
+        {
+          "mode": "fast-async",
+          "dtype": "float16",
+          "slots": 2,
+          "source_buffers": 4,
+          "compute_steps": 1744,
+          "overlap": null,
+          "layer_ready_at": [
+            1058496.040710006,
+            1058496.041076436,
+            1058496.043428105,
+            1058496.097028785,
+            1058496.097667989,
+            1058496.101114991
+          ],
+          "target_registration": {
+            "live": 0,
+            "owners": 0,
+            "bytes_live": 0,
+            "max_bytes_live": 524320,
+            "registrations": 2,
+            "unregistrations": 2,
+            "overlap_rejections": 0,
+            "stale_rejections": 0,
+            "unregister_failures": 0,
+            "stale": 0,
+            "last_unregister_error": null
+          },
+          "source": {
+            "registration": {
+              "live": 0,
+              "owners": 0,
+              "bytes_live": 0,
+              "max_bytes_live": 394848,
+              "registrations": 1,
+              "unregistrations": 1,
+              "overlap_rejections": 0,
+              "stale_rejections": 0,
+              "unregister_failures": 0,
+              "stale": 0,
+              "last_unregister_error": null
+            },
+            "native_batches": [
+              {
+                "kind": "async",
+                "descriptors": 2,
+                "bytes": 263232
+              },
+              {
+                "kind": "async",
+                "descriptors": 1,
+                "bytes": 131616
+              },
+              {
+                "kind": "async",
+                "descriptors": 2,
+                "bytes": 263232
+              },
+              {
+                "kind": "async",
+                "descriptors": 1,
+                "bytes": 131616
+              },
+              {
+                "kind": "async",
+                "descriptors": 2,
+                "bytes": 263232
+              },
+              {
+                "kind": "async",
+                "descriptors": 1,
+                "bytes": 131616
+              },
+              {
+                "kind": "async",
+                "descriptors": 2,
+                "bytes": 263232
+              },
+              {
+                "kind": "async",
+                "descriptors": 1,
+                "bytes": 131616
+              },
+              {
+                "kind": "async",
+                "descriptors": 2,
+                "bytes": 263232
+              },
+              {
+                "kind": "async",
+                "descriptors": 1,
+                "bytes": 131616
+              },
+              {
+                "kind": "async",
+                "descriptors": 2,
+                "bytes": 263232
+              },
+              {
+                "kind": "async",
+                "descriptors": 1,
+                "bytes": 131616
+              },
+              {
+                "kind": "async",
+                "descriptors": 2,
+                "bytes": 263232
+              },
+              {
+                "kind": "async",
+                "descriptors": 1,
+                "bytes": 131616
+              },
+              {
+                "kind": "async",
+                "descriptors": 2,
+                "bytes": 255040
+              },
+              {
+                "kind": "async",
+                "descriptors": 1,
+                "bytes": 127520
+              },
+              {
+                "kind": "async",
+                "descriptors": 2,
+                "bytes": 263232
+              },
+              {
+                "kind": "async",
+                "descriptors": 1,
+                "bytes": 131616
+              },
+              {
+                "kind": "async",
+                "descriptors": 2,
+                "bytes": 263232
+              },
+              {
+                "kind": "async",
+                "descriptors": 1,
+                "bytes": 131616
+              },
+              {
+                "kind": "async",
+                "descriptors": 2,
+                "bytes": 263232
+              },
+              {
+                "kind": "async",
+                "descriptors": 1,
+                "bytes": 131616
+              },
+              {
+                "kind": "async",
+                "descriptors": 2,
+                "bytes": 263232
+              },
+              {
+                "kind": "async",
+                "descriptors": 1,
+                "bytes": 131616
+              },
+              {
+                "kind": "async",
+                "descriptors": 2,
+                "bytes": 263232
+              },
+              {
+                "kind": "async",
+                "descriptors": 1,
+                "bytes": 131616
+              },
+              {
+                "kind": "async",
+                "descriptors": 2,
+                "bytes": 263232
+              },
+              {
+                "kind": "async",
+                "descriptors": 1,
+                "bytes": 131616
+              },
+              {
+                "kind": "async",
+                "descriptors": 2,
+                "bytes": 263232
+              },
+              {
+                "kind": "async",
+                "descriptors": 1,
+                "bytes": 131616
+              },
+              {
+                "kind": "async",
+                "descriptors": 2,
+                "bytes": 255040
+              },
+              {
+                "kind": "async",
+                "descriptors": 1,
+                "bytes": 127520
+              }
+            ],
+            "group_size": 3,
+            "unsafe_guard": false,
+            "stats": {
+              "1f7ba63d3fed3602ab2381e55a56515b": {
+                "backend": "tcp-host-v1",
+                "group_size": 3,
+                "token_range": 257,
+                "submitted_groups": [
+                  {
+                    "layers": [
+                      0,
+                      1
+                    ],
+                    "token_range": [
+                      0,
+                      257
+                    ]
+                  },
+                  {
+                    "layers": [
+                      2
+                    ],
+                    "token_range": [
+                      0,
+                      257
+                    ]
+                  },
+                  {
+                    "layers": [
+                      0,
+                      1
+                    ],
+                    "token_range": [
+                      257,
+                      514
+                    ]
+                  },
+                  {
+                    "layers": [
+                      2
+                    ],
+                    "token_range": [
+                      257,
+                      514
+                    ]
+                  },
+                  {
+                    "layers": [
+                      0,
+                      1
+                    ],
+                    "token_range": [
+                      514,
+                      771
+                    ]
+                  },
+                  {
+                    "layers": [
+                      2
+                    ],
+                    "token_range": [
+                      514,
+                      771
+                    ]
+                  },
+                  {
+                    "layers": [
+                      0,
+                      1
+                    ],
+                    "token_range": [
+                      771,
+                      1028
+                    ]
+                  },
+                  {
+                    "layers": [
+                      2
+                    ],
+                    "token_range": [
+                      771,
+                      1028
+                    ]
+                  },
+                  {
+                    "layers": [
+                      0,
+                      1
+                    ],
+                    "token_range": [
+                      1028,
+                      1285
+                    ]
+                  },
+                  {
+                    "layers": [
+                      2
+                    ],
+                    "token_range": [
+                      1028,
+                      1285
+                    ]
+                  },
+                  {
+                    "layers": [
+                      0,
+                      1
+                    ],
+                    "token_range": [
+                      1285,
+                      1542
+                    ]
+                  },
+                  {
+                    "layers": [
+                      2
+                    ],
+                    "token_range": [
+                      1285,
+                      1542
+                    ]
+                  },
+                  {
+                    "layers": [
+                      0,
+                      1
+                    ],
+                    "token_range": [
+                      1542,
+                      1799
+                    ]
+                  },
+                  {
+                    "layers": [
+                      2
+                    ],
+                    "token_range": [
+                      1542,
+                      1799
+                    ]
+                  },
+                  {
+                    "layers": [
+                      0,
+                      1
+                    ],
+                    "token_range": [
+                      1799,
+                      2048
+                    ]
+                  },
+                  {
+                    "layers": [
+                      2
+                    ],
+                    "token_range": [
+                      1799,
+                      2048
+                    ]
+                  },
+                  {
+                    "layers": [
+                      3,
+                      4
+                    ],
+                    "token_range": [
+                      0,
+                      257
+                    ]
+                  },
+                  {
+                    "layers": [
+                      5
+                    ],
+                    "token_range": [
+                      0,
+                      257
+                    ]
+                  },
+                  {
+                    "layers": [
+                      3,
+                      4
+                    ],
+                    "token_range": [
+                      257,
+                      514
+                    ]
+                  },
+                  {
+                    "layers": [
+                      5
+                    ],
+                    "token_range": [
+                      257,
+                      514
+                    ]
+                  },
+                  {
+                    "layers": [
+                      3,
+                      4
+                    ],
+                    "token_range": [
+                      514,
+                      771
+                    ]
+                  },
+                  {
+                    "layers": [
+                      5
+                    ],
+                    "token_range": [
+                      514,
+                      771
+                    ]
+                  },
+                  {
+                    "layers": [
+                      3,
+                      4
+                    ],
+                    "token_range": [
+                      771,
+                      1028
+                    ]
+                  },
+                  {
+                    "layers": [
+                      5
+                    ],
+                    "token_range": [
+                      771,
+                      1028
+                    ]
+                  },
+                  {
+                    "layers": [
+                      3,
+                      4
+                    ],
+                    "token_range": [
+                      1028,
+                      1285
+                    ]
+                  },
+                  {
+                    "layers": [
+                      5
+                    ],
+                    "token_range": [
+                      1028,
+                      1285
+                    ]
+                  },
+                  {
+                    "layers": [
+                      3,
+                      4
+                    ],
+                    "token_range": [
+                      1285,
+                      1542
+                    ]
+                  },
+                  {
+                    "layers": [
+                      5
+                    ],
+                    "token_range": [
+                      1285,
+                      1542
+                    ]
+                  },
+                  {
+                    "layers": [
+                      3,
+                      4
+                    ],
+                    "token_range": [
+                      1542,
+                      1799
+                    ]
+                  },
+                  {
+                    "layers": [
+                      5
+                    ],
+                    "token_range": [
+                      1542,
+                      1799
+                    ]
+                  },
+                  {
+                    "layers": [
+                      3,
+                      4
+                    ],
+                    "token_range": [
+                      1799,
+                      2048
+                    ]
+                  },
+                  {
+                    "layers": [
+                      5
+                    ],
+                    "token_range": [
+                      1799,
+                      2048
+                    ]
+                  }
+                ],
+                "bytes": 6292992,
+                "rc": 0
+              }
+            },
+            "hub": null
+          },
+          "group": 3,
+          "token_range": 257,
+          "native_batches_count": 32,
+          "bounded_host_slots": true
+        },
+        {
+          "mode": "fast-async",
+          "dtype": "bfloat16",
+          "slots": 1,
+          "source_buffers": 4,
+          "compute_steps": 1153,
+          "overlap": null,
+          "layer_ready_at": [
+            1058498.309468102,
+            1058498.313105445,
+            1058498.316292555,
+            1058498.319634963,
+            1058498.345539349,
+            1058498.34860924
+          ],
+          "target_registration": {
+            "live": 0,
+            "owners": 0,
+            "bytes_live": 0,
+            "max_bytes_live": 524320,
+            "registrations": 3,
+            "unregistrations": 3,
+            "overlap_rejections": 0,
+            "stale_rejections": 0,
+            "unregister_failures": 0,
+            "stale": 0,
+            "last_unregister_error": null
+          },
+          "source": {
+            "registration": {
+              "live": 0,
+              "owners": 0,
+              "bytes_live": 0,
+              "max_bytes_live": 1050752,
+              "registrations": 1,
+              "unregistrations": 1,
+              "overlap_rejections": 0,
+              "stale_rejections": 0,
+              "unregister_failures": 0,
+              "stale": 0,
+              "last_unregister_error": null
+            },
+            "native_batches": [
+              {
+                "kind": "async",
+                "descriptors": 1,
+                "bytes": 262688
+              },
+              {
+                "kind": "async",
+                "descriptors": 1,
+                "bytes": 262688
+              },
+              {
+                "kind": "async",
+                "descriptors": 1,
+                "bytes": 262688
+              },
+              {
+                "kind": "async",
+                "descriptors": 1,
+                "bytes": 262688
+              },
+              {
+                "kind": "async",
+                "descriptors": 1,
+                "bytes": 262688
+              },
+              {
+                "kind": "async",
+                "descriptors": 1,
+                "bytes": 262688
+              },
+              {
+                "kind": "async",
+                "descriptors": 1,
+                "bytes": 262688
+              },
+              {
+                "kind": "async",
+                "descriptors": 1,
+                "bytes": 262688
+              },
+              {
+                "kind": "async",
+                "descriptors": 1,
+                "bytes": 262688
+              },
+              {
+                "kind": "async",
+                "descriptors": 1,
+                "bytes": 262688
+              },
+              {
+                "kind": "async",
+                "descriptors": 1,
+                "bytes": 262688
+              },
+              {
+                "kind": "async",
+                "descriptors": 1,
+                "bytes": 262688
+              },
+              {
+                "kind": "async",
+                "descriptors": 1,
+                "bytes": 260640
+              },
+              {
+                "kind": "async",
+                "descriptors": 1,
+                "bytes": 260640
+              },
+              {
+                "kind": "async",
+                "descriptors": 1,
+                "bytes": 260640
+              },
+              {
+                "kind": "async",
+                "descriptors": 1,
+                "bytes": 260640
+              },
+              {
+                "kind": "async",
+                "descriptors": 1,
+                "bytes": 262688
+              },
+              {
+                "kind": "async",
+                "descriptors": 1,
+                "bytes": 262688
+              },
+              {
+                "kind": "async",
+                "descriptors": 1,
+                "bytes": 262688
+              },
+              {
+                "kind": "async",
+                "descriptors": 1,
+                "bytes": 262688
+              },
+              {
+                "kind": "async",
+                "descriptors": 1,
+                "bytes": 262688
+              },
+              {
+                "kind": "async",
+                "descriptors": 1,
+                "bytes": 262688
+              },
+              {
+                "kind": "async",
+                "descriptors": 1,
+                "bytes": 260640
+              },
+              {
+                "kind": "async",
+                "descriptors": 1,
+                "bytes": 260640
+              }
+            ],
+            "group_size": 4,
+            "unsafe_guard": false,
+            "stats": {
+              "3d8f9bcef81762e844d092bed37590ce": {
+                "backend": "tcp-host-v1",
+                "group_size": 4,
+                "token_range": 513,
+                "submitted_groups": [
+                  {
+                    "layers": [
+                      0
+                    ],
+                    "token_range": [
+                      0,
+                      513
+                    ]
+                  },
+                  {
+                    "layers": [
+                      1
+                    ],
+                    "token_range": [
+                      0,
+                      513
+                    ]
+                  },
+                  {
+                    "layers": [
+                      2
+                    ],
+                    "token_range": [
+                      0,
+                      513
+                    ]
+                  },
+                  {
+                    "layers": [
+                      3
+                    ],
+                    "token_range": [
+                      0,
+                      513
+                    ]
+                  },
+                  {
+                    "layers": [
+                      0
+                    ],
+                    "token_range": [
+                      513,
+                      1026
+                    ]
+                  },
+                  {
+                    "layers": [
+                      1
+                    ],
+                    "token_range": [
+                      513,
+                      1026
+                    ]
+                  },
+                  {
+                    "layers": [
+                      2
+                    ],
+                    "token_range": [
+                      513,
+                      1026
+                    ]
+                  },
+                  {
+                    "layers": [
+                      3
+                    ],
+                    "token_range": [
+                      513,
+                      1026
+                    ]
+                  },
+                  {
+                    "layers": [
+                      0
+                    ],
+                    "token_range": [
+                      1026,
+                      1539
+                    ]
+                  },
+                  {
+                    "layers": [
+                      1
+                    ],
+                    "token_range": [
+                      1026,
+                      1539
+                    ]
+                  },
+                  {
+                    "layers": [
+                      2
+                    ],
+                    "token_range": [
+                      1026,
+                      1539
+                    ]
+                  },
+                  {
+                    "layers": [
+                      3
+                    ],
+                    "token_range": [
+                      1026,
+                      1539
+                    ]
+                  },
+                  {
+                    "layers": [
+                      0
+                    ],
+                    "token_range": [
+                      1539,
+                      2048
+                    ]
+                  },
+                  {
+                    "layers": [
+                      1
+                    ],
+                    "token_range": [
+                      1539,
+                      2048
+                    ]
+                  },
+                  {
+                    "layers": [
+                      2
+                    ],
+                    "token_range": [
+                      1539,
+                      2048
+                    ]
+                  },
+                  {
+                    "layers": [
+                      3
+                    ],
+                    "token_range": [
+                      1539,
+                      2048
+                    ]
+                  },
+                  {
+                    "layers": [
+                      4
+                    ],
+                    "token_range": [
+                      0,
+                      513
+                    ]
+                  },
+                  {
+                    "layers": [
+                      5
+                    ],
+                    "token_range": [
+                      0,
+                      513
+                    ]
+                  },
+                  {
+                    "layers": [
+                      4
+                    ],
+                    "token_range": [
+                      513,
+                      1026
+                    ]
+                  },
+                  {
+                    "layers": [
+                      5
+                    ],
+                    "token_range": [
+                      513,
+                      1026
+                    ]
+                  },
+                  {
+                    "layers": [
+                      4
+                    ],
+                    "token_range": [
+                      1026,
+                      1539
+                    ]
+                  },
+                  {
+                    "layers": [
+                      5
+                    ],
+                    "token_range": [
+                      1026,
+                      1539
+                    ]
+                  },
+                  {
+                    "layers": [
+                      4
+                    ],
+                    "token_range": [
+                      1539,
+                      2048
+                    ]
+                  },
+                  {
+                    "layers": [
+                      5
+                    ],
+                    "token_range": [
+                      1539,
+                      2048
+                    ]
+                  }
+                ],
+                "bytes": 6292224,
+                "rc": 0
+              }
+            },
+            "hub": null
+          },
+          "group": 4,
+          "token_range": 513,
+          "native_batches_count": 24,
+          "bounded_host_slots": true
+        },
+        {
+          "mode": "fast-sync",
+          "dtype": "float16",
+          "slots": 3,
+          "source_buffers": 4,
+          "compute_steps": 1154,
+          "overlap": null,
+          "layer_ready_at": [
+            1058500.19422666,
+            1058500.194719636,
+            1058500.215787526,
+            1058500.216465741,
+            1058500.238301407,
+            1058500.238698835
+          ],
+          "target_registration": {
+            "live": 0,
+            "owners": 0,
+            "bytes_live": 0,
+            "max_bytes_live": 524320,
+            "registrations": 4,
+            "unregistrations": 4,
+            "overlap_rejections": 0,
+            "stale_rejections": 0,
+            "unregister_failures": 0,
+            "stale": 0,
+            "last_unregister_error": null
+          },
+          "source": {
+            "registration": {
+              "live": 0,
+              "owners": 0,
+              "bytes_live": 0,
+              "max_bytes_live": 523328,
+              "registrations": 1,
+              "unregistrations": 1,
+              "overlap_rejections": 0,
+              "stale_rejections": 0,
+              "unregister_failures": 0,
+              "stale": 0,
+              "last_unregister_error": null
+            },
+            "native_batches": [
+              {
+                "kind": "async",
+                "descriptors": 2,
+                "bytes": 523328
+              },
+              {
+                "kind": "async",
+                "descriptors": 2,
+                "bytes": 523328
+              },
+              {
+                "kind": "async",
+                "descriptors": 2,
+                "bytes": 523328
+              },
+              {
+                "kind": "async",
+                "descriptors": 2,
+                "bytes": 523328
+              },
+              {
+                "kind": "async",
+                "descriptors": 2,
+                "bytes": 4160
+              },
+              {
+                "kind": "async",
+                "descriptors": 2,
+                "bytes": 523328
+              },
+              {
+                "kind": "async",
+                "descriptors": 2,
+                "bytes": 523328
+              },
+              {
+                "kind": "async",
+                "descriptors": 2,
+                "bytes": 523328
+              },
+              {
+                "kind": "async",
+                "descriptors": 2,
+                "bytes": 523328
+              },
+              {
+                "kind": "async",
+                "descriptors": 2,
+                "bytes": 4160
+              },
+              {
+                "kind": "async",
+                "descriptors": 2,
+                "bytes": 523328
+              },
+              {
+                "kind": "async",
+                "descriptors": 2,
+                "bytes": 523328
+              },
+              {
+                "kind": "async",
+                "descriptors": 2,
+                "bytes": 523328
+              },
+              {
+                "kind": "async",
+                "descriptors": 2,
+                "bytes": 523328
+              },
+              {
+                "kind": "async",
+                "descriptors": 2,
+                "bytes": 4160
+              }
+            ],
+            "group_size": 2,
+            "unsafe_guard": false,
+            "stats": {
+              "541da3d8d25462945060a8a61d00e9e8": {
+                "backend": "tcp-host-v1",
+                "group_size": 2,
+                "token_range": 511,
+                "submitted_groups": [
+                  {
+                    "layers": [
+                      0,
+                      1
+                    ],
+                    "token_range": [
+                      0,
+                      511
+                    ]
+                  },
+                  {
+                    "layers": [
+                      0,
+                      1
+                    ],
+                    "token_range": [
+                      511,
+                      1022
+                    ]
+                  },
+                  {
+                    "layers": [
+                      0,
+                      1
+                    ],
+                    "token_range": [
+                      1022,
+                      1533
+                    ]
+                  },
+                  {
+                    "layers": [
+                      0,
+                      1
+                    ],
+                    "token_range": [
+                      1533,
+                      2044
+                    ]
+                  },
+                  {
+                    "layers": [
+                      0,
+                      1
+                    ],
+                    "token_range": [
+                      2044,
+                      2048
+                    ]
+                  },
+                  {
+                    "layers": [
+                      2,
+                      3
+                    ],
+                    "token_range": [
+                      0,
+                      511
+                    ]
+                  },
+                  {
+                    "layers": [
+                      2,
+                      3
+                    ],
+                    "token_range": [
+                      511,
+                      1022
+                    ]
+                  },
+                  {
+                    "layers": [
+                      2,
+                      3
+                    ],
+                    "token_range": [
+                      1022,
+                      1533
+                    ]
+                  },
+                  {
+                    "layers": [
+                      2,
+                      3
+                    ],
+                    "token_range": [
+                      1533,
+                      2044
+                    ]
+                  },
+                  {
+                    "layers": [
+                      2,
+                      3
+                    ],
+                    "token_range": [
+                      2044,
+                      2048
+                    ]
+                  },
+                  {
+                    "layers": [
+                      4,
+                      5
+                    ],
+                    "token_range": [
+                      0,
+                      511
+                    ]
+                  },
+                  {
+                    "layers": [
+                      4,
+                      5
+                    ],
+                    "token_range": [
+                      511,
+                      1022
+                    ]
+                  },
+                  {
+                    "layers": [
+                      4,
+                      5
+                    ],
+                    "token_range": [
+                      1022,
+                      1533
+                    ]
+                  },
+                  {
+                    "layers": [
+                      4,
+                      5
+                    ],
+                    "token_range": [
+                      1533,
+                      2044
+                    ]
+                  },
+                  {
+                    "layers": [
+                      4,
+                      5
+                    ],
+                    "token_range": [
+                      2044,
+                      2048
+                    ]
+                  }
+                ],
+                "bytes": 6292416,
+                "rc": 0
+              }
+            },
+            "hub": null
+          },
+          "group": 2,
+          "token_range": 511,
+          "native_batches_count": 15,
+          "bounded_host_slots": true
+        },
+        {
+          "mode": "cpu-layer",
+          "dtype": "bfloat16",
+          "slots": 0,
+          "source_buffers": 4,
+          "compute_steps": 849,
+          "overlap": null,
+          "layer_ready_at": [
+            1058502.292797858,
+            1058502.293474538,
+            1058502.294086336,
+            1058502.327842658,
+            1058502.328883481,
+            1058502.330002409
+          ],
+          "target_registration": {
+            "live": 0,
+            "owners": 0,
+            "bytes_live": 0,
+            "max_bytes_live": 784992,
+            "registrations": 5,
+            "unregistrations": 5,
+            "overlap_rejections": 0,
+            "stale_rejections": 0,
+            "unregister_failures": 0,
+            "stale": 0,
+            "last_unregister_error": null
+          },
+          "source": {
+            "registration": {
+              "live": 0,
+              "owners": 0,
+              "bytes_live": 0,
+              "max_bytes_live": 784992,
+              "registrations": 1,
+              "unregistrations": 1,
+              "overlap_rejections": 0,
+              "stale_rejections": 0,
+              "unregister_failures": 0,
+              "stale": 0,
+              "last_unregister_error": null
+            },
+            "native_batches": [
+              {
+                "kind": "async",
+                "descriptors": 3,
+                "bytes": 784992
+              },
+              {
+                "kind": "async",
+                "descriptors": 3,
+                "bytes": 784992
+              },
+              {
+                "kind": "async",
+                "descriptors": 3,
+                "bytes": 784992
+              },
+              {
+                "kind": "async",
+                "descriptors": 3,
+                "bytes": 784992
+              },
+              {
+                "kind": "async",
+                "descriptors": 3,
+                "bytes": 6240
+              },
+              {
+                "kind": "async",
+                "descriptors": 3,
+                "bytes": 784992
+              },
+              {
+                "kind": "async",
+                "descriptors": 3,
+                "bytes": 784992
+              },
+              {
+                "kind": "async",
+                "descriptors": 3,
+                "bytes": 784992
+              },
+              {
+                "kind": "async",
+                "descriptors": 3,
+                "bytes": 784992
+              },
+              {
+                "kind": "async",
+                "descriptors": 3,
+                "bytes": 6240
+              }
+            ],
+            "group_size": 3,
+            "unsafe_guard": false,
+            "stats": {
+              "4c2c7d74af4e1fa73983cf93716ebab8": {
+                "backend": "tcp-host-v1",
+                "group_size": 3,
+                "token_range": 511,
+                "submitted_groups": [
+                  {
+                    "layers": [
+                      0,
+                      1,
+                      2
+                    ],
+                    "token_range": [
+                      0,
+                      511
+                    ]
+                  },
+                  {
+                    "layers": [
+                      0,
+                      1,
+                      2
+                    ],
+                    "token_range": [
+                      511,
+                      1022
+                    ]
+                  },
+                  {
+                    "layers": [
+                      0,
+                      1,
+                      2
+                    ],
+                    "token_range": [
+                      1022,
+                      1533
+                    ]
+                  },
+                  {
+                    "layers": [
+                      0,
+                      1,
+                      2
+                    ],
+                    "token_range": [
+                      1533,
+                      2044
+                    ]
+                  },
+                  {
+                    "layers": [
+                      0,
+                      1,
+                      2
+                    ],
+                    "token_range": [
+                      2044,
+                      2048
+                    ]
+                  },
+                  {
+                    "layers": [
+                      3,
+                      4,
+                      5
+                    ],
+                    "token_range": [
+                      0,
+                      511
+                    ]
+                  },
+                  {
+                    "layers": [
+                      3,
+                      4,
+                      5
+                    ],
+                    "token_range": [
+                      511,
+                      1022
+                    ]
+                  },
+                  {
+                    "layers": [
+                      3,
+                      4,
+                      5
+                    ],
+                    "token_range": [
+                      1022,
+                      1533
+                    ]
+                  },
+                  {
+                    "layers": [
+                      3,
+                      4,
+                      5
+                    ],
+                    "token_range": [
+                      1533,
+                      2044
+                    ]
+                  },
+                  {
+                    "layers": [
+                      3,
+                      4,
+                      5
+                    ],
+                    "token_range": [
+                      2044,
+                      2048
+                    ]
+                  }
+                ],
+                "bytes": 6292416,
+                "rc": 0
+              }
+            },
+            "hub": null
+          },
+          "group": 3,
+          "token_range": 511,
+          "native_batches_count": 10,
+          "bounded_host_slots": true
+        },
+        {
+          "mode": "fast-async",
+          "slots": 2,
+          "remote_drop": true,
+          "rpc_calls": 3,
+          "local_layers": 5,
+          "max_abs_errors": [
+            0.00025591254234313965,
+            0.0002759695053100586,
+            0.00030553340911865234
+          ],
+          "dropped_layer_still_remote": true,
+          "target_quarantined": false,
+          "host_registration_reclaimed": true,
+          "source": {
+            "registration": {
+              "live": 0,
+              "owners": 0,
+              "bytes_live": 0,
+              "max_bytes_live": 784992,
+              "registrations": 1,
+              "unregistrations": 1,
+              "overlap_rejections": 0,
+              "stale_rejections": 0,
+              "unregister_failures": 0,
+              "stale": 0,
+              "last_unregister_error": null
+            },
+            "native_batches": [
+              {
+                "kind": "async",
+                "descriptors": 2,
+                "bytes": 523328
+              },
+              {
+                "kind": "async",
+                "descriptors": 1,
+                "bytes": 261664
+              },
+              {
+                "kind": "async",
+                "descriptors": 2,
+                "bytes": 523328
+              },
+              {
+                "kind": "async",
+                "descriptors": 1,
+                "bytes": 261664
+              },
+              {
+                "kind": "async",
+                "descriptors": 2,
+                "bytes": 523328
+              },
+              {
+                "kind": "async",
+                "descriptors": 1,
+                "bytes": 261664
+              },
+              {
+                "kind": "async",
+                "descriptors": 2,
+                "bytes": 523328
+              },
+              {
+                "kind": "async",
+                "descriptors": 1,
+                "bytes": 261664
+              },
+              {
+                "kind": "async",
+                "descriptors": 2,
+                "bytes": 4160
+              },
+              {
+                "kind": "async",
+                "descriptors": 1,
+                "bytes": 2080
+              },
+              {
+                "kind": "async",
+                "descriptors": 2,
+                "bytes": 523328
+              },
+              {
+                "kind": "async",
+                "descriptors": 1,
+                "bytes": 261664
+              },
+              {
+                "kind": "async",
+                "descriptors": 2,
+                "bytes": 523328
+              },
+              {
+                "kind": "async",
+                "descriptors": 1,
+                "bytes": 261664
+              },
+              {
+                "kind": "async",
+                "descriptors": 2,
+                "bytes": 523328
+              },
+              {
+                "kind": "async",
+                "descriptors": 1,
+                "bytes": 261664
+              },
+              {
+                "kind": "async",
+                "descriptors": 2,
+                "bytes": 523328
+              },
+              {
+                "kind": "async",
+                "descriptors": 1,
+                "bytes": 261664
+              },
+              {
+                "kind": "async",
+                "descriptors": 2,
+                "bytes": 4160
+              },
+              {
+                "kind": "async",
+                "descriptors": 1,
+                "bytes": 2080
+              }
+            ],
+            "group_size": 3,
+            "unsafe_guard": false,
+            "stats": {
+              "7dff47c5c8aa4511b97d48ad5c1e5eb7": {
+                "backend": "tcp-host-v1",
+                "group_size": 3,
+                "token_range": 511,
+                "submitted_groups": [
+                  {
+                    "layers": [
+                      0,
+                      1
+                    ],
+                    "token_range": [
+                      0,
+                      511
+                    ]
+                  },
+                  {
+                    "layers": [
+                      2
+                    ],
+                    "token_range": [
+                      0,
+                      511
+                    ]
+                  },
+                  {
+                    "layers": [
+                      0,
+                      1
+                    ],
+                    "token_range": [
+                      511,
+                      1022
+                    ]
+                  },
+                  {
+                    "layers": [
+                      2
+                    ],
+                    "token_range": [
+                      511,
+                      1022
+                    ]
+                  },
+                  {
+                    "layers": [
+                      0,
+                      1
+                    ],
+                    "token_range": [
+                      1022,
+                      1533
+                    ]
+                  },
+                  {
+                    "layers": [
+                      2
+                    ],
+                    "token_range": [
+                      1022,
+                      1533
+                    ]
+                  },
+                  {
+                    "layers": [
+                      0,
+                      1
+                    ],
+                    "token_range": [
+                      1533,
+                      2044
+                    ]
+                  },
+                  {
+                    "layers": [
+                      2
+                    ],
+                    "token_range": [
+                      1533,
+                      2044
+                    ]
+                  },
+                  {
+                    "layers": [
+                      0,
+                      1
+                    ],
+                    "token_range": [
+                      2044,
+                      2048
+                    ]
+                  },
+                  {
+                    "layers": [
+                      2
+                    ],
+                    "token_range": [
+                      2044,
+                      2048
+                    ]
+                  },
+                  {
+                    "layers": [
+                      3,
+                      4
+                    ],
+                    "token_range": [
+                      0,
+                      511
+                    ]
+                  },
+                  {
+                    "layers": [
+                      5
+                    ],
+                    "token_range": [
+                      0,
+                      511
+                    ]
+                  },
+                  {
+                    "layers": [
+                      3,
+                      4
+                    ],
+                    "token_range": [
+                      511,
+                      1022
+                    ]
+                  },
+                  {
+                    "layers": [
+                      5
+                    ],
+                    "token_range": [
+                      511,
+                      1022
+                    ]
+                  },
+                  {
+                    "layers": [
+                      3,
+                      4
+                    ],
+                    "token_range": [
+                      1022,
+                      1533
+                    ]
+                  },
+                  {
+                    "layers": [
+                      5
+                    ],
+                    "token_range": [
+                      1022,
+                      1533
+                    ]
+                  },
+                  {
+                    "layers": [
+                      3,
+                      4
+                    ],
+                    "token_range": [
+                      1533,
+                      2044
+                    ]
+                  },
+                  {
+                    "layers": [
+                      5
+                    ],
+                    "token_range": [
+                      1533,
+                      2044
+                    ]
+                  },
+                  {
+                    "layers": [
+                      3,
+                      4
+                    ],
+                    "token_range": [
+                      2044,
+                      2048
+                    ]
+                  },
+                  {
+                    "layers": [
+                      5
+                    ],
+                    "token_range": [
+                      2044,
+                      2048
+                    ]
+                  }
+                ],
+                "bytes": 6292416,
+                "rc": 0
+              }
+            },
+            "hub": {
+              "active_conns": 0,
+              "attached_handoffs": 0,
+              "in_flight": 0,
+              "idle_closes": 0,
+              "rpc_completed": 3,
+              "rpc_failed": 0,
+              "pool": {
+                "n": 2,
+                "busy": 0,
+                "queued": 0,
+                "max_parallel": 1,
+                "completed": 3,
+                "failed": 0,
+                "max_queue_ms": 0.093,
+                "avg_exec_ms": 207.109
+              }
+            }
+          }
+        },
+        {
+          "mode": "fast-async",
+          "cancelled": true,
+          "gpu_reuse_safe": true,
+          "initially_quarantined": true,
+          "target_quarantined": true,
+          "host_registration_reclaimed": false,
+          "source": {
+            "registration": {
+              "live": 0,
+              "owners": 0,
+              "bytes_live": 0,
+              "max_bytes_live": 784992,
+              "registrations": 1,
+              "unregistrations": 1,
+              "overlap_rejections": 0,
+              "stale_rejections": 0,
+              "unregister_failures": 0,
+              "stale": 0,
+              "last_unregister_error": null
+            },
+            "native_batches": [
+              {
+                "kind": "async",
+                "descriptors": 2,
+                "bytes": 523328
+              },
+              {
+                "kind": "async",
+                "descriptors": 1,
+                "bytes": 261664
+              },
+              {
+                "kind": "async",
+                "descriptors": 2,
+                "bytes": 523328
+              },
+              {
+                "kind": "async",
+                "descriptors": 1,
+                "bytes": 261664
+              },
+              {
+                "kind": "async",
+                "descriptors": 2,
+                "bytes": 523328
+              },
+              {
+                "kind": "async",
+                "descriptors": 1,
+                "bytes": 261664
+              },
+              {
+                "kind": "async",
+                "descriptors": 2,
+                "bytes": 523328
+              },
+              {
+                "kind": "async",
+                "descriptors": 1,
+                "bytes": 261664
+              },
+              {
+                "kind": "async",
+                "descriptors": 2,
+                "bytes": 4160
+              }
+            ],
+            "group_size": 3,
+            "unsafe_guard": false,
+            "stats": {},
+            "hub": null
+          }
+        },
+        {
+          "mode": "fast-async",
+          "fault": "lost-status",
+          "source_reuse_blocked": true,
+          "target_host_retained": true,
+          "target_gpu_fenced": true,
+          "source": {
+            "registration": {
+              "live": 1,
+              "owners": 1,
+              "bytes_live": 784992,
+              "max_bytes_live": 784992,
+              "registrations": 1,
+              "unregistrations": 0,
+              "overlap_rejections": 0,
+              "stale_rejections": 0,
+              "unregister_failures": 0,
+              "stale": 0,
+              "last_unregister_error": null
+            },
+            "native_batches": [
+              {
+                "kind": "async",
+                "descriptors": 2,
+                "bytes": 523328
+              }
+            ],
+            "group_size": 3,
+            "unsafe_guard": true,
+            "stats": {},
+            "hub": null
+          }
+        }
+      ],
+      "scope": "Real Qwen layer-group x token-range transport; no model-weight claim."
+    }
+  },
+  "tested_source_sha256": {
+    "plugins/remote_attn/control_plane/p2d_driver.py": "cd2af1cdd422f3d980fbd0625581e2bf4055f678ea5b817599484af8175ef5d5",
+    "plugins/remote_attn/control_plane/p4_dsv_gateway.py": "eea990484bb5cf6f40502e095b679b3416d8595e8fb9262df8137e00244dba15",
+    "plugins/remote_attn/control_plane/p4_gateway.py": "e9a86ee63cc58fc8cc790cd3eb7366e4d78091133c000a6eaa9901be8529ccb1",
+    "plugins/remote_attn/sglang_remote_attn/__init__.py": "f64e878600a7775c62cd79063dbd94d92ccfd6513909f6fed3a221758ebe067f",
+    "plugins/remote_attn/sglang_remote_attn/check.py": "a7e23c69b57df34ec943df1aad40e4a4e11171fc30cb0f7fcb8ee9072bada438",
+    "plugins/remote_attn/sglang_remote_attn/compat.py": "8772dd8af6143737b0ccbd53a3a88cc441259e9cadb374e66547abe8b420a971",
+    "plugins/remote_attn/sglang_remote_attn/d2d_bulk.py": "d59c87bc25e8d8d6e2915a028b55fa4258d509ab12f2861efae2556244002aa6",
+    "plugins/remote_attn/sglang_remote_attn/d2d_groups.py": "1b0760336fc1c0274fafc3419e9691e7efa2bbe0564cc3c0016ffdfc7ef99949",
+    "plugins/remote_attn/sglang_remote_attn/d2d_ranges.py": "c85aa311e1fd7b8f7f9b435fc20cd82d138c023b4372733694984cb02576bfee",
+    "plugins/remote_attn/sglang_remote_attn/decode_overlap.py": "cc946c7c27d3337a569e2d175f61dfc9546713887068db9570081ceb98745ea5",
+    "plugins/remote_attn/sglang_remote_attn/destination_cache.py": "3b6f693b02bb3b75c77ddf9d3f82f83a9c7dffc54f2b46c10ae7f76b64c9fb14",
+    "plugins/remote_attn/sglang_remote_attn/dsv41_fast.py": "fd894d78b27530a914cd72ed19d9abcaaf137f533c1e1643be280d0623b6c470",
+    "plugins/remote_attn/sglang_remote_attn/dsv41_graph.py": "8d26ac9eed337db0764aca93ce638b1e58bd34d19a6962b139c5f508d31fc946",
+    "plugins/remote_attn/sglang_remote_attn/dsv41_kernels.py": "5ae677e1f1c8f3a1bd06fa3127fecfa97bb414eca9dd196d7266605bb0877d9a",
+    "plugins/remote_attn/sglang_remote_attn/dsv41_layerwise.py": "b4c231d4d1e03234cf30e750435c5c7f5414cd5ecf38991410f90de8b68e4df5",
+    "plugins/remote_attn/sglang_remote_attn/dsv41_paged.py": "6b413fe3eeca846c51b800c32467b8779a384b91ee6765ee914987bde6412d2f",
+    "plugins/remote_attn/sglang_remote_attn/dsv41_progressive.py": "3573ab543f774425de4a440a59ca1fb25fd7443b73858a43537a49c24950eb13",
+    "plugins/remote_attn/sglang_remote_attn/dsv41_receive.py": "499cb18fb58dd4f4dac92b3121a4bd2c39d6a5ce9e76aa7ceddb6d26e8c944bf",
+    "plugins/remote_attn/sglang_remote_attn/dsv41_remote.py": "507430211aa9004520e33b10774764c3478b8c0b64411ee03cafffef96c5b77d",
+    "plugins/remote_attn/sglang_remote_attn/dsv41_rpc.py": "3e5da18fa8647120237ac0fc285a40a6bf486fb94a2b7bde2c5040de23cadb38",
+    "plugins/remote_attn/sglang_remote_attn/dsv41_sparse_math.py": "174980ce3bffac2e1791c0bfdce6c6f823275a47ad0be120f3a3a110d6c9f56e",
+    "plugins/remote_attn/sglang_remote_attn/dsv41_staging.py": "5b90acab85161dc63dc6ea50dee59a3c56f1eaf28b9dad92252a0fcba422a6df",
+    "plugins/remote_attn/sglang_remote_attn/dsv_d2d.py": "e8d19051bac200ab8e90ab0cba2373abee61db4ce689bf3c4ac5ee0cd70daf8e",
+    "plugins/remote_attn/sglang_remote_attn/dsv_d2d_reservation.py": "ba56bc55295d8aa38317ef05b8c48a70de3f6c5ecedbb9ec03f58905c8d12ed1",
+    "plugins/remote_attn/sglang_remote_attn/dsv_gateway_control.py": "354fe306823f7216cfb2b0814986045ae55e82a32ce258f6e7dad4e23a968740",
+    "plugins/remote_attn/sglang_remote_attn/handoff_control.py": "0c74a27b0c7d9fad9f9f63a296efceafea912d0c01711eef02128f9f67261453",
+    "plugins/remote_attn/sglang_remote_attn/hooks.py": "230051690e9b4675dd06e17279adf6510b4daeae085fb1cd80c4abd2dfe1e5ed",
+    "plugins/remote_attn/sglang_remote_attn/interfaces.py": "d471a011bfd194f212713588fdd9deb635c7738cf80b08aa2cefa4e942f895c2",
+    "plugins/remote_attn/sglang_remote_attn/mooncake_backend.py": "4a1e80d29e71210ff4e61bef1f80b236ae518c173f6fce23a3726d7a6542c7d1",
+    "plugins/remote_attn/sglang_remote_attn/pd_mesh.py": "0c188d26f07f3a4626c14f1e5dbfd3b2352d39d481e13d48a93203d8513cd3ed",
+    "plugins/remote_attn/sglang_remote_attn/pre_layerwise.py": "d5b3f178e7f8932db6c51cda032fc65c71d0389081112093b587a8549f4d4e41",
+    "plugins/remote_attn/sglang_remote_attn/prefill_admission.py": "4894fb9d626dfd01f9a98b483f6febd4720653f95cb8fd4454f44cf9053a9e00",
+    "plugins/remote_attn/sglang_remote_attn/prefill_overlap.py": "8528da51b28ed4621d439b13dd9d2f621256fea73f8f32f8f304028b54f0edd0",
+    "plugins/remote_attn/sglang_remote_attn/prefix_stream.py": "d05526c327087a86fc9b93cf0095fa890c70de20cf11695e57cecedb96cdf26f",
+    "plugins/remote_attn/sglang_remote_attn/qwen_ranges.py": "ccbf557c3fd469c21993507d042d563ebf0b2863ee933d24e4f06270d381f897",
+    "plugins/remote_attn/sglang_remote_attn/qwen_reservation.py": "8efb487be2243cf3b10fbcaaf991e1e913984ced6443c59d12602ee9d8d75c6b",
+    "plugins/remote_attn/sglang_remote_attn/remote_data_plane.py": "90fc86381c7b33c5524324f3909869854d7c07d2e93224a7ccd3515c7ff94fc0",
+    "plugins/remote_attn/sglang_remote_attn/retirement.py": "b8bff23a87fc6aa5b743589756dc18967fe160ccdf7de59672df178497f45f09",
+    "plugins/remote_attn/sglang_remote_attn/segmented_graph.py": "7fa3205eef1e7b044a972b40a4502671edefb5c3247c9e0deecffaccbbda389b",
+    "plugins/remote_attn/sglang_remote_attn/source_cache.py": "c60d91df378a70378893e436b9ec901f7cb8ada4d29a5bfb59578bf450bf5146",
+    "plugins/remote_attn/sglang_remote_attn/source_resources.py": "2e35ee2d617d45b44e3d32595f8b7a0b7434240d42349bab2ab906f004d0c418",
+    "plugins/remote_attn/sglang_remote_attn/swa_checkpoints.py": "e280dd79afcc5fbcef451e41bfd67c657b381b9f9c2e374753cbf6b89a5b2024",
+    "plugins/remote_attn/sglang_remote_attn/tp.py": "766b5028a3a08a801c2891580e406a40f1868d7d21cde8ef46be1d76b86b059c",
+    "plugins/remote_attn/sglang_remote_attn/transfer_priority.py": "ed9226f61d2b3612cffbd3e7b66f30a26bcd3feaaa654b61a43fa11612377aee",
+    "plugins/remote_attn/sglang_remote_attn/transport_failure.py": "37fff73986d65af4eb9bb546760529f739a63004c67a0b4581dc7586584332c4",
+    "python/sglang/kernels/ops/attention/dsv4/kv_layout.py": "85f012a8a5c3cd1a534e5250030b4085ebd9f2dfac83c1fca4b5d9cbc771a8a4",
+    "python/sglang/kernels/ops/memory/allocator.py": "9afa04af577797f88f7b41e97d52ff23112904a6b1ecf7e4f6bd7575201b5495",
+    "python/sglang/srt/disaggregation/decode.py": "8efea196e4d5facb7ecec504417a1ef0e57296de3a7270f3769e4d4b68bec328",
+    "python/sglang/srt/disaggregation/pinned_staging_buffer.py": "dc484b3d66bba9c3ab5403331c14ad78e619b07408289814f63cc0276cbb61df",
+    "python/sglang/srt/distributed/device_communicators/mooncake_transfer_engine.py": "ac7d5f2e543bfb01f3ae3de1ab8686c3eed6388c96d8ac00f7373bf106617126",
+    "python/sglang/srt/layers/attention/deepseek_v4_backend.py": "70498af7eafc15bbb9d9a6b6b995415766139233433851e0e3bbfc4635129ac9",
+    "python/sglang/srt/managers/schedule_batch.py": "2cb190b7143aaaf59792001595ef1967a13fb5d5fcedc0f38ec499ae0f4f1a49",
+    "python/sglang/srt/mem_cache/allocator/base.py": "17c07a9ab32c62932048d3579e620eaa2e2558b03b828df152b2ee953c4bfe32",
+    "python/sglang/srt/mem_cache/allocator/paged.py": "c72f28d9c5b953a05fcc0a0451307ecdbfbfb756eca3f0073f7be3eb737d38f6",
+    "python/sglang/srt/mem_cache/common.py": "9eea69d03f541339a4a4faadab5d636275210b2ed73a628b11c2629f0845d013",
+    "python/sglang/srt/mem_cache/deepseek_v4_compress_state.py": "20fe9fd0d022ad8ef0800da95c9956800187639abc8df853c607d0f7cc97247a",
+    "python/sglang/srt/mem_cache/deepseek_v4_memory_pool.py": "1782124ee47755cc77d3458be77bdae1c10153849d96f58ddca78aff7e4b21b3",
+    "python/sglang/srt/mem_cache/memory_pool.py": "c901ae2f167970dfe041816a8e0a16136766ba3c045bdeb71b8a87ac735935a3",
+    "python/sglang/srt/mooncake_contract.py": "39313d1034188440f1b29fc72f1538f3b4dd768e8420337ae2118bb54518d7b0",
+    "python/sglang/srt/utils/common.py": "09fab1e8dfe245dc37bc067d66304c7f7f9c1b85422ddaf86c01d3c000d85813",
+    "python/sglang/test/kernels/deepseek_v4/dsv41_kv_quant_reference.py": "7370805c53323eaf0059fc4987688aac59a8ca4c80aefb673e87b002a31e3292",
+    "python/sglang/test/kernels/deepseek_v4/k_cache_reference.py": "5dbf65f377a6e0730162e1d9636375e9788838f75f054850de3e50d2879db55f",
+    "test/manual/remote_attn/cuda_handoff_probe.py": "5bc0eebd13ae93fb62a154d867966746c36b8c064b0228b2b8bc63f8fc10f12d",
+    "test/manual/remote_attn/dsv41_fast_cuda_probe.py": "6368e249ce1bb5de53af7c2fe034f7d28fa816b999baeade0db4ffbd2b8eaaa1",
+    "test/manual/remote_attn/dsv41_graph_probe_support.py": "058999d47890646d91496fb7172f44f6096535a65986f889bd6554fb68c30b9d",
+    "test/manual/remote_attn/dsv41_hopper_cuda_probe.py": "f8afb5e9242abd60fd564fbe815a70639b9d6e4ea9db7dfd8fe03d9f7cb5db66",
+    "test/manual/remote_attn/dsv41_host_staging_cuda_probe.py": "a6f3b419f4704b0a34a7a844ac014b1ad6f76fff2d6f97451d27944a034180cc",
+    "test/manual/remote_attn/dsv41_progressive_probe_support.py": "38426dc9de227cadf2e5cc5a5fcd11f64885277677fcbf05cd72fc285fa3a7f3",
+    "test/manual/remote_attn/dsv41_receive_staging_cuda_probe.py": "f09abc2c82d80f829f2256436dd380e2da9dd136292e52dc1e225c1549639274",
+    "test/manual/remote_attn/dsv41_remote_cuda_probe.py": "c1b91162846c2fea3578e409188b37a9919d896dd193d7ba341ea7e7f2311be0",
+    "test/manual/remote_attn/dsv41_remote_probe_support.py": "eda67756ba392faa9bba5f5f32cae68e8676547fc0838c2370bbacd32bde4bf2",
+    "test/manual/remote_attn/dsv41_segmented_graph_probe.py": "a8868538a8813972fcef5bcfcb5cd4d0fa800f7df3c84e160349c1a9db9c8978",
+    "test/manual/remote_attn/dsv41_staging_probe_support.py": "a6648119f94c48ab330128abcf5eab4b1c01abda00b43fcc5c27e2ef8087399d",
+    "test/manual/remote_attn/dsv_d2d_bulk_cuda_review.py": "d798c7bae275acc7c96c60e877c4408156de62e5cbbe15758497b87e4964cda8",
+    "test/manual/remote_attn/dsv_d2d_cuda_probe.py": "feaa3655244ff1a27b7d78abee3f1a8b73b52bfe566e9e688c257b93ea0d6f6a",
+    "test/manual/remote_attn/dsv_d2d_probe_support.py": "3e7cc0ef5b67838b8bfc3767ba47783fd3c06a28c513b50c3506ed4e70dda47e",
+    "test/manual/remote_attn/dsv_d2d_tp_worker.py": "d35875edb6daa6cff17d81115d6c82d8f7b5f10b790bec0eb41c6311ba7c99d8",
+    "test/manual/remote_attn/flash0731_cuda_probe.py": "2bd4ffb50638d08680dc179aba225e08bb009d1f00df2d24e115aa81b6a7444e",
+    "test/manual/remote_attn/flash0731_probe_support.py": "baa2edee8dc696b279d1843fd10ea2359b0e0e711a1f28b693dc08b445cae178",
+    "test/manual/remote_attn/full_capture_scope_probe.py": "b0ec48e4ca1d27276cb43bdeba118c72fea81c803e66d423b40354733772d1ab",
+    "test/manual/remote_attn/group_layer_cuda_probe.py": "168d28ca221719728f87c35af16558dadec1f343e14117d63be17120914c1895",
+    "test/manual/remote_attn/mooncake_contract_probe.py": "27c43e57b3a0aedd3d698c9c208b49ac9bb99a1d22d0b7f923675c10119d5e6c",
+    "test/manual/remote_attn/p4_dsv_gateway_worker.py": "f46c9c8963b9e08e84743f893d903b75ecdfad7e06e193b16ec3f5dfeb2fae56",
+    "test/manual/remote_attn/p4_dsv_probe_support.py": "ea896130ede238d079ba3c31745f83f0a96df77e8b735faf432cd6acd1215e69",
+    "test/manual/remote_attn/pd_mesh_probe_support.py": "4e7be864e3b1531534693df11a23999027ed4df52bc50214155d9f0b4638cdc4",
+    "test/manual/remote_attn/pre_layerwise_report.py": "b99f02e4bc83f1aadea093925e8bee7d3c1dadee9552a0026cabbf6155f42280",
+    "test/manual/remote_attn/pre_layerwise_staging_probe.py": "9dbf366e251a051eb853b5338cf60255b783319cf2ffb174c7d90b0f1a8daa9c",
+    "test/manual/remote_attn/prefill_overlap_cuda_probe.py": "530197accd810c2c42e06e5a62cb4f10a78f6e40e1e6d33fa173aeb2e8320ce5",
+    "test/manual/remote_attn/qo_mooncake_cuda_probe.py": "5d0ab39fabf9c75ad870a7c9e06a046a7ef1847a41821abdf7cd481ba76d4202",
+    "test/manual/remote_attn/qwen_reservation_cuda_probe.py": "0647b04022b9c6671e2cef488e75753181bf172786b3d406c174449aeb116a0b",
+    "test/manual/remote_attn/qwen_reservation_probe_support.py": "410c2c53e3aace73301241a09b35e3ca71df68d2ffd2d2db248cef62a90139e8",
+    "test/manual/remote_attn/qwen_reservation_tp_worker.py": "b8b865c67d61c0046c5d6ccc91baf2a5936fb11c3eda8895fc542a96034c0030",
+    "test/manual/remote_attn/range_layer_cuda_probe.py": "955c4634b6d5c898a24f4697532f08bc8d2f263aa87f64b94ae133fedfd4034f",
+    "test/manual/remote_attn/rdma_staging_cuda_probe.py": "c955ec34076d4fc2cbec35ae7c45499f734f485c9deadada7a1d0c1cf64ea512",
+    "test/manual/remote_attn/remote_final_forward_cuda_probe.py": "f4a3b0c2021915f2501fb2b923353df1629494e14d1bf7803ee4adf2690165f2",
+    "test/manual/remote_attn/remote_gpu_lifetime_probe.py": "bd94aeb1f184f39d8e5697a783838e9bef3be4a1bd3290dbeac1c1b28a4362f3",
+    "test/manual/remote_attn/remote_gpu_probe_support.py": "d57bf8cfa82447104d2968741e3b97195e6287be9ca55c21c694d6960b0e7e1f",
+    "test/manual/remote_attn/segmented_graph_probe.py": "1a567d9ebfb1b3dc7930c1bb52be11d6275bc134fee82544318be132a5691cb0",
+    "test/manual/remote_attn/staging_recovery_cuda_probe.py": "2c195dd58cb9d831d94ac5d0eecce104c2a40f3235c67fd154254f7b3658d3e8",
+    "test/manual/remote_attn/tp_control_worker.py": "700357a1c9fc5d657d39ddbc7159e38afee390dcbde35ecf24a160c19bfbced7",
+    "test/manual/remote_attn/verify_dsv41_prepare_dispatch.py": "7a9975af2bd2fc83c91b583f203f0d4c7f358230807fdcdf8900fc3530df4c22",
+    "test/registered/unit/plugins/test_d2d_mooncake_backend.py": "a389990badfd5c8a17fc2d5bda739dcbceddf1566f645a7b5e3609a1a09a0e0d",
+    "test/registered/unit/plugins/test_remote_attn.py": "bc6a86d5bd3d22b17aac68fe1a15aeebc96c4fdac51cc3dc5191f783bc08fc29",
+    "test/registered/unit/plugins/test_remote_mooncake_data_plane.py": "0af026583266d624c5e255583d58ae7cdf6e4b4468cfaa8f2e6eabe932beaabb"
+  }
+}

@@ -75,6 +75,9 @@ def source_worker(
     cancel_request=None,
     source_release=None,
     completion_root=None,
+    group_size=1,
+    token_range=None,
+    fault=None,
 ):
     try:
         os.environ.update(
@@ -82,9 +85,46 @@ def source_worker(
             HANDOFF_FAST_COPY_STREAMS="2",
             HANDOFF_FAST_ASYNC="1" if mode != "fast-sync" else "0",
             MC_FORCE_TCP="1",
+            HANDOFF_D2D_GROUP_SIZE=str(group_size),
         )
         from sglang_remote_attn import handoff_control as rt
 
+        native = rt._get_te()
+        native_batches = []
+
+        from sglang_remote_attn import mooncake_backend as mb
+
+        assert mb.handle(native).protocol == "tcp"
+
+        class CaptureEngine:
+            protocol = "tcp"  # Verified factory metadata, retained by this wrapper.
+            d2d_protocol_verified = True
+
+            def __getattr__(self, name):
+                return getattr(native, name)
+
+            def get_batch_transfer_status(self, bids):
+                result = native.get_batch_transfer_status(bids)
+                if fault == "lost-status":
+                    raise RuntimeError(
+                        "injected status loss after actual native completion"
+                    )
+                return result
+
+            def batch_transfer_async_write(self, session, src, dst, sizes):
+                native_batches.append(
+                    dict(kind="async", descriptors=len(src), bytes=sum(sizes))
+                )
+                return native.batch_transfer_async_write(session, src, dst, sizes)
+
+            def batch_transfer_sync_write(self, session, src, dst, sizes):
+                native_batches.append(
+                    dict(kind="sync", descriptors=len(src), bytes=sum(sizes))
+                )
+                return native.batch_transfer_sync_write(session, src, dst, sizes)
+
+        captured = CaptureEngine()
+        rt._get_te = lambda: captured
         torch.cuda.set_device(0)
         pool = kv_pool(getattr(torch, dtype_name))
         indices = torch.arange(TOKENS, device="cuda") * 2 + 1
@@ -112,6 +152,14 @@ def source_worker(
             chunks=[[TOKENS] for _ in range(LAYERS)],
             fast_freeze=mode.startswith("fast"),
         )
+        if token_range is not None:
+            from sglang_remote_attn.d2d_ranges import PROTOCOL
+
+            meta.update(
+                d2d_range_protocol=PROTOCOL,
+                d2d_token_range=token_range,
+                d2d_group_size=group_size,
+            )
         if mode.startswith("fast"):
             transfer = rt._start_layer_gpu_server(
                 scheduler, req, meta, source_release is not None
@@ -132,11 +180,19 @@ def source_worker(
         if req._handoff_transfer_thread.is_alive():
             rt.stop_source_transfer(req)
             raise TimeoutError("source sender did not finish")
-        if cancel_request is None:
+        if cancel_request is None and fault is None:
             assert not rt._TRANSFER_ERRORS, rt._TRANSFER_ERRORS
         registrations = rt._get_registration_manager().stats()
-        if cancel_request is None:
+        if cancel_request is None and fault is None:
             assert registrations["live"] == 0, registrations
+        unsafe_guard = False
+        if fault is not None:
+            assert rt._TRANSFER_ERRORS and registrations["live"] > 0
+            try:
+                rt.stop_source_transfer(req)
+            except RuntimeError:
+                unsafe_guard = True
+            assert unsafe_guard, "unknown transport completion allowed source reuse"
         hub_stats = None
         if source_release is not None:
             assert source_release.wait(timeout=60), "target did not finish remote reads"
@@ -151,6 +207,9 @@ def source_worker(
             {
                 "source": {
                     "registration": registrations,
+                    "native_batches": native_batches,
+                    "group_size": group_size,
+                    "unsafe_guard": unsafe_guard,
                     "stats": rt._TRANSFER_STATS,
                     "hub": hub_stats,
                 }
@@ -187,6 +246,9 @@ def transfer_probe(
     profile=False,
     cancel=False,
     remote_drop=False,
+    group_size=1,
+    token_range=None,
+    fault=None,
 ):
     from sglang_remote_attn import handoff_control as rt
 
@@ -208,6 +270,9 @@ def transfer_probe(
             cancel_request,
             source_release,
             str(completion_root),
+            group_size,
+            token_range,
+            fault,
         ),
     )
     source.start()
@@ -300,6 +365,38 @@ def transfer_probe(
             profiler.__exit__(None, None, None)
             profiler.export_chrome_trace(str(output / "overlap-trace.json"))
             profiler = None
+        if fault is not None:
+            assert state.error is not None and state.import_done_at is None
+            # Layer-mode errors wake waiters; those bits are not Local proof.
+            # The normal runtime guard must reject the request and no range
+            # may have reached GPU KV without its native completion proof.
+            try:
+                rt._check_target_state(state)
+                raise AssertionError("failed handoff became usable")
+            except RuntimeError:
+                pass
+            assert all(bool(torch.isnan(tensor).all()) for tensor in keys + values)
+            assert owner in rt._TRANSFER_QUARANTINE
+            packet = messages.get(timeout=15)
+            assert "error" not in packet, packet
+            source.join(timeout=10)
+            assert source.exitcode == 0 and packet["source"]["unsafe_guard"]
+            assert packet["source"]["registration"]["live"] > 0
+            for tensor in keys + values:
+                tensor.fill_(-7)
+            torch.cuda.current_stream().synchronize()
+            time.sleep(0.1)
+            assert all(bool((tensor == -7).all()) for tensor in keys + values)
+            rt.reap_transfer_buffers()
+            assert owner in rt._TRANSFER_QUARANTINE
+            return dict(
+                mode=mode,
+                fault=fault,
+                source_reuse_blocked=True,
+                target_host_retained=True,
+                target_gpu_fenced=True,
+                **packet,
+            )
         if cancel:
             assert state.error is not None and state.import_done_at is None
             initially_quarantined = owner in rt._TRANSFER_QUARANTINE
@@ -314,15 +411,19 @@ def transfer_probe(
             source.join(timeout=10)
             assert source.exitcode == 0, source.exitcode
             rt.reap_transfer_buffers()
-            assert owner not in rt._TRANSFER_QUARANTINE
-            assert rt._get_registration_manager().stats()["live"] == 0
+            quarantined = owner in rt._TRANSFER_QUARANTINE
+            if token_range is None:
+                assert not quarantined
+                assert rt._get_registration_manager().stats()["live"] == 0
+            elif quarantined:
+                assert rt._get_registration_manager().stats()["live"] > 0
             return dict(
                 mode=mode,
                 cancelled=True,
                 gpu_reuse_safe=True,
                 initially_quarantined=initially_quarantined,
-                target_quarantined=False,
-                host_registration_reclaimed=True,
+                target_quarantined=quarantined,
+                host_registration_reclaimed=not quarantined,
                 **packet,
             )
         if remote_drop:

@@ -128,12 +128,15 @@ class MooncakeTransferEngine:
         self.engine = TransferEngine()
         self.hostname = hostname
         self.gpu_id = gpu_id if gpu_id is not None else 0
-        # MC_FORCE_TCP=1 makes mooncake install TcpTransport instead of RDMA,
-        # in which case RDMA HCA selection is irrelevant; pass empty device.
-        if os.environ.get("MC_FORCE_TCP") == "1":
-            self.ib_device = ""
-        else:
-            self.ib_device = get_ib_devices_for_gpu(ib_device, self.gpu_id)
+        from sglang.srt.mooncake_contract import INIT_LOCK
+
+        # Match native getenv presence, and do not observe a concurrent D2D
+        # fallback initializer's temporary override when choosing the HCA filter.
+        with INIT_LOCK:
+            if "MC_FORCE_TCP" in os.environ:
+                self.ib_device = ""
+            else:
+                self.ib_device = get_ib_devices_for_gpu(ib_device, self.gpu_id)
 
         self.initialize(
             hostname=self.hostname,
@@ -208,12 +211,17 @@ class MooncakeTransferEngine:
             # Default is "rdma"; set MOONCAKE_PROTOCOL=efa on AWS EFA hardware.
             protocol = envs.MOONCAKE_PROTOCOL.get()
 
-        ret_value = run_with_deadline(
-            lambda: self.engine.initialize(
+        from sglang.srt.mooncake_contract import initialize_engine
+
+        self.protocol = "unsupported"
+        self.d2d_rdma_eligible = self.d2d_protocol_verified = False
+        ret_value, effective = run_with_deadline(
+            lambda: initialize_engine(
+                self.engine,
                 hostname,
-                "P2PHANDSHAKE",
                 protocol,
                 device_name if device_name is not None else "",
+                force_tcp=protocol == "tcp",
             ),
             timeout_s=envs.SGLANG_DISAGGREGATION_ENGINE_INIT_TIMEOUT.get(),
             what=f"Mooncake TransferEngine.initialize({hostname!r}, {protocol!r}, {device_name!r})",
@@ -221,6 +229,9 @@ class MooncakeTransferEngine:
         if ret_value != 0:
             logger.error("Mooncake Transfer Engine initialization failed.")
             raise RuntimeError("Mooncake Transfer Engine initialization failed.")
+        self.protocol = effective
+        self.d2d_protocol_verified = effective in ("tcp", "rdma")
+        self.d2d_rdma_eligible = effective == "rdma"
 
     def transfer_sync(
         self, session_id: str, buffer: int, peer_buffer_address: int, length: int

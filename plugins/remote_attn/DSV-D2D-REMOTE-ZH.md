@@ -7,8 +7,9 @@ SWA、压缩器/indexer 状态和 indexer 历史，再接管 pending token。历
 这不是等待全部 KV 复制完成后才恢复 Decode 的 copy-wait。
 
 这是实验性后端控制接口。现有 P→D 最后 chunk 完整 forward 后的 Decode–KV
-transfer overlap 不变；没有把最后 chunk 改回 layerwise forward。原有 Qwen3
-迁移命令也不变。P4 Gateway 可通过 `--backend dsv` 显式启用 DSV 编排、token SSE
+transfer overlap 不变；没有把最后 chunk 改回 layerwise forward。Qwen3
+Gateway 同步采用原生预留凭据；手工控制需先 plan / reserve / confirmation，见
+[统一二维搬运](D2D-LAYER-TOKEN-RANGE-ZH.md)。P4 Gateway 可通过 `--backend dsv` 显式启用 DSV 编排、token SSE
 接续和持久化恢复，见 [P4 DSV 模式](P4-DSV-GATEWAY-ZH.md)。旧 Qwen 流程不自动
 识别 DSV；绕过 Gateway 的原生 HTTP/SSE 连接也不会自动改道。不要把算子/协议验证当作整模、网关或 H20 RDMA 性能验收。
 
@@ -33,6 +34,11 @@ transfer overlap 不变；没有把最后 chunk 改回 layerwise forward。原�
   为 bulk 接收区，不宣称是 GPU Direct KV 传输。Q/O/LSE 可独立通过
   `HANDOFF_REMOTE_GPU_TRANSFER=1` 使用现有原生 Mooncake GPU 通道。跨机地址沿用 `HANDOFF_PD_NETWORK=1` 和
   `HANDOFF_NETWORK_*`；控制文件通过现有受控通道送到各实例。
+
+历史 global KV 使用 `HANDOFF_D2D_GROUP_SIZE`（默认 `1`）和
+`HANDOFF_D2D_TOKEN_RANGE`（默认 `1024`）规划层组 × token 区间，按原生页对齐并
+拆成有界帧；每个 entry 完整覆盖后独立切 Local 和退休。配置与 Qwen 对应路径
+见 [统一二维搬运](D2D-LAYER-TOKEN-RANGE-ZH.md)。
 
 ## 数据与 KV 所有权
 

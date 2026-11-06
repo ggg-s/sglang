@@ -860,6 +860,99 @@ class Gateway:
             self._send_event(handler, st, self._event(st, seq, src_ids[seq], "src"))
         return len(src_ids)
 
+    def _cancel_reserved(self, rids, timeout=60):
+        grouped = {}
+        with self.journal_lock:
+            identities = {
+                entry.get("drid"): entry.get("reservation_epoch")
+                for entry in self.journal.values()
+                if isinstance(entry, dict)
+            }
+        for rid in rids:
+            grouped.setdefault(identities.get(rid), []).append(rid)
+        cancelled, errors = [], {}
+        for epoch, members in grouped.items():
+            payload = dict(cmd="reserve_cancel", rids=members)
+            if epoch is not None:
+                payload["epoch"] = epoch
+            result = self.dst.send(payload, timeout=timeout)
+            errors.update(self._all_rank_errors(result))
+            cancelled.extend(result.get("cancelled", []))
+        return dict(cancelled=cancelled, errors=errors)
+
+    def _reserve_planned(self, items, epoch, timeout=120):
+        """Reserve native rows/KV from source plans before any freeze command."""
+        targets = {}
+        for st in getattr(self, "active", {}).values():
+            targets[st.drid] = st.rid
+        with self.journal_lock:
+            for key, entry in self.journal.items():
+                if isinstance(entry, dict) and entry.get("drid"):
+                    targets[entry["drid"]] = entry.get("rid", key)
+        requested = []
+        for item in items:
+            if int(item.get("tokens", 0)) > 10_000_000:
+                return {"errors": {item["rid"]: "injected capacity rejection"}}
+            rid = item["rid"]
+            if rid not in targets:
+                raise ValueError(f"reservation target {rid!r} has no source identity")
+            requested.append(
+                dict(
+                    rid=targets[rid],
+                    target_rid=rid,
+                    growth_tokens=int(
+                        os.environ.get("HANDOFF_D2D_RESERVE_GROWTH", "64")
+                    ),
+                )
+            )
+        with self.journal_lock:
+            for item in requested:
+                self.journal.setdefault(item["rid"], {})["reservation_epoch"] = epoch
+        self._journal_flush()
+        planned = self.src.send(
+            dict(cmd="plan", items=requested, epoch=epoch), timeout=timeout
+        )
+        ranks = planned.get("tp_rank_results") or [planned]
+        if any(not x.get("plans") or x.get("errors") or x.get("error") for x in ranks):
+            raise RuntimeError(f"source D2D planning rejected: {planned}")
+        upper = {p["target_rid"]: p["upper"] for p in ranks[0]["plans"]}
+        for item in items:
+            item["tokens"] = upper[item["rid"]]
+        result = self.dst.send(
+            dict(
+                cmd="reserve",
+                plans=[x["plans"] for x in ranks],
+                items=[
+                    dict(rid=p["target_rid"], tokens=p["upper"])
+                    for p in ranks[0]["plans"]
+                ],
+                epoch=epoch,
+            ),
+            timeout=timeout,
+        )
+        replies = result.get("tp_rank_results") or [result]
+        if any(
+            x.get("errors") or x.get("error") or not x.get("reservations")
+            for x in replies
+        ):
+            return (
+                result
+                if self._all_rank_errors(result)
+                else {"errors": {"reservation": "native reservation unproven"}}
+            )
+        confirmed = self.src.send(
+            dict(
+                cmd="reservation_ready",
+                certificates=[x["reservations"] for x in replies],
+                epoch=epoch,
+            ),
+            timeout=timeout,
+        )
+        cr = confirmed.get("tp_rank_results") or [confirmed]
+        if not all(x.get("confirmed") for x in cr):
+            raise RuntimeError("source did not confirm target native reservations")
+        return result
+
     def _cutover_epoch(self, members):
         with self.journal_lock:
             drain = self.journal.get("__drain__") or {}
@@ -879,9 +972,7 @@ class Gateway:
         print(f"[gw] enter _cutover rid={st.rid} wave={st.wave} "
               f"group={st.group}", flush=True)
         epoch = self._cutover_epoch([st])
-        n = st.prompt_len + st.cut + 64
-        if inject == "capacity":
-            n += 10_000_000
+        n = 10_000_001 if inject == "capacity" else 0
         try:
             st_now = self.dst.send({"cmd": "status"}, timeout=4)
             tps = st_now.get("tp_rank_results") or [st_now]
@@ -896,17 +987,7 @@ class Gateway:
         except Exception as exc:
             print(f"[gw] cutover slot gate skipped: {exc!r}", flush=True)
         t0 = time.monotonic()
-        rv = self._send_timed(
-            self.dst,
-            {
-                "cmd": "reserve",
-                "items": [{"rid": st.drid, "tokens": n}],
-                "epoch": epoch,
-            },
-            120,
-            st,
-            "reserve",
-        )
+        rv = self._reserve_planned([{"rid": st.drid, "tokens": n}], epoch, timeout=120)
         st.cutover["reserve_ms"] = (time.monotonic() - t0) * 1000.0
         if rv.get("errors"):
             st.cutover["capacity_rejected"] = rv.get("errors")
@@ -1093,9 +1174,7 @@ class Gateway:
                 st.error = "target_committed"
                 return False
             try:
-                self.dst.send(
-                    {"cmd": "reserve_cancel", "rids": [st.drid]}, timeout=60
-                )
+                self._cancel_reserved([st.drid], timeout=60)
             except Exception:
                 pass
             if n_tp > 1:
@@ -1260,9 +1339,7 @@ class Gateway:
                 st.batch_failed = True
                 st.error = st.error or str(g.get("aborted"))
                 return False
-        n = st.prompt_len + st.cut + 64
-        if inject == "capacity":
-            n += 10_000_000
+        n = 10_000_001 if inject == "capacity" else 0
         try:
             # Slot-aware capacity gate (per-request wave path): count target
             # rows plus members already frozen but not yet imported, so an
@@ -1287,17 +1364,7 @@ class Gateway:
                 raise
             except Exception as exc:
                 print(f"[gw] wave slot gate skipped: {exc!r}", flush=True)
-            rv = self._send_timed(
-                self.dst,
-                {
-                    "cmd": "reserve",
-                    "items": [{"rid": st.drid, "tokens": n}],
-                    "epoch": epoch,
-                },
-                120,
-                st,
-                "reserve",
-            )
+            rv = self._reserve_planned([{"rid": st.drid, "tokens": n}], epoch, timeout=120)
             if rv.get("errors"):
                 st.cutover["capacity_rejected"] = rv["errors"]
                 raise RuntimeError(f"reserve: {rv['errors']}")
@@ -1383,11 +1450,7 @@ class Gateway:
         )
         if n_tp > 1:
             try:
-                self.dst.send(
-                    {"cmd": "reserve_cancel",
-                     "rids": [x.drid for x in members]},
-                    timeout=10,
-                )
+                self._cancel_reserved([x.drid for x in members], timeout=10)
             except Exception:
                 pass
             to_resume = []
@@ -1525,11 +1588,7 @@ class Gateway:
                 g["aborted"] = f"import_wave: {rv.get('errors')}"
             self._cancel_epochs(members)
             try:
-                self.dst.send(
-                    {"cmd": "reserve_cancel",
-                     "rids": [st.drid for st in members]},
-                    timeout=10,
-                )
+                self._cancel_reserved([st.drid for st in members], timeout=10)
             except Exception:
                 pass
             if n_tp > 1:
@@ -1667,24 +1726,13 @@ class Gateway:
         n_tp = 1
         try:
             t_res = time.monotonic()
-            rv = self._send_timed(
-                self.dst,
-                {
-                    "cmd": "reserve",
-                    "items": [
+            rv = self._reserve_planned([
                         {
                             "rid": st.drid,
-                            "tokens": st.prompt_len + st.cut
-                            + (10_000_000 if inject == "capacity" else 64),
+                            "tokens": 10_000_001 if inject == "capacity" else 0,
                         }
                         for st in members
-                    ],
-                    "epoch": epoch,
-                },
-                120,
-                members[0],
-                "reserve",
-            )
+                    ], epoch, timeout=120)
             self._copy_ctl(members, "reserve")
             if rv.get("errors"):
                 raise RuntimeError(f"reserve: {rv['errors']}")
@@ -1898,11 +1946,7 @@ class Gateway:
                 ).start()
         except Exception as exc:
             try:
-                self.dst.send(
-                    {"cmd": "reserve_cancel",
-                     "rids": [st.drid for st in members]},
-                    timeout=10,
-                )
+                self._cancel_reserved([st.drid for st in members], timeout=10)
             except Exception:
                 pass
             if wave_all:
@@ -2392,9 +2436,7 @@ class Gateway:
         ]
         if rids:
             try:
-                self.dst.send(
-                    {"cmd": "reserve_cancel", "rids": rids}, timeout=10
-                )
+                self._cancel_reserved(rids, timeout=10)
                 d["reserve_cleanup"] = []
             except Exception:
                 d["reserve_cleanup"] = rids
@@ -2757,9 +2799,7 @@ class Gateway:
         # turn the whole drain into BLOCKED.
         if e.get("phase") == "done" and e.get("owner") in (None, "src"):
             try:
-                self.dst.send(
-                    {"cmd": "reserve_cancel", "rids": [drid]}, timeout=5
-                )
+                self._cancel_reserved([drid], timeout=5)
             except Exception:
                 pass
             e["needs_cancel"] = False
@@ -2782,9 +2822,7 @@ class Gateway:
             and not e.get("observed_committed")
         ):
             try:
-                self.dst.send(
-                    {"cmd": "reserve_cancel", "rids": [drid]}, timeout=5
-                )
+                self._cancel_reserved([drid], timeout=5)
             except Exception as exc:
                 e["last_error"] = f"reserve_cancel: {exc!r}"
                 if d is not None:
@@ -2841,9 +2879,7 @@ class Gateway:
             return "blocked"
         e["cancel_confirmed"] = True
         try:
-            self.dst.send(
-                {"cmd": "reserve_cancel", "rids": [drid]}, timeout=5
-            )
+            self._cancel_reserved([drid], timeout=5)
         except Exception:
             pass
         try:
@@ -2913,9 +2949,8 @@ class Gateway:
             out = int(src_reqs[rid].get("output_len", 0))
             items.append({
                 "rid": e["drid"],
-                # Output can grow between reserve and freeze/import; keep a
-                # 512-token margin or import_wave fails the reservation check.
-                "tokens": int(e.get("prompt_len", 0)) + out + 512,
+                # Filled from the source's native reservation plan below.
+                "tokens": 0,
                 "slots": 1,
             })
         if items:
@@ -2928,10 +2963,7 @@ class Gateway:
                 time.sleep(delay)
             try:
                 wave["timeline"]["reserve_send_at"] = time.monotonic()
-                rv = self.dst.send(
-                    {"cmd": "reserve", "items": items, "epoch": epoch},
-                    timeout=5,
-                )
+                rv = self._reserve_planned(items, epoch, timeout=5)
                 wave["timeline"]["reserve_done_at"] = time.monotonic()
             except Exception as exc:
                 rv = {"errors": {it["rid"]: repr(exc) for it in items}}
@@ -3107,10 +3139,7 @@ class Gateway:
                 e["migration_abandoned"] = True
                 e["last_error"] = "freeze_not_ready_abandoned"
                 try:
-                    self.dst.send(
-                        {"cmd": "reserve_cancel", "rids": [e["drid"]]},
-                        timeout=5,
-                    )
+                    self._cancel_reserved([e["drid"]], timeout=5)
                 except Exception:
                     pass
         if not frozen:
@@ -3517,9 +3546,7 @@ class Gateway:
         if not rids:
             return
         try:
-            rv = self.dst.send(
-                {"cmd": "reserve_cancel", "rids": rids}, timeout=5
-            )
+            rv = self._cancel_reserved(rids, timeout=5)
         except Exception:
             return
         d["reserve_cleanup"] = []
@@ -3549,9 +3576,7 @@ class Gateway:
             if e.get("drid"):
                 rids.append(e["drid"])
         try:
-            self.dst.send(
-                {"cmd": "reserve_cancel", "rids": rids}, timeout=10
-            )
+            self._cancel_reserved(rids, timeout=10)
             d["reserve_cleanup"] = []
         except Exception:
             d["reserve_cleanup"] = rids
@@ -3877,22 +3902,11 @@ class Gateway:
             for rid in members:
                 e = self.journal.get(rid) or {}
                 drid = str(e.get("drid") or f"dst-{rid}")
-                tokens = (
-                    int(e.get("prompt_len") or 0)
-                    + int(e.get("max_new") or 0)
-                    + 512
-                )
-                if tokens > 0:
-                    items.append({
-                        "rid": drid, "tokens": tokens, "slots": 1,
-                    })
+                items.append({"rid": drid, "tokens": 0, "slots": 1})
         if not items:
             return True
         try:
-            rv = self.dst.send(
-                {"cmd": "reserve", "items": items, "epoch": epoch},
-                timeout=15,
-            )
+            rv = self._reserve_planned(items, epoch, timeout=15)
         except Exception as exc:
             drain["state"] = "ROLLED_BACK"
             drain["rolled_back_at"] = time.time()
@@ -3904,9 +3918,7 @@ class Gateway:
         if errs:
             rids = [it["rid"] for it in items]
             try:
-                self.dst.send(
-                    {"cmd": "reserve_cancel", "rids": rids}, timeout=10
-                )
+                self._cancel_reserved(rids, timeout=10)
             except Exception:
                 pass
             why = " ".join(

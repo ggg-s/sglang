@@ -65,11 +65,7 @@ def check_plan(controller, plan, epoch):
     if not plan["destination"] or not plan["target_rid"]:
         raise ValueError("empty D2D reservation destination/rid")
     lower, upper = plan["lower"], plan["upper"]
-    if (
-        not isinstance(lower, int)
-        or not isinstance(upper, int)
-        or not 0 < lower <= upper
-    ):
+    if type(lower) is not int or type(upper) is not int or not 0 < lower <= upper:
         raise ValueError("invalid D2D reservation interval")
     if lower != len(plan["origin_input_ids"]) + len(plan["output_ids"]) - 1:
         raise ValueError("invalid D2D reservation history")
@@ -98,8 +94,8 @@ def handle(controller, data):
             raise ValueError("D2D plan requires an active unowned request")
         params = d2d.sampling(req)
         lower = len(req.origin_input_ids) + len(req.output_ids) - 1
-        growth = int(data.get("growth_tokens", 64))
-        if not req.output_ids or growth < 0:
+        growth = data.get("growth_tokens", 64)
+        if not req.output_ids or type(growth) is not int or growth < 0:
             raise ValueError("D2D plan requires sampled output and nonnegative growth")
         upper = min(
             lower + growth,

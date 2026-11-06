@@ -8,10 +8,16 @@ import os
 import secrets
 import socket
 import threading
+import time
 from contextlib import nullcontext
 from types import SimpleNamespace
 
 import torch
+
+from . import mooncake_backend as transport
+
+WIRE_VERSION = "remote-mooncake-v1"
+FOOTER = 32
 
 Q_BYTES = 2 * 1024 * 1024
 O_BYTES = 4 * 1024 * 1024
@@ -19,6 +25,8 @@ LSE_BYTES = 16 * 1024
 TOTAL = Q_BYTES + O_BYTES + LSE_BYTES
 OFFSETS = (0, Q_BYTES, Q_BYTES + O_BYTES)
 CAPACITIES = (Q_BYTES, O_BYTES, LSE_BYTES)
+WIRE_OFFSETS = (0, Q_BYTES + FOOTER, Q_BYTES + O_BYTES + 2 * FOOTER)
+WIRE_TOTAL = TOTAL + 3 * FOOTER
 DTYPES = {
     "bfloat16": torch.bfloat16,
     "float16": torch.float16,
@@ -43,14 +51,17 @@ def manager_for(scheduler):
 
 
 class Visibility:
-    def __init__(self, device):
+    def __init__(self, device, protocol=None):
         self.device = torch.device(device)
         self.flush = None
         if self.device.type == "cpu":  # explicit CPU contract-test boundary
             return
-        if (
-            os.environ.get("MC_FORCE_TCP") == "1"
-            or os.environ.get("MOONCAKE_PROTOCOL") == "tcp"
+        if protocol == "tcp" or (
+            protocol is None
+            and (
+                os.environ.get("MC_FORCE_TCP") == "1"
+                or os.environ.get("MOONCAKE_PROTOCOL") == "tcp"
+            )
         ):
             return  # Native CUDA copy completion, not external RDMA writes.
         from cuda.bindings import runtime as cuda
@@ -138,40 +149,148 @@ def ready(req):
 
 
 class Slab:
-    def __init__(self, plane):
-        self.plane = plane
-        self.tensor = torch.empty(TOTAL, dtype=torch.uint8, device=plane.device)
+    def __init__(self, plane, backend=transport.TCP):
+        self.plane, self.backend = plane, backend
+        self.engine = plane.catalog.engines[backend]
         self.nonce = secrets.token_hex(16)
-        self.closed = False
-        self.quarantined = False
+        self.closed = self.quarantined = False
+        self.stream = None
+        self.copy_owner = None
+        self.tensor = torch.empty(TOTAL, dtype=torch.uint8, device=plane.device)
+        self.initialized = event(plane.device)
+        self.wire = (
+            self.tensor
+            if backend == transport.GPU
+            else torch.empty(
+                WIRE_TOTAL,
+                dtype=torch.uint8,
+                device="cpu",
+                pin_memory=plane.device.type == "cuda",
+            )
+        )
+        self.offsets = OFFSETS if backend == transport.GPU else WIRE_OFFSETS
+        self.visibility = (
+            Visibility(plane.device, protocol="rdma")
+            if backend == transport.GPU
+            else None
+        )
+        # Durable engine ownership BEFORE any registration can partially succeed.
+        with plane.lock:
+            retained = self.engine.__dict__.setdefault("_qo_slabs", [])
+            retained.append(self)
         try:
+            self.initialized.synchronize()
+            if plane.device.type == "cuda":
+                self.stream = torch.cuda.Stream(device=plane.device)
             with plane.send_guard():
-                rc = plane.engine.batch_register([self.tensor.data_ptr()], [TOTAL])
+                rc = self.engine.batch_register(
+                    [self.wire.data_ptr()], [self.wire.numel()]
+                )
             if rc != 0:
-                raise RuntimeError("native Mooncake GPU registration failed")
+                raise RuntimeError("Mooncake Q/O registration failed")
         except BaseException:
             self.poison()
             raise
 
     def descriptor(self):
-        return dict(base=self.tensor.data_ptr(), size=TOTAL, nonce=self.nonce)
+        return dict(
+            base=self.wire.data_ptr(),
+            size=self.wire.numel(),
+            nonce=self.nonce,
+            backend=self.backend,
+        )
 
     def view(self, region, spec):
         shape, dtype, size = tensor_spec(spec, region)
         return self.tensor.narrow(0, OFFSETS[region], size).view(dtype).reshape(shape)
 
+    def stamp(self, nonce, sequence, region, size):
+        if type(sequence) is not int or not 0 < sequence < 2**64:
+            raise ValueError("invalid Q/O transfer sequence")
+        return (
+            bytes.fromhex(nonce)
+            + sequence.to_bytes(8, "little")
+            + ((size << 2) | region).to_bytes(8, "little")
+        )
+
+    def copy_context(self):
+        return (
+            torch.cuda.stream(self.stream) if self.stream is not None else nullcontext()
+        )
+
+    def drain(self):
+        if self.stream is not None:
+            self.stream.synchronize()
+
+    def prepare(self, remote, entries, sequence):
+        sizes = [tensor_spec(value, region)[2] for region, value in entries]
+        if self.backend == transport.TCP:
+            producer = event(self.plane.device)
+            with self.copy_context():
+                if self.stream is not None:
+                    self.stream.wait_event(producer)
+                for (region, _), size in zip(entries, sizes):
+                    self.wire[self.offsets[region] : self.offsets[region] + size].copy_(
+                        self.tensor[OFFSETS[region] : OFFSETS[region] + size],
+                        non_blocking=True,
+                    )
+            self.drain()  # Independent D2H must finish before native reads Host.
+            for (region, _), size in zip(entries, sizes):
+                offset = self.offsets[region] + size
+                self.wire[offset : offset + FOOTER].copy_(
+                    torch.tensor(
+                        list(self.stamp(remote["nonce"], sequence, region, size)),
+                        dtype=torch.uint8,
+                    )
+                )
+            sizes = [size + FOOTER for size in sizes]
+        return sizes
+
+    def receive(self, entries, sequence):
+        if self.quarantined or self.closed:
+            raise RuntimeError("Q/O slot is quarantined/closed")
+        if self.backend == transport.GPU:
+            self.visibility.receive()
+            return
+        # Each region's payload/footer is ONE ordered TCP descriptor. Native
+        # sender completion alone does not prove receiver bytes have arrived.
+        deadline = time.monotonic() + float(
+            os.environ.get("HANDOFF_PD_DRAIN_TIMEOUT_S", "300")
+        )
+        for region, value in entries:
+            size = tensor_spec(value, region)[2]
+            offset = self.offsets[region] + size
+            stamp = self.stamp(self.nonce, sequence, region, size)
+            while bytes(self.wire[offset : offset + FOOTER].tolist()) != stamp:
+                if self.quarantined or time.monotonic() >= deadline:
+                    raise TimeoutError("Q/O Host payload arrival unproven")
+                time.sleep(0.001)
+        with self.copy_context():
+            if self.stream is not None:
+                self.stream.wait_event(self.initialized)
+            for region, value in entries:
+                size = tensor_spec(value, region)[2]
+                self.tensor[OFFSETS[region] : OFFSETS[region] + size].copy_(
+                    self.wire[self.offsets[region] : self.offsets[region] + size],
+                    non_blocking=True,
+                )
+        self.drain()  # Prove H2D before another stream consumes or sender reuses.
+
     def close(self):
         if self.closed or self.quarantined:
             return
         try:
+            self.drain()
             with self.plane.send_guard():
-                rc = self.plane.engine.batch_deregister([self.tensor.data_ptr()])
+                rc = self.engine.batch_deregister([self.wire.data_ptr()])
             if rc != 0:
-                raise RuntimeError("native Mooncake GPU deregistration failed")
+                raise RuntimeError("Mooncake Q/O deregistration failed")
         except BaseException:
             self.poison()
             raise
         self.closed = True
+        with self.plane.lock:
+            self.engine._qo_slabs.remove(self)
 
     def poison(self):
         if not self.quarantined:
@@ -205,13 +324,18 @@ def spec(tensor):
     return dict(shape=list(tensor.shape), dtype=str(tensor.dtype).split(".")[-1])
 
 
-def descriptor(value):
+def descriptor(value, backend=None):
     if (
-        type(value.get("base")) is not int
+        not isinstance(value, dict)
+        or value.get("backend") not in (transport.GPU, transport.TCP)
+        or (backend is not None and value.get("backend") != backend)
+        or type(value.get("base")) is not int
         or value["base"] <= 0
-        or value.get("size") != TOTAL
+        or value.get("size")
+        != (TOTAL if value.get("backend") == transport.GPU else WIRE_TOTAL)
         or not isinstance(value.get("nonce"), str)
         or len(value["nonce"]) != 32
+        or any(c not in "0123456789abcdef" for c in value["nonce"])
     ):
         raise ValueError("invalid registered GPU region")
     return value
@@ -237,18 +361,19 @@ class Plane:
             manager.engine,
             torch.device(device),
         )
-        for name in (
-            "batch_register",
-            "batch_deregister",
-            "batch_transfer_sync",
-            "get_session_id",
-        ):
-            if not callable(getattr(self.engine, name, None)):
-                raise RuntimeError(f"native Mooncake GPU payload requires {name}")
-        self.session = self.engine.get_session_id()
-        self.visibility = Visibility(self.device)
+        self.catalog = transport.Catalog(
+            self.engine, self.device, policy_name="HANDOFF_REMOTE_BACKEND"
+        )
+        self.engine = self.catalog.primary
+        self.session = self.engine.session  # Native PD identity, not fallback endpoint.
+        for engine in self.catalog.engines.values():
+            for name in ("batch_transfer_async_write", "get_batch_transfer_status"):
+                if not callable(getattr(engine.raw, name, None)):
+                    raise RuntimeError(
+                        f"Mooncake Q/O requires single-submit API {name}"
+                    )
         self.clients, self.lanes, self.quarantine = {}, set(), []
-        self.lock = threading.Lock()
+        self.lock = threading.RLock()
         self.closed = False
         self.transfers = self.payload_bytes = 0
         print(
@@ -280,23 +405,21 @@ class Plane:
                 ),
             )
 
-    def write(self, slab, remote, session, entries):
-        remote = descriptor(remote)
+    def write(self, slab, remote, session, entries, sequence):
+        remote = descriptor(remote, slab.backend)
         if slab.quarantined or slab.closed:
             raise RuntimeError("GPU slot is not reusable")
-        local, target, lengths = [], [], []
-        for region, value in entries:
-            _, _, size = tensor_spec(value, region)
-            local.append(slab.tensor.data_ptr() + OFFSETS[region])
-            target.append(remote["base"] + OFFSETS[region])
-            lengths.append(size)
-        # Ready events are awaited before this lock, never inside native KV's
-        # host-staging/FIFO path. Keep the existing manager's send serialization.
-        with self.send_guard():
-            rc = self.engine.batch_transfer_sync(session, local, target, lengths)
-        if rc != 0:
-            slab.poison()
-            raise RuntimeError("Mooncake GPU transfer completion is unknown")
+        try:
+            lengths = slab.prepare(remote, entries, sequence)
+            local = [
+                slab.wire.data_ptr() + slab.offsets[region] for region, _ in entries
+            ]
+            target = [remote["base"] + slab.offsets[region] for region, _ in entries]
+            with self.send_guard():
+                slab.engine.batch_transfer_sync(session, local, target, lengths)
+        except BaseException:
+            slab.poison()  # Includes partial submit, hidden receiver work and CUDA failure.
+            raise
         with self.lock:
             self.transfers += 1
             self.payload_bytes += sum(lengths)
@@ -307,7 +430,9 @@ class Plane:
             if self.closed:
                 raise RuntimeError("GPU data plane closed")
             client = self.clients.get(key)
-            if client is not None and client.slab.quarantined:
+            if client is not None and (
+                client.closed or (client.slab is not None and client.slab.quarantined)
+            ):
                 # A new request can use fresh backing memory. The failed
                 # request's IO remains poisoned and may never be retried here.
                 client = None
@@ -340,7 +465,7 @@ def plane_for(controller):
 class Client:
     def __init__(self, plane, route):
         self.plane, self.route = plane, route
-        self.slab = Slab(plane)
+        self.slab = None  # Allocate/register only after a common backend is selected.
         self.lock = threading.Lock()
         self.sock, self.remote, self.session = None, None, None
         self.sequence = 0
@@ -357,6 +482,17 @@ class Client:
         return result
 
     def connect(self):
+        try:
+            self._connect()
+        except BaseException:
+            self.closed = True
+            if self.slab is not None:
+                self.slab.poison()
+            if self.sock is not None:
+                self.sock.close()
+            raise
+
+    def _connect(self):
         self.sock = socket.create_connection(
             (self.route["host"], int(self.route["port"])), timeout=10
         )
@@ -365,14 +501,37 @@ class Client:
         self.rpc(dict(cmd="hello", proto=2))
         result = self.rpc(
             dict(
-                cmd="te_open",
+                cmd="te_negotiate",
+                version=WIRE_VERSION,
                 route=self.route,
-                session=self.plane.session,
+                native_session=self.plane.session,
+                capabilities=self.plane.catalog.offer,
+                sessions={
+                    key: engine.session
+                    for key, engine in self.plane.catalog.engines.items()
+                },
+            )
+        )
+        backend = self.plane.catalog.select(result["capabilities"])
+        if result.get("version") != WIRE_VERSION or result.get("backend") != backend:
+            raise ValueError("Q/O backend negotiation mismatch")
+        self.session = result["session"]
+        self.slab = Slab(self.plane, backend)
+        result = self.rpc(
+            dict(
+                cmd="te_open",
+                version=WIRE_VERSION,
+                backend=backend,
+                session=self.slab.engine.session,
                 region=self.slab.descriptor(),
             )
         )
-        self.remote = descriptor(result["region"])
-        self.session = result["session"]
+        self.remote = descriptor(result["region"], backend)
+        if (
+            result.get("session") != self.session
+            or result.get("version") != WIRE_VERSION
+        ):
+            raise ValueError("Q/O engine identity changed during open")
 
     def call(self, queries, rows, reqs):
         if (
@@ -383,23 +542,30 @@ class Client:
             raise ValueError("GPU payload requires 1..4 mapped rows")
         ios = [io_for(req) for req in reqs]
         with self.lock:
-            if self.closed or self.slab.quarantined:
+            if self.closed or (self.slab is not None and self.slab.quarantined):
                 raise RuntimeError("GPU lane is quarantined/closed")
-            for io in ios:
-                io.begin()
             try:
+                for io in ios:
+                    io.begin()
                 if self.sock is None:
                     self.connect()
                 if self.consumed is not None:
                     self.consumed.synchronize()
+                    self.slab.copy_owner = None
                 if any(q.device != self.plane.device for q in queries):
                     raise ValueError("Q belongs to another GPU")
                 query = torch.stack(queries)
                 query_spec = spec(query)
+                self.slab.copy_owner = query
                 self.slab.view(0, query_spec).copy_(query)
                 event(self.plane.device).synchronize()
+                self.slab.copy_owner = None
                 self.plane.write(
-                    self.slab, self.remote, self.session, [(0, query_spec)]
+                    self.slab,
+                    self.remote,
+                    self.session,
+                    [(0, query_spec)],
+                    self.sequence + 1,
                 )
                 self.sequence += 1
                 result = self.rpc(
@@ -407,11 +573,14 @@ class Client:
                 )
                 if result.get("sequence") != self.sequence:
                     raise ValueError("GPU result sequence changed")
-                self.plane.visibility.receive()
+                self.slab.receive([(1, result["o"]), (2, result["lse"])], self.sequence)
                 # Return owned tensors; the arena never aliases a future graph
                 # segment. Reuse waits for the final slot->owned D2D reads.
+                self.slab.copy_owner = []
                 out = self.slab.view(1, result["o"]).clone()
+                self.slab.copy_owner.append(out)
                 lse = self.slab.view(2, result["lse"]).clone()
+                self.slab.copy_owner.append(lse)
                 if out.shape != query.shape or lse.shape != query.shape[:-1]:
                     raise ValueError("GPU result shape changed")
                 self.consumed = event(self.plane.device)
@@ -420,11 +589,13 @@ class Client:
                     io.finish(self.consumed)
                 return result, out, lse
             except BaseException:
-                self.slab.poison()
+                if self.slab is not None:
+                    self.slab.poison()
                 for io in ios:
                     io.poison()
                 if self.sock is not None:
                     self.sock.close()
+                self.closed = True
                 raise
 
     def close(self):
@@ -432,6 +603,10 @@ class Client:
             if self.closed:
                 return
             self.closed = True
+            if self.slab is None:
+                if self.sock is not None:
+                    self.sock.close()
+                return
             if self.slab.quarantined:
                 return
             try:
@@ -440,6 +615,7 @@ class Client:
                 if self.sock is not None:
                     self.rpc(dict(cmd="te_close", sequence=self.sequence))
                     self.sock.close()
+                self.slab.copy_owner = None
                 self.slab.close()
             except Exception:
                 self.slab.poison()
@@ -447,9 +623,16 @@ class Client:
 
 
 class Lane:
-    def __init__(self, plane, remote, session):
-        self.plane, self.remote, self.session = plane, descriptor(remote), session
-        self.slab = Slab(plane)
+    def __init__(
+        self, plane, remote, session, backend=transport.TCP, native_session=None
+    ):
+        self.plane, self.remote, self.session = (
+            plane,
+            descriptor(remote, backend),
+            session,
+        )
+        self.native_session = native_session or session
+        self.slab = Slab(plane, backend)
         self.sequence = 0
         self.state = "idle"
         self.lock = threading.Lock()
@@ -491,7 +674,7 @@ class Job:
         from .handoff_control import execute_remote_attention_batch
 
         plane = self.lane.plane
-        plane.visibility.receive()
+        self.lane.slab.receive([(0, self.header["q"])], self.lane.sequence)
         with (
             torch.cuda.stream(stream) if plane.device.type == "cuda" else nullcontext()
         ):
@@ -529,15 +712,18 @@ class Job:
                 torch.stack([o for _, o, _ in outs]),
                 torch.stack([l for _, _, l in outs]),
             )
+            self.lane.slab.copy_owner = (outs, out, lse)
             o_spec, l_spec = spec(out), spec(lse)
             self.lane.slab.view(1, o_spec).copy_(out)
             self.lane.slab.view(2, l_spec).copy_(lse)
             event(plane.device).synchronize()
+            self.lane.slab.copy_owner = None
             plane.write(
                 self.lane.slab,
                 self.lane.remote,
                 self.lane.session,
                 [(1, o_spec), (2, l_spec)],
+                self.lane.sequence,
             )
         with self.lane.lock:
             if self.lane.state != "running":
@@ -592,27 +778,70 @@ def handle(hub, hc, frame):
         raise RuntimeError("GPU payload transport is disabled")
     plane = plane_for(controller)
     command = frame["cmd"]
-    if command == "te_open":
+    if command == "te_negotiate":
+        if (
+            frame.get("version") != WIRE_VERSION
+            or hc.gpu_negotiation is not None
+            or hc.gpu_lane is not None
+        ):
+            raise ValueError("Q/O negotiation version/state mismatch")
         route = frame["route"]
         ctx = hub.registry.get(route["handoff_id"], route["epoch"])
+        native_session = frame["native_session"]
         if (
             ctx is None
             or not hmac.compare_digest(str(route["token"]), ctx.token)
-            or not allowed(ctx, frame["session"])
+            or not allowed(ctx, native_session)
         ):
             raise RuntimeError("GPU lane is not bound to the native PD peer")
+        backend = plane.catalog.select(frame["capabilities"])
+        sessions = frame.get("sessions")
+        if not isinstance(sessions, dict) or set(sessions) != set(
+            frame["capabilities"]["backends"]
+        ):
+            raise ValueError("Q/O capability endpoints missing")
+        session = sessions.get(backend)
+        if not isinstance(session, str) or not 0 < len(session) <= 512:
+            raise ValueError("Q/O capability endpoint invalid")
+        hc.gpu_negotiation = (backend, native_session, session)
+        hub._send(
+            hc,
+            dict(
+                ok=True,
+                cmd=command,
+                version=WIRE_VERSION,
+                capabilities=plane.catalog.offer,
+                backend=backend,
+                session=plane.catalog.engines[backend].session,
+            ),
+        )
+        return
+    if command == "te_open":
+        if hc.gpu_negotiation is None or frame.get("version") != WIRE_VERSION:
+            raise ValueError("Q/O open requires capability negotiation")
+        backend, native_session, session = hc.gpu_negotiation
+        if (
+            frame.get("backend") != backend
+            or frame.get("session") != session
+            or not isinstance(frame.get("session"), str)
+            or not 0 < len(frame["session"]) <= 512
+        ):
+            raise ValueError("Q/O negotiated backend/session changed")
         with plane.lock:
-            if len(plane.lanes) >= 16 or getattr(hc, "gpu_lane", None) is not None:
+            if len(plane.lanes) >= 16 or hc.gpu_lane is not None:
                 raise RuntimeError("GPU lane capacity/binding exceeded")
-            lane = hc.gpu_lane = Lane(plane, frame["region"], frame["session"])
+            lane = hc.gpu_lane = Lane(
+                plane, frame["region"], frame["session"], backend, native_session
+            )
             plane.lanes.add(lane)
         hub._send(
             hc,
             dict(
                 ok=True,
                 cmd=command,
+                version=WIRE_VERSION,
                 region=lane.slab.descriptor(),
-                session=plane.session,
+                session=lane.slab.engine.session,
             ),
         )
         return
@@ -645,7 +874,7 @@ def handle(hub, hc, frame):
                     raise RuntimeError("stale GPU source lease")
                 contexts.append(ctx)
                 if not hmac.compare_digest(str(row["token"]), ctx.token) or not allowed(
-                    ctx, lane.session
+                    ctx, lane.native_session
                 ):
                     raise RuntimeError("GPU RPC peer capability changed")
             job = Job(hub, hc, lane, frame, contexts)
