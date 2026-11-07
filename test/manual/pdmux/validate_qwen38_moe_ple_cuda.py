@@ -9,6 +9,7 @@ from __future__ import annotations
 import argparse
 import ast
 import contextlib
+import contextvars
 import functools
 import hashlib
 import json
@@ -239,7 +240,7 @@ def load_moe():
                 align.moe_align_block_size, pad_expert_ids=True
             ),
         ),
-        functions=all_functions(path),
+        functions=tuple(n for n in all_functions(path) if n != "fused_moe"),
     )
     topk = small.selected(
         "moe_ple_topk",
@@ -406,6 +407,390 @@ def moe_case(m, fp8, intermediate):
     return *funcs, references
 
 
+def enable_fp8_linears(module):
+    quant = production_quant()
+    gemm = ops.load(
+        "moe_ple_fp8_gemm",
+        "python/sglang/kernels/ops/gemm/fp8_kernel.py",
+        is_cuda=lambda: True,
+        is_gfx1250_supported=lambda: False,
+        register_custom_op=lambda **kw: lambda fn: fn,
+        get_device_name=torch.cuda.get_device_name,
+        get_platform=lambda: NS(is_sm90=False),
+        log_info_on_rank0=lambda logger, message: logger.info(message),
+    )
+    count = 0
+    for linear in module.modules():
+        if isinstance(linear, small.Linear) and all(
+            n % 128 == 0 for n in linear.weight.shape
+        ):
+            if linear.fp8_ops is None:
+                linear.enable_fp8(
+                    quant._per_token_group_quant_8bit_raw,
+                    gemm.w8a8_block_fp8_matmul_triton,
+                )
+            count += 1
+    return count
+
+
+class VocabMetadata(nn.Module):
+    """Only the sharding/weight-loading boundary; actual lookups use pinned PLE."""
+
+    def __init__(self, rows, dim, params_dtype, output_dtype, use_attn_tp_group):
+        super().__init__()
+        self.quant_method = UnquantizedEmbeddingMetadata()
+        self.weight = nn.Parameter(
+            torch.empty(rows, dim, dtype=params_dtype), requires_grad=False
+        )
+        self.shard_indices = NS(org_vocab_start_index=0, org_vocab_end_index=rows)
+        self.embedding_dim, self.tp_size, self.num_added_embeddings = dim, 1, 0
+        self.quant_config = None
+        self.enable_tp = self.use_attn_tp_group = self.use_presharded_weights = False
+        self.padding_size = 0
+        for key in (
+            "num_embeddings",
+            "org_vocab_size",
+            "org_vocab_size_padded",
+            "num_embeddings_padded",
+            "num_embeddings_per_partition",
+            "num_org_embeddings_per_partition",
+        ):
+            setattr(self, key, rows)
+        self.num_added_embeddings_per_partition = 0
+
+    def weight_loader(self, param, loaded):
+        param.copy_(loaded)
+
+
+class UnquantizedEmbeddingMetadata:
+    pass
+
+
+def load_ple(fp8):
+    import msgspec
+    import sympy
+
+    if "sglang" not in sys.modules:
+        ops.bootstrap_fla()
+    current = contextvars.ContextVar("ple_current_batch")
+    req_pool = NS(
+        ple_window_cache=None,
+        size=8,
+        state_sub_pool="ple",
+        get_mamba_indices=lambda indices: indices,
+    )
+    pools = small.selected(
+        "ple_real_pools",
+        "python/sglang/srt/mem_cache/ple_state_pool.py",
+        {
+            "NGramPool": ([], {"get_context", "set_context"}),
+            "ShortConvPool": ([], {"layer_cache", "layer_intermediate_cache"}),
+        },
+        dict(torch=torch),
+    )
+    ngram = pools.NGramPool()
+    ngram.context = torch.randint(1, 256, (8, 2), device="cuda")
+    ngram.context[0] = 0
+    ngram.context[1, 0] = 0
+    ngram.context[2, 1] = 0
+    conv = pools.ShortConvPool()
+    conv.layer_map = {0: 0, 1: 1}
+    conv.conv_state = (
+        torch.randn(2, 8, 1024, 9, device="cuda", dtype=torch.bfloat16) * 0.02
+    )
+    conv.conv_state[:, 0] = 0
+    conv.intermediate_conv_state = None
+    router = NS(
+        part_view=lambda part: ngram,
+        wait_for_part=lambda part: None,
+        read=lambda layer, part: NS(view=conv, view_layer_id=layer),
+    )
+    token_pool = NS(layer_router=router)
+
+    class Backend:
+        runner_ids = NS(state_ids=lambda pool: NS(ids=lambda indices: indices))
+
+        @property
+        def linear_attn_backend(self):
+            return NS(state_tracking_indices=current.get().track_indices)
+
+    backend = Backend()
+    envs = NS(
+        SGLANG_ENABLE_QWEN4_PLE_FUSION=NS(get=lambda: True),
+        SGLANG_USE_ATTN_TP_NGRAM=NS(get=lambda: False),
+    )
+    host = ops.load(
+        "ple_real_host", "python/sglang/srt/models/qwen4_exp_ple_table.py", envs=envs
+    )
+    numerics = ops.load("ple_real_numerics", "python/sglang/kernels/numerics.py")
+    for name, rel, kw in (
+        (
+            "sglang.kernels.ops.embeddings.qwen4_ngram",
+            "python/sglang/kernels/ops/embeddings/qwen4_ngram.py",
+            {},
+        ),
+        (
+            "sglang.kernels.ops.elementwise.qwen4_gate",
+            "python/sglang/kernels/ops/elementwise/qwen4_gate.py",
+            {"round_bf16_to_fp32": numerics.round_bf16_to_fp32},
+        ),
+        (
+            "sglang.kernels.ops.mamba.qwen4_short_conv",
+            "python/sglang/kernels/ops/mamba/qwen4_short_conv.py",
+            {"round_bf16_to_fp32": numerics.round_bf16_to_fp32},
+        ),
+    ):
+        ops.load(name, rel, **kw)
+
+    class Projection(small.Linear):
+        def __init__(self, i, o, **kwargs):
+            super().__init__(i, o)
+
+    path = "python/sglang/srt/models/qwen4_exp.py"
+    src = small.selected(
+        "ple_real_model",
+        path,
+        {
+            "_PLEBatch": (["msgspec.Struct"], None),
+            "Qwen4ExpPLEGroupedNorm": (["nn.Module"], None),
+            "Qwen4ExpNGramEmbedding": (["nn.Module"], None),
+            "Qwen4ExpPinnedHostEmbedding": (["VocabParallelEmbedding"], None),
+            "Qwen4ExpPLELayer": (["nn.Module"], None),
+        },
+        dict(
+            torch=torch,
+            nn=nn,
+            F=F,
+            triton=triton,
+            tl=triton.language,
+            math=math,
+            msgspec=msgspec,
+            sympy=sympy,
+            nullcontext=contextlib.nullcontext,
+            envs=envs,
+            get_disagg=lambda: NS(enable_pdmux=True),
+            get_parallel=lambda: NS(attn_dp_size=1),
+            is_dp_attention_enabled=lambda: False,
+            get_is_capture_mode=torch.cuda.is_current_stream_capturing,
+            is_in_breakable_cuda_graph=lambda: False,
+            get_req_to_token_pool=lambda: req_pool,
+            get_token_to_kv_pool=lambda: token_pool,
+            get_attn_backend=lambda: backend,
+            SHORT_CONV_PART="short_conv",
+            NGRAM_PART="ngram",
+            ReplicatedLinear=Projection,
+            VocabParallelEmbedding=VocabMetadata,
+            UnquantizedEmbeddingMethod=UnquantizedEmbeddingMetadata,
+            allocate_ple_host_table=host.allocate_ple_host_table,
+            make_ple_file_prefetcher=host.make_ple_file_prefetcher,
+            make_ple_file_rss_trimmer=host.make_ple_file_rss_trimmer,
+        ),
+        functions=(
+            "_ple_table_is_fp8",
+            "_use_attn_tp_ngram",
+            "_get_ple_forward_mode",
+            "_get_processed_token_count",
+            "_prepare_ple_batch",
+            "_commit_ple_batch",
+            "_ple_track_targets",
+            "_pad_token_rows",
+            "_gather_ple_embedding_from_pinned_kernel",
+        ),
+    )
+    cfg = NS(
+        hidden_size=256,
+        ple_embed_dim=256,
+        ple_conv_kernel_size=4,
+        hc_count=4,
+        ngram_size=3,
+        heads_per_ngram=8,
+        vocab_size=256,
+        ngram_vocab_size_base=101,
+        make_ngram_vocab_size_divisible_by=128,
+        eos_token_id=0,
+        seed=1234,
+        ple_embedding_dtype="float8_e4m3fn" if fp8 else None,
+        ple_offload_embedding=True,
+        ple_offload_backend="pinned",
+        rms_norm_eps=1e-6,
+    )
+    old_dtype = torch.get_default_dtype()
+    torch.set_default_dtype(torch.bfloat16)
+    try:
+        with torch.device("cuda"):
+            layers = nn.ModuleList(
+                [
+                    src.Qwen4ExpPLELayer(cfg, layer_id=i, ple_layer_index=i)
+                    for i in range(2)
+                ]
+            )
+    finally:
+        torch.set_default_dtype(old_dtype)
+    for layer in layers:
+        table = layer.ple_embedding.ngram_embedding.weight
+        table.copy_((torch.randn(table.shape, device="cpu") * 0.1).to(table.dtype))
+        layer.ple_embedding.ngram_embedding.weight_scale.fill_(0.75)
+        layer.conv1d.weight.copy_(torch.randn_like(layer.conv1d.weight) * 0.1)
+        assert table.is_pinned() and table.device.type == "cpu"
+    if fp8:
+        assert enable_fp8_linears(layers) == 4
+    initial = ngram.context.clone(), conv.conv_state.clone()
+    return NS(
+        src=src,
+        layers=layers,
+        ngram=ngram,
+        conv=conv,
+        req_pool=req_pool,
+        current=current,
+        initial=initial,
+        cfg=cfg,
+    )
+
+
+def ple_batch(tokens, decode=False, slots=None):
+    lengths = [1] if decode else ([33, 32] if tokens == 65 else [tokens])
+    slots = slots or ([2] if decode else ([1, 3] if len(lengths) > 1 else [1]))
+    physical = tokens if decode else tokens + 5
+    b = NS(
+        forward_mode=small.Mode(decode),
+        _original_forward_mode=None,
+        tbo_parent_token_range=None,
+        spec_algorithm=None,
+        spec_info=None,
+        global_num_token_non_padded_cpu=tokens,
+        extend_seq_lens_cpu=lengths,
+        extend_seq_lens=torch.tensor(lengths, device="cuda", dtype=torch.int32),
+        req_pool_indices=torch.tensor(slots, device="cuda", dtype=torch.long),
+        out_cache_loc=torch.ones(physical, device="cuda", dtype=torch.long),
+        mamba_track_indices=torch.tensor(
+            [6] if decode else [4, 5][: len(slots)], device="cuda"
+        ),
+        mamba_track_mask=torch.ones(len(slots), device="cuda", dtype=torch.bool),
+    )
+    b.track_indices = b.mamba_track_indices
+    aligned = torch.tensor(
+        [1] if decode else [min(16, n) for n in lengths], device="cuda"
+    )
+    b.mamba_track_aligned_lens = lambda: aligned
+    b.input_ids = torch.randint(1, 256, (physical,), device="cuda")
+    if not decode:
+        b.input_ids[10] = 0
+        if tokens > 40:
+            b.input_ids[40] = 0
+    return b
+
+
+def reset_ple(p, b):
+    indices = torch.cat([b.req_pool_indices, b.track_indices])
+    p.ngram.context[indices] = p.initial[0][indices]
+    p.conv.conv_state[:, indices] = p.initial[1][:, indices]
+
+
+def scalar_ngram(layer, contexts):
+    rows = contexts.cpu().tolist()
+    multipliers = layer.layer_multipliers.cpu().tolist()
+    sizes = layer.ngram_heads_vocab_sizes.cpu().tolist()
+    offsets = layer.ngram_heads_offsets.cpu().tolist()
+    ids = []
+    for old, previous, token in rows:
+        a = token * multipliers[0]
+        b = previous * multipliers[1]
+        c = (old if old != 0 and previous != 0 else 0) * multipliers[2]
+        ids.append(
+            [
+                ((a ^ b) if h < 8 else (a ^ b ^ c)) % sizes[h] + offsets[h]
+                for h in range(16)
+            ]
+        )
+    return torch.tensor(ids, device=contexts.device, dtype=torch.long)
+
+
+def ple_case(p):
+    funcs, refs = [], []
+    for lane, (tokens, decode) in enumerate(((65, False), (1, True))):
+        b = ple_batch(tokens, decode)
+        x = (
+            torch.randn(b.input_ids.numel(), 1024, device="cuda", dtype=torch.bfloat16)
+            * 0.1
+        )
+        p.current.set(b)
+        reset_ple(p, b)
+        batch = p.src._prepare_ple_batch(
+            b.input_ids, b, ngram_size=3, ngram_eos_token_id=0
+        )
+        contexts = (
+            batch.ngram_context
+            if decode
+            else batch.ngram_context.unfold(1, 3, 1)[
+                batch.req_indices, batch.token_offsets
+            ]
+        )
+        expected_ids = scalar_ngram(p.layers[-1].ple_embedding, contexts)
+        table = p.layers[-1].ple_embedding.ngram_embedding
+        expected_embed = (
+            table.weight.float()[expected_ids.cpu()].bfloat16().to("cuda").flatten(1)
+            * table.weight_scale
+        )
+        expected_context = batch.ngram_context.gather(
+            1, batch.lengths[:, None] + torch.arange(2, device="cuda")
+        )
+        aligned = b.mamba_track_aligned_lens()
+        expected_track = batch.ngram_context.gather(
+            1, aligned[:, None] + torch.arange(2, device="cuda")
+        )
+        refs.append(
+            (
+                expected_ids,
+                expected_embed,
+                expected_context,
+                expected_track,
+                x[-5:].clone() if not decode else None,
+            )
+        )
+
+        def fn(b=b, x=x):
+            p.current.set(b)
+            reset_ple(p, b)
+            batch = p.src._prepare_ple_batch(
+                b.input_ids, b, ngram_size=3, ngram_eos_token_id=0
+            )
+            p.layers[1].start_prefetch(batch, b)
+            assert p.layers[1]._prefetch_state is None
+            out = x
+            for layer in p.layers:
+                out = out + layer(out, b, batch)
+            ids = p.layers[-1].ple_embedding.compute_ngram_ids(batch)
+            embedding = p.layers[-1].ple_embedding(batch, b)
+            p.src._commit_ple_batch(batch, b)
+            return (
+                out,
+                ids.clone(),
+                embedding.clone(),
+                p.ngram.context[b.req_pool_indices].clone(),
+                p.conv.conv_state[:, b.req_pool_indices].clone(),
+                p.ngram.context[b.track_indices].clone(),
+                p.conv.conv_state[:, b.track_indices].clone(),
+            )
+
+        funcs.append(fn)
+    sentinel = p.ngram.context[7].clone(), p.conv.conv_state[:, 7].clone()
+
+    def references(a, b):
+        torch.testing.assert_close(p.ngram.context[7], sentinel[0], rtol=0, atol=0)
+        torch.testing.assert_close(p.conv.conv_state[:, 7], sentinel[1], rtol=0, atol=0)
+        torch.testing.assert_close(a[0][-5:], refs[0][4], rtol=0, atol=0)
+        for output in (a[0], b[0]):
+            assert torch.isfinite(output).all().item()
+        return [
+            (actual[i], expected[j], 0)
+            for actual, expected in zip((a, b), refs)
+            for i, j in ((1, 0), (2, 1), (3, 2), (5, 3))
+        ]
+
+    return *funcs, references
+
+
+@torch.inference_mode()
 def main():
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--output", type=Path, required=True)
@@ -434,6 +819,16 @@ def main():
                 result = ops.pair_test(
                     name, *moe_case(m, fp8, intermediate), args.rounds
                 )
+                report["cases"].append(result)
+                print(json.dumps(result), flush=True)
+            except Exception as exc:
+                traceback.print_exc()
+                report["errors"].append({"name": name, "error": str(exc)})
+    if args.only in ("ple", "all"):
+        for fp8 in (False, True):
+            name = f"real_ple_{'fp8' if fp8 else 'bf16'}_pinned_table_and_state"
+            try:
+                result = ops.pair_test(name, *ple_case(load_ple(fp8)), args.rounds)
                 report["cases"].append(result)
                 print(json.dumps(result), flush=True)
             except Exception as exc:
