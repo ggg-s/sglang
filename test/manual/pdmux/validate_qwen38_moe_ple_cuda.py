@@ -383,13 +383,132 @@ def make_moe(m, fp8, intermediate=256):
     return block
 
 
+def effective_moe_reference(block, x):
+    """Check independent matmul math on the exact FP8 operands that were used.
+
+    A separately rounded ideal quantizer can cross FP8 midpoint boundaries;
+    preserve that comparison as a second metric, rather than conflating it
+    with the expert GEMMs' arithmetic error.
+    """
+    impl = block.experts.m.impl
+    invoke = impl.invoke_fused_moe_kernel
+    namespace = invoke.__globals__
+    quant = namespace["sglang_per_token_group_quant_fp8"]
+    tail = impl.silu_and_mul_block_quant_two_group
+    operands = []
+    gemms = []
+
+    def capture_quant(a, g):
+        q, s = quant(a, g)
+        operands.append((a.clone(), q.clone(), s.clone()))
+        return q, s
+
+    def capture_invoke(*a, **kw):
+        invoke(*a, **kw)
+        gemms.append((a[0].clone(), a[3].clone()))
+
+    def capture_tail(*a, **kw):
+        q, s = tail(*a, **kw)
+        gate, up = a[0].float().chunk(2, -1)
+        operands.append(((F.silu(gate) * up).bfloat16(), q.clone(), s.clone()))
+        return q, s
+
+    namespace["sglang_per_token_group_quant_fp8"] = capture_quant
+    impl.invoke_fused_moe_kernel = capture_invoke
+    impl.silu_and_mul_block_quant_two_group = capture_tail
+    try:
+        actual = block(x)
+    finally:
+        namespace["sglang_per_token_group_quant_fp8"] = quant
+        impl.invoke_fused_moe_kernel = invoke
+        impl.silu_and_mul_block_quant_two_group = tail
+    topk = block.topk.last
+    ideal = block.experts.reference(x, topk)
+    ideal_nrmse = (
+        (actual.float() - ideal.float()).norm() / ideal.float().norm()
+    ).item()
+    assert ideal_nrmse < 0.02, ideal_nrmse
+    info = {
+        "ideal_quantizer_nrmse": ideal_nrmse,
+        "ideal_quantizer_max_abs": (actual.float() - ideal.float()).abs().max().item(),
+        "effective_operand_gemm_nrmse": [],
+        "quantizer_different_elements": [],
+        "quantizer_midpoint_fraction": [],
+    }
+    assert len(operands) == len(gemms) == 2
+    stage_refs = []
+    for i, ((a, q, s), (_, out), w, scale) in enumerate(
+        zip(
+            operands,
+            gemms,
+            (block.experts.w1, block.experts.w2),
+            (block.experts.s1, block.experts.s2),
+        )
+    ):
+        expanded = s.repeat_interleave(128, -1)[:, : q.shape[-1]]
+        dequant = q.float() * expanded
+        # E4M3 round-to-nearest error: <=6.25% for normals plus half a
+        # subnormal step. The small margin covers approximate reciprocals.
+        bound = a.float().abs() * 0.063 + expanded * 0.0011
+        assert ((dequant - a.float()).abs() <= bound).all().item()
+        info["quantizer_different_elements"].append(
+            int((torch_group_quant(a) != dequant).sum().item())
+        )
+        ideal_q = (
+            (a.float() / expanded).clamp(-448, 448).to(torch.float8_e4m3fn).float()
+        )
+        different = q.float() != ideal_q
+        fraction = 0.0
+        if different.any().item():
+            midpoint = (q.float() + ideal_q) * 0.5
+            step = (q.float() - ideal_q).abs().clamp_min(1e-10)
+            fraction = (
+                ((a.float() / expanded - midpoint).abs() / step)[different].max().item()
+            )
+        info["quantizer_midpoint_fraction"].append(fraction)
+        weights = (
+            w.float()
+            * scale.repeat_interleave(128, 1).repeat_interleave(128, 2)[
+                :, : w.shape[1], : w.shape[2]
+            ]
+        )
+        values = []
+        for choice in range(2):
+            ids = topk.topk_ids[:, choice].long()
+            rows = dequant if i == 0 else dequant.view(x.shape[0], 2, -1)[:, choice]
+            value = torch.bmm(weights[ids], rows.unsqueeze(-1)).squeeze(-1)
+            if i == 1:
+                value = value * topk.topk_weights[:, choice, None]
+            values.append(value.bfloat16())
+        reference = torch.stack(values, 1).reshape_as(out)
+        nrmse = (
+            (out.float() - reference.float()).norm() / reference.float().norm()
+        ).item()
+        assert nrmse < 0.003, nrmse
+        torch.testing.assert_close(out, reference, atol=0.02, rtol=0.02)
+        info["effective_operand_gemm_nrmse"].append(nrmse)
+        stage_refs.append(reference)
+    # Independently check the activation before its second quantization.
+    gate, up = gemms[0][1].float().chunk(2, -1)
+    torch.testing.assert_close(
+        operands[1][0], (F.silu(gate) * up).bfloat16(), atol=0.002, rtol=0.008
+    )
+    result = stage_refs[1][:, 0] + stage_refs[1][:, 1]
+    return result, info
+
+
 def moe_case(m, fp8, intermediate):
     block = make_moe(m, fp8, intermediate)
-    funcs, refs = [], []
+    funcs, refs, diagnostics = [], [], []
     for rows in (65, 1):
         x = torch.randn(rows, 256, device="cuda", dtype=torch.bfloat16)
         topk = block.topk(x, block.gate(x)[0])
-        refs.append(block.experts.reference(x, topk))
+        if fp8:
+            reference, info = effective_moe_reference(block, x)
+            diagnostics.append(info)
+            refs.append(reference)
+        else:
+            refs.append(block.experts.reference(x, topk))
         funcs.append(
             lambda x=x: (
                 block(x),
@@ -406,7 +525,7 @@ def moe_case(m, fp8, intermediate):
             pairs.append((actual, ref, 0.02))
         return pairs
 
-    return *funcs, references
+    return (*funcs, references), diagnostics
 
 
 def enable_fp8_linears(module):
@@ -827,6 +946,7 @@ def integrated_run(rounds, fp8):
         b = small.prepare_batch(tokens, lane)
         side = ple_batch(tokens, tokens == 1, slots=[lane + 1])
         b.__dict__.update(side.__dict__)
+        b.indices = b.req_pool_indices.int()
         b.input_ids = b.input_ids[:tokens].contiguous()
         b.out_cache_loc = b.out_cache_loc[:tokens]
         batches.append(b)
@@ -835,7 +955,7 @@ def integrated_run(rounds, fp8):
         )
 
     def reset(lane):
-        gdn.reset(lane)
+        gdn.reset(lane + 1)
         qsa.reset(lane)
         reset_ple(ple, batches[lane])
 
@@ -854,8 +974,8 @@ def integrated_run(rounds, fp8):
         b = batches[lane]
         values = [
             *output,
-            gdn.state[lane],
-            gdn.conv_state[lane],
+            gdn.state[lane + 1],
+            gdn.conv_state[lane + 1],
             qsa.k[lane],
             qsa.v[lane],
             b.layer_outputs[0],
@@ -877,8 +997,8 @@ def integrated_run(rounds, fp8):
     sentinel = (
         ple.ngram.context[7].clone(),
         ple.conv.conv_state[:, 7].clone(),
-        gdn.state[2].clone(),
-        gdn.conv_state[2].clone(),
+        gdn.state[0].clone(),
+        gdn.conv_state[0].clone(),
         qsa.k[2].clone(),
         qsa.v[2].clone(),
     )
@@ -917,8 +1037,8 @@ def integrated_run(rounds, fp8):
     actual = (
         ple.ngram.context[7],
         ple.conv.conv_state[:, 7],
-        gdn.state[2],
-        gdn.conv_state[2],
+        gdn.state[0],
+        gdn.conv_state[0],
         qsa.k[2],
         qsa.v[2],
     )
@@ -969,9 +1089,9 @@ def main():
         for fp8, intermediate in ((False, 256), (True, 256), (True, 192)):
             name = f"real_moe_{'fp8' if fp8 else 'bf16'}_I{intermediate}"
             try:
-                result = ops.pair_test(
-                    name, *moe_case(m, fp8, intermediate), args.rounds
-                )
+                case, diagnostics = moe_case(m, fp8, intermediate)
+                result = ops.pair_test(name, *case, args.rounds)
+                result["reference_diagnostics"] = diagnostics
                 report["cases"].append(result)
                 print(json.dumps(result), flush=True)
             except Exception as exc:
