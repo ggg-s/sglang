@@ -57,7 +57,14 @@ class ReadLease:
         try:
             # Publish before the callback can release/reuse the request row.
             # All callers must already hold the GPU/IO/Remote retirement proof.
-            if self.pending_checkpoint is not None and not self.abort:
+            # MAMBA's mutable state now describes the final frontier. Native
+            # final release publishes/donates it once; replaying an earlier
+            # deferred frontier would attach the wrong state to that prefix.
+            if (
+                self.pending_checkpoint is not None
+                and not self.abort
+                and not getattr(self.guard, "allow_mamba", False)
+            ):
                 up_to, kwargs = self.pending_checkpoint
                 if not getattr(self.req, "skip_radix_cache_insert", False):
                     from .swa_checkpoints import replay
@@ -83,8 +90,9 @@ class ReadLease:
 
 
 class CacheGuard:
-    def __init__(self, cache, *, allow_swa=False, scheduler=None):
+    def __init__(self, cache, *, allow_swa=False, scheduler=None, allow_mamba=False):
         self.allow_swa = allow_swa
+        self.allow_mamba = allow_mamba
         self.scheduler = scheduler
         self.cache = cache
         self.leases = {}
@@ -187,7 +195,7 @@ class CacheGuard:
         return self.reset()
 
 
-def install(cache, *, allow_swa=False, scheduler=None):
+def install(cache, *, allow_swa=False, scheduler=None, allow_mamba=False):
     if cache.disable:
         return None
     from sglang.srt.mem_cache.radix_cache import RadixCache
@@ -196,13 +204,15 @@ def install(cache, *, allow_swa=False, scheduler=None):
 
     if type(cache) not in (RadixCache, UnifiedRadixCache):
         raise ValueError("P radix Remote reads require a built-in dense cache")
-    if allow_swa and type(cache) is not UnifiedRadixCache:
-        raise ValueError("DSV4.1 P prefix cache requires native UnifiedRadixCache")
+    if (allow_swa or allow_mamba) and type(cache) is not UnifiedRadixCache:
+        raise ValueError("stateful P prefix cache requires native UnifiedRadixCache")
     supported = (
         ((ComponentType.FULL,), (ComponentType.FULL, ComponentType.SWA))
         if allow_swa
         else ((ComponentType.FULL,),)
     )
+    if allow_mamba:
+        supported = ((ComponentType.FULL, ComponentType.MAMBA),)
     if type(cache) is UnifiedRadixCache and (
         cache.tree_components not in supported
         or cache.cache_controller is not None
@@ -211,12 +221,14 @@ def install(cache, *, allow_swa=False, scheduler=None):
     ):
         raise ValueError(
             "P radix reads support device-only FULL"
-            + ("/SWA" if allow_swa else "")
+            + ("/MAMBA" if allow_mamba else "/SWA" if allow_swa else "")
             + " cache without session refs"
         )
     if hasattr(cache, "_remote_attn_source_cache"):
         return cache._remote_attn_source_cache
-    guard = CacheGuard(cache, allow_swa=allow_swa, scheduler=scheduler)
+    guard = CacheGuard(
+        cache, allow_swa=allow_swa, scheduler=scheduler, allow_mamba=allow_mamba
+    )
     cache._remote_attn_source_cache = guard
     return guard
 

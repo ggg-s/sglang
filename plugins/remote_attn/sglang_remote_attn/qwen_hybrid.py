@@ -309,7 +309,7 @@ def execute(job, stream, cache):
 
     source = getattr(job.ctx, "dsv41_source", None)
     if source is None or not getattr(source.owner, "hybrid_gdn", False):
-        raise ValueError("hybrid RPC has no frozen native hybrid lease")
+        raise ValueError("hybrid RPC has no native immutable-prefix lease")
     layer = job.header.get("layer")
     config = text_config(source.owner.scheduler.tp_worker.model_runner)
     if (
@@ -333,12 +333,7 @@ def execute(job, stream, cache):
 
 
 def validate_prefill_cache(cache):
-    """Hybrid P uses native FULL+MAMBA checkpoint/CoW and native PD retirement.
-
-    P never serves D2D Remote reads: D0 owns that lease after the final native
-    PD commit. A dense-only read guard would intercept the native Mamba slot
-    donation/CoW path and must not be installed here.
-    """
+    """Hybrid P requires native FULL+MAMBA checkpoint/CoW for PD read leases."""
     if cache.disable:
         return
     from sglang.srt.mem_cache.unified_cache.component_type import ComponentType
@@ -430,6 +425,7 @@ class Controller(pre_layerwise.Controller):
             raise ValueError("hybrid Remote first supports FP32 GDN SSM state")
         self.executing = None
         self.remote_targets = {}
+        self.pd_visibility = dp.Visibility(pool.full_kv_pool.k_buffer[0].device)
         manager = (
             s.disagg_prefill_bootstrap_queue.kv_manager
             if s.disaggregation_mode.value == "prefill"
@@ -471,13 +467,30 @@ class Controller(pre_layerwise.Controller):
         return manifest(self, manager)
 
     def prepare(self, batch):
+        if (
+            self.scheduler.disaggregation_mode.value == "prefill"
+            and batch.forward_mode.is_extend()
+        ):
+            from .qwen_hybrid_pd import prepare
+
+            prepare(self, batch.reqs)
+            return [
+                source
+                for req in batch.reqs
+                if (source := getattr(req, "_pre_layerwise_source", None)) is not None
+                and req.extend_end == len(req.origin_input_ids)
+            ]
         return None
 
     def offer(self, queue, dr):
-        return None
+        from .qwen_hybrid_pd import offer
+
+        return offer(self, queue, dr)
 
     def early_targets(self, queue, rids_to_check):
-        return [], []
+        from .qwen_hybrid_pd import early_targets
+
+        return early_targets(self, queue, rids_to_check)
 
     def forward(self, original, runner, fb, *args, **kwargs):
         if (
@@ -486,4 +499,16 @@ class Controller(pre_layerwise.Controller):
             or getattr(fb, "replace_embeds", None) is not None
         ):
             raise ValueError("hybrid Remote first supports pure-text inputs only")
-        return original(runner, fb, *args, **kwargs)
+        result = original(runner, fb, *args, **kwargs)
+        if self.scheduler.disaggregation_mode.value == "prefill" and self.plan:
+            from .remote_data_plane import event
+
+            freeze_ready(self)
+            for source in self.plan:
+                if source.req.extend_end == source.prefix_len and not source.finalized:
+                    source.final_event = event(
+                        self.pool.full_kv_pool.k_buffer[0].device
+                    )
+                    source.prefill_complete = True
+                    source.prefix_stream.bound = True
+        return result

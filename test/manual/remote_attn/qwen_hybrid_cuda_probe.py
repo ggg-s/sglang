@@ -17,7 +17,7 @@ from unittest.mock import patch
 import torch
 
 
-def compute(root):
+def compute(root, pd_mode=False):
     import flashinfer
     from qwen_hybrid_probe_support import HybridEnvironment
     from sglang.kernels.ops.attention.fla.fused_recurrent import (
@@ -26,7 +26,12 @@ def compute(root):
     from sglang.kernels.ops.mamba.causal_conv1d_triton import causal_conv1d_update
     from sglang_remote_attn import qwen_hybrid as hybrid
 
-    f = HybridEnvironment(root, device="cuda")
+    if pd_mode:
+        from qwen_hybrid_pd_probe_support import Environment as PDEnvironment
+
+        f = PDEnvironment(root, device="cuda")
+    else:
+        f = HybridEnvironment(root, device="cuda")
     try:
         torch.manual_seed(20261107)
         p, d = f.source, f.target
@@ -42,11 +47,17 @@ def compute(root):
             m.mamba_cache.temporal.normal_(std=0.1)
             for tensor in hybrid.kv_buffers(p.pool):
                 tensor.normal_(std=0.2)
-        tr = f.reserve_and_freeze(growth=2)
-        f.import_(tr)
-        target = d.d2d_targets[f.epoch]
+        if pd_mode:
+            f.start()
+            f.wait_barrier()
+            target = f.admit()
+            assert not f.canonical and not target.rpc.all_local()
+        else:
+            tr = f.reserve_and_freeze(growth=2)
+            f.import_(tr)
+            target = d.d2d_targets[f.epoch]
+            assert f.blocked.wait(5) and not target.copied
         req = target.decode_req.req
-        assert f.blocked.wait(5) and not target.copied
         assert req.kv.mamba_needs_clear is False
         si = f.req.kv.mamba_pool_idx.reshape(1).int()
         di = req.kv.mamba_pool_idx.reshape(1).int()
@@ -109,7 +120,8 @@ def compute(root):
             errors.append((outputs[0] - outputs[1]).abs().max().item())
         # GQA remote prefix + newly decoded local suffix must equal a full KV
         # decode, both before and after the per-entry Local certificate.
-        assert f.command(d, "d2d_commit")["admitted"]
+        if not pd_mode:
+            assert f.command(d, "d2d_commit")["admitted"]
         row = req.kv.req_pool_idx
         location = f.native[1].allocator.alloc(1)
         f.native[1].pool.write((row, slice(f.prefix, f.prefix + 1)), location.int())
@@ -181,21 +193,25 @@ def compute(root):
             remote_o.reshape_as(oracle).float(), oracle, rtol=0.02, atol=0.001
         )
         assert target.rpc.calls == 1
-        f.gate.set()
-        f.wait_copy()
-        assert target.group_frames == 4 and target.grouped_entries == 4
-        for resource in target.resources:
-            resource.finish()
+        if pd_mode:
+            f.local(target)
+        else:
+            f.gate.set()
+            f.wait_copy()
+            assert target.group_frames == 4 and target.grouped_entries == 4
+            for resource in target.resources:
+                resource.finish()
         local_o = hybrid.attention(d, native, module, q, k, v, fb, save_kv_cache=False)
         torch.testing.assert_close(
             local_o.reshape_as(expected), expected, rtol=0, atol=0
         )
         assert target.rpc.calls == 1
         assert torch.equal(d.pool.get_key_buffer(3)[location.long()], k)
-        target.finish()
-        source = p.d2d_sources[f.epoch]
-        assert source.poll()
-        source.retire()
+        if not pd_mode:
+            target.finish()
+            source = p.d2d_sources[f.epoch]
+            assert source.poll()
+            source.retire()
         assert not f.req.kv.holds_mamba and req.kv.holds_mamba
         return {
             "gdn_layers": 6,
@@ -215,10 +231,12 @@ def compute(root):
             .item(),
             "native_mooncake_submissions": len(f.transport.calls),
             "distinct_source_target_slots": [int(si.item()), int(di.item())],
-            "layer_group_size": target.group_size,
-            "token_range": target.token_range,
-            "bulk_group_frames": target.group_frames,
-            "max_entries_per_frame": target.grouped_entries,
+            "pd_remote": pd_mode,
+            "remote_calls": target.rpc.calls,
+            "layer_group_size": getattr(target, "group_size", None),
+            "token_range": getattr(target, "token_range", None),
+            "bulk_group_frames": getattr(target, "group_frames", None),
+            "max_entries_per_frame": getattr(target, "grouped_entries", None),
             "producer_stream_fenced": True,
             "tail_preserved": True,
         }
@@ -230,6 +248,9 @@ def main():
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--source-root", type=Path, required=True)
     parser.add_argument("--output", type=Path, required=True)
+    parser.add_argument(
+        "--pd", action="store_true", help="validate native P-to-D Remote instead of D2D"
+    )
     args = parser.parse_args()
     root = args.source_root.resolve()
     torch.cuda.set_device(0)
@@ -243,7 +264,7 @@ def main():
     pkg = types.ModuleType("sglang")
     pkg.__path__ = [str(root / "python/sglang")]
     with patch.dict(sys.modules, {"sglang": pkg}):
-        result = compute(root)
+        result = compute(root, pd_mode=args.pd)
         stub = types.ModuleType("sglang.test.test_utils")
         stub.CustomTestCase = unittest.TestCase
         with patch.dict(sys.modules, {stub.__name__: stub}):
@@ -255,7 +276,14 @@ def main():
             spec.loader.exec_module(tests)
             tests.TestQwenHybridD2D.device = "cuda"
             run = unittest.TextTestRunner(verbosity=2).run(
-                unittest.defaultTestLoader.loadTestsFromTestCase(
+                unittest.defaultTestLoader.loadTestsFromNames(
+                    [
+                        "TestQwenHybridD2D.test_hybrid_pd_requires_gdn_barrier_and_retires_remote_before_free"
+                    ],
+                    tests,
+                )
+                if args.pd
+                else unittest.defaultTestLoader.loadTestsFromTestCase(
                     tests.TestQwenHybridD2D
                 )
             )
@@ -267,7 +295,11 @@ def main():
         lifecycle_tests=run.testsRun,
         full_checkpoint=False,
         real_rdma=False,
-        scope=__doc__,
+        scope=(
+            "Hybrid P→D Remote, native GDN/Conv and GPU K/V pools, Mooncake TCP; small layouts, no 27B checkpoint or HTTP performance claim."
+            if args.pd
+            else __doc__
+        ),
     )
     args.output.parent.mkdir(parents=True, exist_ok=True)
     args.output.write_text(json.dumps(result, indent=2) + "\n")

@@ -657,6 +657,57 @@ class TestQwenHybridD2D(CustomTestCase):
                     {e[1] for e in peer["states"]}, set(expected["linear_layer_ids"])
                 )
 
+    def test_hybrid_pd_requires_gdn_barrier_and_retires_remote_before_free(self):
+        """PD must use P attention while K/V is incomplete, with GDN already local."""
+        from sglang_remote_attn import qwen_hybrid as hybrid, qwen_hybrid_pd as pd
+        from sglang_remote_attn.dsv_d2d_partial import can_freeze
+
+        with patch.object(
+            sys, "path", [str(ROOT / "test/manual/remote_attn"), *sys.path]
+        ):
+            from qwen_hybrid_pd_probe_support import Environment
+        for cancel in (False, True):
+            with self.subTest(cancel=cancel):
+                e = Environment(ROOT, device=getattr(self, "device", "cpu"))
+                self.addCleanup(e.close)
+                e.req.start_send_idx = 1
+                pd.prepare(e.source, [e.req])
+                self.assertIsNone(getattr(e.req, "_pre_layerwise_source", None))
+                e.req.start_send_idx = 0
+                e.allow_state.clear()
+                e.start()
+                self.assertEqual(pd.early_targets(e.target, e.queue, None)[0], [])
+                self.assertFalse(e.dr_req.output_ids)
+                self.assertTrue(e.dr_req.kv.mamba_needs_clear)
+                e.allow_state.set()
+                e.wait_barrier()
+                parent = e.admit()
+                self.assertEqual(e.state_copies, 1)
+                self.assertFalse(e.dr_req.kv.mamba_needs_clear)
+                self.assertFalse(parent.rpc.all_local())
+                self.assertTrue(can_freeze(e.dr_req))
+                for (_, a, ai), (_, b, bi) in zip(
+                    hybrid.state_rows(e.source, e.req, 8),
+                    hybrid.state_rows(e.target, e.dr_req, 8),
+                ):
+                    self.assertTrue(torch.equal(a[ai.long()], b[bi.long()]))
+                self.assertTrue(e.req.kv.holds_kv and e.req.kv.holds_mamba)
+                if cancel:
+                    from sglang.srt.mem_cache.common import release_kv_cache
+
+                    e.dr_req.finished = lambda: True
+                    release_kv_cache(
+                        e.dr_req, e.target.scheduler.tree_cache, checkpoint=False
+                    )
+                    self.assertTrue(e.dr_req.kv.holds_kv and e.dr_req.kv.holds_mamba)
+                    self.assertIsNotNone(parent.release)
+                    self.assertFalse(parent.ready_to_finish())
+                e.local(parent)
+                if cancel:
+                    self.assertFalse(e.dr_req.kv.holds_kv or e.dr_req.kv.holds_mamba)
+                self.assertTrue(parent.closed)
+                self.assertFalse(e.req.kv.holds_kv or e.req.kv.holds_mamba)
+
     def test_hybrid_prefill_prefix_cache_enabled_decode_stays_disabled(self):
         """A P cache hit must not be rejected by a D-only ownership restriction."""
         from sglang.srt.mem_cache.unified_radix_cache import UnifiedRadixCache
@@ -673,7 +724,6 @@ class TestQwenHybridD2D(CustomTestCase):
         controller = f.startup("prefill", prefix_cache=cache)
         self.assertIs(controller.scheduler.tree_cache, cache)
         self.assertIsNone(controller.cache_guard)
-        self.assertIsNone(controller.prepare(NS()))
         self.assertEqual(controller.sources, [])
         with self.assertRaisesRegex(ValueError, "hybrid Decode Remote requires"):
             f.startup("decode", prefix_cache=cache)

@@ -147,13 +147,17 @@ def register(source):
             route=source.service,
             prefix_len=source.prefix_len,
             decode_prefix_len=source.decode_prefix_len,
-            owners=dict(
+            owners=dict(global_prefix="P-readonly", gdn="D-native")
+            if getattr(controller, "hybrid_gdn", False)
+            else dict(
                 global_prefix="P-readonly",
                 indexer_topk="D-native",
                 swa="D-native",
                 carry="D-native",
             ),
-            boundary="progressive-sparse"
+            boundary="hybrid-gdn-state"
+            if getattr(controller, "hybrid_gdn", False)
+            else "progressive-sparse"
             if getattr(source, "schema", None)
             else "first-post-PD-decode",
             at=time.monotonic(),
@@ -435,7 +439,9 @@ class Target:
 def commit(original, queue, dr, *, keep_receiver=False):
     controller = getattr(queue.scheduler, "_pre_layerwise", None)
     result = original(queue, dr, keep_receiver=keep_receiver)
-    if not getattr(controller, "dsv41_remote", False):
+    if not getattr(controller, "dsv41_remote", False) or getattr(
+        controller, "hybrid_gdn", False
+    ):
         return result
     offer = getattr(dr, "_pre_layerwise_offer", None)
     if offer is None:

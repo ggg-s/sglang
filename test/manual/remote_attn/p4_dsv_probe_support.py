@@ -100,6 +100,8 @@ class Driver:
         if self.before.get(key):
             raise self.before[key].pop(0)
         result = d2d.handle(self.controllers[role], payload)
+        if key == "d2d_worker_status" and not getattr(self, "admission_plan", False):
+            result["admission_plan_supported"] = False
         if self.after.get(key):
             raise self.after[key].pop(0)
         return dict(result, tp_rank_results=[dict(ok=True, **result)])

@@ -1,4 +1,4 @@
-# Qwen3.8-27B-FP8：纯文本混合状态 D2D
+# Qwen3.8-27B-FP8：PD Remote 与混合状态 D2D
 
 本分支通过原生 `Qwen3_5ForConditionalGeneration` / `qwen3_5` ABI 接入
 `Qwen/Qwen3.8-27B-FP8`。复用原生模型加载与 FP8 权重计算，不新增模型类。
@@ -8,16 +8,19 @@
 ReplaySSM、LoRA、HiCache 和 unified memory。完整 attention 使用 page-size=1 的
 原生 NHD BF16/FP16 KV；SSM 使用 FP32。**FP8 权重不等于 FP8 KV。**
 
-P→D 使用原生最终 PD 提交和 `MAMBA` 状态传输；不提前接纳 GDN 状态尚未完整的请求。
-P 缓存命中同时恢复 FULL KV 与 GDN checkpoint；使用原生 CoW 得到请求自己的
-Conv/SSM 工作 slot。P 只计算未命中的后缀，但 D 没有 prefix cache，因此仍需发送
-**完整 prompt KV**，以及后缀完成后的工作 slot 状态。不能把缓存 checkpoint 的
-slot id 当作最终工作 slot，也不能把 P 的命中长度用作 D 的接收偏移。
+P→D 先使用原生 `MAMBA` 状态规划和传输安装全部 Conv/SSM 与采样 metadata。
+只有该 barrier 在所有 TP rank 完成后，D 才提前接纳；此时 full-attention KV 可以仍在 P，
+D 通过 Remote attention 读取不可变前缀，逐 entry/range 搬完后切回 Local。GDN 始终在 D 本地续算，
+不走 DSV sparse math 或 DSV staging ring，也不等待整个 KV 传完才建立 target。
 
-P 保留原生 checkpoint/dedup、缓存锁、早发 cached-prefix 与发送队列退休路径。
-Hybrid P 不提供 Remote 读服务，不安装 dense-only `source_cache.CacheGuard`；
-Remote 的读 lease 由完成原生 PD 的 D0 在后续 D2D freeze 时建立。
-原生 PD 未完成时请求行及工作 slot 保留；成功后才释放，缓存 checkpoint 可供后续请求复用。
+P 缓存命中同时恢复 FULL KV 与 GDN checkpoint；原生 CoW 得到请求自己的工作 slot。
+P 只计算未命中的后缀，但 D 没有 prefix cache，仍需传送完整 prompt KV 和最终工作状态。
+不能把缓存 checkpoint 的 slot id 当作最终工作 slot，也不能用 P 命中长度偏移 D 接收位置。
+
+P 安装支持 `(FULL, MAMBA)` 的读 lease，独立固定缓存前缀、保留请求私有后缀和工作 slot。
+中间 checkpoint 延期；最终原生回收只发布与最终 GDN 状态对应的前沿，不重放较早 checkpoint。
+全部 KV 写、Remote 读、GPU forward 与 TP 退休证明完成后，才调用原生释放/状态 donation。
+D 传输中完成或取消也先延期回收，避免工作 slot 或请求行提前复用。
 P 当前要求内置、device-only `(FULL, MAMBA)` UnifiedRadixCache；HiCache、
 外部 storage/linker、session cache 和第三方 radix backend 不在此支持范围。
 D0→D1 支持 Remote attention 与逐 entry 渐进 Local。Remote 期间使用 eager，
@@ -87,6 +90,8 @@ case ",${SGLANG_PLUGINS:-}," in
   *,remote_attn,*) ;;
   *) export SGLANG_PLUGINS="${SGLANG_PLUGINS:+${SGLANG_PLUGINS},}remote_attn" ;;
 esac
+# P/D 共用 PD rendezvous；多机使用现有 PD mesh 配置。
+export HANDOFF_PD_DIR=/path/to/shared/pd-rendezvous
 export HANDOFF_PRE_LAYERWISE=remote
 export HANDOFF_REMOTE_GPU_TRANSFER=1
 export HANDOFF_REMOTE_BACKEND=auto
@@ -112,3 +117,6 @@ peer schema 中的 `family=qwen-gdn-d2d-v1` 防止把 DSV 或不同模型状态�
 权重、TP 多卡或真实 RDMA HCA/CQ 验收。整模型部署仍需目标显存与 TP 配置实测。
 
 P prefix cache 的原生 CUDA/PD 验证见 [专项验证](validation/qwen-hybrid-prefill-cache-4060.md)。
+
+本次 PD Remote、缓存读 lease 与网关 journal 修复的验证见
+[专项记录](validation/gateway-journal-hybrid-pd-4060.md)。

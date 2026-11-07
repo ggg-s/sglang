@@ -8,33 +8,46 @@ Only then may D0 publish a D2D manifest or expose bytes to D1.
 from .transport_failure import TransportFailure
 
 
-def can_freeze(req):
+def freeze_blocker(req):
     from .dsv41_progressive import ProgressiveTarget
+    from .qwen_hybrid_pd import Target as HybridPDTarget
 
     target = getattr(req, "_pre_layerwise_target", None)
     rpc = getattr(req, "_dsv41_remote", None)
-    if not isinstance(target, ProgressiveTarget) or target.closed:
-        return False
-    if (
-        not target.native_staging
-        or target.release is not None
-        or target.release_failed
-        or target.cache_lease is not None
-        or rpc is not target.rpc
-        or not rpc.progressive
-        or rpc.closed
-        or rpc.controller is not target.owner
-        or target.decode_req.req is not req
-    ):
-        return False
+    if not isinstance(target, (ProgressiveTarget, HybridPDTarget)) or target.closed:
+        return "native_progressive_owner_required"
+    checks = (
+        (
+            target.native_staging or isinstance(target, HybridPDTarget),
+            "native_staging_required",
+        ),
+        (target.release is None, "previous_kv_release_pending"),
+        (not target.release_failed, "previous_transfer_release_failed"),
+        (target.cache_lease is None, "decode_cache_lease_active"),
+        (rpc is target.rpc and rpc is not None, "remote_owner_mismatch"),
+        (
+            rpc is not None and rpc.progressive and not rpc.closed,
+            "remote_lease_inactive",
+        ),
+        (
+            rpc is not None and rpc.controller is target.owner,
+            "remote_controller_mismatch",
+        ),
+        (target.decode_req.req is req, "native_request_mismatch"),
+    )
+    for ready, reason in checks:
+        if not ready:
+            return reason
     protocol = target.owner.decode_overlap.retirement
     entry = protocol.registered.get(target.admission_id)
     if entry is None or entry[0] is not target or target not in target.owner.targets:
-        return False
-    # Early admission already installed indexer/SWA/carry/metadata. Check the
-    # still-live attempt and transport, without waiting for global entries.
+        return "native_retirement_registration_missing"
     target.refresh()
-    return True
+    return None
+
+
+def can_freeze(req):
+    return freeze_blocker(req) is None
 
 
 def prepare(controller, source):

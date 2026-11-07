@@ -1,0 +1,179 @@
+{
+  "branch": "codex/remote-attn-pre-layerwise",
+  "base_commit": "171a8d351bc8411aba15cebd7b50549e2cda053c",
+  "scope": "4060 native ABI/GPU/TCP probes; no full H20 DSv4 or Qwen 27B checkpoint/performance claim",
+  "gateway_journal": {
+    "scope": "Compare hot journal scalar updates at the reported 27 x 32768 prompt size.\n\nThis measures coordinator serialization/persistence on the same CPU and disk,\nnot GPU inference or D2D timing. No backend requests are submitted.\n",
+    "current": {
+      "entries": 27,
+      "input_tokens": 32768,
+      "updates": 10,
+      "scalar_update_ms": [
+        4.46984707377851,
+        4.517727997153997,
+        4.187572048977017,
+        4.034346900880337,
+        4.5863131526857615,
+        4.734598100185394,
+        4.579114960506558,
+        4.2061160784214735,
+        4.409121116623282,
+        4.0218939539045095
+      ],
+      "p50_ms": 4.439484095200896,
+      "journal_bytes": 27918
+    },
+    "baseline": {
+      "entries": 27,
+      "input_tokens": 32768,
+      "updates": 10,
+      "scalar_update_ms": [
+        179.73131500184536,
+        178.2904730644077,
+        195.93620812520385,
+        185.13925303705037,
+        198.3979910146445,
+        185.28488697484136,
+        193.23682598769665,
+        192.39417091012,
+        225.2460268791765,
+        182.11971898563206
+      ],
+      "p50_ms": 188.83952894248068,
+      "journal_bytes": 5919629
+    },
+    "speedup": 42.536367941179726
+  },
+  "hybrid_pd": {
+    "gdn_layers": 6,
+    "conv_max_error": 0.0,
+    "ssm_output_max_error": 0.0,
+    "gqa_remote_max_error": 0.0009765625,
+    "gqa_local_max_error": 0.0,
+    "gqa_fp32_oracle_max_error": 0.0007805526256561279,
+    "native_mooncake_submissions": 18,
+    "distinct_source_target_slots": [
+      1,
+      2
+    ],
+    "pd_remote": true,
+    "remote_calls": 1,
+    "layer_group_size": null,
+    "token_range": null,
+    "bulk_group_frames": null,
+    "max_entries_per_frame": null,
+    "producer_stream_fenced": true,
+    "tail_preserved": true,
+    "status": "PASS",
+    "device": "NVIDIA GeForce RTX 4060 Laptop GPU",
+    "lifecycle_tests": 1,
+    "full_checkpoint": false,
+    "real_rdma": false,
+    "scope": "Hybrid P→D Remote, native GDN/Conv and GPU K/V pools, Mooncake TCP; small layouts, no 27B checkpoint or HTTP performance claim."
+  },
+  "hybrid_prefill_read_lease": {
+    "prefix_hits": [
+      8,
+      10
+    ],
+    "native_cache": true,
+    "remote_read_pin_preserves_final_frontier": true,
+    "cached_gdn_matches_cold_exactly": true,
+    "cow_preserves_cached_checkpoint": true,
+    "native_pd_full_prompt_transferred": true,
+    "native_pd_uses_working_state_slot": true,
+    "pending_pd_retains_kv_and_gdn": true,
+    "native_release_after_success": true,
+    "mooncake_transfers": 6,
+    "sha256": {
+      "plugins/remote_attn/sglang_remote_attn/qwen_hybrid.py": "f451084b45b759b6b89f4ed70dd363699403af41edc9e15a959b48d2fceff763",
+      "test/manual/remote_attn/qwen_hybrid_prefix_cache_cuda_probe.py": "9a894b21a58d68b88e2113ac2bce6e68da898bcd2feb32ddf3bb68de4b424c0e"
+    }
+  },
+  "concurrent_d2d": {
+    "results": [
+      {
+        "concurrency": 4,
+        "cut": 32,
+        "pre_sample_preparations": 4,
+        "reservation_owners_accounted": 4,
+        "consumed_owners_transferred": true,
+        "migrations": 4,
+        "partial_remote_frozen": 4,
+        "destination_first_tokens": 4,
+        "source_free_count": 4,
+        "returned_reservation_tokens": 256,
+        "handoff_observations": 4,
+        "freeze_ack_observations": 4,
+        "source_native_pd_retired_before_export": true,
+        "source_retained_until_reader_retirement": true,
+        "mooncake_transfers": 32
+      },
+      {
+        "concurrency": 8,
+        "cut": 32,
+        "pre_sample_preparations": 8,
+        "reservation_owners_accounted": 8,
+        "consumed_owners_transferred": true,
+        "migrations": 8,
+        "partial_remote_frozen": 8,
+        "destination_first_tokens": 8,
+        "source_free_count": 8,
+        "returned_reservation_tokens": 512,
+        "handoff_observations": 8,
+        "freeze_ack_observations": 8,
+        "source_native_pd_retired_before_export": true,
+        "source_retained_until_reader_retirement": true,
+        "mooncake_transfers": 64
+      }
+    ],
+    "full_model": false,
+    "real_rdma": false,
+    "control_driver": "in-process command dispatch, not file RPC latency",
+    "sampler": "native ABI boundary fixture",
+    "sha256": {
+      "plugins/remote_attn/control_plane/p4_dsv_gateway.py": "4c1d46fe8fa07a4d7cf3e54eb54b16c9d778724476318aa7eb260466258da924",
+      "plugins/remote_attn/sglang_remote_attn/dsv_d2d.py": "1bcb1284898a5653e448bbfb8fba43fe06dff513cc881c0d0c50dd6615b9d407",
+      "plugins/remote_attn/sglang_remote_attn/dsv_d2d_reservation.py": "dee0f02b0ea2257fddaab1bd2d98bb1273794ae1d17cba180ed1229ffa21f8cd",
+      "plugins/remote_attn/sglang_remote_attn/dsv_gateway_control.py": "42ec1906244c31f5db520b29097c47197084d2f200da75fb433cf22f69aa718e",
+      "plugins/remote_attn/sglang_remote_attn/source_resources.py": "5b3208f3c01695437e45a3ff8fe8a9e51c0d4f66b102a37f9b7ac69b92a5fc0d",
+      "test/manual/remote_attn/dsv_d2d_partial_probe_support.py": "65332a4c4b4167a5f2a6557e6810fe111cfc130b6cbf0fbf66576bd76020f549",
+      "test/manual/remote_attn/dsv_d2d_control_cuda_probe.py": "5f23345143d3a9b44470fa212cb03a7f7340c15b1a2d39cdef332c19dbe25ca5"
+    }
+  },
+  "targeted_regressions": {
+    "gateway_journal_admission_recovery_cancel": 7,
+    "native_tp2_gloo": 1,
+    "existing_hybrid_startup_cache_d2d_cancel": 4,
+    "hybrid_pd_lifecycle_cuda_with_cancel_subcase": 1
+  },
+  "source_preflight": {
+    "hooks": 51,
+    "core_interfaces": 146
+  },
+  "static_checks": {
+    "ruff": true,
+    "python_ast": true,
+    "git_diff_check": true
+  },
+  "environment_note": "Startup CPU probes preload native torch._dynamo before scoped source-loading fixtures to avoid duplicate lazy module registration.",
+  "verified_source_sha256": {
+    "plugins/remote_attn/control_plane/p4_dsv_gateway.py": "4c1d46fe8fa07a4d7cf3e54eb54b16c9d778724476318aa7eb260466258da924",
+    "plugins/remote_attn/sglang_remote_attn/dsv41_remote.py": "efe2c0d59e7ccbe35de641f31a0d03deb96800e7e7811077a066fd8f4d9a19cf",
+    "plugins/remote_attn/sglang_remote_attn/dsv_d2d_partial.py": "28ba9bebdb8e602eb980b19b9d7ef883331040608b755a42c7e1194552487d8c",
+    "plugins/remote_attn/sglang_remote_attn/dsv_gateway_control.py": "42ec1906244c31f5db520b29097c47197084d2f200da75fb433cf22f69aa718e",
+    "plugins/remote_attn/sglang_remote_attn/pre_layerwise.py": "12037db0310c9ffd0873966459876fab3b20ed94dc35ea74fcb4049bdeb1f1c5",
+    "plugins/remote_attn/sglang_remote_attn/prefix_stream.py": "f0dd13a6b737a384a73069ed50ee99ca4bf5bc426d4c6f79c4622c7e3885c0bd",
+    "plugins/remote_attn/sglang_remote_attn/qwen_hybrid.py": "fa82e496bac9c1e16a83492dcd3785e12766babf1b521012e3bb2fb7f74a9ffc",
+    "plugins/remote_attn/sglang_remote_attn/source_cache.py": "5a8b40834d89e1420a5781d48094017f450b528b73946abddb2563cb3ad07bd0",
+    "test/manual/remote_attn/dsv_d2d_control_cuda_probe.py": "5f23345143d3a9b44470fa212cb03a7f7340c15b1a2d39cdef332c19dbe25ca5",
+    "test/manual/remote_attn/p4_dsv_probe_support.py": "06f2d18e56d5c18eb660585c1036805dc0f292a4735f59d024d5630f14ddc661",
+    "test/manual/remote_attn/qwen_hybrid_cuda_probe.py": "9ab55e8ff523dd3f4e44e57dd9130abb361724f599e451c26c96aaf39299a113",
+    "test/manual/remote_attn/qwen_hybrid_prefix_cache_cuda_probe.py": "9a894b21a58d68b88e2113ac2bce6e68da898bcd2feb32ddf3bb68de4b424c0e",
+    "test/registered/unit/plugins/test_remote_attn.py": "a3d8eb6e1c576ddba32acf370f2c05c659cd02a32203775ccd72fee6e95ca586",
+    "test/registered/unit/plugins/test_remote_main_contracts.py": "e06038ae9eb7018a8c42be110fc7b03f114506564d66f20b184d915911353602",
+    "plugins/remote_attn/sglang_remote_attn/qwen_hybrid_pd.py": "7eb4a9ce5703d3fc1c7dbed2748b2b62514fd39edd38cf1215eea990c172c712",
+    "test/manual/remote_attn/bench_p4_dsv_journal.py": "9a3452d4efb016960d1a6bcb4779998515fba2314657dde494ab3f124a5b1777",
+    "test/manual/remote_attn/qwen_hybrid_pd_probe_support.py": "289aec402cbaac6fdb4aad8755b5fd63206a9521355ab65f39de1bbbddc7c57e"
+  }
+}

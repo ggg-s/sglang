@@ -332,8 +332,26 @@ class Probe(PD):
         assert req.kv.holds_kv and req.kv.holds_mamba and req.kv.req_pool_idx == row
         assert torch.equal(req.kv.mamba_pool_idx, slot) and not sender.cleared
         sender.complete()
-        self.process_disagg_prefill_transfer_queue()
-        assert req.kv.is_kv_released and not req.kv.holds_mamba and sender.cleared
+        guard = self._pre_layerwise.cache_guard
+        lease = None if guard is None else guard.by_req.get(id(req))
+        if lease is None:
+            self.process_disagg_prefill_transfer_queue()
+        else:
+            # Native sender is complete; the separate PD Remote probe verifies
+            # that retirement also waits for the reader/GPU/TP proof.
+            lease.retire(self.process_disagg_prefill_transfer_queue)
+            assert lease.closed and lease.published_tokens == len(req.origin_input_ids)
+        assert req.kv.is_kv_released and sender.cleared
+        if req.kv.holds_mamba:
+            # A fresh native final insertion donates the working state to the
+            # tree; core retains its old numeric id on the retired Req. It is
+            # tree-owned, and must not be returned to the free list again.
+            donated = self.tree_cache.tree_core.get_component_device_value(
+                req.last_node, ComponentType.MAMBA
+            )
+            assert torch.equal(donated.reshape(-1), slot.reshape(-1))
+        else:
+            assert not req.kv.holds_mamba
         assert sum(len(pages) for pages, _ in sender.sent) == len(req.origin_input_ids)
 
     def close(self):
@@ -349,7 +367,12 @@ def run(folder):
         warm = probe.new("warm", range(8))
         probe.step(warm, range(8))
         probe.pd(warm, 0)
+        from sglang_remote_attn.source_cache import install
+
+        guard = install(probe.tree_cache, allow_mamba=True, scheduler=probe)
+        probe._pre_layerwise.cache_guard = guard
         cached = probe.new("hit", range(10), True)
+        lease = guard.hold(cached)
         assert cached.prefix_len == 8
         prefix_slot = probe.tree_cache.tree_core.get_component_device_value(
             cached.last_node, ComponentType.MAMBA
@@ -360,6 +383,10 @@ def run(folder):
         ]
         assert int(prefix_slot.item()) != int(cached.kv.mamba_pool_idx.item())
         actual = probe.step(cached, range(8, 10))
+        # The mutable working state is now at 10. An older checkpoint must
+        # remain deferred and never be replayed with this newer GDN state.
+        probe.tree_cache.checkpoint(cached, up_to=8)
+        assert lease.pending_checkpoint[0] == 8 and not lease.closed
         cold = probe.new("cold", range(10))
         expected = probe.step(cold, range(10))[-6:]
         for a, b in zip(actual, expected):
@@ -374,11 +401,14 @@ def run(folder):
         probe.pd(again, 10)
         assert (
             not probe._pre_layerwise.sources
-            and probe._pre_layerwise.cache_guard is None
+            and not guard.leases
+            and lease.closed
+            and not lease.replayed_checkpoint
         )
         return dict(
             prefix_hits=[8, 10],
             native_cache=True,
+            remote_read_pin_preserves_final_frontier=True,
             cached_gdn_matches_cold_exactly=True,
             cow_preserves_cached_checkpoint=True,
             native_pd_full_prompt_transferred=True,

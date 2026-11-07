@@ -41,7 +41,7 @@ def request_status(controller, req):
     )
 
 
-def migration_status(controller, epoch):
+def migration_status(controller, epoch, *, include_transfer=True):
     sources, targets = d2d.records(controller)
     source, target = sources.get(epoch), targets.get(epoch)
     return dict(
@@ -68,7 +68,7 @@ def migration_status(controller, epoch):
             resumed=source.released and not source.committed,
             error=source.error,
             kv_released=not source.req.kv.holds_kv,
-            transfer=getattr(source, "meta", None),
+            transfer=getattr(source, "meta", None) if include_transfer else None,
             prepared=getattr(source, "meta", None) is not None,
             pending_retirement=getattr(source, "meta", None) is None
             and not source.released,
@@ -136,11 +136,15 @@ def handle(controller, data):
             idle=bool(getattr(scheduler, "is_fully_idle", lambda: False)()),
             protocol=d2d.VERSION,
             precopy_protocol="closed-page-precopy-v1",
+            admission_plan_supported=True,
             instance_id=instance(controller),
             rank=controller.rank,
             tp_size=controller.tp_size,
             requests={r.rid: request_status(controller, r) for r in reqs},
-            migrations={e: migration_status(controller, e) for e in sorted(epochs)},
+            migrations={
+                e: migration_status(controller, e, include_transfer=False)
+                for e in sorted(epochs)
+            },
         )
     tracked = d2d.remote.runtime()._tracked(scheduler)
     rid = str(data["rid"])
@@ -183,6 +187,7 @@ def handle(controller, data):
             "prefill_url",
         )
     }
+    payload["prepare_migration"] = data.get("prepare_migration")
     previous = controller.d2d_submissions.get(epoch)
     if previous is not None:
         if previous != payload:
@@ -191,7 +196,12 @@ def handle(controller, data):
             controller.d2d_submission_requests[epoch], "_d2d_submission_error", None
         ):
             raise ValueError("native PD submission failed; refusing enqueue retry")
-        return dict(queued=True, rid=rid, duplicate=True)
+        return submission_result(
+            controller,
+            data,
+            req=controller.d2d_submission_requests[epoch],
+            duplicate=True,
+        )
     error = None
     try:
         if rid in tracked or any(r.rid == rid for r in candidates(controller)):
@@ -243,7 +253,7 @@ def handle(controller, data):
     except BaseException as exc:
         req._d2d_submission_error = repr(exc)
         raise
-    return dict(queued=True, rid=rid, bootstrap_room=int(payload["bootstrap_room"]))
+    return submission_result(controller, data, req=req)
 
 
 def prefill(req, payload):
@@ -291,3 +301,20 @@ def prefill(req, payload):
     finally:
         if conn is not None:
             conn.close()
+
+
+def submission_result(controller, data, *, req, duplicate=False):
+    result = dict(
+        queued=True,
+        rid=req.rid,
+        duplicate=duplicate,
+        bootstrap_room=int(data["bootstrap_room"]),
+    )
+    prepare = data.get("prepare_migration")
+    if prepare is not None:
+        result.update(
+            reservations.handle(
+                controller, dict(cmd="d2d_plan", rid=req.rid, **prepare)
+            )
+        )
+    return result

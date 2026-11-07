@@ -23,7 +23,11 @@ from p4_dsv_probe_support import Driver, gateway
 
 
 def run(concurrency):
+    import torch
+
     e = SharedEnvironment(ROOT, concurrency, "cuda")
+    for controller in e.nodes:
+        controller.scheduler.forward_stream = torch.cuda.current_stream()
     gw = None
     try:
         for req in e.requests:
@@ -70,8 +74,16 @@ def run(concurrency):
         for req in e.requests:
             req.output_ids[:] = list(range(31, 63))
             req.kv.kv_committed_len = req.kv.kv_allocated_len = 62
-        gw.tick()
-        assert all(gw.entry(rid)["phase"] == "FREEZE" for rid in rids)
+        # The closed-page pre-copy snapshot is a durable WAIT_CUT step even
+        # when all prefix entries are still Remote and availability is zero.
+        for _ in range(64):
+            gw.tick()
+            if all(gw.entry(rid)["phase"] == "FREEZE" for rid in rids):
+                break
+        assert all(gw.entry(rid)["phase"] == "FREEZE" for rid in rids), [
+            (gw.entry(rid)["phase"], gw.entry(rid).get("error")) for rid in rids
+        ]
+        assert all(not req._handoff_frozen for req in e.requests)
         gw.tick()
         sources = [e.source.d2d_sources[epoch] for epoch in epochs]
         assert all(s.partial_remote and s.service is None for s in sources)

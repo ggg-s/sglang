@@ -176,7 +176,8 @@ class Plan:
         if self.dsv:
             from .dsv41_receive import install
 
-            install(controller, self.manager, "prefill")
+            if not getattr(controller, "hybrid_gdn", False):
+                install(controller, self.manager, "prefill")
             schema = controller._schema(self.manager)
             self.groups = [
                 ((i,), (i,), e[0] == "index") for i, e in enumerate(schema["entries"])
@@ -237,7 +238,8 @@ class Plan:
             raise RuntimeError(
                 f"prefix stream ownership unproven; retaining KV: {self.error}"
             )
-        self.cache_lease.check()
+        if self.cache_lease is not None:
+            self.cache_lease.check()
         if any(
             self.manager.decode_kv_args_table.get(p.mooncake_session_id) is not reg
             or tuple(reg.dst_kv_ptrs) != self.destinations[i]
@@ -463,7 +465,8 @@ def before_mutation(scheduler, req):
         raise RuntimeError("prefix abort IO unproven across TP; retaining pages")
     source = plan.source
     plan.aborted = True
-    source.cache_lease.abort = True
+    if source.cache_lease is not None:
+        source.cache_lease.abort = True
     source.release = lambda: None  # Native mutation below still owns the real free.
     source.retire()
     plan.controller.sources.remove(source)
@@ -471,6 +474,12 @@ def before_mutation(scheduler, req):
 
 def cached_prefix(original, scheduler, req, allow_send=True):
     controller = getattr(scheduler, "_pre_layerwise", None)
+    if getattr(controller, "hybrid_gdn", False):
+        if allow_send:
+            from .qwen_hybrid_pd import prepare
+
+            prepare(controller, [req])
+        return original(scheduler, req, allow_send=allow_send)
     if (
         not allow_send
         or controller is None
@@ -621,6 +630,8 @@ def track(original, manager, room, indices, span, last, *args, **kw):
         return send(manager, room, indices, span, last, *args, **kw)
     if args:
         raise ValueError("prefix ranges require native keyword metadata")
+    if last and getattr(plan.controller, "hybrid_gdn", False):
+        return plan.source.capture_final(send, indices, span, kw)
     if last and not len(indices):
         if plan.dsv and not kw.get("_dsv41_canonical", False):
             return send(manager, room, indices, span, last, **kw)

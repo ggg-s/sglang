@@ -7,8 +7,10 @@ sequence ids; a reconnect supplies Last-Event-ID/after to acknowledge receipt.
 
 from __future__ import annotations
 
+from collections import deque
 import copy
 import fcntl
+import hashlib
 import json
 import os
 import re
@@ -21,6 +23,78 @@ from urllib.parse import parse_qs
 PROTOCOL = "dsv-d2d-v2"
 TERMINAL = {"DONE", "CANCELLED"}
 PRECOMMIT = {"PLAN", "RESERVE", "WAIT_CUT", "FREEZE", "IMPORT"}
+
+
+# Immutable large fields never participate in hot intent rewrites/deepcopies.
+PAYLOAD_FIELDS = (
+    "input_ids",
+    "plans",
+    "reservations",
+    "transfers",
+    "admission_plans",
+    "precopy_receipts",
+)
+
+
+class Payloads:
+    def __init__(self, root):
+        self.root, self.cache = root, {}
+        self.root.mkdir(parents=True, exist_ok=True)
+
+    def put(self, value):
+        raw = json.dumps(value, ensure_ascii=False, separators=(",", ":")).encode()
+        key = hashlib.sha256(raw).hexdigest()
+        path = self.root / (key + ".json")
+        if key not in self.cache:
+            if path.exists():
+                if hashlib.sha256(path.read_bytes()).hexdigest() != key:
+                    raise ValueError("corrupt D2D journal payload")
+            else:
+                tmp = self.root / (key + "." + uuid.uuid4().hex + ".tmp")
+                try:
+                    with tmp.open("xb") as stream:
+                        os.fchmod(stream.fileno(), 0o600)
+                        stream.write(raw)
+                        stream.flush()
+                        os.fsync(stream.fileno())
+                    os.replace(tmp, path)
+                    fd = os.open(self.root, os.O_RDONLY)
+                    try:
+                        os.fsync(fd)
+                    finally:
+                        os.close(fd)
+                finally:
+                    tmp.unlink(missing_ok=True)
+            # Independent immutable snapshot, never alias caller-owned arrays.
+            self.cache[key] = json.loads(raw)
+        return key
+
+    def get(self, key):
+        if re.fullmatch(r"[0-9a-f]{64}", key or "") is None:
+            raise ValueError("invalid D2D journal payload reference")
+        if key not in self.cache:
+            raw = (self.root / (key + ".json")).read_bytes()
+            if hashlib.sha256(raw).hexdigest() != key:
+                raise ValueError("corrupt D2D journal payload")
+            self.cache[key] = json.loads(raw)
+        return self.cache[key]
+
+    def pack(self, fields):
+        fields = dict(fields)
+        for name in PAYLOAD_FIELDS:
+            if name in fields:
+                value = fields.pop(name)
+                fields[name + "_ref"] = None if value is None else self.put(value)
+        return fields
+
+    def view(self, entry, *, copy_payloads=False):
+        value = dict(entry)
+        for name in PAYLOAD_FIELDS:
+            if name + "_ref" in value:
+                key = value[name + "_ref"]
+                payload = None if key is None else self.get(key)
+                value[name] = copy.deepcopy(payload) if copy_payloads else payload
+        return value
 
 
 class StatusBusy(Exception):
@@ -64,6 +138,9 @@ class DsvGateway:
         self.out = Path(out) if out else None
         self.path = Path(state_dir) / "dsv_gateway_journal.json"
         self.path.parent.mkdir(parents=True, exist_ok=True)
+        self.payloads = Payloads(self.path.parent / "dsv_payloads")
+        self.tick_cursor = 0
+        self.tick_samples = deque(maxlen=256)
         self.lock = threading.RLock()
         self.work_lock = threading.Lock()
         self.cv = threading.Condition(self.lock)
@@ -82,14 +159,14 @@ class DsvGateway:
                 json.loads(self.path.read_text())
                 if self.path.exists()
                 else dict(
-                    version=1,
+                    version=2,
                     protocol=PROTOCOL,
                     entries={},
                     drain=None,
                 )
             )
             if (
-                self.journal.get("version") != 1
+                self.journal.get("version") not in (1, 2)
                 or self.journal.get("protocol") != PROTOCOL
             ):
                 raise ValueError(
@@ -115,6 +192,7 @@ class DsvGateway:
                             "ROLLBACK",
                         }
                     )
+                    or not (entry.get("input_ids") or entry.get("input_ids_ref"))
                     or not {
                         "owner",
                         "initial_owner",
@@ -122,7 +200,6 @@ class DsvGateway:
                         "source_rid",
                         "target_rid",
                         "submission_epoch",
-                        "input_ids",
                         "sampling",
                         "bootstrap_room",
                         "bootstrap_host",
@@ -140,6 +217,13 @@ class DsvGateway:
                     raise ValueError(
                         "incomplete DSV gateway journal; refusing recovery"
                     )
+            migrated = self.journal["version"] == 1
+            for rid, entry in list(self.journal["entries"].items()):
+                self.journal["entries"][rid] = self.payloads.pack(entry)
+                self.payloads.view(self.journal["entries"][rid])
+            self.journal["version"] = 2
+            if migrated:
+                self._persist()
         except BaseException:
             os.close(self.fd)
             raise
@@ -178,7 +262,7 @@ class DsvGateway:
         tmp = self.path.with_suffix(".tmp")
         with tmp.open("w") as stream:
             os.fchmod(stream.fileno(), 0o600)
-            json.dump(self.journal, stream, ensure_ascii=False)
+            json.dump(self.journal, stream, ensure_ascii=False, separators=(",", ":"))
             stream.flush()
             os.fsync(stream.fileno())
         os.replace(tmp, self.path)
@@ -190,6 +274,7 @@ class DsvGateway:
 
     def _update(self, rid, **changes):
         with self.cv:
+            changes = self.payloads.pack(changes)
             if all(
                 self.journal["entries"][rid].get(key) == value
                 for key, value in changes.items()
@@ -215,7 +300,7 @@ class DsvGateway:
             ):
                 try:
                     self.out.parent.mkdir(parents=True, exist_ok=True)
-                    state = self.entry(rid)
+                    state = self._entry(rid)
                     with self.out.open("a") as metrics:
                         metrics.write(
                             json.dumps(
@@ -248,9 +333,11 @@ class DsvGateway:
                 except OSError:
                     pass  # The durable ownership journal remains authoritative.
 
-    def entry(self, rid):
+    def entry(self, rid, *, copy_payloads=True):
         with self.lock:
-            entry = copy.deepcopy(self.journal["entries"][rid])
+            entry = self.payloads.view(
+                copy.deepcopy(self.journal["entries"][rid]), copy_payloads=copy_payloads
+            )
         entry["migration_deferred_wait_ms"] = self._deferred_wait_ms(entry)
         return entry
 
@@ -261,6 +348,9 @@ class DsvGateway:
         if entry.get("migration_deferred") and since is not None:
             elapsed += max(0, time.time() - since) * 1000
         return elapsed
+
+    def _entry(self, rid):
+        return self.entry(rid, copy_payloads=False)
 
     def _defer_migration(self, entry, reason, **changes):
         active = entry.get("migration_deferred", False)
@@ -370,6 +460,9 @@ class DsvGateway:
                     skipped[reason] = skipped.get(reason, 0) + 1
             return dict(
                 control_latency_ms=copy.deepcopy(self.control_latencies),
+                tick_recent_latency_ms=latency_histogram(self.tick_samples),
+                journal_bytes=self.path.stat().st_size if self.path.exists() else 0,
+                journal_version=self.journal["version"],
                 handoff_latency_ms=latency_histogram(
                     e["handoff_latency_ms"]
                     for e in entries
@@ -508,6 +601,7 @@ class DsvGateway:
                 source_rid="p4s-" + uid,
                 target_rid="p4d-" + uid,
                 submission_epoch="pd-" + uid,
+                admission_epoch="move-" + uid,
                 epoch=None,
                 phase="SUBMIT",
                 owner=role,
@@ -540,7 +634,7 @@ class DsvGateway:
             )
             if entry["growth_tokens"] < 0 or entry["cut"] < 0:
                 raise ValueError("cut/growth_tokens must be nonnegative")
-            self.journal["entries"][rid] = entry
+            self.journal["entries"][rid] = self.payloads.pack(entry)
             try:
                 self._persist()
             except BaseException:
@@ -554,7 +648,7 @@ class DsvGateway:
         return dict(
             ok=True,
             rid=rid,
-            cancellation_pending=self.entry(rid)["phase"] not in TERMINAL,
+            cancellation_pending=self._entry(rid)["phase"] not in TERMINAL,
         )
 
     def _begin(self, entry):
@@ -568,7 +662,9 @@ class DsvGateway:
         self._update(
             entry["rid"],
             phase="PLAN",
-            epoch="move-" + uuid.uuid4().hex,
+            epoch=entry["admission_plans"][0]["epoch"]
+            if entry.get("admission_plans")
+            else "move-" + uuid.uuid4().hex,
             instances=instances,
             attempts=entry["attempts"] + 1,
             cut_attempted=True,
@@ -703,7 +799,22 @@ class DsvGateway:
             role = entry["initial_owner"]
             backend_rid = entry["source_rid"] if role == "src" else entry["target_rid"]
             if request is None:
-                self._call(
+                prepare = None
+                if (
+                    role == "src"
+                    and entry["cut"] < entry["max_new"]
+                    and all(
+                        r.get("admission_plan_supported") for r in self.facts["src"]
+                    )
+                ):
+                    prepare = dict(
+                        migration_epoch=entry.get("admission_epoch")
+                        or ("move-" + entry["submission_epoch"]),
+                        target_rid=entry["target_rid"],
+                        destination="D1",
+                        growth_tokens=max(entry["growth_tokens"], entry["max_new"]),
+                    )
+                rows = self._call(
                     role,
                     "d2d_submit_pd",
                     entry["submission_epoch"],
@@ -714,10 +825,29 @@ class DsvGateway:
                     bootstrap_host=entry["bootstrap_host"],
                     bootstrap_port=entry["bootstrap_port"],
                     prefill_url=entry["prefill_url"],
+                    prepare_migration=prepare,
                 )
+                if prepare is not None and all(r.get("plan") for r in rows):
+                    self._update(
+                        rid,
+                        admission_plans=[r["plan"] for r in rows],
+                        admission_plan_at=time.time(),
+                        plan_before_first_token=all(
+                            not p["plan"]["output_ids"]
+                            for p in rows
+                        ),
+                    )
             self._update(rid, phase="SOURCE" if role == "src" else "DIRECT")
             return
         if phase in {"SOURCE", "DIRECT"}:
+            if (
+                phase == "SOURCE"
+                and entry.get("admission_plans")
+                and not entry["cut_attempted"]
+                and not entry["cancel_requested"]
+            ):
+                self._begin(entry)
+                return
             if request is None:
                 raise RuntimeError("native request missing; refusing resubmission")
             if entry["cancel_requested"] and not request["finished"]:
@@ -766,12 +896,16 @@ class DsvGateway:
             destination="D1", target_rid=entry["target_rid"], rid=entry["source_rid"]
         )
         if phase == "PLAN":
-            rows = self._call(
-                "src",
-                "d2d_plan",
-                epoch,
-                growth_tokens=max(entry["growth_tokens"], entry["max_new"]),
-                **common,
+            rows = (
+                [dict(plan=p) for p in entry["admission_plans"]]
+                if entry.get("admission_plans")
+                else self._call(
+                    "src",
+                    "d2d_plan",
+                    epoch,
+                    growth_tokens=max(entry["growth_tokens"], entry["max_new"]),
+                    **common,
+                )
             )
             if any(r.get("deferred") for r in rows):
                 if not all(r.get("deferred") for r in rows):
@@ -893,7 +1027,8 @@ class DsvGateway:
                 self._update(
                     rid,
                     freeze_ack_latency_ms=max(
-                        0, (time.time() - self.entry(rid)["freeze_requested_at"]) * 1000
+                        0,
+                        (time.time() - self._entry(rid)["freeze_requested_at"]) * 1000,
                     ),
                 )
             if any(r.get("pending_retirement") for r in rows):
@@ -939,7 +1074,7 @@ class DsvGateway:
             # Persist irreversible intent BEFORE the first possible commit RPC.
             self._update(
                 rid,
-                phase="ROLLBACK" if self.entry(rid)["cancel_requested"] else "COMMIT",
+                phase="ROLLBACK" if self._entry(rid)["cancel_requested"] else "COMMIT",
             )
         elif phase == "COMMIT":
             # A timeout, partial TP commit or gateway crash can never send us
@@ -999,6 +1134,7 @@ class DsvGateway:
                     rid,
                     phase="SOURCE",
                     migration_requested=retry,
+                    admission_plans=None,
                     freeze_pending=False,
                     retry_at=time.time() + 1,
                     blocked=False,
@@ -1050,13 +1186,18 @@ class DsvGateway:
                     for e in self.journal["entries"].values()
                     if e["phase"] not in TERMINAL
                 ]
-            for entry in entries:
+            if entries:
+                offset = self.tick_cursor % len(entries)
+                entries = entries[offset:] + entries[:offset]
+            started, served = time.monotonic(), 0
+            for raw_entry in entries:
+                entry = self.payloads.view(raw_entry)
                 try:
                     self._advance(entry)
-                    if self.entry(entry["rid"])["blocked"]:
+                    if self._entry(entry["rid"])["blocked"]:
                         self._update(entry["rid"], blocked=False, error=None)
                 except Exception as exc:
-                    current = self.entry(entry["rid"])
+                    current = self._entry(entry["rid"])
                     # RPC timeouts have unknown completion. Retrying the SAME
                     # epoch is safe; only explicit precommit errors roll back.
                     phase = current["phase"]
@@ -1069,6 +1210,13 @@ class DsvGateway:
                         error=repr(exc),
                         blocked=not rollback,
                     )
+                served += 1
+                if self.background and time.monotonic() - started >= 0.05:
+                    break
+            if entries:
+                self.tick_cursor = (offset + served) % len(entries)
+            with self.lock:
+                self.tick_samples.append((time.monotonic() - started) * 1000)
 
     def _loop(self):
         while not self.stop.is_set():
@@ -1081,7 +1229,7 @@ class DsvGateway:
             self.stop.wait(self.poll_s)
 
     def events(self, rid, after=-1):
-        entry = self.entry(rid)
+        entry = self._entry(rid)
         with self.lock:
             if entry["phase"] in TERMINAL and "final_output_ids" in entry:
                 req = dict(output_ids=entry["final_output_ids"], finished=True)
@@ -1254,7 +1402,7 @@ class DsvGateway:
                     # Backend unreachability/identity mismatch never permits
                     # changing the output owner. Keep the client connection alive.
                     events, finished = [], False
-                state = self.entry(rid)
+                state = self._entry(rid)
                 status_key = (
                     state["phase"],
                     state["blocked"],
@@ -1339,7 +1487,7 @@ class DsvGateway:
                 migrations = {
                     rid: dict(phase=entry["phase"], **self.migration_fields(entry))
                     for rid in self.journal["entries"]
-                    for entry in (self.entry(rid),)
+                    for entry in (self._entry(rid),)
                 }
             return self.json_response(
                 handler,

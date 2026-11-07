@@ -17890,6 +17890,72 @@ class TestRemoteAttn(CustomTestCase):
         target.worker.join(10)
         self.assertFalse(target.worker.is_alive())
 
+    def test_p4_dsv_large_payloads_leave_hot_journal_and_survive_restart(self):
+        """27 long prompts must not be re-encoded by each scalar intent update."""
+        f = self._p4_dsv_env(accept=False)
+        prompt = list(range(32768))
+        rids = [
+            f.gw.accept(
+                dict(rid=f"long-{i}", prompt_ids=prompt, max_new_tokens=128, cut=32)
+            )
+            for i in range(27)
+        ]
+        self.assertLess(f.gw.path.stat().st_size, 65536)
+        with patch.object(
+            f.gw.payloads,
+            "put",
+            side_effect=AssertionError("hot update encoded payload"),
+        ):
+            f.gw._update(rids[0], migration_deferred=True)
+        # Recover an old v1 journal atomically, then continue with small intents.
+        legacy = copy.deepcopy(f.gw.journal)
+        legacy["version"] = 1
+        for rid in rids:
+            entry = legacy["entries"][rid]
+            entry["input_ids"] = prompt
+            entry.pop("input_ids_ref")
+        f.gw.close()
+        f.gw.path.write_text(json.dumps(legacy))
+        self._p4_dsv_restart(f)
+        self.assertEqual(f.gw.journal["version"], 2)
+        self.assertEqual(f.gw.entry(rids[-1])["input_ids"], prompt)
+        self.assertTrue(f.gw.entry(rids[0])["migration_deferred"])
+        self.assertLess(f.gw.path.stat().st_size, 65536)
+        self.assertEqual(len(list(f.gw.payloads.root.glob("*.json"))), 1)
+
+    def test_p4_dsv_admission_plan_does_not_wait_for_status_or_first_sample(self):
+        """The submission RPC itself must create the plan before any Decode step."""
+        f = self._p4_dsv_env(accept=False)
+        f.driver.admission_plan = True
+        enqueue = f.e.source.scheduler._add_request_to_queue
+
+        def unsampled(req):
+            enqueue(req)
+            req.output_ids.clear()
+            req.kv.kv_committed_len = req.kv.kv_allocated_len = 0
+
+        f.e.source.scheduler._add_request_to_queue = unsampled
+        f.gw.tick()
+        f.rid = f.gw.accept(
+            dict(
+                rid="admission",
+                prompt_ids=list(f.e.req.origin_input_ids),
+                max_new_tokens=128,
+                cut=32,
+            )
+        )
+        f.gw.tick()  # native submission, including its inline capacity plan
+        entry = f.gw.entry(f.rid)
+        plan = entry["admission_plans"][0]
+        self.assertFalse(plan["output_ids"])
+        self.assertIn(plan["epoch"], f.e.source.d2d_plans)
+        f.support.until(f.gw, f.rid, "WAIT_CUT")
+        entry = f.gw.entry(f.rid)
+        self.assertTrue(entry["plan_before_first_token"])
+        self.assertEqual(f.driver.count("d2d_plan"), 0)
+        self.assertEqual(f.driver.count("d2d_reserve"), 1)
+        self.assertFalse(f.e.req._handoff_frozen)
+
     def test_p4_dsv_prepares_before_first_token_waits_for_cut_and_recovers(self):
         """Plan/reserve cannot consume the short request's post-cut window."""
         f = self._p4_dsv_env(accept=False)

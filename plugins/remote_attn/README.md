@@ -401,3 +401,24 @@ commands. D TP workers must share the same host and `/tmp`; P and native admissi
 synchronization are unchanged. See [verification](validation/ORDERED-RETIREMENT.md).
 
 Qwen3-8B、DSV4/4.1 的 Q/O/LSE 协商、GPU RDMA/Host TCP 路径、单次提交与异常回收见 [Remote Attention Mooncake 数据面](REMOTE-MOONCAKE-ZH.md)。
+
+### Long-prompt gateway journals and hybrid PD Remote
+
+The native DSV/hybrid gateway now writes immutable prompt/plan/transfer payloads
+once under `HANDOFF_STATE_DIR/dsv_payloads`; the version-2 ownership journal
+contains references and small state. Keep this directory with the journal for
+restart recovery. Version-1 journals migrate before commands resume. Each intent
+still uses fsync and atomic rename; payloads are retained rather than reclaimed
+while an ownership proof may reference them. Worker-wide status omits full
+transfer manifests; an epoch-specific status still returns them.
+
+Admission can return a capacity plan in the native submit command, before the
+first sample; target reservation follows before the cut. Freeze still requires
+the native sampled-token and ownership boundary. Recent tick latency, journal
+bytes and version are exposed in gateway latency metrics. The background tick
+rotates its starting request and yields between entries after a 50 ms budget;
+an individual control RPC retains its existing timeout.
+
+Hybrid PD now admits after native GDN/metadata completion while full-attention
+KV can remain Remote on P. See [hybrid deployment](QWEN38-HYBRID-D2D-ZH.md) and
+[targeted verification](validation/gateway-journal-hybrid-pd-4060.md).

@@ -1349,6 +1349,12 @@ def initialize(scheduler):
     from .source_cache import install
 
     if (
+        getattr(controller, "hybrid_gdn", False)
+        and scheduler.disaggregation_mode.value == "prefill"
+    ):
+        controller.cache_guard = install(scheduler.tree_cache, allow_mamba=True)
+
+    if (
         getattr(controller, "dsv41_layerwise", False)
         and not getattr(controller, "hybrid_gdn", False)
         and scheduler.disaggregation_mode.value == "prefill"
@@ -1403,7 +1409,9 @@ def run_batch(original, scheduler, batch, *args, **kwargs):
     )
     if overlap is not None:
         return overlap.run_batch(original, scheduler, batch, *args, **kwargs)
-    if getattr(controller, "cache_guard", None) is not None:
+    if getattr(controller, "cache_guard", None) is not None and not getattr(
+        controller, "hybrid_gdn", False
+    ):
         # Native cached-prefix sends must precede final-tail reservation. The
         # repeated call inside Scheduler.run_batch is then a native no-op.
         controller.prefix_batch = batch
