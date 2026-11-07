@@ -34,10 +34,7 @@ def request_status(controller, req):
         error=getattr(req, "_d2d_submission_error", None),
         migration_ready=bool(
             req.output_ids
-            and not req.finished()
-            and not getattr(req, "_handoff_frozen", False)
-            and getattr(req, "_pre_layerwise_target", None) is None
-            and getattr(req, "_dsv41_remote", None) is None
+            and d2d.source_local(req)
             and d2d.can_quiesce(controller.scheduler)
         ),
     )
@@ -185,6 +182,7 @@ def handle(controller, data):
         if not payload["input_ids"] or int(payload["bootstrap_room"]) <= 0:
             raise ValueError("native PD requires prompt tokens and a bootstrap room")
         from sglang.srt.sampling.sampling_params import SamplingParams
+
         from .handoff_control import _new_req
 
         url = urlparse(payload["prefill_url"])

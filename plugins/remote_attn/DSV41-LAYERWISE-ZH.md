@@ -196,8 +196,14 @@ prompt 长度的较大值判断 3072 阈值，因此 32K prompt + 很短尾块�
 功能验证可在 P 设置 `HANDOFF_PRE_LAYERWISE_GROUP_SIZE=1` 强制按生产者分组。
 
 SMG 使用原有 PD router 命令，不加载插件环境。先通过原生 `/health`、`/server_info`
-确认 P/D 配置；这个 layerwise 路径不启动 RemoteHub，不以 `ready.<rank>.json`
-作为路径证明。
+确认 P/D 配置。D 初始化完成后启动 RemoteHub 并发布 `ready.<rank>.json`，
+用于控制驱动发现 TP ranks；该文件不是 layerwise 数据路径的完成证明。
+
+`HANDOFF_PRE_LAYERWISE=layerwise` 仅支持原生 PD/SMG，不支持 P4 D2D 驱动。
+`d2d_worker_status` 等 D2D 命令返回 `DSV D2D requires a remote Decode worker`，
+应检查 `result.<rank>.json` 中的 `ok/error`，不要将其解释为尚未 ready 后无限重试。
+P4 D2D 的 D0/D1 都必须设 `HANDOFF_PRE_LAYERWISE=remote` 并禁用 Decode radix cache。
+P 端仍可保留 radix cache。
 
 ## P overlap 的生命周期
 

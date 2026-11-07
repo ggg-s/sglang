@@ -83,7 +83,6 @@ def _scheduler_init(original, scheduler, *args, **kwargs):
 
 def validate_config():
     from mooncake.engine import TransferEngine
-
     from sglang.srt.runtime_context import (
         get_device,
         get_disagg,
@@ -617,6 +616,7 @@ HOOKS = {
     "sglang.srt.disaggregation.mooncake.conn.MooncakeKVManager._try_create_staging_strategy": dsv41_receive.strategy,
     "sglang.srt.disaggregation.mooncake.conn.MooncakeKVManager.send_layer_group_to_staging": dsv41_receive.send_group,
     "sglang.srt.disaggregation.mooncake.conn.MooncakeKVManager.teardown": dsv41_receive.teardown,
+    "sglang.srt.disaggregation.mooncake.conn.MooncakeKVManager.build_receiver_registration_message": dsv41_receive.registration_message,
     "sglang.srt.model_executor.runner_backend.utils.resolve_decode_backend": segmented_graph.resolve_backend,
     "sglang.srt.managers.scheduler.Scheduler.__init__": _scheduler_init,
     "sglang.srt.managers.scheduler.Scheduler.run_event_loop": _event_loop,

@@ -3524,7 +3524,6 @@ class TestRemoteAttn(CustomTestCase):
             _target_metadata_glue=False,
             _resolve_lora_variant=lambda fb: None,
             _early_verify_metadata=None,
-            enable_pdmux=False,
             _make_graph_key=lambda size, *a: f.full.keys[size],
         )
         runner.model_runner.spec_algorithm = SimpleNamespace(
@@ -3689,7 +3688,6 @@ class TestRemoteAttn(CustomTestCase):
                 model_runner=SimpleNamespace(model=model, lora_manager=None)
             ),
             kv_checksum_computer=None,
-            enable_pdmux=False,
         )
         with (
             tempfile.TemporaryDirectory() as directory,
@@ -9850,7 +9848,7 @@ class TestRemoteAttn(CustomTestCase):
         scheduler = scheduler_cls()
         scheduler.invariant_checker = SimpleNamespace()
         scheduler.kv_checksum_computer = None
-        scheduler.enable_staging = scheduler.enable_pdmux = False
+        scheduler.enable_staging = False
         scheduler.sliding_window_size = 128
         scheduler.chunked_prefill_size = 16
         scheduler.disagg_prefill_pending_chunk_rids = set()
@@ -10229,7 +10227,13 @@ class TestRemoteAttn(CustomTestCase):
         disagg, memory = f.context.get_disagg(), f.context.get_memory()
         disagg.disaggregation_decode_enable_radix_cache = True
         memory.disable_radix_cache = False
+        f.scheduler.enable_fpm = True
+        control_dir = Path(self.enterContext(tempfile.TemporaryDirectory()))
         with (
+            patch.object(self.runtime, "_CTL_DIR", str(control_dir)),
+            patch.object(
+                self.runtime, "_create_hub_streams", lambda n: [(None, None, None)] * n
+            ),
             patch.dict(
                 sys.modules,
                 {
@@ -10261,6 +10265,9 @@ class TestRemoteAttn(CustomTestCase):
             patch.object(remote_data_plane, "enabled", return_value=False),
         ):
             self.hooks.pre_layerwise.initialize(f.scheduler)
+        self.addCleanup(self.runtime.close_handoff_hub, f.scheduler)
+        ready = json.loads((control_dir / "ready.0.json").read_text())
+        self.assertEqual((ready["rank"], ready["tp_size"]), (0, 1))
         controller = f.scheduler._pre_layerwise
         self.addCleanup(controller.decode_overlap.retirement.close)
         self.assertIs(controller.destination_cache, cached.guard)
@@ -16142,6 +16149,90 @@ class TestRemoteAttn(CustomTestCase):
         with self.assertRaisesRegex(RuntimeError, "native extend/prebuilt"):
             quiesce(scheduler, req)
         self.assertEqual(len(scheduler.result_queue), 1)
+
+    def test_dsv_d2d_requires_local_entries_then_retires_previous_owner_before_freeze(
+        self,
+    ):
+        from sglang_remote_attn import dsv_d2d as d2d
+        from sglang_remote_attn import dsv_gateway_control as gateway
+        from sglang_remote_attn.dsv41_remote import Target
+
+        e = self._d2d_env()
+        rpc = Target(
+            e.source, e.req, Path(e.tmp) / "previous", "previous", {}, e.prefix
+        )
+        rpc.progressive = True
+        e.req._dsv41_remote = rpc
+        e.source.remote_targets[rpc.row] = rpc
+        kv_entries = {
+            i
+            for i, entry in enumerate(
+                e.source._schema(d2d.manager(e.source))["entries"]
+            )
+            if entry[0] == "kv"
+        }
+        self.assertFalse(gateway.request_status(e.source, e.req)["migration_ready"])
+        with self.assertRaisesRegex(ValueError, "active unowned"):
+            self._d2d_reserve(e)
+        rpc.local_entries.update(kv_entries)
+        self.assertTrue(gateway.request_status(e.source, e.req)["migration_ready"])
+        parent = SimpleNamespace(
+            closed=False,
+            release=None,
+            release_failed=False,
+            ready_to_finish=lambda: False,
+            admission_id=1,
+            generation="previous",
+            decode_req=SimpleNamespace(req=e.req),
+        )
+        e.req._pre_layerwise_target = parent
+        self.assertFalse(gateway.request_status(e.source, e.req)["migration_ready"])
+        parent.ready_to_finish = lambda: True
+        e.source.targets.append(parent)
+        e.source.decode_overlap.retirement.register(parent)
+        retired = []
+
+        def finish(*, wait):
+            self.assertFalse(e.req._handoff_frozen)
+            rpc.close("previous-owner-retired")
+            parent.closed = True
+            e.req._pre_layerwise_target = None
+            retired.append(True)
+
+        parent.finish = finish
+        _, reserved = self._d2d_reserve(e)
+        self._d2d_reserved_freeze(e, reserved)
+        self.assertEqual(retired, [True])
+        self.assertTrue(e.req._handoff_frozen)
+        self.assertIsNone(e.req._dsv41_remote)
+        self.assertNotIn(rpc.row, e.source.remote_targets)
+
+    def test_layerwise_d2d_control_publishes_unsupported_result(self):
+        from sglang.srt.runtime_context import get_parallel
+
+        e = self._d2d_env()
+        e.source.dsv41_remote = False
+        e.source.dsv41_layerwise = True
+        control_dir = Path(e.tmp) / "control"
+        control_dir.mkdir()
+        command = dict(cmd="d2d_worker_status", migration_epoch="status", nonce="first")
+        (control_dir / "cmd.0.json").write_text(json.dumps(command))
+        with (
+            patch.object(self.runtime, "_CTL_DIR", str(control_dir)),
+            get_parallel().override(
+                tp_rank=0, tp_size=1, pp_rank=0, attn_tp_rank=0, attn_cp_rank=0
+            ),
+        ):
+            controls = self.hooks._broadcast(
+                lambda receiver, reqs, local: reqs, None, []
+            )
+            self.hooks._process_requests(
+                lambda scheduler, reqs: None, e.source.scheduler, controls
+            )
+        result = json.loads((control_dir / "result.0.json").read_text())
+        self.assertFalse(result["ok"])
+        self.assertEqual(result["nonce"], "first")
+        self.assertIn("requires a remote Decode worker", result["error"])
 
     def test_flash0731_mixed_ratio_page_maps_keep_native_guard_capacities(self):
         from sglang_remote_attn import dsv41_paged as paged

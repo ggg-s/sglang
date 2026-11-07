@@ -74,6 +74,7 @@ CORE_CALLS = {
             ("get_session_id", {}),
         )
     },
+    MANAGER + "build_receiver_registration_message": {},
     MANAGER + "build_receiver_metadata_message": {
         "bootstrap_room": inspect.Parameter.empty,
         "is_dummy": inspect.Parameter.empty,

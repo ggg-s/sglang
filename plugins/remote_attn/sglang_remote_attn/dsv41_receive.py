@@ -13,6 +13,19 @@ logger = logging.getLogger(__name__)
 WIRE = "dsv41-flat-v2"
 
 
+def registration_message(original, manager):
+    message = original(manager)
+    if getattr(manager, "_dsv41_layerwise_schema", None) is not None:
+        # Native code omits strides without customized-info. The progressive
+        # state/aux barrier needs D's actual row strides on the FIRST request.
+        # The controller installs the schema before any request is accepted.
+        lens = manager.kv_args.aux_item_lens
+        if len(lens) != len(manager.kv_args.aux_data_ptrs) or any(n <= 0 for n in lens):
+            raise ValueError("invalid DSV auxiliary registration strides")
+        message[6] = struct.pack(f"{len(lens)}Q", *lens)
+    return message
+
+
 def install(controller, manager, role):
     if role == "prefill" and getattr(manager, "_dsv41_receive_sender_ready", False):
         return

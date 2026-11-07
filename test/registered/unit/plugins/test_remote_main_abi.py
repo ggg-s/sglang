@@ -9,6 +9,7 @@ import ast
 import ctypes
 import functools
 import logging
+import struct
 import sys
 import threading
 import time
@@ -286,6 +287,67 @@ class TestRemoteMainABI(CustomTestCase):
             trace, ["kv", "metadata-clear", "metadata-free", "abort-state", "receiver"]
         )
         self.assertIsNone(f.dr.kv_receiver)
+
+    def test_live_staging_registration_is_idempotent_without_losing_scatter_proofs(
+        self,
+    ):
+        f = self.scatter_fixture(False)
+        with patch.dict(sys.modules, f.modules):
+            f.handler.submit_chunk_scatter(7, 0, 0, 2, stream=f.explicit)
+        events, ready = f.dr._chunk_events, f.dr._req_to_token_ready
+        token = f.handler._room_tokens[7]
+        f.dr._staging_success_ts = 123.0
+        f.handler.register_decode_req(7, f.dr)
+        self.assertIs(f.dr._chunk_events, events)
+        self.assertEqual(events, [(f.event, 5)])
+        self.assertIs(f.dr._req_to_token_ready, ready)
+        self.assertIs(f.handler._room_tokens[7], token)
+        self.assertEqual(f.dr._staging_success_ts, 123.0)
+        with self.assertRaisesRegex(RuntimeError, "still owns receive storage"):
+            f.handler.register_decode_req(
+                7, SimpleNamespace(req=f.req, kv_receiver=f.receiver)
+            )
+
+    def test_first_dsv_registration_publishes_aux_strides_without_customized_info(self):
+        native = definitions(
+            NATIVE / "mooncake/conn.py",
+            {"build_receiver_registration_message"},
+            {"struct": struct, "pack_int_lists": lambda values, fmt: b""},
+            owner="MooncakeKVManager",
+        )["build_receiver_registration_message"]
+        hook = definitions(
+            PLUGIN / "dsv41_receive.py", {"registration_message"}, {"struct": struct}
+        )["registration_message"]
+        manager = SimpleNamespace(
+            kv_args=SimpleNamespace(
+                kv_data_ptrs=[10],
+                aux_data_ptrs=[20, 30],
+                aux_item_lens=[8, 6],
+                state_data_ptrs=[],
+                state_item_lens=[],
+                state_layer_ids=[],
+                engine_rank=0,
+                kv_item_lens=[4],
+                kv_layer_ids=[0],
+            ),
+            get_session_id=lambda: "decoder",
+            local_ip="127.0.0.1",
+            rank_port=1,
+            attn_tp_size=1,
+            dcp_size=1,
+            dcp_rank=0,
+            enable_staging=False,
+            customized_info_enabled=False,
+        )
+        self.assertEqual(hook(native, manager)[6], b"")
+        manager._dsv41_layerwise_schema = {"entries": [("kv",)]}
+        message = hook(native, manager)
+        self.assertEqual(struct.unpack("2Q", message[6]), (8, 6))
+        self.assertEqual(message[:6], native(manager)[:6])
+        self.assertEqual(message[7:], native(manager)[7:])
+        manager.kv_args.aux_item_lens = [8]
+        with self.assertRaisesRegex(ValueError, "registration strides"):
+            hook(native, manager)
 
     def test_failed_transfer_without_hold_drains_before_native_kv_retirement(self):
         """The no-ACK-hold failure path must fence scatter before freeing KV."""

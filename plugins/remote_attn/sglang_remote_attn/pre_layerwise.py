@@ -125,6 +125,9 @@ class LayerCoverage:
     def ready(self, layer):
         return self.intervals.get(layer) == [(0, self.prefix_len)]
 
+    def all_local(self):
+        return all(self.ready(layer) for layer in range(self.layers))
+
 
 def buffer_groups(layer_ids, layers, group_size):
     """Return whole MHA K/V pairs, respecting the actual pointer entry order."""
@@ -620,9 +623,7 @@ class Target:
     def ready_to_finish(self):
         ready = self.gpu_ready() and self.transport_ready()
         ranges = getattr(self, "_range_coverage", None)
-        return ready and (
-            ranges is None or all(ranges.ready(i) for i in range(ranges.layers))
-        )
+        return ready and (ranges is None or ranges.all_local())
 
 
 class Controller:
@@ -730,10 +731,8 @@ class Controller:
             raise ValueError("model has no split-prefill entry point")
         if s.kv_checksum_computer is not None:
             raise ValueError("pre-layerwise does not support whole-prefix KV checksums")
-        if get_memory().enable_unified_memory or s.enable_pdmux:
-            raise ValueError(
-                "pre-layerwise does not support unified KV or PD multiplexing"
-            )
+        if get_memory().enable_unified_memory:
+            raise ValueError("pre-layerwise does not support unified KV")
         if get_disagg().disaggregation_decode_allocation_policy == "prefill_complete":
             raise ValueError(
                 "pre-layerwise requires destination allocation before prefill"
@@ -1323,9 +1322,8 @@ def initialize(scheduler):
     config = Config.from_env()
     if config is None:
         return
-    from .dsv41_layerwise import DSV41Controller, is_dsv41
-
     from . import qwen_hybrid
+    from .dsv41_layerwise import DSV41Controller, is_dsv41
 
     runner = scheduler.tp_worker.model_runner
     cls = (
@@ -1390,6 +1388,10 @@ def initialize(scheduler):
     install_accounting(controller)
     scheduler._pre_layerwise = controller
     scheduler.tp_worker.model_runner._pre_layerwise = controller
+    if scheduler.disaggregation_mode.value == "decode":
+        # Publish rank readiness before the first native P->D request. D may
+        # never become a remote source during an ordinary serving run.
+        _runtime().get_remote_hub(scheduler)
 
 
 def run_batch(original, scheduler, batch, *args, **kwargs):

@@ -202,6 +202,30 @@ def validate(controller):
         raise ValueError("D2D native state component is unsupported")
 
 
+def source_local(req):
+    """Local KV can migrate while the previous controller still tracks it."""
+    if (
+        req.finished()
+        or getattr(req, "_handoff_frozen", False)
+        or getattr(req, "_dsv_d2d_source", None) is not None
+        or getattr(req, "_remote_attn_transport_quarantine", None) is not None
+    ):
+        return False
+    rpc = getattr(req, "_dsv41_remote", None)
+    if rpc is not None and not rpc.all_local():
+        return False
+    target = getattr(req, "_pre_layerwise_target", None)
+    if target is None or target.closed:
+        return True
+    # Local switches do not retire the receive ring or canonical PD envelope.
+    # Admit only a provably drainable lifetime, with no deferred KV release.
+    return (
+        target.release is None
+        and not target.release_failed
+        and target.ready_to_finish()
+    )
+
+
 def quiesce(scheduler, req):
     """Consume one native overlap result before changing batch membership.
 
@@ -227,14 +251,22 @@ def quiesce(scheduler, req):
         scheduler.last_batch = None
     if req.finished():
         raise ValueError("cannot migrate a finished request")
-    if (
-        getattr(req, "_pre_layerwise_target", None) is not None
-        or getattr(req, "_dsv41_remote", None) is not None
-    ):
+    if not source_local(req):
         raise ValueError("D2D source must have completed its previous transfer")
     expected = len(req.origin_input_ids) + len(req.output_ids) - 1
     if not req.output_ids or req.kv.kv_committed_len != expected:
         raise ValueError("D2D freeze requires one pending sampled token")
+
+
+def retire_previous(controller, req):
+    # This command was broadcast to all TP ranks. Drain through the existing
+    # ordered protocol before a new source can own or release these KV pages.
+    target = getattr(req, "_pre_layerwise_target", None)
+    if target is not None and not target.closed:
+        controller.decode_overlap.retirement.drain(required=target)
+    rpc = getattr(req, "_dsv41_remote", None)
+    if rpc is not None:
+        rpc.close("d2d-local-source")
 
 
 def sampling(req):
@@ -994,9 +1026,7 @@ def handle(controller, data):
             params = sampling(req)
             group_size = grouping.size()
             token_range = ranges.tokens()
-            if getattr(req, "_dsv_d2d_source", None) is not None or not can_quiesce(
-                controller.scheduler
-            ):
+            if not source_local(req) or not can_quiesce(controller.scheduler):
                 raise ValueError(
                     "request has a D2D owner or needs native Decode boundary"
                 )
@@ -1006,7 +1036,22 @@ def handle(controller, data):
             raise ValueError(
                 f"TP D2D freeze preflight rejected: {error or 'peer rejected'}"
             )
-        quiesce(controller.scheduler, req)
+        error = None
+        try:
+            quiesce(controller.scheduler, req)
+        except Exception as exc:
+            error = repr(exc)
+        if not controller.agree([int(error is None)])[0]:
+            raise ValueError(f"TP D2D quiesce rejected: {error or 'peer rejected'}")
+        error = None
+        try:
+            retire_previous(controller, req)
+        except Exception as exc:
+            error = repr(exc)
+        if not controller.agree([int(error is None)])[0]:
+            raise ValueError(
+                f"TP D2D previous transfer retirement rejected: {error or 'peer rejected'}"
+            )
         # Quiescing can commit one overlap result; validate the final length
         # collectively before removing any rank from its runnable batches.
         error = None

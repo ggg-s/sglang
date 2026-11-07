@@ -377,3 +377,8 @@ all_reduce。P 端及原生准入/计算同步保持原有协议；D overlap 关
 `retry after state change` 表示一次未获准的切换尝试，资源仍保留；稳定 Remote
 无新状态时不应不断产生新尝试。具体本地证据见
 [事件驱动退休验证](validation/ORDERED-RETIREMENT.md)。
+
+## 合并后验证
+
+依赖同步、D2D 模式限制以及前缀冷热/TPOT 的统一测量口径见
+[DSV4 合并问题核对与验证口径](validation/DSV4-MERGE-ISSUES.md)。

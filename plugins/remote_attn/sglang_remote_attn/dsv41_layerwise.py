@@ -378,12 +378,11 @@ class DSV41Controller(Controller):
                 getattr(s, "enable_staging", False)
                 and not getattr(self, "receive_installed", False)
             )
-            or s.enable_pdmux
             or get_memory().enable_unified_memory
             or get_memory().enable_hierarchical_cache
         ):
             raise ValueError(
-                "DSV4.1 staging requires P send / D receive roles; no HiCache/PD multiplexing"
+                "DSV4.1 staging requires P send / D receive roles; no unified KV/HiCache"
             )
         if get_disagg().disaggregation_decode_allocation_policy == "prefill_complete":
             raise ValueError(

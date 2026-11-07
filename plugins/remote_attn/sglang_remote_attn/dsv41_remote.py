@@ -6,11 +6,11 @@ The native-complete one-forward window remains a compatibility fallback.
 """
 
 import functools
-from contextlib import nullcontext
 import inspect
 import os
 import secrets
 import time
+from contextlib import nullcontext
 from dataclasses import dataclass, field
 
 from . import dsv41_sparse_math as sparse
@@ -326,6 +326,24 @@ class Target:
             raise RuntimeError(
                 "Remote target attempt/row changed; retaining read lease"
             )
+
+    def all_local(self):
+        if self.closed:
+            return True
+        if not self.progressive:
+            return False
+        self.check()
+        # Indexer/state/aux were proven before admission. Only these immutable
+        # KV entries can still need Remote; submission/scatter alone is not a
+        # Local switch. local_entries is updated by TP-ordered retirement.
+        schema = self.controller._schema(
+            self.controller.scheduler.disagg_decode_prealloc_queue.kv_manager
+        )
+        return all(
+            i in self.local_entries
+            for i, entry in enumerate(schema["entries"])
+            if entry[0] == "kv"
+        )
 
     def call(self, query, positions, layer, ratio, scale):
         import torch

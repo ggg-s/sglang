@@ -201,6 +201,14 @@ class DecodeStagingHandler:
             while room in self._closing_rooms:
                 self._staging_lifecycle.wait()
             if room in self._room_to_decode_req:
+                if (
+                    self._room_to_decode_req[room] is decode_req
+                    and room in self._room_tokens
+                    and self._room_to_receiver[room] is decode_req.kv_receiver
+                ):
+                    # Plugin admission may register before native metadata.
+                    # Preserve all events and the live allocation generation.
+                    return
                 raise RuntimeError(
                     f"Staging room {room} still owns receive storage; drain it before reuse"
                 )

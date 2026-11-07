@@ -90,7 +90,7 @@ def handle(controller, data):
                 raise ValueError("D2D plan retry identity mismatch")
             return dict(plan=plan, duplicate=True)
         req = d2d.find_req(controller.scheduler, data["rid"])
-        if req.finished() or getattr(req, "_dsv_d2d_source", None) is not None:
+        if not d2d.source_local(req):
             raise ValueError("D2D plan requires an active unowned request")
         params = d2d.sampling(req)
         lower = len(req.origin_input_ids) + len(req.output_ids) - 1
@@ -162,6 +162,7 @@ def handle(controller, data):
         if epoch in sources or epoch in targets:
             raise ValueError("D2D reservation epoch already used")
         from sglang.srt.sampling.sampling_params import SamplingParams
+
         from .handoff_control import _new_req, _tracked
 
         if plan["target_rid"] in _tracked(controller.scheduler) or any(

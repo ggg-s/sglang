@@ -365,7 +365,6 @@ class Controller(pre_layerwise.Controller):
             or get_spec().speculative_algorithm is not None
             or getattr(s, "enable_hisparse", False)
             or runner.lora_manager is not None
-            or s.enable_pdmux
             or s.kv_checksum_computer is not None
             or self.config.recv_host_staging
             or not get_schedule().disable_overlap_schedule
