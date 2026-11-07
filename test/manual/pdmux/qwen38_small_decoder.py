@@ -43,7 +43,12 @@ def selected(name, rel, classes, env, functions=()):
                 n
                 for n in node.body
                 if isinstance(n, (ast.FunctionDef, ast.AnnAssign))
-                and (
+                or (methods is None and isinstance(n, ast.Assign))
+            ]
+            node.body = [
+                n
+                for n in node.body
+                if (
                     methods is None
                     or getattr(n, "name", None) in methods
                     or isinstance(n, ast.AnnAssign)
@@ -609,6 +614,7 @@ def build_stack():
                     "_ffn_mix",
                     "_ffn_combine",
                     "_prepare_attn_stage",
+                    "_add_ple_embedding",
                     "_run_ffn_stage",
                 },
             ),
