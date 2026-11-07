@@ -221,9 +221,11 @@ class Fixture:
             split_interval=interval,
         )
 
-    def snapshot(self, lane, output, bridge=False, routes=None):
+    def snapshot(self, lane, output, bridge=False, routes=None, selected_override=None):
         b = self.batches[lane]
         selected = b.selected_tokens
+        if selected_override is not None:
+            selected = selected_override
         if bridge:
             selected = self.stack.layers[1]._qsa_prefill_topk_bridges[0][
                 : len(b.input_ids)
@@ -304,6 +306,7 @@ class Fixture:
                 self.reset(1)
                 self.decode_outputs = self.forward(1)
                 self.decode_routes = self.route_views()
+                self.decode_selected = self.batches[1].selected_tokens
         self.ds.synchronize()
 
     def replay(self, key, batch, **kwargs):
@@ -337,7 +340,12 @@ class Fixture:
             self.decode_graph.replay()
             decode_cpu = (time.perf_counter() - t) * 1000
             decode = (
-                self.snapshot(1, self.decode_outputs, routes=self.decode_routes)
+                self.snapshot(
+                    1,
+                    self.decode_outputs,
+                    routes=self.decode_routes,
+                    selected_override=self.decode_selected,
+                )
                 if verify
                 else None
             )

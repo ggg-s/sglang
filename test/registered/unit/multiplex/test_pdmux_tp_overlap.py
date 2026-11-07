@@ -577,8 +577,7 @@ def _gloo_lane_rank(rank, store_path):
             "DSparkWorkerV2",
             ["_finalize_prefill"],
             SpecTpSyncSite=NS(DSPARK_TARGET="prefill"),
-            get_parallel=lambda: NS(enable_dp_attention=True, attn_cp_size=2),
-            get_tp_group=lanes.get_tp_group,
+            get_dp_tp_group=lanes.get_tp_group,
         )["_finalize_prefill"]
         worker = NS(_target_hidden_projection_enabled=False, _tp_sync=sync)
         for chunk in range(32):
@@ -588,7 +587,7 @@ def _gloo_lane_rank(rank, store_path):
                 next_token_ids=torch.tensor([chunk + rank]),
             )
             try:
-                finalize(worker, NS(seq_lens=None), output, None)
+                finalize(worker, NS(seq_lens=None), output, None, placement=None)
             except RuntimeError as exc:
                 assert "aux hidden capture" in str(exc)
             assert output.next_token_ids.item() == chunk
