@@ -32,8 +32,6 @@ import unittest
 from types import SimpleNamespace
 from unittest.mock import Mock, patch
 
-from sglang.srt.runtime_context import get_context
-
 import sglang.srt.managers.scheduler as scheduler_module
 import sglang.srt.multiplex.multiplexing_mixin as multiplexing_mixin
 from sglang.srt.model_executor.forward_batch_info import ForwardMode
@@ -51,6 +49,7 @@ from sglang.srt.multiplex.pdmux_context import (
     decode_lane_attn_backend,
     is_pdmux_standard_prefill,
 )
+from sglang.srt.runtime_context import get_context
 from sglang.test.ci.ci_register import register_cpu_ci
 
 register_cpu_ci(est_time=5, suite="base-a-test-cpu")

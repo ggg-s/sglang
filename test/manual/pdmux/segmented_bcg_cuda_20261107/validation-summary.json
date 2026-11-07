@@ -1,0 +1,23 @@
+{
+  "gpu_tested_commit": "050f5683330bef795bd7162b009b1f293eb7d193",
+  "gpu_configurations": 16,
+  "correctness_pairs": 512,
+  "timing_pairs": 4096,
+  "all_exact": true,
+  "cpu_checks": {
+    "bcg": 18,
+    "tp_targeted": 12,
+    "dispatcher": 13,
+    "capture_source_methods": 2,
+    "standard_admission_source_methods": 3
+  },
+  "limits": [
+    "TP1 real CUDA math; two-rank Gloo protocol uses CPU segment callables",
+    "No real green-context placement or multi-GPU NCCL acceptance",
+    "No full checkpoint/server or end-to-end throughput/TTFT/TPOT acceptance"
+  ],
+  "cpu_total": 48,
+  "source_hash_checks": 258,
+  "timed_source_commit": "050f5683330bef795bd7162b009b1f293eb7d193",
+  "tp_targeted_source_commit": "05413e8a684c1c016cccf468802f0b222df6da9b"
+}

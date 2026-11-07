@@ -1,0 +1,19 @@
+{
+  "collection_git_commit": "05413e8a684c1c016cccf468802f0b222df6da9b",
+  "gpu": "NVIDIA GeForce RTX 4060 Laptop GPU, 592.82, 8188 MiB",
+  "python": "/workspace/conditional-graph-20261019/venv/bin/python",
+  "cuda_home": "/workspace/qwen38-decoder-cuda-20261107/cuda13/nvidia/cu13",
+  "scope": "TP1 real CUDA math with production BCG primitives and continuation executor; metadata/constructor/outer-tail adapters; plain streams, no green partitions",
+  "harness_sha256": {
+    "test/manual/pdmux/validate_segmented_bcg_cuda.py": "5391b8ad37ac778b39456833ee222d98d396bad751cb008091dc412ef0c38c28",
+    "test/manual/pdmux/validate_qwen38_moe_ple_cuda.py": "dd06606f2f84a7809a09ff490c785615a2c0d3e1b13464099ab7fe26ee63235c",
+    "test/manual/pdmux/qwen38_small_decoder.py": "f2a993d2c3d99f38ad9b9c9f845c3a5c2614d2e38707781982c3159290a7933e",
+    "test/manual/pdmux/validate_qwen38_real_ops_cuda.py": "6ce2dd40516578e834224f534e0c3dbcd9af8c4895266422b4c1175ebbc63eff"
+  },
+  "performance_trials": 8,
+  "rounds_per_trial": 32,
+  "transport": "origin push plus Git bundle/object-pack fast-forward over Windows SSH; CUDA in WSL",
+  "gpu_tested_git_commits": [
+    "050f5683330bef795bd7162b009b1f293eb7d193"
+  ]
+}

@@ -24,7 +24,6 @@ from sglang.srt.model_executor.cuda_graph_config import Backend
 from sglang.srt.model_executor.forward_batch_info import ForwardBatch, PPProxyTensors
 from sglang.srt.model_executor.forward_mode import CaptureHiddenMode, ForwardMode
 from sglang.srt.model_executor.model_runner import ModelRunner
-from sglang.srt.model_executor.runner_utils.pdmux import _can_replay_whole_split_prefill
 from sglang.srt.model_executor.model_runner_components.cuda_graph_setup import (
     capture_prefill_graph,
 )
@@ -32,6 +31,7 @@ from sglang.srt.model_executor.runner.prefill_cuda_graph_runner import (
     PrefillCudaGraphRunner,
 )
 from sglang.srt.model_executor.runner.shape_key import ShapeKey
+from sglang.srt.model_executor.runner_utils.pdmux import _can_replay_whole_split_prefill
 from sglang.srt.multimodal.modality import Modality
 from sglang.srt.runtime_context import get_context
 from sglang.test.ci.ci_register import register_cpu_ci

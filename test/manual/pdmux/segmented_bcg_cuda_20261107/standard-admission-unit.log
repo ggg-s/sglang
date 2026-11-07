@@ -1,0 +1,9 @@
+test_a_clean_profile_is_accepted (bcg_admission_source.TestPdmuxStandardPrefillAdmission) ... ok
+test_dp_attention_is_accepted (bcg_admission_source.TestPdmuxStandardPrefillAdmission) ... ok
+test_every_incompatible_feature_is_rejected (bcg_admission_source.TestPdmuxStandardPrefillAdmission)
+Completeness: each gate must actually fire. ... ok
+
+----------------------------------------------------------------------
+Ran 3 tests in 0.000s
+
+OK

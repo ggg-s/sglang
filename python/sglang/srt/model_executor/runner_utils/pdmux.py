@@ -7,8 +7,8 @@ from typing import TYPE_CHECKING, Optional
 from sglang.srt.utils.device_timer import device_timer_ctx
 
 if TYPE_CHECKING:
-    from sglang.srt.model_executor.forward_batch_info import ForwardBatch
     from sglang.srt.layers.logits_processor import LogitsProcessorOutput
+    from sglang.srt.model_executor.forward_batch_info import ForwardBatch
 
 
 def _can_replay_whole_split_prefill(

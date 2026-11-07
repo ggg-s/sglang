@@ -1,5 +1,12 @@
 # PDMux standard-prefill lane: validation runbook
 
+The plain-TP text/no-speculation profile can select prefill BCG with
+`--cuda-graph-backend-prefill breakable` in either `standard` or `layer_split`
+mode. [Implementation, real-layer CUDA results and timing definitions](segmented_bcg_cuda_20261107/README.md)
+describe per-stream-group capture and private graph storage. Commands below
+that use `disabled` retain the eager baseline; their MTP/DSpark profiles do not
+enable the new prefill BCG path.
+
 Companion to `--pdmux-prefill-mode standard`. Everything here is a command to
 run on the 8-GPU host; nothing below has been executed in the session that
 produced the branch (that checkout had no torch, no GPU and no checkpoint).

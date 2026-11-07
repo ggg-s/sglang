@@ -1,0 +1,360 @@
+{
+  "cases": {
+    "eager_split": {
+      "correctness_rounds": 32,
+      "exact": true,
+      "samples": [
+        {
+          "cpu_submit_ms": 10.516469781578053,
+          "mixed_gpu_ms": 10.519719123840332,
+          "prefill_cpu_ms": 10.230493113340344,
+          "longest_prefill_call_ms": 5.3180654140305705,
+          "decode_cpu_ms": 0.06224542448762804
+        },
+        {
+          "cpu_submit_ms": 10.663511784514412,
+          "mixed_gpu_ms": 10.665310859680176,
+          "prefill_cpu_ms": 10.370605748903472,
+          "longest_prefill_call_ms": 5.380048161896411,
+          "decode_cpu_ms": 0.07194231875473633
+        },
+        {
+          "cpu_submit_ms": 10.615790779411327,
+          "mixed_gpu_ms": 10.617690086364746,
+          "prefill_cpu_ms": 10.337010855437256,
+          "longest_prefill_call_ms": 5.5010420983307995,
+          "decode_cpu_ms": 0.060033664340153337
+        },
+        {
+          "cpu_submit_ms": 10.498036594071891,
+          "mixed_gpu_ms": 10.49964427947998,
+          "prefill_cpu_ms": 10.228575665678363,
+          "longest_prefill_call_ms": 5.367183890484739,
+          "decode_cpu_ms": 0.05834858166053891
+        },
+        {
+          "cpu_submit_ms": 10.233279754174873,
+          "mixed_gpu_ms": 10.23744010925293,
+          "prefill_cpu_ms": 9.964238408429082,
+          "longest_prefill_call_ms": 5.156971572432667,
+          "decode_cpu_ms": 0.05998273263685405
+        },
+        {
+          "cpu_submit_ms": 10.626823219354264,
+          "mixed_gpu_ms": 10.628714561462402,
+          "prefill_cpu_ms": 10.34111122135073,
+          "longest_prefill_call_ms": 5.344940989743918,
+          "decode_cpu_ms": 0.06569355173269287
+        },
+        {
+          "cpu_submit_ms": 10.560777249338571,
+          "mixed_gpu_ms": 10.562969207763672,
+          "prefill_cpu_ms": 10.276941829943098,
+          "longest_prefill_call_ms": 5.322130782587919,
+          "decode_cpu_ms": 0.06431184010580182
+        },
+        {
+          "cpu_submit_ms": 10.353409001254477,
+          "mixed_gpu_ms": 10.355039596557617,
+          "prefill_cpu_ms": 10.062188106530812,
+          "longest_prefill_call_ms": 5.233287876762915,
+          "decode_cpu_ms": 0.06045996997272596
+        }
+      ],
+      "cpu_submit_ms": 10.538623515458312,
+      "mixed_gpu_ms": 10.541344165802002,
+      "prefill_cpu_ms": 10.253717471641721,
+      "longest_prefill_call_ms": 5.333535886165919,
+      "decode_cpu_ms": 0.061352697230177
+    },
+    "split_bcg": {
+      "correctness_rounds": 32,
+      "exact": true,
+      "samples": [
+        {
+          "cpu_submit_ms": 4.941717779729515,
+          "mixed_gpu_ms": 4.952672004699707,
+          "prefill_cpu_ms": 4.688847482611891,
+          "longest_prefill_call_ms": 2.4121582391671836,
+          "decode_cpu_ms": 0.045849177695345134
+        },
+        {
+          "cpu_submit_ms": 4.702115686086472,
+          "mixed_gpu_ms": 4.7270050048828125,
+          "prefill_cpu_ms": 4.465842401259579,
+          "longest_prefill_call_ms": 2.3198865019367076,
+          "decode_cpu_ms": 0.04218864341964945
+        },
+        {
+          "cpu_submit_ms": 4.791789906448685,
+          "mixed_gpu_ms": 4.834943771362305,
+          "prefill_cpu_ms": 4.5486493545467965,
+          "longest_prefill_call_ms": 2.3368619586108252,
+          "decode_cpu_ms": 0.0434504690929316
+        },
+        {
+          "cpu_submit_ms": 4.679038844187744,
+          "mixed_gpu_ms": 4.806335926055908,
+          "prefill_cpu_ms": 4.447053070180118,
+          "longest_prefill_call_ms": 2.278192238009069,
+          "decode_cpu_ms": 0.03964552888646722
+        },
+        {
+          "cpu_submit_ms": 4.419218937982805,
+          "mixed_gpu_ms": 4.550047874450684,
+          "prefill_cpu_ms": 4.136700925300829,
+          "longest_prefill_call_ms": 2.218916080892086,
+          "decode_cpu_ms": 0.038544851122424006
+        },
+        {
+          "cpu_submit_ms": 4.826496973691974,
+          "mixed_gpu_ms": 4.876319885253906,
+          "prefill_cpu_ms": 4.580693363095634,
+          "longest_prefill_call_ms": 2.3438121716026217,
+          "decode_cpu_ms": 0.04473013541428372
+        },
+        {
+          "cpu_submit_ms": 4.448480474820826,
+          "mixed_gpu_ms": 4.460383892059326,
+          "prefill_cpu_ms": 4.21991463372251,
+          "longest_prefill_call_ms": 2.170999112422578,
+          "decode_cpu_ms": 0.03928883234038949
+        },
+        {
+          "cpu_submit_ms": 4.712571433628909,
+          "mixed_gpu_ms": 4.725215911865234,
+          "prefill_cpu_ms": 4.411961155710742,
+          "longest_prefill_call_ms": 2.360329744988121,
+          "decode_cpu_ms": 0.041736588173080236
+        }
+      ],
+      "cpu_submit_ms": 4.707343559857691,
+      "mixed_gpu_ms": 4.76667046546936,
+      "prefill_cpu_ms": 4.456447735719848,
+      "longest_prefill_call_ms": 2.3283742302737664,
+      "decode_cpu_ms": 0.041962615796364844
+    },
+    "standard_eager": {
+      "correctness_rounds": 32,
+      "exact": true,
+      "samples": [
+        {
+          "cpu_submit_ms": 10.50587343343068,
+          "mixed_gpu_ms": 10.506976127624512,
+          "prefill_cpu_ms": 10.229526735201944,
+          "longest_prefill_call_ms": 10.229526735201944,
+          "decode_cpu_ms": 0.05902955308556557
+        },
+        {
+          "cpu_submit_ms": 10.240074348985218,
+          "mixed_gpu_ms": 10.241727828979492,
+          "prefill_cpu_ms": 9.959732669813093,
+          "longest_prefill_call_ms": 9.959732669813093,
+          "decode_cpu_ms": 0.05853307084180415
+        },
+        {
+          "cpu_submit_ms": 10.30920619086828,
+          "mixed_gpu_ms": 10.311073303222656,
+          "prefill_cpu_ms": 10.04198324517347,
+          "longest_prefill_call_ms": 10.04198324517347,
+          "decode_cpu_ms": 0.059905600210186094
+        },
+        {
+          "cpu_submit_ms": 10.57613905868493,
+          "mixed_gpu_ms": 10.576859474182129,
+          "prefill_cpu_ms": 10.300103705958463,
+          "longest_prefill_call_ms": 10.300103705958463,
+          "decode_cpu_ms": 0.05914712528465316
+        },
+        {
+          "cpu_submit_ms": 10.56556602998171,
+          "mixed_gpu_ms": 10.568316459655762,
+          "prefill_cpu_ms": 10.290543628798332,
+          "longest_prefill_call_ms": 10.290543628798332,
+          "decode_cpu_ms": 0.06152145215310156
+        },
+        {
+          "cpu_submit_ms": 10.304839466698468,
+          "mixed_gpu_ms": 10.302623748779297,
+          "prefill_cpu_ms": 10.044740061857738,
+          "longest_prefill_call_ms": 10.044740061857738,
+          "decode_cpu_ms": 0.054773678130004555
+        },
+        {
+          "cpu_submit_ms": 10.405204033304472,
+          "mixed_gpu_ms": 10.407039642333984,
+          "prefill_cpu_ms": 10.13307632820215,
+          "longest_prefill_call_ms": 10.13307632820215,
+          "decode_cpu_ms": 0.05888328450964764
+        },
+        {
+          "cpu_submit_ms": 10.465807405125815,
+          "mixed_gpu_ms": 10.468026161193848,
+          "prefill_cpu_ms": 10.188284271862358,
+          "longest_prefill_call_ms": 10.188284271862358,
+          "decode_cpu_ms": 0.06372066854964942
+        }
+      ],
+      "cpu_submit_ms": 10.435505719215143,
+      "mixed_gpu_ms": 10.437532901763916,
+      "prefill_cpu_ms": 10.160680300032254,
+      "longest_prefill_call_ms": 10.160680300032254,
+      "decode_cpu_ms": 0.05908833918510936
+    },
+    "standard_bcg": {
+      "correctness_rounds": 32,
+      "exact": true,
+      "samples": [
+        {
+          "cpu_submit_ms": 4.230423532135319,
+          "mixed_gpu_ms": 4.244631767272949,
+          "prefill_cpu_ms": 4.0209104627138,
+          "longest_prefill_call_ms": 4.0209104627138,
+          "decode_cpu_ms": 0.040158665797207505
+        },
+        {
+          "cpu_submit_ms": 4.320452026149724,
+          "mixed_gpu_ms": 4.33192777633667,
+          "prefill_cpu_ms": 4.101146958419122,
+          "longest_prefill_call_ms": 4.101146958419122,
+          "decode_cpu_ms": 0.04297767736716196
+        },
+        {
+          "cpu_submit_ms": 4.69960587361129,
+          "mixed_gpu_ms": 4.711383819580078,
+          "prefill_cpu_ms": 4.4573150225915015,
+          "longest_prefill_call_ms": 4.4573150225915015,
+          "decode_cpu_ms": 0.048574438551440835
+        },
+        {
+          "cpu_submit_ms": 4.633634001947939,
+          "mixed_gpu_ms": 4.67577600479126,
+          "prefill_cpu_ms": 4.397430217068177,
+          "longest_prefill_call_ms": 4.397430217068177,
+          "decode_cpu_ms": 0.047039684432093054
+        },
+        {
+          "cpu_submit_ms": 4.7958845316316,
+          "mixed_gpu_ms": 4.811007976531982,
+          "prefill_cpu_ms": 4.545918956864625,
+          "longest_prefill_call_ms": 4.545918956864625,
+          "decode_cpu_ms": 0.05016882641939446
+        },
+        {
+          "cpu_submit_ms": 4.660785962187219,
+          "mixed_gpu_ms": 4.672031879425049,
+          "prefill_cpu_ms": 4.416914714965969,
+          "longest_prefill_call_ms": 4.416914714965969,
+          "decode_cpu_ms": 0.049083202611655
+        },
+        {
+          "cpu_submit_ms": 4.4644841545959935,
+          "mixed_gpu_ms": 4.480895042419434,
+          "prefill_cpu_ms": 4.2203295743092895,
+          "longest_prefill_call_ms": 4.2203295743092895,
+          "decode_cpu_ms": 0.060110694903414696
+        },
+        {
+          "cpu_submit_ms": 4.861807254201267,
+          "mixed_gpu_ms": 4.8751678466796875,
+          "prefill_cpu_ms": 4.616717946191784,
+          "longest_prefill_call_ms": 4.616717946191784,
+          "decode_cpu_ms": 0.05012174369767308
+        }
+      ],
+      "cpu_submit_ms": 4.647209982067579,
+      "mixed_gpu_ms": 4.673903942108154,
+      "prefill_cpu_ms": 4.407172466017073,
+      "longest_prefill_call_ms": 4.407172466017073,
+      "decode_cpu_ms": 0.048828820581547916
+    }
+  },
+  "capture": {
+    "split_bcg": {
+      "segments": 9,
+      "capture_ms": 10.871149133890867
+    },
+    "standard_bcg": {
+      "segments": 7,
+      "capture_ms": 9.232754120603204
+    }
+  },
+  "fp8_projections": 13,
+  "tokens": 129,
+  "decode_cuda_graph": true,
+  "selected_qsa_tokens_canonical": true,
+  "passed": true,
+  "torch": "2.14.1+cu130",
+  "gpu": "NVIDIA GeForce RTX 4060 Laptop GPU",
+  "dtype": "fp8",
+  "source_sha256": {
+    "python/sglang/kernels/ops/attention/fla/chunk.py": "2c38a5b622b33e55e75a0119495a70b2fcd78a1d01a286cb4432e583b025e745",
+    "python/sglang/kernels/ops/attention/fla/chunk_delta_h.py": "7015fa8774f6d9a099b47604eb3d3f91b072277c1e307eacf8ee9615674ee498",
+    "python/sglang/kernels/ops/attention/fla/chunk_fwd.py": "01df2726d9416009cc3c0040c32574069838dfcda54ed77b93ddbc6014da50c2",
+    "python/sglang/kernels/ops/attention/fla/chunk_intra.py": "9afd7def4cbdafa6a4e3d6d721c9e67b70cd8061abf25e622d0a0a198b9c5495",
+    "python/sglang/kernels/ops/attention/fla/chunk_intra_token_parallel.py": "42da78ec3c423523fe9dee299706b066e211427627237e20797ad370ae9d8632",
+    "python/sglang/kernels/ops/attention/fla/chunk_o.py": "cd707c231ae63a5b14710f0ea0b0a6e55b17f2ef644083e5641aedaa09d1865e",
+    "python/sglang/kernels/ops/attention/fla/cumsum.py": "832b2b2dedac8931c9c172f574a2f23c6fd6c45ed8ef169eb62b957718011c6a",
+    "python/sglang/kernels/ops/attention/fla/fused_norm_gate.py": "d1cdfbd2385b40011b1a082dc2941e515dd0b4ebfab296f15868618269133094",
+    "python/sglang/kernels/ops/attention/fla/fused_recurrent.py": "b978898b39eb18969994d737cb4853a99eeb89e16759862e48694c133f6e4562",
+    "python/sglang/kernels/ops/attention/fla/index.py": "9381b5310363cb7883fc2ef7a8b531080a0e4424b4e7132dcd2bdad6df68b028",
+    "python/sglang/kernels/ops/attention/fla/kda.py": "10c99ca3f62a189be95d50035f8eb3f166dbc647a744cb63851ed5b3dc187a8f",
+    "python/sglang/kernels/ops/attention/fla/l2norm.py": "e51a2b73431f6ff55099476e15b1211e2a8f7069dff05bd566cfc09fc27fbfaf",
+    "python/sglang/kernels/ops/attention/fla/layernorm_gated.py": "95d10783a8374e75bcc2c6d15ffdb580acd38d87c20b17c4f8bb24083c805be4",
+    "python/sglang/kernels/ops/attention/fla/op.py": "ed1294fc5ba003d255504c28b53105e697fdbf207e2586cb8a36599d8df293cd",
+    "python/sglang/kernels/ops/attention/fla/utils.py": "5c39b5cffde309760fd8fd7d73e32325dc788628e00f4a7552d6773972b3c3e6",
+    "python/sglang/kernels/ops/attention/fla/wy_fast.py": "25f763bcfcfbf230fc7748d2d8aa1493ab0999298ef46ccebaa04b65b351e748",
+    "python/sglang/kernels/aot/csrc/memory/weak_ref_tensor.cpp": "9c06761315699cf9654a714243258c6d5df28f668476eff75a6cb765770eb37d",
+    "python/sglang/srt/model_executor/runner_backend_utils/weak_ref_tensor.py": "07e8f8a2b3c59767c465c487a8a5cec55f46a9c8ea95dd93b84426b85a5136ac",
+    "python/sglang/srt/model_executor/runner_backend_utils/breakable_cuda_graph/cuda_utils.py": "b70b45435bca7005b6e63d0836f61e2845b0a53a7a0f0c4a48614b258c690700",
+    "python/sglang/srt/model_executor/runner_backend_utils/breakable_cuda_graph/breakable_cuda_graph.py": "bfc2bf2e26d403153c634e8697ccc4659135b69231adad627b2d904428d7ef80",
+    "python/sglang/srt/model_executor/runner_backend_utils/breakable_cuda_graph/context.py": "b56f2b53c1d1f8767c048d686fafa374bad4578b5c9fb18cc36f21657beb51f5",
+    "python/sglang/srt/model_executor/runner_utils/pdmux_bcg.py": "a73f65afa3e27581effe7dbba27ed145dbeeed1d614afdae30957eb514ec570f",
+    "python/sglang/srt/model_executor/runner_utils/pdmux.py": "4263cb04e4245410348a7f983a3e42f4a49ae05907aef257be61b2a33bf95387",
+    "python/sglang/srt/model_executor/runner/shape_key.py": "a0b073be7deb70d3304f6244df3b69608a44088fec395f6a72f0f741fdc3258f",
+    "python/sglang/srt/model_executor/runner_utils/shared_read_event.py": "547664912fa647c47b3af10b6754d147b3812db34fad88664becf4d5eb6449dc",
+    "python/sglang/kernels/ops/gemm/hc_mix.py": "bbebd1d701dfa6f6e4be58450735b742677fe0dbdc4334ebaa8de40443c66332",
+    "python/sglang/srt/layers/hc_mix_flydsl.py": "b622d37c0f5a57bf4f424e2363817b4f24087a7fe5f13be5058190a3fdd99f3c",
+    "python/sglang/srt/layers/hyperconnection.py": "6249a13d1a4e25ee8ed13bdc1570083747f462803014bc5f4fb7895981669c00",
+    "python/sglang/kernels/ops/mamba/causal_conv1d_triton.py": "adc8f54d862c02ad3cc3012a9194697c33a4309c4206ef871678af0a430fd51b",
+    "python/sglang/kernels/ops/attention/triton_gdn_fused_proj.py": "8089e19a70e0acd3e74614b499c8b5d2eff68606de2537c4cad6c649fe532bfb",
+    "python/sglang/kernels/ops/attention/linear/fused_gdn_gating.py": "ac21c53ae52ac37802acafeadfc7732a230c745da69c98aca19438488f7c0a55",
+    "python/sglang/kernels/ops/attention/linear/fused_sigmoid_gating_recurrent.py": "dc0f7c9964efe09ea0900d28ae8a74180f2060ed593eba40635e33c6c61440bc",
+    "python/sglang/kernels/ops/attention/fused_qk_rmsnorm_rope_gate.py": "c26c77e65ce865d83f79fc731effe85be1dc263c973b0ff3aa70f6367a9f91e1",
+    "python/sglang/kernels/ops/elementwise/elementwise.py": "3a4d16972225f655abe4d365a076f036955b18d210ec1da72b85ead2c3028d3b",
+    "python/sglang/srt/layers/attention/qsa/kernel.py": "cbaab3e0d1c5f75bd58eb03d6d28da6bb0b411747d16dc2743b49afc23640dd9",
+    "python/sglang/srt/layers/attention/qsa/sparse_attn.py": "6577a659a47cb97388d0f95341f7744b5476f6e18aa8083d07dcb5ca453c8b38",
+    "python/sglang/srt/layers/attention/qsa/mqa.py": "6955e638f6a514fdd41c4d4846100c2f3e15b8a4e8f82160297d09ec3b8264d8",
+    "python/sglang/srt/models/qwen3_5.py": "a7cce068d488f82e2eafce7f6f7ad1d548f47f59955210236383fe07ce55aab1",
+    "python/sglang/kernels/jit/csrc/elementwise/fast_topk.cuh": "0559b987ed8a9f701e9b41595444b9c614f6bcf3fbbdc4d05b79d6cd51491529",
+    "python/sglang/kernels/ops/attention/fast_topk.py": "a17180477295060066aec757c5a300b12bd2756a9f1748f47a21476044e12fd9",
+    "python/sglang/srt/layers/attention/qsa/qsa_indexer.py": "9d4f9f0de76a240dac49904acd4b24e4af00e148411958cf1366d164f93223b1",
+    "python/sglang/srt/models/qwen4_exp.py": "e373c018e3ba13be7330dc6b74cf204fb02d400892a3113326ca26b012cfc4d0",
+    "python/sglang/srt/models/qwen2.py": "5f464221a18262864e1a0e405ec7ff75d06e2d8eeca99948fec8f422b60ed448",
+    "python/sglang/srt/layers/activation.py": "bf4c74c83d15e25c71c3ea5351fcc874ec1b43eba290c78a4e591f86f5b5f03a",
+    "python/sglang/kernels/jit/utils/compile/cpp_args.py": "8ff45d45f3ff4bc91d9d5532bc5c1c2b00141f92fd61757e09bbc8859896a7ee",
+    "python/sglang/kernels/ops/quantization/fp8_kernel.py": "1201c78090f9f70b78b2b6fcde88647fd9d029151d93a67507b79ec509718ee1",
+    "python/sglang/kernels/ops/moe/fused_moe_triton_kernels.py": "67276d4b983e442c072c3b0788a0af592b5d9aa8a2692911d4af94337f63ca7b",
+    "python/sglang/kernels/ops/activation/activation.py": "b862e39632cc98b28f6818fdc485442db43e55f83e98ebbcb26e6460fc762f0a",
+    "python/sglang/kernels/ops/moe/moe_align.py": "22ed332b37238a321012683a164b39748b0b88e380ca2aed9a8befb0b68dd4b6",
+    "python/sglang/srt/layers/moe/moe_runner/triton_utils/moe_align_block_size.py": "b8f616c390b20cbb95e9d72d1e43084624054c7c68e2fda6fa5467be56039d52",
+    "python/sglang/srt/layers/moe/moe_runner/triton_utils/fused_moe_triton_config.py": "ca9935897b7567c8a022d61b88b31845cbf3efad95d4e68af008c824c9ca7a96",
+    "python/sglang/kernels/ops/activation/silu_and_mul_block_quant.py": "8d07079b14555c8f209453d91ee613b009597a696916cfa223aceaad166bc2ee",
+    "python/sglang/srt/layers/moe/moe_runner/triton_utils/fused_moe.py": "1b64fa76feb50676cb4dd77ecbc396d09f89c3ccd1da861c9f070feca6836572",
+    "python/sglang/srt/layers/moe/topk.py": "17d2f2ed25f255684c6134f99ed135dabbd48405c0c9127a45f3cb08432306a6",
+    "python/sglang/srt/models/qwen2_moe.py": "e64bf8deb427e14b3ab85fe46c6960073f9f16dd2aaf7bc0fd1d06f09d5ef174",
+    "python/sglang/srt/mem_cache/ple_state_pool.py": "720751bfbb62907a8527c22b6266297430da1e529634a88d57c14189fb4db0a9",
+    "python/sglang/srt/models/qwen4_exp_ple_table.py": "02acd61c3a6a94c2d7d26f25b3b51ad5dd4fd4f06d3596b80130f7158f837245",
+    "python/sglang/kernels/numerics.py": "095d9d39524be7d0c392932a33a2795f9a8d497e147b588c0ffe232316a1a492",
+    "python/sglang/kernels/ops/embeddings/qwen4_ngram.py": "316b7bf976a7fb7ace80fa537a4aef091369f7eea8f3e0cae04610b45a90d6c9",
+    "python/sglang/kernels/ops/elementwise/qwen4_gate.py": "8fc4e918b49c9eda1e7cee3855af81317e6f55fc3f1d0254fdafea196f7065db",
+    "python/sglang/kernels/ops/mamba/qwen4_short_conv.py": "771b919ae8e3c067b238aafa37e0642437c3b4a638facf16a2ad5aa4a9ef4ff8",
+    "python/sglang/kernels/ops/gemm/fp8_kernel.py": "554f00527e7753daddccbb90a3c4b37ade22fd19fbc48075c54f50ae33660904",
+    "python/sglang/kernels/jit/csrc/moe/moe_align_kernel.cu": "387dd3272a8e79fea9efc33da3d3c62d3f3f8f4e4d3de7b705f72e4991c35d16",
+    "python/sglang/kernels/jit/csrc/elementwise/activation.cuh": "7a73dcaccf54798c38e936be083ce895be3f9e7eb95d20f8b544ea962c3ab10f",
+    "test/manual/pdmux/validate_segmented_bcg_cuda.py": "5391b8ad37ac778b39456833ee222d98d396bad751cb008091dc412ef0c38c28"
+  },
+  "git_commit": "050f5683330bef795bd7162b009b1f293eb7d193",
+  "tp_size": 1,
+  "dynamic_input_variants": 2
+}

@@ -1,0 +1,21 @@
+Pre-fix source: 8f4fb9f900
+test_fresh_forward_batch_can_enter_split_without_adapter_fields (fb_field_regression.TestPdmuxMainCompat)
+The real worker creates a fresh FB; it must own its initial cursor. ... ERROR
+
+======================================================================
+ERROR: test_fresh_forward_batch_can_enter_split_without_adapter_fields (fb_field_regression.TestPdmuxMainCompat)
+The real worker creates a fresh FB; it must own its initial cursor.
+----------------------------------------------------------------------
+Traceback (most recent call last):
+  File "/Users/guoqing/Desktop/workspaces/sglang/test/registered/unit/multiplex/test_pdmux_main_compat.py", line 114, in test_fresh_forward_batch_can_enter_split_without_adapter_fields
+    self.assertIsNone(run(runner, first))
+  File "python/sglang/srt/model_executor/runner_utils/pdmux.py", line 57, in run_split_prefill
+    # including when the logical token count is not divisible by CP size.
+AttributeError: 'ForwardBatch' object has no attribute 'split_index'
+
+----------------------------------------------------------------------
+Ran 1 test in 0.020s
+
+FAILED (errors=1)
+
+Expected pre-fix failure reproduced

@@ -56,6 +56,36 @@ def load_method(path, owner, name, **namespace):
 
 
 class TestPdmuxMainCompat(unittest.TestCase):
+    def test_active_split_graph_pins_its_lane_until_final_interval(self):
+        """Repartitioning midway would select another graph's activations."""
+        selected, trace = [0], []
+        activate = load_method(
+            "python/sglang/srt/multiplex/multiplexing_mixin.py",
+            "SchedulerMultiplexMixin",
+            "_activate_pdmux_stream_group",
+            get_current_stream_idx=lambda: selected[0],
+            set_current_stream_idx=lambda index: selected.__setitem__(0, index),
+        )
+        executor = SimpleNamespace(owner=object())
+        stream = SimpleNamespace(synchronize=lambda: trace.append("drain"))
+        groups = [(stream, stream), (object(), object())]
+        scheduler = SimpleNamespace(
+            stream_groups=groups,
+            tp_worker=SimpleNamespace(
+                model_runner=SimpleNamespace(
+                    prefill_cuda_graph_runner=SimpleNamespace(
+                        pdmux_split_executor=executor
+                    )
+                )
+            ),
+            _update_decode_attn_backends=lambda index: trace.append(index),
+        )
+        self.assertEqual(activate(scheduler, 1), (0, groups[0]))
+        self.assertEqual(trace, [])
+        executor.owner = None
+        self.assertEqual(activate(scheduler, 1), (1, groups[1]))
+        self.assertEqual(trace, ["drain", "drain", 1])
+
     def test_fresh_forward_batch_can_enter_split_without_adapter_fields(self):
         """The real worker creates a fresh FB; it must own its initial cursor.
 

@@ -1,5 +1,12 @@
 # Qwen3.8-Flash-Next-FP8 with PDMux
 
+For text/plain TP without speculative decoding, prefill BCG can now be selected
+in either split or standard mode. [Generic segmented/standard BCG implementation
+and real-layer results](segmented_bcg_cuda_20261107/README.md) include the
+ForwardBatch initialization fix, dynamic-input checks and four-mode timing
+comparison. Commands below with prefill graphs disabled remain the eager
+baseline; MTP still requires that eager prefill profile.
+
 Checkpoint: `Qwen/Qwen3.8-Flash-Next-FP8`. Its config declares
 `Qwen4ExpForConditionalGeneration` (`qwen4_exp`), with 48 hybrid GDN/QSA layers,
 4 HyperConnection streams, PLE and block FP8 weights. Keep the model's existing
