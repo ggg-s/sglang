@@ -376,7 +376,7 @@ class BreakableCUDAGraph:
         stream = get_device_module().current_stream()
         token = _current_stream_var.set(stream)
         try:
-            if self._hicache_graph_events is not None:
+            if self._hicache_graph_events is not None and start == 0:
                 self._hicache_graph_events.bind(
                     self._segments, self._hicache_wait_nodes
                 )

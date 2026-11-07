@@ -251,7 +251,12 @@ def test_run_eager_method_torch_compile():
 
 def test_split_intervals_partition_eager_breaks_and_run_tail_once(monkeypatch):
     """A yield must neither repeat preparation nor omit the final eager tail."""
-    graph = bcg.BreakableCUDAGraph()
+    bindings = []
+    graph = bcg.BreakableCUDAGraph(
+        hicache_graph_events=SimpleNamespace(
+            bind=lambda *args: bindings.append("bound")
+        )
+    )
     state = torch.zeros(1)
     events = []
     actions = [
@@ -271,9 +276,11 @@ def test_split_intervals_partition_eager_breaks_and_run_tail_once(monkeypatch):
     assert state.item() == 5 and events == [0, 1]
     graph.replay_layers(1, 2)
     assert state.item() == 42 and events == [0, 1, 2, 3]
+    assert bindings == ["bound"]
     state.zero_()
     graph.replay()
     assert state.item() == 42
+    assert bindings == ["bound", "bound"]
     with pytest.raises(ValueError):
         graph.replay_layers(1, 3)
     graph._layer_ends = {2: 4}
