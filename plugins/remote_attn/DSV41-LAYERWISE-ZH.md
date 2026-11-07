@@ -212,7 +212,8 @@ P 端仍可保留 radix cache。
   result handler 通过结果上的 plan 找回对应发送区间；不依赖共享 `controller.plan`。
 - 同请求的多个 middle→final plan 共用请求租约。middle 在 forward event 后按原生
   sender FIFO 提前入队；final 仅预留尚未发送的页，仍由原生 final 接口发送 SWA、
-  carry 和 metadata。`inflight_middle_chunks > 0` 不再单独导致长请求回退。
+  carry 和 metadata。middle/final 身份沿用批次的 `chunked_req`；请求的
+  `inflight_steps` 统计所有未处理 step，不能用作 middle-chunk 标志。
 - 页索引在原生 forward stream 等待 schedule stream 后做 pinned D2H，索引 event
   随原生 `indices_event` 传给 worker；GPU/host 索引的引用保留至 IO 完成。
 - 正常完成要同时满足：所有相关 launch 的 forward event、原生已提交采样/回拷的

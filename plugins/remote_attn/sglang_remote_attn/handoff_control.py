@@ -9672,9 +9672,7 @@ def _handle(scheduler, data):
                         }
                     ),
                     "finished": bool(req.finished()),
-                    "inflight_middle_chunks": int(
-                        getattr(req, "inflight_middle_chunks", 0) or 0
-                    ),
+                    "inflight_steps": int(req.inflight_steps),
                     "held": bool(getattr(req, "handoff_held", False)),
                 }
             )

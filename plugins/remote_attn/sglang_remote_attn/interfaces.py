@@ -312,6 +312,7 @@ CORE_CALLS = {
 }
 CORE_PROPERTIES = (DISAGG + "mooncake.pinned_staging_core.CorePinnedStager.poisoned",)
 CORE_FIELDS = {
+    "sglang.srt.managers.schedule_batch.ScheduleBatch": ("chunked_req",),
     "sglang.srt.managers.schedule_batch.ReqKvInfo": ("swa_retained_ranges",),
     "sglang.srt.managers.scheduler_components.invariant_checker.SchedulerInvariantChecker": (
         "get_external_kv_owners",
@@ -349,7 +350,13 @@ CORE_STATE = {
     ),
     "sglang.srt.managers.schedule_batch.Req.__init__": (
         "self",
-        ("cache_request_handle", "last_node", "lock", "retraction_count"),
+        (
+            "cache_request_handle",
+            "last_node",
+            "lock",
+            "retraction_count",
+            "inflight_steps",
+        ),
     ),
     "sglang.srt.mem_cache.unified_radix_cache.UnifiedRadixCache.__init__": (
         "self",

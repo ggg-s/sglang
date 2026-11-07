@@ -1,0 +1,48 @@
+{
+  "baseline": "b8272bd0f6",
+  "upstream_removal": "dbeecc932d",
+  "middle_chunk_identity": "req is batch.chunked_req",
+  "legacy_counter_fallback": false,
+  "tests": {
+    "main": {
+      "passed": true,
+      "count": 377,
+      "elapsed_s": 188.909
+    },
+    "contracts": {
+      "passed": true,
+      "count": 23,
+      "elapsed_s": 18.581
+    },
+    "focused": {
+      "passed": true,
+      "count": 3,
+      "elapsed_s": 7.026,
+      "included_in_main": true
+    }
+  },
+  "preflight": {
+    "source_hooks": 51,
+    "core_interfaces": 132
+  },
+  "negative_control": {
+    "baseline": "b8272bd0f6",
+    "restored_files": [
+      "plugins/remote_attn/sglang_remote_attn/pre_layerwise.py",
+      "plugins/remote_attn/sglang_remote_attn/dsv41_layerwise.py"
+    ],
+    "expected_failure_confirmed": true,
+    "errors": 4,
+    "error": "AttributeError: inflight_middle_chunks",
+    "elapsed_s": 1.656
+  },
+  "full_model_serving": false,
+  "h20_validation": false,
+  "sha256": {
+    "plugins/remote_attn/sglang_remote_attn/pre_layerwise.py": "4eef05832eb0d6327cc6e3a7e5b2c3bc04c738f9142683d43166ff817b1f6f86",
+    "plugins/remote_attn/sglang_remote_attn/dsv41_layerwise.py": "ba3d08163f62303d7db495eb0569168d3610a6f0a6bae2a93780d0105113a87a",
+    "plugins/remote_attn/sglang_remote_attn/handoff_control.py": "5cb55b20b78a5e750c5eb7aedd1b27c902abd408b8d1cb5b4ab084a18adf0696",
+    "plugins/remote_attn/sglang_remote_attn/interfaces.py": "c9f15807a891ced423733238bc10d088a5754802303db335b336b441fbfce95c",
+    "test/registered/unit/plugins/test_remote_attn.py": "aa7f1ac9f8dde3805b8c6dc485f2f9149a682d43daaca5c39b7058896239fefa"
+  }
+}

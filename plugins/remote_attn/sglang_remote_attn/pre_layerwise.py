@@ -850,7 +850,7 @@ class Controller:
             if (
                 not req.pending_bootstrap
                 and getattr(req, "session_id", None) is None
-                and req.inflight_middle_chunks <= 0
+                and req is not batch.chunked_req
                 and req.extend_end == len(req.origin_input_ids)
                 and req.multimodal_inputs is None
                 and req.input_embeds is None

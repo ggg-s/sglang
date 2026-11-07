@@ -525,7 +525,7 @@ class DSV41Controller(Controller):
                 type(sender) is MooncakeKVSender
                 and not req.pending_bootstrap
                 and not getattr(req, "session_id", None)
-                and (allow_middle or req.inflight_middle_chunks <= 0)
+                and (allow_middle or req is not batch.chunked_req)
                 and (allow_middle or req.extend_end == len(req.origin_input_ids))
                 and req.multimodal_inputs is None
                 and req.input_embeds is None

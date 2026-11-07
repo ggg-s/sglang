@@ -1688,7 +1688,7 @@ class TestRemoteAttn(CustomTestCase):
             req.pending_bootstrap = False
             req.start_send_idx = req.disagg_decode_prefix_len = 0
             req.extend_end, req.extend_len = 8, 4
-            req.inflight_middle_chunks = 0
+            req.inflight_steps = 0
             req.multimodal_inputs = req.input_embeds = None
             cache, guard = c.cache, CacheGuard(c.cache)
             controller = self.hooks.pre_layerwise.Controller.__new__(
@@ -1818,6 +1818,40 @@ class TestRemoteAttn(CustomTestCase):
         if enabled:
             self.assertIsNotNone(f.plan)
         return f
+
+    def test_prefill_qualification_uses_batch_chunk_not_request_counter(self):
+        """Merged Req lacks the old counter; only the batch identifies its middle chunk."""
+        for dsv in (False, True):
+            for parked in (False, True):
+                with self.subTest(dsv=dsv, parked=parked):
+                    f = self._prefix_stream_fixture(dsv=dsv)
+                    req, batch = f.req, f.batch
+                    self.assertFalse(hasattr(req, "inflight_middle_chunks"))
+                    req.extend_end = len(req.origin_input_ids)
+                    req.extend_len = req.extend_end - req.start_send_idx
+                    req.inflight_steps = 0
+                    # Even if the live Req has advanced, this batch is still
+                    # a middle chunk; it must not consume the final sender tail.
+                    batch.chunked_req = req
+                    cursor = f.sender.curr_idx
+                    with patch.dict(sys.modules, f.modules):
+                        self.assertIsNone(f.controller.prepare(batch))
+                        self.assertEqual(f.sender.curr_idx, cursor)
+                        self.assertFalse(f.plan.bound)
+                        if dsv:
+                            self.assertIsNotNone(
+                                f.controller.candidates(batch, allow_middle=True)[0]
+                            )
+                        # A previous launched step, or another parked request,
+                        # cannot turn this final batch into a middle chunk.
+                        req.inflight_steps = 1
+                        batch.chunked_req = object() if parked else None
+                        jobs = f.controller.prepare(batch)
+                    self.assertTrue(jobs)
+                    source = jobs[0] if dsv else jobs[0][0]
+                    self.assertIs(source, f.plan.source)
+                    self.assertTrue(f.plan.bound)
+                    self.assertEqual(req.start_send_idx, len(req.origin_input_ids))
 
     def test_prefix_stream_off_preserves_native_cached_send(self):
         """The ablation must keep the native cached chunk without range ownership."""
@@ -9820,7 +9854,7 @@ class TestRemoteAttn(CustomTestCase):
         req = SimpleNamespace(
             disagg_kv_sender=sender,
             pending_bootstrap=False,
-            inflight_middle_chunks=0,
+            inflight_steps=0,
             extend_end=16,
             extend_len=16,
             origin_input_ids=list(range(length)),
@@ -9924,6 +9958,7 @@ class TestRemoteAttn(CustomTestCase):
         )
         batch = SimpleNamespace(
             reqs=[req],
+            chunked_req=None,
             forward_mode=SimpleNamespace(
                 is_extend=lambda: True,
                 is_split_prefill=lambda: False,
@@ -13137,7 +13172,7 @@ class TestRemoteAttn(CustomTestCase):
             req = SimpleNamespace(
                 disagg_kv_sender=sender,
                 pending_bootstrap=False,
-                inflight_middle_chunks=1,
+                inflight_steps=0,
                 extend_end=9,
                 extend_len=5,
                 origin_input_ids=list(range(9)),
@@ -13149,6 +13184,7 @@ class TestRemoteAttn(CustomTestCase):
             )
             batch = SimpleNamespace(
                 reqs=[req],
+                chunked_req=req,
                 forward_mode=SimpleNamespace(
                     is_extend=lambda: True,
                     is_split_prefill=lambda: False,
@@ -13194,7 +13230,7 @@ class TestRemoteAttn(CustomTestCase):
             ):
                 self.assertIsNone(controller.prepare(batch))
                 self.assertEqual(sender.curr_idx, 4)
-                req.inflight_middle_chunks = 0
+                batch.chunked_req = None
                 # Deployment allows 32K, but this actual tail has five tokens.
                 # A skipped layerwise plan must leave native sending untouched.
                 offer_path = root / "7/0/offer.json"
@@ -13411,6 +13447,8 @@ class TestRemoteAttn(CustomTestCase):
     def test_prelayer_preflight_rejects_missing_task_state_and_environment(self):
         """Mixed core files must fail before a worker accesses absent fields."""
         cases = (
+            ("sglang.srt.managers.schedule_batch.ScheduleBatch", "chunked_req"),
+            ("sglang.srt.managers.schedule_batch.Req.__init__", "inflight_steps"),
             ("sglang.srt.managers.utils.GenerationBatchResult", "delay_sample_func"),
             ("sglang.srt.managers.scheduler.Scheduler.run_batch", "copy_done"),
             (
