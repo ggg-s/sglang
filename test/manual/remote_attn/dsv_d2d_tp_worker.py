@@ -161,6 +161,33 @@ def main():
         assert not e.source.d2d_plans and not e.req._handoff_frozen and not e.freed
         e.req._dsv41_remote = None
 
+        # A request may finish on either shard after the status snapshot.
+        # Both ranks must return the same window-loss result without publishing
+        # an owner, changing batch membership, or releasing source KV.
+        for finished_rank in (0, 1):
+            batch = e.source.scheduler.running_batch
+            before = list(batch.reqs)
+            with patch.object(
+                e.req, "finished", return_value=args.rank == finished_rank
+            ):
+                skipped = d2d.handle(
+                    e.source,
+                    dict(
+                        cmd="d2d_freeze",
+                        migration_epoch=f"finished-window-{finished_rank}",
+                        rid="source",
+                        destination="D1",
+                        target_rid="target",
+                    ),
+                )
+            assert skipped == dict(
+                deferred=True,
+                migration_deferred_reason="request_finished",
+                retryable=False,
+            )
+            assert not e.source.d2d_sources and not e.req._handoff_frozen
+            assert batch.reqs == before and e.req.kv.holds_kv and not e.freed
+
         # One rank lacks capacity: neither shard may freeze or allocate a row.
         plans = prepare("no-capacity")
         available = e.target.scheduler.req_to_token_pool.available_size
@@ -347,6 +374,7 @@ def main():
                     tp_partial_remote_waits_for_peer_gpu=partial_ok,
                     tp_partial_commit_never_admits=True,
                     reserved_before_freeze=True,
+                    tp_finished_window_ranks=[0, 1],
                     tp_preflight_rejected_before_freeze=True,
                     asymmetric_gpu_blocks_both=True,
                     decode_before_copy=True,

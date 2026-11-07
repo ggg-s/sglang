@@ -16103,6 +16103,7 @@ class TestRemoteAttn(CustomTestCase):
                             tp_partial_remote_waits_for_peer_gpu=True,
                             tp_partial_commit_never_admits=True,
                             reserved_before_freeze=True,
+                            tp_finished_window_ranks=[0, 1],
                             tp_preflight_rejected_before_freeze=True,
                             asymmetric_gpu_blocks_both=True,
                             decode_before_copy=True,

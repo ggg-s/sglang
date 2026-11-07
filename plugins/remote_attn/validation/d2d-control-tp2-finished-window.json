@@ -1,0 +1,28 @@
+{
+  "baseline": "94fa153418",
+  "test": "TestRemoteAttn.test_dsv_d2d_tp2_asymmetric_completion_and_quarantine",
+  "passed": true,
+  "elapsed_s": 4.659,
+  "backend": "two CPU processes, Gloo",
+  "finished_rank_cases": [
+    0,
+    1
+  ],
+  "all_ranks_report_request_finished": true,
+  "all_ranks_report_non_retryable": true,
+  "no_source_owner_created": true,
+  "no_batch_membership_change": true,
+  "no_source_free": true,
+  "negative_control": {
+    "handle_baseline": "165575c97e",
+    "passed": false,
+    "elapsed_s": 4.448,
+    "expected_failure": "TP D2D freeze preflight rejected; generic D2D owner/native Decode boundary and peer rejected"
+  },
+  "sha256": {
+    "test/manual/remote_attn/dsv_d2d_tp_worker.py": "1b72d0eca17d0735cc49779aa81c9a0b567530ee9e94fe6ee2f908f0389c9a8e",
+    "test/registered/unit/plugins/test_remote_attn.py": "2a9cbe804444c46d2ea8927ba07126724ad5dda75f02213de2714e192c2dbc06",
+    "plugins/remote_attn/control_plane/p2d_driver.py": "3a1539a813e2a1eba3679f63e766ef609290990b93c72a9078941ff68f7b50d2",
+    "plugins/remote_attn/sglang_remote_attn/dsv_d2d.py": "2ef0a06c7d38affd14efa9da5f0e6cd2943705c3b3dbcd95f3e284e2f0f63dd7"
+  }
+}

@@ -77,6 +77,17 @@ SSE 在 cursor=31 后仅给出目标 seq=32 的后续 token。该探针的 Gatew
 发送文件，因此未将该补充用例纳入本次提交；现有 TP2 回归与单 rank 窗口归因回归
 均已通过。
 
+补充 TP2 窗口归因验证已完成：真实双进程 Gloo 中，分别仅令 rank 0 或 rank 1
+在 freeze 预检前发现请求已结束。两个进程均返回相同的 `request_finished`、
+`retryable=false`；没有创建 Source、修改 batch membership、冻结请求或释放源 KV。
+该用例扩展既有 TP2 回归，总测试项数不变；定向执行 1 项通过（4.659 s）。
+
+负对照在独立快照中仅将 D2D `handle` 恢复为 `165575c97e` 的版本，其余代码和
+新增用例保持一致；同一用例失败，复现泛化的 `D2D owner or needs native Decode
+boundary` / `peer rejected` 报错。验证使用 CPU 小池和真实 Gloo collective，
+不等同于两张 GPU 或跨机 TP 的验收。结果及源码哈希见
+[d2d-control-tp2-finished-window.json](d2d-control-tp2-finished-window.json)。
+
 没有 H20 内网访问能力，未测 H20 完整模型、跨机 RDMA、冷热缓存下 c=4/8 的
 实际迁移窗口/TTFT/吞吐。H20 复测应先全量预热，再分别记录 c=4/8 的 plan/reserve
 是否在 cut 前完成、实际目标续 token 数、request_finished 次数，以及 control 与
