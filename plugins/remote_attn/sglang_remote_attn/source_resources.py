@@ -102,6 +102,11 @@ def owned_requests(controller):
         for target in getattr(controller, "d2d_targets", {}).values()
         if not target.closed
     )
+    reqs.extend(
+        ticket.req
+        for ticket in getattr(controller, "d2d_reservations", {}).values()
+        if ticket is not None and not ticket.cancelled and not ticket.consumed
+    )
     return reqs
 
 

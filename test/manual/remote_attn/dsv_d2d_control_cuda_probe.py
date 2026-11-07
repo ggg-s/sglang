@@ -27,8 +27,8 @@ def run(concurrency):
     gw = None
     try:
         for req in e.requests:
-            req.output_ids[:] = [31]
-            req.kv.kv_committed_len = req.kv.kv_allocated_len = 31
+            req.output_ids[:] = []
+            req.kv.kv_committed_len = req.kv.kv_allocated_len = 0
             req.sampling_params.max_new_tokens = 128
         driver = Driver.__new__(Driver)
         driver.env = e
@@ -58,6 +58,14 @@ def run(concurrency):
         assert driver.count("d2d_freeze") == 0
         assert all(not req._handoff_frozen for req in e.requests)
         epochs = [gw.entry(rid)["epoch"] for rid in rids]
+        from sglang_remote_attn.source_resources import owned_requests
+
+        tickets = [e.target.d2d_reservations[epoch] for epoch in epochs]
+        assert {id(t.req.kv) for t in tickets} == {
+            id(r.kv) for r in owned_requests(e.target)
+        }
+        assert all(gw.entry(rid)["plan_before_first_token"] for rid in rids)
+        assert all(not req.output_ids for req in e.requests)
         # Model/sampling boundary: reach the cut on the same shared source batch.
         for req in e.requests:
             req.output_ids[:] = list(range(31, 63))
@@ -81,6 +89,9 @@ def run(concurrency):
             gw.entry(r) for r in rids
         ]
         targets = [e.target.d2d_targets[epoch] for epoch in epochs]
+        owners = owned_requests(e.target)
+        assert {id(t.decode_req.req.kv) for t in targets} == {id(r.kv) for r in owners}
+        assert not ({id(t.req) for t in tickets} & {id(r) for r in owners})
         assert len({t.decode_req.req.kv.req_pool_idx for t in targets}) == concurrency
         assert all(s.committed and not s.poll() for s in sources)
         assert not e.freed and len(e.resumed) == concurrency
@@ -114,13 +125,18 @@ def run(concurrency):
         return dict(
             concurrency=concurrency,
             cut=32,
-            first_token_preparations=concurrency,
+            pre_sample_preparations=concurrency,
+            reservation_owners_accounted=concurrency,
+            consumed_owners_transferred=True,
             migrations=concurrency,
             partial_remote_frozen=concurrency,
             destination_first_tokens=concurrency,
             source_free_count=len(e.freed),
             returned_reservation_tokens=len(e.returned_tokens[1]),
             handoff_observations=gw.latency_metrics()["handoff_latency_ms"]["count"],
+            freeze_ack_observations=sum(
+                gw.entry(rid)["freeze_ack_latency_ms"] is not None for rid in rids
+            ),
             source_native_pd_retired_before_export=True,
             source_retained_until_reader_retirement=True,
             mooncake_transfers=len(e.transport.calls),
@@ -147,6 +163,7 @@ def main():
         "plugins/remote_attn/sglang_remote_attn/dsv_d2d.py",
         "plugins/remote_attn/sglang_remote_attn/dsv_d2d_reservation.py",
         "plugins/remote_attn/sglang_remote_attn/dsv_gateway_control.py",
+        "plugins/remote_attn/sglang_remote_attn/source_resources.py",
         "test/manual/remote_attn/dsv_d2d_partial_probe_support.py",
         "test/manual/remote_attn/dsv_d2d_control_cuda_probe.py",
     ]

@@ -64,16 +64,20 @@ Remote Attention 的 RemoteHub/mesh 地址仍按 [多机部署](MULTI-PD-ZH.md) 
 
 ## 控制面与迁移窗口
 
-Gateway 在首个已采样 token 可见、请求可安全规划时就执行 plan/reserve；
-不再等 `cut` 才开始三跳串行控制。预留成功进入持久化 `WAIT_CUT`，源继续生成，
-到 `cut` 或显式请求迁移时才进入 FREEZE。同一 epoch 支持等待、重启恢复和取消。
+Gateway 在源 Decode 已接纳请求、可安全规划时就执行 plan/reserve，即使
+尚无采样 token、Prefill 尚在执行；不再把首 token 作为准备门槛。预留成功进入持久化 `WAIT_CUT`，源继续生成，
+至少有一个真实采样 token，且到 `cut` 或显式请求迁移时才进入 FREEZE。同一 epoch 支持等待、重启恢复和取消。
 plan 不要求 native Decode 边界；freeze 仍必须在调度器线程的安全边界执行。
 
 提前预留需覆盖源继续生成期间的长度变化，因此预留上界至少覆盖剩余输出上限，
-由 worker 的采样上限与原生 context 容量截断。相比临近 cut 才预留，这会更早占用
-D1 row/KV；目标容量不足时沿用原有失败/回滚流程。源提前结束或取消会撤销目标
+由 worker 的采样上限与原生 context 容量截断。无采样输出时，下界为完整 prompt
+长度；原生预留所需的 pending-token 占位仅存于 D1 未准入的 ticket，源输出始终
+保持真实。证书绑定源 Req、cache attempt、retraction 计数、prompt/输出前缀和
+sampling 配置；期间回退或更换历史会拒绝旧证书并走显式回滚。
+相比临近 cut 才预留，这会更早占用 D1 row/KV；目标容量不足时沿用原有失败/回滚流程。源提前结束或取消会撤销目标
 预留，不能让 ticket 隐式过期。实际 import 只消费冻结长度，多预留的尾部按原生
-页对齐规则退还。
+页对齐规则退还。未消费 ticket 作为外部 KV owner 参与原生 row/FULL/SWA
+检查；消费后由 Target 接管，取消后退出计账，不能重复计入同一 KV record。
 
 空闲入口的原生 zmq Poller 增加管道唤醒：后台 watcher 每 5 ms 只检查控制文件名，
 不读取请求、不执行命令、不访问 KV 或 TP。命令仍经原生 request broadcast 由
@@ -85,18 +89,29 @@ Gateway 的 status 轮询遇到排队中的修改命令会让行，驱动收取 
 角色锁等待与 RPC 总耗时（含失败尝试，进程重启清零）；`handoff_latency_ms` 记录
 freeze 首次提交至目标 commit/admit 成功的耗时，从 journal 恢复。每请求还暴露
 `prepare_latency_ms`、`handoff_latency_ms` 和 `migration_skip_reason`。
+`plan_before_first_token` 表示各 TP rank 规划时输出都为空，不代表预留或迁移已完成；
+`freeze_ack_latency_ms` 是首次发出 freeze 至首次收到已冻结确认的耗时上界，
+包括控制等待及该次回复之前的准备，不等同于 worker 内纯冻结执行时间。
 worker 发现请求已结束时返回结构化 `request_finished`，Gateway 撤销预留并报告
 `migration_outcome=window_missed_request_finished`；语义拒绝单独报告
 `semantic_rejection`，可重试的 native 边界等待仍使用 `migration_deferred`。
 `migration_skip_reasons` 汇总当前 journal 中的跳过原因。
 
-验证与 H20 复测边界见 [控制面窗口验证](validation/D2D-CONTROL-LATENCY.md)。
+验证与 H20 复测边界见 [控制面窗口验证](validation/D2D-CONTROL-LATENCY.md)
+和 [首 token 前准备](validation/D2D-PRE-SAMPLE-PREPARATION.md)。
+
+源只需要在自然结束前完成 freeze，成功冻结后不会继续 Decode 至 finished；
+之后旧 PD 退休、import 和 commit 仍是用户可见停顿，不能用“冻结成功”推断迁移
+有收益。128-token 短请求若以延迟为目标，应比较迁移停顿/目标加速与剩余本地工作；
+以腾空 worker 为目标时，应同时比较自然排空时间。延长输出只能增加实验窗口，
+不能当作修复握手时延或证明短请求值得迁移。
 
 ## 数据路径与完成顺序
 
-DSV Remote 请求可在仍依赖 P 的部分 global KV entries 时进入 D2D plan。
-只接受已通过 indexer/SWA/carry/metadata barrier、持有原生 progressive PD receiver
-并登记有序退休协议的请求；Decode radix cache 仍必须禁用。
+DSV Remote 请求可在 P Prefill 期间提前 plan/reserve。
+对仍依赖 P global KV entries 的请求，freeze 仍只接受已通过
+indexer/SWA/carry/metadata barrier、持有原生 progressive PD receiver 并登记有序
+退休协议的请求；Decode radix cache 仍必须禁用。
 
 目标预留成功后，D0 在原生 Decode 边界提交待处理采样结果，冻结输出历史和 KV
 长度，并将请求移出 runnable batch。其余请求可继续执行。此时原 P→D0 的

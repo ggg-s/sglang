@@ -1,0 +1,101 @@
+{
+  "results": [
+    {
+      "concurrency": 4,
+      "cut": 32,
+      "pre_sample_preparations": 4,
+      "reservation_owners_accounted": 4,
+      "consumed_owners_transferred": true,
+      "migrations": 4,
+      "partial_remote_frozen": 4,
+      "destination_first_tokens": 4,
+      "source_free_count": 4,
+      "returned_reservation_tokens": 256,
+      "handoff_observations": 4,
+      "freeze_ack_observations": 4,
+      "source_native_pd_retired_before_export": true,
+      "source_retained_until_reader_retirement": true,
+      "mooncake_transfers": 28
+    },
+    {
+      "concurrency": 8,
+      "cut": 32,
+      "pre_sample_preparations": 8,
+      "reservation_owners_accounted": 8,
+      "consumed_owners_transferred": true,
+      "migrations": 8,
+      "partial_remote_frozen": 8,
+      "destination_first_tokens": 8,
+      "source_free_count": 8,
+      "returned_reservation_tokens": 512,
+      "handoff_observations": 8,
+      "freeze_ack_observations": 8,
+      "source_native_pd_retired_before_export": true,
+      "source_retained_until_reader_retirement": true,
+      "mooncake_transfers": 56
+    }
+  ],
+  "full_model": false,
+  "real_rdma": false,
+  "control_driver": "in-process command dispatch, not file RPC latency",
+  "sampler": "native ABI boundary fixture",
+  "sha256": {
+    "plugins/remote_attn/control_plane/p4_dsv_gateway.py": "23c204360144eff324b5a841d8e2f91ce2a2de4115c6d1acd67fe95f652ad926",
+    "plugins/remote_attn/sglang_remote_attn/dsv_d2d.py": "0d49c4a906d038eb030c449cbbb399b04372b02d3703fbdb1cd9bfa7cb958f48",
+    "plugins/remote_attn/sglang_remote_attn/dsv_d2d_reservation.py": "cdbc9e946d1800bdca0ecbef7d94d50d4e9074f1940b21a711f3e40fef14d62a",
+    "plugins/remote_attn/sglang_remote_attn/dsv_gateway_control.py": "6077331717274e7ce45e442b7ae3d25f5ea6625a02d67e0a7be41003a9df16c9",
+    "plugins/remote_attn/sglang_remote_attn/source_resources.py": "5b3208f3c01695437e45a3ff8fe8a9e51c0d4f66b102a37f9b7ac69b92a5fc0d",
+    "test/manual/remote_attn/dsv_d2d_partial_probe_support.py": "65332a4c4b4167a5f2a6557e6810fe111cfc130b6cbf0fbf66576bd76020f549",
+    "test/manual/remote_attn/dsv_d2d_control_cuda_probe.py": "c457b1f4930564046e496febd6ef4517ac9860d37db54a3784259f854006e247"
+  },
+  "baseline": "b86de9fc1b",
+  "validation": {
+    "main": {
+      "passed": true,
+      "count": 381,
+      "elapsed_s": 201.809
+    },
+    "contracts": {
+      "passed": true,
+      "count": 24,
+      "elapsed_s": 18.184
+    },
+    "native_abi": {
+      "passed": true,
+      "count": 6,
+      "elapsed_s": 0.481
+    },
+    "focused": {
+      "passed": true,
+      "count": 5,
+      "elapsed_s": 16.795,
+      "included_in_main": true
+    },
+    "ownership": {
+      "passed": true,
+      "count": 2,
+      "elapsed_s": 2.815,
+      "included_in_main": true
+    },
+    "preflight": {
+      "hooks": 51,
+      "core_interfaces": 145
+    },
+    "negative_pre_sample": {
+      "expected_failure_confirmed": true,
+      "tests": 2,
+      "failures": 2,
+      "errors": 1,
+      "reason": "sampled_output_pending"
+    },
+    "negative_owner": {
+      "expected_failure_confirmed": true,
+      "reason": "native FULL/SWA total (0,0), expected (12,4)"
+    }
+  },
+  "validation_source_sha256": {
+    "test/registered/unit/plugins/test_remote_attn.py": "21d00d87ace533231015b051c118df98efa40deed8f1b664d5107565f15c795e",
+    "test/registered/unit/plugins/test_remote_main_contracts.py": "2cac0b69e11f8d021a46b0c9b65e6e6f1d48b3a4ce918ff78bfbd0951a9237ee",
+    "test/manual/remote_attn/dsv_d2d_tp_worker.py": "17dc9b3db08a746b0beead355ae9e9b1f791fd652da6899aaceb75f39d5488fb"
+  }
+}

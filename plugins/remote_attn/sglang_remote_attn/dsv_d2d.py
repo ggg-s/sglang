@@ -242,8 +242,6 @@ def planning_blocker(req):
             reason = None
     if reason is not None:
         return reason
-    if not req.output_ids:
-        return "sampled_output_pending"
     return None
 
 
@@ -251,6 +249,8 @@ def migration_blocker(scheduler, req):
     reason = planning_blocker(req)
     if reason is not None:
         return reason
+    if not req.output_ids:
+        return "sampled_output_pending"
     return None if can_quiesce(scheduler) else "decode_boundary_pending"
 
 
@@ -1269,6 +1269,7 @@ def handle(controller, data):
             controller.d2d_source_cancelled_epochs = set()
         controller.d2d_source_cancelled_epochs.add(epoch)
         if absent:
+            getattr(controller, "d2d_plans", {}).pop(epoch, None)
             return dict(resumed=True, never_frozen=True)
         return resume_source(controller, source)
     raise ValueError("unsupported D2D command")

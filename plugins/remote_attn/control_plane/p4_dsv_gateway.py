@@ -236,6 +236,8 @@ class DsvGateway:
                                         "freeze_pending",
                                         "source_partial_remote",
                                         "migration_skip_reason",
+                                        "plan_before_first_token",
+                                        "freeze_ack_latency_ms",
                                         "prepare_latency_ms",
                                         "handoff_latency_ms",
                                     )
@@ -295,6 +297,8 @@ class DsvGateway:
             freeze_pending=entry.get("freeze_pending", False),
             source_partial_remote=entry.get("source_partial_remote", False),
             migration_skip_reason=entry.get("migration_skip_reason"),
+            plan_before_first_token=entry.get("plan_before_first_token", False),
+            freeze_ack_latency_ms=entry.get("freeze_ack_latency_ms"),
             prepare_latency_ms=entry.get("prepare_latency_ms"),
             handoff_latency_ms=entry.get("handoff_latency_ms"),
         )
@@ -572,6 +576,8 @@ class DsvGateway:
             source_partial_remote=False,
             prepare_started_at=time.time(),
             freeze_requested_at=None,
+            freeze_ack_latency_ms=None,
+            plan_before_first_token=False,
             prepare_latency_ms=None,
             handoff_latency_ms=None,
             migration_skip_reason=None,
@@ -579,7 +585,7 @@ class DsvGateway:
 
     @staticmethod
     def _cut_due(entry, request):
-        return (
+        return bool(request["output_ids"]) and (
             entry["migration_requested"] or len(request["output_ids"]) >= entry["cut"]
         )
 
@@ -650,7 +656,7 @@ class DsvGateway:
                     not entry["cut_attempted"] and entry["cut"] < entry["max_new"]
                 )
                 if prepare:
-                    if not request["plan_ready"] or not request["output_ids"]:
+                    if not request["plan_ready"]:
                         self._defer_migration(
                             entry,
                             request["plan_deferred_reason"] or "sampled_output_pending",
@@ -703,7 +709,13 @@ class DsvGateway:
             plans = [r["plan"] for r in rows]
             if len({(p["lower"], p["upper"]) for p in plans}) != 1:
                 raise RuntimeError("TP plan length mismatch")
-            self._update(rid, plans=plans, phase="RESERVE", **self._end_deferral(entry))
+            self._update(
+                rid,
+                plans=plans,
+                phase="RESERVE",
+                plan_before_first_token=all(not p["output_ids"] for p in plans),
+                **self._end_deferral(entry),
+            )
         elif phase == "RESERVE":
             rows = self._call("dst", "d2d_reserve", epoch, plans=entry["plans"])
             if not all(r.get("reserved") for r in rows):
@@ -767,6 +779,13 @@ class DsvGateway:
                 else:
                     self._defer_migration(entry, reason)
                 return
+            if entry.get("freeze_ack_latency_ms") is None:
+                self._update(
+                    rid,
+                    freeze_ack_latency_ms=max(
+                        0, (time.time() - self.entry(rid)["freeze_requested_at"]) * 1000
+                    ),
+                )
             if any(r.get("pending_retirement") for r in rows):
                 if not all(
                     r.get("frozen") and r.get("pending_retirement") for r in rows

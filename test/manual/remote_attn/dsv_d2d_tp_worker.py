@@ -98,6 +98,48 @@ def partial_freeze(root, rank):
         e.close()
 
 
+def pre_sample_reservation(root, rank):
+    """Real TP2 votes keep an unsampled source runnable while D1 owns capacity."""
+    e = Environment(root)
+    try:
+        for c in e.nodes:
+            c.rank, c.tp_size = rank, 2
+            c.scheduler.attn_tp_cpu_group = dist.group.WORLD
+            c.agree = Controller.agree.__get__(c)
+        e.req.output_ids.clear()
+        e.req.kv.kv_committed_len = e.req.kv.kv_allocated_len = 0
+        common = dict(
+            migration_epoch="pre-sample",
+            rid=e.req.rid,
+            target_rid="target",
+            destination="D1",
+        )
+        plan = d2d.handle(e.source, dict(cmd="d2d_plan", growth_tokens=8, **common))[
+            "plan"
+        ]
+        plans = [None, None]
+        dist.all_gather_object(plans, plan)
+        reserved = d2d.handle(e.target, dict(cmd="d2d_reserve", plans=plans, **common))
+        certificates = [None, None]
+        dist.all_gather_object(certificates, reserved["reservation"])
+        reply = d2d.handle(
+            e.source, dict(cmd="d2d_freeze", reservations=certificates, **common)
+        )
+        assert reply["migration_deferred_reason"] == "sampled_output_pending"
+        ticket = e.target.d2d_reservations[common["migration_epoch"]]
+        assert ticket.req.kv.kv_committed_len == plan["upper"]
+        assert not e.req.output_ids and not e.req._handoff_frozen and not e.freed
+        assert not e.source.d2d_sources
+        assert d2d.handle(e.target, dict(cmd="d2d_reserve_cancel", **common))[
+            "cancelled"
+        ]
+        assert d2d.handle(e.source, dict(cmd="d2d_resume", **common))["resumed"]
+        assert e.freed == ["target"] and not e.source.d2d_plans
+        return True
+    finally:
+        e.close()
+
+
 def main():
     parser = argparse.ArgumentParser()
     parser.add_argument("rank", type=int)
@@ -112,6 +154,7 @@ def main():
         timeout=timedelta(seconds=20),
     )
     root = Path(__file__).resolve().parents[3]
+    pre_sample_ok = pre_sample_reservation(root, args.rank)
     partial_ok = partial_freeze(root, args.rank)
     e = Environment(root)
     try:
@@ -375,6 +418,7 @@ def main():
                     tp_partial_commit_never_admits=True,
                     reserved_before_freeze=True,
                     tp_finished_window_ranks=[0, 1],
+                    tp_pre_sample_reservation=pre_sample_ok,
                     tp_preflight_rejected_before_freeze=True,
                     asymmetric_gpu_blocks_both=True,
                     decode_before_copy=True,

@@ -760,6 +760,48 @@ class TestQwenHybridD2D(CustomTestCase):
                 forward, None, NS(mm_inputs=[None], input_embeds=torch.ones(1))
             )
 
+    def test_pre_sample_reservation_keeps_native_gdn_capacity_until_cancel(self):
+        from sglang_remote_attn import dsv_d2d as d2d
+
+        f = self.environment()
+        del f.req.output_ids[:]
+        f.req.kv.kv_committed_len = f.req.kv.kv_allocated_len = 0
+        native = f.native[1]
+        before = (
+            native.allocator.available_size(),
+            native.allocator.state.slots.available_size(),
+        )
+        common = dict(
+            migration_epoch="pre-gdn",
+            destination="D1",
+            target_rid="target",
+            rid=f.req.rid,
+        )
+        plan = d2d.handle(f.source, dict(cmd="d2d_plan", growth_tokens=2, **common))[
+            "plan"
+        ]
+        reserved = d2d.handle(f.target, dict(cmd="d2d_reserve", plan=plan, **common))
+        ticket = f.target.d2d_reservations[common["migration_epoch"]]
+        self.assertEqual(ticket.req.kv.kv_committed_len, plan["upper"])
+        self.assertTrue(ticket.req.kv.holds_mamba)
+        self.assertEqual(native.allocator.state.slots.available_size(), before[1] - 1)
+        reply = d2d.handle(
+            f.source,
+            dict(cmd="d2d_freeze", reservation=reserved["reservation"], **common),
+        )
+        self.assertEqual(reply["migration_deferred_reason"], "sampled_output_pending")
+        self.assertFalse(f.req.output_ids or f.req._handoff_frozen)
+        d2d.handle(f.target, dict(cmd="d2d_reserve_cancel", **common))
+        self.assertEqual(
+            (
+                native.allocator.available_size(),
+                native.allocator.state.slots.available_size(),
+            ),
+            before,
+        )
+        self.assertFalse(ticket.req.kv.holds_kv or ticket.req.kv.holds_mamba)
+        self.assertTrue(f.req.kv.holds_mamba)
+
     def test_reserve_accounts_for_native_working_and_tracking_slots(self):
         from sglang_remote_attn import dsv_d2d as d2d
 

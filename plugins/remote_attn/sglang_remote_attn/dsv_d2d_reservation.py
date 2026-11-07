@@ -21,6 +21,10 @@ class Ticket:
     ready: object = None
 
 
+def source_attempt(req):
+    return req.cache_request_handle, getattr(req, "retraction_count", 0)
+
+
 def records(controller):
     if not hasattr(controller, "d2d_plans"):
         controller.d2d_plans, controller.d2d_reservations = {}, {}
@@ -67,7 +71,7 @@ def check_plan(controller, plan, epoch):
     lower, upper = plan["lower"], plan["upper"]
     if type(lower) is not int or type(upper) is not int or not 0 < lower <= upper:
         raise ValueError("invalid D2D reservation interval")
-    if lower != len(plan["origin_input_ids"]) + len(plan["output_ids"]) - 1:
+    if lower != len(plan["origin_input_ids"]) + max(len(plan["output_ids"]) - 1, 0):
         raise ValueError("invalid D2D reservation history")
     if upper > controller.scheduler.req_to_token_pool.req_to_token.shape[1]:
         raise ValueError("D2D reservation exceeds native request context")
@@ -78,10 +82,14 @@ def handle(controller, data):
     sources, targets = d2d.records(controller)
     epoch, cmd = data["migration_epoch"], data["cmd"]
     if cmd == "d2d_plan":
+        if epoch in getattr(controller, "d2d_source_cancelled_epochs", ()):
+            raise ValueError("D2D source epoch was cancelled")
         if epoch in sources or epoch in targets or epoch in tickets:
             raise ValueError("D2D epoch already has an owner")
         if epoch in plans:
-            plan, req = plans[epoch]
+            plan, req, attempt = plans[epoch]
+            if source_attempt(req) != attempt:
+                raise ValueError("D2D source attempt changed after planning")
             if (data["rid"], data["target_rid"], data["destination"]) != (
                 req.rid,
                 plan["target_rid"],
@@ -108,10 +116,12 @@ def handle(controller, data):
                 deferred=True, migration_deferred_reason=blocker or "peer_not_ready"
             )
         params = d2d.sampling(req)
-        lower = len(req.origin_input_ids) + len(req.output_ids) - 1
+        # A pre-sample plan describes capacity, not a frozen decode history.
+        # The earliest legal freeze is the full prompt plus one pending token.
+        lower = len(req.origin_input_ids) + max(len(req.output_ids) - 1, 0)
         growth = data.get("growth_tokens", 64)
-        if not req.output_ids or type(growth) is not int or growth < 0:
-            raise ValueError("D2D plan requires sampled output and nonnegative growth")
+        if type(growth) is not int or growth < 0:
+            raise ValueError("D2D plan requires nonnegative growth")
         upper = min(
             lower + growth,
             len(req.origin_input_ids) + params["max_new_tokens"] - 1,
@@ -133,7 +143,7 @@ def handle(controller, data):
             sampling=params,
         )
         check_plan(controller, plan, epoch)
-        plans[epoch] = (plan, req)
+        plans[epoch] = (plan, req, source_attempt(req))
         return dict(plan=plan)
     if cmd == "d2d_reserve_cancel":
         t = tickets.get(epoch)
@@ -189,7 +199,12 @@ def handle(controller, data):
             raise ValueError("D2D reservation target rid already in use")
         params = SamplingParams(**plan["sampling"])
         params.normalize(controller.scheduler.tokenizer)
-        output = plan["output_ids"] + [0] * (plan["upper"] - plan["lower"])
+        # Native allocation excludes one pending sampled token. Reserve that
+        # placeholder even when the source has not produced any output yet;
+        # it stays on this non-admitted ticket, never on the source request.
+        output = plan["output_ids"] + [0] * (
+            plan["upper"] - len(plan["origin_input_ids"]) + 1 - len(plan["output_ids"])
+        )
         req = _new_req(
             controller.scheduler,
             plan["target_rid"],
@@ -246,6 +261,14 @@ def check_freeze(controller, data, req):
     saved = plans.get(data["migration_epoch"])
     if saved is None or saved[0] != certificate or saved[1] is not req:
         raise ValueError("D2D freeze reservation does not match source plan/request")
+    if (
+        saved[2] != source_attempt(req)
+        or list(req.origin_input_ids) != certificate["origin_input_ids"]
+        or list(req.output_ids[: len(certificate["output_ids"])])
+        != certificate["output_ids"]
+        or d2d.sampling(req) != certificate["sampling"]
+    ):
+        raise ValueError("D2D source attempt/history changed after planning")
     if (data["destination"], data["target_rid"]) != (
         certificate["destination"],
         certificate["target_rid"],

@@ -7811,6 +7811,15 @@ class TestRemoteAttn(CustomTestCase):
         for name in names - {"_check_pool_invariant"}:
             setattr(checker, name, MethodType(getattr(cls, name), checker))
         self.assertEqual(checker._get_total_uncached_sizes(True), (12, 4))
+        ticket = SimpleNamespace(req=req, cancelled=False, consumed=False)
+        owner.d2d_reservations = {"prepared": ticket}
+        # A prepared ticket can be the only owner for an entire Prefill. It
+        # must count exactly once even outside all native scheduling lists.
+        owner.sources.clear()
+        owner.cache_guard.leases.clear()
+        owner.transport_quarantine.clear()
+        checker.get_request_lists = lambda: {}
+        self.assertEqual(checker._get_total_uncached_sizes(True), (12, 4))
         checker.get_last_batch, checker.get_chunked_req = lambda: None, lambda: None
         checker._check_full_pool = lambda ps, uncached=0: cls._check_pool_invariant(
             "full", ps.full_free, 0, 4, 0, 32, uncached
@@ -7831,6 +7840,16 @@ class TestRemoteAttn(CustomTestCase):
                 checker._check_req_pool()
         self.assertTrue(req.kv.holds_kv)
         self.assertEqual(kv.get_evicted_seqlen("swa"), 12)
+        ticket.consumed = True
+        owner.d2d_targets = {
+            "prepared": SimpleNamespace(
+                closed=False, decode_req=SimpleNamespace(req=SimpleNamespace(kv=kv))
+            )
+        }
+        self.assertEqual(len(checker._external_kv_owners()), 1)
+        owner.d2d_targets.clear()
+        ticket.cancelled = True
+        self.assertEqual(checker._external_kv_owners(), [])
 
     def test_source_deferred_checkpoint_reclaims_long_prompt_swa_only(self):
         from sglang_remote_attn.source_cache import CacheGuard
@@ -16178,6 +16197,7 @@ class TestRemoteAttn(CustomTestCase):
                             tp_partial_commit_never_admits=True,
                             reserved_before_freeze=True,
                             tp_finished_window_ranks=[0, 1],
+                            tp_pre_sample_reservation=True,
                             tp_preflight_rejected_before_freeze=True,
                             asymmetric_gpu_blocks_both=True,
                             decode_before_copy=True,
@@ -17619,7 +17639,7 @@ class TestRemoteAttn(CustomTestCase):
         target.worker.join(10)
         self.assertFalse(target.worker.is_alive())
 
-    def test_p4_dsv_prepares_at_first_token_waits_for_cut_and_recovers(self):
+    def test_p4_dsv_prepares_before_first_token_waits_for_cut_and_recovers(self):
         """Plan/reserve cannot consume the short request's post-cut window."""
         f = self._p4_dsv_env(accept=False)
         f.rid = f.gw.accept(
@@ -17633,8 +17653,8 @@ class TestRemoteAttn(CustomTestCase):
         )
         f.support.until(f.gw, f.rid, "SOURCE")
         req = f.e.req
-        req.output_ids[:] = [31]
-        req.kv.kv_committed_len = req.kv.kv_allocated_len = len(req.origin_input_ids)
+        req.output_ids[:] = []
+        req.kv.kv_committed_len = req.kv.kv_allocated_len = 0
         f.support.until(f.gw, f.rid, "WAIT_CUT")
         entry = f.gw.entry(f.rid)
         epoch = entry["epoch"]
@@ -17651,7 +17671,14 @@ class TestRemoteAttn(CustomTestCase):
             f.gw.tick()
         self.assertEqual(f.gw.entry(f.rid)["phase"], "WAIT_CUT")
         self.assertEqual(f.driver.count("d2d_plan"), 1)
-        req.output_ids.extend([32, 33, 34, 35])
+        self.assertTrue(entry["plan_before_first_token"])
+        self.assertFalse(req.output_ids)
+        plan = entry["plans"][0]
+        self.assertEqual(plan["lower"], len(req.origin_input_ids))
+        self.assertEqual(
+            f.e.target.d2d_reservations[epoch].req.kv.kv_committed_len, plan["upper"]
+        )
+        req.output_ids.extend([31, 32, 33, 34, 35])
         req.kv.kv_committed_len = req.kv.kv_allocated_len = (
             len(req.origin_input_ids) + 4
         )
@@ -17664,6 +17691,10 @@ class TestRemoteAttn(CustomTestCase):
             f.e.source.d2d_sources[epoch].frozen_output, tuple(req.output_ids)
         )
         self.assertEqual(f.gw.latency_metrics()["handoff_latency_ms"]["count"], 1)
+        self.assertIsNotNone(moved["freeze_ack_latency_ms"])
+        self.assertGreaterEqual(
+            moved["handoff_latency_ms"], moved["freeze_ack_latency_ms"]
+        )
         f.e.gate.set()
 
     def test_p4_dsv_finished_window_is_classified_and_reservation_cancelled(self):
@@ -17703,6 +17734,114 @@ class TestRemoteAttn(CustomTestCase):
         self.assertTrue(f.e.target.d2d_reservations[epoch].cancelled)
         self.assertEqual(f.driver.count("d2d_freeze"), 0)
         self.assertEqual(f.driver.count("d2d_commit"), 0)
+
+    def test_dsv_pre_sample_plan_reserves_native_capacity_without_fake_source_output(
+        self,
+    ):
+        from sglang_remote_attn import dsv_d2d as d2d
+        from sglang_remote_attn.dsv_gateway_control import request_status
+
+        for limit in (1, 8):
+            with self.subTest(max_new_tokens=limit):
+                e = self._d2d_env()
+                e.req.output_ids.clear()
+                e.req.sampling_params.max_new_tokens = limit
+                e.req.kv.kv_committed_len = e.req.kv.kv_allocated_len = 0
+                status = request_status(e.source, e.req)
+                self.assertTrue(status["plan_ready"])
+                self.assertFalse(status["migration_ready"])
+                self.assertEqual(
+                    status["migration_deferred_reason"], "sampled_output_pending"
+                )
+                plan, reserved = self._d2d_reserve(e, growth=limit)
+                self.assertEqual(plan["lower"], len(e.req.origin_input_ids))
+                self.assertEqual(plan["upper"], plan["lower"] + limit - 1)
+                ticket = e.target.d2d_reservations[e.epoch]
+                self.assertEqual(ticket.req.kv.kv_committed_len, plan["upper"])
+                self.assertEqual(len(ticket.req.output_ids), limit)
+                from sglang_remote_attn.source_resources import owned_requests
+
+                self.assertIn(ticket.req, owned_requests(e.target))
+                skipped = d2d.handle(
+                    e.source,
+                    dict(
+                        cmd="d2d_freeze",
+                        migration_epoch=e.epoch,
+                        rid=e.req.rid,
+                        destination="D1",
+                        target_rid="target",
+                        reservation=reserved["reservation"],
+                    ),
+                )
+                self.assertEqual(
+                    skipped["migration_deferred_reason"], "sampled_output_pending"
+                )
+                self.assertFalse(
+                    e.req.output_ids
+                    or e.req._handoff_frozen
+                    or e.source.d2d_sources
+                    or e.freed
+                )
+                e.command(e.target, "d2d_reserve_cancel")
+                e.command(e.source, "d2d_resume")
+                self.assertEqual(e.freed, ["target"])
+                self.assertNotIn(ticket.req, owned_requests(e.target))
+                self.assertNotIn(e.epoch, e.source.d2d_plans)
+                with self.assertRaisesRegex(ValueError, "cancelled"):
+                    d2d.handle(
+                        e.source,
+                        dict(
+                            cmd="d2d_plan",
+                            migration_epoch=e.epoch,
+                            rid=e.req.rid,
+                            destination="D1",
+                            target_rid="target",
+                            growth_tokens=limit,
+                        ),
+                    )
+
+    def test_dsv_prepared_reservation_rejects_changed_source_attempt_or_history(self):
+        for change in ("handle", "retraction", "prompt", "sampling"):
+            with self.subTest(change=change):
+                e = self._d2d_env()
+                plan, reserved = self._d2d_reserve(e)
+                if change == "handle":
+                    e.req.cache_request_handle = (e.req.rid, 1)
+                elif change == "retraction":
+                    e.req.retraction_count = 1
+                elif change == "prompt":
+                    e.req.origin_input_ids[0] += 1
+                else:
+                    e.req.sampling_params.temperature = 0.5
+                with self.assertRaisesRegex(ValueError, "attempt/history"):
+                    self._d2d_reserved_freeze(e, reserved)
+                self.assertFalse(
+                    e.req._handoff_frozen or e.source.d2d_sources or e.freed
+                )
+                self.assertTrue(e.target.d2d_reservations[e.epoch].req.kv.holds_kv)
+                e.command(e.target, "d2d_reserve_cancel")
+                self.assertEqual(e.freed, ["target"])
+
+    def test_p4_dsv_pre_sample_cancel_or_finish_returns_unused_reservation(self):
+        for cancel in (False, True):
+            with self.subTest(cancel=cancel):
+                f = self._p4_dsv_env()
+                f.support.until(f.gw, f.rid, "SOURCE")
+                f.e.req.output_ids.clear()
+                f.e.req.kv.kv_committed_len = 0
+                f.support.until(f.gw, f.rid, "WAIT_CUT")
+                epoch = f.gw.entry(f.rid)["epoch"]
+                if cancel:
+                    f.gw.cancel(f.rid)
+                else:
+                    f.e.req.finished = lambda: True
+                f.gw.tick()
+                self.assertEqual(f.gw.entry(f.rid)["phase"], "ROLLBACK")
+                f.gw.tick()
+                self.assertTrue(f.e.target.d2d_reservations[epoch].cancelled)
+                self.assertEqual(f.driver.count("d2d_freeze"), 0)
+                self.assertNotIn(epoch, f.e.source.d2d_plans)
+                self.assertFalse(f.e.req._handoff_frozen)
 
     def test_dsv_plan_can_prepare_before_decode_boundary_but_freeze_defers(self):
         from sglang_remote_attn import dsv_d2d as d2d
