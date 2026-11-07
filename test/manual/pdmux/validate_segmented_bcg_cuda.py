@@ -139,7 +139,11 @@ def build(fp8, bcg, ctx):
     )
     layer = stack.layers[1]
     layer._qsa_prefill_topk_bridges = []
-    layer._compute_qsa_topk_indices_eager = qsa.select
+
+    def select_eager(hidden_states, positions, forward_batch):
+        return qsa.select(hidden_states, positions, forward_batch)
+
+    layer._compute_qsa_topk_indices_eager = select_eager
     layer._compute_qsa_topk_indices = types.MethodType(
         selected.Qwen4ExpAttentionDecoderLayer._compute_qsa_topk_indices, layer
     )
