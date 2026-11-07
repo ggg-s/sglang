@@ -179,6 +179,13 @@ class Fixture:
         self.mode = "split_bcg"
         self.pools = {}
         self.capture()
+        self.variants = [
+            (self.batches[0].input_ids.clone(), self.inputs[0].clone()),
+            (
+                torch.randint(0, 256, self.batches[0].input_ids.shape, device="cuda"),
+                torch.randn_like(self.inputs[0]) * 0.1,
+            ),
+        ]
         # Exercise the production session executor, using explicit constructor,
         # I/O and LM-head boundaries around the real transformer computations.
         self.runner = NS(
@@ -242,6 +249,11 @@ class Fixture:
             for layer in self.stack.layers
             for t in (layer.mlp.topk.last.topk_ids, layer.mlp.topk.last.topk_weights)
         ]
+
+    def set_variant(self, index):
+        ids, hidden = self.variants[index]
+        self.batches[0].input_ids.copy_(ids)
+        self.inputs[0].copy_(hidden)
 
     @contextlib.contextmanager
     def forward_context(self, batch, **kwargs):
@@ -346,21 +358,30 @@ class Fixture:
     def run(self, rounds, trials):
         modes = ("eager_split", "split_bcg", "standard_eager", "standard_bcg")
         controls = []
-        for lane in (0, 1):
-            self.reset(lane)
-            controls.append(self.snapshot(lane, self.forward(lane)))
+        for variant in range(2):
+            self.set_variant(variant)
+            pair = []
+            for lane in (0, 1):
+                self.reset(lane)
+                pair.append(self.snapshot(lane, self.forward(lane)))
+            controls.append(pair)
         torch.cuda.synchronize()
         results = {}
         for mode in modes:
-            records = [self.submit(mode) for _ in range(rounds)]
+            records = []
+            for i in range(rounds):
+                with torch.cuda.stream(self.ps):
+                    self.set_variant(i % 2)
+                records.append(self.submit(mode))
             torch.cuda.synchronize()
-            for pair in records:
-                for actual, expected in zip(pair, controls):
+            for i, pair in enumerate(records):
+                for actual, expected in zip(pair, controls[i % 2]):
                     for a, b in zip(actual, expected):
                         torch.testing.assert_close(a, b, atol=0, rtol=0)
             results[mode] = dict(correctness_rounds=rounds, exact=True, samples=[])
         for trial in range(trials):
             for mode in modes[trial % 4 :] + modes[: trial % 4]:
+                self.set_variant(0)
                 torch.cuda.synchronize()
                 begin, finish = (
                     torch.cuda.Event(enable_timing=True),
