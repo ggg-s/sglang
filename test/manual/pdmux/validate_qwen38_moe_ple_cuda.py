@@ -1063,6 +1063,97 @@ def integrated_run(rounds, fp8):
     )
 
 
+def ple_progressive_run(rounds):
+    """Graph replay must consume the history committed by its previous step."""
+    p = load_ple(True)
+    pb, db = ple_batch(65), ple_batch(1, True)
+    px = torch.randn(70, 1024, device="cuda", dtype=torch.bfloat16) * 0.1
+    dx = torch.empty(1, 1024, device="cuda", dtype=torch.bfloat16)
+    inputs = torch.randn(rounds, 1, 1024, device="cuda", dtype=torch.bfloat16) * 0.1
+    tokens = torch.randint(1, 256, (rounds,), device="cuda")
+    if rounds > 5:
+        tokens[5] = 0
+    if rounds > 17:
+        tokens[17] = 0
+
+    def encode(b, x):
+        p.current.set(b)
+        batch = p.src._prepare_ple_batch(
+            b.input_ids, b, ngram_size=3, ngram_eos_token_id=0
+        )
+        p.layers[1].start_prefetch(batch, b)
+        out = x
+        for layer in p.layers:
+            out = out + layer(out, b, batch)
+        ids = p.layers[-1].ple_embedding.compute_ngram_ids(batch)
+        p.src._commit_ple_batch(batch, b)
+        return tuple(
+            t.clone()
+            for t in (
+                out,
+                ids,
+                p.ngram.context[b.req_pool_indices],
+                p.ngram.context[b.track_indices],
+                p.conv.conv_state[:, b.req_pool_indices],
+                p.conv.conv_state[:, b.track_indices],
+            )
+        )
+
+    reset_ple(p, pb)
+    prefill_control = encode(pb, px)
+    reset_ple(p, db)
+    serial = []
+    for i in range(rounds):
+        dx.copy_(inputs[i])
+        db.input_ids.copy_(tokens[i : i + 1])
+        serial.append(encode(db, dx))
+    torch.cuda.synchronize()
+    sentinel = p.ngram.context[7].clone(), p.conv.conv_state[:, 7].clone()
+    ready = torch.cuda.current_stream().record_event()
+    ps, ds = torch.cuda.Stream(), torch.cuda.Stream(priority=-1)
+    ps.wait_event(ready)
+    ds.wait_event(ready)
+    graph = torch.cuda.CUDAGraph()
+    with torch.cuda.graph(graph, stream=ds):
+        graph_outputs = encode(db, dx)
+    ds.synchronize()
+    with torch.cuda.stream(ds):
+        reset_ple(p, db)
+    records = []
+    for i in range(rounds):
+        with torch.cuda.stream(ps):
+            reset_ple(p, pb)
+            prefill = encode(pb, px)
+        with torch.cuda.stream(ds):
+            dx.copy_(inputs[i])
+            db.input_ids.copy_(tokens[i : i + 1])
+            graph.replay()
+            decode = tuple(t.clone() for t in graph_outputs)
+            torch.empty((128, 128), device="cuda").fill_(3)
+        records.append((prefill, decode))
+    ps.synchronize()
+    ds.synchronize()
+    for i, (prefill, decode) in enumerate(records):
+        for got, expected in ((prefill, prefill_control), (decode, serial[i])):
+            for a, b in zip(got, expected):
+                torch.testing.assert_close(a, b, atol=0, rtol=0)
+    if rounds >= 2:
+        torch.testing.assert_close(p.ngram.context[2], tokens[-2:], atol=0, rtol=0)
+        torch.testing.assert_close(p.ngram.context[6], tokens[-2:], atol=0, rtol=0)
+    for a, b in zip((p.ngram.context[7], p.conv.conv_state[:, 7]), sentinel):
+        torch.testing.assert_close(a, b, atol=0, rtol=0)
+    return dict(
+        name="real_ple_progressive_fp8",
+        rounds=rounds,
+        decode_cuda_graph=True,
+        reset_between_decode_steps=False,
+        changing_token_ids_and_hidden_states=True,
+        history_and_conv_exact=True,
+        outputs_exact=True,
+        untouched_slots_exact=True,
+    )
+
+
 @torch.inference_mode()
 def main():
     parser = argparse.ArgumentParser(description=__doc__)
@@ -1107,6 +1198,15 @@ def main():
             except Exception as exc:
                 traceback.print_exc()
                 report["errors"].append({"name": name, "error": str(exc)})
+        try:
+            result = ple_progressive_run(args.rounds)
+            report["cases"].append(result)
+            print(json.dumps(result), flush=True)
+        except Exception as exc:
+            traceback.print_exc()
+            report["errors"].append(
+                {"name": "real_ple_progressive_fp8", "error": str(exc)}
+            )
     if args.only in ("integrated", "all"):
         for fp8 in (False, True):
             name = f"integrated_{'fp8' if fp8 else 'bf16'}"
