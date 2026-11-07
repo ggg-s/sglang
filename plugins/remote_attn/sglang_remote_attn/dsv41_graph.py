@@ -16,7 +16,7 @@ def is_model(runner):
     config = getattr(
         getattr(runner.model_runner, "model_config", None), "hf_config", None
     )
-    return getattr(config, "model_type", None) == "deepseek_v41"
+    return getattr(config, "model_type", None) in ("deepseek_v4", "deepseek_v41")
 
 
 class DSV41GraphBackend(RemoteGraphBackend):
@@ -303,11 +303,7 @@ def bind(model_runner, owner, name, kind):
 
 def install(model_runner, runner):
     backend = getattr(runner, "attn_backend", model_runner.attn_backend)
-    if (
-        not getattr(backend, "is_dsv41", False)
-        or backend.trtllm_attn
-        or backend.mega_attn
-    ):
+    if not is_model(runner) or backend.trtllm_attn or backend.mega_attn:
         raise ValueError("DSV Remote graphs require the native flashmla backend")
     bind(model_runner, backend, "init_forward_metadata_in_graph", "metadata")
     bind(model_runner, backend, "forward", "attention")
@@ -323,7 +319,7 @@ def capture_signature(model_runner, runner):
     rows = []
     try:
         backend = runner.attn_backend
-        valid = backend.is_dsv41 and not backend.trtllm_attn and not backend.mega_attn
+        valid = is_model(runner) and not backend.trtllm_attn and not backend.mega_attn
         owners = [
             (backend, "init_forward_metadata_in_graph", ("forward_batch",)),
             (backend, "init_forward_metadata", ("forward_batch",)),
@@ -338,8 +334,7 @@ def capture_signature(model_runner, runner):
         for layer in layers:
             owner = layer.self_attn
             valid &= (
-                owner.is_dsv41
-                and owner.compress_ratio in (0, 1, 2)
+                owner.compress_ratio in ((0, 1, 2) if owner.is_dsv41 else (0, 4, 128))
                 and not owner.use_mega_attention
                 and not owner.use_fused_qk_norm_rope
             )
@@ -392,7 +387,7 @@ def capture_signature(model_runner, runner):
             rows.append((name, tuple(signature.parameters)))
         from sglang.srt.environ import envs
 
-        rows.append(("split_qkv_v1", envs.SGLANG_DSV4_USE_BF16_KV_QUANT_SOURCE.get()))
+        rows.append(("split_qkv_v2", envs.SGLANG_DSV4_USE_BF16_KV_QUANT_SOURCE.get()))
         variants = getattr(runner, "attention_graph_variants", None)
         rows.append(
             (

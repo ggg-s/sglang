@@ -55,6 +55,7 @@ def main(
     gpu_transfer=False,
     kv_layout="v41",
     serial_prepare=False,
+    model_family="v41",
 ):
     torch.cuda.set_device(0)
     native = root / "python/sglang/srt/model_executor"
@@ -307,6 +308,7 @@ def main(
             bf16_source=bf16_source,
             multi_stream=not serial_prepare,
             kv_layout=kv_layout,
+            model_family=model_family,
         )
         if transport:
             d_engine = transport.attach(f.controller, "decode")
@@ -362,7 +364,7 @@ def main(
         projection_capture_calls = len(f.projections)
         for buffer in f.cache:
             buffer.fill_(-99)
-        for buffer in f.carry:
+        for buffer in f.carry + f.indexer_carry:
             buffer.zero_()
         carry_expected = [buf.clone() for buf in f.carry]
         assert sorted(backend.remote_keys) == [1, 2, 4, 8, 16]
@@ -464,6 +466,13 @@ def main(
                         )
                         torch.testing.assert_close(
                             f.carry[layer], carry_expected[layer], atol=0, rtol=0
+                        )
+                    if model_family == "v4":
+                        torch.testing.assert_close(
+                            f.indexer_carry[1], carry_expected[1], atol=0, rtol=0
+                        )
+                        assert not f.indexer_carry[2].any(), (
+                            "C128 must not run an indexer"
                         )
                     assert mode.get_capture_attention_variant() is None
                     assert f.metadata[-1] == marker
@@ -597,6 +606,7 @@ def main(
             bf16_kv_source=bf16_source,
             kv_layout=kv_layout,
             serial_prepare=serial_prepare,
+            model_family=model_family,
             live_swa_and_carry_verified=True,
             unsupported_remote_eager=[3, 12, 32],
             local_full_restored=True,
@@ -630,6 +640,7 @@ if __name__ == "__main__":
     parser.add_argument("--gpu-transfer", action="store_true")
     parser.add_argument("--kv-layout", choices=("v4", "v41"), default="v41")
     parser.add_argument("--serial-prepare", action="store_true")
+    parser.add_argument("--model-family", choices=("v4", "v41"), default="v41")
     args = parser.parse_args()
     main(
         args.source_root.resolve(),
@@ -640,4 +651,5 @@ if __name__ == "__main__":
         gpu_transfer=args.gpu_transfer,
         kv_layout=args.kv_layout,
         serial_prepare=args.serial_prepare,
+        model_family=args.model_family,
     )

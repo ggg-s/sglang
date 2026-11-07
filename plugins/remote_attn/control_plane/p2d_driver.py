@@ -22,7 +22,7 @@ except ImportError:  # local Windows mirrors never open the control channel
 
 from transformers import AutoTokenizer
 
-CTL = Path("/workspace/handoff_ctl")
+CTL = Path(os.environ.get("HANDOFF_CTL_DIR", "/workspace/handoff_ctl"))
 STATE = Path(os.environ.get("HANDOFF_STATE_DIR", "/workspace/handoff_state"))
 STATE.mkdir(parents=True, exist_ok=True)
 MODEL = os.environ.get("HANDOFF_MODEL", "/workspace/models/Qwen3-8B")
@@ -39,13 +39,20 @@ if TRANSFER_OVERRIDE and MODE == "copy_wait":
 TRANSFER_MODE = SERVER_MODE
 
 
+def control_dir(role: str) -> Path:
+    if role not in ("src", "dst"):
+        raise ValueError(f"unknown control role: {role}")
+    explicit = os.environ.get(f"HANDOFF_{role.upper()}_CTL_DIR", "").strip()
+    return Path(explicit) if explicit else CTL / role
+
+
 def _ready(role: str) -> list:
     """Live rank readiness files written atomically by RemoteHub on each rank.
 
     Reads exact names (no directory scan): ``ready.0.json`` defines tp_size and
     the remaining eager per-rank files are read directly.
     """
-    base = CTL / role
+    base = control_dir(role)
     first = base / "ready.0.json"
     try:
         info0 = json.loads(first.read_text(encoding="utf-8"))
@@ -120,7 +127,7 @@ def _role_lock(role: str):
     if fcntl is None:
         yield
         return
-    d = CTL / role
+    d = control_dir(role)
     d.mkdir(parents=True, exist_ok=True)
     fh = open(d / ".control.lock", "a+")
     try:
@@ -134,7 +141,7 @@ def _role_lock(role: str):
 
 
 def _send_unlocked(role: str, payload: dict, timeout: float = 300.0) -> dict:
-    d = CTL / role
+    d = control_dir(role)
     d.mkdir(parents=True, exist_ok=True)
     infos = _ready(role)
     if not infos:
@@ -144,6 +151,8 @@ def _send_unlocked(role: str, payload: dict, timeout: float = 300.0) -> dict:
         while not infos and time.time() < deadline:
             time.sleep(0.1)
             infos = _ready(role)
+    if not infos and str(payload.get("cmd", "")).startswith("d2d_"):
+        raise RuntimeError(f"{role}: D2D requires live ready.<rank>.json files in {d}; refusing nonce-free legacy control")
     if not infos:
         # Old single-rank servers publish no ready file: legacy protocol.
         return _send_legacy(d, role, payload, timeout)

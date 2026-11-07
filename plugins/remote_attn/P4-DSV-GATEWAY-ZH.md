@@ -131,3 +131,41 @@ fence，并停止轮询随后可被外部停止的源 worker；不发送进程 k
 真实 CLI/HTTP/SSE、进程 SIGKILL、TP2 共识、CUDA sparse kernel 和 Mooncake TCP 分别验证；
 模型 scheduler/allocator admission 使用明确 ABI 夹具。尚未加载完整 DSV 权重验证整模
 HTTP PD，也没有将这些结果作为 H20 TP4/RDMA 性能或原生 SMG 接入验收。
+
+## 连接已有 D0/D1 与主动迁移测量
+
+现有 Decode worker 已发布 ready 文件时，不必为了 gateway 重建 `src/dst` 目录。
+指定两个实际目录（包含 `ready.0.json` 等文件），或使用环境变量
+`HANDOFF_SRC_CTL_DIR` / `HANDOFF_DST_CTL_DIR`：
+
+```sh
+HANDOFF_MODEL=/workspace/models/your-dsv-model \
+HANDOFF_STATE_DIR=/workspace/p4-active-migration \
+HANDOFF_PD_PREFILL_URL=http://127.0.0.1:31016/generate \
+HANDOFF_PD_BOOTSTRAP_HOST=127.0.0.1 HANDOFF_PD_BOOTSTRAP_PORT=35409 \
+python plugins/remote_attn/control_plane/p4_gateway.py --backend dsv \
+  --src-control-dir /workspace/control/D0 \
+  --dst-control-dir /workspace/control/D1 --port 31080
+```
+
+Bootstrap 端口需使用 P 实际发布的端口。控制目录、ready 文件的 PID 与所有 TP rank
+必须在 gateway 所在机器可见；这不是跨机文件同步机制。
+Driver 为每条命令生成 nonce，并在对应目录完成逐 rank 控制协议和 flock。
+不要直接写无 nonce 的 `cmd.0.json`。
+
+通过该 gateway 提交新请求，可显式指定公开 `rid`；gateway 保存它与内部 source/target
+rid 的映射。已有 router/OpenAI 请求不自动成为 P4 托管请求。`cut` 触发的完整流程包含
+PLAN → RESERVE → FREEZE → IMPORT → COMMIT，不应直接跳过预留执行 freeze。
+所有迁移测试流量需改发 gateway；双 router 停止投放只测自然排空。
+
+```sh
+python test/manual/remote_attn/bench_p4_dsv_migration.py \
+  --gateway http://127.0.0.1:31080 --prompt-ids /workspace/prompt-32k.json \
+  --concurrency 4 --cut 32 --max-new-tokens 512 --output /workspace/d2d-c4.json
+```
+
+`prompt-32k.json` 是同一模型 tokenizer 生成的输入 token ID 列表。输出长度应足够让迁移
+在源请求结束前完成。探针逐请求要求实际看到 `owner=src` 后切到 `owner=dst`、seq 连续、
+不切回源、最终收到 DONE。自然完成或只看到源输出会标为失败，而不是迁移成功。
+输出 TTFT、首个目标 token 时间、E2EL 和最大 token 间隔；这些不等于 bulk-copy 耗时，
+也不证明 SAFE_TO_STOP，后者仍需读取 `/v1/drain/status` 和源 lease 退休状态。

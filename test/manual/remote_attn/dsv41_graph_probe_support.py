@@ -18,6 +18,7 @@ def fixture(
     bf16_source=False,
     multi_stream=True,
     kv_layout="v41",
+    model_family="v41",
 ):
     controller = SimpleNamespace(
         graph_fast_path=True, dsv41_remote=True, remote_targets={}, targets=[]
@@ -74,6 +75,7 @@ def fixture(
     )
     cache = [torch.full((32, 4), -99.0, device=device, dtype=dtype) for _ in range(3)]
     carry = [torch.zeros(32, device=device, dtype=dtype) for _ in range(3)]
+    indexer_carry = [torch.zeros_like(t) for t in carry]
 
     def norm(kv, weight, eps, freqs, pos):
         # External fused norm/RoPE kernel boundary; preserve in-place semantics.
@@ -157,19 +159,35 @@ def fixture(
                 return q + forward_batch.marker
             return q
 
+        def forward_core_compressor(self, x, forward_batch, layer_id, compressor):
+            carry[layer_id].index_add_(0, forward_batch.out_cache_loc, x.sum(-1))
+
     attn = AttentionBackend()
+    attn.is_dsv41 = model_family == "v41"
 
     class Layer(torch.nn.Module):
         def __init__(self, index):
             super().__init__()
             self.layer_id = index
             self.side = torch.cuda.Stream() if device == "cuda" else None
-            self.is_dsv41 = True
-            self.compress_ratio = index
+            self.is_dsv41 = model_family == "v41"
+            self.compress_ratio = index if self.is_dsv41 else (0, 4, 128)[index]
             self.use_mega_attention = self.use_fused_qk_norm_rope = False
             self.fuse_wqa_wkv = fused
             self.q_lora_rank = 4
-            self.compressor = self.indexer = object() if index else None
+            self.compressor = object() if index else None
+            if self.is_dsv41:
+                self.indexer = object() if index else None
+            else:
+                self.indexer = (
+                    (
+                        lambda **kw: indexer_carry[self.layer_id].index_add_(
+                            0, kw["forward_batch"].out_cache_loc, kw["q_lora"].sum(-1)
+                        )
+                    )
+                    if index == 1
+                    else None
+                )
             self.kv_norm = SimpleNamespace(
                 weight=torch.ones(4, device=device, dtype=dtype)
             )
@@ -218,7 +236,7 @@ def fixture(
             self._compute_kv_to_cache(
                 x, positions, forward_batch, attn_backend, qkv_a=packed
             )
-            if self.compress_ratio:
+            if self.is_dsv41 and self.compress_ratio:
                 attn_backend.forward_low_ratio_sources(
                     layer=self,
                     x=x,
@@ -226,6 +244,19 @@ def fixture(
                     positions=positions,
                     forward_batch=forward_batch,
                 )
+            elif not self.is_dsv41:
+                if self.indexer is not None:
+                    self.indexer(
+                        x=x,
+                        q_lora=q_lora,
+                        forward_batch=forward_batch,
+                        attn_backend=attn_backend,
+                        q_lora_quant=None,
+                    )
+                if self.compressor is not None:
+                    attn_backend.forward_core_compressor(
+                        x, forward_batch, self.layer_id, self.compressor
+                    )
             return q, None
 
         def _forward_prepare_multi_stream(
@@ -317,7 +348,8 @@ def fixture(
         model_config=SimpleNamespace(
             num_hidden_layers=3,
             hf_config=SimpleNamespace(
-                model_type="deepseek_v41", compress_ratios=[0, 1, 2]
+                model_type="deepseek_v41" if model_family == "v41" else "deepseek_v4",
+                compress_ratios=[0, 1, 2] if model_family == "v41" else [0, 4, 128],
             ),
         ),
         attn_backend=attn,
@@ -411,6 +443,7 @@ def fixture(
         projections=projections,
         cache=cache,
         carry=carry,
+        indexer_carry=indexer_carry,
         core=Core,
         output_type=Output,
         decode_output=decode_output,

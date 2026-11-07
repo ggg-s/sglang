@@ -1126,8 +1126,11 @@ def handle_language_model_only(server_args: Any):
         if flag:
             raise ValueError(f"--language-model-only cannot be combined with {name}")
     hf_config = model_config_of(server_args).hf_config
-    # V4.1 text-only workers use the standard PD KV transfer path.
-    if cfg.disaggregation_mode != "null" and hf_config.model_type != "deepseek_v41":
+    # V4/V4.1 text-only workers use the standard PD KV transfer path.
+    if cfg.disaggregation_mode != "null" and hf_config.model_type not in (
+        "deepseek_v4",
+        "deepseek_v41",
+    ):
         raise ValueError(
             "--language-model-only is incompatible with --disaggregation-mode "
             "prefill/decode"

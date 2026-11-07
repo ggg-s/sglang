@@ -133,5 +133,129 @@ class TestRemoteMainContracts(CustomTestCase):
         )
 
 
+class TestFlashSplitAndControl(CustomTestCase):
+    def test_native_c4_c128_projection_state_order(self):
+        # Load the production split bodies, with small real CPU tensors at the
+        # CUDA cache/indexer boundary. C128 must never invent an indexer call.
+        tree = ast.parse((ROOT / "python/sglang/srt/models/deepseek_v4.py").read_text())
+        owner = next(n for n in tree.body if getattr(n, "name", "") == "MQALayer")
+        nodes = [
+            n
+            for n in owner.body
+            if getattr(n, "name", "") in {"project_decode_qkv", "update_decode_state"}
+        ]
+        namespace = {}
+        module = ast.Module(
+            body=[
+                ast.ImportFrom(
+                    module="__future__", names=[ast.alias(name="annotations")], level=0
+                ),
+                *nodes,
+            ],
+            type_ignores=[],
+        )
+        exec(
+            compile(ast.fix_missing_locations(module), "<native-split>", "exec"),
+            namespace,
+        )
+        for ratio in (0, 4, 128):
+            for fused in (False, True):
+                with self.subTest(ratio=ratio, fused=fused):
+                    trace = []
+                    x = torch.arange(8, dtype=torch.float32).reshape(2, 4)
+                    owner = NS(
+                        is_dsv41=False,
+                        compress_ratio=ratio,
+                        use_mega_attention=False,
+                        use_fused_qk_norm_rope=False,
+                        fuse_wqa_wkv=fused,
+                        q_lora_rank=4,
+                        layer_id=7,
+                    )
+                    owner.wqkv_a = lambda v: (torch.cat((v, v * 3), -1), None)
+                    owner.wkv = lambda v: (v * 3, None)
+                    owner._compute_q_a = lambda v, qkv_a=None: (v + 1, v + 1)
+                    owner._compute_q_b = lambda v, pos, out: v * 2
+                    q, lora, kv = namespace["project_decode_qkv"](owner, x, None)
+                    torch.testing.assert_close(q, (x + 1) * 2)
+                    torch.testing.assert_close(kv, x * 3)
+                    owner._compute_kv_to_cache = lambda *a, projected_kv: trace.append(
+                        ("swa", projected_kv.clone())
+                    )
+                    owner.indexer = (
+                        (lambda **kw: trace.append(("index", kw["q_lora"])))
+                        if ratio == 4
+                        else None
+                    )
+                    owner.compressor = object() if ratio else None
+                    backend = NS(
+                        forward_core_compressor=lambda *a: trace.append(
+                            ("compress", a[2])
+                        )
+                    )
+                    fb = NS(forward_mode=NS(is_decode=lambda: True))
+                    namespace["update_decode_state"](
+                        owner, x, lora, kv, None, fb, backend
+                    )
+                    self.assertEqual(
+                        [a[0] for a in trace],
+                        ["swa"]
+                        + (["index"] if ratio == 4 else [])
+                        + (["compress"] if ratio else []),
+                    )
+                    torch.testing.assert_close(trace[0][1], x * 3)
+
+    def test_d2d_without_ready_never_enters_nonce_free_legacy_control(self):
+        import tempfile
+        import time
+
+        tree = ast.parse(
+            (ROOT / "plugins/remote_attn/control_plane/p2d_driver.py").read_text()
+        )
+        node = next(n for n in tree.body if getattr(n, "name", "") == "_send_unlocked")
+        with tempfile.TemporaryDirectory() as folder:
+            namespace = dict(
+                control_dir=lambda role: Path(folder),
+                _ready=lambda role: [],
+                _BARE_LEGACY_WAIT_S=0,
+                time=time,
+                _send_legacy=lambda *a: "unsafe-legacy",
+            )
+            exec(
+                compile(ast.Module(body=[node], type_ignores=[]), "<driver>", "exec"),
+                namespace,
+            )
+            with self.assertRaisesRegex(RuntimeError, "refusing nonce-free"):
+                namespace["_send_unlocked"]("src", {"cmd": "d2d_freeze"}, 1)
+
+    def test_control_directory_overrides_preserve_role_isolation(self):
+        tree = ast.parse(
+            (ROOT / "plugins/remote_attn/control_plane/p2d_driver.py").read_text()
+        )
+        node = next(n for n in tree.body if getattr(n, "name", "") == "control_dir")
+        import os
+
+        namespace = dict(os=os, Path=Path, CTL=Path("/legacy"))
+        exec(
+            compile(ast.Module(body=[node], type_ignores=[]), "<control-dir>", "exec"),
+            namespace,
+        )
+        with patch.dict(
+            os.environ,
+            {
+                "HANDOFF_SRC_CTL_DIR": "/existing/D0",
+                "HANDOFF_DST_CTL_DIR": "/existing/D1",
+            },
+        ):
+            self.assertEqual(namespace["control_dir"]("src"), Path("/existing/D0"))
+            self.assertEqual(namespace["control_dir"]("dst"), Path("/existing/D1"))
+            with self.assertRaises(ValueError):
+                namespace["control_dir"]("other")
+        with patch.dict(
+            os.environ, {"HANDOFF_SRC_CTL_DIR": "", "HANDOFF_DST_CTL_DIR": ""}
+        ):
+            self.assertEqual(namespace["control_dir"]("src"), Path("/legacy/src"))
+
+
 if __name__ == "__main__":
     unittest.main()

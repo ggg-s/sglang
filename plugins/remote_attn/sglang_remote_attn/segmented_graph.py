@@ -522,11 +522,6 @@ def resolve_backend(original, runner):
             "DSV Remote graph native metadata/prepare/attention ABI is incompatible"
         )
     full = original(runner)
-    if flash:
-        # C4/C128 native prepare has no split projection/state ABI. The
-        # controller dispatches eager while Remote; native full graphs resume
-        # after the existing GPU/PD/TP retirement boundary.
-        return full
     if settings != ("decode", "remote", "1"):
         return full
     if not cuda_python:

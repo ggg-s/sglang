@@ -248,5 +248,5 @@ forward event 进入现有 indexer/state/global 交接。串行路径保留原�
 ## DSV4 Flash-0731
 
 现支持 `deepseek_v4` 的 C4/C128 Remote、原生状态交接及生命周期保护。
-Flash 的 Remote 阶段使用 eager，退休后恢复 native full graph。
+Flash 的 C4/C128 Remote 阶段现支持分段图；投影留在图内，原生 SWA/indexer/compressor 使用 live metadata 在图外执行。退休后恢复 native full graph。
 详见 [Flash-0731 适配与 4060 验证](DSV4-FLASH-0731-REMOTE-ZH.md)。

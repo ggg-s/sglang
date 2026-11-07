@@ -1994,20 +1994,19 @@ class MQALayer(MqaAttentionBase):
         q_out: Optional[torch.Tensor] = None,
         x_quant=None,
     ) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
-        """Pure projections for non-unified V4.1 low-ratio decode.
+        """Pure projections for non-unified V4/V4.1 decode.
 
         Uses native fusion/quantization and Q norm/RoPE. It neither reads nor
         updates request cache state. Only tensors cross the state boundary;
         quantized input wrappers remain within the projection calculation.
         """
         if (
-            not self.is_dsv41
-            or self.compress_ratio not in (0, 1, 2)
+            self.compress_ratio not in ((0, 1, 2) if self.is_dsv41 else (0, 4, 128))
             or self.use_mega_attention
             or self.use_fused_qk_norm_rope
         ):
             raise ValueError(
-                "split decode QKV requires non-unified V4.1 CUDA preparation"
+                "split decode QKV requires non-unified V4/V4.1 CUDA preparation"
             )
         x_linear = x_quant if x_quant is not None else x
         qkv_a = self.wqkv_a(x_linear)[0] if self.fuse_wqa_wkv else None
@@ -2035,11 +2034,9 @@ class MQALayer(MqaAttentionBase):
         until these native operations complete and order them before attention.
         """
         if not forward_batch.forward_mode.is_decode() or self.compress_ratio not in (
-            0,
-            1,
-            2,
+            (0, 1, 2) if self.is_dsv41 else (0, 4, 128)
         ):
-            raise ValueError("split state update requires low-ratio decode")
+            raise ValueError("split state update requires native V4/V4.1 decode")
         self._compute_kv_to_cache(
             x, positions, forward_batch, attn_backend, projected_kv=kv
         )
@@ -2053,6 +2050,24 @@ class MQALayer(MqaAttentionBase):
                 positions=positions,
                 forward_batch=forward_batch,
             )
+        elif not self.is_dsv41:
+            # Match the native C4/C128 serial prepare order. Indexer owns its
+            # own compression; the attention compressor is a distinct state.
+            if self.indexer is not None:
+                self.indexer(
+                    x=x,
+                    q_lora=q_lora,
+                    forward_batch=forward_batch,
+                    attn_backend=attn_backend,
+                    q_lora_quant=None,
+                )
+            if self.compressor is not None:
+                attn_backend.forward_core_compressor(
+                    x,
+                    forward_batch,
+                    self.layer_id,
+                    self.compressor,
+                )
 
     def _forward_prepare_multi_stream(
         self,

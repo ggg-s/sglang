@@ -5034,10 +5034,16 @@ def main():
     p = argparse.ArgumentParser()
     p.add_argument("--backend", choices=("qwen", "dsv"),
                    default=os.environ.get("HANDOFF_GW_BACKEND", "qwen"))
+    p.add_argument("--src-control-dir", type=Path)
+    p.add_argument("--dst-control-dir", type=Path)
     p.add_argument("--port", type=int, default=31080)
     p.add_argument("--poll-ms", type=float, default=3.0)
     p.add_argument("--out", default=str(STATE / "p4_gateway.jsonl"))
     args = p.parse_args()
+    for role in ("src", "dst"):
+        directory = getattr(args, f"{role}_control_dir")
+        if directory is not None:
+            os.environ[f"HANDOFF_{role.upper()}_CTL_DIR"] = str(directory.resolve())
     if args.backend == "dsv":
         from p4_dsv_gateway import DsvGateway
 

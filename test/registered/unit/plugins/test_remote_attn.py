@@ -15113,6 +15113,8 @@ class TestRemoteAttn(CustomTestCase):
             ("is_dsv41", False),
         ):
             f = self._dsv41_split_core()
+            if flag == "is_dsv41":
+                f.layers[0].compress_ratio = 1  # V4 rejects V4.1-only C1.
             setattr(f.layers[0], flag, value)
             with self.assertRaisesRegex(ValueError, "split decode QKV"):
                 f.layers[0].project_decode_qkv(torch.ones(1, 4), torch.zeros(1))
@@ -16188,7 +16190,10 @@ class TestRemoteAttn(CustomTestCase):
         cfg = f.runner.model_runner.model_config.hf_config
         cfg.model_type, cfg.compress_ratios = "deepseek_v4", [0, 0, 4, 128]
         self.assertTrue(dsv41_layerwise.is_dsv41(f.runner.model_runner))
-        with patch.object(f.sg, "agree_capture_settings") as agree:
+        with (
+            patch.object(f.sg, "agree_capture_settings") as agree,
+            patch.dict(os.environ, {"HANDOFF_REMOTE_SEGMENTED_GRAPH": "0"}),
+        ):
             self.assertIs(
                 f.sg.resolve_backend(f.original, f.runner), f.original.return_value
             )
@@ -16235,6 +16240,21 @@ class TestRemoteAttn(CustomTestCase):
         backend.trtllm_attn = True
         with self.assertRaisesRegex(ValueError, "flashmla backend"):
             remote.validate(controller, mr, "decode")
+
+    def test_flash0731_segmented_requires_split_abi_before_native_warmup(self):
+        from sglang_remote_attn import dsv41_graph
+
+        f = self._dsv41_layout_startup_fixture()
+        cfg = f.runner.model_runner.model_config.hf_config
+        cfg.model_type, cfg.compress_ratios = "deepseek_v4", [0, 0, 4, 128]
+        with (
+            patch.object(f.sg, "agree_capture_settings"),
+            patch.dict(os.environ, {"HANDOFF_REMOTE_SEGMENTED_GRAPH": "1"}),
+            patch.object(dsv41_graph, "capture_signature", return_value=(False, ())),
+        ):
+            with self.assertRaisesRegex(ValueError, "ABI is incompatible"):
+                f.sg.resolve_backend(f.original, f.runner)
+            f.original.assert_not_called()
 
     def test_flash0731_native_c4_and_c128_state_registration_and_pending_ring(self):
         import numpy as np

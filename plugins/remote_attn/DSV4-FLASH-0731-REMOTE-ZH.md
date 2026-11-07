@@ -24,9 +24,9 @@
   padding 分别按 native layout 处理。native V4 的未初始化 padded TP query heads
   先置零，避免 Remote 校验或计算读取 NaN；有效 heads 不变。
 
-Flash 的 C4/C128 native prepare 尚未提供 V4.1 split projection/state ABI，因此
-**Remote 使用 eager**。即使 HANDOFF_REMOTE_SEGMENTED_GRAPH=1，也不构建不兼容的
-Remote 分段图；全部 Local 并通过 GPU/PD/TP 退休后恢复 native full graph。
+Flash 的 C4/C128 native prepare 现已提供 split projection/state ABI。
+`HANDOFF_REMOTE_SEGMENTED_GRAPH=1` 启用 Remote 分段图；设为 0 可显式使用 eager。
+全部 Local 并通过 GPU/PD/TP 退休后恢复 native full graph。
 启动的 TP 签名包含实际 model_type、压缩率和布局。
 
 ## 配置与边界
@@ -73,3 +73,25 @@ PYTHONPATH=plugins/remote_attn python test/manual/remote_attn/flash0731_cuda_pro
 已修复混合 C4/C128（及 C1/C2）native guard 容量不同导致的逆页表冲突。
 逆页表按 ratio 持有，仍拒绝同 ratio 容量漂移和请求身份变化；成功退休统一清理。
 详见 [状态、尾块与 KV 生命周期审阅](validation/flash0731-lifetime-review.md)。
+
+
+## C4/C128 分段图更新
+
+默认 `HANDOFF_REMOTE_SEGMENTED_GRAPH=1` 不再对 `deepseek_v4` 强制回退 eager。
+需要 native FlashMLA、full decode graph、纯 TP、非 unified KV，并使用本分支配套
+`project_decode_qkv/update_decode_state` 接口。C4 先写 SWA，再更新 indexer 和独立 attention
+compressor；C128 更新 SWA 与 attention compressor，不引入 indexer。
+捕获/回放仍保留逐 entry ownership 快照、实际行裁剪和安全回收 fence。
+
+`--language-model-only` 现在允许 V4 与 V4.1 原生 PD，不必再本地放宽校验。
+分段图不能消除每层网络往返；需要在目标 H20 上重测 TTFT/TPOT 和实际通信路径。
+仅设置 `HANDOFF_REMOTE_GPU_TRANSFER=1` 或看到 RDMA 初始化日志，不证明每次 Q/O 提交
+实际使用 GPU RDMA；应同时核对协商 backend 和请求的 `path=remote-segmented`。
+
+```sh
+python test/manual/remote_attn/dsv41_segmented_graph_probe.py --source-root . \
+  --model-family v4 --kv-layout v4 --gpu-transfer --output /tmp/flash-graph.json
+```
+
+这是小型 CUDA/原生方法及 TCP 数据面回归，不是 DeepSeek-V4-Flash-0731 整模性能基准。
+主动迁移部署和测量见 [P4 DSV Gateway](P4-DSV-GATEWAY-ZH.md)。
