@@ -74,6 +74,7 @@ def jit_bootstrap():
                 "-DSGL_CUDA_ARCH=890",
                 "-std=c++20",
                 "-O3",
+                "--expt-relaxed-constexpr",
                 "-gencode=arch=compute_89,code=sm_89",
                 *flags,
             ],
@@ -651,7 +652,9 @@ def load_ple(fp8):
 
 
 def ple_batch(tokens, decode=False, slots=None):
-    lengths = [1] if decode else ([33, 32] if tokens == 65 else [tokens])
+    lengths = (
+        [1] if decode else ([33, 32] if tokens == 65 and slots is None else [tokens])
+    )
     slots = slots or ([2] if decode else ([1, 3] if len(lengths) > 1 else [1]))
     physical = tokens if decode else tokens + 5
     b = NS(
@@ -793,6 +796,153 @@ def ple_case(p):
     return *funcs, references
 
 
+def integrated_run(rounds, fp8):
+    stack, gdn, qsa = small.build_stack()
+    qsa.canonical_topk = True
+    moe = load_moe()
+    ple = load_ple(fp8)
+    globals_ = stack.forward.__func__.__globals__
+    globals_.update(
+        _prepare_ple_batch=ple.src._prepare_ple_batch,
+        _commit_ple_batch=ple.src._commit_ple_batch,
+        Qwen2MoeSparseMoeBlock=moe.block.Qwen2MoeSparseMoeBlock,
+    )
+    stack.has_ple = True
+    stack.ple_ngram_size, stack.ple_ngram_eos_token_id = 3, 0
+    for i, layer in enumerate(stack.layers):
+        shared = layer.mlp
+        layer.mlp = make_moe(moe, fp8)
+        layer.mlp.shared_expert = shared
+        layer.mlp.shared_expert_gate = nn.Linear(
+            256, 1, bias=False, device="cuda", dtype=torch.bfloat16
+        )
+        layer.ple = ple.layers[i]
+    moe.block.__dict__["fused_gate_sigmoid_mul_add"] = (
+        qsa.m.elem.fused_gate_sigmoid_mul_add
+    )
+    fp8_count = enable_fp8_linears(stack) if fp8 else 0
+    batches = []
+    inputs = []
+    for lane, tokens in enumerate((65, 1)):
+        b = small.prepare_batch(tokens, lane)
+        side = ple_batch(tokens, tokens == 1, slots=[lane + 1])
+        b.__dict__.update(side.__dict__)
+        b.input_ids = b.input_ids[:tokens].contiguous()
+        b.out_cache_loc = b.out_cache_loc[:tokens]
+        batches.append(b)
+        inputs.append(
+            torch.randn(tokens, 256, device="cuda", dtype=torch.bfloat16) * 0.1
+        )
+
+    def reset(lane):
+        gdn.reset(lane)
+        qsa.reset(lane)
+        reset_ple(ple, batches[lane])
+
+    def forward(lane, interval=None):
+        b = batches[lane]
+        ple.current.set(b)
+        return stack.forward(
+            b.input_ids,
+            b.positions,
+            b,
+            inputs_embeds=inputs[lane],
+            split_interval=interval,
+        )
+
+    def snapshot(lane, output):
+        b = batches[lane]
+        values = [
+            *output,
+            gdn.state[lane],
+            gdn.conv_state[lane],
+            qsa.k[lane],
+            qsa.v[lane],
+            b.layer_outputs[0],
+            b.selected_tokens,
+            ple.ngram.context[b.req_pool_indices],
+            ple.ngram.context[b.track_indices],
+            ple.conv.conv_state[:, b.req_pool_indices],
+            ple.conv.conv_state[:, b.track_indices],
+        ]
+        for layer in stack.layers:
+            values += [layer.mlp.topk.last.topk_ids, layer.mlp.topk.last.topk_weights]
+        return tuple(t.clone() for t in values)
+
+    controls = []
+    for lane in (0, 1):
+        reset(lane)
+        controls.append(snapshot(lane, forward(lane)))
+    torch.cuda.synchronize()
+    sentinel = (
+        ple.ngram.context[7].clone(),
+        ple.conv.conv_state[:, 7].clone(),
+        gdn.state[2].clone(),
+        gdn.conv_state[2].clone(),
+        qsa.k[2].clone(),
+        qsa.v[2].clone(),
+    )
+    ready = torch.cuda.current_stream().record_event()
+    ps, ds = torch.cuda.Stream(priority=0), torch.cuda.Stream(priority=-1)
+    ps.wait_event(ready)
+    ds.wait_event(ready)
+    graph = torch.cuda.CUDAGraph()
+    with torch.cuda.graph(graph, stream=ds):
+        reset(1)
+        graph_outputs = snapshot(1, forward(1))
+    ds.synchronize()
+    records = []
+    for _ in range(rounds):
+        with torch.cuda.stream(ps):
+            reset(0)
+            assert forward(0, (0, 1)) is None
+        with torch.cuda.stream(ds):
+            graph.replay()
+            d = tuple(t.clone() for t in graph_outputs)
+            torch.empty((128, 128), device="cuda").fill_(3)
+        with torch.cuda.stream(ps):
+            p = snapshot(0, forward(0, (1, 2)))
+            assert not batches[0].model_specific_states
+            assert all(layer.ple._prefetch_state is None for layer in stack.layers)
+        records.append((p, d))
+    ps.synchronize()
+    ds.synchronize()
+    errors = [0.0] * len(controls[0])
+    for pair in records:
+        for outputs, control in zip(pair, controls):
+            for i, (a, b) in enumerate(zip(outputs, control)):
+                assert torch.isfinite(a).all().item()
+                errors[i] = max(errors[i], (a.float() - b.float()).abs().max().item())
+                torch.testing.assert_close(a, b, atol=0, rtol=0)
+    actual = (
+        ple.ngram.context[7],
+        ple.conv.conv_state[:, 7],
+        gdn.state[2],
+        gdn.conv_state[2],
+        qsa.k[2],
+        qsa.v[2],
+    )
+    for a, b in zip(actual, sentinel):
+        torch.testing.assert_close(a, b, rtol=0, atol=0)
+    return dict(
+        name=f"real_gdn_qsa_moe_ple_{'fp8' if fp8 else 'bf16'}",
+        rounds=rounds,
+        decode_cuda_graph=True,
+        decode_stream_priority=-1,
+        split_at_layer=1,
+        canonical_qsa_tokens=True,
+        experts=4,
+        topk=2,
+        shared_expert=True,
+        fp8_linear_count=fp8_count,
+        ple_table_dtype=str(ple.layers[0].ple_embedding.ngram_embedding.weight.dtype),
+        max_abs=errors,
+        untouched_slots_exact=True,
+        prefetch_state_isolated=True,
+        scope="production decoder/MoE/PLE forwards; real kernels, TP1 metadata adapters and fixed QSA prefix",
+    )
+
+
 @torch.inference_mode()
 def main():
     parser = argparse.ArgumentParser(description=__doc__)
@@ -832,6 +982,16 @@ def main():
             name = f"real_ple_{'fp8' if fp8 else 'bf16'}_pinned_table_and_state"
             try:
                 result = ops.pair_test(name, *ple_case(load_ple(fp8)), args.rounds)
+                report["cases"].append(result)
+                print(json.dumps(result), flush=True)
+            except Exception as exc:
+                traceback.print_exc()
+                report["errors"].append({"name": name, "error": str(exc)})
+    if args.only in ("integrated", "all"):
+        for fp8 in (False, True):
+            name = f"integrated_{'fp8' if fp8 else 'bf16'}"
+            try:
+                result = integrated_run(args.rounds, fp8)
                 report["cases"].append(result)
                 print(json.dumps(result), flush=True)
             except Exception as exc:
