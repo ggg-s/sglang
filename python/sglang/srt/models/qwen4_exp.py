@@ -99,7 +99,11 @@ from sglang.srt.models.qwen4_exp_ple_table import (
     make_ple_file_prefetcher,
     make_ple_file_rss_trimmer,
 )
-from sglang.srt.runtime_context import get_parallel, linear_attn_parallel_group
+from sglang.srt.runtime_context import (
+    get_disagg,
+    get_parallel,
+    linear_attn_parallel_group,
+)
 from sglang.srt.utils import get_bool_env_var, is_cuda, is_hip, logger
 
 _is_cuda = is_cuda()
@@ -1313,7 +1317,10 @@ class Qwen4ExpPLELayer(nn.Module):
         forward_batch: ForwardBatch,
     ) -> None:
         """Gather PLE rows via UVA while the preceding decoder layer runs."""
-        if self._prefetch_stream is None:
+        # PDMux may yield before this PLE layer while decode visits the same
+        # module. Its cached prefetch buffer/state is shared between lanes.
+        # Gather inline on the submitting lane instead.
+        if self._prefetch_stream is None or get_disagg().enable_pdmux:
             return
         if self._prefetch_state is not None:
             raise RuntimeError("PLE prefetch state was not consumed before reuse")
@@ -1554,7 +1561,10 @@ def _build_qwen4_exp_stages(config, layer_id, residual, *, linear_attention=Fals
 def _prepare_decode_moe_comm(mlp):
     # qwen4_decode pulls in CUDA-only communication kernels (tvm_ffi), so
     # only import it where its Blackwell decode path can be enabled.
-    if not (_is_cuda and isinstance(mlp, Qwen2MoeSparseMoeBlock)):
+    if (
+        not (_is_cuda and isinstance(mlp, Qwen2MoeSparseMoeBlock))
+        or get_disagg().enable_pdmux
+    ):
         return None
     from sglang.srt.layers.moe.qwen4_decode import prepare_qwen4_decode_comm
 
@@ -1945,6 +1955,7 @@ class Qwen4ExpAttentionDecoderLayer(
     ) -> torch.Tensor:
         overlap_indexer = (
             self.is_qsa
+            and not get_disagg().enable_pdmux
             and self.alt_stream is not None
             and get_is_capture_mode()
             # Graph breaks must stay off the decode overlap stream.
@@ -2084,8 +2095,16 @@ class Qwen4ExpModel(Qwen3_5ForCausalLM):
         forward_batch: ForwardBatch,
         inputs_embeds: Optional[torch.Tensor] = None,
         pp_proxy_tensors: Optional[PPProxyTensors] = None,
+        split_interval: Optional[Tuple[int, int]] = None,
     ) -> Union[torch.Tensor, Tuple[torch.Tensor, torch.Tensor], PPProxyTensors]:
-        if self.pp_group.is_first_rank:
+        start, end = split_interval or (self.start_layer, self.end_layer)
+        continuation = split_interval is not None and start > self.start_layer
+        split_state = None
+        if continuation:
+            split_state = forward_batch.model_specific_states["qwen4_pdmux"]
+            hidden_states = split_state["hidden_states"]
+            positions = split_state["positions"]
+        elif self.pp_group.is_first_rank:
             if inputs_embeds is not None:
                 hidden_states = inputs_embeds
             else:
@@ -2103,7 +2122,7 @@ class Qwen4ExpModel(Qwen3_5ForCausalLM):
             )
 
         shards_rows = _shards_rows_over_cp(forward_batch)
-        if shards_rows:
+        if shards_rows and not continuation:
             hidden_states, positions = cp_split_before_forward(
                 hidden_states, positions, forward_batch
             )
@@ -2114,7 +2133,9 @@ class Qwen4ExpModel(Qwen3_5ForCausalLM):
             and forward_batch.forward_mode.is_extend()
         )
         ple_batch = None
-        if breakable_ple:
+        if continuation:
+            ple_batch = split_state["ple_batch"]
+        elif breakable_ple:
             ple_batch = _BreakablePLEBatch()
             _breakable_prepare_ple_batch(
                 input_ids=input_ids,
@@ -2129,9 +2150,11 @@ class Qwen4ExpModel(Qwen3_5ForCausalLM):
                 ngram_size=self.ple_ngram_size,
                 ngram_eos_token_id=self.ple_ngram_eos_token_id,
             )
-        aux_hidden_states = AuxHiddenStateList()
-        normalized_input = None
-        for i in range(self.start_layer, self.end_layer):
+        aux_hidden_states = (
+            split_state["aux_hidden_states"] if continuation else AuxHiddenStateList()
+        )
+        normalized_input = split_state["normalized_input"] if continuation else None
+        for i in range(start, end):
             layer = self.layers[i]
             if i + 1 < self.end_layer:
                 next_ple = self.layers[i + 1].ple
@@ -2166,6 +2189,25 @@ class Qwen4ExpModel(Qwen3_5ForCausalLM):
                 )
 
             normalized_input = norms.output
+
+        if split_interval is not None and end < self.end_layer:
+            # Keep all cross-segment state on the batch: a decode forward on
+            # this model may run before the next segment is submitted.
+            if forward_batch.model_specific_states is None:
+                forward_batch.model_specific_states = {}
+            forward_batch.model_specific_states["qwen4_pdmux"] = {
+                "hidden_states": hidden_states,
+                "positions": positions,
+                "ple_batch": ple_batch,
+                "aux_hidden_states": aux_hidden_states,
+                "normalized_input": normalized_input,
+            }
+            return None
+        if (
+            split_interval is not None
+            and forward_batch.model_specific_states is not None
+        ):
+            forward_batch.model_specific_states.pop("qwen4_pdmux", None)
 
         if breakable_ple:
             _breakable_commit_ple_batch(batch=ple_batch)
@@ -2225,6 +2267,7 @@ class Qwen4ExpVLModel(Qwen4ExpModel):
         input_embeds: Optional[torch.Tensor] = None,
         pp_proxy_tensors: Optional[Any] = None,
         input_deepstack_embeds: Optional[torch.Tensor] = None,
+        split_interval: Optional[Tuple[int, int]] = None,
     ) -> torch.Tensor:
         self.last_hc_hidden_states = None
         # mm routine passes input_ids=None; PLE needs the real ids.
@@ -2236,6 +2279,7 @@ class Qwen4ExpVLModel(Qwen4ExpModel):
             forward_batch=forward_batch,
             inputs_embeds=input_embeds,
             pp_proxy_tensors=pp_proxy_tensors,
+            split_interval=split_interval,
         )
         if isinstance(model_output, PPProxyTensors):
             return model_output
@@ -2300,6 +2344,46 @@ class Qwen4ExpForConditionalGeneration(Qwen3VLForConditionalGeneration):
         hc_hidden_states = self.model.last_hc_hidden_states
         if hc_hidden_states is not None and isinstance(output, LogitsProcessorOutput):
             output.hidden_states = hc_hidden_states
+        return output
+
+    @torch.no_grad()
+    def forward_split_prefill(
+        self,
+        input_ids: torch.Tensor,
+        positions: torch.Tensor,
+        forward_batch: ForwardBatch,
+        split_interval: Tuple[int, int],
+        input_embeds: Optional[torch.Tensor] = None,
+    ):
+        """Text-only PDMux segments, sharing the normal QSA/GDN/PLE forward."""
+        if not (self.pp_group.is_first_rank and self.pp_group.is_last_rank):
+            raise ValueError("Qwen3.8 PDMux split prefill requires pipeline size 1")
+        if forward_batch.mm_inputs and any(
+            item is not None and item.contains_mm_input()
+            for item in forward_batch.mm_inputs
+        ):
+            raise ValueError("Qwen3.8 PDMux split prefill currently supports text only")
+        if forward_batch.spec_info is not None:
+            raise ValueError(
+                "Qwen3.8 PDMux split prefill does not support verify inputs"
+            )
+        if self.is_mrope_enabled:
+            positions = forward_batch.mrope_positions
+        hidden_states = self.model.forward(
+            input_ids=input_ids,
+            positions=positions,
+            forward_batch=forward_batch,
+            input_embeds=input_embeds,
+            split_interval=split_interval,
+        )
+        if hidden_states is None:
+            return None
+        output = self.logits_processor(
+            input_ids, hidden_states, self.lm_head, forward_batch
+        )
+        if self.model.last_hc_hidden_states is not None:
+            # Native MTP consumes the widened HC streams, not the terminal mix.
+            output.hidden_states = self.model.last_hc_hidden_states
         return output
 
     def _load_qwen4_exp_ple_buffer(

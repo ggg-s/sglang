@@ -114,6 +114,52 @@ class TestTritonGDNBackendCorrectness(CustomTestCase):
                         )
 
     @torch.inference_mode()
+    def test_chunk_prefill_updates_strided_state_and_track_pools(self):
+        """The entry guard must not redirect pool writes into contiguous copies."""
+        from sglang.kernels.ops.attention.fla.chunk import chunk_gated_delta_rule
+
+        torch.manual_seed(42)
+        heads, value_heads, dim, tokens = 2, 6, 128, 65
+        q = torch.randn(1, tokens, heads, dim, device="cuda", dtype=torch.bfloat16)
+        k = torch.randn_like(q)
+        v = torch.randn(1, tokens, value_heads, dim, device="cuda", dtype=q.dtype)
+        g = torch.nn.functional.logsigmoid(
+            torch.randn(1, tokens, value_heads, device="cuda")
+        )
+        beta = torch.rand(1, tokens, value_heads, device="cuda", dtype=q.dtype)
+        backing = torch.randn(3, 2, value_heads, dim, dim, device="cuda") / 100
+        state = backing[:, 0]
+        control = state.clone()
+        before = state.clone()
+        track_backing = torch.full_like(backing, float("nan"))
+        track = track_backing[:, 0]
+        control_track = track.clone()
+        indices = torch.tensor([1], device="cuda", dtype=torch.int32)
+        track_chunk = torch.tensor([1], device="cuda", dtype=torch.int32)
+        self.assertFalse(state.is_contiguous())
+        outputs = []
+        for pool, snapshots in ((control, control_track), (state, track)):
+            output, _, _ = chunk_gated_delta_rule(
+                q,
+                k,
+                v,
+                g,
+                beta,
+                initial_state=pool,
+                initial_state_indices=indices,
+                track_state=snapshots,
+                track_chunk_idx=track_chunk,
+                use_qk_l2norm_in_kernel=True,
+            )
+            outputs.append(output)
+        torch.testing.assert_close(outputs[0], outputs[1], atol=0, rtol=0)
+        torch.testing.assert_close(state, control, atol=0, rtol=0)
+        torch.testing.assert_close(track, control_track, atol=0, rtol=0, equal_nan=True)
+        self.assertFalse(torch.equal(state[1], before[1]))
+        torch.testing.assert_close(state[[0, 2]], before[[0, 2]], atol=0, rtol=0)
+        self.assertTrue(torch.isfinite(track[0]).all().item())
+
+    @torch.inference_mode()
     def test_prefix_track_state_keeps_fp32_precision(self):
         """A cache hit must restore the accumulator, not an activation-rounded h."""
         from sglang.kernels.ops.attention.fla.chunk import chunk_gated_delta_rule

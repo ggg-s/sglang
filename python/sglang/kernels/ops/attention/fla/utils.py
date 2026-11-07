@@ -142,18 +142,33 @@ def tensor_cache(fn: Callable[..., torch.Tensor]) -> Callable[..., torch.Tensor]
     return wrapper
 
 
-def input_guard(fn: Callable[..., torch.Tensor]) -> Callable[..., torch.Tensor]:
+def input_guard(
+    fn: Callable[..., torch.Tensor] | None = None, *, preserve: tuple[str, ...] = ()
+) -> Callable[..., torch.Tensor]:
     """
-    A decorator to make sure all input tensors are contiguous and set the device based on input tensors.
+    Make inputs contiguous and select their device, preserving named in-place
+    buffers whose kernels support strides. Copying such a buffer would discard
+    writes to the caller's state pool.
     """
+    if fn is None:
+        return functools.partial(input_guard, preserve=preserve)
+    parameter_names = tuple(inspect.signature(fn).parameters) if preserve else ()
 
     @functools.wraps(fn)
     def wrapper(*args, **kwargs):
         contiguous_args = (
-            i if not isinstance(i, torch.Tensor) else i.contiguous() for i in args
+            value
+            if not isinstance(value, torch.Tensor)
+            or (index < len(parameter_names) and parameter_names[index] in preserve)
+            else value.contiguous()
+            for index, value in enumerate(args)
         )
         contiguous_kwargs = {
-            k: (v if not isinstance(v, torch.Tensor) else v.contiguous())
+            k: (
+                v
+                if not isinstance(v, torch.Tensor) or k in preserve
+                else v.contiguous()
+            )
             for k, v in kwargs.items()
         }
 

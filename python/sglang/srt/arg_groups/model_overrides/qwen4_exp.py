@@ -17,6 +17,29 @@ from sglang.srt.runtime_context import get_platform
 logger = logging.getLogger(__name__)
 
 
+def _qwen4_pdmux_overrides(cfg: Any, hf_config: Any) -> dict:
+    """FP8 MoE backends with model-owned scratch cannot share PDMux lanes."""
+    quant = getattr(hf_config, "quantization_config", None) or {}
+    quant_method = cfg.quantization or quant.get("quant_method")
+    if not cfg.enable_pdmux or quant_method != "fp8":
+        return {}
+    overrides = {}
+    for field in ("moe_runner_backend", "speculative_moe_runner_backend"):
+        if field.startswith("speculative") and cfg.speculative_algorithm is None:
+            continue
+        backend = getattr(cfg, field)
+        if backend in (None, "auto"):
+            overrides[field] = "triton"
+        elif backend != "triton":
+            raise ValueError(
+                "Qwen3.8 FP8 PDMux requires --"
+                + field.replace("_", "-")
+                + " triton; other FP8 MoE workspaces have not been isolated "
+                "between prefill and decode lanes."
+            )
+    return overrides
+
+
 @_register_for("Qwen4ExpForConditionalGeneration")
 def _qwen4_exp_overrides(server_args: Any, hf_config: Any) -> dict:
     """Compressed QSA must own ``page_size`` here,
@@ -37,7 +60,9 @@ def _qwen4_exp_overrides(server_args: Any, hf_config: Any) -> dict:
         )
     if cfg.enable_unified_memory:
         raise ValueError("Qwen4-Exp does not support --enable-unified-memory yet")
-    overrides: Dict[str, Any] = {}
+    # Inspect requested backend choices here: an earlier generic family rule
+    # may already have resolved "auto" to a backend with shared scratch.
+    overrides: Dict[str, Any] = _qwen4_pdmux_overrides(server_args, hf_config)
 
     if cfg.ple_offload_embedding is None:
         import torch

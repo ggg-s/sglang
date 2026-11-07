@@ -1,0 +1,239 @@
+{
+  "scope": "production model loop with small tensor-layer collaborators",
+  "not_validated": [
+    "full model",
+    "real GDN/QSA/FP8 operators",
+    "answer accuracy",
+    "serving performance",
+    "multi-GPU TP"
+  ],
+  "torch": "2.14.1+cu130",
+  "gpu": "NVIDIA GeForce RTX 4060 Laptop GPU",
+  "capability": [
+    8,
+    9
+  ],
+  "cases": [
+    {
+      "dtype": "torch.float32",
+      "tokens": 1,
+      "quantum": 1,
+      "rounds": 32,
+      "decode_forwards": 128,
+      "exact_match": true,
+      "harness_seconds": 0.7108379190322012
+    },
+    {
+      "dtype": "torch.float32",
+      "tokens": 1,
+      "quantum": 2,
+      "rounds": 32,
+      "decode_forwards": 64,
+      "exact_match": true,
+      "harness_seconds": 0.10738291405141354
+    },
+    {
+      "dtype": "torch.float32",
+      "tokens": 1,
+      "quantum": 4,
+      "rounds": 32,
+      "decode_forwards": 32,
+      "exact_match": true,
+      "harness_seconds": 0.07345993793569505
+    },
+    {
+      "dtype": "torch.float32",
+      "tokens": 65,
+      "quantum": 1,
+      "rounds": 32,
+      "decode_forwards": 128,
+      "exact_match": true,
+      "harness_seconds": 0.16947806486859918
+    },
+    {
+      "dtype": "torch.float32",
+      "tokens": 65,
+      "quantum": 2,
+      "rounds": 32,
+      "decode_forwards": 64,
+      "exact_match": true,
+      "harness_seconds": 0.12350251106545329
+    },
+    {
+      "dtype": "torch.float32",
+      "tokens": 65,
+      "quantum": 4,
+      "rounds": 32,
+      "decode_forwards": 32,
+      "exact_match": true,
+      "harness_seconds": 0.0738737010397017
+    },
+    {
+      "dtype": "torch.float32",
+      "tokens": 513,
+      "quantum": 1,
+      "rounds": 32,
+      "decode_forwards": 128,
+      "exact_match": true,
+      "harness_seconds": 0.16596955596469343
+    },
+    {
+      "dtype": "torch.float32",
+      "tokens": 513,
+      "quantum": 2,
+      "rounds": 32,
+      "decode_forwards": 64,
+      "exact_match": true,
+      "harness_seconds": 0.1120494999922812
+    },
+    {
+      "dtype": "torch.float32",
+      "tokens": 513,
+      "quantum": 4,
+      "rounds": 32,
+      "decode_forwards": 32,
+      "exact_match": true,
+      "harness_seconds": 0.07678897795267403
+    },
+    {
+      "dtype": "torch.float32",
+      "tokens": 2048,
+      "quantum": 1,
+      "rounds": 32,
+      "decode_forwards": 128,
+      "exact_match": true,
+      "harness_seconds": 0.18882895004935563
+    },
+    {
+      "dtype": "torch.float32",
+      "tokens": 2048,
+      "quantum": 2,
+      "rounds": 32,
+      "decode_forwards": 64,
+      "exact_match": true,
+      "harness_seconds": 0.12163602793589234
+    },
+    {
+      "dtype": "torch.float32",
+      "tokens": 2048,
+      "quantum": 4,
+      "rounds": 32,
+      "decode_forwards": 32,
+      "exact_match": true,
+      "harness_seconds": 0.07595156808383763
+    },
+    {
+      "dtype": "torch.bfloat16",
+      "tokens": 1,
+      "quantum": 1,
+      "rounds": 32,
+      "decode_forwards": 128,
+      "exact_match": true,
+      "harness_seconds": 0.24485306115821004
+    },
+    {
+      "dtype": "torch.bfloat16",
+      "tokens": 1,
+      "quantum": 2,
+      "rounds": 32,
+      "decode_forwards": 64,
+      "exact_match": true,
+      "harness_seconds": 0.11226143804378808
+    },
+    {
+      "dtype": "torch.bfloat16",
+      "tokens": 1,
+      "quantum": 4,
+      "rounds": 32,
+      "decode_forwards": 32,
+      "exact_match": true,
+      "harness_seconds": 0.0745620159432292
+    },
+    {
+      "dtype": "torch.bfloat16",
+      "tokens": 65,
+      "quantum": 1,
+      "rounds": 32,
+      "decode_forwards": 128,
+      "exact_match": true,
+      "harness_seconds": 0.18054156890138984
+    },
+    {
+      "dtype": "torch.bfloat16",
+      "tokens": 65,
+      "quantum": 2,
+      "rounds": 32,
+      "decode_forwards": 64,
+      "exact_match": true,
+      "harness_seconds": 0.10866177291609347
+    },
+    {
+      "dtype": "torch.bfloat16",
+      "tokens": 65,
+      "quantum": 4,
+      "rounds": 32,
+      "decode_forwards": 32,
+      "exact_match": true,
+      "harness_seconds": 0.06989209190942347
+    },
+    {
+      "dtype": "torch.bfloat16",
+      "tokens": 513,
+      "quantum": 1,
+      "rounds": 32,
+      "decode_forwards": 128,
+      "exact_match": true,
+      "harness_seconds": 0.18134452099911869
+    },
+    {
+      "dtype": "torch.bfloat16",
+      "tokens": 513,
+      "quantum": 2,
+      "rounds": 32,
+      "decode_forwards": 64,
+      "exact_match": true,
+      "harness_seconds": 0.11645756801590323
+    },
+    {
+      "dtype": "torch.bfloat16",
+      "tokens": 513,
+      "quantum": 4,
+      "rounds": 32,
+      "decode_forwards": 32,
+      "exact_match": true,
+      "harness_seconds": 0.06563709699548781
+    },
+    {
+      "dtype": "torch.bfloat16",
+      "tokens": 2048,
+      "quantum": 1,
+      "rounds": 32,
+      "decode_forwards": 128,
+      "exact_match": true,
+      "harness_seconds": 0.18183032306842506
+    },
+    {
+      "dtype": "torch.bfloat16",
+      "tokens": 2048,
+      "quantum": 2,
+      "rounds": 32,
+      "decode_forwards": 64,
+      "exact_match": true,
+      "harness_seconds": 0.11148496298119426
+    },
+    {
+      "dtype": "torch.bfloat16",
+      "tokens": 2048,
+      "quantum": 4,
+      "rounds": 32,
+      "decode_forwards": 32,
+      "exact_match": true,
+      "harness_seconds": 0.07115371897816658
+    }
+  ],
+  "source_sha256": {
+    "python/sglang/srt/models/qwen4_exp.py": "82db127a8a668966534d75b97b1e0e6445f78430516c5f367728f1871e447879",
+    "test/registered/unit/models/test_qwen38_pdmux.py": "df3de3ca8693efb4e5ceadd2203a4813ce53230a3d0851d9e03273157d19fb4a"
+  },
+  "passed": true
+}
