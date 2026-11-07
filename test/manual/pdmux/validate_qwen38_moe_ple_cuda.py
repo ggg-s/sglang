@@ -18,6 +18,7 @@ import math
 import sys
 import traceback
 import types
+import typing
 from pathlib import Path
 
 import torch
@@ -565,6 +566,8 @@ def load_ple(fp8):
             tl=triton.language,
             math=math,
             msgspec=msgspec,
+            Optional=typing.Optional,
+            ForwardMode=small.Mode,
             sympy=sympy,
             nullcontext=contextlib.nullcontext,
             envs=envs,
