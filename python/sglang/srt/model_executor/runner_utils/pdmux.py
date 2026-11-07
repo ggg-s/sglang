@@ -39,10 +39,13 @@ def run_split_prefill(
 ) -> Optional[LogitsProcessorOutput]:
     from sglang.srt.layers.cp.utils import is_cp_active, prepare_cp_forward
 
+    forward_batch.split_prefill_can_run_graph = False
+
     graph = getattr(model_runner, "prefill_cuda_graph_runner", None)
     can_run_split = getattr(graph, "can_run_split", None)
     if can_run_split is not None and can_run_split(forward_batch, forward_count):
         output = graph.execute_split(forward_batch, forward_count)
+        forward_batch.split_prefill_can_run_graph = True
         forward_batch.split_index = min(
             forward_batch.split_index + forward_count,
             model_runner.model_config.num_hidden_layers,

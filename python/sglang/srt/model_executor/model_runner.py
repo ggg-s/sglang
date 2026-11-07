@@ -2194,6 +2194,9 @@ class ModelRunner:
                         reinit_attn_backend=reinit_attn_backend,
                         forward_count=forward_count,
                     )
+                    can_run_graph = getattr(
+                        forward_batch, "split_prefill_can_run_graph", False
+                    )
             elif (
                 forward_batch.forward_mode.is_extend(include_draft_extend_v2=True)
                 and not isinstance(self.prefill_cuda_graph_runner, EagerRunner)

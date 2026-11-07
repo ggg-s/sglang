@@ -11,6 +11,8 @@ import contextlib
 import hashlib
 import json
 import statistics
+import subprocess
+import sys
 import tempfile
 import time
 import types
@@ -77,6 +79,18 @@ def load_bcg():
         PREFILL_CUDA_GRAPH_CAPTURE_FAILED_MSG="BCG {backend}: {suggestions}",
     )
     executor = ops.load("bcg_continuation", BASE + "runner_utils/pdmux_bcg.py")
+    dispatch = ops.load(
+        "bcg_split_dispatch",
+        BASE + "runner_utils/pdmux.py",
+        device_timer_ctx=lambda *a: contextlib.nullcontext(),
+    )
+    executor.run_split_prefill = dispatch.run_split_prefill
+    # CP is excluded by the admitted plain-TP profile. Only this metadata
+    # boundary is supplied; dispatch and all model/kernel bodies are original.
+    cp = types.ModuleType("sglang.srt.layers.cp.utils")
+    cp.is_cp_active = lambda batch: False
+    cp.prepare_cp_forward = lambda batch: None
+    sys.modules[cp.__name__] = cp
     shape = ops.load("bcg_shape_key", BASE + "runner/shape_key.py")
     small.selected(
         "sglang.srt.model_executor.runner_utils.shared_read_event",
@@ -202,8 +216,30 @@ class Fixture:
             device_module=torch.cuda,
             _execute_body_capture=self.final_interval,
             _finalize_execute_output=lambda output: output,
+            capture_num_tokens=[tokens],
+            _pad_to_bucket=lambda size, buckets: size,
+            can_run_graph=lambda batch: True,
         )
         self.continuation = executor.PdmuxBCGExecutor(self.runner)
+        self.runner.backend.has_layer_range = lambda key, start, end: bool(
+            self.graphs["split_bcg"].layer_segment_range(start, end)
+        )
+        self.dispatch_runner = NS(
+            model_config=NS(num_hidden_layers=2),
+            device_timer=None,
+            attn_backend=NS(init_forward_metadata=lambda batch: None),
+            model=NS(
+                forward_split_prefill=lambda ids, pos, batch, interval: self.forward(
+                    0, interval
+                )
+            ),
+            prefill_cuda_graph_runner=NS(
+                can_run_split=lambda b, count: (
+                    self.mode == "split_bcg" and self.continuation.can_run(b, count)
+                ),
+                execute_split=self.continuation.execute,
+            ),
+        )
 
     def reset(self, lane):
         self.gdn.reset(lane + 1)
@@ -330,9 +366,9 @@ class Fixture:
             b.split_index = 0
             t = time.perf_counter()
             if mode == "eager_split":
-                self.forward(0, (0, 1))
+                self.api.run_split_prefill(self.dispatch_runner, b, forward_count=1)
             elif mode == "split_bcg":
-                self.continuation.execute(b, 1)
+                self.api.run_split_prefill(self.dispatch_runner, b, forward_count=1)
             if mode in ("eager_split", "split_bcg"):
                 prefill_cpu.append((time.perf_counter() - t) * 1000)
         with torch.cuda.stream(self.ds):
@@ -352,10 +388,14 @@ class Fixture:
         with torch.cuda.stream(self.ps):
             t = time.perf_counter()
             if mode == "eager_split":
-                prefill = self.forward(0, (1, 2))
+                prefill = self.api.run_split_prefill(
+                    self.dispatch_runner, b, forward_count=1
+                )
             elif mode == "split_bcg":
-                b.split_index = 1
-                prefill = self.continuation.execute(b, 1)
+                prefill = self.api.run_split_prefill(
+                    self.dispatch_runner, b, forward_count=1
+                )
+                assert b.split_prefill_can_run_graph
             elif mode == "standard_eager":
                 prefill = self.forward(0)
             else:
@@ -457,19 +497,38 @@ def main():
     bcg, ctx, executor, shape = load_bcg()
     fixture = Fixture(args.dtype == "fp8", args.tokens, bcg, ctx, executor, shape)
     result = fixture.run(args.rounds, args.trials)
+    ops.SOURCES[str(Path(__file__).relative_to(ops.ROOT))] = hashlib.sha256(
+        Path(__file__).read_bytes()
+    ).hexdigest()
     result.update(
         passed=True,
         torch=torch.__version__,
         gpu=torch.cuda.get_device_name(),
         dtype=args.dtype,
         source_sha256=ops.SOURCES,
+        git_commit=subprocess.check_output(
+            [
+                "git",
+                "-c",
+                "safe.directory=" + str(ops.ROOT),
+                "-C",
+                str(ops.ROOT),
+                "rev-parse",
+                "HEAD",
+            ],
+            text=True,
+        ).strip(),
+        tp_size=1,
+        dynamic_input_variants=2,
     )
     args.output.parent.mkdir(parents=True, exist_ok=True)
     args.output.write_text(json.dumps(result, indent=2) + "\n")
-    print(
-        json.dumps({k: v for k, v in result.items() if k != "source_sha256"}),
-        flush=True,
-    )
+    summary = {k: v for k, v in result.items() if k != "source_sha256"}
+    summary["cases"] = {
+        k: {m: value for m, value in v.items() if m != "samples"}
+        for k, v in result["cases"].items()
+    }
+    print(json.dumps(summary), flush=True)
 
 
 if __name__ == "__main__":

@@ -681,6 +681,10 @@ class ForwardBatch(ForwardBatchDeepSeekMHAMixin):
     # Segment 0 owns padding; later PDMux segments only restore process state
     # overwritten by intervening decode forwards.
     _pdmux_dp_state: Optional[tuple] = None
+    # Split prefill survives several worker calls with decode in between.
+    split_index: int = 0
+    model_specific_states: Optional[dict] = None
+    split_prefill_can_run_graph: bool = False
     # global_num_tokens_cpu as published for the DP gather: attn-TP aligned and,
     # under MAX_LEN, padded to the max. None when the raw list already is.
     global_num_tokens_padded_cpu: Optional[List[int]] = None

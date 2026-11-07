@@ -8,6 +8,7 @@ from __future__ import annotations
 
 import ast
 import contextlib
+import dataclasses
 import enum
 import importlib.util
 import sys
@@ -55,6 +56,74 @@ def load_method(path, owner, name, **namespace):
 
 
 class TestPdmuxMainCompat(unittest.TestCase):
+    def test_fresh_forward_batch_can_enter_split_without_adapter_fields(self):
+        """The real worker creates a fresh FB; it must own its initial cursor.
+
+        Keep the production dataclass fields/defaults and omit GPU methods so
+        this reproduces the worker boundary without importing CUDA packages.
+        """
+        path = ROOT / "python/sglang/srt/model_executor/forward_batch_info.py"
+        cls = next(
+            n
+            for n in ast.parse(path.read_text()).body
+            if isinstance(n, ast.ClassDef) and n.name == "ForwardBatch"
+        )
+        cls.bases = []
+        cls.body = [n for n in cls.body if isinstance(n, ast.AnnAssign)]
+        ns = {"dataclass": dataclasses.dataclass, "__name__": __name__}
+        body = [ast.parse("from __future__ import annotations").body[0], cls]
+        exec(
+            compile(
+                ast.fix_missing_locations(ast.Module(body=body, type_ignores=[])),
+                str(path),
+                "exec",
+            ),
+            ns,
+        )
+        frame_type = ns["ForwardBatch"]
+        required = {
+            f.name: None
+            for f in dataclasses.fields(frame_type)
+            if f.default is dataclasses.MISSING
+        }
+        first, second = frame_type(**required), frame_type(**required)
+        run = load_method(
+            "python/sglang/srt/model_executor/runner_utils/pdmux.py",
+            None,
+            "run_split_prefill",
+            device_timer_ctx=lambda *a: contextlib.nullcontext(),
+        )
+
+        def eager(ids, positions, batch, interval):
+            if interval[0] == 0:
+                self.assertIsNone(batch.model_specific_states)
+                batch.model_specific_states = {"saved": interval[1]}
+                return None
+            return batch.model_specific_states.pop("saved")
+
+        runner = SimpleNamespace(
+            model_config=SimpleNamespace(num_hidden_layers=2),
+            device_timer=None,
+            attn_backend=SimpleNamespace(init_forward_metadata=lambda batch: None),
+            model=SimpleNamespace(forward_split_prefill=eager),
+        )
+        cp = SimpleNamespace(
+            is_cp_active=lambda batch: False, prepare_cp_forward=lambda batch: None
+        )
+        with patch.dict(sys.modules, {"sglang.srt.layers.cp.utils": cp}):
+            self.assertIsNone(run(runner, first))
+            self.assertIsNone(second.model_specific_states)
+            self.assertEqual(run(runner, first), 1)
+            self.assertEqual(first.split_index, 2)
+            self.assertFalse(first.split_prefill_can_run_graph)
+            runner.prefill_cuda_graph_runner = SimpleNamespace(
+                can_run_split=lambda *args: True,
+                execute_split=lambda *args: "graph-logits",
+            )
+            self.assertEqual(run(runner, second, forward_count=2), "graph-logits")
+            self.assertTrue(second.split_prefill_can_run_graph)
+            self.assertEqual(second.split_index, 2)
+
     def test_split_bcg_interval_is_not_forwarded_to_the_model_tail(self):
         """Replay controls must not escape into arbitrary model.forward APIs."""
         execute = load_method(
