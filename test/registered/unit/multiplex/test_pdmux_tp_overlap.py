@@ -17,7 +17,7 @@ from unittest.mock import Mock
 
 from test_pdmux_sxf_port import SRT, load_methods, register_cpu_ci
 
-register_cpu_ci(est_time=5, suite="base-a-test-cpu")
+register_cpu_ci(est_time=10, suite="base-a-test-cpu")
 
 
 def lane_namespace(decode, prefill, *, attention=None, moe=None):
@@ -381,6 +381,7 @@ def _exercise_chunked_scheduler(rank, group, *, overlap):
         logger=Mock(),
         ForwardMode=NS(SPLIT_PREFILL=object()),
         get_current_stream_idx=lambda: 0,
+        get_parallel=lambda: NS(tp_size=2, attn_dp_size=1),
         set_pdmux_status=lambda value: None,
         publish_carried_tensors=lambda *args: None,
         profile_range=lambda *args, **kw: contextlib.nullcontext(),
@@ -431,7 +432,6 @@ def _exercise_chunked_scheduler(rank, group, *, overlap):
         return False
 
     def admit(running):
-        pump()
         return NS(
             running_batch=running,
             batch_to_run=NS(
@@ -458,6 +458,7 @@ def _exercise_chunked_scheduler(rank, group, *, overlap):
 
     scheduler.ingest_requests = ingest
     scheduler.check_hicache_events_if_enabled = pump
+    scheduler._process_hicache_events = pump
     scheduler.get_new_batch_prefill = admit
     scheduler.run_batch = run
     scheduler._merge_finished_prefill_batch = merge
@@ -603,8 +604,76 @@ def _gloo_lane_rank(rank, store_path):
         dist.destroy_process_group()
 
 
+def _gloo_bcg_rank(rank, store_path):
+    """BCG intervals must keep TP collectives ordered across decode yields."""
+    import torch
+    import torch.distributed as dist
+
+    class Group:
+        def __init__(self, group):
+            self.group, self.count = group, 0
+
+        def all_reduce(self, x):
+            self.count += 1
+            dist.all_reduce(x, group=self.group)
+
+    dist.init_process_group(
+        "gloo",
+        init_method="file://" + store_path,
+        rank=rank,
+        world_size=2,
+        timeout=timedelta(seconds=20),
+    )
+    try:
+        decode = Group(dist.group.WORLD)
+        prefill = Group(dist.new_group([0, 1], backend="gloo"))
+        lanes = lane_namespace(decode, prefill)
+        graph_type = load_constructor(
+            "model_executor/runner_backend_utils/breakable_cuda_graph/breakable_cuda_graph.py",
+            "BreakableCUDAGraph",
+            dict(
+                get_device_module=lambda: NS(current_stream=lambda: None),
+                _current_stream_var=ContextVar("gloo_bcg_stream", default=None),
+            ),
+            methods=("layer_segment_range", "replay_layers", "_replay_segments"),
+        )
+        graph = graph_type()
+        x, y = torch.zeros(17), torch.zeros(17)
+        iteration = [0]
+
+        def layer_one():
+            x.mul_(rank + 1)
+            lanes.get_tp_group().all_reduce(x)
+
+        def layer_two():
+            x.add_(rank)
+            lanes.get_tp_group().all_reduce(x)
+
+        graph._segments = [
+            NS(replay=lambda: x.fill_(iteration[0] + 1)),
+            NS(replay=layer_one),
+            NS(replay=layer_two),
+            NS(replay=lambda: y.copy_(x * 0.5)),
+        ]
+        graph._layer_ends = {1: 2, 2: 3}
+        for i in range(32):
+            iteration[0] = i
+            lanes.set_pdmux_status(True)
+            graph.replay_layers(0, 1)
+            lanes.set_pdmux_status(False)
+            d = torch.tensor([i + rank])
+            lanes.get_tp_group().all_reduce(d)
+            torch.testing.assert_close(d, torch.tensor([2 * i + 1]))
+            lanes.set_pdmux_status(True)
+            graph.replay_layers(1, 2)
+            torch.testing.assert_close(y, torch.full_like(y, (6 * (i + 1) + 1) / 2))
+        assert prefill.count == 64 and decode.count == 32
+    finally:
+        dist.destroy_process_group()
+
+
 class TestPdmuxTPGloo(unittest.TestCase):
-    def test_two_ranks_keep_prefill_and_decode_collectives_separate(self):
+    def _run_ranks(self, target):
         try:
             import torch.distributed as dist
         except ImportError:
@@ -614,9 +683,7 @@ class TestPdmuxTPGloo(unittest.TestCase):
         ctx = multiprocessing.get_context("spawn")
         with tempfile.TemporaryDirectory(prefix="pdmux-tp-gloo-") as tmp:
             processes = [
-                ctx.Process(
-                    target=_gloo_lane_rank, args=(rank, str(Path(tmp) / "store"))
-                )
+                ctx.Process(target=target, args=(rank, str(Path(tmp) / "store")))
                 for rank in range(2)
             ]
             for process in processes:
@@ -631,6 +698,12 @@ class TestPdmuxTPGloo(unittest.TestCase):
                     if process.is_alive():
                         process.terminate()
                     process.join(timeout=5)
+
+    def test_segmented_bcg_collectives_keep_their_lane(self):
+        self._run_ranks(_gloo_bcg_rank)
+
+    def test_two_ranks_keep_prefill_and_decode_collectives_separate(self):
+        self._run_ranks(_gloo_lane_rank)
 
 
 if __name__ == "__main__":
