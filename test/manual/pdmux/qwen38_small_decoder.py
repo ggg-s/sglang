@@ -137,7 +137,10 @@ class Boundary:
         write = (
             self.layer._attn_combine if self.kind == "attn" else self.layer._ffn_combine
         )
-        return write(x, b.residuals.pop(self.key))
+        output = write(x, b.residuals.pop(self.key))
+        if self.kind == "ffn":
+            b.layer_outputs[self.key[0]] = output.clone()
+        return output
 
     @contextlib.contextmanager
     def exit(self, b):
@@ -148,6 +151,7 @@ class ResidualBatch:
     @staticmethod
     def start(b):
         b.residuals = {}
+        b.layer_outputs = {}
 
     @staticmethod
     def final_norm(x, b, mixer):
@@ -465,7 +469,7 @@ class QSACore(nn.Module):
     def select(self, hidden, positions, b):
         q = self.index_proj(hidden)[0].view(-1, 8, 128)
         if b.forward_mode.is_decode():
-            return self.indexer.select_decode_tokens(
+            result = self.indexer.select_decode_tokens(
                 q,
                 self.compressed.reshape(-1, 16, 1, 128),
                 b.page_table,
@@ -474,15 +478,18 @@ class QSACore(nn.Module):
                 positions,
                 b.seq_lens,
             )
-        return self.indexer.select_prefill_tokens(
-            q,
-            self.compressed[b.lane],
-            b.row_starts,
-            b.row_ends,
-            positions,
-            b.row_seq_lens,
-            max_row_keys=1024,
-        )
+        else:
+            result = self.indexer.select_prefill_tokens(
+                q,
+                self.compressed[b.lane],
+                b.row_starts,
+                b.row_ends,
+                positions,
+                b.row_seq_lens,
+                max_row_keys=1024,
+            )
+        b.selected_tokens = result.sort(dim=-1).values
+        return result
 
     def forward(self, q, k, v, b, topk_indices):
         rows = q.shape[0]
@@ -710,6 +717,8 @@ def run_decoder(rounds):
                 gdn.conv_state[lane],
                 qsa.k[lane],
                 qsa.v[lane],
+                batches[lane].layer_outputs[0],
+                batches[lane].selected_tokens,
             )
         )
 
@@ -733,7 +742,17 @@ def run_decoder(rounds):
         reset(1)
         dout = forward(1)
     ds.synchronize()
-    max_abs = [0.0] * 6
+    names = (
+        "terminal_mix",
+        "hc_output",
+        "gdn_state",
+        "conv_state",
+        "qsa_k",
+        "qsa_v",
+        "gdn_layer",
+        "selected_tokens",
+    )
+    max_abs = [0.0] * len(names)
     records = []
     for _ in range(rounds):
         with torch.cuda.stream(ps):
@@ -751,18 +770,31 @@ def run_decoder(rounds):
         records.append((p, d))
     ps.synchronize()
     ds.synchronize()
+    failures = {}
     for p, d in records:
-        for actual, control in zip((p, d), controls):
+        for lane, (actual, control) in enumerate(zip((p, d), controls)):
             for i, (a, c) in enumerate(zip(actual, control)):
                 assert torch.isfinite(a).all()
                 max_abs[i] = max(max_abs[i], (a.float() - c.float()).abs().max().item())
                 # Native top-k output order is unspecified; sparse reductions
                 # may differ by BF16 rounding, while state writes must be exact.
-                torch.testing.assert_close(
-                    a, c, atol=0.002 if i < 2 else 0, rtol=0.002 if i < 2 else 0
-                )
+                try:
+                    torch.testing.assert_close(
+                        a, c, atol=0.002 if i < 2 else 0, rtol=0.002 if i < 2 else 0
+                    )
+                except AssertionError:
+                    failures.setdefault(
+                        f"lane{lane}.{names[i]}",
+                        {
+                            "max_abs": max_abs[i],
+                            "unequal": int((a != c).sum().item()),
+                            "total": a.numel(),
+                        },
+                    )
     for a, c in zip((gdn.state[2], gdn.conv_state[2], qsa.k[2], qsa.v[2]), untouched):
         torch.testing.assert_close(a, c, atol=0, rtol=0)
+    if failures:
+        raise AssertionError(f"decoder parity diagnostics: {failures}")
     return dict(
         name="production_gdn_qsa_decoder_stack",
         rounds=rounds,

@@ -63,6 +63,10 @@ def main():
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--output", type=Path, required=True)
     parser.add_argument("--rounds", type=int, default=32)
+    parser.add_argument("--dtype", choices=("bf16", "fp8", "both"), default="both")
+    parser.add_argument(
+        "--layout", choices=("absolute", "relative", "both"), default="both"
+    )
     parser.add_argument(
         "--debug",
         action="store_true",
@@ -103,8 +107,16 @@ def main():
                     mqa, name, api.debug_kernel_api(getattr(mqa, name), op_name=name)
                 )
         report["tilelang"] = mqa.tilelang.__version__
-        for dtype in (torch.bfloat16, torch.float8_e4m3fn):
-            for relative in (False, True):
+        dtypes = {
+            "bf16": (torch.bfloat16,),
+            "fp8": (torch.float8_e4m3fn,),
+            "both": (torch.bfloat16, torch.float8_e4m3fn),
+        }[args.dtype]
+        layouts = {"absolute": (False,), "relative": (True,), "both": (False, True)}[
+            args.layout
+        ]
+        for dtype in dtypes:
+            for relative in layouts:
                 name = f"tilelang_mqa_{dtype}_{'relative' if relative else 'absolute'}"
                 try:
                     result = ops.pair_test(
