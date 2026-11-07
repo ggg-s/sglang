@@ -189,14 +189,16 @@ python -m pip install --no-deps -e ./plugins/remote_attn
 python -m sglang_remote_attn.check
 ```
 
-Preflight checks entry-point installation, all 23 hook targets, progressive core
-interfaces and Mooncake's `send_probe`. Core checks include explicit keyword
-parameters/defaults, transfer task fields, staging state initialization and typed
-environment declarations. Installed preflight resolves the loaded modules rather
+Preflight checks entry-point installation, all configured hook targets, progressive
+core interfaces and Mooncake's `send_probe`. Core checks include explicit keyword
+parameters/defaults, request/KV and batch fields, transfer registration/task fields,
+KVArgs annotations, staging state initialization and typed environment declarations. Installed preflight resolves the loaded modules rather
 than a checkout; plugin registration repeats these checks before registering hooks.
 Source-only checks validate the selected checkout with the same contract list.
 These checks do not start a server or validate GPU transfer correctness. Ordinary
 package installation without `HANDOFF_CTL_DIR` registers no hooks.
+The boundary audit and its validation limits are recorded in
+[the upstream interface audit](validation/UPSTREAM-INTERFACE-AUDIT.md).
 
 For interface checks on a machine without CUDA/Mooncake:
 

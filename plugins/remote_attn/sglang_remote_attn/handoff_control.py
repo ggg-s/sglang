@@ -9648,9 +9648,17 @@ def _handle(scheduler, data):
         return {"results": results, "errors": errors, "count": len(reqs)}
 
     if cmd == "debug_queue":
+        from sglang.srt.managers.scheduler_components.request_list import ListKind
+
+        held = {
+            id(req)
+            for req in (
+                *scheduler.request_lists().get(ListKind.PD_HELD, ()),
+                *getattr(scheduler, "_handoff_held_reqs", ()),
+            )
+        }
         rows = []
         for req in list(scheduler.waiting_queue):
-            er = getattr(req, "extend_range", None)
             pi = getattr(req, "_handoff_prefix_indices", None)
             hp = getattr(req, "handoff_prefix_indices", None)
             rows.append(
@@ -9664,16 +9672,16 @@ def _handle(scheduler, data):
                     "handoff_prefix_pending": hp is not None,
                     "extend_range": (
                         None
-                        if er is None
+                        if req.extend_end is None
                         else {
-                            "start": int(er.start),
-                            "end": int(er.end),
-                            "length": int(er.length),
+                            "start": int(req.prefix_len),
+                            "end": int(req.extend_end),
+                            "length": int(req.extend_len),
                         }
                     ),
                     "finished": bool(req.finished()),
                     "inflight_steps": int(req.inflight_steps),
-                    "held": bool(getattr(req, "handoff_held", False)),
+                    "held": id(req) in held,
                 }
             )
         return {"waiting": rows, "count": len(rows)}

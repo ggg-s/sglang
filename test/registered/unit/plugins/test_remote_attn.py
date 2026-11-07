@@ -11985,8 +11985,7 @@ class TestRemoteAttn(CustomTestCase):
                 return "native-local-compute"
 
         backend = NativeBackendBoundary()
-        f.runner.attn_backend = f.runner.decode_attn_backend = backend
-        f.runner.decode_attn_backend_group = [backend]
+        f.runner.attn_backend = backend
         f.scheduler.disaggregation_mode = SimpleNamespace(value="decode")
         # Ring allocation has its own native CUDA/source-loaded coverage.
         with (
@@ -13339,6 +13338,7 @@ class TestRemoteAttn(CustomTestCase):
             list(self.hooks.HOOKS)
             + list(api.CORE_CALLS)
             + list(api.CORE_FIELDS)
+            + list(api.CORE_ANNOTATIONS)
             + list(api.CORE_PROPERTIES)
             + list(api.CORE_STATE)
             + ["sglang.srt.environ.Envs"]
@@ -13447,6 +13447,14 @@ class TestRemoteAttn(CustomTestCase):
     def test_prelayer_preflight_rejects_missing_task_state_and_environment(self):
         """Mixed core files must fail before a worker accesses absent fields."""
         cases = (
+            ("sglang.srt.managers.schedule_batch.Req.__init__", "pending_bootstrap"),
+            ("sglang.srt.managers.schedule_batch.ReqKvInfo", "kv_committed_len"),
+            ("sglang.srt.disaggregation.decode.DecodeRequest", "pending_metadata"),
+            (
+                "sglang.srt.disaggregation.mooncake.conn.KVArgsRegisterInfo",
+                "dst_aux_item_lens",
+            ),
+            ("sglang.srt.disaggregation.base.conn.KVArgs", "state_item_lens"),
             ("sglang.srt.managers.schedule_batch.ScheduleBatch", "chunked_req"),
             ("sglang.srt.managers.schedule_batch.Req.__init__", "inflight_steps"),
             ("sglang.srt.managers.utils.GenerationBatchResult", "delay_sample_func"),
@@ -13594,8 +13602,36 @@ class TestRemoteAttn(CustomTestCase):
                     for name in api.declared_fields(source.resolve(target))
                 ],
             )
+        for target in api.CORE_ANNOTATIONS:
+            loaded[target] = type(
+                "LoadedAnnotations",
+                (),
+                {
+                    "__annotations__": {
+                        name: object
+                        for name in api.declared_fields(source.resolve(target))
+                    }
+                },
+            )
         loaded["sglang.srt.environ.envs"] = envs
         self.check.check_runtime_interfaces(resolve=loaded.__getitem__)
+
+        annotation = "sglang.srt.disaggregation.base.conn.KVArgs"
+        original = loaded[annotation]
+        loaded[annotation] = type(
+            "OldKVArgs",
+            (),
+            {
+                "__annotations__": {
+                    k: v
+                    for k, v in original.__annotations__.items()
+                    if k != "state_item_lens"
+                }
+            },
+        )
+        with self.assertRaisesRegex(RuntimeError, "state_item_lens"):
+            self.check.check_runtime_interfaces(resolve=loaded.__getitem__)
+        loaded[annotation] = original
 
         task = "sglang.srt.disaggregation.common.utils.TransferKVChunk"
         original = loaded[task]
@@ -16451,7 +16487,7 @@ class TestRemoteAttn(CustomTestCase):
 
         backend = DeepseekV4AttnBackend()
         mr = f.runner.model_runner
-        mr.attn_backend, mr.decode_attn_backend = backend, backend
+        mr.attn_backend = backend
         controller = SimpleNamespace(pool=mr.token_to_kv_pool, remote_targets={})
         remote.validate(controller, mr, "decode")
         self.assertIs(backend._dsv41_remote, controller)
@@ -18805,6 +18841,40 @@ class TestRemoteAttn(CustomTestCase):
             dict(epoch=data["epoch"], certificates=[result["reservations"]]),
         )
         return planned[0]
+
+    def test_debug_queue_uses_native_extend_fields_and_live_held_lists(self):
+        """Queue diagnostics must report real intervals/owners instead of deleted fields."""
+        from sglang.srt.managers.scheduler_components.request_list import ListKind
+
+        req = SimpleNamespace(
+            rid="queued",
+            kv=SimpleNamespace(kv_committed_len=3, req_pool_idx=1),
+            seqlen=9,
+            output_ids=[],
+            prefix_len=3,
+            extend_end=9,
+            extend_len=6,
+            inflight_steps=1,
+            finished=lambda: False,
+        )
+        scheduler = SimpleNamespace(waiting_queue=[req], request_lists=lambda: {})
+        for owner in ("none", "native", "plugin"):
+            with self.subTest(owner=owner):
+                scheduler.request_lists = lambda: (
+                    {ListKind.PD_HELD: [req]} if owner == "native" else {}
+                )
+                scheduler._handoff_held_reqs = [req] if owner == "plugin" else []
+                result = self.runtime._handle(scheduler, dict(cmd="debug_queue"))
+                row = result["waiting"][0]
+                self.assertEqual(row["extend_range"], dict(start=3, end=9, length=6))
+                self.assertEqual(row["held"], owner != "none")
+                self.assertEqual(row["inflight_steps"], 1)
+        req.extend_end = None
+        self.assertIsNone(
+            self.runtime._handle(scheduler, dict(cmd="debug_queue"))["waiting"][0][
+                "extend_range"
+            ]
+        )
 
     def test_qwen_native_reservation_reuses_row_and_preserves_partial_tail_page(self):
         from sglang_remote_attn import qwen_reservation as reservation

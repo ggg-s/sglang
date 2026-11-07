@@ -14,6 +14,10 @@ STAGING = DISAGG + "common.staging_handler."
 # Explicit optional parameters are required: **kwargs can silently discard them.
 # Values pin the native, feature-disabled defaults as well as keyword support.
 CORE_CALLS = {
+    "sglang.srt.managers.scheduler.Scheduler.request_lists": {},
+    "sglang.srt.mem_cache.memory_pool.HybridLinearKVPool.get_state_buf_infos": {},
+    "sglang.srt.mem_cache.memory_pool.MambaPool._iter_transfer_state_entries": {},
+    "sglang.srt.mem_cache.base_prefix_cache.BasePrefixCache.supports_swa": {},
     "sglang.srt.mem_cache.unified_radix_cache.UnifiedRadixCache.checkpoint_into_tree": {
         "swa_checkpoint_start": None
     },
@@ -310,10 +314,81 @@ CORE_CALLS = {
         "req": inspect.Parameter.empty
     },
 }
-CORE_PROPERTIES = (DISAGG + "mooncake.pinned_staging_core.CorePinnedStager.poisoned",)
+CORE_PROPERTIES = (
+    DISAGG + "mooncake.pinned_staging_core.CorePinnedStager.poisoned",
+    "sglang.srt.managers.schedule_batch.Req.seqlen",
+    "sglang.srt.managers.schedule_batch.Req.extend_len",
+    "sglang.srt.managers.schedule_batch.ReqKvInfo.holds_kv",
+    "sglang.srt.managers.schedule_batch.ReqKvInfo.is_kv_released",
+)
 CORE_FIELDS = {
-    "sglang.srt.managers.schedule_batch.ScheduleBatch": ("chunked_req",),
-    "sglang.srt.managers.schedule_batch.ReqKvInfo": ("swa_retained_ranges",),
+    "sglang.srt.managers.schedule_batch.ScheduleBatch": (
+        "chunked_req",
+        "forward_mode",
+        "input_embeds",
+        "input_ids",
+        "is_prefill_only",
+        "replace_embeds",
+        "req_pool_indices",
+        "req_pool_indices_cpu",
+        "reqs",
+        "return_hidden_states",
+    ),
+    "sglang.srt.managers.schedule_batch.ReqKvInfo": (
+        "req_pool_idx",
+        "kv_committed_len",
+        "kv_allocated_len",
+        "cache_protected_len",
+        "cache_inserted_len",
+        "swa_retained_ranges",
+        "swa_evict_floor",
+        "mamba_pool_idx",
+    ),
+    "sglang.srt.model_executor.forward_batch_info.ForwardBatch": (
+        "forward_mode",
+        "input_embeds",
+        "mm_inputs",
+        "out_cache_loc",
+        "replace_embeds",
+        "req_pool_indices",
+        "req_pool_indices_cpu",
+        "seq_lens",
+    ),
+    "sglang.srt.disaggregation.decode.DecodeRequest": (
+        "req",
+        "kv_receiver",
+        "metadata_buffer_index",
+        "is_rebootstrap",
+        "awaiting_publish",
+        "pending_metadata",
+    ),
+    "sglang.srt.disaggregation.mooncake.conn.TransferInfo": (
+        "room",
+        "mooncake_session_id",
+        "dst_kv_indices",
+        "dst_aux_index",
+        "dst_state_indices",
+        "is_dummy",
+        "decode_prefix_len",
+        "dst_device_kv_indices",
+    ),
+    "sglang.srt.disaggregation.mooncake.conn.KVArgsRegisterInfo": (
+        "mooncake_session_id",
+        "dst_kv_ptrs",
+        "dst_aux_ptrs",
+        "dst_aux_item_lens",
+        "dst_state_data_ptrs",
+        "dst_attn_tp_size",
+        "dst_kv_item_len",
+        "dst_kv_item_lens",
+        "dst_state_item_lens",
+        "dst_state_dim_per_tensor",
+        "dst_kv_layer_ids",
+        "dst_state_layer_ids",
+        "requires_dcp_relayout",
+        "staging_base_ptr",
+        "staging_total_size",
+    ),
     "sglang.srt.managers.scheduler_components.invariant_checker.SchedulerInvariantChecker": (
         "get_external_kv_owners",
     ),
@@ -337,6 +412,29 @@ CORE_FIELDS = {
         "staging_layer_ids",
     ),
 }
+# KVArgs is an annotated registration contract, not a dataclass. Keep its
+# annotations separate so the runtime check still requires real task dataclasses.
+CORE_ANNOTATIONS = {
+    DISAGG + "base.conn.KVArgs": (
+        "kv_data_ptrs",
+        "kv_data_lens",
+        "kv_item_lens",
+        "kv_layer_ids",
+        "aux_data_ptrs",
+        "aux_data_lens",
+        "aux_item_lens",
+        "state_types",
+        "state_data_ptrs",
+        "state_data_lens",
+        "state_item_lens",
+        "state_layer_ids",
+        "state_dim_per_tensor",
+        "page_size",
+        "pp_rank",
+        "num_draft_entries",
+    ),
+}
+
 # Instance fields cannot be inspected by constructing the real GPU owners.
 # Inspect their initialization declarations in the actual loaded Python sources.
 CORE_STATE = {
@@ -351,11 +449,38 @@ CORE_STATE = {
     "sglang.srt.managers.schedule_batch.Req.__init__": (
         "self",
         (
+            "bootstrap_room",
             "cache_request_handle",
+            "cache_salt",
+            "custom_logit_processor",
+            "disagg_decode_prefix_len",
+            "disagg_kv_sender",
+            "extend_end",
+            "extra_key",
+            "finished_reason",
+            "full_untruncated_fill_ids",
+            "grammar",
+            "host_hit_length",
+            "inflight_steps",
+            "input_embeds",
+            "kv",
             "last_node",
             "lock",
+            "logprob",
+            "metadata_buffer_index",
+            "multimodal_inputs",
+            "origin_input_ids",
+            "output_ids",
+            "pending_bootstrap",
+            "prefix_len",
             "retraction_count",
-            "inflight_steps",
+            "return_logprob",
+            "rid",
+            "sampling_params",
+            "session_id",
+            "skip_radix_cache_insert",
+            "start_send_idx",
+            "swa_branching_seqlen",
         ),
     ),
     "sglang.srt.mem_cache.unified_radix_cache.UnifiedRadixCache.__init__": (
@@ -518,6 +643,12 @@ def check_source_interfaces(root):
             if name not in declared:
                 incompatible(target, f"missing dataclass field {name}")
         checked.append(target)
+    for target, fields in CORE_ANNOTATIONS.items():
+        declared = declared_fields(api.resolve(target))
+        for name in fields:
+            if name not in declared:
+                incompatible(target, f"missing annotation {name}")
+        checked.append(target)
     for target in CORE_PROPERTIES:
         node = api.resolve(target)
         if not any(
@@ -566,6 +697,12 @@ def check_runtime_interfaces(resolve=None):
         for name in fields:
             if name not in declared:
                 incompatible(target, f"missing dataclass field {name}")
+        checked.append(target)
+    for target, fields in CORE_ANNOTATIONS.items():
+        declared = inspect.get_annotations(loaded(target), eval_str=False)
+        for name in fields:
+            if name not in declared:
+                incompatible(target, f"missing annotation {name}")
         checked.append(target)
     for target in CORE_PROPERTIES:
         if not isinstance(loaded(target), property):

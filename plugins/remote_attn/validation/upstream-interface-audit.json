@@ -1,0 +1,109 @@
+{
+  "baseline": "9c8e60e25b",
+  "plugin_python_files": 48,
+  "baseline_attribute_names": 2041,
+  "core_imports": 56,
+  "static_import_calls_checked": 79,
+  "unresolved_imports": [],
+  "removed_name_candidates": 17,
+  "removed_names_cleaned": [
+    "decode_attn_backend",
+    "decode_attn_backend_group"
+  ],
+  "diagnostic_fixes": [
+    "Req.extend_range -> prefix_len/extend_end/extend_len",
+    "Req.handoff_held -> native PD_HELD and plugin owner lists"
+  ],
+  "boundary_scan": {
+    "manager": {
+      "method_call_candidates": 24,
+      "native_member_names": 227
+    },
+    "sender": {
+      "method_call_candidates": 9,
+      "native_member_names": 35
+    },
+    "receiver": {
+      "method_call_candidates": 5,
+      "native_member_names": 51
+    },
+    "decode_req": {
+      "method_call_candidates": 0,
+      "native_member_names": 13
+    },
+    "queue": {
+      "method_call_candidates": 14,
+      "native_member_names": 135
+    },
+    "registration": {
+      "method_call_candidates": 0,
+      "native_member_names": 24
+    },
+    "peer": {
+      "method_call_candidates": 0,
+      "native_member_names": 11
+    },
+    "kv": {
+      "method_call_candidates": 9,
+      "native_member_names": 44
+    },
+    "graph_runner": {
+      "method_call_candidates": 0,
+      "native_member_names": 234
+    },
+    "pool": {
+      "method_call_candidates": 67,
+      "native_member_names": 336
+    },
+    "kv_args": {
+      "method_call_candidates": 0,
+      "native_member_names": 41
+    }
+  },
+  "private_keyword_review": {
+    "name": "_dsv41_canonical",
+    "consumed_before_core": true
+  },
+  "core_contracts": 145,
+  "hooks": 51,
+  "tests": {
+    "main": {
+      "count": 378,
+      "passed": true,
+      "elapsed_s": 194.47
+    },
+    "contracts": {
+      "count": 23,
+      "passed": true,
+      "elapsed_s": 19.45
+    },
+    "abi": {
+      "count": 6,
+      "passed": true,
+      "elapsed_s": 0.511
+    },
+    "focused": {
+      "count": 3,
+      "passed": true,
+      "included_in_main": true,
+      "elapsed_s": 10.39
+    }
+  },
+  "negative_control": {
+    "file": "handoff_control.py",
+    "baseline": "9c8e60e25b",
+    "expected_failure_confirmed": true,
+    "subtest_failures": 3,
+    "elapsed_s": 0.263
+  },
+  "runtime_preflight_passed": false,
+  "runtime_preflight_blocker": "isolated snapshot lacks entry-point installation; direct loaded-core check blocked by native deepseek_v4 -> mhc_mega import: missing deep_gemm",
+  "full_model_serving": false,
+  "h20": false,
+  "sha256": {
+    "plugins/remote_attn/sglang_remote_attn/dsv41_remote.py": "f654638c885f92f17d168b521340176f33dd3fdea23bf1949bd9fbbe1f2d8608",
+    "plugins/remote_attn/sglang_remote_attn/handoff_control.py": "3d956ce4e2039d8fcd50b71e1c3004c67272339479068661a9d34959d6f161a1",
+    "plugins/remote_attn/sglang_remote_attn/interfaces.py": "82816894a6d6e8018d00643339c1c5e97aa5be8387476b68acb7ff7fdecd2ba7",
+    "test/registered/unit/plugins/test_remote_attn.py": "a1349816bd35b7005e2adae940611ee6828f9634891fdb2519147b71bc3241dd"
+  }
+}

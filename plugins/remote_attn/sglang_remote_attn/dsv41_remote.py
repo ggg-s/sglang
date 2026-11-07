@@ -65,12 +65,7 @@ def validate(controller, runner, role):
             controller._fast_warmed = True
     if role == "prefill":
         return
-    backends = [
-        getattr(runner, "attn_backend", None),
-        getattr(runner, "decode_attn_backend", None),
-    ]
-    backends.extend(getattr(runner, "decode_attn_backend_group", None) or [])
-    backends = [backend for backend in backends if backend is not None]
+    backends = [runner.attn_backend]
     if not backends or any(
         not (
             getattr(b, "is_dsv41", False)
