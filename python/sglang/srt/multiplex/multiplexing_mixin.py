@@ -201,6 +201,13 @@ class SchedulerMultiplexMixin:
         stalls host submission behind unrelated queued decode work.
         """
         current_idx = get_current_stream_idx()
+        worker = getattr(self, "tp_worker", None)
+        runner = getattr(worker, "model_runner", None)
+        graph = getattr(runner, "prefill_cuda_graph_runner", None)
+        executor = getattr(graph, "pdmux_split_executor", None)
+        if executor is not None and executor.owner is not None:
+            # Captured intermediate addresses belong to the current variant.
+            return current_idx, self.stream_groups[current_idx]
         if stream_idx == current_idx:
             return stream_idx, self.stream_groups[stream_idx]
         if not getattr(self, "pdmux_temporal_layers", 0):

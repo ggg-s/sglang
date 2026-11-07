@@ -344,8 +344,32 @@ class BreakableCUDAGraph:
         self._deduped_cuda_graph = deduped_cuda_graph
         self._hicache_graph_events = hicache_graph_events
         self._hicache_wait_nodes = []
+        self._layer_ends: dict[int, int] = {}
 
     def replay(self) -> None:
+        self._replay_segments(0, len(self._segments))
+
+    def layer_segment_range(self, start: int, end: int) -> tuple[int, int]:
+        """Include preparation in the first interval and the tail in the last.
+
+        Intervals must be consumed in order by one owner. Intermediates remain
+        in this graph's pool across yields; they cannot migrate to another
+        captured shape or stream-group variant halfway through a forward.
+        """
+        if not self._layer_ends or not 0 <= start < end:
+            raise ValueError(f"Invalid BCG layer interval {(start, end)}")
+        last = max(self._layer_ends)
+        if end not in self._layer_ends or (start and start not in self._layer_ends):
+            raise ValueError(f"Uncaptured BCG layer interval {(start, end)}")
+        return (
+            self._layer_ends[start] if start else 0,
+            len(self._segments) if end == last else self._layer_ends[end],
+        )
+
+    def replay_layers(self, start: int, end: int) -> None:
+        self._replay_segments(*self.layer_segment_range(start, end))
+
+    def _replay_segments(self, start: int, end: int) -> None:
         stream = get_device_module().current_stream()
         token = _current_stream_var.set(stream)
         try:
@@ -353,8 +377,8 @@ class BreakableCUDAGraph:
                 self._hicache_graph_events.bind(
                     self._segments, self._hicache_wait_nodes
                 )
-            for i, seg in enumerate(self._segments):
-                seg.replay()
+            for i in range(start, end):
+                self._segments[i].replay()
                 if i < len(self._break_fns):
                     self._break_fns[i]()
         finally:
@@ -485,3 +509,14 @@ class BreakableCUDAGraphCapture:
 def break_graph() -> None:
     """Insert a graph break. The @eager_on_graph decorator does the actual
     segment split; this function body intentionally does nothing."""
+
+
+def mark_layer_end(layer: int) -> None:
+    """Record a scheduler-safe boundary after a complete decoder layer."""
+    capture = _current_capture_var.get()
+    if capture is None:
+        return
+    if layer in capture.cuda_graph._layer_ends:
+        raise ValueError(f"Duplicate BCG layer boundary {layer}")
+    break_graph()
+    capture.cuda_graph._layer_ends[layer] = len(capture.cuda_graph._segments)

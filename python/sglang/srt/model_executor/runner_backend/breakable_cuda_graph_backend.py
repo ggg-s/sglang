@@ -46,6 +46,7 @@ from sglang.srt.model_executor.runner_backend_utils.hicache_graph_events import 
 )
 from sglang.srt.model_executor.runner_utils.pool import (
     GraphPoolPrecarve,
+    disable_graph_pool_borrow,
     get_or_create_global_graph_memory_pool,
     graph_pool_capture_scope,
     graph_pool_replay_scope,
@@ -113,7 +114,15 @@ class BreakableCudaGraphBackend(DedupedCudaGraphMixin, BaseCudaGraphBackend):
     @contextmanager
     def capture_session(self, stream: torch.cuda.Stream):
         if self._pool is None:
-            self._pool = get_or_create_global_graph_memory_pool(self._device_module)
+            # PDMux prefill and decode replay concurrently. Their graph-pool
+            # intermediates must never alias, even with private input buffers.
+            self._pool = (
+                self._device_module.graph_pool_handle()
+                if getattr(self._cuda_graph_runner, "enable_pdmux", False)
+                else get_or_create_global_graph_memory_pool(self._device_module)
+            )
+            if getattr(self._cuda_graph_runner, "enable_pdmux", False):
+                disable_graph_pool_borrow("PDMux graph lanes may execute concurrently")
         set_graph_pool_id(self._pool)
         self._capture_stream = stream
         self._shared_output_buffer = None
@@ -304,8 +313,22 @@ class BreakableCudaGraphBackend(DedupedCudaGraphMixin, BaseCudaGraphBackend):
         if self._enable_hicache_event_capture and self._hicache_graph_events is None:
             wait_for_layer_loads(self._model_runner.token_to_kv_pool)
         with graph_pool_replay_scope():
-            self._graphs[shape_key].replay()
+            interval = kwargs.get("pdmux_layer_interval")
+            if interval is None:
+                self._graphs[shape_key].replay()
+            else:
+                self._graphs[shape_key].replay_layers(*interval)
         return self._outputs[shape_key]
+
+    def has_layer_range(self, shape_key, start: int, end: int) -> bool:
+        graph = self._graphs.get(shape_key)
+        if graph is None:
+            return False
+        try:
+            graph.layer_segment_range(start, end)
+        except ValueError:
+            return False
+        return True
 
     def cleanup(self) -> None:
         self.close()

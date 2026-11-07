@@ -205,6 +205,7 @@ class TestPrefillCudaGraphRunnerChunkedPrefix(CustomTestCase):
     def test_pdmux_split_graph_replays_only_on_captured_prefill_lane(self):
         runner = PrefillCudaGraphRunner.__new__(PrefillCudaGraphRunner)
         runner.pdmux_split = True
+        runner.pdmux_bcg = True
         runner._is_full_backend = False
         runner.enable_lora = False
         runner._capture_chunked_prefix = False
@@ -813,6 +814,11 @@ class TestPrefillCudaGraphCaptureState(CustomTestCase):
     def _runner(self, *, pdmux_split):
         runner = PrefillCudaGraphRunner.__new__(PrefillCudaGraphRunner)
         runner.pdmux_split = pdmux_split
+        runner.pdmux_bcg = pdmux_split
+        runner.layer_model = SimpleNamespace(layers=[])
+        runner.model_runner = SimpleNamespace(
+            model_config=SimpleNamespace(num_hidden_layers=0)
+        )
         runner.warmup = lambda: None
         runner._capture_one_stream = lambda: None
         runner.backend = SimpleNamespace(capture_session=lambda _stream: nullcontext())
@@ -902,10 +908,12 @@ class TestPrefillCudaGraphCaptureState(CustomTestCase):
         ):
             runner.capture()
 
-        self.assertEqual(set_idx.call_args_list, [call(0), call(3)])
+        self.assertEqual(
+            set_idx.call_args_list, [call(0), call(1), call(2), call(3), call(3)]
+        )
         self.assertEqual(set_status.call_args_list, [call(True), call(False)])
-        self.assertEqual(captured_streams, [groups[0][0]])
-        self.assertIs(runner.stream, groups[0][0])
+        self.assertEqual(captured_streams, [group[0] for group in groups])
+        self.assertIs(runner.stream, groups[-1][0])
         self.assertFalse(dp_flags.capturing_prefill_graph)
 
 

@@ -586,7 +586,7 @@ class UnquantizedEmbeddingMetadata:
     pass
 
 
-def load_ple(fp8):
+def load_ple(fp8, bcg=None, bcg_context=None):
     import msgspec
     import sympy
 
@@ -672,6 +672,7 @@ def load_ple(fp8):
         path,
         {
             "_PLEBatch": (["msgspec.Struct"], None),
+            "_BreakablePLEBatch": ([], None),
             "Qwen4ExpPLEGroupedNorm": (["nn.Module"], None),
             "Qwen4ExpNGramEmbedding": (["nn.Module"], None),
             "Qwen4ExpPinnedHostEmbedding": (["VocabParallelEmbedding"], None),
@@ -694,7 +695,13 @@ def load_ple(fp8):
             get_parallel=lambda: NS(attn_dp_size=1),
             is_dp_attention_enabled=lambda: False,
             get_is_capture_mode=torch.cuda.is_current_stream_capturing,
-            is_in_breakable_cuda_graph=lambda: False,
+            is_in_breakable_cuda_graph=(
+                bcg_context.is_in_breakable_cuda_graph if bcg_context else lambda: False
+            ),
+            eager_on_graph=(
+                bcg.eager_on_graph if bcg else lambda *a, **kw: lambda f: f
+            ),
+            get_tc_piecewise_forward_context=lambda: NS(forward_batch=current.get()),
             get_req_to_token_pool=lambda: req_pool,
             get_token_to_kv_pool=lambda: token_pool,
             get_attn_backend=lambda: backend,
@@ -708,6 +715,10 @@ def load_ple(fp8):
             make_ple_file_rss_trimmer=host.make_ple_file_rss_trimmer,
         ),
         functions=(
+            "_breakable_prepare_ple_batch",
+            "_breakable_ple_prefetch",
+            "_breakable_ple_forward",
+            "_breakable_commit_ple_batch",
             "_ple_table_is_fp8",
             "_use_attn_tp_ngram",
             "_get_ple_forward_mode",

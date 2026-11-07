@@ -968,7 +968,7 @@ class TestPdmuxStandardPrefillAdmission(unittest.TestCase):
         rejections = [
             dict(
                 cuda_graph_config=SimpleNamespace(
-                    prefill=SimpleNamespace(backend="breakable")
+                    prefill=SimpleNamespace(backend="full")
                 )
             ),
             dict(enable_multi_layer_eagle=True),

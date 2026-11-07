@@ -4,7 +4,7 @@ import gc
 import sys
 import weakref
 from contextlib import contextmanager
-from contextvars import Context
+from contextvars import Context, ContextVar
 from types import SimpleNamespace
 
 import pytest
@@ -17,6 +17,7 @@ from sglang.srt.model_executor.runner_utils.forward_batch import (
     get_forward_batch,
     set_forward_batch,
 )
+from sglang.srt.model_executor.runner_utils.pdmux_bcg import PdmuxBCGExecutor
 from sglang.test.ci.ci_register import register_cpu_ci
 
 register_cpu_ci(est_time=7, suite="base-a-test-cpu")
@@ -243,6 +244,91 @@ def test_run_eager_method_torch_compile():
     x = torch.ones(2)
     compiled = torch.compile(layer, backend="eager", fullgraph=True)
     torch.testing.assert_close(compiled(x), layer(x))
+
+
+def test_split_intervals_partition_eager_breaks_and_run_tail_once(monkeypatch):
+    """A yield must neither repeat preparation nor omit the final eager tail."""
+    graph = bcg.BreakableCUDAGraph()
+    state = torch.zeros(1)
+    events = []
+    actions = [
+        lambda: state.fill_(2),
+        lambda: state.add_(3),
+        lambda: state.mul_(4),
+        lambda: state.add_(1),
+        lambda: state.mul_(2),
+    ]
+    graph._segments = [SimpleNamespace(replay=fn) for fn in actions]
+    graph._break_fns = [lambda i=i: events.append(i) for i in range(4)]
+    graph._layer_ends = {1: 2, 2: 4}
+    monkeypatch.setattr(
+        bcg, "get_device_module", lambda: SimpleNamespace(current_stream=lambda: None)
+    )
+    graph.replay_layers(0, 1)
+    assert state.item() == 5 and events == [0, 1]
+    graph.replay_layers(1, 2)
+    assert state.item() == 42 and events == [0, 1, 2, 3]
+    state.zero_()
+    graph.replay()
+    assert state.item() == 42
+    with pytest.raises(ValueError):
+        graph.replay_layers(1, 3)
+
+
+def test_split_session_restores_live_context_and_keeps_one_owner():
+    """Decode between intervals must not replace metadata or reset graph input."""
+    active = ContextVar("split_test_batch", default=None)
+    calls = []
+    batch = SimpleNamespace(split_index=0, input_ids=[1, 2])
+
+    @contextmanager
+    def context(b, **kwargs):
+        token = active.set(b)
+        try:
+            yield
+        finally:
+            active.reset(token)
+
+    def load(b):
+        calls.append("load")
+        return b, None
+
+    def replay(key, b, **kwargs):
+        assert active.get() is batch
+        calls.append(kwargs["pdmux_layer_interval"])
+        return "logits"
+
+    def tail(b, static, size, raw, key, **kwargs):
+        calls.append("tail")
+        return replay(key, b, **kwargs)
+
+    runner = SimpleNamespace(
+        model_runner=SimpleNamespace(model_config=SimpleNamespace(num_hidden_layers=2)),
+        model_context=lambda: context(None),
+        backend=SimpleNamespace(replay_session=lambda: context(None), replay=replay),
+        load_batch=load,
+        raw_num_tokens=2,
+        _shape_key=lambda size, b: (size, 1),
+        buffer_registry=SimpleNamespace(has_slot=lambda name: False),
+        _prefill_forward_context=context,
+        device_module=None,
+        _execute_body_capture=tail,
+        _finalize_execute_output=lambda out: out,
+    )
+    executor = PdmuxBCGExecutor(runner)
+    assert executor.execute(batch, 1) is None
+    assert active.get() is None and executor.owner is batch
+    with pytest.raises(RuntimeError, match="owns"):
+        executor.can_run(SimpleNamespace(), 1)
+    # Replaying an interval twice would repeat a state update; reject it.
+    with pytest.raises(RuntimeError, match="not finalized"):
+        executor.execute(batch, 1)
+    batch.split_index = 1
+    with context("decode"):
+        assert executor.execute(batch, 1) == "logits"
+        assert active.get() == "decode"
+    assert executor.owner is None and executor.session is None
+    assert calls == ["load", (0, 1), "tail", (1, 2)]
 
 
 if __name__ == "__main__":

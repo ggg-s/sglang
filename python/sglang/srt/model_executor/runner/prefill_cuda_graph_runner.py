@@ -164,6 +164,10 @@ from sglang.srt.model_executor.runner_utils.buffers import (
     PrefillInputBuffers,
 )
 from sglang.srt.model_executor.runner_utils.capture_mode import model_capture_mode
+from sglang.srt.model_executor.runner_utils.pdmux_bcg import (
+    PdmuxBCGExecutor,
+    capture_layer_boundaries,
+)
 from sglang.srt.model_executor.runner_utils.forward_batch import set_forward_batch
 from sglang.srt.model_executor.runner_utils.pool import (
     get_or_create_global_graph_capture_stream,
@@ -392,12 +396,13 @@ class PrefillCudaGraphRunner(BaseCudaGraphRunner):
         # --- prefill graph config -------------------------------------
         prefill_config = get_exec().graph.cuda_graph_config.prefill
         self.prefill_backend_name = prefill_config.backend
-        self.pdmux_split = (
+        self.pdmux_bcg = (
             self.enable_pdmux
-            and not self.pdmux_standard
             and not model_runner.is_draft_worker
             and self.prefill_backend_name == Backend.BREAKABLE
         )
+        self.pdmux_split = self.pdmux_bcg and not self.pdmux_standard
+        self.pdmux_split_executor = PdmuxBCGExecutor(self) if self.pdmux_split else None
         qwen_bcg = self.prefill_backend_name == Backend.BREAKABLE and is_qwen4_exp(
             model_runner.model_config.hf_config
         )
@@ -1189,9 +1194,7 @@ class PrefillCudaGraphRunner(BaseCudaGraphRunner):
         return ShapeKey(
             size=num_tokens,
             stream_idx=(
-                get_current_stream_idx()
-                if getattr(self, "pdmux_split", False)
-                else None
+                get_current_stream_idx() if getattr(self, "pdmux_bcg", False) else None
             ),
             variant_label=variant,
         )
@@ -1555,6 +1558,8 @@ class PrefillCudaGraphRunner(BaseCudaGraphRunner):
         return True
 
     def can_run_graph(self, forward_batch: ForwardBatch) -> bool:
+        if getattr(self, "pdmux_bcg", False) and forward_batch.contains_mm_inputs():
+            return False
         # DP check: group verdict from the schedule-time all-gather
         # (min-reduced votes; also requires every rank to hold tokens).
         if (
@@ -1630,7 +1635,7 @@ class PrefillCudaGraphRunner(BaseCudaGraphRunner):
         # layer_model.forward monkey-patch in replay(): the captured graph runs
         # the transformer stack, then the outer model.forward runs
         # logits_processor eagerly on top with live request metadata.
-        if getattr(self, "pdmux_split", False):
+        if getattr(self, "pdmux_bcg", False):
             # A graph captured on the prefill-only stream cannot replay on a
             # green-context lane with a different SM partition.
             graph_size = self._pad_to_bucket(
@@ -1836,13 +1841,27 @@ class PrefillCudaGraphRunner(BaseCudaGraphRunner):
         try:
             with freeze_gc(get_exec().graph.enable_cudagraph_gc):
                 capture_stream = get_or_create_global_graph_capture_stream()
-                if self.pdmux_split:
+                if self.pdmux_bcg:
                     original_stream_idx = get_current_stream_idx()
                     original_pdmux_status = is_pdmux_prefill_enabled()
                     try:
-                        set_current_stream_idx(0)
                         set_pdmux_status(True)
-                        self._capture_on_stream(get_stream_groups()[0][0])
+                        # Captured nodes retain their green-context resource
+                        # placement. Record each lane instead of replaying a
+                        # prefill-only graph on a shared SM partition.
+                        for index, (prefill_stream, _) in enumerate(
+                            get_stream_groups()
+                        ):
+                            set_current_stream_idx(index)
+                            with (
+                                capture_layer_boundaries(
+                                    self.layer_model,
+                                    self.model_runner.model_config.num_hidden_layers,
+                                )
+                                if self.pdmux_split
+                                else nullcontext()
+                            ):
+                                self._capture_on_stream(prefill_stream)
                     finally:
                         set_pdmux_status(original_pdmux_status)
                         set_current_stream_idx(original_stream_idx)
@@ -2341,6 +2360,7 @@ class PrefillCudaGraphRunner(BaseCudaGraphRunner):
         static_num_tokens: int,
         raw_num_tokens: int,
         shape_key: ShapeKey,
+        pdmux_layer_interval=None,
         **kwargs,
     ):
         # BCG / Full: replay the captured body, run the LM head +
@@ -2369,7 +2389,12 @@ class PrefillCudaGraphRunner(BaseCudaGraphRunner):
                 and self.buffer_registry.has_slot("input_embeds")
             ):
                 self._fill_input_embeds_slot(args, layer_kwargs, static_num_tokens)
-            hs = self.backend.replay(shape_key, static_forward_batch, **kwargs)
+            hs = self.backend.replay(
+                shape_key,
+                static_forward_batch,
+                pdmux_layer_interval=pdmux_layer_interval,
+                **kwargs,
+            )
             hs = self._restore_qwen_bcg_hc_output(hs)
             return _slice_output_rows(hs, raw_num_tokens) if full_path else hs
 
@@ -2557,3 +2582,10 @@ class PrefillCudaGraphRunner(BaseCudaGraphRunner):
                     **kwargs,
                 )
             return self._finalize_execute_output(output)
+
+    def can_run_split(self, forward_batch, forward_count):
+        executor = getattr(self, "pdmux_split_executor", None)
+        return executor is not None and executor.can_run(forward_batch, forward_count)
+
+    def execute_split(self, forward_batch, forward_count):
+        return self.pdmux_split_executor.execute(forward_batch, forward_count)

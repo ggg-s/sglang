@@ -295,6 +295,7 @@ def check_server_args(server_args: Any):
 
         if cfg.pdmux_prefill_mode == "standard":
             check_pdmux_standard_prefill(cfg)
+        check_pdmux_prefill_bcg(cfg)
 
         if cfg.pdmux_config_path:
             from sglang.srt.multiplex.pdmux_context import load_pdmux_config
@@ -908,6 +909,25 @@ def check_pdmux_overlap(cfg):
             )
 
 
+def check_pdmux_prefill_bcg(cfg):
+    """First BCG overlap profile: text, plain TP, no speculation.
+
+    TP ranks execute the same captured layer intervals and lane communicator
+    order. DP/CP/EP require their own interval votes and resource isolation.
+    """
+    if cfg.cuda_graph_config.prefill.backend != "breakable":
+        return
+    assert cfg.speculative_algorithm is None, (
+        "PDMux prefill BCG currently requires no speculative decoding/MTP"
+    )
+    for name in ("pp_size", "ep_size", "attn_cp_size", "dcp_size"):
+        assert getattr(cfg, name, 1) == 1, f"PDMux prefill BCG requires {name}=1"
+    assert not cfg.enable_dp_attention, "PDMux prefill BCG requires attention DP=1"
+    assert not getattr(cfg, "enable_prefill_cp", False), (
+        "PDMux prefill BCG does not yet support prefill CP"
+    )
+
+
 def check_pdmux_standard_prefill(cfg):
     """Admission for `--pdmux-prefill-mode standard`.
 
@@ -925,12 +945,10 @@ def check_pdmux_standard_prefill(cfg):
     from sglang.srt.model_executor.cuda_graph_config import Backend
 
     prefill_backend = cfg.cuda_graph_config.prefill.backend
-    assert prefill_backend == Backend.DISABLED, (
+    assert prefill_backend in (Backend.DISABLED, Backend.BREAKABLE), (
         f"--pdmux-prefill-mode standard requires the prefill CUDA graph to be "
-        f"disabled, but the resolved prefill backend is '{prefill_backend}'. "
-        f"The prefill graph is captured once on a plain stream and its shape "
-        f"key carries no stream index, so its nodes keep the resource context "
-        f"they were captured with. Pass --cuda-graph-backend-prefill disabled."
+        f"disabled or breakable, got '{prefill_backend}'. "
+        f"Only BCG has per-stream-group prefill capture and private graph storage."
     )
     assert not cfg.enable_multi_layer_eagle, (
         "--pdmux-prefill-mode standard is not compatible with "
