@@ -21,12 +21,11 @@ import types
 import typing
 from pathlib import Path
 
+import qwen38_small_decoder as small
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
 import triton
-
-import qwen38_small_decoder as small
 import validate_qwen38_real_ops_cuda as ops
 
 NS = types.SimpleNamespace

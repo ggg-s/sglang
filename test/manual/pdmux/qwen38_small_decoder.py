@@ -19,7 +19,6 @@ import torch
 import torch.nn as nn
 import torch.nn.functional as F
 import triton
-
 import validate_qwen38_real_ops_cuda as ops
 
 NS = types.SimpleNamespace
@@ -437,6 +436,7 @@ def make_gdn(m):
 
 def native_topk():
     from functools import lru_cache
+
     from tvm_ffi.cpp import load_inline
 
     header = ops.ROOT / "python/sglang/kernels/jit/csrc/elementwise/fast_topk.cuh"

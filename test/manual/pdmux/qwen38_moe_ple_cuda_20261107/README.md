@@ -147,7 +147,10 @@ Git bundles through SSH and performed `git pull --ff-only`; a Git object pack
 populated missing sparse-checkout dependencies when GitHub HTTPS was unstable.
 CUDA ran in WSL through Windows SSH. Source files were not copied individually.
 Reported source hashes are raw Windows-checkout bytes (CRLF), verified against
-the local LF sources after newline normalization.
+the Git sources at the tested revision after newline normalization. Subsequent
+import sorting passes the repository's isort 7.0.0 and Ruff checks without
+changing test computations; the recorded GPU provenance remains the revision
+above.
 
 From the Git checkout in WSL:
 
