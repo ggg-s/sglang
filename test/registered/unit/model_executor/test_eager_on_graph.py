@@ -300,6 +300,16 @@ def test_generic_layer_hooks_are_removed_between_capture_variants(mapping):
         assert all(not layer._forward_hooks for layer in layers)
 
 
+def test_repeated_decoder_invocation_declines_partial_graph_replay():
+    """Recurrent layer execution can keep full BCG without a false split map."""
+    with recording_capture() as (graph, _):
+        bcg.mark_layer_end(1)
+        bcg.mark_layer_end(1)
+        bcg.mark_layer_end(2)
+    with pytest.raises(ValueError):
+        graph.layer_segment_range(0, 2)
+
+
 def test_split_session_restores_live_context_and_keeps_one_owner():
     """Decode between intervals must not replace metadata or reset graph input."""
     active = ContextVar("split_test_batch", default=None)

@@ -345,6 +345,7 @@ class BreakableCUDAGraph:
         self._hicache_graph_events = hicache_graph_events
         self._hicache_wait_nodes = []
         self._layer_ends: dict[int, int] = {}
+        self._layer_ends_valid = True
 
     def replay(self) -> None:
         self._replay_segments(0, len(self._segments))
@@ -356,7 +357,7 @@ class BreakableCUDAGraph:
         in this graph's pool across yields; they cannot migrate to another
         captured shape or stream-group variant halfway through a forward.
         """
-        if not self._layer_ends or not 0 <= start < end:
+        if not self._layer_ends_valid or not self._layer_ends or not 0 <= start < end:
             raise ValueError(f"Invalid BCG layer interval {(start, end)}")
         last = max(self._layer_ends)
         if tuple(self._layer_ends) != tuple(range(1, last + 1)):
@@ -518,7 +519,12 @@ def mark_layer_end(layer: int) -> None:
     capture = _current_capture_var.get()
     if capture is None:
         return
+    if not capture.cuda_graph._layer_ends_valid:
+        return
     if layer in capture.cuda_graph._layer_ends:
-        raise ValueError(f"Duplicate BCG layer boundary {layer}")
+        # A model may invoke one module more than once. Preserve its full BCG,
+        # but decline partial replay rather than inventing a layer partition.
+        capture.cuda_graph._layer_ends_valid = False
+        return
     break_graph()
     capture.cuda_graph._layer_ends[layer] = len(capture.cuda_graph._segments)

@@ -2128,8 +2128,8 @@ class PrefillCudaGraphRunner(BaseCudaGraphRunner):
             else forward_batch.num_token_non_padded
         )
 
-        # Normalize MIXED / a whole-model SPLIT_PREFILL to the captured
-        # EXTEND mode. A partial split never reaches this runner.
+        # A full or segmented SPLIT_PREFILL BCG uses captured EXTEND metadata.
+        # The segmented runner loads this view once and retains it until final.
         pcg_forward_mode = (
             ForwardMode.EXTEND
             if forward_batch.forward_mode

@@ -55,6 +55,71 @@ def load_method(path, owner, name, **namespace):
 
 
 class TestPdmuxMainCompat(unittest.TestCase):
+    def test_split_bcg_interval_is_not_forwarded_to_the_model_tail(self):
+        """Replay controls must not escape into arbitrary model.forward APIs."""
+        execute = load_method(
+            "python/sglang/srt/model_executor/runner/prefill_cuda_graph_runner.py",
+            "PrefillCudaGraphRunner",
+            "_execute_body_capture",
+        )
+        calls = []
+        original = lambda *args: "eager"
+        layer = SimpleNamespace(forward=original)
+
+        def model_forward(ids, positions, batch):
+            return layer.forward(ids, positions, batch) + "-logits"
+
+        def replay(key, batch, **kwargs):
+            calls.append(kwargs["pdmux_layer_interval"])
+            return "hidden"
+
+        runner = SimpleNamespace(
+            _is_full_backend=False,
+            is_dsv41_model=False,
+            layer_model=layer,
+            model_runner=SimpleNamespace(
+                model=SimpleNamespace(forward=model_forward),
+                pp_group=SimpleNamespace(is_first_rank=False),
+            ),
+            backend=SimpleNamespace(replay=replay),
+            _restore_qwen_bcg_hc_output=lambda out: out,
+            _use_draft_input_embeds=False,
+            _prefill_forward_context=lambda *a, **kw: contextlib.nullcontext(),
+        )
+        batch = SimpleNamespace(input_ids=[1], positions=[0], mm_input_embeds=None)
+        self.assertEqual(
+            execute(runner, batch, batch, 1, 1, "key", pdmux_layer_interval=(1, 2)),
+            "hidden-logits",
+        )
+        self.assertEqual(calls, [(1, 2)])
+        self.assertIs(layer.forward, original)
+
+    def test_prefill_bcg_does_not_borrow_decode_graph_storage(self):
+        """Concurrent lane graphs need distinct pools even with private inputs."""
+        global_pool, private_pool = object(), object()
+        borrowing = [True]
+        factory = load_method(
+            "python/sglang/srt/model_executor/runner_backend/breakable_cuda_graph_backend.py",
+            "BreakableCudaGraphBackend",
+            "capture_session",
+            get_or_create_global_graph_memory_pool=lambda device: global_pool,
+            disable_graph_pool_borrow=lambda reason: borrowing.__setitem__(0, False),
+            set_graph_pool_id=lambda pool: None,
+        )
+        backend = SimpleNamespace(
+            _pool=None,
+            _cuda_graph_runner=SimpleNamespace(enable_pdmux=True),
+            _device_module=SimpleNamespace(graph_pool_handle=lambda: private_pool),
+            begin_cuda_graph_capture=lambda: None,
+            end_cuda_graph_capture=lambda: None,
+            replay_session=contextlib.nullcontext,
+        )
+        with contextlib.contextmanager(factory)(backend, "prefill-stream"):
+            self.assertIs(backend._pool, private_pool)
+            self.assertIsNot(backend._pool, global_pool)
+            self.assertFalse(borrowing[0])
+        self.assertIsNone(backend._capture_stream)
+
     def test_prefill_bcg_admits_plain_tp_and_rejects_unisolated_profiles(self):
         """BCG must not accidentally admit shared speculative/DP/EP state."""
         check = load_method(
