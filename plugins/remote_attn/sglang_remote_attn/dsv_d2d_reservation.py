@@ -182,12 +182,16 @@ def handle(controller, data):
             params,
         )
         prealloc = controller.scheduler.disagg_decode_prealloc_queue
-        page = controller.pool.page_size
-        start = max(0, plan["lower"] - controller.pool.sliding_window) // page * page
-        # Charge the union of windows, not only the tail at the upper bound.
+        start = None
         full, swa = prealloc._prealloc_required_tokens(req)
-        if controller.pool.request_window is None:
-            swa = max(swa, (plan["upper"] - start + page - 1) // page * page)
+        if not getattr(controller, "hybrid_gdn", False):
+            page = controller.pool.page_size
+            start = (
+                max(0, plan["lower"] - controller.pool.sliding_window) // page * page
+            )
+            # Charge the union of windows, not only the upper-bound tail.
+            if controller.pool.request_window is None:
+                swa = max(swa, (plan["upper"] - start + page - 1) // page * page)
         d2d.allocation_preflight(controller, req, required=(full, swa))
     except Exception as exc:
         error = repr(exc)
@@ -198,7 +202,7 @@ def handle(controller, data):
     t = tickets[epoch] = Ticket(plan, req)
     try:
         prealloc._pre_alloc(req, swa_tail_start=start)
-        t.ready = d2d.dp.event(controller.pool.get_swa_key_buffer_radix(0).device)
+        t.ready = d2d.dp.event(d2d.pool_device(controller))
         t.ready.synchronize()
         t.complete = True
     except BaseException as exc:
@@ -216,7 +220,11 @@ def check_freeze(controller, data, req):
     plans, _ = records(controller)
     certificate = select(controller, data, "reservation")
     if certificate is None:
-        if not data.get("allow_unreserved", False) or data["migration_epoch"] in plans:
+        if (
+            getattr(controller, "hybrid_gdn", False)
+            or not data.get("allow_unreserved", False)
+            or data["migration_epoch"] in plans
+        ):
             raise ValueError("D2D freeze requires target reservation")
         return  # Explicit diagnostic compatibility path, never the default.
     saved = plans.get(data["migration_epoch"])
@@ -233,8 +241,10 @@ def consume(controller, data, transfer, req):
     _, tickets = records(controller)
     epoch = data["migration_epoch"]
     if epoch not in tickets:
-        if data.get("require_reservation", False) or transfer.get(
-            "reservation_required", False
+        if (
+            getattr(controller, "hybrid_gdn", False)
+            or data.get("require_reservation", False)
+            or transfer.get("reservation_required", False)
         ):
             raise ValueError("D2D import requires a live native reservation")
         return False

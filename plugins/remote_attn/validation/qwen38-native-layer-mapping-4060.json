@@ -1,0 +1,62 @@
+{
+  "source_files_verified": 6776,
+  "source_verified_before": true,
+  "source_verified_after": true,
+  "updated_source_hashes": {
+    "plugins/remote_attn/sglang_remote_attn/qwen_hybrid.py": "8ae443f8c5b4fc1e7d4c4af0d1ca1b4cbf5cb900f79bb53f0604cef85038a72c",
+    "test/manual/remote_attn/qwen_hybrid_probe_support.py": "94350a45244e5c2e93b1f7cd1dcc2fe13d8c09c8b711482478f3008e4cba017a",
+    "test/registered/unit/plugins/test_remote_main_contracts.py": "5c638d1d06249bea9e6abf679dc5597a28037241c4e6fd02ba0bdabf3f2bdc75"
+  },
+  "hybrid": {
+    "gdn_layers": 6,
+    "conv_max_error": 0.0,
+    "ssm_output_max_error": 0.0,
+    "gqa_remote_max_error": 0.0009765625,
+    "gqa_local_max_error": 0.0,
+    "gqa_fp32_oracle_max_error": 0.0007832050323486328,
+    "native_mooncake_submissions": 18,
+    "distinct_source_target_slots": [
+      1,
+      2
+    ],
+    "layer_group_size": 8,
+    "token_range": 3,
+    "bulk_group_frames": 4,
+    "max_entries_per_frame": 4,
+    "producer_stream_fenced": true,
+    "tail_preserved": true,
+    "status": "PASS",
+    "device": "NVIDIA GeForce RTX 4060 Laptop GPU",
+    "lifecycle_tests": 10,
+    "full_checkpoint": false,
+    "real_rdma": false,
+    "scope": "4060 hybrid D2D: native slot allocation, Mooncake TCP and GDN continuation.\n\nUses small native pool layouts, not the 27B checkpoint. No real RDMA HCA/CQ is\npresent on this GPU; shared RDMA fault probes are run separately with a fake NIC.\n"
+  },
+  "status": "PASS",
+  "date": "2026-11-07",
+  "base_commit": "385af70b530aff3f2d4cc39103de809203ff19e2",
+  "torch": "2.13.0+cu130",
+  "cuda": "13.0",
+  "transformers": "5.12.1",
+  "native_config_classes": [
+    "Qwen3_5Config",
+    "Qwen3_5TextConfig"
+  ],
+  "startup_roles": [
+    "prefill",
+    "decode"
+  ],
+  "startup_scope": "Real native config and Controller construction/validate/manifest; reduced native pool method fixture and attention-module boundary; no full model weights/server.",
+  "cpu_contract_tests": 21,
+  "red_regression": {
+    "status": "EXPECTED_FAILURE",
+    "phase": "native config manifest construction",
+    "error": "AttributeError: 'Qwen3_5TextConfig' object has no attribute 'layer_types'"
+  },
+  "green_regressions": [
+    "native_qwen_config_starts_prefill_and_decode_controllers",
+    "native_layer_mapping_mismatch_rejected_at_startup_and_manifest"
+  ],
+  "full_checkpoint": false,
+  "real_rdma": false
+}

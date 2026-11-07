@@ -1,0 +1,350 @@
+{
+  "status": "PASS",
+  "date": "2026-11-07",
+  "base_commit": "385af70b530aff3f2d4cc39103de809203ff19e2",
+  "device": "NVIDIA GeForce RTX 4060 Laptop GPU",
+  "torch": "2.13.0+cu130",
+  "cuda": "13.0",
+  "real_rdma": false,
+  "full_checkpoint": false,
+  "source_files_verified": 6776,
+  "source_hashes": {
+    "plugins/remote_attn/sglang_remote_attn/qwen_hybrid.py": "9518675de3ec6c6d2aeacad3c952698172b4024b286217447cc5841292994f54",
+    "plugins/remote_attn/sglang_remote_attn/dsv_d2d.py": "2eb2440fc986347d5c6bf1b110c201b17a4abac5eab4a90b9769595ac5c2b074",
+    "plugins/remote_attn/sglang_remote_attn/dsv_d2d_reservation.py": "97cb539b4dc1a9a93fa2fd5778d4bfe4392c39793e60ac7d2942c3edafd2f59a",
+    "plugins/remote_attn/sglang_remote_attn/dsv41_staging.py": "085922f98db640b58febf2a4d74feeb950f0ed38e31b0085e9a8246342698a74",
+    "plugins/remote_attn/sglang_remote_attn/hooks.py": "9b3248490423d0bbb47ec62ac83f43cef954653fa6a267b773f059271fca88d5",
+    "plugins/remote_attn/sglang_remote_attn/pre_layerwise.py": "411e7b1f6508abee230d457db4be7667e78d82b9a0bc4a1190f239b945e597c8",
+    "plugins/remote_attn/sglang_remote_attn/remote_data_plane.py": "6d568333e544f29a3841466d2358be0f81bb3f4ebfcdb4d5d2faac50902a903c",
+    "plugins/remote_attn/sglang_remote_attn/segmented_graph.py": "b4f19607764d110f1deeac0157a47a42b8f15e305c4a76c99f0eff8fa5597d53",
+    "plugins/remote_attn/control_plane/p4_gateway.py": "f977f60904ade925a4242e074de7289b1c35e85ce7ca07fc970f3b22230beda6",
+    "python/sglang/srt/server_args.py": "a29ce57296e0915b749a61af340f188a0ddd692ce3244990c07ddbf4f4a18d27",
+    "python/sglang/srt/arg_groups/model_hook.py": "c36bf155900f245b664034ce977e5fa04ab9776f7badeca2331d96fe4b9ed624",
+    "test/manual/remote_attn/qwen_hybrid_cuda_probe.py": "1363c9eaeeaac7d623de8f7ced755b025e010990dcb3873c49c7075d557c5776",
+    "test/manual/remote_attn/qwen_hybrid_probe_support.py": "d39e85b2eb646700ceccd39842bd2a1e7efa233425577201cbfeb2c135b47518",
+    "test/registered/unit/plugins/test_remote_main_contracts.py": "e700456f411f4aa11363ec15395fa0fc35f6208ecd95a8b17a850a39728b34f4"
+  },
+  "hybrid": {
+    "gdn_layers": 6,
+    "conv_max_error": 0.0,
+    "ssm_output_max_error": 0.0,
+    "gqa_remote_max_error": 0.0009765625,
+    "gqa_local_max_error": 0.0,
+    "gqa_fp32_oracle_max_error": 0.0007832050323486328,
+    "native_mooncake_submissions": 18,
+    "distinct_source_target_slots": [
+      1,
+      2
+    ],
+    "layer_group_size": 8,
+    "token_range": 3,
+    "bulk_group_frames": 4,
+    "max_entries_per_frame": 4,
+    "producer_stream_fenced": true,
+    "tail_preserved": true,
+    "status": "PASS",
+    "device": "NVIDIA GeForce RTX 4060 Laptop GPU",
+    "lifecycle_tests": 8,
+    "full_checkpoint": false,
+    "real_rdma": false,
+    "scope": "4060 hybrid D2D: native slot allocation, Mooncake TCP and GDN continuation.\n\nUses small native pool layouts, not the 27B checkpoint. No real RDMA HCA/CQ is\npresent on this GPU; shared RDMA fault probes are run separately with a fake NIC.\n"
+  },
+  "shared_qo": {
+    "status": "PASS",
+    "device": "NVIDIA GeForce RTX 4060 Laptop GPU",
+    "scope": "Qwen/DSV Q/O/LSE on real CUDA with native TCP or an explicit fake NIC.\n\nNo checkpoint is loaded. Qwen uses FlashInfer; DSV uses native byte layouts and\nsparse kernels. Fake NIC/visibility cases do not validate a real RDMA HCA/CQ.\n",
+    "real_rdma": false,
+    "cases": [
+      {
+        "model": "qwen",
+        "backend": "tcp-host-v1",
+        "real_cuda": true,
+        "native_tcp": true,
+        "mixed_capabilities": false,
+        "owned_results": true,
+        "pass_": true
+      },
+      {
+        "model": "qwen",
+        "backend": "tcp-host-v1",
+        "real_cuda": true,
+        "native_tcp": true,
+        "mixed_capabilities": true,
+        "owned_results": true,
+        "pass_": true
+      },
+      {
+        "model": "qwen",
+        "backend": "rdma-gpu-v1",
+        "real_cuda": true,
+        "native_tcp": false,
+        "mixed_capabilities": false,
+        "owned_results": true,
+        "pass_": true
+      },
+      {
+        "model": "qwen",
+        "backend": "rdma-gpu-v1",
+        "fault": "late",
+        "direction": "q",
+        "late_write_retained": true,
+        "pass_": true
+      },
+      {
+        "model": "qwen",
+        "backend": "rdma-gpu-v1",
+        "fault": "late",
+        "direction": "result",
+        "late_write_retained": true,
+        "pass_": true
+      },
+      {
+        "model": "qwen",
+        "backend": "rdma-gpu-v1",
+        "fault": "exception",
+        "direction": "result",
+        "late_write_retained": true,
+        "pass_": true
+      },
+      {
+        "model": "qwen",
+        "backend": "rdma-gpu-v1",
+        "fault": "cancel",
+        "direction": "result",
+        "late_write_retained": true,
+        "pass_": true
+      },
+      {
+        "model": "v4",
+        "backend": "tcp-host-v1",
+        "real_cuda": true,
+        "native_tcp": true,
+        "mixed_capabilities": false,
+        "owned_results": true,
+        "pass_": true
+      },
+      {
+        "model": "v4",
+        "backend": "tcp-host-v1",
+        "real_cuda": true,
+        "native_tcp": true,
+        "mixed_capabilities": true,
+        "owned_results": true,
+        "pass_": true
+      },
+      {
+        "model": "v4",
+        "backend": "rdma-gpu-v1",
+        "real_cuda": true,
+        "native_tcp": false,
+        "mixed_capabilities": false,
+        "owned_results": true,
+        "pass_": true
+      },
+      {
+        "model": "v4",
+        "backend": "rdma-gpu-v1",
+        "fault": "late",
+        "direction": "q",
+        "late_write_retained": true,
+        "pass_": true
+      },
+      {
+        "model": "v4",
+        "backend": "rdma-gpu-v1",
+        "fault": "late",
+        "direction": "result",
+        "late_write_retained": true,
+        "pass_": true
+      },
+      {
+        "model": "v4",
+        "backend": "rdma-gpu-v1",
+        "fault": "exception",
+        "direction": "result",
+        "late_write_retained": true,
+        "pass_": true
+      },
+      {
+        "model": "v4",
+        "backend": "rdma-gpu-v1",
+        "fault": "cancel",
+        "direction": "result",
+        "late_write_retained": true,
+        "pass_": true
+      },
+      {
+        "model": "v41",
+        "backend": "tcp-host-v1",
+        "real_cuda": true,
+        "native_tcp": true,
+        "mixed_capabilities": false,
+        "owned_results": true,
+        "pass_": true
+      },
+      {
+        "model": "v41",
+        "backend": "tcp-host-v1",
+        "real_cuda": true,
+        "native_tcp": true,
+        "mixed_capabilities": true,
+        "owned_results": true,
+        "pass_": true
+      },
+      {
+        "model": "v41",
+        "backend": "rdma-gpu-v1",
+        "real_cuda": true,
+        "native_tcp": false,
+        "mixed_capabilities": false,
+        "owned_results": true,
+        "pass_": true
+      },
+      {
+        "model": "v41",
+        "backend": "rdma-gpu-v1",
+        "fault": "late",
+        "direction": "q",
+        "late_write_retained": true,
+        "pass_": true
+      },
+      {
+        "model": "v41",
+        "backend": "rdma-gpu-v1",
+        "fault": "late",
+        "direction": "result",
+        "late_write_retained": true,
+        "pass_": true
+      },
+      {
+        "model": "v41",
+        "backend": "rdma-gpu-v1",
+        "fault": "exception",
+        "direction": "result",
+        "late_write_retained": true,
+        "pass_": true
+      },
+      {
+        "model": "v41",
+        "backend": "rdma-gpu-v1",
+        "fault": "cancel",
+        "direction": "result",
+        "late_write_retained": true,
+        "pass_": true
+      }
+    ]
+  },
+  "shared_bulk_staging": {
+    "status": "PASS",
+    "device": "NVIDIA GeForce RTX 4060 Laptop GPU",
+    "scope": "Real CUDA staging/streams with an explicit in-process fake RDMA NIC boundary.\n\nThis does NOT test an RDMA HCA, GPUDirect visibility, or network performance.\nThe fake NIC uses cudaMemcpyAsync on its own stream and reports completion only\nafter its event. Native TCP regression is exercised by range_layer_cuda_probe.\n",
+    "real_rdma": false,
+    "cases": [
+      {
+        "model": "qwen",
+        "snapshot": false,
+        "lost_completion": false,
+        "late_write_after_cancel": false,
+        "fast_async": true,
+        "backend": "rdma-gpu-v1",
+        "batches": 32,
+        "pass_": true
+      },
+      {
+        "model": "qwen",
+        "snapshot": true,
+        "lost_completion": false,
+        "late_write_after_cancel": false,
+        "fast_async": true,
+        "backend": "rdma-gpu-v1",
+        "batches": 32,
+        "pass_": true
+      },
+      {
+        "model": "qwen",
+        "snapshot": false,
+        "lost_completion": true,
+        "late_write_after_cancel": false,
+        "fast_async": true,
+        "backend": "rdma-gpu-v1",
+        "batches": 1,
+        "pass_": true
+      },
+      {
+        "model": "qwen",
+        "snapshot": false,
+        "lost_completion": true,
+        "late_write_after_cancel": true,
+        "fast_async": false,
+        "backend": "rdma-gpu-v1",
+        "batches": 1,
+        "pass_": true
+      },
+      {
+        "model": "qwen",
+        "snapshot": false,
+        "lost_completion": true,
+        "late_write_after_cancel": true,
+        "fast_async": true,
+        "backend": "rdma-gpu-v1",
+        "batches": 1,
+        "pass_": true
+      },
+      {
+        "layout": "v4",
+        "group_size": 4,
+        "entries_per_frame": 2,
+        "independent_entry_local": true,
+        "source_free_count": 1,
+        "backend": "rdma-gpu-v1",
+        "fake_nic": true
+      },
+      {
+        "layout": "v41",
+        "group_size": 4,
+        "entries_per_frame": 2,
+        "independent_entry_local": true,
+        "source_free_count": 1,
+        "backend": "rdma-gpu-v1",
+        "fake_nic": true
+      },
+      {
+        "late_write_after_cancel": false,
+        "layout": "v4",
+        "backend": "rdma-gpu-v1",
+        "lost_completion": true,
+        "source_and_target_retained": true
+      },
+      {
+        "late_write_after_cancel": false,
+        "layout": "v41",
+        "backend": "rdma-gpu-v1",
+        "lost_completion": true,
+        "source_and_target_retained": true
+      },
+      {
+        "late_write_after_cancel": true,
+        "layout": "v4",
+        "backend": "rdma-gpu-v1",
+        "lost_completion": true,
+        "source_and_target_retained": true
+      },
+      {
+        "late_write_after_cancel": true,
+        "layout": "v41",
+        "backend": "rdma-gpu-v1",
+        "lost_completion": true,
+        "source_and_target_retained": true
+      }
+    ]
+  },
+  "cpu_tests": {
+    "existing_remote_attn": 362,
+    "native_boundary_and_hybrid": 19,
+    "total": 381
+  },
+  "source_interfaces": {
+    "hooks": 49,
+    "core_interfaces": 130
+  }
+}

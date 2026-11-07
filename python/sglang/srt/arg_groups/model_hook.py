@@ -1130,6 +1130,7 @@ def handle_language_model_only(server_args: Any):
     if cfg.disaggregation_mode != "null" and hf_config.model_type not in (
         "deepseek_v4",
         "deepseek_v41",
+        "qwen3_5",
     ):
         raise ValueError(
             "--language-model-only is incompatible with --disaggregation-mode "

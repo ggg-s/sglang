@@ -1325,7 +1325,16 @@ def initialize(scheduler):
         return
     from .dsv41_layerwise import DSV41Controller, is_dsv41
 
-    cls = DSV41Controller if is_dsv41(scheduler.tp_worker.model_runner) else Controller
+    from . import qwen_hybrid
+
+    runner = scheduler.tp_worker.model_runner
+    cls = (
+        qwen_hybrid.Controller
+        if qwen_hybrid.matches(runner)
+        else DSV41Controller
+        if is_dsv41(runner)
+        else Controller
+    )
     controller = cls(scheduler, config)
     controller.validate()
     controller.validate_graphs()
@@ -1343,6 +1352,7 @@ def initialize(scheduler):
 
     if (
         getattr(controller, "dsv41_layerwise", False)
+        and not getattr(controller, "hybrid_gdn", False)
         and scheduler.disaggregation_mode.value == "prefill"
     ):
         controller.cache_guard = install(
@@ -1354,7 +1364,9 @@ def initialize(scheduler):
     if not getattr(controller, "dsv41_layerwise", False):
         if scheduler.disaggregation_mode.value == "prefill":
             controller.cache_guard = install(scheduler.tree_cache)
-    if scheduler.disaggregation_mode.value == "decode":
+    if scheduler.disaggregation_mode.value == "decode" and not getattr(
+        controller, "hybrid_gdn", False
+    ):
         from .destination_cache import install as install_destination
 
         controller.destination_cache = install_destination(
@@ -1540,6 +1552,7 @@ def poll(scheduler):
     overlap = getattr(controller, "prefill_overlap", None)
     if (
         getattr(controller, "dsv41_remote", False)
+        and not getattr(controller, "hybrid_gdn", False)
         and controller.scheduler.disaggregation_mode.value == "prefill"
     ):
         from .dsv41_progressive import poll_responses

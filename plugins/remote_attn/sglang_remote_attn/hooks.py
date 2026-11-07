@@ -47,6 +47,11 @@ def _scheduler_init(original, scheduler, *args, **kwargs):
     import torch
 
     runner = scheduler.tp_worker.model_runner
+    from . import qwen_hybrid
+
+    if qwen_hybrid.matches(runner):
+        pre_layerwise.initialize(scheduler)
+        return
     if dsv41_layerwise.is_dsv41(runner):
         from sglang.srt.mem_cache.deepseek_v4_memory_pool import DeepSeekV4TokenToKVPool
 

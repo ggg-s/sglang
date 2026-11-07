@@ -1,5 +1,7 @@
 # Remote attention / progressive KV handoff plugin
 
+Qwen3.8-27B-FP8 纯文本：[GDN Conv/SSM、原生预留与渐进 D2D](QWEN38-HYBRID-D2D-ZH.md)。
+
 DSV4.1 / Flash-0731 D0→D1 Remote 迁移：[后端协议、限制与 KV 生命周期](DSV-D2D-REMOTE-ZH.md)。
 Qwen3-8B / DSV4 / DSV4.1 D2D：[layer group × token range、原生预留与完成语义](D2D-LAYER-TOKEN-RANGE-ZH.md)。
 D2D RDMA：[共用 Mooncake engine、能力协商、GPU staging 与 TCP 回退](D2D-RDMA-ZH.md)。

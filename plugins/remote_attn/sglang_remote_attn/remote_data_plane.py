@@ -693,7 +693,13 @@ class Job:
                 )
                 for i, (ctx, row) in enumerate(zip(self.contexts, self.header["rows"]))
             ]
-            if all(row.header.get("dsv41_sparse") for row in items):
+            if any(row.header.get("qwen_hybrid") for row in items):
+                from .qwen_hybrid import execute
+
+                if not all(row.header.get("qwen_hybrid") for row in items):
+                    raise ValueError("GPU RPC spans different model contracts")
+                outs = [execute(row, stream, cache) for row in items]
+            elif all(row.header.get("dsv41_sparse") for row in items):
                 outs = [dsv41_remote.execute(row, stream, cache) for row in items]
             elif any(row.header.get("dsv41_sparse") for row in items):
                 raise ValueError("GPU RPC spans different model contracts")

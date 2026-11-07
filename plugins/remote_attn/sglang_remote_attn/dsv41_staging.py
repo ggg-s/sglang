@@ -4,6 +4,13 @@ import functools
 
 
 def buffers(pool, manager):
+    if hasattr(pool, "full_attention_layer_id_mapping"):
+        from .qwen_hybrid import kv_buffers
+
+        ordered = kv_buffers(pool)
+        if [t.data_ptr() for t in ordered] != list(manager.kv_args.kv_data_ptrs):
+            raise ValueError("hybrid D2D manager registration mismatch")
+        return ordered
     # MLA skips the MHA tensor-binding path in native prefill initialization.
     # Preserve native registration order and *native* strides: FP4 index scales
     # and payload can span several physical rows for one logical global page.

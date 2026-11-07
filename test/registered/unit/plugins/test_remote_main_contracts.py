@@ -12,7 +12,7 @@ import torch
 from sglang.test.ci.ci_register import register_cpu_ci
 from sglang.test.test_utils import CustomTestCase
 
-register_cpu_ci(est_time=2, suite="base-a-test-cpu")
+register_cpu_ci(est_time=12, suite="base-a-test-cpu")
 ROOT = Path(__file__).resolve().parents[4]
 with patch.object(sys, "path", [str(ROOT / "plugins/remote_attn"), *sys.path]):
     from sglang_remote_attn import destination_cache, hooks, prefix_stream
@@ -507,6 +507,365 @@ class TestGatewayControlPaths(CustomTestCase):
                 self.assertTrue(native._import_cancelled("dst-request", "epoch-1"))
                 self.assertFalse(native._import_cancelled("dst-request", "epoch-2"))
                 self.assertFalse(driver.CTL.exists())
+
+
+class TestQwenHybridD2D(CustomTestCase):
+    """GDN state and pending-token ownership must survive partial KV migration."""
+
+    def environment(self):
+        with patch.object(
+            sys, "path", [str(ROOT / "test/manual/remote_attn"), *sys.path]
+        ):
+            from qwen_hybrid_probe_support import HybridEnvironment
+        env = HybridEnvironment(ROOT, device=getattr(self, "device", "cpu"))
+        self.addCleanup(env.close)
+        return env
+
+    def test_native_qwen_config_starts_prefill_and_decode_controllers(self):
+        """Native config omits layer_types; startup must follow the model's map."""
+        f = self.environment()
+        for role in ("prefill", "decode"):
+            with self.subTest(role=role):
+                controller = f.startup(role)
+                config = (
+                    controller.scheduler.tp_worker.model_runner.model_config.hf_config
+                )
+                self.assertEqual(type(config).__name__, "Qwen3_5Config")
+                self.assertEqual(type(config.text_config).__name__, "Qwen3_5TextConfig")
+                self.assertFalse(hasattr(config.text_config, "layer_types"))
+                expected = {
+                    "full_attention_layer_ids": [3, 7],
+                    "linear_layer_ids": [0, 1, 2, 4, 5, 6],
+                }
+                self.assertEqual(controller.schema_signature["layer_mapping"], expected)
+                self.assertNotIn("layer_types", controller.schema_signature)
+                self.assertEqual(controller.layer_entries, {3: (0, 2), 7: (1, 3)})
+                self.assertEqual(
+                    [m(None, None, None, NS()) for m in controller.attention_modules],
+                    [3, 7],
+                )
+                peer = controller._schema(
+                    controller.scheduler.disagg_prefill_bootstrap_queue.kv_manager
+                )
+                self.assertEqual(peer, controller.schema_signature)
+                self.assertEqual(sorted({e[2] for e in peer["entries"]}), [3, 7])
+                self.assertEqual(
+                    {e[1] for e in peer["states"]}, set(expected["linear_layer_ids"])
+                )
+
+    def test_native_layer_mapping_mismatch_rejected_at_startup_and_manifest(self):
+        from sglang_remote_attn import dsv_d2d as d2d
+
+        f = self.environment()
+        config = f.source.scheduler.tp_worker.model_runner.model_config.hf_config
+        # Change the native model's attention interval without rebuilding pools.
+        # Both validation and the wire schema must reject stale pool ownership.
+        config.text_config.full_attention_interval = 2
+        for role in ("prefill", "decode"):
+            with (
+                self.subTest(role=role),
+                self.assertRaisesRegex(ValueError, "logical layer ownership"),
+            ):
+                f.startup(role)
+        for controller in f.nodes:
+            with self.assertRaisesRegex(ValueError, "logical layer ownership"):
+                controller._schema(d2d.manager(controller))
+
+    def test_native_qwen_language_only_pd_gate(self):
+        tree = ast.parse((ROOT / "python/sglang/srt/server_args.py").read_text())
+        owner = next(n for n in tree.body if getattr(n, "name", None) == "ServerArgs")
+        allowed = next(
+            n.value
+            for n in owner.body
+            if isinstance(n, ast.Assign)
+            and any(
+                getattr(t, "id", None) == "LANGUAGE_MODEL_ONLY_ARCHITECTURES"
+                for t in n.targets
+            )
+        )
+        args = NS(
+            language_model_only=True,
+            encoder_only=False,
+            language_only=False,
+            enable_prefix_mm_cache=False,
+            enable_broadcast_mm_inputs_process=False,
+            mm_enable_dp_encoder=False,
+            disaggregation_mode="decode",
+            LANGUAGE_MODEL_ONLY_ARCHITECTURES=ast.literal_eval(allowed),
+        )
+        hf = NS(model_type="qwen3_5", architectures=["Qwen3_5ForConditionalGeneration"])
+        native = TestGatewayControlPaths.functions(
+            "python/sglang/srt/arg_groups/model_hook.py",
+            {"handle_language_model_only"},
+            dict(
+                resolving_view=lambda value: value,
+                model_config_of=lambda value: NS(hf_config=hf),
+            ),
+        )
+        self.assertIsNone(native.handle_language_model_only(args))
+        hf.model_type = "MuseGlimmer"
+        with self.assertRaisesRegex(ValueError, "disaggregation-mode"):
+            native.handle_language_model_only(args)
+
+    def test_native_text_batch_accepts_none_multimodal_placeholders(self):
+        from sglang_remote_attn.qwen_hybrid import Controller
+
+        controller = Controller.__new__(Controller)
+        sentinel = object()
+        forward = lambda runner, batch: sentinel
+        self.assertIs(
+            controller.forward(forward, None, NS(mm_inputs=[None, None])), sentinel
+        )
+        with self.assertRaisesRegex(ValueError, "pure-text"):
+            controller.forward(forward, None, NS(mm_inputs=[None, object()]))
+        with self.assertRaisesRegex(ValueError, "pure-text"):
+            controller.forward(
+                forward, None, NS(mm_inputs=[None], input_embeds=torch.ones(1))
+            )
+
+    def test_reserve_accounts_for_native_working_and_tracking_slots(self):
+        from sglang_remote_attn import dsv_d2d as d2d
+
+        f = self.environment()
+        native = f.native[1]
+        # Three free state slots: main+two tracking slots fit exactly. A second
+        # live reservation must not pass just because KV and request rows fit.
+        native.pool.enable_mamba_extra_buffer = True
+        native.pool.mamba_ping_pong_track_buffer_size = 2
+        native.pool.enable_mamba_extra_buffer_lazy = False
+        native.pool.get_mamba_ping_pong_other_idx = lambda index: 1 - index
+        native.pool.req_index_to_mamba_ping_pong_track_buffer_mapping = torch.zeros(
+            (4, 2), dtype=torch.int64, device=native.pool.device
+        )
+        common = dict(
+            migration_epoch="slots", destination="D1", target_rid="target", rid="source"
+        )
+        plan = d2d.handle(f.source, dict(cmd="d2d_plan", growth_tokens=2, **common))[
+            "plan"
+        ]
+        baseline = native.allocator.available_size()
+        reserved = d2d.handle(
+            f.target, dict(cmd="d2d_reserve", migration_epoch="slots", plan=plan)
+        )
+        self.assertTrue(reserved["reserved"])
+        self.assertFalse(f.req._handoff_frozen)
+        self.assertEqual(native.allocator.state.slots.available_size(), 0)
+        req = native.make(
+            native.scheduler,
+            "second",
+            list(range(8)),
+            [31, 32, 33],
+            f.req.sampling_params,
+        )
+        with self.assertRaisesRegex(ValueError, "state/request-row budget"):
+            d2d.allocation_preflight(f.target, req)
+        self.assertEqual(native.allocator.available_size(), baseline - plan["upper"])
+        d2d.handle(f.target, dict(cmd="d2d_reserve_cancel", migration_epoch="slots"))
+        self.assertEqual(native.allocator.available_size(), baseline)
+        self.assertEqual(native.allocator.state.slots.available_size(), 3)
+        d2d.handle(f.target, dict(cmd="d2d_reserve_cancel", migration_epoch="slots"))
+        self.assertEqual(native.allocator.state.slots.available_size(), 3)
+
+    def test_all_gdn_state_precedes_admission_and_kv_entries_switch_in_pairs(self):
+        from sglang_remote_attn import dsv_d2d as d2d, qwen_hybrid as hybrid
+
+        f = self.environment()
+        tr = f.reserve_and_freeze(growth=3)
+        ticket = f.target.d2d_reservations[f.epoch]
+        row, slot = ticket.req.kv.req_pool_idx, ticket.req.kv.mamba_pool_idx.clone()
+        self.assertNotEqual(slot.item(), f.req.kv.mamba_pool_idx.item())
+        self.assertTrue(ticket.req.kv.mamba_needs_clear)
+        f.import_(tr)
+        target = f.target.d2d_targets[f.epoch]
+        req = target.decode_req.req
+        self.assertEqual(req.kv.req_pool_idx, row)
+        self.assertEqual(req.kv.mamba_pool_idx.item(), slot.item())
+        self.assertFalse(req.kv.mamba_needs_clear)
+        self.assertEqual(list(req.output_ids), list(f.req.output_ids))
+        self.assertEqual(
+            req.kv.kv_committed_len, len(req.origin_input_ids) + len(req.output_ids) - 1
+        )
+        for (a, source, si), (b, dest, di) in zip(
+            hybrid.state_rows(f.source, f.req, f.prefix),
+            hybrid.state_rows(f.target, req, f.prefix),
+        ):
+            self.assertEqual(a, b)
+            self.assertTrue(torch.equal(source[si], dest[di]))
+        self.assertTrue(f.blocked.wait(5))
+        self.assertFalse(target.copied)
+        self.assertFalse(target.rpc.local_entries)
+        self.assertTrue(f.command(f.target, "d2d_commit")["admitted"])
+        self.assertTrue(f.req.kv.holds_mamba)
+        self.assertTrue(f.req.kv.holds_kv)
+        f.gate.set()
+        f.wait_copy()
+        k, v = f.target.layer_entries[3]
+        next(r for r in target.resources if r.entry == k).finish()
+        self.assertFalse(set((k, v)) <= target.rpc.local_entries)
+        next(r for r in target.resources if r.entry == v).finish()
+        self.assertTrue(set((k, v)) <= target.rpc.local_entries)
+        for i, tensor in enumerate(hybrid.kv_buffers(f.target.pool)):
+            source = hybrid.kv_buffers(f.source.pool)[i]
+            src_ids = f.source.scheduler.req_to_token_pool.req_to_token[
+                f.req.kv.req_pool_idx, : f.prefix
+            ].long()
+            dst_ids = f.target.scheduler.req_to_token_pool.req_to_token[
+                row, : f.prefix
+            ].long()
+            self.assertTrue(torch.equal(tensor[dst_ids], source[src_ids]))
+        self.assertTrue(
+            f.req.kv.holds_mamba
+        )  # copied alone is not a remote-close proof.
+        target.finish()
+        source = f.source.d2d_sources[f.epoch]
+        self.assertTrue(source.poll())
+        source.retire()
+        self.assertFalse(f.req.kv.holds_mamba)
+        self.assertFalse(f.req.kv.holds_kv)
+        self.assertTrue(
+            req.kv.holds_mamba
+        )  # live destination owns its recurrent state.
+
+    def test_cancel_waits_for_inflight_copy_and_tombstones_late_import(self):
+        from sglang_remote_attn import dsv_d2d as d2d
+
+        f = self.environment()
+        tr = f.reserve_and_freeze()
+        f.import_(tr)
+        target = f.target.d2d_targets[f.epoch]
+        req = target.decode_req.req
+        self.assertTrue(f.blocked.wait(5))
+        before = f.native[1].allocator.state.slots.available_size()
+        result = f.command(f.target, "d2d_abort")
+        self.assertTrue(result["pending_reader"])
+        self.assertTrue(req.kv.holds_mamba)
+        self.assertEqual(f.native[1].allocator.state.slots.available_size(), before)
+        f.gate.set()
+        target.worker.join(5)
+        self.assertTrue(f.command(f.target, "d2d_abort")["aborted"])
+        self.assertTrue(req.kv.holds_mamba)  # still waits for retirement certificate.
+        target.finish()
+        self.assertFalse(req.kv.holds_mamba)
+        self.assertEqual(f.native[1].allocator.state.slots.available_size(), before + 1)
+        with self.assertRaisesRegex(ValueError, "cancelled"):
+            f.import_(tr)
+        self.assertEqual(f.native[1].allocator.state.slots.available_size(), before + 1)
+        self.assertTrue(f.command(f.source, "d2d_resume")["resumed"])
+        self.assertTrue(f.req.kv.holds_mamba)
+
+    def test_partial_state_exception_never_reuses_slot_before_abort(self):
+        from sglang_remote_attn import dsv_d2d as d2d
+
+        f = self.environment()
+        tr = f.reserve_and_freeze()
+        original = d2d.copy_rows
+
+        def broken(*args):
+            original(*args)
+            raise RuntimeError("reply lost after first native state write")
+
+        before = f.native[1].allocator.state.slots.available_size()
+        with (
+            patch.object(d2d, "copy_rows", broken),
+            self.assertRaisesRegex(RuntimeError, "reply lost"),
+        ):
+            f.import_(tr)
+        target = f.target.d2d_targets[f.epoch]
+        req = target.decode_req.req
+        self.assertTrue(req.kv.holds_mamba)
+        self.assertTrue(req.kv.mamba_needs_clear)
+        self.assertIsNone(target.rpc)
+        self.assertFalse(target.admitted)
+        with self.assertRaisesRegex(ValueError, "failed/aborted"):
+            f.import_(tr)
+        self.assertEqual(f.native[1].allocator.state.slots.available_size(), before)
+        self.assertTrue(f.command(f.target, "d2d_abort")["aborted"])
+        target.finish()
+        self.assertFalse(req.kv.holds_mamba)
+        self.assertEqual(f.native[1].allocator.state.slots.available_size(), before + 1)
+        self.assertTrue(f.command(f.source, "d2d_resume")["resumed"])
+        self.assertTrue(f.req.kv.holds_mamba)
+
+    def test_late_native_state_write_keeps_kv_gdn_and_staging_owned(self):
+        from sglang_remote_attn import dsv_d2d as d2d
+
+        f = self.environment()
+        tr = f.reserve_and_freeze()
+        engine = d2d.manager(f.source).engine
+        pending = []
+
+        def submit(*args):
+            pending.append(args)
+            return 1
+
+        # Inject at the native completion boundary: submit once, fail the CQ
+        # query, and execute that same write only AFTER cancellation is tried.
+        # CPU fixtures use registered host regions; the CUDA variant uses the
+        # real Mooncake engine for the delayed write after a failed completion.
+        native = getattr(engine, "engine", engine)
+        with (
+            patch.object(native, "batch_transfer_async_write", submit),
+            patch.object(native, "get_batch_transfer_status", return_value=-1),
+        ):
+            with self.assertRaises(RuntimeError):
+                f.import_(tr)
+        source = f.source.d2d_sources[f.epoch]
+        target = f.target.d2d_targets[f.epoch]
+        req = target.decode_req.req
+        self.assertEqual(len(pending), 1)
+        sender, receiver = source.bulk_sender, target.reader.bulk
+        self.assertTrue(sender.unsafe and receiver.unsafe)
+        self.assertTrue(f.req.kv.holds_mamba and req.kv.holds_mamba)
+        budgets = [
+            (n.allocator.available_size(), n.allocator.state.slots.available_size())
+            for n in f.native
+        ]
+        with self.assertRaisesRegex(RuntimeError, "completion unknown|quarantine"):
+            f.command(f.target, "d2d_abort")
+        with self.assertRaises(ValueError):
+            f.command(f.source, "d2d_resume")
+        if getattr(self, "device", "cpu") == "cpu":
+            self.assertEqual(engine.batch_transfer_sync(*pending[0]), 0)
+        else:
+            # One actual single-submit late write, with the existing endpoint
+            # buffers still registered. This is not a retry of the failed call.
+            ticket = engine.engine.batch_transfer_async_write(*pending[0])
+            self.assertGreaterEqual(ticket, 0)
+            self.assertEqual(engine.engine.get_batch_transfer_status([ticket]), 0)
+        self.assertFalse(sender.closed or receiver.closed)
+        self.assertEqual(
+            [
+                (n.allocator.available_size(), n.allocator.state.slots.available_size())
+                for n in f.native
+            ],
+            budgets,
+        )
+        self.assertTrue(f.req.kv.holds_mamba and req.kv.holds_mamba)
+        # A late write/negative CQ is never retroactively a Local certificate.
+        self.assertIsNone(target.rpc)
+        self.assertFalse(target.admitted)
+
+    def test_unreserved_freeze_and_incomplete_state_manifest_reject_without_allocation(
+        self,
+    ):
+        import copy
+        from sglang_remote_attn import dsv_d2d as d2d
+
+        f = self.environment()
+        before = f.native[1].allocator.available_size()
+        with self.assertRaisesRegex(ValueError, "reservation"):
+            f.freeze()
+        self.assertFalse(f.req._handoff_frozen)
+        tr = f.reserve_and_freeze()
+        allocated = f.native[1].allocator.available_size()
+        bad = copy.deepcopy(tr)
+        bad["states"].pop()
+        with self.assertRaisesRegex(ValueError, "GDN state manifest"):
+            f.import_(bad)
+        self.assertEqual(f.native[1].allocator.available_size(), allocated)
+        self.assertFalse(f.target.d2d_reservations[f.epoch].consumed)
+        self.assertNotIn(f.epoch, f.target.d2d_targets)
+        self.assertLess(allocated, before)
 
 
 if __name__ == "__main__":

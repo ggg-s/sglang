@@ -522,6 +522,10 @@ def resolve_backend(original, runner):
             "DSV Remote graph native metadata/prepare/attention ABI is incompatible"
         )
     full = original(runner)
+    from .qwen_hybrid import matches as is_hybrid
+
+    if is_hybrid(mr):
+        return full
     if settings != ("decode", "remote", "1"):
         return full
     if not cuda_python:

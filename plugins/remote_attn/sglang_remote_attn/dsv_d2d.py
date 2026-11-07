@@ -114,6 +114,10 @@ def state_views(pool):
 
 
 def state_rows(controller, req, length):
+    if getattr(controller, "hybrid_gdn", False):
+        from .qwen_hybrid import state_rows as hybrid_rows
+
+        return hybrid_rows(controller, req, length)
     pool, scheduler = controller.pool, controller.scheduler
     views = state_views(pool)
     page = pool.page_size
@@ -161,6 +165,19 @@ def state_rows(controller, req, length):
     return groups
 
 
+def pool_device(controller):
+    pool = controller.pool
+    if getattr(controller, "hybrid_gdn", False):
+        return pool.full_kv_pool.k_buffer[0].device
+    return pool.get_swa_key_buffer_radix(0).device
+
+
+def key_layout(controller, layer):
+    if getattr(controller, "hybrid_gdn", False):
+        return None  # page_size=1: every copied row is an immutable full page.
+    return controller.pool.get_extra_key_layout(layer)
+
+
 def manager(controller):
     return controller.scheduler.disagg_decode_prealloc_queue.kv_manager
 
@@ -174,7 +191,12 @@ def validate(controller):
     if getattr(s, "enable_hisparse", False):
         raise ValueError("DSV D2D does not support HiSparse")
     if any(
-        t.name not in ("SWA", "DSV4_REQUEST_STATE")
+        t.name
+        not in (
+            ("MAMBA",)
+            if getattr(controller, "hybrid_gdn", False)
+            else ("SWA", "DSV4_REQUEST_STATE")
+        )
         for t in manager(controller).kv_args.state_types
     ):
         raise ValueError("D2D native state component is unsupported")
@@ -292,6 +314,10 @@ class Source:
         self.decode_prefix_len = 0
         self.schema = self.owner._schema(manager(self.owner))
         self.barrier_ready = True
+        if getattr(self.owner, "hybrid_gdn", False):
+            from .qwen_hybrid import freeze_ready
+
+            freeze_ready(self.owner)
         self.states = state_rows(self.owner, req, self.prefix_len)
         self.pages = (
             s.req_to_token_pool.req_to_token[
@@ -574,7 +600,7 @@ class Reader:
                 raise RuntimeError(response.get("error", "D2D snapshot failed"))
             return response, out.view(torch.uint8)[: response["bytes"]]
         if self.bulk is None:
-            device = self.owner.pool.get_swa_key_buffer_radix(0).device
+            device = pool_device(self.owner)
             catalog = transport.Catalog(manager(self.owner).engine, device)
             backend = catalog.select(self.offer)
             self.bulk = bulk.Receiver(
@@ -791,9 +817,9 @@ class Target(NativeTarget):
                 req=req,
                 offer=self.reader.offer,
             )
-            device = pool.get_swa_key_buffer_radix(0).device
-            self.copy_stream = new_stream(device)
-            with on_device(device), on_stream(device, self.copy_stream):
+            copy_device = pool_device(self.owner)
+            self.copy_stream = new_stream(copy_device)
+            with on_device(copy_device), on_stream(copy_device, self.copy_stream):
                 self.copy_stream.wait_event(self.decode_req.ready)
                 pages = (
                     self.owner.scheduler.req_to_token_pool.req_to_token[
@@ -844,11 +870,11 @@ class Target(NativeTarget):
                                 self.coverage.prefix_len,
                                 pool.page_size,
                                 entry[1],
-                                pool.get_extra_key_layout(entry[2]),
+                                key_layout(self.owner, entry[2]),
                             )
                             offset += size
                             if coverage.add(i, lo, lo + count):
-                                self.events[i] = dp.event(device)
+                                self.events[i] = dp.event(copy_device)
                 else:
                     for i, (tensor, entry) in enumerate(
                         zip(
@@ -871,7 +897,7 @@ class Target(NativeTarget):
                             )
                             if data.numel() != n * dst.shape[1]:
                                 raise ValueError("truncated D2D global rows")
-                            src = data.reshape(n, -1).to(device, non_blocking=True)
+                            src = data.reshape(n, -1).to(copy_device, non_blocking=True)
                             scatter_prefix(
                                 dst,
                                 src,
@@ -880,10 +906,10 @@ class Target(NativeTarget):
                                 self.coverage.prefix_len,
                                 pool.page_size,
                                 entry[1],
-                                pool.get_extra_key_layout(entry[2]),
+                                key_layout(self.owner, entry[2]),
                             )
-                        self.events[i] = dp.event(device)
-                self.final_event = dp.event(device)
+                        self.events[i] = dp.event(copy_device)
+                self.final_event = dp.event(copy_device)
                 self.final_event.synchronize()
                 if not self.stop.is_set():
                     self.reader.call("copied")
@@ -1140,8 +1166,12 @@ def allocation_preflight(controller, req, required=None):
         full_allocatable_tokens=full_budget,
         swa_allocatable_tokens=swa_budget,
     )
+    if fits and getattr(controller, "hybrid_gdn", False):
+        from .qwen_hybrid import state_capacity
+
+        fits = state_capacity(controller, req)
     if not fits:
-        raise ValueError("D2D target native FULL/SWA/request-row budget unavailable")
+        raise ValueError("D2D target native KV/state/request-row budget unavailable")
 
 
 def import_request(controller, data):
@@ -1171,14 +1201,18 @@ def import_request(controller, data):
     ):
         raise ValueError("D2D transfer epoch/TP mismatch")
     transport.validate(transfer.get("bulk_capabilities"))
-    transport.Catalog(
-        manager(controller).engine, controller.pool.get_swa_key_buffer_radix(0).device
-    ).select(transfer["bulk_capabilities"])
+    transport.Catalog(manager(controller).engine, pool_device(controller)).select(
+        transfer["bulk_capabilities"]
+    )
     ranges.check_history(
         transfer["origin_input_ids"], transfer["output_ids"], transfer["kv_len"]
     )
     if transfer["schema"] != controller._schema(manager(controller)):
         raise ValueError("D2D model/KV/state wire schema mismatch")
+    if getattr(controller, "hybrid_gdn", False):
+        from .qwen_hybrid import validate_transfer
+
+        validate_transfer(transfer)
     if transfer.get("d2d_range_protocol") != ranges.PROTOCOL:
         raise ValueError("D2D requires layer/token range protocol")
     token_range = ranges.tokens(transfer["d2d_token_range"])
@@ -1233,9 +1267,7 @@ def import_request(controller, data):
     req._pre_layerwise_target = target
     reader = None
     try:
-        target.setup_stream = current_stream(
-            controller.pool.get_swa_key_buffer_radix(0).device
-        )
+        target.setup_stream = current_stream(pool_device(controller))
         prealloc = controller.scheduler.disagg_decode_prealloc_queue
         from . import dsv_d2d_reservation as reservation
 
@@ -1261,7 +1293,12 @@ def import_request(controller, data):
         if meta["manifest"] != transfer:
             raise ValueError("D2D frozen manifest changed")
         pool = controller.pool
-        pool.clear_request_scoped_state(req.kv.req_pool_idx)
+        if getattr(controller, "hybrid_gdn", False):
+            from .qwen_hybrid import clear_state
+
+            clear_state(controller, req, transfer["kv_len"])
+        else:
+            pool.clear_request_scoped_state(req.kv.req_pool_idx)
         states = state_rows(controller, req, transfer["kv_len"])
         if [d for d, t, i in states] != transfer["states"]:
             raise ValueError("native D2D state layout/count changed")
@@ -1282,7 +1319,13 @@ def import_request(controller, data):
                 )
         target.decode_req.ready = dp.event(pages.device)
         target.decode_req.ready.synchronize()
-        rpc = target.rpc = remote.Target(
+        if getattr(controller, "hybrid_gdn", False):
+            req.kv.mamba_needs_clear = False
+        rpc_class = remote.Target
+        if getattr(controller, "hybrid_gdn", False):
+            from .qwen_hybrid import Target as rpc_class
+
+        rpc = target.rpc = rpc_class(
             controller,
             req,
             target.path,
@@ -1410,8 +1453,7 @@ def abort_import(controller, target):
             target.reader.call("abort")
         except Exception:
             pass  # Source resume independently revokes/fences its lease.
-    device = controller.pool.get_swa_key_buffer_radix(0).device
-    target.abort_ready = dp.event(device)
+    target.abort_ready = dp.event(pool_device(controller))
     target.abort_ready.synchronize()
     target.cancelled = True
     from sglang.srt.mem_cache.common import release_kv_cache
