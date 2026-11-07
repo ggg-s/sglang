@@ -64,6 +64,11 @@ def main():
     parser.add_argument("--output", type=Path, required=True)
     parser.add_argument("--rounds", type=int, default=32)
     parser.add_argument(
+        "--fp8-projections",
+        action="store_true",
+        help="Use real per-token group quantization and block-FP8 GEMM inside the small decoder.",
+    )
+    parser.add_argument(
         "--canonical-topk",
         action="store_true",
         help="Control experiment: sort the same selected token set before sparse attention.",
@@ -138,7 +143,11 @@ def main():
         from qwen38_small_decoder import run_decoder
 
         try:
-            result = run_decoder(args.rounds, canonical_topk=args.canonical_topk)
+            result = run_decoder(
+                args.rounds,
+                canonical_topk=args.canonical_topk,
+                fp8_projections=args.fp8_projections,
+            )
             report["cases"].append(result)
             print(json.dumps(result), flush=True)
         except Exception as exc:

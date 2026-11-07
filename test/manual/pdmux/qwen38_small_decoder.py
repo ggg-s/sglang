@@ -108,15 +108,40 @@ def batch(tokens, lane):
 
 
 class Linear(nn.Module):
-    """Unsharded BF16 projection with actual learned tensors (no fake outputs)."""
+    """Unsharded projection with real BF16 or block-FP8 CUDA computation."""
 
     def __init__(self, i, o):
         super().__init__()
         self.weight = nn.Parameter(
             torch.randn(o, i, device="cuda", dtype=torch.bfloat16) / math.sqrt(i)
         )
+        self.fp8_ops = None
+
+    def enable_fp8(self, quantize, gemm):
+        n, k = self.weight.shape
+        assert n % 128 == k % 128 == 0
+        weight = self.weight.float()
+        scales = (
+            weight.view(n // 128, 128, k // 128, 128)
+            .abs()
+            .amax((1, 3))
+            .clamp_min(1e-10)
+            / 448
+        )
+        expanded = scales.repeat_interleave(128, 0).repeat_interleave(128, 1)
+        self.weight = nn.Parameter(
+            (weight / expanded).to(torch.float8_e4m3fn), requires_grad=False
+        )
+        self.register_buffer("weight_scales", scales)
+        self.fp8_ops = quantize, gemm
 
     def forward(self, x, **kwargs):
+        if self.fp8_ops is not None:
+            quantize, gemm = self.fp8_ops
+            q, scales = quantize(x.contiguous(), 128)
+            return gemm(
+                q, self.weight, scales, self.weight_scales, [128, 128], torch.bfloat16
+            ), None
         return F.linear(x, self.weight), None
 
 
@@ -691,10 +716,51 @@ def prepare_batch(tokens, lane):
     return b
 
 
+def enable_fp8_projections(stack):
+    quant = selected(
+        "small_fp8_quant",
+        "python/sglang/kernels/ops/quantization/fp8_kernel.py",
+        {},
+        dict(
+            torch=torch,
+            triton=triton,
+            tl=triton.language,
+            fp8_dtype=torch.float8_e4m3fn,
+            _is_hip=False,
+        ),
+        functions=(
+            "_per_token_group_quant_8bit",
+            "_per_token_group_quant_8bit_colmajor",
+            "_per_token_group_quant_8bit_raw",
+            "create_per_token_group_quant_fp8_output_scale",
+        ),
+    )
+    gemm = ops.load(
+        "small_fp8_gemm",
+        "python/sglang/kernels/ops/gemm/fp8_kernel.py",
+        is_cuda=lambda: True,
+        is_gfx1250_supported=lambda: False,
+        register_custom_op=lambda **kw: lambda fn: fn,
+        get_device_name=torch.cuda.get_device_name,
+        get_platform=lambda: NS(is_sm90=False),
+        log_info_on_rank0=lambda logger, message: logger.info(message),
+    )
+    count = 0
+    for layer in stack.modules():
+        if isinstance(layer, Linear) and all(n % 128 == 0 for n in layer.weight.shape):
+            layer.enable_fp8(
+                quant._per_token_group_quant_8bit_raw, gemm.w8a8_block_fp8_matmul_triton
+            )
+            count += 1
+    assert count >= 8, count
+    return count
+
+
 @torch.inference_mode()
-def run_decoder(rounds, canonical_topk=False):
+def run_decoder(rounds, canonical_topk=False, fp8_projections=False):
     stack, gdn, qsa = build_stack()
     qsa.canonical_topk = canonical_topk
+    fp8_count = enable_fp8_projections(stack) if fp8_projections else 0
     batches = [prepare_batch(t, lane) for lane, t in enumerate((65, 1))]
     inputs = [
         torch.randn(t, 256, device="cuda", dtype=torch.bfloat16) * 0.1 for t in (65, 1)
@@ -781,9 +847,8 @@ def run_decoder(rounds, canonical_topk=False):
                 # Native top-k output order is unspecified; sparse reductions
                 # may differ by BF16 rounding, while state writes must be exact.
                 try:
-                    torch.testing.assert_close(
-                        a, c, atol=0.002 if i < 2 else 0, rtol=0.002 if i < 2 else 0
-                    )
+                    tolerance = 0.002 if i < 2 and not canonical_topk else 0
+                    torch.testing.assert_close(a, c, atol=tolerance, rtol=tolerance)
                 except AssertionError:
                     failures.setdefault(
                         f"lane{lane}.{names[i]}",
@@ -803,6 +868,7 @@ def run_decoder(rounds, canonical_topk=False):
         decode_cuda_graph=True,
         split_at_layer=1,
         canonical_topk=canonical_topk,
+        fp8_projection_count=fp8_count,
         comparison_names=names,
         max_abs=max_abs,
         untouched_slots_exact=True,
