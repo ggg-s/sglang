@@ -151,6 +151,9 @@ python plugins/remote_attn/control_plane/p4_gateway.py --backend dsv \
 Bootstrap 端口需使用 P 实际发布的端口。控制目录、ready 文件的 PID 与所有 TP rank
 必须在 gateway 所在机器可见；这不是跨机文件同步机制。
 Driver 为每条命令生成 nonce，并在对应目录完成逐 rank 控制协议和 flock。
+Qwen 与 DSV 的命令均通过 `d.control_dir(role)` 解析目录；Qwen 的心跳和提前取消
+标记也使用该解析器，取消 RPC 超时不影响标记对迟到 import 的阻挡。DSV 继续通过
+同一命令路径发送原生 epoch 取消 RPC。
 不要直接写无 nonce 的 `cmd.0.json`。
 
 通过该 gateway 提交新请求，可显式指定公开 `rid`；gateway 保存它与内部 source/target

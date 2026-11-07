@@ -466,7 +466,7 @@ class Gateway:
 
     def _heartbeat_loop(self):
         """Durable liveness marker for the source/target frozen watchdogs."""
-        dirs = [d.CTL / "src", d.CTL / "dst"]
+        dirs = [d.control_dir(role) for role in ("src", "dst")]
         payload = {"pid": os.getpid()}
         while not self._hb_stop:
             payload["ts"] = time.time()
@@ -813,7 +813,7 @@ class Gateway:
         so a control command that times out but still executes later cannot
         create a target request after the source resumed.
         """
-        dst_dir = d.CTL / "dst"
+        dst_dir = d.control_dir("dst")
         items = []
         try:
             dst_dir.mkdir(parents=True, exist_ok=True)

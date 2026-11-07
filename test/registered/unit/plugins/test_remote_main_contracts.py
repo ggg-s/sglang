@@ -257,5 +257,257 @@ class TestFlashSplitAndControl(CustomTestCase):
             self.assertEqual(namespace["control_dir"]("src"), Path("/legacy/src"))
 
 
+class TestGatewayControlPaths(CustomTestCase):
+    @staticmethod
+    def functions(relative, names, namespace, owner=None):
+        tree = ast.parse((ROOT / relative).read_text())
+        body = (
+            tree.body
+            if owner is None
+            else next(n.body for n in tree.body if getattr(n, "name", "") == owner)
+        )
+        nodes = [n for n in body if isinstance(n, ast.FunctionDef) and n.name in names]
+        if {n.name for n in nodes} != set(names):
+            raise AssertionError("production function missing")
+        module = ast.Module(
+            body=[
+                ast.ImportFrom(
+                    module="__future__", names=[ast.alias(name="annotations")], level=0
+                ),
+                *nodes,
+            ],
+            type_ignores=[],
+        )
+        exec(
+            compile(ast.fix_missing_locations(module), str(ROOT / relative), "exec"),
+            namespace,
+        )
+        return NS(**{name: namespace[name] for name in names})
+
+    def driver(self, root):
+        import contextlib
+        import fcntl
+        import json
+        import os
+        import time
+        import uuid
+
+        names = {"control_dir", "_ready", "_role_lock", "_send_unlocked", "send"}
+        ns = dict(
+            CTL=root / "legacy",
+            Path=Path,
+            contextlib=contextlib,
+            fcntl=fcntl,
+            os=os,
+            time=time,
+            json=json,
+            uuid=uuid,
+            _BARE_LEGACY_WAIT_S=0,
+            _READY_WAIT_S=0,
+        )
+        driver = self.functions(
+            "plugins/remote_attn/control_plane/p2d_driver.py", names, ns
+        )
+        # Keep CTL on the namespace too: the buggy gateway directly accesses it.
+        driver.CTL = ns["CTL"]
+        for role in ("src", "dst"):
+            directory = driver.control_dir(role)
+            directory.mkdir(parents=True)
+            (directory / "ready.0.json").write_text(
+                json.dumps(dict(pid=os.getpid(), rank=0, tp_size=1))
+            )
+        return driver
+
+    def test_heartbeat_and_qwen_dsv_commands_share_selected_directories(self):
+        import json
+        import os
+        import tempfile
+        import threading
+        import time
+
+        with tempfile.TemporaryDirectory() as folder:
+            root = Path(folder)
+            with patch.dict(
+                os.environ,
+                {
+                    "HANDOFF_SRC_CTL_DIR": str(root / "existing-D0"),
+                    "HANDOFF_DST_CTL_DIR": str(root / "existing-D1"),
+                },
+            ):
+                driver = self.driver(root)
+                gateway = NS(_hb_stop=False)
+                clock = NS(
+                    time=time.time, sleep=lambda _: setattr(gateway, "_hb_stop", True)
+                )
+                heartbeat = self.functions(
+                    "plugins/remote_attn/control_plane/p4_gateway.py",
+                    {"_heartbeat_loop"},
+                    dict(d=driver, os=os, json=json, time=clock),
+                    "Gateway",
+                )
+                heartbeat._heartbeat_loop(gateway)
+                for role in ("src", "dst"):
+                    directory = driver.control_dir(role)
+                    hb = json.loads((directory / "heartbeat.json").read_text())
+                    self.assertEqual(hb["pid"], os.getpid())
+                    self.assertGreater(hb["ts"], 0)
+                    self.assertFalse((directory / "heartbeat.tmp").exists())
+                # Both backends use the real nonce/ready/flock command writer.
+                # No worker responds, so a zero timeout deterministically leaves
+                # the command on disk and proves the path without a fake ACK.
+                for role in ("src", "dst"):
+                    with self.assertRaises(TimeoutError):
+                        driver.send(
+                            role, {"cmd": "cancel_import", "items": []}, timeout=0
+                        )
+                    command = json.loads(
+                        (driver.control_dir(role) / "cmd.0.json").read_text()
+                    )
+                    self.assertEqual(command["cmd"], "cancel_import")
+                    self.assertEqual(len(command["nonce"]), 32)
+                native_send = driver.send
+                driver.send = lambda role, payload, timeout: native_send(
+                    role, payload, timeout=0
+                )
+                dsv = self.functions(
+                    "plugins/remote_attn/control_plane/p4_dsv_gateway.py",
+                    {"_call", "rows"},
+                    dict(),
+                    "DsvGateway",
+                )
+                coordinator = NS(
+                    driver=driver,
+                    rows=dsv.rows,
+                    role_locks={r: threading.Lock() for r in ("src", "dst")},
+                    facts={
+                        r: [dict(instance_id=r + "-instance")] for r in ("src", "dst")
+                    },
+                )
+                with self.assertRaises(TimeoutError):
+                    dsv._call(coordinator, "dst", "d2d_abort", "migration-1")
+                command = json.loads(
+                    (driver.control_dir("dst") / "cmd.0.json").read_text()
+                )
+                self.assertEqual(command["cmd"], "d2d_abort")
+                self.assertEqual(command["migration_epoch"], "migration-1")
+                self.assertEqual(command["expected_instances"], ["dst-instance"])
+                self.assertTrue(coordinator.role_locks["dst"].acquire(blocking=False))
+                coordinator.role_locks["dst"].release()
+                self.assertFalse(
+                    driver.CTL.exists(),
+                    "legacy path must not receive heartbeat or commands",
+                )
+
+    def test_cancel_timeout_fences_already_waiting_native_import(self):
+        import concurrent.futures
+        import json
+        import os
+        import tempfile
+        import threading
+        import time
+
+        with tempfile.TemporaryDirectory() as folder:
+            root = Path(folder)
+            with patch.dict(
+                os.environ,
+                {
+                    "HANDOFF_SRC_CTL_DIR": str(root / "existing-D0"),
+                    "HANDOFF_DST_CTL_DIR": str(root / "existing-D1"),
+                    "HANDOFF_TEST_IMPORT_DELAY_MS": "1",
+                },
+            ):
+                driver = self.driver(root)
+                directory = driver.control_dir("dst")
+                entered, proceed = threading.Event(), threading.Event()
+
+                def delayed_import(_):
+                    entered.set()
+                    if not proceed.wait(5):
+                        raise TimeoutError("test failed to release native import")
+
+                clock = NS(
+                    sleep=delayed_import,
+                    monotonic=time.monotonic,
+                    time=time.time,
+                    perf_counter=time.perf_counter,
+                )
+                ns = dict(
+                    os=os,
+                    time=clock,
+                    Path=Path,
+                    _CTL_DIR=str(directory),
+                    _CANCELLED_IMPORTS={},
+                    _CANCEL_TTL_S=120,
+                    _tracked=lambda scheduler: {},
+                    _tp_rank=lambda scheduler: 0,
+                    _tp_size=lambda scheduler: 1,
+                )
+                native = self.functions(
+                    "plugins/remote_attn/sglang_remote_attn/handoff_control.py",
+                    {"_handle", "_import_cancelled"},
+                    ns,
+                )
+                attempted = []
+
+                def transfer(*args):
+                    attempted.append("transfer")
+                    raise AssertionError("cancelled import reached allocation/transfer")
+
+                ns["_select_transfer"] = transfer
+                timeouts = []
+
+                def cancel_send(payload, timeout):
+                    # The marker must be visible BEFORE submitting the RPC.
+                    timeouts.append(
+                        (directory / "cancel.dst-request.epoch-1.json").exists()
+                    )
+                    return driver.send("dst", payload, timeout=0)
+
+                cancel = self.functions(
+                    "plugins/remote_attn/control_plane/p4_gateway.py",
+                    {"_cancel_epochs"},
+                    dict(d=driver, os=os, json=json, time=time),
+                    "Gateway",
+                )
+                from types import ModuleType
+
+                runtime = ModuleType("sglang.srt.runtime_context")
+                runtime.get_schedule = Mock(
+                    side_effect=AssertionError("cancelled import read scheduler config")
+                )
+                with (
+                    patch.dict(sys.modules, {runtime.__name__: runtime}),
+                    concurrent.futures.ThreadPoolExecutor(max_workers=1) as pool,
+                ):
+                    pending = pool.submit(
+                        native._handle,
+                        NS(),
+                        dict(cmd="import", rid="dst-request", epoch="epoch-1"),
+                    )
+                    try:
+                        if not entered.wait(5):
+                            pending.result(timeout=0)
+                            self.fail("native import did not reach its delay")
+                        cancel._cancel_epochs(
+                            NS(dst=NS(send=cancel_send)),
+                            [NS(drid="dst-request", freeze_epoch="epoch-1")],
+                        )
+                    finally:
+                        proceed.set()
+                    with self.assertRaisesRegex(RuntimeError, "import epoch cancelled"):
+                        pending.result(timeout=5)
+                self.assertEqual(timeouts, [True])
+                command = json.loads((directory / "cmd.0.json").read_text())
+                self.assertEqual(command["cmd"], "cancel_import")
+                self.assertEqual(
+                    command["items"], [dict(rid="dst-request", epoch="epoch-1")]
+                )
+                self.assertEqual(len(command["nonce"]), 32)
+                self.assertEqual(attempted, [])
+                self.assertTrue(native._import_cancelled("dst-request", "epoch-1"))
+                self.assertFalse(native._import_cancelled("dst-request", "epoch-2"))
+                self.assertFalse(driver.CTL.exists())
+
+
 if __name__ == "__main__":
     unittest.main()
