@@ -186,7 +186,12 @@ class DsvGateway:
             if self.out is not None and any(
                 previous["entries"][rid].get(key)
                 != self.journal["entries"][rid].get(key)
-                for key in ("phase", "migration_deferred", "migration_deferred_reason")
+                for key in (
+                    "phase",
+                    "migration_deferred",
+                    "migration_deferred_reason",
+                    "freeze_pending",
+                )
             ):
                 try:
                     self.out.parent.mkdir(parents=True, exist_ok=True)
@@ -208,6 +213,8 @@ class DsvGateway:
                                         "migration_deferred_count",
                                         "migration_deferred_wait_ms",
                                         "migration_outcome",
+                                        "freeze_pending",
+                                        "source_partial_remote",
                                     )
                                 }
                             )
@@ -262,6 +269,8 @@ class DsvGateway:
             migration_deferred_count=entry.get("migration_deferred_count", 0),
             migration_deferred_wait_ms=entry.get("migration_deferred_wait_ms", 0),
             migration_outcome=entry.get("migration_outcome"),
+            freeze_pending=entry.get("freeze_pending", False),
+            source_partial_remote=entry.get("source_partial_remote", False),
         )
 
     @staticmethod
@@ -426,6 +435,8 @@ class DsvGateway:
                 migration_deferred_since=None,
                 migration_deferred_ms=0,
                 migration_outcome=None,
+                freeze_pending=False,
+                source_partial_remote=False,
                 created_at=time.time(),
                 error=None,
                 blocked=False,
@@ -466,6 +477,8 @@ class DsvGateway:
             cut_attempted=True,
             error=None,
             blocked=False,
+            freeze_pending=False,
+            source_partial_remote=False,
         )
 
     def _advance(self, entry):
@@ -588,6 +601,19 @@ class DsvGateway:
             rows = self._call(
                 "src", "d2d_freeze", epoch, reservations=entry["reservations"], **common
             )
+            if any(r.get("pending_retirement") for r in rows):
+                if not all(
+                    r.get("frozen") and r.get("pending_retirement") for r in rows
+                ):
+                    raise RuntimeError("TP frozen PD retirement disagreed")
+                self._update(
+                    rid,
+                    freeze_pending=True,
+                    source_partial_remote=any(
+                        r.get("source_partial_remote", False) for r in rows
+                    ),
+                )
+                return
             transfers = [r["transfer"] for r in rows]
             if any(
                 t["output_ids"] != transfers[0]["output_ids"]
@@ -600,6 +626,10 @@ class DsvGateway:
                 transfers=transfers,
                 frozen_output=transfers[0]["output_ids"],
                 phase="IMPORT",
+                freeze_pending=False,
+                source_partial_remote=any(
+                    t.get("source_partial_remote", False) for t in transfers
+                ),
             )
         elif phase == "IMPORT":
             self._call(
@@ -660,6 +690,7 @@ class DsvGateway:
                     rid,
                     phase="SOURCE",
                     migration_requested=retry,
+                    freeze_pending=False,
                     retry_at=time.time() + 1,
                     blocked=False,
                 )
@@ -825,6 +856,7 @@ class DsvGateway:
                 migration_deferred_count=sum(
                     e.get("migration_deferred_count", 0) for e in entries
                 ),
+                freeze_pending=sum(bool(e.get("freeze_pending")) for e in entries),
                 state="STOPPED"
                 if drain.get("stopped")
                 else "SAFE_TO_STOP"
@@ -842,6 +874,8 @@ class DsvGateway:
                         migration_deferred_count=e.get("migration_deferred_count", 0),
                         migration_deferred_wait_ms=self._deferred_wait_ms(e),
                         migration_outcome=e.get("migration_outcome"),
+                        freeze_pending=e.get("freeze_pending", False),
+                        source_partial_remote=e.get("source_partial_remote", False),
                     )
                     for e in entries
                 },
@@ -892,10 +926,12 @@ class DsvGateway:
                     state.get("migration_deferred_reason"),
                     state.get("migration_deferred_count"),
                     state.get("migration_outcome"),
+                    state.get("freeze_pending"),
                 )
                 if status_key != last_status and (
                     state["blocked"]
                     or state.get("migration_deferred")
+                    or state.get("freeze_pending")
                     or last_status is not None
                     or state.get("migration_outcome")
                     == "completed_on_source_before_migration"

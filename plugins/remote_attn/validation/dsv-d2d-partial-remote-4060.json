@@ -1,0 +1,85 @@
+{
+  "device": "RTX 4060 Laptop 8GB",
+  "transport": "Mooncake TCP",
+  "incoming_pd_boundary": "injected pinned-ring bytes, native H2D/scatter/events",
+  "results": [
+    {
+      "concurrency": 4,
+      "shared_workers": 1,
+      "partial_remote_frozen": 4,
+      "migrations": 4,
+      "pending_chunk_blocks_export": true,
+      "native_pd_retired_before_export": true,
+      "distinct_destination_rows": true,
+      "state_bytes_exact": true,
+      "source_frees": 4,
+      "destination_admissions": 4,
+      "token_history_exact": true,
+      "mooncake_transfers": 32
+    },
+    {
+      "concurrency": 8,
+      "shared_workers": 1,
+      "partial_remote_frozen": 8,
+      "migrations": 8,
+      "pending_chunk_blocks_export": true,
+      "native_pd_retired_before_export": true,
+      "distinct_destination_rows": true,
+      "state_bytes_exact": true,
+      "source_frees": 8,
+      "destination_admissions": 8,
+      "token_history_exact": true,
+      "mooncake_transfers": 64
+    }
+  ],
+  "sha256": {
+    "plugins/remote_attn/sglang_remote_attn/dsv_d2d.py": "ba2b5189e8cdaaf41357d0a82bb5aa502732c24dbf0fd6bbd60d2b05be59d20a",
+    "plugins/remote_attn/sglang_remote_attn/dsv_d2d_partial.py": "38fe90190583223598d55f5255671b22741bf1bba70146cb2da8fdc8ef6c6d0a",
+    "plugins/remote_attn/sglang_remote_attn/dsv_gateway_control.py": "6a9c55a30cef9041816f03f5447a54d890f6aee16dfc41d05cc21d8660e686a4",
+    "plugins/remote_attn/control_plane/p4_dsv_gateway.py": "1153ce03bebf43f17f7b1209d5a9f48998dc97639be05d809acefc054927531f",
+    "test/manual/remote_attn/dsv_d2d_partial_probe_support.py": "a4751e7ce707a3b3a6df04d6a9fe8212a4e51d2b6b4b59215558e29e70bf1574",
+    "test/manual/remote_attn/dsv_d2d_partial_cuda_probe.py": "b81e24afc42c8f357184830929d43dc93a06466af9ddd559b023562e1358e03f",
+    "test/registered/unit/plugins/test_remote_attn.py": "c2890f8f96a201bc9b504dbe3be6a7854599bdef2e511d90e4dd6eef6b28d59e",
+    "test/manual/remote_attn/dsv_d2d_tp_worker.py": "6c6fee1ae5ab95c58e210dd85e5e326680aabc4bcff526a3505204271b91fe80"
+  },
+  "baseline": "5240abdb8bf90b4cdd5e3e8b811d27cfdce95d32",
+  "date": "2026-11-07",
+  "cpu_regressions": {
+    "test_remote_attn.py": {
+      "passed": 371,
+      "seconds": 182.192
+    },
+    "test_disaggregation_wire.py": {
+      "passed": 83
+    },
+    "test_remote_main_contracts.py": {
+      "passed": 21
+    },
+    "test_remote_main_abi.py": {
+      "passed": 6
+    },
+    "total_passed": 481,
+    "final_partial_focused_passed": 4
+  },
+  "tp2": {
+    "real_gloo": true,
+    "partial_remote_frozen": 4,
+    "one_rank_gpu_pending_blocks_export_on_both": true,
+    "partial_commit_and_quarantine_regression_passed": true
+  },
+  "negative_control": {
+    "baseline_d2d_implementation": "5240abdb8b",
+    "selector": "partial_remote_shared",
+    "exit_code": 1,
+    "c4_and_c8_fail_before_plan": true
+  },
+  "boundaries": {
+    "model_and_sampling": "ABI fixtures",
+    "incoming_prefill_bytes": "injected at native ring boundary",
+    "native_staging_cuda_and_outbound_mooncake_tcp": "real",
+    "h20_full_model_tested": false,
+    "cross_machine_rdma_tested": false,
+    "performance_claim": false
+  },
+  "raw_logs": "/private/tmp/dsv-d2d-partial-results/results.tar.gz"
+}

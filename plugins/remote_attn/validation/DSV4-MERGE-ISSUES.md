@@ -11,7 +11,7 @@
 | ③ staging 重复登记 | 同一 live room、同一 DecodeRequest 和 receiver 幂等，保留 token、事件、成功状态。不同请求、receiver 替换及 drain 失败后的重试仍拒绝覆盖。 |
 | ④ D ready 文件缺失 | D controller 初始化完成后 eager 建 hub；不依赖首次充当远端源。 |
 | ⑤ 首请求 aux strides 缺失 | DSV 注册消息始终携带 D 的实际 aux strides；customized-info 默认关闭时，校验显式 stride 的一致性，不要求开启该功能。错误列出具体失败条件。 |
-| ⑥ remote 阻止 D2D | 当前只迁移全部 Local 的请求。gateway 显式报告等待原因/次数/时间；plan 重新进行 TP 准入检查，竞态引起的推迟不消耗重试。等待至源结束时明确标记未迁移。部分 Remote 请求的迁移仍未实现。 |
+| ⑥ remote 阻止 D2D | 支持已准入原生 progressive PD 请求的部分 Remote 冻结。先移出运行批次，保留 P→D 接收及读 lease；旧 PD 经 scatter/GPU/TP 有序退休后才发布 D2D 读服务。gateway 使用同一 epoch 重试并报告 freeze_pending/source_partial_remote。见 [并发验证](DSV-D2D-PARTIAL-REMOTE.md)。 |
 | ⑦ layerwise 控制语义 | layerwise 只支持 native PD/SMG。D2D 要求两个 Decode worker 都使用 remote 且禁用 D radix；不支持的命令通过 `result.<rank>.json` 返回错误。ready 文件只证明控制端已初始化。 |
 
 DSV remote/receive adapter 会安装自己的 staging ring；

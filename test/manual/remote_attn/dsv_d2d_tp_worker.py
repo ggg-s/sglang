@@ -23,6 +23,81 @@ from sglang_remote_attn.pre_layerwise import Controller
 from sglang_remote_attn.retirement import Retirement
 
 
+def partial_freeze(root, rank):
+    from dsv_d2d_partial_probe_support import SharedEnvironment
+
+    e = SharedEnvironment(root, 4)
+    try:
+        for c in e.nodes:
+            c.decode_overlap.retirement.close()
+            c.rank, c.tp_size = rank, 2
+            c.scheduler.attn_tp_cpu_group = dist.group.WORLD
+            c.agree = Controller.agree.__get__(c)
+            protocol = c.decode_overlap.retirement = Retirement(c)
+            for target in c.targets:
+                protocol.register(target)
+            e.stack.callback(protocol.close)
+        commands = []
+        for i, req in enumerate(e.requests):
+            common = dict(
+                migration_epoch=f"partial-{i}",
+                destination="D1",
+                target_rid=f"partial-target-{i}",
+            )
+            plan = d2d.handle(
+                e.source, dict(cmd="d2d_plan", rid=req.rid, growth_tokens=0, **common)
+            )["plan"]
+            plans = [None, None]
+            dist.all_gather_object(plans, plan)
+            ticket = d2d.handle(
+                e.target, dict(cmd="d2d_reserve", plans=plans, **common)
+            )
+            certificates = [None, None]
+            dist.all_gather_object(certificates, ticket["reservation"])
+            cmd = dict(
+                cmd="d2d_freeze", rid=req.rid, reservations=certificates, **common
+            )
+            assert d2d.handle(e.source, cmd)["pending_retirement"]
+            commands.append(cmd)
+        proof = [rank == 0]
+        e.parents[0].forward_proofs.append(NS(ready=lambda: proof[0]))
+        for i in range(4):
+            e.arrive(i)
+
+        def pump():
+            e.handler.flush_pending_scatters(e.stream)
+            p = e.source.decode_overlap.retirement
+            p.observe()
+            command = [p.poll_command() if rank == 0 else None]
+            dist.broadcast_object_list(command, src=0)
+            if command[0]:
+                p.arm(command[0])
+                p.finalize()
+
+        # Rank 0 has all bytes/proofs, but rank 1's last GPU consumer is live.
+        pump()
+        source = e.source.d2d_sources["partial-0"]
+        assert d2d.handle(e.source, commands[0])["pending_retirement"]
+        assert source.service is None and not e.parents[0].closed and not e.freed
+        proof[0] = True
+        deadline = time.monotonic() + 5
+        while not e.source.agree([int(all(t.closed for t in e.parents))])[0]:
+            assert time.monotonic() < deadline
+            pump()
+        for cmd in commands:
+            reply = d2d.handle(e.source, cmd)
+            assert reply["transfer"]["source_partial_remote"]
+        assert not e.allocator.allocations and len(e.metadata_freed) == 4
+        assert not e.freed
+        for cmd in commands:
+            assert d2d.handle(
+                e.source, dict(cmd="d2d_resume", migration_epoch=cmd["migration_epoch"])
+            )["resumed"]
+        return True
+    finally:
+        e.close()
+
+
 def main():
     parser = argparse.ArgumentParser()
     parser.add_argument("rank", type=int)
@@ -37,6 +112,7 @@ def main():
         timeout=timedelta(seconds=20),
     )
     root = Path(__file__).resolve().parents[3]
+    partial_ok = partial_freeze(root, args.rank)
     e = Environment(root)
     try:
         for c in e.nodes:
@@ -268,6 +344,7 @@ def main():
         args.output.write_text(
             json.dumps(
                 dict(
+                    tp_partial_remote_waits_for_peer_gpu=partial_ok,
                     tp_partial_commit_never_admits=True,
                     reserved_before_freeze=True,
                     tp_preflight_rejected_before_freeze=True,

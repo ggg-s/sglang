@@ -2,6 +2,9 @@
 
 基线：`98fd13c507`，`codex/remote-attn-pre-layerwise`。
 
+本文记录 `5240abdb8b` 的历史结果。Issue B 后续已实现部分 Remote 冻结迁移，
+当前协议与 c=4/8 小池验证见 [DSV-D2D-PARTIAL-REMOTE.md](DSV-D2D-PARTIAL-REMOTE.md)。
+
 ## Issue A：默认关闭 customized-info 时仍可发布 aux strides
 
 根因是 `validate_aux_buffers` 把显式目的端 stride 与启用 customized-info 绑定。

@@ -235,6 +235,11 @@ def source_local(req):
 
 def migration_blocker(scheduler, req):
     reason = source_blocker(req)
+    if reason in ("remote_entries_pending", "previous_transfer_pending"):
+        from .dsv_d2d_partial import can_freeze
+
+        if can_freeze(req):
+            reason = None
     if reason is not None:
         return reason
     if not req.output_ids:
@@ -269,22 +274,11 @@ def quiesce(scheduler, req):
         scheduler.last_batch = None
     if req.finished():
         raise ValueError("cannot migrate a finished request")
-    if not source_local(req):
+    if migration_blocker(scheduler, req) is not None:
         raise ValueError("D2D source must have completed its previous transfer")
     expected = len(req.origin_input_ids) + len(req.output_ids) - 1
     if not req.output_ids or req.kv.kv_committed_len != expected:
         raise ValueError("D2D freeze requires one pending sampled token")
-
-
-def retire_previous(controller, req):
-    # This command was broadcast to all TP ranks. Drain through the existing
-    # ordered protocol before a new source can own or release these KV pages.
-    target = getattr(req, "_pre_layerwise_target", None)
-    if target is not None and not target.closed:
-        controller.decode_overlap.retirement.drain(required=target)
-    rpc = getattr(req, "_dsv41_remote", None)
-    if rpc is not None:
-        rpc.close("d2d-local-source")
 
 
 def sampling(req):
@@ -353,11 +347,20 @@ class Source:
     created: float = field(default_factory=time.monotonic)
     remote_closed: object = field(default_factory=threading.Event)
     lock: object = field(default_factory=threading.RLock)
+    previous_target: object = None
+    previous_rpc: object = None
+    partial_remote: bool = False
+    remote_entries_at_freeze: tuple = ()
+    frozen_output: tuple = ()
 
     def initialize(self):
         from .dsv41_staging import buffers
 
         s, req = self.owner.scheduler, self.req
+        if self.previous_target is not None and not self.previous_target.closed:
+            raise TransportFailure(
+                "cannot export D2D bytes while native PD still owns writes"
+            )
         self.generation = self.epoch
         self.handle, self.row = req.cache_request_handle, req.kv.req_pool_idx
         self.prefix_len = int(req.kv.kv_committed_len)
@@ -408,6 +411,8 @@ class Source:
             tp_size=self.owner.tp_size,
             states=[d for d, t, i in self.states],
             route=self.service,
+            source_partial_remote=self.partial_remote,
+            source_remote_entries=list(self.remote_entries_at_freeze),
         )
         self.meta["route"] = self.service
 
@@ -431,6 +436,10 @@ class Source:
         if time.monotonic() - self.created > self.owner.config.drain_timeout:
             raise TransportFailure("D2D source lease timed out; retaining KV")
         self.check_read(allow_aborted=True)
+        if getattr(self, "meta", None) is None:
+            # Frozen native PD still owns writes, or a scheduler command has
+            # not yet published the drained D2D source. No read service exists.
+            return False
         if self.aborted:
             return self.remote_closed.is_set() and self.release is not None
         if getattr(self.req, "_handoff_transfer_unsafe", False):
@@ -1026,11 +1035,15 @@ def handle(controller, data):
             source = sources[epoch]
             if source.released or source.aborted:
                 raise ValueError("D2D source epoch is retired")
-            if getattr(source, "meta", None) is None or source.error:
+            if source.error:
                 raise RuntimeError(
                     "D2D source preparation failed; inspect status/resume"
                 )
-            return dict(transfer=source.meta)
+            if getattr(source, "meta", None) is not None:
+                return dict(transfer=source.meta)
+            from .dsv_d2d_partial import prepare
+
+            return prepare(controller, source)
         if epoch in targets:
             raise ValueError("migration epoch was already used by a D2D import")
         error = None
@@ -1044,7 +1057,7 @@ def handle(controller, data):
             params = sampling(req)
             group_size = grouping.size()
             token_range = ranges.tokens()
-            if not source_local(req) or not can_quiesce(controller.scheduler):
+            if migration_blocker(controller.scheduler, req) is not None:
                 raise ValueError(
                     "request has a D2D owner or needs native Decode boundary"
                 )
@@ -1061,53 +1074,63 @@ def handle(controller, data):
             error = repr(exc)
         if not controller.agree([int(error is None)])[0]:
             raise ValueError(f"TP D2D quiesce rejected: {error or 'peer rejected'}")
-        error = None
-        try:
-            retire_previous(controller, req)
-        except Exception as exc:
-            error = repr(exc)
-        if not controller.agree([int(error is None)])[0]:
-            raise ValueError(
-                f"TP D2D previous transfer retirement rejected: {error or 'peer rejected'}"
-            )
         # Quiescing can commit one overlap result; validate the final length
         # collectively before removing any rank from its runnable batches.
         error = None
         try:
             reservation.check_freeze(controller, data, req)
+            source = Source(
+                controller,
+                req,
+                epoch,
+                destination,
+                target_rid,
+                params,
+                controller.config.directory
+                / "d2d"
+                / epoch
+                / str(controller.rank)
+                / "source",
+                group_size=group_size,
+                token_range=token_range,
+                previous_target=getattr(req, "_pre_layerwise_target", None),
+                previous_rpc=getattr(req, "_dsv41_remote", None),
+                prefix_len=int(req.kv.kv_committed_len),
+                handle=req.cache_request_handle,
+                row=req.kv.req_pool_idx,
+                frozen_output=tuple(req.output_ids),
+            )
+            rpc = source.previous_rpc
+            if rpc is not None and getattr(rpc, "progressive", False):
+                schema = controller._schema(manager(controller))
+                source.remote_entries_at_freeze = tuple(
+                    i
+                    for i, entry in enumerate(schema["entries"])
+                    if entry[0] == "kv" and i not in rpc.local_entries
+                )
+                source.partial_remote = bool(source.remote_entries_at_freeze)
         except Exception as exc:
             error = repr(exc)
         if not controller.agree([int(error is None)])[0]:
             raise ValueError(f"TP D2D reservation rejected: {error or 'peer rejected'}")
-        remote.runtime()._remove_from_batches(controller.scheduler, req)
         req._handoff_frozen = True
         req._handoff_req = True
         req._handoff_epoch = epoch
-        source = Source(
-            controller,
-            req,
-            epoch,
-            destination,
-            target_rid,
-            params,
-            controller.config.directory
-            / "d2d"
-            / epoch
-            / str(controller.rank)
-            / "source",
-            group_size=group_size,
-            token_range=token_range,
-        )
         req._dsv_d2d_source = req._pre_layerwise_source = source
         sources[epoch] = source
         controller.sources.append(source)
-        try:
-            source.initialize()
-        except BaseException as exc:
-            source.error = repr(exc)
-            raise
         remote.runtime()._tracked(controller.scheduler)[req.rid] = req
-        return dict(transfer=source.meta)
+        error = None
+        try:
+            remote.runtime()._remove_from_batches(controller.scheduler, req)
+        except Exception as exc:
+            error = repr(exc)
+        if not controller.agree([int(error is None)])[0]:
+            source.error = f"TP D2D batch removal failed: {error or 'peer failed'}"
+            raise TransportFailure(source.error)
+        from .dsv_d2d_partial import prepare
+
+        return prepare(controller, source)
     if cmd == "d2d_import":
         return import_request(controller, data)
     if cmd == "d2d_abort":
@@ -1441,6 +1464,11 @@ def resume_source(controller, source):
         and not getattr(source.req, "_d2d_bulk_unsafe", False)
         and source.release is None
         and getattr(source.req, "_remote_attn_transport_quarantine", None) is None
+        and not (
+            source.previous_target is not None
+            and not source.previous_target.closed
+            and source.error
+        )
     )
     if not controller.agree([int(can_resume)])[0]:
         raise ValueError("destination owns generation or source already released")

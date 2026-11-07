@@ -57,6 +57,12 @@ def migration_status(controller, epoch):
             error=source.error,
             kv_released=not source.req.kv.holds_kv,
             transfer=getattr(source, "meta", None),
+            prepared=getattr(source, "meta", None) is not None,
+            pending_retirement=getattr(source, "meta", None) is None
+            and not source.released,
+            source_partial_remote=source.partial_remote,
+            source_remote_entries=list(source.remote_entries_at_freeze),
+            frozen_kv_len=source.prefix_len,
         ),
         target=None
         if target is None

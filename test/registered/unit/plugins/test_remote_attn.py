@@ -16100,6 +16100,7 @@ class TestRemoteAttn(CustomTestCase):
                     rows,
                     [
                         dict(
+                            tp_partial_remote_waits_for_peer_gpu=True,
                             tp_partial_commit_never_admits=True,
                             reserved_before_freeze=True,
                             tp_preflight_rejected_before_freeze=True,
@@ -16154,7 +16155,7 @@ class TestRemoteAttn(CustomTestCase):
             quiesce(scheduler, req)
         self.assertEqual(len(scheduler.result_queue), 1)
 
-    def test_dsv_d2d_requires_local_entries_then_retires_previous_owner_before_freeze(
+    def test_dsv_d2d_non_native_remote_defers_and_local_owner_retires_after_freeze(
         self,
     ):
         from sglang_remote_attn import dsv_d2d as d2d
@@ -16211,19 +16212,99 @@ class TestRemoteAttn(CustomTestCase):
         retired = []
 
         def finish(*, wait):
-            self.assertFalse(e.req._handoff_frozen)
+            self.assertTrue(e.req._handoff_frozen)
             rpc.close("previous-owner-retired")
             parent.closed = True
             e.req._pre_layerwise_target = None
             retired.append(True)
 
         parent.finish = finish
+        parent.refresh = lambda: None
         _, reserved = self._d2d_reserve(e)
-        self._d2d_reserved_freeze(e, reserved)
+        data = dict(
+            cmd="d2d_freeze",
+            rid=e.req.rid,
+            destination="D1",
+            target_rid="target",
+            migration_epoch=e.epoch,
+            reservation=reserved["reservation"],
+        )
+        self.assertTrue(d2d.handle(e.source, data)["pending_retirement"])
+        e.source.decode_overlap.retirement.drain(required=parent)
+        self.assertIn("transfer", d2d.handle(e.source, data))
         self.assertEqual(retired, [True])
         self.assertTrue(e.req._handoff_frozen)
         self.assertIsNone(e.req._dsv41_remote)
         self.assertNotIn(rpc.row, e.source.remote_targets)
+
+    def _partial_d2d_env(self, concurrency=4):
+        # Reuse the established source-loaded native pool/module boundaries.
+        bootstrap = self._d2d_env()
+        bootstrap.gate.set()
+        import importlib.util
+
+        path = ROOT / "test/manual/remote_attn/dsv_d2d_partial_probe_support.py"
+        spec = importlib.util.spec_from_file_location("partial_probe", path)
+        module = importlib.util.module_from_spec(spec)
+        spec.loader.exec_module(module)
+        env = module.SharedEnvironment(ROOT, concurrency)
+        self.addCleanup(env.close)
+        return module, env
+
+    def test_dsv_d2d_partial_remote_shared_worker_c4_c8(self):
+        """Concurrent incomplete PD requests freeze and migrate before they finish."""
+        for concurrency in (4, 8):
+            with self.subTest(concurrency=concurrency):
+                module, env = self._partial_d2d_env(concurrency)
+                result = module.exercise_shared(env)
+                self.assertEqual(result["migrations"], concurrency)
+                self.assertEqual(result["source_frees"], concurrency)
+
+    def test_dsv_d2d_partial_remote_resume_preserves_native_pd_owner(self):
+        from sglang_remote_attn import dsv_d2d as d2d
+
+        _, e = self._partial_d2d_env()
+        data, reply = e.plan_freeze(0)
+        self.assertTrue(reply["pending_retirement"])
+        req, parent = e.requests[0], e.parents[0]
+        old_rpc, old_row, history = (
+            req._dsv41_remote,
+            req.kv.req_pool_idx,
+            list(req.output_ids),
+        )
+        source = e.source.d2d_sources[data["migration_epoch"]]
+        result = d2d.handle(
+            e.source, dict(cmd="d2d_resume", migration_epoch=source.epoch)
+        )
+        self.assertTrue(result["resumed"])
+        self.assertFalse(req._handoff_frozen)
+        self.assertIs(req._pre_layerwise_target, parent)
+        self.assertIs(req._dsv41_remote, old_rpc)
+        self.assertEqual(req.kv.req_pool_idx, old_row)
+        self.assertEqual(req.output_ids, history)
+        self.assertIsNone(source.service)
+        self.assertFalse(e.freed)
+        self.assertIn(req, e.source.scheduler.running_batch.reqs)
+        for i in range(e.concurrency):
+            e.arrive(i)
+        e.complete_pd()
+        self.assertFalse(e.freed)
+
+    def test_dsv_d2d_partial_remote_failed_receive_retains_frozen_kv(self):
+        from sglang_remote_attn import dsv_d2d as d2d
+
+        _, e = self._partial_d2d_env()
+        data, _ = e.plan_freeze(0)
+        parent, req = e.parents[0], e.requests[0]
+        parent.decode_req.kv_receiver.status = e.KVPoll.Failed
+        with self.assertRaisesRegex(RuntimeError, "previous PD lifetime failed"):
+            d2d.handle(e.source, data)
+        source = e.source.d2d_sources[data["migration_epoch"]]
+        with self.assertRaisesRegex(ValueError, "destination owns generation"):
+            d2d.handle(e.source, dict(cmd="d2d_resume", migration_epoch=source.epoch))
+        self.assertTrue(req._handoff_frozen and req.kv.holds_kv)
+        self.assertIsNone(source.service)
+        self.assertFalse(e.freed)
 
     def test_layerwise_d2d_control_publishes_unsupported_result(self):
         from sglang.srt.runtime_context import get_parallel
@@ -17391,6 +17472,77 @@ class TestRemoteAttn(CustomTestCase):
         f.gw = f.support.gateway(f.driver, ROOT, f.folder)
         self.addCleanup(f.gw.close)
         return f.gw
+
+    def test_p4_dsv_partial_remote_freeze_survives_restart_and_lost_reply(self):
+        """A frozen partial PD owner must neither roll back nor freeze twice."""
+        import importlib.util
+
+        _, e = self._partial_d2d_env()
+        path = ROOT / "test/manual/remote_attn/p4_dsv_probe_support.py"
+        spec = importlib.util.spec_from_file_location("partial_gateway_support", path)
+        support = importlib.util.module_from_spec(spec)
+        spec.loader.exec_module(support)
+        driver = support.Driver.__new__(support.Driver)
+        driver.env = e
+        driver.calls, driver.before, driver.after = [], {}, {}
+        driver.controllers = dict(src=e.source, dst=e.target)
+        folder = self.enterContext(tempfile.TemporaryDirectory())
+        gw = support.gateway(driver, ROOT, folder)
+        self.addCleanup(gw.close)
+        gw.tick()
+        rid = gw.accept(
+            dict(
+                rid="partial",
+                prompt_ids=list(range(31)),
+                max_new_tokens=64,
+                cut=2,
+                growth_tokens=0,
+            )
+        )
+        # PD/model submission is the existing ABI boundary; adopt its active Req.
+        gw._update(rid, phase="SOURCE", source_rid=e.req.rid)
+        support.until(gw, rid, "FREEZE")
+        first, _ = gw.events(rid)
+        self.assertEqual([x["token_id"] for x in first], [31, 32, 33])
+        self.assertEqual({x["owner"] for x in first}, {"src"})
+        driver.after["d2d_freeze"] = [TimeoutError("lost freeze response")]
+        gw.tick()
+        entry = gw.entry(rid)
+        epoch = entry["epoch"]
+        self.assertEqual(entry["phase"], "FREEZE")
+        self.assertTrue(e.req._handoff_frozen)
+        source = e.source.d2d_sources[epoch]
+        self.assertIsNone(source.service)
+        gw.close()
+        gw = support.gateway(driver, ROOT, folder)
+        self.addCleanup(gw.close)
+        gw.tick()
+        entry = gw.entry(rid)
+        self.assertEqual(entry["epoch"], epoch)
+        self.assertTrue(entry["freeze_pending"] and entry["source_partial_remote"])
+        self.assertEqual(entry["attempts"], 1)
+        self.assertEqual(driver.count("d2d_import"), 0)
+        for i in range(e.concurrency):
+            e.arrive(i)
+        e.complete_pd()
+        support.until(gw, rid, "TARGET")
+        self.assertIs(e.source.d2d_sources[epoch], source)
+        self.assertFalse(gw.entry(rid)["freeze_pending"])
+        self.assertEqual(gw.entry(rid)["migration_outcome"], "migrated")
+        target = e.target.d2d_targets[epoch]
+        target.decode_req.req.output_ids.append(34)
+        target.decode_req.req.kv.kv_committed_len += 1
+        target.decode_req.req.kv.kv_allocated_len += 1
+        gw.tick()
+        events, _ = gw.events(rid, after=2)
+        self.assertEqual(
+            [(x["seq"], x["token_id"], x["owner"]) for x in events],
+            [(3, 34, "dst")],
+        )
+        self.assertFalse(e.freed)
+        e.gate.set()
+        target.worker.join(10)
+        self.assertFalse(target.worker.is_alive())
 
     def test_p4_dsv_orders_native_reserve_before_freeze_and_sse_owner_switch(self):
         f = self._p4_dsv_env()

@@ -64,20 +64,41 @@ Remote Attention 的 RemoteHub/mesh 地址仍按 [多机部署](MULTI-PD-ZH.md) 
 
 ## 数据路径与完成顺序
 
-DSV Remote 请求只有在本 rank 的 KV entries 全部经有序切换回 Local，且前一个
-receive lifetime 可退休时，才会进入 D2D plan。当前不支持搬迁仍依赖 P 端 Remote
-entries 的请求；并发下可能一直等到源请求自然结束，不能承诺主动迁移收益。
+DSV Remote 请求可在仍依赖 P 的部分 global KV entries 时进入 D2D plan。
+只接受已通过 indexer/SWA/carry/metadata barrier、持有原生 progressive PD receiver
+并登记有序退休协议的请求；Decode radix cache 仍必须禁用。
 
-Gateway 到达 `cut` 或收到 drain 指令后，会显式等待该条件。worker status 提供
-`migration_deferred_reason`（例如 `remote_entries_pending`）；gateway journal 保存
-等待状态、计数、累计时间及本轮开始时间。SSE status、router status 与 drain status 提供 `migration_deferred`、
-`migration_deferred_reason`、`migration_deferred_count` 和 `migration_deferred_wait_ms`。
-计数按进入等待/原因变化计，不随轮询增长。若等待期间在源结束，结果为
-`migration_outcome=completed_on_source_before_migration`，不会被计为已迁移。
+目标预留成功后，D0 在原生 Decode 边界提交待处理采样结果，冻结输出历史和 KV
+长度，并将请求移出 runnable batch。其余请求可继续执行。此时原 P→D0 的
+receiver、ring、页表和 Remote RPC lease 全部保留，原生循环继续处理到达的
+chunk 和 deferred scatter。不能在调度器控制命令里同步等待，否则可能阻塞
+完成这些 scatter 所必需的调度循环。
 
-worker status 与 plan 之间可能变化；plan 在 TP 上共同重新检查准入，返回
-`deferred=true` 时没有创建 plan、预留或冻结。gateway 回到等待状态，不消耗迁移
-重试次数。它不会用清掉 Remote 标记的方式绕过既有 KV 所有权证明。
+只有 canonical Success、所有 scatter/GPU consumer 以及 TP 有序退休均完成，
+旧 receiver/metadata/ring 和 P Remote read lease 已退休后，D0 才发布 D2D manifest
+及读服务。D2D 从冻结的 D0 页读取；不会让 D1 链式读取仍由 P 写入的页。
+因此不再等待运行中的请求自然进入 `all_local()` 窗口，但冻结至导出仍需等待
+P→D0 真正排空；本改动不承诺迁移延迟或性能收益。
+
+等待旧 PD 退休时，`d2d_freeze` 幂等返回 `frozen=true, pending_retirement=true`。
+Gateway 保持同一 epoch 的 FREEZE 阶段，重试不会再冻结或消耗尝试次数。
+journal、router status、drain status、SSE status 暴露 `freeze_pending` 和
+`source_partial_remote`；worker migration status 还提供冻结时的 Remote entries、
+KV 长度与 prepared 状态。Gateway 重启或丢失 freeze 回包后沿用同一 epoch。
+
+commit 前取消：先取消目标预留/import，再撤销 D2D 读服务并恢复 D0；旧 PD
+尚未退休时，保留原 receiver/RPC，继续正常接收。接收、GPU 或 TP 证明失败时
+冻结请求保留 KV，不导出、不通过 resume 绕过失败。commit 后只有 D1 生成后续
+输出，D0 要等全部 D2D reader 和复制完成证明才释放一次原生 KV。
+
+不具备安全冻结条件时（例如 native Decode 边界未到或非原生 Remote owner），
+worker 仍报告 `migration_deferred_reason`；Gateway 的 `migration_deferred`、
+reason、count、wait_ms 继续表示**冻结之前**的等待。TP plan 返回 `deferred=true`
+时不会创建 plan、预留或冻结，也不消耗迁移重试次数。等待期间在源结束仍标记
+`migration_outcome=completed_on_source_before_migration`，实际切至 D1 才计为迁移。
+
+小池验证结果与 H20 复测边界见
+[部分 Remote D2D 验证](validation/DSV-D2D-PARTIAL-REMOTE.md)。
 
 TCP 路径保留独立 D2H Host staging、连续 payload/footer、目标 H2D 和 ACK：
 
