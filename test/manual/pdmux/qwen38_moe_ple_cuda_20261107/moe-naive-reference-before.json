@@ -1,0 +1,58 @@
+{
+  "gpu": "NVIDIA GeForce RTX 4060 Laptop GPU",
+  "torch": "2.14.1+cu130",
+  "cases": [
+    {
+      "name": "real_moe_bf16_I256",
+      "rounds": 32,
+      "decode_cuda_graph": true,
+      "dual_stream_exact_match": true,
+      "reference_max_abs": [
+        0.00390625,
+        0.0
+      ]
+    }
+  ],
+  "errors": [
+    {
+      "name": "real_moe_fp8_I256",
+      "error": "Tensor-likes are not close!\n\nMismatched elements: 166 / 16640 (1.0%)\nGreatest absolute difference: 0.05078125 at index (27, 22) (up to 0.02 allowed)\nGreatest relative difference: 26.0 at index (25, 196) (up to 0.02 allowed)"
+    },
+    {
+      "name": "real_moe_fp8_I192",
+      "error": "Tensor-likes are not close!\n\nMismatched elements: 347 / 16640 (2.1%)\nGreatest absolute difference: 0.078125 at index (6, 104) (up to 0.02 allowed)\nGreatest relative difference: inf at index (61, 4) (up to 0.02 allowed)"
+    }
+  ],
+  "source_sha256": {
+    "python/sglang/kernels/ops/attention/fla/chunk.py": "2c38a5b622b33e55e75a0119495a70b2fcd78a1d01a286cb4432e583b025e745",
+    "python/sglang/kernels/ops/attention/fla/chunk_delta_h.py": "7015fa8774f6d9a099b47604eb3d3f91b072277c1e307eacf8ee9615674ee498",
+    "python/sglang/kernels/ops/attention/fla/chunk_fwd.py": "01df2726d9416009cc3c0040c32574069838dfcda54ed77b93ddbc6014da50c2",
+    "python/sglang/kernels/ops/attention/fla/chunk_intra.py": "9afd7def4cbdafa6a4e3d6d721c9e67b70cd8061abf25e622d0a0a198b9c5495",
+    "python/sglang/kernels/ops/attention/fla/chunk_intra_token_parallel.py": "42da78ec3c423523fe9dee299706b066e211427627237e20797ad370ae9d8632",
+    "python/sglang/kernels/ops/attention/fla/chunk_o.py": "cd707c231ae63a5b14710f0ea0b0a6e55b17f2ef644083e5641aedaa09d1865e",
+    "python/sglang/kernels/ops/attention/fla/cumsum.py": "832b2b2dedac8931c9c172f574a2f23c6fd6c45ed8ef169eb62b957718011c6a",
+    "python/sglang/kernels/ops/attention/fla/fused_norm_gate.py": "d1cdfbd2385b40011b1a082dc2941e515dd0b4ebfab296f15868618269133094",
+    "python/sglang/kernels/ops/attention/fla/fused_recurrent.py": "b978898b39eb18969994d737cb4853a99eeb89e16759862e48694c133f6e4562",
+    "python/sglang/kernels/ops/attention/fla/index.py": "9381b5310363cb7883fc2ef7a8b531080a0e4424b4e7132dcd2bdad6df68b028",
+    "python/sglang/kernels/ops/attention/fla/kda.py": "10c99ca3f62a189be95d50035f8eb3f166dbc647a744cb63851ed5b3dc187a8f",
+    "python/sglang/kernels/ops/attention/fla/l2norm.py": "e51a2b73431f6ff55099476e15b1211e2a8f7069dff05bd566cfc09fc27fbfaf",
+    "python/sglang/kernels/ops/attention/fla/layernorm_gated.py": "95d10783a8374e75bcc2c6d15ffdb580acd38d87c20b17c4f8bb24083c805be4",
+    "python/sglang/kernels/ops/attention/fla/op.py": "ed1294fc5ba003d255504c28b53105e697fdbf207e2586cb8a36599d8df293cd",
+    "python/sglang/kernels/ops/attention/fla/utils.py": "5c39b5cffde309760fd8fd7d73e32325dc788628e00f4a7552d6773972b3c3e6",
+    "python/sglang/kernels/ops/attention/fla/wy_fast.py": "25f763bcfcfbf230fc7748d2d8aa1493ab0999298ef46ccebaa04b65b351e748",
+    "python/sglang/kernels/jit/utils/compile/cpp_args.py": "8ff45d45f3ff4bc91d9d5532bc5c1c2b00141f92fd61757e09bbc8859896a7ee",
+    "python/sglang/kernels/ops/quantization/fp8_kernel.py": "1201c78090f9f70b78b2b6fcde88647fd9d029151d93a67507b79ec509718ee1",
+    "python/sglang/kernels/ops/moe/fused_moe_triton_kernels.py": "67276d4b983e442c072c3b0788a0af592b5d9aa8a2692911d4af94337f63ca7b",
+    "python/sglang/kernels/ops/activation/activation.py": "b862e39632cc98b28f6818fdc485442db43e55f83e98ebbcb26e6460fc762f0a",
+    "python/sglang/kernels/ops/moe/moe_align.py": "22ed332b37238a321012683a164b39748b0b88e380ca2aed9a8befb0b68dd4b6",
+    "python/sglang/srt/layers/moe/moe_runner/triton_utils/moe_align_block_size.py": "b8f616c390b20cbb95e9d72d1e43084624054c7c68e2fda6fa5467be56039d52",
+    "python/sglang/srt/layers/moe/moe_runner/triton_utils/fused_moe_triton_config.py": "ca9935897b7567c8a022d61b88b31845cbf3efad95d4e68af008c824c9ca7a96",
+    "python/sglang/kernels/ops/activation/silu_and_mul_block_quant.py": "8d07079b14555c8f209453d91ee613b009597a696916cfa223aceaad166bc2ee",
+    "python/sglang/srt/layers/moe/moe_runner/triton_utils/fused_moe.py": "1b64fa76feb50676cb4dd77ecbc396d09f89c3ccd1da861c9f070feca6836572",
+    "python/sglang/srt/layers/moe/topk.py": "17d2f2ed25f255684c6134f99ed135dabbd48405c0c9127a45f3cb08432306a6",
+    "python/sglang/srt/models/qwen2_moe.py": "e64bf8deb427e14b3ab85fe46c6960073f9f16dd2aaf7bc0fd1d06f09d5ef174",
+    "python/sglang/kernels/jit/csrc/moe/moe_align_kernel.cu": "387dd3272a8e79fea9efc33da3d3c62d3f3f8f4e4d3de7b705f72e4991c35d16",
+    "python/sglang/kernels/jit/csrc/elementwise/activation.cuh": "7a73dcaccf54798c38e936be083ce895be3f9e7eb95d20f8b544ea962c3ab10f"
+  },
+  "passed": false
+}

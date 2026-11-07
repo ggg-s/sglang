@@ -1,0 +1,33 @@
+Using default MoE kernel config. Performance might be sub-optimal! Config file not found at /mnt/c/Users/27839/AppData/Local/Temp/qwen38-decoder-source/python/sglang/srt/layers/moe/moe_runner/triton_utils/configs/triton_3_8_0/E=4,N=256,device_name=NVIDIA_GeForce_RTX_4060_Laptop_GPU.json, you can create them with https://github.com/sgl-project/sglang/tree/main/benchmark/kernels/fused_moe_triton
+Using default MoE kernel config. Performance might be sub-optimal! Config file not found at /mnt/c/Users/27839/AppData/Local/Temp/qwen38-decoder-source/python/sglang/srt/layers/moe/moe_runner/triton_utils/configs/triton_3_8_0/E=4,N=256,device_name=NVIDIA_GeForce_RTX_4060_Laptop_GPU_down.json, you can create them with https://github.com/sgl-project/sglang/tree/main/benchmark/kernels/fused_moe_triton
+{"name": "real_moe_bf16_I256", "rounds": 32, "decode_cuda_graph": true, "dual_stream_exact_match": true, "reference_max_abs": [0.00390625, 0.0]}
+Using default MoE kernel config. Performance might be sub-optimal! Config file not found at /mnt/c/Users/27839/AppData/Local/Temp/qwen38-decoder-source/python/sglang/srt/layers/moe/moe_runner/triton_utils/configs/triton_3_8_0/E=4,N=256,device_name=NVIDIA_GeForce_RTX_4060_Laptop_GPU,dtype=fp8_w8a8,block_shape=[128, 128].json, you can create them with https://github.com/sgl-project/sglang/tree/main/benchmark/kernels/fused_moe_triton
+Using default MoE kernel config. Performance might be sub-optimal! Config file not found at /mnt/c/Users/27839/AppData/Local/Temp/qwen38-decoder-source/python/sglang/srt/layers/moe/moe_runner/triton_utils/configs/triton_3_8_0/E=4,N=256,device_name=NVIDIA_GeForce_RTX_4060_Laptop_GPU,dtype=fp8_w8a8,block_shape=[128, 128]_down.json, you can create them with https://github.com/sgl-project/sglang/tree/main/benchmark/kernels/fused_moe_triton
+Traceback (most recent call last):
+  File "/mnt/c/Users/27839/AppData/Local/Temp/qwen38-decoder-source/test/manual/pdmux/validate_qwen38_moe_ple_cuda.py", line 972, in main
+    result = ops.pair_test(
+             ^^^^^^^^^^^^^^
+  File "/mnt/c/Users/27839/AppData/Local/Temp/qwen38-decoder-source/test/manual/pdmux/validate_qwen38_real_ops_cuda.py", line 83, in pair_test
+    torch.testing.assert_close(
+  File "/workspace/conditional-graph-20261019/venv/lib/python3.12/site-packages/torch/testing/_comparison.py", line 1689, in assert_close
+    raise error_metas[0].to_error(msg)
+AssertionError: Tensor-likes are not close!
+
+Mismatched elements: 166 / 16640 (1.0%)
+Greatest absolute difference: 0.05078125 at index (27, 22) (up to 0.02 allowed)
+Greatest relative difference: 26.0 at index (25, 196) (up to 0.02 allowed)
+Using default MoE kernel config. Performance might be sub-optimal! Config file not found at /mnt/c/Users/27839/AppData/Local/Temp/qwen38-decoder-source/python/sglang/srt/layers/moe/moe_runner/triton_utils/configs/triton_3_8_0/E=4,N=192,device_name=NVIDIA_GeForce_RTX_4060_Laptop_GPU,dtype=fp8_w8a8,block_shape=[128, 128].json, you can create them with https://github.com/sgl-project/sglang/tree/main/benchmark/kernels/fused_moe_triton
+Using default MoE kernel config. Performance might be sub-optimal! Config file not found at /mnt/c/Users/27839/AppData/Local/Temp/qwen38-decoder-source/python/sglang/srt/layers/moe/moe_runner/triton_utils/configs/triton_3_8_0/E=4,N=192,device_name=NVIDIA_GeForce_RTX_4060_Laptop_GPU,dtype=fp8_w8a8,block_shape=[128, 128]_down.json, you can create them with https://github.com/sgl-project/sglang/tree/main/benchmark/kernels/fused_moe_triton
+Traceback (most recent call last):
+  File "/mnt/c/Users/27839/AppData/Local/Temp/qwen38-decoder-source/test/manual/pdmux/validate_qwen38_moe_ple_cuda.py", line 972, in main
+    result = ops.pair_test(
+             ^^^^^^^^^^^^^^
+  File "/mnt/c/Users/27839/AppData/Local/Temp/qwen38-decoder-source/test/manual/pdmux/validate_qwen38_real_ops_cuda.py", line 83, in pair_test
+    torch.testing.assert_close(
+  File "/workspace/conditional-graph-20261019/venv/lib/python3.12/site-packages/torch/testing/_comparison.py", line 1689, in assert_close
+    raise error_metas[0].to_error(msg)
+AssertionError: Tensor-likes are not close!
+
+Mismatched elements: 347 / 16640 (2.1%)
+Greatest absolute difference: 0.078125 at index (6, 104) (up to 0.02 allowed)
+Greatest relative difference: inf at index (61, 4) (up to 0.02 allowed)

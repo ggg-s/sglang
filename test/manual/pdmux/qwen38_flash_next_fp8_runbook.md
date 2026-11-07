@@ -106,3 +106,23 @@ that strict native-order failure and explains the controlled comparison.
 The small configuration uses single-rank metadata adapters and a fixed
 compressed prefix. Full checkpoint/MoE/PLE/indexer-update/MTP/TP acceptance,
 answer accuracy and serving performance remain outside these results.
+
+## Small real MoE/PLE and progressive graph regression (2026-11-07)
+
+[MoE/PLE results, diagnostics and reproduction](qwen38_moe_ple_cuda_20261107/README.md)
+add eight configurations, each passing 32 paired iterations with decode CUDA
+Graph replay. Coverage includes real BF16/FP8 routed MoE, native alignment and
+activation, pinned BF16/FP8 PLE table UVA lookup, working/track history and
+short-conv state, and GDN → QSA decoder layers combining PLE, routed MoE and
+shared experts. Dual-stream outputs/state/routing match serial controls exactly.
+The combined FP8 decoder includes 13 FP8 projections and two FP8 MoE blocks.
+A progressive PLE case changes inputs for 32 graph replays without resetting
+decode history and matches every serial state transition exactly.
+
+The report preserves the initial FP8 pointwise-reference failure and separates
+near-midpoint quantization differences from GEMM error; stream comparisons stay
+at zero tolerance. Construction/cache/TP1 metadata adapters and canonical QSA
+token ordering remain explicit. This adds small-layer MoE/PLE coverage, while
+full-checkpoint loading, complete serving/backend integration, indexer/cache
+progression, file-backed PLE restore, MTP, TP/EP, model accuracy, long stress and
+end-to-end performance acceptance remain pending.
