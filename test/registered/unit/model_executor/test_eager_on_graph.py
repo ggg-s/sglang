@@ -17,7 +17,10 @@ from sglang.srt.model_executor.runner_utils.forward_batch import (
     get_forward_batch,
     set_forward_batch,
 )
-from sglang.srt.model_executor.runner_utils.pdmux_bcg import PdmuxBCGExecutor
+from sglang.srt.model_executor.runner_utils.pdmux_bcg import (
+    PdmuxBCGExecutor,
+    capture_layer_boundaries,
+)
 from sglang.test.ci.ci_register import register_cpu_ci
 
 register_cpu_ci(est_time=7, suite="base-a-test-cpu")
@@ -273,6 +276,28 @@ def test_split_intervals_partition_eager_breaks_and_run_tail_once(monkeypatch):
     assert state.item() == 42
     with pytest.raises(ValueError):
         graph.replay_layers(1, 3)
+    graph._layer_ends = {2: 4}
+    with pytest.raises(ValueError, match="every decoder layer"):
+        graph.replay_layers(0, 2)
+
+
+@pytest.mark.parametrize("mapping", [False, True])
+def test_generic_layer_hooks_are_removed_between_capture_variants(mapping):
+    """A second shape/lane must not retain the first capture's layer hooks."""
+    layers = [torch.nn.Identity(), torch.nn.Identity()]
+    model = SimpleNamespace(
+        layers=(
+            torch.nn.ModuleDict({str(i): l for i, l in enumerate(layers)})
+            if mapping
+            else torch.nn.ModuleList(layers)
+        )
+    )
+    for _ in range(2):
+        with capture_layer_boundaries(model, 2), recording_capture() as (graph, _):
+            for layer in layers:
+                layer(torch.ones(1))
+            assert list(graph._layer_ends) == [1, 2]
+        assert all(not layer._forward_hooks for layer in layers)
 
 
 def test_split_session_restores_live_context_and_keeps_one_owner():

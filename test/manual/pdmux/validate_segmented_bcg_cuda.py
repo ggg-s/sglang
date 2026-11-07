@@ -321,21 +321,28 @@ class Fixture:
     def submit(self, mode, verify=True):
         self.mode = mode
         b = self.batches[0]
+        prefill_cpu = []
         with torch.cuda.stream(self.ps):
             self.reset(0)
             b.split_index = 0
+            t = time.perf_counter()
             if mode == "eager_split":
                 self.forward(0, (0, 1))
             elif mode == "split_bcg":
                 self.continuation.execute(b, 1)
+            if mode in ("eager_split", "split_bcg"):
+                prefill_cpu.append((time.perf_counter() - t) * 1000)
         with torch.cuda.stream(self.ds):
+            t = time.perf_counter()
             self.decode_graph.replay()
+            decode_cpu = (time.perf_counter() - t) * 1000
             decode = (
                 self.snapshot(1, self.decode_outputs, routes=self.decode_routes)
                 if verify
                 else None
             )
         with torch.cuda.stream(self.ps):
+            t = time.perf_counter()
             if mode == "eager_split":
                 prefill = self.forward(0, (1, 2))
             elif mode == "split_bcg":
@@ -346,6 +353,7 @@ class Fixture:
             else:
                 with self.ctx.enable_breakable_cuda_graph(), self.forward_context(b):
                     prefill = self.replay(self.shape, b)
+            prefill_cpu.append((time.perf_counter() - t) * 1000)
             if verify:
                 prefill = self.snapshot(
                     0,
@@ -353,6 +361,11 @@ class Fixture:
                     bridge=mode.endswith("bcg"),
                     routes=self.routes[mode] if mode.endswith("bcg") else None,
                 )
+        self.last_submit_stats = dict(
+            prefill_cpu_ms=sum(prefill_cpu),
+            longest_prefill_call_ms=max(prefill_cpu),
+            decode_cpu_ms=decode_cpu,
+        )
         return prefill, decode
 
     def run(self, rounds, trials):
@@ -390,8 +403,10 @@ class Fixture:
                 with torch.cuda.stream(self.ps):
                     begin.record()
                 t = time.perf_counter()
+                submissions = []
                 for _ in range(rounds):
                     self.submit(mode, verify=False)
+                    submissions.append(self.last_submit_stats)
                 cpu_ms = (time.perf_counter() - t) * 1000 / rounds
                 with torch.cuda.stream(self.ps):
                     self.ps.wait_stream(self.ds)
@@ -401,10 +416,14 @@ class Fixture:
                     dict(
                         cpu_submit_ms=cpu_ms,
                         mixed_gpu_ms=begin.elapsed_time(finish) / rounds,
+                        **{
+                            metric: statistics.mean(s[metric] for s in submissions)
+                            for metric in submissions[0]
+                        },
                     )
                 )
         for result in results.values():
-            for metric in ("cpu_submit_ms", "mixed_gpu_ms"):
+            for metric in result["samples"][0]:
                 result[metric] = statistics.median(s[metric] for s in result["samples"])
         return dict(
             cases=results,

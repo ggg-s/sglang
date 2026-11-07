@@ -111,7 +111,10 @@ class PdmuxBCGExecutor:
             if self.owner is not batch or s.next_layer != start:
                 raise RuntimeError("Non-contiguous split BCG continuation")
             size = len(s.static_batch.input_ids)
-            if r._shape_key(size, batch) != s.shape_key:
+            if (
+                len(batch.input_ids) != s.raw_num_tokens
+                or r._shape_key(size, batch) != s.shape_key
+            ):
                 raise RuntimeError("Split BCG cannot migrate between captured variants")
             with r._prefill_forward_context(
                 s.static_batch, num_tokens=size, raw_num_tokens=s.raw_num_tokens

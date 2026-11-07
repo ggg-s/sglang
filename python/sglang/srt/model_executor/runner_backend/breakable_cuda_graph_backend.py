@@ -68,6 +68,13 @@ class BreakableCudaGraphBackend(DedupedCudaGraphMixin, BaseCudaGraphBackend):
     attention metadata is recomputed at replay outside captured segments.
     """
 
+    def build_deduped_cuda_graph(self):
+        # Exec-update signatures do not include the PDMux green-context lane.
+        # Keep separate executables instead of deduplicating across partitions.
+        if getattr(self._cuda_graph_runner, "enable_pdmux", False):
+            return None
+        return super().build_deduped_cuda_graph()
+
     def __init__(
         self,
         cuda_graph_runner: BaseCudaGraphRunner,
