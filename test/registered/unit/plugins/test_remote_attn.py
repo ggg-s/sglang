@@ -17544,6 +17544,151 @@ class TestRemoteAttn(CustomTestCase):
         target.worker.join(10)
         self.assertFalse(target.worker.is_alive())
 
+    def test_p4_dsv_prepares_at_first_token_waits_for_cut_and_recovers(self):
+        """Plan/reserve cannot consume the short request's post-cut window."""
+        f = self._p4_dsv_env(accept=False)
+        f.rid = f.gw.accept(
+            dict(
+                rid="early",
+                prompt_ids=list(f.e.req.origin_input_ids),
+                max_new_tokens=8,
+                cut=5,
+                growth_tokens=0,
+            )
+        )
+        f.support.until(f.gw, f.rid, "SOURCE")
+        req = f.e.req
+        req.output_ids[:] = [31]
+        req.kv.kv_committed_len = req.kv.kv_allocated_len = len(req.origin_input_ids)
+        f.support.until(f.gw, f.rid, "WAIT_CUT")
+        entry = f.gw.entry(f.rid)
+        epoch = entry["epoch"]
+        self.assertEqual(f.driver.count("d2d_plan"), 1)
+        self.assertEqual(f.driver.count("d2d_reserve"), 1)
+        self.assertEqual(f.driver.count("d2d_freeze"), 0)
+        self.assertFalse(req._handoff_frozen)
+        self.assertTrue(f.e.target.d2d_reservations[epoch].req.kv.holds_kv)
+        self.assertEqual(
+            f.gw.latency_metrics()["control_latency_ms"]["src/d2d_plan"]["count"], 1
+        )
+        self._p4_dsv_restart(f)
+        for _ in range(3):
+            f.gw.tick()
+        self.assertEqual(f.gw.entry(f.rid)["phase"], "WAIT_CUT")
+        self.assertEqual(f.driver.count("d2d_plan"), 1)
+        req.output_ids.extend([32, 33, 34, 35])
+        req.kv.kv_committed_len = req.kv.kv_allocated_len = (
+            len(req.origin_input_ids) + 4
+        )
+        f.support.until(f.gw, f.rid, "TARGET")
+        moved = f.gw.entry(f.rid)
+        self.assertEqual(moved["epoch"], epoch)
+        self.assertEqual(moved["migration_outcome"], "migrated")
+        self.assertEqual(f.driver.count("d2d_freeze"), 1)
+        self.assertEqual(
+            f.e.source.d2d_sources[epoch].frozen_output, tuple(req.output_ids)
+        )
+        self.assertEqual(f.gw.latency_metrics()["handoff_latency_ms"]["count"], 1)
+        f.e.gate.set()
+
+    def test_p4_dsv_finished_window_is_classified_and_reservation_cancelled(self):
+        f = self._p4_dsv_env()
+        f.support.until(f.gw, f.rid, "FREEZE")
+        epoch = f.gw.entry(f.rid)["epoch"]
+        f.e.req.finished = lambda: True
+        f.gw.tick()
+        entry = f.gw.entry(f.rid)
+        self.assertEqual(entry["phase"], "ROLLBACK")
+        self.assertEqual(entry["migration_skip_reason"], "request_finished")
+        self.assertEqual(entry["migration_outcome"], "window_missed_request_finished")
+        self.assertNotIn(epoch, f.e.source.d2d_sources)
+        f.gw.tick()
+        self.assertTrue(f.e.target.d2d_reservations[epoch].cancelled)
+        self.assertFalse(f.e.req._handoff_frozen)
+        self.assertEqual(
+            f.gw.latency_metrics()["migration_skip_reasons"], {"request_finished": 1}
+        )
+        self.assertEqual(f.gw.latency_metrics()["handoff_latency_ms"]["count"], 0)
+
+    def test_p4_dsv_cancel_prepared_before_cut_never_freezes_source(self):
+        f = self._p4_dsv_env(accept=False)
+        f.rid = f.gw.accept(
+            dict(
+                rid="cancel-early",
+                prompt_ids=list(f.e.req.origin_input_ids),
+                max_new_tokens=8,
+                cut=6,
+                growth_tokens=0,
+            )
+        )
+        f.support.until(f.gw, f.rid, "WAIT_CUT")
+        epoch = f.gw.entry(f.rid)["epoch"]
+        f.gw.cancel(f.rid)
+        f.support.until(f.gw, f.rid, "CANCELLED")
+        self.assertTrue(f.e.target.d2d_reservations[epoch].cancelled)
+        self.assertEqual(f.driver.count("d2d_freeze"), 0)
+        self.assertEqual(f.driver.count("d2d_commit"), 0)
+
+    def test_dsv_plan_can_prepare_before_decode_boundary_but_freeze_defers(self):
+        from sglang_remote_attn import dsv_d2d as d2d
+
+        e = self._d2d_env()
+        e.source.scheduler.result_queue = [
+            (
+                SimpleNamespace(forward_mode=SimpleNamespace(is_decode=lambda: False)),
+                None,
+            )
+        ]
+        data = dict(
+            migration_epoch="early",
+            rid=e.req.rid,
+            target_rid="early-target",
+            destination="D1",
+        )
+        result = d2d.handle(e.source, dict(cmd="d2d_plan", growth_tokens=8, **data))
+        self.assertIn("plan", result)
+        deferred = d2d.handle(e.source, dict(cmd="d2d_freeze", **data))
+        self.assertEqual(
+            deferred["migration_deferred_reason"], "decode_boundary_pending"
+        )
+        self.assertFalse(e.req._handoff_frozen)
+        e.source.scheduler.result_queue = []
+        e.req.finished = lambda: True
+        skipped = d2d.handle(e.source, dict(cmd="d2d_freeze", **data))
+        self.assertEqual(skipped["migration_deferred_reason"], "request_finished")
+        self.assertFalse(e.source.d2d_sources or e.freed)
+
+    def test_p4_dsv_status_poll_yields_to_waiting_mutation_without_worker_error(self):
+        f = self._p4_dsv_env()
+        held, waiting = threading.Lock(), threading.Event()
+        held.acquire()
+
+        class GateLock:
+            def acquire(self, *args, **kwargs):
+                if kwargs.get("timeout"):
+                    waiting.set()
+                return held.acquire(*args, **kwargs)
+
+            def release(self):
+                held.release()
+
+        f.gw.role_locks["src"] = GateLock()
+        results = []
+        t = threading.Thread(
+            target=lambda: results.append(f.gw._call("src", "d2d_status", "priority"))
+        )
+        t.start()
+        try:
+            self.assertTrue(waiting.wait(2))
+            polls = f.driver.count("d2d_worker_status")
+            f.gw._refresh_role("src")
+            self.assertEqual(f.driver.count("d2d_worker_status"), polls)
+            self.assertNotIn("src", f.gw.fact_errors)
+        finally:
+            held.release()
+            t.join(2)
+        self.assertEqual(len(results), 1)
+
     def test_p4_dsv_orders_native_reserve_before_freeze_and_sse_owner_switch(self):
         f = self._p4_dsv_env()
         f.support.until(f.gw, f.rid, "SOURCE")

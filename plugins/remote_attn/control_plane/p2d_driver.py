@@ -218,7 +218,7 @@ def _send_unlocked(role: str, payload: dict, timeout: float = 300.0) -> dict:
             results[r] = res
             pending.discard(r)
         if pending:
-            time.sleep(0.02)
+            time.sleep(0.005 if payload["cmd"].startswith("d2d_") else 0.02)
     if pending:
         raise TimeoutError(
             f"{role} {payload['cmd']} timed out after {timeout}s; "

@@ -1,0 +1,44 @@
+{
+  "results": [
+    {
+      "concurrency": 4,
+      "cut": 32,
+      "first_token_preparations": 4,
+      "migrations": 4,
+      "partial_remote_frozen": 4,
+      "destination_first_tokens": 4,
+      "source_free_count": 4,
+      "returned_reservation_tokens": 256,
+      "handoff_observations": 4,
+      "source_native_pd_retired_before_export": true,
+      "source_retained_until_reader_retirement": true,
+      "mooncake_transfers": 28
+    },
+    {
+      "concurrency": 8,
+      "cut": 32,
+      "first_token_preparations": 8,
+      "migrations": 8,
+      "partial_remote_frozen": 8,
+      "destination_first_tokens": 8,
+      "source_free_count": 8,
+      "returned_reservation_tokens": 512,
+      "handoff_observations": 8,
+      "source_native_pd_retired_before_export": true,
+      "source_retained_until_reader_retirement": true,
+      "mooncake_transfers": 56
+    }
+  ],
+  "full_model": false,
+  "real_rdma": false,
+  "control_driver": "in-process command dispatch, not file RPC latency",
+  "sampler": "native ABI boundary fixture",
+  "sha256": {
+    "plugins/remote_attn/control_plane/p4_dsv_gateway.py": "392c70dbb660fa6f2467900860cf30e35fe514486a05e4949a66a2b43613bbe0",
+    "plugins/remote_attn/sglang_remote_attn/dsv_d2d.py": "2ef0a06c7d38affd14efa9da5f0e6cd2943705c3b3dbcd95f3e284e2f0f63dd7",
+    "plugins/remote_attn/sglang_remote_attn/dsv_d2d_reservation.py": "192cf28adfa6e95bd8a70b6a270034a1c359d62ecf7f2112fb956148454e9b8b",
+    "plugins/remote_attn/sglang_remote_attn/dsv_gateway_control.py": "6077331717274e7ce45e442b7ae3d25f5ea6625a02d67e0a7be41003a9df16c9",
+    "test/manual/remote_attn/dsv_d2d_partial_probe_support.py": "65332a4c4b4167a5f2a6557e6810fe111cfc130b6cbf0fbf66576bd76020f549",
+    "test/manual/remote_attn/dsv_d2d_control_cuda_probe.py": "6eb3be65b897e18237f6d70947e42ce51796c4c4603baa299d6edeca5668cea7"
+  }
+}

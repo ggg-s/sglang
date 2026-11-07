@@ -233,7 +233,7 @@ def source_local(req):
     return source_blocker(req) is None
 
 
-def migration_blocker(scheduler, req):
+def planning_blocker(req):
     reason = source_blocker(req)
     if reason in ("remote_entries_pending", "previous_transfer_pending"):
         from .dsv_d2d_partial import can_freeze
@@ -244,9 +244,14 @@ def migration_blocker(scheduler, req):
         return reason
     if not req.output_ids:
         return "sampled_output_pending"
-    if not can_quiesce(scheduler):
-        return "decode_boundary_pending"
     return None
+
+
+def migration_blocker(scheduler, req):
+    reason = planning_blocker(req)
+    if reason is not None:
+        return reason
+    return None if can_quiesce(scheduler) else "decode_boundary_pending"
 
 
 def quiesce(scheduler, req):
@@ -1057,22 +1062,58 @@ def handle(controller, data):
             params = sampling(req)
             group_size = grouping.size()
             token_range = ranges.tokens()
-            if migration_blocker(controller.scheduler, req) is not None:
-                raise ValueError(
-                    "request has a D2D owner or needs native Decode boundary"
-                )
+            blocker = migration_blocker(controller.scheduler, req)
         except Exception as exc:
             error = repr(exc)
-        if not controller.agree([int(error is None)])[0]:
+        votes = controller.agree(
+            [
+                int(error is None),
+                int(error is None and blocker is None),
+                int(error is not None or blocker != "request_finished"),
+                int(
+                    error is not None
+                    or blocker
+                    in (
+                        None,
+                        "decode_boundary_pending",
+                        "remote_entries_pending",
+                        "previous_transfer_pending",
+                        "sampled_output_pending",
+                    )
+                ),
+            ]
+        )
+        if not votes[0]:
             raise ValueError(
                 f"TP D2D freeze preflight rejected: {error or 'peer rejected'}"
+            )
+        if not votes[1]:
+            return dict(
+                deferred=True,
+                migration_deferred_reason="request_finished"
+                if not votes[2]
+                else blocker or "peer_not_ready",
+                retryable=bool(votes[3]),
             )
         error = None
         try:
             quiesce(controller.scheduler, req)
         except Exception as exc:
             error = repr(exc)
-        if not controller.agree([int(error is None)])[0]:
+        votes = controller.agree(
+            [
+                int(error is None),
+                int(not req.finished()),
+                int(error is None or req.finished()),
+            ]
+        )
+        if not votes[0]:
+            if not votes[1] and votes[2]:
+                return dict(
+                    deferred=True,
+                    migration_deferred_reason="request_finished",
+                    retryable=False,
+                )
             raise ValueError(f"TP D2D quiesce rejected: {error or 'peer rejected'}")
         # Quiescing can commit one overlap result; validate the final length
         # collectively before removing any rank from its runnable batches.

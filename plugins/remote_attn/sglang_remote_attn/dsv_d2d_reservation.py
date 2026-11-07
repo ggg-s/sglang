@@ -92,7 +92,7 @@ def handle(controller, data):
         error, blocker = None, None
         try:
             req = d2d.find_req(controller.scheduler, data["rid"])
-            blocker = d2d.migration_blocker(controller.scheduler, req)
+            blocker = d2d.planning_blocker(req)
         except Exception as exc:
             error = repr(exc)
         votes = controller.agree(

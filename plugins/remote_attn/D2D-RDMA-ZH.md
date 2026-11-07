@@ -62,6 +62,36 @@ export HANDOFF_MOONCAKE_HOST=<本机对端可达的IPv4地址>
 Remote Attention 的 RemoteHub/mesh 地址仍按 [多机部署](MULTI-PD-ZH.md) 配置。
 上述变量不替代 RemoteHub、原生 bootstrap 或 Gateway 地址配置。
 
+## 控制面与迁移窗口
+
+Gateway 在首个已采样 token 可见、请求可安全规划时就执行 plan/reserve；
+不再等 `cut` 才开始三跳串行控制。预留成功进入持久化 `WAIT_CUT`，源继续生成，
+到 `cut` 或显式请求迁移时才进入 FREEZE。同一 epoch 支持等待、重启恢复和取消。
+plan 不要求 native Decode 边界；freeze 仍必须在调度器线程的安全边界执行。
+
+提前预留需覆盖源继续生成期间的长度变化，因此预留上界至少覆盖剩余输出上限，
+由 worker 的采样上限与原生 context 容量截断。相比临近 cut 才预留，这会更早占用
+D1 row/KV；目标容量不足时沿用原有失败/回滚流程。源提前结束或取消会撤销目标
+预留，不能让 ticket 隐式过期。实际 import 只消费冻结长度，多预留的尾部按原生
+页对齐规则退还。
+
+空闲入口的原生 zmq Poller 增加管道唤醒：后台 watcher 每 5 ms 只检查控制文件名，
+不读取请求、不执行命令、不访问 KV 或 TP。命令仍经原生 request broadcast 由
+所有 TP rank 的调度线程顺序执行。Rust 入口保留原生 ring 等待，空闲等待上限
+缩为 10 ms。该机制唤醒空闲 poll，不能抢占正在运行的 GPU forward。
+Gateway 的 status 轮询遇到排队中的修改命令会让行，驱动收取 D2D 回包的间隔为 5 ms。
+
+`/v1/router/status` 增加累计桶直方图：`control_latency_ms` 按 role/command 记录
+角色锁等待与 RPC 总耗时（含失败尝试，进程重启清零）；`handoff_latency_ms` 记录
+freeze 首次提交至目标 commit/admit 成功的耗时，从 journal 恢复。每请求还暴露
+`prepare_latency_ms`、`handoff_latency_ms` 和 `migration_skip_reason`。
+worker 发现请求已结束时返回结构化 `request_finished`，Gateway 撤销预留并报告
+`migration_outcome=window_missed_request_finished`；语义拒绝单独报告
+`semantic_rejection`，可重试的 native 边界等待仍使用 `migration_deferred`。
+`migration_skip_reasons` 汇总当前 journal 中的跳过原因。
+
+验证与 H20 复测边界见 [控制面窗口验证](validation/D2D-CONTROL-LATENCY.md)。
+
 ## 数据路径与完成顺序
 
 DSV Remote 请求可在仍依赖 P 的部分 global KV entries 时进入 D2D plan。
@@ -94,8 +124,10 @@ commit 前取消：先取消目标预留/import，再撤销 D2D 读服务并恢�
 不具备安全冻结条件时（例如 native Decode 边界未到或非原生 Remote owner），
 worker 仍报告 `migration_deferred_reason`；Gateway 的 `migration_deferred`、
 reason、count、wait_ms 继续表示**冻结之前**的等待。TP plan 返回 `deferred=true`
-时不会创建 plan、预留或冻结，也不消耗迁移重试次数。等待期间在源结束仍标记
-`migration_outcome=completed_on_source_before_migration`，实际切至 D1 才计为迁移。
+时不会创建 plan、预留或冻结，也不消耗迁移重试次数。未进入准备阶段就在源
+结束仍标记 `migration_outcome=completed_on_source_before_migration`；准备后在 cut
+之前结束标记 `completed_on_source_before_cut`，错过冻结窗口则报告
+`window_missed_request_finished`。实际切至 D1 才计为迁移。
 
 小池验证结果与 H20 复测边界见
 [部分 Remote D2D 验证](validation/DSV-D2D-PARTIAL-REMOTE.md)。

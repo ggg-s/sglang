@@ -7,6 +7,7 @@ import pkgutil
 import time
 
 from . import (
+    control_wakeup,
     decode_overlap,
     destination_cache,
     dsv41_layerwise,
@@ -161,7 +162,10 @@ def _event_loop(original, scheduler, *args, **kwargs):
         try:
             shutdown(scheduler)
         finally:
-            _runtime().shutdown_handoff(scheduler)
+            try:
+                _runtime().shutdown_handoff(scheduler)
+            finally:
+                control_wakeup.close(scheduler)
 
 
 def _broadcast(original, receiver, recv_reqs, local_reqs=None):
@@ -657,6 +661,7 @@ HOOKS.update(
         "sglang.srt.managers.scheduler.Scheduler.launch_batch_sample_if_needed": prefill_overlap.after_sample,
         "sglang.srt.managers.scheduler.Scheduler.should_process_last_batch_early": decode_overlap.process_last_batch_early,
         "sglang.srt.managers.scheduler.Scheduler.is_fully_idle": pre_layerwise.is_fully_idle,
+        "sglang.srt.managers.scheduler.Scheduler.maybe_sleep_on_idle": control_wakeup.sleep,
         "sglang.srt.model_executor.model_runner.ModelRunner.forward": pre_layerwise.forward,
         "sglang.srt.disaggregation.prefill.SchedulerDisaggregationPrefillMixin.send_kv_chunk": pre_layerwise.send_chunk,
         "sglang.srt.disaggregation.decode.DecodeTransferQueue.pop_transferred": pre_layerwise.pop_transferred,

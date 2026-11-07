@@ -318,6 +318,101 @@ class TestGatewayControlPaths(CustomTestCase):
             )
         return driver
 
+    def test_idle_file_controls_wake_native_poller_without_inference_traffic(self):
+        """An idle worker must answer file controls without waiting for real requests."""
+        import json
+        import os
+        import tempfile
+        import threading
+        import time
+        from sglang.srt.environ import envs
+        from sglang.srt.managers.scheduler_components.idle_sleeper import IdleSleeper
+        from sglang.srt.runtime_context import get_parallel
+        from sglang_remote_attn import control_wakeup, handoff_control as runtime
+
+        entered, stopped = threading.Event(), threading.Event()
+        failures, executed = [], []
+
+        class TracedPoller:
+            def __init__(self, raw):
+                self.raw = raw
+
+            def __getattr__(self, name):
+                return getattr(self.raw, name)
+
+            def poll(self, timeout):
+                entered.set()
+                return self.raw.poll(timeout)
+
+        with (
+            tempfile.TemporaryDirectory() as folder,
+            patch.dict(
+                os.environ, {"HANDOFF_SRC_CTL_DIR": "", "HANDOFF_DST_CTL_DIR": ""}
+            ),
+            patch.object(runtime, "_CTL_DIR", str(Path(folder) / "legacy/src")),
+            envs.SGLANG_EMPTY_CACHE_INTERVAL.override(0),
+        ):
+            driver = self.driver(Path(folder))
+            scheduler = NS(
+                idle_sleeper=IdleSleeper([]),
+                running_batch=None,
+                last_batch=None,
+                waiting_queue=[],
+            )
+            scheduler.idle_sleeper.poller = TracedPoller(scheduler.idle_sleeper.poller)
+
+            def handle(s, command):
+                executed.append(threading.get_ident())
+                return dict(protocol="dsv-d2d-v2", command=command["cmd"])
+
+            def loop():
+                try:
+                    with get_parallel().override(tp_rank=0, tp_size=1):
+                        while not stopped.is_set():
+                            hooks.HOOKS[
+                                "sglang.srt.managers.scheduler.Scheduler.maybe_sleep_on_idle"
+                            ](lambda s: s.idle_sleeper.maybe_sleep(), scheduler)
+                            if stopped.is_set():
+                                break
+                            item = runtime.poll_broadcast_control()
+                            if item:
+                                runtime.execute_handoff_control(scheduler, item["data"])
+                except BaseException as exc:
+                    failures.append(exc)
+
+            with patch.object(runtime, "_handle", side_effect=handle):
+                worker = threading.Thread(target=loop, name="test-native-scheduler")
+                worker.start()
+                latencies = []
+                try:
+                    for _ in range(8):
+                        self.assertTrue(entered.wait(2))
+                        entered.clear()
+                        started = time.monotonic()
+                        result = driver.send(
+                            "src", dict(cmd="d2d_worker_status"), timeout=2
+                        )
+                        latencies.append((time.monotonic() - started) * 1000)
+                        self.assertEqual(result["command"], "d2d_worker_status")
+                    self.assertLess(max(latencies), 500, latencies)
+                    self.assertEqual(set(executed), {worker.ident})
+                    self.assertFalse(failures)
+                    print("[control-wakeup-ms] " + json.dumps(latencies))
+                finally:
+                    stopped.set()
+                    (Path(folder) / "legacy/src/cmd.0.json").write_text("{}")
+                    worker.join(2)
+                    control_wakeup.close(scheduler)
+                self.assertFalse(worker.is_alive())
+            # Rust's request ring has no zmq FD; retain it with a bounded wait.
+            rust = NS(timeout_ms=1000)
+            scheduler.idle_sleeper = rust
+            calls = []
+            control_wakeup.sleep(
+                lambda s: calls.append(s.idle_sleeper.timeout_ms), scheduler
+            )
+            self.assertEqual(calls, [10])
+
     def test_heartbeat_and_qwen_dsv_commands_share_selected_directories(self):
         import json
         import os
@@ -369,15 +464,24 @@ class TestGatewayControlPaths(CustomTestCase):
                 driver.send = lambda role, payload, timeout: native_send(
                     role, payload, timeout=0
                 )
+                ns = dict(time=time)
+                self.functions(
+                    "plugins/remote_attn/control_plane/p4_dsv_gateway.py",
+                    {"latency_histogram"},
+                    ns,
+                )
                 dsv = self.functions(
                     "plugins/remote_attn/control_plane/p4_dsv_gateway.py",
                     {"_call", "rows"},
-                    dict(),
+                    ns,
                     "DsvGateway",
                 )
                 coordinator = NS(
                     driver=driver,
                     rows=dsv.rows,
+                    lock=threading.RLock(),
+                    command_waiters=dict(src=0, dst=0),
+                    control_latencies={},
                     role_locks={r: threading.Lock() for r in ("src", "dst")},
                     facts={
                         r: [dict(instance_id=r + "-instance")] for r in ("src", "dst")

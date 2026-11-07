@@ -53,6 +53,7 @@ class SharedEnvironment(Environment):
         self.requests, self.parents, self.saved = [], [], []
         self.metadata_freed, self.receivers_cleared = [], []
         self.target_rows = set()
+        self.returned_tokens = [[], []]
         page, width = self.f.page, 128
         capacity = concurrency * (width // page) + 1
         self.buffers = []
@@ -119,6 +120,11 @@ class SharedEnvironment(Environment):
             )
             c.scheduler.token_to_kv_pool_allocator.translate_swa_indices_for_transfer = (
                 lambda full: full
+            )
+            # Allocation itself is the fixture boundary. Exercise native
+            # reservation tail trimming and record the exact returned units.
+            c.scheduler.token_to_kv_pool_allocator.free = lambda ids, n=n: (
+                self.returned_tokens[n].extend(ids.cpu().tolist())
             )
             c.scheduler.handoff_tracked_reqs.clear()
             c.scheduler.running_batch = Batch([])

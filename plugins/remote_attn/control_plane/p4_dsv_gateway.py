@@ -20,7 +20,25 @@ from urllib.parse import parse_qs
 
 PROTOCOL = "dsv-d2d-v2"
 TERMINAL = {"DONE", "CANCELLED"}
-PRECOMMIT = {"PLAN", "RESERVE", "FREEZE", "IMPORT"}
+PRECOMMIT = {"PLAN", "RESERVE", "WAIT_CUT", "FREEZE", "IMPORT"}
+
+
+class StatusBusy(Exception):
+    """Skip advisory polling while a mutation is queued; keep the last facts."""
+
+
+def latency_histogram(samples):
+    limits = (10, 25, 50, 100, 250, 500, 1000, 2500, 5000, 10000)
+    values = list(samples)
+    return dict(
+        count=len(values),
+        sum_ms=sum(values),
+        max_ms=max(values, default=0),
+        buckets={
+            **{str(n): sum(v <= n for v in values) for n in limits},
+            "+Inf": len(values),
+        },
+    )
 
 
 class DsvGateway:
@@ -53,6 +71,8 @@ class DsvGateway:
         self.facts, self.fact_errors = {}, {}
         self.connections = set()
         self.role_locks = {role: threading.Lock() for role in ("src", "dst")}
+        self.command_waiters = dict(src=0, dst=0)
+        self.control_latencies = {}
         self.background = autostart
         self.status_threads = []
         self.fd = os.open(str(self.path) + ".lock", os.O_CREAT | os.O_RDWR, 0o600)
@@ -215,6 +235,9 @@ class DsvGateway:
                                         "migration_outcome",
                                         "freeze_pending",
                                         "source_partial_remote",
+                                        "migration_skip_reason",
+                                        "prepare_latency_ms",
+                                        "handoff_latency_ms",
                                     )
                                 }
                             )
@@ -271,6 +294,9 @@ class DsvGateway:
             migration_outcome=entry.get("migration_outcome"),
             freeze_pending=entry.get("freeze_pending", False),
             source_partial_remote=entry.get("source_partial_remote", False),
+            migration_skip_reason=entry.get("migration_skip_reason"),
+            prepare_latency_ms=entry.get("prepare_latency_ms"),
+            handoff_latency_ms=entry.get("handoff_latency_ms"),
         )
 
     @staticmethod
@@ -281,20 +307,70 @@ class DsvGateway:
         return rows
 
     def _call(self, role, cmd, epoch="worker", **payload):
-        if cmd != "d2d_worker_status":
-            payload["expected_instances"] = [r["instance_id"] for r in self.facts[role]]
-        if not self.role_locks[role].acquire(timeout=1):
-            raise TimeoutError(f"{role} control busy; command not submitted")
+        status = cmd == "d2d_worker_status"
+        started = time.monotonic()
+        acquired = False
+        with self.lock:
+            if status and self.command_waiters[role]:
+                raise StatusBusy()
+            if not status:
+                self.command_waiters[role] += 1
         try:
+            if not status:
+                payload["expected_instances"] = [
+                    r["instance_id"] for r in self.facts[role]
+                ]
+            acquired = (
+                self.role_locks[role].acquire(blocking=False)
+                if status
+                else self.role_locks[role].acquire(timeout=1)
+            )
+            if not acquired:
+                if status:
+                    raise StatusBusy()
+                raise TimeoutError(f"{role} control busy; command not submitted")
             return self.rows(
                 self.driver.send(
                     role,
                     dict(cmd=cmd, migration_epoch=epoch, **payload),
-                    timeout=2 if cmd == "d2d_worker_status" else 30,
+                    timeout=2 if status else 30,
                 )
             )
         finally:
-            self.role_locks[role].release()
+            if acquired:
+                self.role_locks[role].release()
+            with self.lock:
+                if not status:
+                    self.command_waiters[role] -= 1
+                if acquired:
+                    sample = latency_histogram([(time.monotonic() - started) * 1000])
+                    key = role + "/" + cmd
+                    old = self.control_latencies.get(key)
+                    if old:
+                        sample["count"] += old["count"]
+                        sample["sum_ms"] += old["sum_ms"]
+                        sample["max_ms"] = max(sample["max_ms"], old["max_ms"])
+                        for bucket in sample["buckets"]:
+                            sample["buckets"][bucket] += old["buckets"][bucket]
+                    self.control_latencies[key] = sample
+
+    def latency_metrics(self):
+        with self.lock:
+            entries = list(self.journal["entries"].values())
+            skipped = {}
+            for entry in entries:
+                reason = entry.get("migration_skip_reason")
+                if reason:
+                    skipped[reason] = skipped.get(reason, 0) + 1
+            return dict(
+                control_latency_ms=copy.deepcopy(self.control_latencies),
+                handoff_latency_ms=latency_histogram(
+                    e["handoff_latency_ms"]
+                    for e in entries
+                    if e.get("handoff_latency_ms") is not None
+                ),
+                migration_skip_reasons=skipped,
+            )
 
     def _refresh_role(self, role):
         with self.lock:
@@ -314,6 +390,8 @@ class DsvGateway:
                 self.facts[role] = rows
                 self.fact_errors.pop(role, None)
                 self.cv.notify_all()
+        except StatusBusy:
+            return
         except Exception as exc:
             with self.cv:
                 self.fact_errors[role] = repr(exc)
@@ -354,6 +432,19 @@ class DsvGateway:
             output_ids=prefix,
             finished=all(r["finished"] for r in rows),
             kv_released=all(r["kv_released"] for r in rows),
+            plan_ready=all(
+                r.get("plan_ready", r.get("migration_ready", False)) for r in rows
+            ),
+            plan_deferred_reason=next(
+                (
+                    r.get("plan_deferred_reason")
+                    or r.get("migration_deferred_reason")
+                    or "worker_not_ready"
+                    for r in rows
+                    if not r.get("plan_ready", r.get("migration_ready", False))
+                ),
+                None,
+            ),
             migration_ready=all(r.get("migration_ready", False) for r in rows),
             migration_deferred_reason=next(
                 (
@@ -479,6 +570,17 @@ class DsvGateway:
             blocked=False,
             freeze_pending=False,
             source_partial_remote=False,
+            prepare_started_at=time.time(),
+            freeze_requested_at=None,
+            prepare_latency_ms=None,
+            handoff_latency_ms=None,
+            migration_skip_reason=None,
+        )
+
+    @staticmethod
+    def _cut_due(entry, request):
+        return (
+            entry["migration_requested"] or len(request["output_ids"]) >= entry["cut"]
         )
 
     def _advance(self, entry):
@@ -531,9 +633,12 @@ class DsvGateway:
                     rid,
                     phase="CANCELLED" if entry["cancel_requested"] else "DONE",
                     final_output_ids=request["output_ids"],
-                    migration_outcome="completed_on_source_before_migration"
-                    if phase == "SOURCE" and entry.get("migration_deferred")
-                    else entry.get("migration_outcome"),
+                    migration_outcome=entry.get("migration_outcome")
+                    or (
+                        "completed_on_source_before_migration"
+                        if phase == "SOURCE" and entry.get("migration_deferred")
+                        else None
+                    ),
                     **self._end_deferral(entry),
                 )
             elif (
@@ -541,16 +646,14 @@ class DsvGateway:
                 and not entry["cancel_requested"]
                 and not request["finished"]
             ):
-                due = entry["migration_requested"] or (
-                    not entry["cut_attempted"]
-                    and len(request["output_ids"]) >= entry["cut"]
+                prepare = entry["migration_requested"] or (
+                    not entry["cut_attempted"] and entry["cut"] < entry["max_new"]
                 )
-                if due:
-                    if not request["migration_ready"] or not request["output_ids"]:
+                if prepare:
+                    if not request["plan_ready"] or not request["output_ids"]:
                         self._defer_migration(
                             entry,
-                            request["migration_deferred_reason"]
-                            or "sampled_output_pending",
+                            request["plan_deferred_reason"] or "sampled_output_pending",
                         )
                     elif time.time() >= entry.get("retry_at", 0):
                         self._begin(entry)
@@ -564,20 +667,31 @@ class DsvGateway:
         )
         if phase == "PLAN":
             rows = self._call(
-                "src", "d2d_plan", epoch, growth_tokens=entry["growth_tokens"], **common
+                "src",
+                "d2d_plan",
+                epoch,
+                growth_tokens=max(entry["growth_tokens"], entry["max_new"]),
+                **common,
             )
             if any(r.get("deferred") for r in rows):
                 if not all(r.get("deferred") for r in rows):
                     raise RuntimeError(
                         "TP plan deferral disagreed; refusing reservation"
                     )
+                reason = next(
+                    r["migration_deferred_reason"]
+                    for r in rows
+                    if r.get("migration_deferred_reason")
+                )
                 self._defer_migration(
                     entry,
-                    next(
-                        r["migration_deferred_reason"]
-                        for r in rows
-                        if r.get("migration_deferred_reason")
-                    ),
+                    reason,
+                    migration_skip_reason=reason
+                    if reason == "request_finished"
+                    else None,
+                    migration_outcome="window_missed_request_finished"
+                    if reason == "request_finished"
+                    else None,
                     phase="SOURCE",
                     epoch=None,
                     cut_attempted=False,
@@ -595,12 +709,64 @@ class DsvGateway:
             if not all(r.get("reserved") for r in rows):
                 raise RuntimeError("target did not reserve on every rank")
             self._update(
-                rid, reservations=[r["reservation"] for r in rows], phase="FREEZE"
+                rid,
+                reservations=[r["reservation"] for r in rows],
+                phase="FREEZE"
+                if request and self._cut_due(entry, request)
+                else "WAIT_CUT",
+                prepare_latency_ms=max(
+                    0,
+                    (time.time() - entry.get("prepare_started_at", time.time())) * 1000,
+                ),
             )
+        elif phase == "WAIT_CUT":
+            if request is None:
+                raise RuntimeError("prepared source request missing")
+            if request["finished"]:
+                self._update(
+                    rid,
+                    phase="ROLLBACK",
+                    migration_skip_reason="request_finished",
+                    migration_outcome="window_missed_request_finished"
+                    if self._cut_due(entry, request)
+                    else "completed_on_source_before_cut",
+                )
+            elif self._cut_due(entry, request):
+                self._update(rid, phase="FREEZE")
         elif phase == "FREEZE":
+            if entry.get("freeze_requested_at") is None:
+                self._update(rid, freeze_requested_at=time.time())
             rows = self._call(
                 "src", "d2d_freeze", epoch, reservations=entry["reservations"], **common
             )
+            if any(r.get("deferred") for r in rows):
+                if not all(r.get("deferred") for r in rows):
+                    raise RuntimeError("TP freeze deferral disagreed")
+                reason = next(
+                    (
+                        r.get("migration_deferred_reason")
+                        for r in rows
+                        if r.get("migration_deferred_reason")
+                    ),
+                    "peer_not_ready",
+                )
+                if reason == "request_finished":
+                    self._update(
+                        rid,
+                        phase="ROLLBACK",
+                        migration_skip_reason=reason,
+                        migration_outcome="window_missed_request_finished",
+                    )
+                elif not all(r.get("retryable", True) for r in rows):
+                    self._update(
+                        rid,
+                        phase="ROLLBACK",
+                        migration_skip_reason=reason,
+                        migration_outcome="semantic_rejection",
+                    )
+                else:
+                    self._defer_migration(entry, reason)
+                return
             if any(r.get("pending_retirement") for r in rows):
                 if not all(
                     r.get("frozen") and r.get("pending_retirement") for r in rows
@@ -630,6 +796,7 @@ class DsvGateway:
                 source_partial_remote=any(
                     t.get("source_partial_remote", False) for t in transfers
                 ),
+                **self._end_deferral(entry),
             )
         elif phase == "IMPORT":
             self._call(
@@ -662,6 +829,11 @@ class DsvGateway:
                 error=None,
                 blocked=False,
                 migration_outcome="migrated",
+                handoff_latency_ms=max(
+                    0,
+                    (time.time() - (entry.get("freeze_requested_at") or time.time()))
+                    * 1000,
+                ),
             )
         elif phase == "ROLLBACK":
             states = self._states(entry, "src")
@@ -927,6 +1099,7 @@ class DsvGateway:
                     state.get("migration_deferred_count"),
                     state.get("migration_outcome"),
                     state.get("freeze_pending"),
+                    state.get("migration_skip_reason"),
                 )
                 if status_key != last_status and (
                     state["blocked"]
@@ -1011,6 +1184,7 @@ class DsvGateway:
                     drain=self.drain_status(),
                     worker_errors=dict(self.fact_errors),
                     migrations=migrations,
+                    **self.latency_metrics(),
                 ),
             )
         return self.json_response(handler, 404, dict(error="unknown DSV route"))
