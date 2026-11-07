@@ -1,0 +1,80 @@
+2026-11-07 13:17:42  [TileLang:tilelang.jit.kernel:INFO] (kernel.py:129): TileLang begins to compile kernel `kernel` with `out_idx=None`
+2026-11-07 13:17:46  [TileLang:tilelang.jit.kernel:INFO] (kernel.py:137): TileLang completes to compile kernel `kernel`
+2026-11-07 13:17:47  [TileLang:tilelang.jit.kernel:INFO] (kernel.py:129): TileLang begins to compile kernel `kernel` with `out_idx=None`
+2026-11-07 13:17:48  [TileLang:tilelang.jit.kernel:INFO] (kernel.py:137): TileLang completes to compile kernel `kernel`
+2026-11-07 13:17:49  [TileLang:tilelang.jit.kernel:INFO] (kernel.py:129): TileLang begins to compile kernel `kernel` with `out_idx=None`
+[13:17:49] : Warning: Data race detected: `Logits(bx, position)`is written by multiple threads in loop (token,), Example:
+  batch = 1
+  bx = 0
+  by = 0
+  context_len[0] = 1
+  context_len[0]$1 = 0
+  context_len[0]$2 = 1
+  context_len[0]$3 = 0
+  group = 0
+  num_groups = 1
+  position = (- 1)
+  step = 0
+  token = 1
+  token_OTHER_ = 0
+  tx = 0
+If you believe this is a false positive, pass `PassKey.TL_DISABLE_DATA_RACE_CHECK` to pass key to disable this check.
+2026-11-07 13:17:52  [TileLang:tilelang.jit.kernel:INFO] (kernel.py:137): TileLang completes to compile kernel `kernel`
+{"name": "tilelang_mqa_torch.bfloat16_absolute", "rounds": 32, "decode_cuda_graph": true, "dual_stream_exact_match": true, "reference_max_abs": [8.940696716308594e-08, 8.940696716308594e-08]}
+2026-11-07 13:17:54  [TileLang:tilelang.jit.kernel:INFO] (kernel.py:129): TileLang begins to compile kernel `kernel` with `out_idx=None`
+[13:17:55] : Warning: Data race detected: `Logits(row_base + qi, column)`is written by multiple threads in loop (n,), Example:
+  bx = 0
+  by = 0
+  column = 0
+  n = 0
+  n_OTHER_ = 1
+  qi = 0
+  qi_OTHER_ = 0
+  row_base = 0
+  rows = 1
+  ti = 0
+  tile_count = 1
+  tx = 0
+  width = 1
+If you believe this is a false positive, pass `PassKey.TL_DISABLE_DATA_RACE_CHECK` to pass key to disable this check.
+2026-11-07 13:17:59  [TileLang:tilelang.jit.kernel:INFO] (kernel.py:137): TileLang completes to compile kernel `kernel`
+{"name": "tilelang_mqa_torch.bfloat16_relative", "rounds": 32, "decode_cuda_graph": true, "dual_stream_exact_match": true, "reference_max_abs": [8.940696716308594e-08, 5.960464477539063e-08]}
+2026-11-07 13:18:00  [TileLang:tilelang.jit.kernel:INFO] (kernel.py:129): TileLang begins to compile kernel `kernel` with `out_idx=None`
+2026-11-07 13:18:03  [TileLang:tilelang.jit.kernel:INFO] (kernel.py:137): TileLang completes to compile kernel `kernel`
+2026-11-07 13:18:04  [TileLang:tilelang.jit.kernel:INFO] (kernel.py:129): TileLang begins to compile kernel `kernel` with `out_idx=None`
+[13:18:04] : Warning: Data race detected: `Logits(bx, position)`is written by multiple threads in loop (token,), Example:
+  batch = 1
+  bx = 0
+  by = 0
+  context_len[0] = 1
+  context_len[0]$1 = 0
+  context_len[0]$2 = 1
+  context_len[0]$3 = 0
+  group = 0
+  num_groups = 1
+  position = (- 1)
+  step = 0
+  token = 1
+  token_OTHER_ = 0
+  tx = 0
+If you believe this is a false positive, pass `PassKey.TL_DISABLE_DATA_RACE_CHECK` to pass key to disable this check.
+2026-11-07 13:18:07  [TileLang:tilelang.jit.kernel:INFO] (kernel.py:137): TileLang completes to compile kernel `kernel`
+{"name": "tilelang_mqa_torch.float8_e4m3fn_absolute", "rounds": 32, "decode_cuda_graph": true, "dual_stream_exact_match": true, "reference_max_abs": [7.385015487670898e-05, 3.202259540557861e-05]}
+2026-11-07 13:18:08  [TileLang:tilelang.jit.kernel:INFO] (kernel.py:129): TileLang begins to compile kernel `kernel` with `out_idx=None`
+[13:18:08] : Warning: Data race detected: `Logits(row_base + qi, column)`is written by multiple threads in loop (n,), Example:
+  bx = 0
+  by = 0
+  column = 0
+  n = 1
+  n_OTHER_ = 0
+  qi = 0
+  qi_OTHER_ = 0
+  row_base = 0
+  rows = 1
+  ti = 0
+  tile_count = 1
+  tx = 0
+  width = 1
+If you believe this is a false positive, pass `PassKey.TL_DISABLE_DATA_RACE_CHECK` to pass key to disable this check.
+2026-11-07 13:18:12  [TileLang:tilelang.jit.kernel:INFO] (kernel.py:137): TileLang completes to compile kernel `kernel`
+{"name": "tilelang_mqa_torch.float8_e4m3fn_relative", "rounds": 32, "decode_cuda_graph": true, "dual_stream_exact_match": true, "reference_max_abs": [7.215142250061035e-05, 3.810226917266846e-05]}

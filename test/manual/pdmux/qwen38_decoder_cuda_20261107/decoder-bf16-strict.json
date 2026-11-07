@@ -1,0 +1,89 @@
+{
+  "gpu": "NVIDIA GeForce RTX 4060 Laptop GPU",
+  "torch": "2.14.1+cu130",
+  "cases": [
+    {
+      "name": "production_gdn_qsa_decoder_stack",
+      "rounds": 32,
+      "decode_cuda_graph": true,
+      "split_at_layer": 1,
+      "canonical_topk": true,
+      "fp8_projection_count": 0,
+      "comparison_names": [
+        "terminal_mix",
+        "hc_output",
+        "gdn_state",
+        "conv_state",
+        "qsa_k",
+        "qsa_v",
+        "gdn_layer",
+        "selected_tokens"
+      ],
+      "max_abs": [
+        0.0,
+        0.0,
+        0.0,
+        0.0,
+        0.0,
+        0.0,
+        0.0,
+        0.0
+      ],
+      "untouched_slots_exact": true,
+      "hidden_size": 256,
+      "hc_count": 4,
+      "gdn_heads": [
+        2,
+        6
+      ],
+      "gdn_dim": 128,
+      "qsa_heads": [
+        6,
+        1
+      ],
+      "qsa_dim": 256,
+      "token_topk": 2048,
+      "context": 4096,
+      "scope": "production forwards, real HC/dense FFN/GDN conv+norm/QSA kernels; TP1 transport and fixed compressed-prefix adapters"
+    }
+  ],
+  "errors": [],
+  "source_sha256": {
+    "python/sglang/kernels/ops/attention/fla/chunk.py": "2c38a5b622b33e55e75a0119495a70b2fcd78a1d01a286cb4432e583b025e745",
+    "python/sglang/kernels/ops/attention/fla/chunk_delta_h.py": "7015fa8774f6d9a099b47604eb3d3f91b072277c1e307eacf8ee9615674ee498",
+    "python/sglang/kernels/ops/attention/fla/chunk_fwd.py": "01df2726d9416009cc3c0040c32574069838dfcda54ed77b93ddbc6014da50c2",
+    "python/sglang/kernels/ops/attention/fla/chunk_intra.py": "9afd7def4cbdafa6a4e3d6d721c9e67b70cd8061abf25e622d0a0a198b9c5495",
+    "python/sglang/kernels/ops/attention/fla/chunk_intra_token_parallel.py": "42da78ec3c423523fe9dee299706b066e211427627237e20797ad370ae9d8632",
+    "python/sglang/kernels/ops/attention/fla/chunk_o.py": "cd707c231ae63a5b14710f0ea0b0a6e55b17f2ef644083e5641aedaa09d1865e",
+    "python/sglang/kernels/ops/attention/fla/cumsum.py": "832b2b2dedac8931c9c172f574a2f23c6fd6c45ed8ef169eb62b957718011c6a",
+    "python/sglang/kernels/ops/attention/fla/fused_norm_gate.py": "d1cdfbd2385b40011b1a082dc2941e515dd0b4ebfab296f15868618269133094",
+    "python/sglang/kernels/ops/attention/fla/fused_recurrent.py": "b978898b39eb18969994d737cb4853a99eeb89e16759862e48694c133f6e4562",
+    "python/sglang/kernels/ops/attention/fla/index.py": "9381b5310363cb7883fc2ef7a8b531080a0e4424b4e7132dcd2bdad6df68b028",
+    "python/sglang/kernels/ops/attention/fla/kda.py": "10c99ca3f62a189be95d50035f8eb3f166dbc647a744cb63851ed5b3dc187a8f",
+    "python/sglang/kernels/ops/attention/fla/l2norm.py": "e51a2b73431f6ff55099476e15b1211e2a8f7069dff05bd566cfc09fc27fbfaf",
+    "python/sglang/kernels/ops/attention/fla/layernorm_gated.py": "95d10783a8374e75bcc2c6d15ffdb580acd38d87c20b17c4f8bb24083c805be4",
+    "python/sglang/kernels/ops/attention/fla/op.py": "ed1294fc5ba003d255504c28b53105e697fdbf207e2586cb8a36599d8df293cd",
+    "python/sglang/kernels/ops/attention/fla/utils.py": "5c39b5cffde309760fd8fd7d73e32325dc788628e00f4a7552d6773972b3c3e6",
+    "python/sglang/kernels/ops/attention/fla/wy_fast.py": "25f763bcfcfbf230fc7748d2d8aa1493ab0999298ef46ccebaa04b65b351e748",
+    "python/sglang/kernels/ops/gemm/hc_mix.py": "bbebd1d701dfa6f6e4be58450735b742677fe0dbdc4334ebaa8de40443c66332",
+    "python/sglang/srt/layers/hc_mix_flydsl.py": "b622d37c0f5a57bf4f424e2363817b4f24087a7fe5f13be5058190a3fdd99f3c",
+    "python/sglang/srt/layers/hyperconnection.py": "6249a13d1a4e25ee8ed13bdc1570083747f462803014bc5f4fb7895981669c00",
+    "python/sglang/kernels/ops/mamba/causal_conv1d_triton.py": "adc8f54d862c02ad3cc3012a9194697c33a4309c4206ef871678af0a430fd51b",
+    "python/sglang/kernels/ops/attention/triton_gdn_fused_proj.py": "8089e19a70e0acd3e74614b499c8b5d2eff68606de2537c4cad6c649fe532bfb",
+    "python/sglang/kernels/ops/attention/linear/fused_gdn_gating.py": "ac21c53ae52ac37802acafeadfc7732a230c745da69c98aca19438488f7c0a55",
+    "python/sglang/kernels/ops/attention/linear/fused_sigmoid_gating_recurrent.py": "dc0f7c9964efe09ea0900d28ae8a74180f2060ed593eba40635e33c6c61440bc",
+    "python/sglang/kernels/ops/attention/fused_qk_rmsnorm_rope_gate.py": "c26c77e65ce865d83f79fc731effe85be1dc263c973b0ff3aa70f6367a9f91e1",
+    "python/sglang/kernels/ops/elementwise/elementwise.py": "3a4d16972225f655abe4d365a076f036955b18d210ec1da72b85ead2c3028d3b",
+    "python/sglang/srt/layers/attention/qsa/kernel.py": "cbaab3e0d1c5f75bd58eb03d6d28da6bb0b411747d16dc2743b49afc23640dd9",
+    "python/sglang/srt/layers/attention/qsa/sparse_attn.py": "6577a659a47cb97388d0f95341f7744b5476f6e18aa8083d07dcb5ca453c8b38",
+    "python/sglang/srt/layers/attention/qsa/mqa.py": "6955e638f6a514fdd41c4d4846100c2f3e15b8a4e8f82160297d09ec3b8264d8",
+    "python/sglang/srt/models/qwen3_5.py": "a7cce068d488f82e2eafce7f6f7ad1d548f47f59955210236383fe07ce55aab1",
+    "python/sglang/kernels/jit/csrc/elementwise/fast_topk.cuh": "0559b987ed8a9f701e9b41595444b9c614f6bcf3fbbdc4d05b79d6cd51491529",
+    "python/sglang/kernels/ops/attention/fast_topk.py": "a17180477295060066aec757c5a300b12bd2756a9f1748f47a21476044e12fd9",
+    "python/sglang/srt/layers/attention/qsa/qsa_indexer.py": "9d4f9f0de76a240dac49904acd4b24e4af00e148411958cf1366d164f93223b1",
+    "python/sglang/srt/models/qwen4_exp.py": "e373c018e3ba13be7330dc6b74cf204fb02d400892a3113326ca26b012cfc4d0",
+    "python/sglang/srt/models/qwen2.py": "5f464221a18262864e1a0e405ec7ff75d06e2d8eeca99948fec8f422b60ed448",
+    "python/sglang/srt/layers/activation.py": "bf4c74c83d15e25c71c3ea5351fcc874ec1b43eba290c78a4e591f86f5b5f03a"
+  },
+  "passed": true
+}

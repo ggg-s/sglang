@@ -1,0 +1,10 @@
+Traceback (most recent call last):
+  File "/mnt/c/Users/27839/AppData/Local/Temp/qwen38-decoder-source/test/manual/pdmux/validate_qwen38_decoder_cuda.py", line 141, in main
+    result = run_decoder(args.rounds, canonical_topk=args.canonical_topk)
+             ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "/workspace/conditional-graph-20261019/venv/lib/python3.12/site-packages/torch/utils/_contextlib.py", line 124, in decorate_context
+    return func(*args, **kwargs)
+           ^^^^^^^^^^^^^^^^^^^^^
+  File "/mnt/c/Users/27839/AppData/Local/Temp/qwen38-decoder-source/test/manual/pdmux/qwen38_small_decoder.py", line 799, in run_decoder
+    raise AssertionError(f"decoder parity diagnostics: {failures}")
+AssertionError: decoder parity diagnostics: {'lane0.terminal_mix': {'max_abs': 0.0078125, 'unequal': 3134, 'total': 16640}, 'lane0.hc_output': {'max_abs': 0.005859375, 'unequal': 11536, 'total': 66560}, 'lane1.terminal_mix': {'max_abs': 0.0078125, 'unequal': 13, 'total': 256}, 'lane1.hc_output': {'max_abs': 0.005859375, 'unequal': 131, 'total': 1024}}

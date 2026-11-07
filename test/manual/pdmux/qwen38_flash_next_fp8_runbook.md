@@ -89,3 +89,20 @@ bug was fixed: the input guard copied non-contiguous mutable state/track pools,
 so kernel writes failed to reach the caller's pool. The new registered regression
 fails against the original source and passes with named state-buffer preservation.
 Full decoder/model and serving-performance acceptance remain pending.
+
+## Small real decoder and TileLang MQA regression (2026-11-07)
+
+[Decoder/MQA evidence and reproduction](qwen38_decoder_cuda_20261107/README.md)
+extend this to production decoder forwards with real GDN convolution, HC,
+dense FFN, QSA scoring/selection/attention and nine FP8 projections. Four
+TileLang MQA configurations and BF16/FP8 small decoder variants passed 32
+dual-stream rounds each, including decode CUDA Graphs and layer-split prefill.
+With a canonical order for the same selected token set, decoder outputs and
+states match serial execution exactly. Native top-k's unspecified order yields
+BF16 output variation in both dual-stream and ordinary single-stream controls;
+the selected sets, state pools and KV contents remain exact. The report retains
+that strict native-order failure and explains the controlled comparison.
+
+The small configuration uses single-rank metadata adapters and a fixed
+compressed prefix. Full checkpoint/MoE/PLE/indexer-update/MTP/TP acceptance,
+answer accuracy and serving performance remain outside these results.

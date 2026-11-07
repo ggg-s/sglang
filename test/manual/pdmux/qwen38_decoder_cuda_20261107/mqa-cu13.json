@@ -1,0 +1,53 @@
+{
+  "gpu": "NVIDIA GeForce RTX 4060 Laptop GPU",
+  "torch": "2.14.1+cu130",
+  "cases": [
+    {
+      "name": "tilelang_mqa_torch.bfloat16_absolute",
+      "rounds": 32,
+      "decode_cuda_graph": true,
+      "dual_stream_exact_match": true,
+      "reference_max_abs": [
+        8.940696716308594e-08,
+        8.940696716308594e-08
+      ]
+    },
+    {
+      "name": "tilelang_mqa_torch.bfloat16_relative",
+      "rounds": 32,
+      "decode_cuda_graph": true,
+      "dual_stream_exact_match": true,
+      "reference_max_abs": [
+        8.940696716308594e-08,
+        5.960464477539063e-08
+      ]
+    },
+    {
+      "name": "tilelang_mqa_torch.float8_e4m3fn_absolute",
+      "rounds": 32,
+      "decode_cuda_graph": true,
+      "dual_stream_exact_match": true,
+      "reference_max_abs": [
+        7.385015487670898e-05,
+        3.202259540557861e-05
+      ]
+    },
+    {
+      "name": "tilelang_mqa_torch.float8_e4m3fn_relative",
+      "rounds": 32,
+      "decode_cuda_graph": true,
+      "dual_stream_exact_match": true,
+      "reference_max_abs": [
+        7.215142250061035e-05,
+        3.810226917266846e-05
+      ]
+    }
+  ],
+  "errors": [],
+  "tilelang": "0.1.12",
+  "source_sha256": {
+    "python/sglang/srt/layers/attention/qsa/mqa.py": "6955e638f6a514fdd41c4d4846100c2f3e15b8a4e8f82160297d09ec3b8264d8",
+    "python/sglang/kernels/kernel_api_logging.py": "6e8768921150a1ae43d86b2b1f18ae50c11633421b972566f0d6704345a0152b"
+  },
+  "passed": true
+}

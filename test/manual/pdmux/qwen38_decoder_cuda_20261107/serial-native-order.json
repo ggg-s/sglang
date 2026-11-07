@@ -1,0 +1,11 @@
+{
+  "rounds": 32,
+  "streams": "default stream only; no split and no graph",
+  "native_topk_order": true,
+  "max_abs_terminal_and_hc": [
+    0.015625,
+    0.0078125
+  ],
+  "state_and_kv_exact": true,
+  "selected_token_sets_exact": true
+}
