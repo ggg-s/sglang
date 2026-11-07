@@ -23,8 +23,15 @@ def capture_layer_boundaries(layer_model, num_layers):
     )
 
     layers = getattr(layer_model, "layers", ())
+    layers = tuple(layers.values() if hasattr(layers, "values") else layers)
     handles = []
-    if len(layers) == num_layers:
+    if (
+        len(layers) == num_layers
+        and len({id(layer) for layer in layers}) == num_layers
+        and all(
+            callable(getattr(layer, "register_forward_hook", None)) for layer in layers
+        )
+    ):
         for index, layer in enumerate(layers):
 
             def after_layer(module, args, output, end=index + 1):
@@ -55,6 +62,8 @@ class PdmuxBCGExecutor:
         self.session = None
 
     def can_run(self, batch, forward_count):
+        if forward_count < 1:
+            raise ValueError("Split BCG requires a positive layer count")
         if self.owner is batch:
             return True
         if self.owner is not None:

@@ -39,7 +39,7 @@ def load_bcg():
         "at::Tensor weak_ref_tensor(const at::Tensor&);\n"
         "TORCH_LIBRARY(pdmux_bcg_validation, m) {\n"
         'm.def("weak_ref_tensor(Tensor x) -> Tensor");\n'
-        '}\nTORCH_LIBRARY_IMPL(pdmux_bcg_validation, CUDA, m) {\n'
+        "}\nTORCH_LIBRARY_IMPL(pdmux_bcg_validation, CUDA, m) {\n"
         'm.impl("weak_ref_tensor", &weak_ref_tensor); }\n'
     )
     load(
@@ -94,8 +94,14 @@ def build(fp8, bcg, ctx):
     moe = real.load_moe()
     ple = real.load_ple(fp8, bcg, ctx)
     env = stack.forward.__func__.__globals__
-    env.update(ple.src.__dict__ | {"__name__": env["__name__"]})
-    # Restore stack-specific globals after importing the PLE definitions.
+    env.update(
+        {
+            name: value
+            for name, value in ple.src.__dict__.items()
+            if name.startswith("_breakable_")
+            or name in ("_BreakablePLEBatch", "_prepare_ple_batch", "_commit_ple_batch")
+        }
+    )
     env.update(
         Qwen2MoeSparseMoeBlock=moe.block.Qwen2MoeSparseMoeBlock,
         is_in_breakable_cuda_graph=ctx.is_in_breakable_cuda_graph,

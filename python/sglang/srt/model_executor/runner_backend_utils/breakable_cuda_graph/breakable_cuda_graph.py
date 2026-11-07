@@ -359,6 +359,8 @@ class BreakableCUDAGraph:
         if not self._layer_ends or not 0 <= start < end:
             raise ValueError(f"Invalid BCG layer interval {(start, end)}")
         last = max(self._layer_ends)
+        if tuple(self._layer_ends) != tuple(range(1, last + 1)):
+            raise ValueError("BCG did not capture every decoder layer in order")
         if end not in self._layer_ends or (start and start not in self._layer_ends):
             raise ValueError(f"Uncaptured BCG layer interval {(start, end)}")
         return (
