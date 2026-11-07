@@ -16198,6 +16198,7 @@ class TestRemoteAttn(CustomTestCase):
                             reserved_before_freeze=True,
                             tp_finished_window_ranks=[0, 1],
                             tp_pre_sample_reservation=True,
+                            tp_precopy_asymmetric_pages_and_exact_bytes=True,
                             tp_preflight_rejected_before_freeze=True,
                             asymmetric_gpu_blocks_both=True,
                             decode_before_copy=True,
@@ -17264,6 +17265,256 @@ class TestRemoteAttn(CustomTestCase):
             ),
         )["transfer"]
 
+    def _precopy_support(self):
+        # Sampler/allocator ABI fixtures; native pool layouts and actual byte TE.
+        folder = str(ROOT / "test/manual/remote_attn")
+        self.enterContext(patch.object(sys, "path", [folder] + sys.path))
+        return importlib.import_module("d2d_precopy_probe_support")
+
+    def test_dsv_d2d_precopy_live_prefix_sealed_tail_and_mutable_state(self):
+        """Closed pages survive source continuation; freeze copies only the suffix."""
+        from sglang_remote_attn import d2d_precopy as pc
+        from sglang_remote_attn import dsv_d2d as d2d
+
+        e = self._d2d_env()
+        p = self._precopy_support()
+        common, plan = p.reserve(e)
+        available, receipts = p.copy_available(e, "precopy", retry=False)
+        self.assertEqual(available, [4] * len(plan["schema"]["entries"]))
+        self.assertFalse(e.req._handoff_frozen)
+        self.assertIn(e.req, e.source.scheduler.running_batch.reqs)
+        # A following forward changes the open tail and mutable carry.
+        e.req.output_ids.extend([34, 35])
+        e.req.kv.kv_committed_len = e.req.kv.kv_allocated_len = 35
+        for _, table, indices in d2d.state_rows(e.source, e.req, 35):
+            table.index_fill_(0, indices.long(), 77)
+        with patch.dict(os.environ, {"HANDOFF_D2D_TOKEN_RANGE": "16"}):
+            meta = p.command(
+                e.source,
+                "precopy",
+                "freeze",
+                reservation=plan,
+                precopy_receipts=[receipts],
+                **common,
+            )["transfer"]
+        self.assertEqual(meta["precopy"]["prefix_pages"], available)
+        target = None
+        reads = []
+        actual = d2d.Reader.call
+
+        def read(reader, action, **kw):
+            if action == "read" and kw.get("kind") == "global":
+                reads.append((kw["entry"], kw["start"], kw["count"]))
+            if action == "read_group":
+                reads.extend(
+                    (x["entry"], x["start"], x["count"]) for x in kw["segments"]
+                )
+            return actual(reader, action, **kw)
+
+        with patch.object(d2d.Reader, "call", read):
+            target = p.finish(e, "precopy", meta)
+        self.assertTrue(reads)
+        self.assertTrue(all(lo >= 4 for _, lo, _ in reads), reads)
+        self.assertTrue(target.closed)
+        self.assertFalse(
+            any(not s.closed for s in pc.bulk.owners(d2d.manager(e.source).engine))
+        )
+
+    def test_dsv_d2d_precopy_rejects_changed_mapping_before_freeze(self):
+        """Retraction/page-map reuse invalidates a previously copied prefix."""
+        e = self._d2d_env()
+        p = self._precopy_support()
+        common, plan = p.reserve(e, epoch="map")
+        receipt = p.copy_frame(e, "map", 0, 0, 4)
+        row = e.source.scheduler.req_to_token_pool.req_to_token[e.req.kv.req_pool_idx]
+        row[0] += e.f.page
+        with self.assertRaisesRegex(ValueError, "ownership changed"):
+            p.command(
+                e.source,
+                "map",
+                "freeze",
+                reservation=plan,
+                precopy_receipts=[[receipt]],
+                **common,
+            )
+        self.assertFalse(e.req._handoff_frozen)
+
+    def test_dsv_d2d_precopy_cancel_late_dma_isolated_from_reused_native_kv(self):
+        """Unknown late TE owns private staging; canceled native rows cannot be touched."""
+        from sglang_remote_attn import d2d_precopy as pc
+
+        e = self._d2d_env()
+        p = self._precopy_support()
+        _, plan = p.reserve(e)
+        f = dict(entry=0, start=0, count=1, chunk=uuid.uuid4().hex)
+        receive = p.command(e.target, "precopy", "precopy_prepare", frame=f)["receive"]
+        state = e.target.d2d_reservations["precopy"].precopy
+        private = state.receiver.tensor
+        p.command(e.target, "precopy", "reserve_cancel")
+        self.assertTrue(state.receiver.unsafe)
+        self.assertTrue(e.target.d2d_reservations["precopy"].cancelled)
+        self.assertTrue(e.target.d2d_precopy_unsafe)
+        native = pc.tables(e.target)[0]
+        native.fill_(199)  # allocator has reused the canceled row
+        # Deterministic delayed native write to the OLD published descriptor.
+        proof = p.command(
+            e.source, "precopy", "precopy_copy", frame=f, receive=receive
+        )["proof"]
+        self.assertTrue(torch.all(native == 199))
+        self.assertTrue(private[: proof["bytes"]].any())
+        with self.assertRaisesRegex(ValueError, "live unadmitted"):
+            p.command(e.target, "precopy", "precopy_apply", frame=f, proof=proof)
+        closes = p.command(e.source, "precopy", "precopy_close")
+        self.assertTrue(closes["safe"])
+        with self.assertRaisesRegex(ValueError, "closed/failed"):
+            p.command(e.source, "precopy", "precopy_copy", frame=f, receive=receive)
+        self.assertFalse(e.req._handoff_frozen)
+
+    def test_dsv_d2d_precopy_cancel_sent_slot_waits_for_receive_visibility(self):
+        """Producer stop is not peer arrival: cancellation must fence the last write."""
+        e = self._d2d_env()
+        p = self._precopy_support()
+        p.reserve(e)
+        frame = dict(entry=0, start=0, count=1, chunk=uuid.uuid4().hex)
+        receive = p.command(e.target, "precopy", "precopy_prepare", frame=frame)[
+            "receive"
+        ]
+        p.command(e.source, "precopy", "precopy_copy", frame=frame, receive=receive)
+        stopped = p.command(
+            e.source, "precopy", "precopy_close", pending_chunk=frame["chunk"]
+        )
+        ticket = e.target.d2d_reservations["precopy"]
+        receiver = ticket.precopy.receiver
+        actual = receiver.consume
+        entered, visible = threading.Event(), threading.Event()
+        errors = []
+
+        def consume(*args):
+            entered.set()
+            if not visible.wait(5):
+                raise TimeoutError("delayed peer arrival")
+            return actual(*args)
+
+        def cancel():
+            try:
+                p.command(
+                    e.target, "precopy", "reserve_cancel", precopy_close=[stopped]
+                )
+            except BaseException as exc:
+                errors.append(exc)
+
+        with patch.object(receiver, "consume", consume):
+            worker = threading.Thread(target=cancel)
+            worker.start()
+            try:
+                self.assertTrue(entered.wait(2))
+                self.assertTrue(ticket.req.kv.holds_kv)
+                self.assertFalse(receiver.closed)
+            finally:
+                visible.set()
+                worker.join(5)
+        self.assertFalse(worker.is_alive())
+        self.assertFalse(errors)
+        self.assertTrue(ticket.cancelled and receiver.closed)
+        self.assertFalse(ticket.req.kv.holds_kv)
+
+    def test_dsv_d2d_precopy_seal_requires_destination_receipts(self):
+        """Successful send is not permission to skip pages not applied on D1."""
+        e = self._d2d_env()
+        p = self._precopy_support()
+        common, plan = p.reserve(e)
+        receipts = [p.copy_frame(e, "precopy", 0, 0, 4)]
+        meta = p.command(
+            e.source,
+            "precopy",
+            "freeze",
+            reservation=plan,
+            precopy_receipts=[receipts],
+            **common,
+        )["transfer"]
+        bad = copy.deepcopy(meta)
+        bad["precopy"]["receipts"] = []
+        with self.assertRaisesRegex(ValueError, "destination applied receipts"):
+            e.epoch = "precopy"
+            e.import_(bad)
+        self.assertFalse(e.target.d2d_reservations["precopy"].consumed)
+        self.assertTrue(e.req._handoff_frozen)
+
+    def test_dsv_d2d_precopy_failed_gpu_read_or_scatter_keeps_native_owner(self):
+        """A private DMA error may free native KV; an unproven GPU access may not."""
+        from sglang_remote_attn import d2d_precopy as pc
+        from sglang_remote_attn import dsv_d2d as d2d
+        from sglang_remote_attn.pre_layerwise import defer_release
+
+        for stage in ("read", "scatter"):
+            with self.subTest(stage=stage):
+                e = self._d2d_env()
+                p = self._precopy_support()
+                p.reserve(e)
+                f = dict(entry=0, start=0, count=1, chunk=uuid.uuid4().hex)
+                receive = p.command(e.target, "precopy", "precopy_prepare", frame=f)[
+                    "receive"
+                ]
+
+                def fail():
+                    raise RuntimeError("GPU completion unproven")
+
+                proof = None
+                if stage == "scatter":
+                    proof = p.command(
+                        e.source, "precopy", "precopy_copy", frame=f, receive=receive
+                    )["proof"]
+                boundary = SimpleNamespace(
+                    prepare_abort=lambda req, *a, **kw: setattr(
+                        req, "finished", lambda: True
+                    )
+                )
+                with (
+                    patch.object(
+                        d2d.dp, "event", return_value=SimpleNamespace(synchronize=fail)
+                    ),
+                    patch.dict(
+                        sys.modules, {"sglang.srt.disaggregation.utils": boundary}
+                    ),
+                ):
+                    with self.assertRaisesRegex(
+                        d2d.TransportFailure, "GPU completion unproven"
+                    ):
+                        if stage == "read":
+                            p.command(
+                                e.source,
+                                "precopy",
+                                "precopy_copy",
+                                frame=f,
+                                receive=receive,
+                            )
+                        else:
+                            p.command(
+                                e.target,
+                                "precopy",
+                                "precopy_apply",
+                                frame=f,
+                                proof=proof,
+                            )
+                if stage == "read":
+                    freed = []
+                    self.assertTrue(
+                        defer_release(
+                            e.req, lambda: freed.append(True), checkpoint=False
+                        )
+                    )
+                    self.assertFalse(freed)
+                    self.assertTrue(e.req.kv.holds_kv)
+                    self.assertIsNotNone(pc.sources(e.source)["precopy"].gpu_hold)
+                else:
+                    with self.assertRaisesRegex(d2d.TransportFailure, "unproven"):
+                        p.command(e.target, "precopy", "reserve_cancel")
+                    self.assertTrue(
+                        e.target.d2d_reservations["precopy"].req.kv.holds_kv
+                    )
+                self.assertFalse(e.freed)
+                e.close()
+
     def test_dsv_d2d_reserve_before_freeze_consumes_native_row_once(self):
         from sglang_remote_attn import dsv_d2d as d2d
 
@@ -18079,11 +18330,19 @@ class TestRemoteAttn(CustomTestCase):
         self.assertEqual(f.driver.count("d2d_abort"), 0)
 
     def test_p4_dsv_lost_submit_and_import_replies_do_not_allocate_twice(self):
-        for command in ("d2d_submit_pd", "d2d_import", "d2d_freeze", "d2d_reserve"):
+        for command in (
+            "d2d_submit_pd",
+            "d2d_import",
+            "d2d_freeze",
+            "d2d_reserve",
+            "d2d_precopy_prepare",
+            "d2d_precopy_copy",
+            "d2d_precopy_apply",
+        ):
             with self.subTest(command=command):
                 f = self._p4_dsv_env()
                 f.driver.after[command] = [TimeoutError("reply lost")]
-                for _ in range(8):
+                for _ in range(40):
                     f.gw.tick()
                     if f.gw.entry(f.rid)["blocked"]:
                         break

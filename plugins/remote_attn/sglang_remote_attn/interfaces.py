@@ -438,6 +438,10 @@ CORE_ANNOTATIONS = {
 # Instance fields cannot be inspected by constructing the real GPU owners.
 # Inspect their initialization declarations in the actual loaded Python sources.
 CORE_STATE = {
+    "sglang.srt.managers.scheduler.Scheduler.init_model_worker": (
+        "self",
+        ("forward_stream",),
+    ),
     "sglang.srt.managers.async_d2h_copy_worker.HostCopyDone.__init__": (
         "self",
         ("error",),
@@ -616,9 +620,12 @@ def check_state(target, node, owner, fields):
         targets = item.targets if isinstance(item, ast.Assign) else []
         if isinstance(item, ast.AnnAssign):
             targets = [item.target]
-        for attribute in targets:
+        for attribute in (
+            node for target_node in targets for node in ast.walk(target_node)
+        ):
             if (
                 isinstance(attribute, ast.Attribute)
+                and isinstance(attribute.ctx, ast.Store)
                 and isinstance(attribute.value, ast.Name)
                 and attribute.value.id == owner
             ):

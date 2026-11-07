@@ -1471,6 +1471,10 @@ def defer_release(req, release, *, checkpoint=None):
     from .source_cache import lease_for
     from .transport_failure import TransportFailure, hold_release, retain_release
 
+    from .d2d_precopy import release_source
+
+    if release_source(req, release):
+        return True
     cache_lease = lease_for(req)
     if cache_lease is not None and checkpoint is False:
         cache_lease.abort = True
@@ -1573,6 +1577,7 @@ def is_fully_idle(original, scheduler, for_health_check=False, ignore_waiting=Fa
         and controller is not None
         and (
             controller.sources
+            or bool(getattr(controller, "d2d_precopy_unsafe", False))
             or any(
                 ticket is not None and not ticket.cancelled and not ticket.consumed
                 for ticket in getattr(controller, "d2d_reservations", {}).values()

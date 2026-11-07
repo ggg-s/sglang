@@ -40,6 +40,10 @@ COMMANDS = {
     "d2d_resume",
     "d2d_status",
     "d2d_abort",
+    *{
+        "d2d_precopy_" + name
+        for name in ("status", "prepare", "copy", "apply", "close")
+    },
 }
 
 
@@ -338,6 +342,9 @@ class Source:
     aborted: bool = False
     copied: bool = False
     retirement_failed: bool = False
+    frozen_at: float = field(default_factory=time.time)
+    released_at: float | None = None
+    postfreeze_bytes: int = 0
     service: object = None
     states: list = field(default_factory=list)
     globals: list = field(default_factory=list)
@@ -416,6 +423,7 @@ class Source:
             tp_size=self.owner.tp_size,
             states=[d for d, t, i in self.states],
             route=self.service,
+            precopy=getattr(self, "precopy_seal", None),
             source_partial_remote=self.partial_remote,
             source_remote_entries=list(self.remote_entries_at_freeze),
         )
@@ -470,6 +478,7 @@ class Source:
         self.release()
         self.release = None
         self.released = True
+        self.released_at = time.time()
         self.req._pre_layerwise_source = None
         self.req._dsv_d2d_source = None
         self.globals.clear()
@@ -618,6 +627,7 @@ def execute(job, stream, cache):
             )
         ready = dp.event(device)
         size = source.bulk_sender.write(data, ready, region, sequence)
+        source.postfreeze_bytes += size
     # Empty tensor envelope preserves the authenticated RemoteHub request lease;
     # Receiver checks the host arrival footer before consuming any KV bytes.
     return reply(
@@ -708,14 +718,14 @@ class Reader:
                 self.bulk.close()
 
 
-def copy_rows(reader, kind, entry, dst, indices, rows):
+def copy_rows(reader, kind, entry, dst, indices, rows, start=0):
     if indices.numel() != rows:
         raise ValueError("D2D native source/destination state counts differ")
     stride = dst.shape[1]
     chunk = LIMIT // stride
     if not chunk:
         raise ValueError("native D2D row exceeds transfer budget")
-    for lo in range(0, rows, chunk):
+    for lo in range(start, rows, chunk):
         n = min(chunk, rows - lo)
         _h, data = reader.call("read", kind=kind, entry=entry, start=lo, count=n)
         if data.numel() != n * stride:
@@ -893,8 +903,15 @@ class Target(NativeTarget):
                 ).long()
                 tensors = buffers(pool, manager(self.owner))
                 entries = self.owner._schema(manager(self.owner))["entries"]
+                prefixes = (getattr(self, "precopy", None) or {}).get(
+                    "prefix_pages", [0] * len(entries)
+                )
                 if self.token_range:
                     coverage = ranges.Coverage(len(entries), pages.numel())
+                    coverage.ends[:] = prefixes
+                    for i, end in enumerate(prefixes):
+                        if end == pages.numel() and entries[i][0] == "kv":
+                            self.events[i] = dp.event(copy_device)
                     for rectangle in grouping.range_frames(
                         entries,
                         self.coverage.prefix_len,
@@ -903,7 +920,15 @@ class Target(NativeTarget):
                         self.token_range,
                         LIMIT,
                     ):
-                        frame = rectangle["segments"]
+                        frame = []
+                        for segment in rectangle["segments"]:
+                            lo = max(segment["start"], prefixes[segment["entry"]])
+                            hi = segment["start"] + segment["count"]
+                            if lo < hi:
+                                frame.append(dict(segment, start=lo, count=hi - lo))
+                        if not frame:
+                            continue
+                        rectangle = dict(rectangle, segments=frame)
                         if self.stop.is_set():
                             raise RuntimeError("D2D prepared import cancelled")
                         _h, data = self.bulk_reader.call("read_group", **rectangle)
@@ -952,7 +977,7 @@ class Target(NativeTarget):
                         chunk = LIMIT // dst.shape[1]
                         if not chunk:
                             raise ValueError("D2D global row exceeds budget")
-                        for lo in range(0, pages.numel(), chunk):
+                        for lo in range(prefixes[i], pages.numel(), chunk):
                             if self.stop.is_set():
                                 raise RuntimeError("D2D prepared import cancelled")
                             n = min(chunk, pages.numel() - lo)
@@ -1023,6 +1048,10 @@ def handle(controller, data):
         )
         if not controller.agree([int(matches)])[0]:
             raise ValueError("D2D worker instance changed; refusing stale command")
+    from . import d2d_precopy as precopy
+
+    if cmd in precopy.COMMANDS:
+        return precopy.handle(controller, data)
     if cmd in gateway.COMMANDS:
         return gateway.handle(controller, data)
     if cmd in {"d2d_plan", "d2d_reserve", "d2d_reserve_cancel"}:
@@ -1141,6 +1170,14 @@ def handle(controller, data):
                 row=req.kv.req_pool_idx,
                 frozen_output=tuple(req.output_ids),
             )
+            receipts = data.get(
+                "precopy_receipts", [[] for _ in range(controller.tp_size)]
+            )
+            if not isinstance(receipts, list) or len(receipts) != controller.tp_size:
+                raise ValueError("precopy receipt TP count mismatch")
+            source.precopy_seal = precopy.seal(
+                controller, source, receipts[controller.rank]
+            )
             rpc = source.previous_rpc
             if rpc is not None and getattr(rpc, "progressive", False):
                 schema = controller._schema(manager(controller))
@@ -1154,6 +1191,7 @@ def handle(controller, data):
             error = repr(exc)
         if not controller.agree([int(error is None)])[0]:
             raise ValueError(f"TP D2D reservation rejected: {error or 'peer rejected'}")
+        source.frozen_at = time.time()
         req._handoff_frozen = True
         req._handoff_req = True
         req._handoff_epoch = epoch
@@ -1189,7 +1227,12 @@ def handle(controller, data):
         ticket = getattr(controller, "d2d_reservations", {}).get(epoch)
         if result.get("aborted") and (ticket is None or not ticket.consumed):
             reservation.handle(
-                controller, dict(cmd="d2d_reserve_cancel", migration_epoch=epoch)
+                controller,
+                dict(
+                    cmd="d2d_reserve_cancel",
+                    migration_epoch=epoch,
+                    precopy_close=data.get("precopy_close"),
+                ),
             )
         return result
     if cmd == "d2d_commit":
@@ -1269,6 +1312,7 @@ def handle(controller, data):
             controller.d2d_source_cancelled_epochs = set()
         controller.d2d_source_cancelled_epochs.add(epoch)
         if absent:
+            precopy.close_source(controller, epoch)
             getattr(controller, "d2d_plans", {}).pop(epoch, None)
             return dict(resumed=True, never_frozen=True)
         return resume_source(controller, source)
@@ -1390,6 +1434,7 @@ def import_request(controller, data):
     # D2D owns its frozen manifest and pending token already. It shares the
     # native queue interface for lifetime tracking but never enters the normal
     # PD metadata/token-commit queue and must not sample that token a second time.
+    target.precopy = transfer.get("precopy")
     targets[epoch] = target
     _tracked(controller.scheduler)[rid] = req
     req._pre_layerwise_target = target
@@ -1443,7 +1488,15 @@ def import_request(controller, data):
         ):
             if entry[0] == "index":
                 copy_rows(
-                    reader, "global", i, matrix(tensor, entry[-1]), pages, pages.numel()
+                    reader,
+                    "global",
+                    i,
+                    matrix(tensor, entry[-1]),
+                    pages,
+                    pages.numel(),
+                    start=(transfer.get("precopy") or {}).get(
+                        "prefix_pages", [0] * len(transfer["schema"]["entries"])
+                    )[i],
                 )
         target.decode_req.ready = dp.event(pages.device)
         target.decode_req.ready.synchronize()

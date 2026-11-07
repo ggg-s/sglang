@@ -19,6 +19,7 @@ class Ticket:
     release_started: bool = False
     error: str | None = None
     ready: object = None
+    precopy: object = None
 
 
 def source_attempt(req):
@@ -160,6 +161,11 @@ def handle(controller, data):
             raise d2d.TransportFailure(
                 "D2D reservation allocation/release unproven; retaining memory"
             )
+        from . import d2d_precopy
+
+        proofs = data.get("precopy_close")
+        proof = None if proofs is None else proofs[controller.rank]
+        d2d_precopy.close_destination(controller, t, proof)
         t.release_started = True
         try:
             t.ready.synchronize()
@@ -300,6 +306,9 @@ def consume(controller, data, transfer, req):
         or not plan["lower"] <= transfer["kv_len"] <= plan["upper"]
     ):
         raise ValueError("D2D frozen manifest does not fit reservation")
+    from . import d2d_precopy
+
+    d2d_precopy.consume(controller, t, transfer)
     t.ready.synchronize()
     # Transfer ownership before any allocator mutation. Failure leaves the
     # tracked Target owning the row; reserve_cancel can no longer free it.

@@ -1,5 +1,8 @@
 # DSV4.1 / Flash-0731 Remote D2D
 
+
+稳定 KV 预复制：见 [行为、取消回收及同起点自然排空验证](validation/D2D-STABLE-KV-PRECOPY.md)。
+冻结前仅写入未准入预留空间，冻结后补尾部/可变状态；源释放仍等待最终退休证明。
 本分支新增显式 D0→D1 后端迁移协议：D0 先提供增长范围，D1 真实预留原生
 FULL/SWA KV 和请求状态行，随后 D0 才在完整 Decode 边界停算。D1 先接收
 SWA、压缩器/indexer 状态和 indexer 历史，再接管 pending token。历史 global KV

@@ -1,0 +1,44 @@
+{
+  "scope": "c=4/8 live stable-page copies using real CUDA scatters and Mooncake TCP.\n\nNative allocator/sampler ABI fixtures, not full model serving or H20/RDMA.\n",
+  "results": [
+    {
+      "concurrency": 4,
+      "migrated": 4,
+      "before_first_sample": true,
+      "source_continued_after_precopy": true,
+      "partial_remote_at_freeze": true,
+      "source_frees": 4,
+      "precopy_bytes": 145152,
+      "postfreeze_bytes": 279040,
+      "full_snapshot_bytes": 424192,
+      "freeze_dispatch_to_native_source_release_ms": 308.4732450079173,
+      "native_byte_equality": true,
+      "private_slots_released": true
+    },
+    {
+      "concurrency": 8,
+      "migrated": 8,
+      "before_first_sample": true,
+      "source_continued_after_precopy": true,
+      "partial_remote_at_freeze": true,
+      "source_frees": 8,
+      "precopy_bytes": 290304,
+      "postfreeze_bytes": 558080,
+      "full_snapshot_bytes": 848384,
+      "freeze_dispatch_to_native_source_release_ms": 638.9636229723692,
+      "native_byte_equality": true,
+      "private_slots_released": true
+    }
+  ],
+  "cancellation": {
+    "late_native_write_arrived": true,
+    "recycled_cuda_kv_unchanged": true,
+    "native_reservation_freed": true,
+    "private_slot_quarantined": true
+  },
+  "sha256": {
+    "plugins/remote_attn/sglang_remote_attn/d2d_precopy.py": "7cc3b671f023107567a07ab4df390eb9d2aadb747b22a756e8f7a496815b5a7e",
+    "plugins/remote_attn/sglang_remote_attn/dsv_d2d.py": "1bcb1284898a5653e448bbfb8fba43fe06dff513cc881c0d0c50dd6615b9d407",
+    "plugins/remote_attn/sglang_remote_attn/dsv_d2d_reservation.py": "dee0f02b0ea2257fddaab1bd2d98bb1273794ae1d17cba180ed1229ffa21f8cd"
+  }
+}

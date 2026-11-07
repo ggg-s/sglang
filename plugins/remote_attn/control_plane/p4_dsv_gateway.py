@@ -301,6 +301,8 @@ class DsvGateway:
             freeze_ack_latency_ms=entry.get("freeze_ack_latency_ms"),
             prepare_latency_ms=entry.get("prepare_latency_ms"),
             handoff_latency_ms=entry.get("handoff_latency_ms"),
+            precopy_bytes=entry.get("precopy_bytes", 0),
+            precopy_pages=entry.get("precopy_pages"),
         )
 
     @staticmethod
@@ -578,6 +580,12 @@ class DsvGateway:
             freeze_requested_at=None,
             freeze_ack_latency_ms=None,
             plan_before_first_token=False,
+            precopy_pending=None,
+            precopy_receipts=None,
+            precopy_bytes=0,
+            precopy_pages=None,
+            precopy_goal=None,
+            precopy_done=False,
             prepare_latency_ms=None,
             handoff_latency_ms=None,
             migration_skip_reason=None,
@@ -588,6 +596,92 @@ class DsvGateway:
         return bool(request["output_ids"]) and (
             entry["migration_requested"] or len(request["output_ids"]) >= entry["cut"]
         )
+
+    def _precopy(self, entry, stop_after_snapshot=False):
+        """Advance one bounded, durable frame; Decode runs between commands."""
+        rid, epoch = entry["rid"], entry["epoch"]
+        pending = entry.get("precopy_pending")
+        if pending is None:
+            if not all(
+                r.get("precopy_protocol") == "closed-page-precopy-v1"
+                for role in ("src", "dst")
+                for r in self.facts.get(role, [])
+            ):
+                return
+            rows = self._call("src", "d2d_precopy_status", epoch)
+            available = [
+                min(r["available"][i] for r in rows)
+                for i in range(len(rows[0]["available"]))
+            ]
+            ends = entry.get("precopy_pages") or [0] * len(available)
+            if stop_after_snapshot:
+                goal = entry.get("precopy_goal")
+                if goal is None:
+                    goal = [max(a, b) for a, b in zip(available, ends)]
+                    self._update(rid, precopy_goal=goal)
+                available = [min(a, b) for a, b in zip(available, goal)]
+            schema = entry["plans"][0]["schema"]
+            # Same frame on every shard; each has its own authenticated slot.
+            for i, end in enumerate(available):
+                end = min(end, entry["plans"][0]["upper"] // schema["page_size"])
+                count = min(
+                    end - ends[i], (4 * 1024 * 1024) // schema["entries"][i][-1]
+                )
+                if count > 0:
+                    pending = dict(
+                        stage="PREPARE",
+                        frame=dict(
+                            entry=i, start=ends[i], count=count, chunk=uuid.uuid4().hex
+                        ),
+                    )
+                    self._update(rid, precopy_pending=pending)
+                    break
+            if pending is None:
+                if stop_after_snapshot:
+                    self._update(rid, precopy_done=True)
+                return
+        frame = pending["frame"]
+        if pending["stage"] == "PREPARE":
+            rows = self._call("dst", "d2d_precopy_prepare", epoch, frame=frame)
+            self._update(
+                rid,
+                precopy_pending=dict(
+                    pending, stage="COPY", receives=[r["receive"] for r in rows]
+                ),
+            )
+        elif pending["stage"] == "COPY":
+            rows = self._call(
+                "src",
+                "d2d_precopy_copy",
+                epoch,
+                frame=frame,
+                receives=pending["receives"],
+            )
+            self._update(
+                rid,
+                precopy_pending=dict(
+                    pending, stage="APPLY", proofs=[r["proof"] for r in rows]
+                ),
+            )
+        else:
+            rows = self._call(
+                "dst", "d2d_precopy_apply", epoch, frame=frame, proofs=pending["proofs"]
+            )
+            if any(r["prefix_pages"] != rows[0]["prefix_pages"] for r in rows):
+                raise RuntimeError("TP precopy installed coverage disagreed")
+            receipts = copy.deepcopy(
+                entry.get("precopy_receipts") or [[] for _ in rows]
+            )
+            for receipt, row in zip(receipts, rows):
+                receipt.append(row["receipt"])
+            self._update(
+                rid,
+                precopy_pending=None,
+                precopy_pages=rows[0]["prefix_pages"],
+                precopy_receipts=receipts,
+                precopy_bytes=entry.get("precopy_bytes", 0)
+                + sum(r["receipt"]["bytes"] for r in rows),
+            )
 
     def _advance(self, entry):
         rid, phase = entry["rid"], entry["phase"]
@@ -723,9 +817,7 @@ class DsvGateway:
             self._update(
                 rid,
                 reservations=[r["reservation"] for r in rows],
-                phase="FREEZE"
-                if request and self._cut_due(entry, request)
-                else "WAIT_CUT",
+                phase="WAIT_CUT",
                 prepare_latency_ms=max(
                     0,
                     (time.time() - entry.get("prepare_started_at", time.time())) * 1000,
@@ -743,13 +835,31 @@ class DsvGateway:
                     if self._cut_due(entry, request)
                     else "completed_on_source_before_cut",
                 )
+            elif entry.get("precopy_pending") is not None:
+                self._precopy(entry)
             elif self._cut_due(entry, request):
-                self._update(rid, phase="FREEZE")
+                supported = all(
+                    r.get("precopy_protocol") == "closed-page-precopy-v1"
+                    for role in ("src", "dst")
+                    for r in self.facts.get(role, [])
+                )
+                if not supported or entry.get("precopy_done"):
+                    self._update(rid, phase="FREEZE")
+                else:
+                    self._precopy(entry, stop_after_snapshot=True)
+            else:
+                self._precopy(entry)
         elif phase == "FREEZE":
             if entry.get("freeze_requested_at") is None:
                 self._update(rid, freeze_requested_at=time.time())
             rows = self._call(
-                "src", "d2d_freeze", epoch, reservations=entry["reservations"], **common
+                "src",
+                "d2d_freeze",
+                epoch,
+                reservations=entry["reservations"],
+                precopy_receipts=entry.get("precopy_receipts")
+                or [[] for _ in entry["reservations"]],
+                **common,
             )
             if any(r.get("deferred") for r in rows):
                 if not all(r.get("deferred") for r in rows):
@@ -865,7 +975,15 @@ class DsvGateway:
                     error="observed committed source during rollback",
                 )
                 return
-            rows = self._call("dst", "d2d_abort", epoch)
+            closes = self._call(
+                "src",
+                "d2d_precopy_close",
+                epoch,
+                pending_chunk=(entry.get("precopy_pending") or {})
+                .get("frame", {})
+                .get("chunk"),
+            )
+            rows = self._call("dst", "d2d_abort", epoch, precopy_close=closes)
             if not all(r.get("aborted") for r in rows):
                 return
             rows = self._call("src", "d2d_resume", epoch)
@@ -999,7 +1117,9 @@ class DsvGateway:
         finished = bool(req and req["finished"]) or entry["phase"] in TERMINAL
         return result, finished
 
-    def start_drain(self):
+    def start_drain(self, mode="d2d"):
+        if mode not in {"d2d", "natural"}:
+            raise ValueError("drain mode must be d2d or natural")
         with self.cv:
             if self.journal["drain"] and self.journal["drain"]["active"]:
                 return self.drain_status()
@@ -1008,12 +1128,26 @@ class DsvGateway:
                 for rid, e in self.journal["entries"].items()
                 if e["initial_owner"] == "src" and e["phase"] not in TERMINAL
             ]
+            if mode == "natural" and any(
+                self.journal["entries"][rid].get("epoch") for rid in members
+            ):
+                raise ValueError(
+                    "natural comparison requires source requests without active migration"
+                )
             previous = copy.deepcopy(self.journal)
             self.journal["drain"] = dict(
-                id=uuid.uuid4().hex, active=True, members=members
+                id=uuid.uuid4().hex,
+                active=True,
+                members=members,
+                started_at=time.time(),
+                mode=mode,
             )
             for rid in members:
-                self.journal["entries"][rid]["migration_requested"] = True
+                self.journal["entries"][rid]["migration_requested"] = mode == "d2d"
+                if mode == "natural":
+                    self.journal["entries"][rid]["cut"] = self.journal["entries"][rid][
+                        "max_new"
+                    ]
             try:
                 self._persist()
             except BaseException:
@@ -1035,12 +1169,24 @@ class DsvGateway:
                 and bool(self.facts.get("src"))
                 and all(row.get("idle", False) for row in self.facts.get("src", []))
             )
+            if safe and drain.get("source_released_at") is None:
+                drain["source_released_at"] = time.time()
+                self.journal["drain"].update(
+                    source_released_at=drain["source_released_at"]
+                )
+                self._persist()
             blocked = any(
                 e["blocked"] or e["phase"] == "SOURCE" and e["cut_attempted"]
                 for e in entries
             )
             return dict(
                 **drain,
+                source_release_ms=(
+                    max(0, (drain["source_released_at"] - drain["started_at"]) * 1000)
+                    if drain.get("source_released_at") is not None
+                    and drain.get("started_at") is not None
+                    else None
+                ),
                 migration_deferred=sum(
                     bool(e.get("migration_deferred")) for e in entries
                 ),
@@ -1216,11 +1362,13 @@ class DsvGateway:
             if path in {"/v1/cancel", "/v1/release"}:
                 return self.json_response(handler, 200, self.cancel(body["rid"]))
             if path == "/v1/drain":
-                if body.get("mode", "d2d") != "d2d" or body.get("targets", ["dst"]) != [
-                    "dst"
-                ]:
+                if body.get("mode", "d2d") not in {"d2d", "natural"} or body.get(
+                    "targets", ["dst"]
+                ) != ["dst"]:
                     raise ValueError("DSV P4 supports D2D drain to dst")
-                return self.json_response(handler, 200, self.start_drain())
+                return self.json_response(
+                    handler, 200, self.start_drain(body.get("mode", "d2d"))
+                )
             if path == "/v1/drain/stop":
                 with self.lock:
                     state = self.drain_status()["state"]

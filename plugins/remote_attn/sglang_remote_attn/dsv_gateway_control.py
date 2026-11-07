@@ -46,6 +46,7 @@ def migration_status(controller, epoch):
     source, target = sources.get(epoch), targets.get(epoch)
     return dict(
         reservation=reservations.status(controller, epoch),
+        precopy_unsafe=bool(getattr(controller, "d2d_precopy_unsafe", False)),
         source_cancelled=epoch
         in getattr(controller, "d2d_source_cancelled_epochs", ()),
         target_cancelled=epoch in getattr(controller, "d2d_cancelled_epochs", ()),
@@ -56,6 +57,14 @@ def migration_status(controller, epoch):
             committed=source.committed,
             copied=source.copied,
             released=source.released,
+            frozen_at=source.frozen_at,
+            released_at=source.released_at,
+            freeze_to_release_ms=(
+                None
+                if source.released_at is None
+                else max(0, (source.released_at - source.frozen_at) * 1000)
+            ),
+            postfreeze_bytes=source.postfreeze_bytes,
             resumed=source.released and not source.committed,
             error=source.error,
             kv_released=not source.req.kv.holds_kv,
@@ -126,6 +135,7 @@ def handle(controller, data):
         return dict(
             idle=bool(getattr(scheduler, "is_fully_idle", lambda: False)()),
             protocol=d2d.VERSION,
+            precopy_protocol="closed-page-precopy-v1",
             instance_id=instance(controller),
             rank=controller.rank,
             tp_size=controller.tp_size,
