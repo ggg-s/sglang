@@ -3,11 +3,23 @@
 本分支通过原生 `Qwen3_5ForConditionalGeneration` / `qwen3_5` ABI 接入
 `Qwen/Qwen3.8-27B-FP8`。复用原生模型加载与 FP8 权重计算，不新增模型类。
 
-当前阶段：纯文本、P/D0/D1 同 TP、关闭 MTP/推测、radix cache、调度 overlap、
+当前阶段：纯文本、P/D0/D1 同 TP。**P 支持原生 FULL+MAMBA prefix cache；D0/D1 关闭 radix cache**。
+关闭 MTP/推测、调度 overlap、
 ReplaySSM、LoRA、HiCache 和 unified memory。完整 attention 使用 page-size=1 的
 原生 NHD BF16/FP16 KV；SSM 使用 FP32。**FP8 权重不等于 FP8 KV。**
 
 P→D 使用原生最终 PD 提交和 `MAMBA` 状态传输；不提前接纳 GDN 状态尚未完整的请求。
+P 缓存命中同时恢复 FULL KV 与 GDN checkpoint；使用原生 CoW 得到请求自己的
+Conv/SSM 工作 slot。P 只计算未命中的后缀，但 D 没有 prefix cache，因此仍需发送
+**完整 prompt KV**，以及后缀完成后的工作 slot 状态。不能把缓存 checkpoint 的
+slot id 当作最终工作 slot，也不能把 P 的命中长度用作 D 的接收偏移。
+
+P 保留原生 checkpoint/dedup、缓存锁、早发 cached-prefix 与发送队列退休路径。
+Hybrid P 不提供 Remote 读服务，不安装 dense-only `source_cache.CacheGuard`；
+Remote 的读 lease 由完成原生 PD 的 D0 在后续 D2D freeze 时建立。
+原生 PD 未完成时请求行及工作 slot 保留；成功后才释放，缓存 checkpoint 可供后续请求复用。
+P 当前要求内置、device-only `(FULL, MAMBA)` UnifiedRadixCache；HiCache、
+外部 storage/linker、session cache 和第三方 radix backend 不在此支持范围。
 D0→D1 支持 Remote attention 与逐 entry 渐进 Local。Remote 期间使用 eager，
 全部资源经 TP 退休后恢复原生 Local CUDA graph；本阶段不提供混合模型的 Remote 分段图。
 
@@ -56,12 +68,16 @@ group 根据逻辑模型 layer id 分组。每个 entry/range 的覆盖证明保
 ```bash
 --model-path Qwen/Qwen3.8-27B-FP8 \
 --language-model-only \
---disable-radix-cache \
 --disable-overlap-schedule \
 --page-size 1 \
 --kv-cache-dtype bfloat16 \
 --mamba-ssm-dtype float32
 ```
+
+**P 端不传 `--disable-radix-cache`**。当前 page-size=1、overlap 关闭的默认
+`auto` 策略解析为 `no_buffer`，也可显式传 `--mamba-radix-cache-strategy no_buffer`。
+**D0、D1 额外添加 `--disable-radix-cache`**；插件仍会拒绝 D 开启 radix。
+不要在共用启动参数中给三侧统一关闭 radix，否则 P 也不会有缓存命中。
 
 不传 speculative/MTP 开关；保留模型原生的 attention/linear-attention 后端。
 插件环境：
@@ -94,3 +110,5 @@ peer schema 中的 `family=qwen-gdn-d2d-v1` 防止把 DSV 或不同模型状态�
 [原生配置启动回归](validation/qwen38-native-layer-mapping-4060.md)。8 GB 4060
 验证小尺寸原生池、实际 CUDA GDN/FlashInfer 和 Mooncake TCP；不等于完整 27B
 权重、TP 多卡或真实 RDMA HCA/CQ 验收。整模型部署仍需目标显存与 TP 配置实测。
+
+P prefix cache 的原生 CUDA/PD 验证见 [专项验证](validation/qwen-hybrid-prefill-cache-4060.md)。

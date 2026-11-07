@@ -24,6 +24,9 @@ class HybridEnvironment(Environment):
         # Import before allocator fixtures install scoped runtime boundaries.
         # Never synthesize layer_types: native Qwen configs discard that HF key.
         from sglang.srt.configs.qwen3_5 import Qwen3_5Config
+        from sglang.srt import runtime_context
+
+        self.native_runtime = runtime_context
 
         config = Qwen3_5Config(
             architectures=["Qwen3_5ForConditionalGeneration"],
@@ -357,7 +360,7 @@ class HybridEnvironment(Environment):
             )
         )
 
-    def startup(self, role):
+    def startup(self, role, *, prefix_cache=None):
         """Run the real controller startup with native config and pool methods.
 
         Pool construction and the heavyweight attention model are boundaries;
@@ -368,8 +371,9 @@ class HybridEnvironment(Environment):
         owner = self.source if role == "prefill" else self.target
         scheduler = NS(**vars(owner.scheduler))
         scheduler.disaggregation_mode = NS(value=role)
-        scheduler.enable_pdmux = False
         scheduler.kv_checksum_computer = None
+        if prefix_cache is not None:
+            scheduler.tree_cache = prefix_cache
         manager = d2d.manager(owner)
         scheduler.disagg_prefill_bootstrap_queue = NS(kv_manager=manager)
         runner = NS(**vars(owner.scheduler.tp_worker.model_runner))
@@ -392,13 +396,6 @@ class HybridEnvironment(Environment):
             HybridLinearKVPool=type(owner.pool),
             MHATokenToKVPool=type(owner.pool.full_kv_pool),
         )
-        runtime = NS(
-            get_parallel=lambda: self.native[0].parallel,
-            get_disagg=lambda: NS(language_model_only=True),
-            get_memory=lambda: NS(disable_radix_cache=True),
-            get_schedule=lambda: NS(disable_overlap_schedule=True),
-            get_spec=lambda: NS(speculative_algorithm=None),
-        )
         with ExitStack() as stack:
             stack.enter_context(
                 patch.dict(
@@ -408,8 +405,22 @@ class HybridEnvironment(Environment):
                         "sglang.srt.layers.radix_attention": NS(
                             RadixAttention=AttentionBoundary
                         ),
-                        "sglang.srt.runtime_context": runtime,
+                        "sglang.srt.runtime_context": self.native_runtime,
                     },
+                )
+            )
+            stack.enter_context(
+                self.native_runtime.get_context().override_server_args(
+                    disable_radix_cache=prefix_cache is None or prefix_cache.disable,
+                    language_model_only=True,
+                    disable_overlap_schedule=True,
+                    disaggregation_mode=role,
+                )
+            )
+            stack.enter_context(
+                self.native_runtime.get_parallel().override(
+                    tp_rank=0,
+                    tp_size=1,
                 )
             )
             stack.enter_context(

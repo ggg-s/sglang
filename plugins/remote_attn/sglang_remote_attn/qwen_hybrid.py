@@ -332,6 +332,31 @@ def execute(job, stream, cache):
     return execute_remote_attention(job, stream, cache)
 
 
+def validate_prefill_cache(cache):
+    """Hybrid P uses native FULL+MAMBA checkpoint/CoW and native PD retirement.
+
+    P never serves D2D Remote reads: D0 owns that lease after the final native
+    PD commit. A dense-only read guard would intercept the native Mamba slot
+    donation/CoW path and must not be installed here.
+    """
+    if cache.disable:
+        return
+    from sglang.srt.mem_cache.unified_cache.component_type import ComponentType
+    from sglang.srt.mem_cache.unified_radix_cache import UnifiedRadixCache
+
+    if (
+        type(cache) is not UnifiedRadixCache
+        or cache.tree_components != (ComponentType.FULL, ComponentType.MAMBA)
+        or cache.cache_controller is not None
+        or cache.linker is not None
+        or cache.enable_session_radix_cache
+    ):
+        raise ValueError(
+            "hybrid Prefill prefix cache requires native device-only FULL+MAMBA "
+            "UnifiedRadixCache without HiCache, external storage or sessions"
+        )
+
+
 class Controller(pre_layerwise.Controller):
     # Reuse the native-state D2D command/lifetime path, never DSV sparse math.
     hybrid_gdn = True
@@ -360,7 +385,6 @@ class Controller(pre_layerwise.Controller):
             self.config.mode != "remote"
             or not dp.enabled()
             or s.disaggregation_mode.value not in ("prefill", "decode")
-            or not get_memory().disable_radix_cache
             or not get_disagg().language_model_only
             or get_spec().speculative_algorithm is not None
             or getattr(s, "enable_hisparse", False)
@@ -370,8 +394,16 @@ class Controller(pre_layerwise.Controller):
             or not get_schedule().disable_overlap_schedule
         ):
             raise ValueError(
-                "hybrid Remote requires text-only native PD, remote GPU plane, radix/overlap/MTP/LoRA disabled"
+                "hybrid Remote requires text-only native PD, remote GPU plane, overlap/MTP/LoRA disabled"
             )
+        if s.disaggregation_mode.value == "decode":
+            if not get_memory().disable_radix_cache or not s.tree_cache.disable:
+                raise ValueError(
+                    "hybrid Decode Remote requires --disable-radix-cache; "
+                    "Prefill prefix cache may stay enabled"
+                )
+        else:
+            validate_prefill_cache(s.tree_cache)
         if (
             type(pool) is not HybridLinearKVPool
             or type(pool.full_kv_pool) is not MHATokenToKVPool

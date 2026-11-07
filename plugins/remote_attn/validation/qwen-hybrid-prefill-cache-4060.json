@@ -1,0 +1,81 @@
+{
+  "date": "2026-11-07",
+  "baseline": "fde7c621c88e0b74fb3e39827bc296cbcf9004a2",
+  "device": "NVIDIA GeForce RTX 4060 Laptop GPU",
+  "prefill_cache": {
+    "prefix_hits": [
+      8,
+      10
+    ],
+    "native_cache": true,
+    "cached_gdn_matches_cold_exactly": true,
+    "cow_preserves_cached_checkpoint": true,
+    "native_pd_full_prompt_transferred": true,
+    "native_pd_uses_working_state_slot": true,
+    "pending_pd_retains_kv_and_gdn": true,
+    "native_release_after_success": true,
+    "mooncake_transfers": 6,
+    "sha256": {
+      "plugins/remote_attn/sglang_remote_attn/qwen_hybrid.py": "9b275cca31f9994172943646235d038b41cdd94a85a04acc03678dd7de2ec830",
+      "test/manual/remote_attn/qwen_hybrid_prefix_cache_cuda_probe.py": "848da17788674c5ce184d9f6137e32fa30792d241b0a0d594360b92cb0852fa5",
+      "test/manual/remote_attn/qwen_hybrid_probe_support.py": "965640ed825d6b6e89bfafa31b7c4ff4020ec48ca7f4a289964354ea206a7934",
+      "test/registered/unit/plugins/test_remote_main_contracts.py": "6c718a5e9b90b9ce20ea16e5ebb30b78fbdd687527edac4d8a5e3d97c3226d55"
+    }
+  },
+  "hybrid_d2d_regression": {
+    "gdn_layers": 6,
+    "conv_max_error": 0.0,
+    "ssm_output_max_error": 0.0,
+    "gqa_remote_max_error": 0.0009765625,
+    "gqa_local_max_error": 0.0,
+    "gqa_fp32_oracle_max_error": 0.0007832050323486328,
+    "native_mooncake_submissions": 18,
+    "distinct_source_target_slots": [
+      1,
+      2
+    ],
+    "layer_group_size": 8,
+    "token_range": 3,
+    "bulk_group_frames": 4,
+    "max_entries_per_frame": 4,
+    "producer_stream_fenced": true,
+    "tail_preserved": true,
+    "status": "PASS",
+    "device": "NVIDIA GeForce RTX 4060 Laptop GPU",
+    "lifecycle_tests": 11,
+    "full_checkpoint": false,
+    "real_rdma": false,
+    "scope": "4060 hybrid D2D: native slot allocation, Mooncake TCP and GDN continuation.\n\nUses small native pool layouts, not the 27B checkpoint. No real RDMA HCA/CQ is\npresent on this GPU; shared RDMA fault probes are run separately with a fake NIC.\n"
+  },
+  "cpu_regression": {
+    "test_remote_main_contracts.py": {
+      "passed": 22,
+      "seconds": 17.091
+    }
+  },
+  "negative_control": {
+    "implementation": "fde7c621c8",
+    "test": "TestQwenHybridD2D.test_hybrid_prefill_prefix_cache_enabled_decode_stays_disabled",
+    "exit_code": 1,
+    "failure": "hybrid Remote requires ... radix/overlap/MTP/LoRA disabled"
+  },
+  "scope": {
+    "native_req_cache_match_checkpoint_cow": true,
+    "native_cuda_conv_gdn": true,
+    "native_pd_page_state_selection_and_retirement": true,
+    "mooncake_tcp_bytes": true,
+    "model_weights_http_tested": false,
+    "sampler_metadata_sender_integration": "explicit ABI fixtures",
+    "tested_cache_strategy": "no_buffer",
+    "h20_full_model_tested": false,
+    "real_rdma_tested": false,
+    "performance_claim": false
+  },
+  "source_sha256": {
+    "plugins/remote_attn/sglang_remote_attn/qwen_hybrid.py": "9b275cca31f9994172943646235d038b41cdd94a85a04acc03678dd7de2ec830",
+    "test/manual/remote_attn/qwen_hybrid_prefix_cache_cuda_probe.py": "848da17788674c5ce184d9f6137e32fa30792d241b0a0d594360b92cb0852fa5",
+    "test/manual/remote_attn/qwen_hybrid_probe_support.py": "965640ed825d6b6e89bfafa31b7c4ff4020ec48ca7f4a289964354ea206a7934",
+    "test/registered/unit/plugins/test_remote_main_contracts.py": "6c718a5e9b90b9ce20ea16e5ebb30b78fbdd687527edac4d8a5e3d97c3226d55"
+  },
+  "raw_logs": "/private/tmp/hybrid-prefix-results/results.tar.gz"
+}

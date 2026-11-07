@@ -553,6 +553,39 @@ class TestQwenHybridD2D(CustomTestCase):
                     {e[1] for e in peer["states"]}, set(expected["linear_layer_ids"])
                 )
 
+    def test_hybrid_prefill_prefix_cache_enabled_decode_stays_disabled(self):
+        """A P cache hit must not be rejected by a D-only ownership restriction."""
+        from sglang.srt.mem_cache.unified_radix_cache import UnifiedRadixCache
+        from sglang.srt.mem_cache.unified_cache.component_type import ComponentType
+
+        # Startup validates cache type/policy; the native CUDA probe exercises
+        # actual checkpoint, match, CoW and native PD send/retirement.
+        cache = object.__new__(UnifiedRadixCache)
+        cache.disable = False
+        cache.tree_components = (ComponentType.FULL, ComponentType.MAMBA)
+        cache.cache_controller = cache.linker = None
+        cache.enable_session_radix_cache = False
+        f = self.environment()
+        controller = f.startup("prefill", prefix_cache=cache)
+        self.assertIs(controller.scheduler.tree_cache, cache)
+        self.assertIsNone(controller.cache_guard)
+        self.assertIsNone(controller.prepare(NS()))
+        self.assertEqual(controller.sources, [])
+        with self.assertRaisesRegex(ValueError, "hybrid Decode Remote requires"):
+            f.startup("decode", prefix_cache=cache)
+        for field, value in (
+            ("cache_controller", object()),
+            ("linker", object()),
+            ("enable_session_radix_cache", True),
+            ("tree_components", (ComponentType.FULL,)),
+        ):
+            with self.subTest(field=field):
+                before = getattr(cache, field)
+                setattr(cache, field, value)
+                with self.assertRaisesRegex(ValueError, r"device-only FULL\+MAMBA"):
+                    f.startup("prefill", prefix_cache=cache)
+                setattr(cache, field, before)
+
     def test_native_layer_mapping_mismatch_rejected_at_startup_and_manifest(self):
         from sglang_remote_attn import dsv_d2d as d2d
 
@@ -667,7 +700,7 @@ class TestQwenHybridD2D(CustomTestCase):
         self.assertEqual(native.allocator.state.slots.available_size(), 3)
 
     def test_all_gdn_state_precedes_admission_and_kv_entries_switch_in_pairs(self):
-        from sglang_remote_attn import dsv_d2d as d2d, qwen_hybrid as hybrid
+        from sglang_remote_attn import qwen_hybrid as hybrid
 
         f = self.environment()
         tr = f.reserve_and_freeze(growth=3)
@@ -727,8 +760,6 @@ class TestQwenHybridD2D(CustomTestCase):
         )  # live destination owns its recurrent state.
 
     def test_cancel_waits_for_inflight_copy_and_tombstones_late_import(self):
-        from sglang_remote_attn import dsv_d2d as d2d
-
         f = self.environment()
         tr = f.reserve_and_freeze()
         f.import_(tr)
@@ -849,7 +880,6 @@ class TestQwenHybridD2D(CustomTestCase):
         self,
     ):
         import copy
-        from sglang_remote_attn import dsv_d2d as d2d
 
         f = self.environment()
         before = f.native[1].allocator.available_size()
