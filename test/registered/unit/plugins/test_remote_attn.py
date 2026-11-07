@@ -14393,6 +14393,10 @@ class TestRemoteAttn(CustomTestCase):
                     result = (
                         output_factory(*a, **kw) if output_factory else fn(*a, **kw)
                     )
+                    if output_factory and isinstance(result, torch.Tensor):
+                        # CPU fake capture does not execute attention here.
+                        # Later fake model ops must not consume empty() bytes.
+                        result.zero_()
                     remote.record.append(lambda: fn(*a, **kw))
                     return result
                 return fn(*a, **kw)
@@ -16172,8 +16176,22 @@ class TestRemoteAttn(CustomTestCase):
             if entry[0] == "kv"
         }
         self.assertFalse(gateway.request_status(e.source, e.req)["migration_ready"])
-        with self.assertRaisesRegex(ValueError, "active unowned"):
-            self._d2d_reserve(e)
+        deferred = d2d.handle(
+            e.source,
+            dict(
+                cmd="d2d_plan",
+                rid=e.req.rid,
+                destination="D1",
+                target_rid="target",
+                migration_epoch="not-local",
+                growth_tokens=0,
+            ),
+        )
+        self.assertTrue(deferred["deferred"])
+        self.assertEqual(
+            deferred["migration_deferred_reason"], "remote_entries_pending"
+        )
+        self.assertFalse(e.source.d2d_plans)
         rpc.local_entries.update(kv_entries)
         self.assertTrue(gateway.request_status(e.source, e.req)["migration_ready"])
         parent = SimpleNamespace(
@@ -17400,6 +17418,111 @@ class TestRemoteAttn(CustomTestCase):
         f.driver.finish_local()
         f.gw.tick()
         self.assertEqual(f.gw.entry(f.rid)["phase"], "LOCAL")
+
+    def test_p4_dsv_waits_for_local_reports_deferral_once_and_recovers_after_restart(
+        self,
+    ):
+        from sglang_remote_attn.dsv41_remote import Target
+
+        f = self._p4_dsv_env()
+        f.support.until(f.gw, f.rid, "SOURCE")
+        rpc = Target(
+            f.e.source, f.e.req, Path(f.folder) / "previous", "old", {}, f.e.prefix
+        )
+        rpc.progressive = True
+        f.e.req._dsv41_remote = rpc
+        f.e.source.remote_targets[rpc.row] = rpc
+        metrics = Path(f.folder) / "metrics.jsonl"
+        f.gw.out = metrics
+        f.gw.start_drain()
+        for _ in range(5):
+            f.gw.tick()
+        entry = f.gw.entry(f.rid)
+        self.assertEqual(entry["phase"], "SOURCE")
+        self.assertTrue(entry["migration_deferred"])
+        self.assertEqual(entry["migration_deferred_reason"], "remote_entries_pending")
+        self.assertEqual(entry["migration_deferred_count"], 1)
+        self.assertEqual(entry["attempts"], 0)
+        self.assertEqual(f.driver.count("d2d_plan"), 0)
+        self.assertFalse(f.e.freed or f.e.req._handoff_frozen)
+        with patch.object(
+            time, "time", return_value=entry["migration_deferred_since"] + 1
+        ):
+            self.assertGreaterEqual(
+                f.gw.entry(f.rid)["migration_deferred_wait_ms"], 1000
+            )
+        self.assertEqual(f.gw.drain_status()["migration_deferred"], 1)
+        waiting = [json.loads(line) for line in metrics.read_text().splitlines()]
+        self.assertEqual(len(waiting), 1)
+        handler = SimpleNamespace(
+            wfile=io.BytesIO(),
+            send_response=lambda *args: None,
+            send_header=lambda *args: None,
+            end_headers=lambda: None,
+        )
+        f.gw.http_get(handler, SimpleNamespace(path="/v1/router/status", query=""))
+        visible = json.loads(handler.wfile.getvalue())["migrations"][f.rid]
+        self.assertTrue(visible["migration_deferred"])
+        handler.wfile = io.BytesIO()
+        with patch.object(f.gw, "events", return_value=([], True)):
+            f.gw.stream(handler, f.rid)
+        wire = handler.wfile.getvalue().decode()
+        self.assertIn("event: status", wire)
+        self.assertIn('"migration_deferred_reason": "remote_entries_pending"', wire)
+        self.assertEqual(
+            waiting[0]["migration_deferred_reason"], "remote_entries_pending"
+        )
+        self._p4_dsv_restart(f)
+        self.assertEqual(f.gw.entry(f.rid)["migration_deferred_count"], 1)
+        rpc.local_entries.update(
+            i for i, e in enumerate(f.e.source._schema(None)["entries"]) if e[0] == "kv"
+        )
+        f.support.until(f.gw, f.rid, "TARGET")
+        entry = f.gw.entry(f.rid)
+        self.assertFalse(entry["migration_deferred"])
+        self.assertEqual(entry["migration_deferred_count"], 1)
+        self.assertEqual(entry["attempts"], 1)
+        self.assertEqual(entry["migration_outcome"], "migrated")
+
+    def test_p4_dsv_plan_readiness_race_defers_without_rollback_or_retry_budget(self):
+        f = self._p4_dsv_env()
+        f.support.until(f.gw, f.rid, "PLAN")
+        f.e.req._dsv41_remote = SimpleNamespace(all_local=lambda: False)
+        f.gw.tick()
+        entry = f.gw.entry(f.rid)
+        self.assertEqual(entry["phase"], "SOURCE")
+        self.assertEqual(entry["attempts"], 0)
+        self.assertFalse(entry["cut_attempted"])
+        self.assertTrue(entry["migration_deferred"])
+        self.assertEqual(entry["migration_deferred_reason"], "remote_entries_pending")
+        self.assertFalse(f.e.source.d2d_plans)
+        self.assertFalse(f.e.freed or f.e.req._handoff_frozen)
+        self.assertEqual(f.driver.count("d2d_reserve"), 0)
+        self.assertEqual(f.driver.count("d2d_abort"), 0)
+        self.assertEqual(f.driver.count("d2d_resume"), 0)
+        f.e.req._dsv41_remote = None
+        with patch.object(time, "time", return_value=entry["retry_at"] + 1):
+            f.support.until(f.gw, f.rid, "RESERVE")
+        self.assertFalse(f.gw.entry(f.rid)["migration_deferred"])
+        self.assertEqual(f.gw.entry(f.rid)["attempts"], 1)
+
+    def test_p4_dsv_source_completion_records_missed_deferred_migration(self):
+        f = self._p4_dsv_env()
+        f.support.until(f.gw, f.rid, "SOURCE")
+        f.e.req._dsv41_remote = SimpleNamespace(all_local=lambda: False)
+        f.gw.tick()
+        self.assertTrue(f.gw.entry(f.rid)["migration_deferred"])
+        f.e.req.finished = lambda: True
+        f.e.req.kv.holds_kv = False
+        f.gw.tick()
+        entry = f.gw.entry(f.rid)
+        self.assertEqual(entry["phase"], "DONE")
+        self.assertFalse(entry["migration_deferred"])
+        self.assertEqual(
+            entry["migration_outcome"], "completed_on_source_before_migration"
+        )
+        self.assertEqual(entry["migration_deferred_count"], 1)
+        self.assertEqual(f.driver.count("d2d_plan"), 0)
 
     def test_p4_dsv_restart_reconciles_every_precommit_intent_and_commit(self):
         for phase in (

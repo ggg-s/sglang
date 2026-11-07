@@ -202,28 +202,46 @@ def validate(controller):
         raise ValueError("D2D native state component is unsupported")
 
 
-def source_local(req):
-    """Local KV can migrate while the previous controller still tracks it."""
-    if (
-        req.finished()
-        or getattr(req, "_handoff_frozen", False)
-        or getattr(req, "_dsv_d2d_source", None) is not None
-        or getattr(req, "_remote_attn_transport_quarantine", None) is not None
-    ):
-        return False
+def source_blocker(req):
+    """Explain why the current owner cannot yet become a D2D source."""
+    if req.finished():
+        return "request_finished"
+    if getattr(req, "_handoff_frozen", False):
+        return "request_frozen"
+    if getattr(req, "_dsv_d2d_source", None) is not None:
+        return "d2d_owner_active"
+    if getattr(req, "_remote_attn_transport_quarantine", None) is not None:
+        return "transport_quarantined"
     rpc = getattr(req, "_dsv41_remote", None)
     if rpc is not None and not rpc.all_local():
-        return False
+        return "remote_entries_pending"
     target = getattr(req, "_pre_layerwise_target", None)
     if target is None or target.closed:
-        return True
+        return None
     # Local switches do not retire the receive ring or canonical PD envelope.
     # Admit only a provably drainable lifetime, with no deferred KV release.
-    return (
-        target.release is None
-        and not target.release_failed
-        and target.ready_to_finish()
-    )
+    if target.release is not None:
+        return "previous_kv_release_pending"
+    if target.release_failed:
+        return "previous_transfer_release_failed"
+    if not target.ready_to_finish():
+        return "previous_transfer_pending"
+    return None
+
+
+def source_local(req):
+    return source_blocker(req) is None
+
+
+def migration_blocker(scheduler, req):
+    reason = source_blocker(req)
+    if reason is not None:
+        return reason
+    if not req.output_ids:
+        return "sampled_output_pending"
+    if not can_quiesce(scheduler):
+        return "decode_boundary_pending"
+    return None
 
 
 def quiesce(scheduler, req):

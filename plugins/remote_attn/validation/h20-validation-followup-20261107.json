@@ -1,0 +1,152 @@
+{
+  "date": "2026-11-07",
+  "branch": "codex/remote-attn-pre-layerwise",
+  "base_commit": "98fd13c507246283bbec58a5c357d8f7365e6ec9",
+  "cpu_suites": [
+    {
+      "path": "test/registered/unit/plugins/test_remote_attn.py",
+      "tests": 367,
+      "seconds": 168.747,
+      "passed": true,
+      "log": "h20-followup-main-final.log"
+    },
+    {
+      "path": "test/registered/unit/disaggregation/test_disaggregation_wire.py",
+      "tests": 83,
+      "seconds": 0.247,
+      "passed": true,
+      "log": "h20-followup-wire-with-deps.log"
+    },
+    {
+      "path": "test/registered/unit/plugins/test_remote_main_contracts.py",
+      "tests": 21,
+      "seconds": 15.232,
+      "passed": true,
+      "log": "h20-followup-contracts.log"
+    },
+    {
+      "path": "test/registered/unit/plugins/test_remote_main_abi.py",
+      "tests": 6,
+      "seconds": 0.612,
+      "passed": true,
+      "log": "h20-followup-abi.log"
+    }
+  ],
+  "total_cpu_tests": 477,
+  "padding_fixture_control": {
+    "baseline_deterministic_fill_failed": true,
+    "fixed_deterministic_fill_passed": true
+  },
+  "source_preflight": {
+    "hooks": 50,
+    "core_interfaces": 131,
+    "passed": true
+  },
+  "ruff_passed": true,
+  "whitespace_check_passed": true,
+  "gpu": {
+    "device": "NVIDIA GeForce RTX 4060 Laptop GPU",
+    "scope": "D2D commands + native state bytes + actual GPU Remote during blocked KV copy.\n\nSmall pools and scheduler/allocator ABI fixtures; no model weights, SM100\nFlashMLA, native HTTP stream rerouting, or H20 RDMA performance claim.\n",
+    "cases": [
+      {
+        "ratio": 2,
+        "kv_layout": "v4",
+        "gpu_query_transport": true,
+        "bulk_transport": "mooncake-host-v1",
+        "group_size": 1,
+        "group_frames": 2,
+        "max_entries_per_frame": 1,
+        "p4_gateway": true,
+        "gateway_restart_after_lost_commit": true,
+        "native_decode_admissions": 1,
+        "reserved_before_freeze": true,
+        "reserved_row_consumed": true,
+        "state_bytes_exact": true,
+        "decode_before_bulk_copy": true,
+        "remote_calls": 1,
+        "max_error": 0.0,
+        "tail_and_padding_exact": true,
+        "delayed_forward_retained_kv": true,
+        "source_free_count": 1,
+        "local_restored": true,
+        "mooncake_transfers": 10
+      }
+    ],
+    "source_sha256": {
+      "plugins/remote_attn/sglang_remote_attn/dsv_d2d.py": "a640883dacb078e3ea08e30267b1e1ddeb5530d5f055faee37fa40bb2453b39a",
+      "plugins/remote_attn/sglang_remote_attn/dsv_d2d_reservation.py": "d50b4c6fddf825d7a08a27a90cdf08838eca70f64204f6db289e0dd1858d290e",
+      "plugins/remote_attn/sglang_remote_attn/destination_cache.py": "465308aad4a2ef82a344e9267c68e4292728d8c1b4d1bc2a2b5bea51cc859425",
+      "plugins/remote_attn/sglang_remote_attn/swa_checkpoints.py": "e280dd79afcc5fbcef451e41bfd67c657b381b9f9c2e374753cbf6b89a5b2024",
+      "plugins/remote_attn/sglang_remote_attn/decode_overlap.py": "07948aae7b1b3f47f60f1ba806cc83b777026eb26a58c8e8918faf6869bc8e35",
+      "plugins/remote_attn/sglang_remote_attn/prefix_stream.py": "411c83424b6afab21516c9cd2f89cdfd8b690e15baccad1d1e8b233f932484a6",
+      "plugins/remote_attn/sglang_remote_attn/prefill_overlap.py": "8528da51b28ed4621d439b13dd9d2f621256fea73f8f32f8f304028b54f0edd0",
+      "plugins/remote_attn/sglang_remote_attn/pre_layerwise.py": "902c8253e724f54206d197f3ed3cc53ff1e292bb22507a477bd10b7ed6c79f36",
+      "plugins/remote_attn/sglang_remote_attn/segmented_graph.py": "b4f19607764d110f1deeac0157a47a42b8f15e305c4a76c99f0eff8fa5597d53",
+      "plugins/remote_attn/sglang_remote_attn/transfer_priority.py": "ed9226f61d2b3612cffbd3e7b66f30a26bcd3feaaa654b61a43fa11612377aee",
+      "plugins/remote_attn/sglang_remote_attn/mooncake_backend.py": "4a1e80d29e71210ff4e61bef1f80b236ae518c173f6fce23a3726d7a6542c7d1",
+      "plugins/remote_attn/sglang_remote_attn/dsv41_staging.py": "085922f98db640b58febf2a4d74feeb950f0ed38e31b0085e9a8246342698a74",
+      "plugins/remote_attn/sglang_remote_attn/source_cache.py": "699f8fa4532ee878d54f77812af3dc60361b5971659d9aafbc6bbd571776a3de",
+      "plugins/remote_attn/sglang_remote_attn/dsv41_receive.py": "679a263daca1126a78ce411dc63b5e82b459e3463edcc9042260111c843bdac8",
+      "plugins/remote_attn/sglang_remote_attn/pd_mesh.py": "0c188d26f07f3a4626c14f1e5dbfd3b2352d39d481e13d48a93203d8513cd3ed",
+      "plugins/remote_attn/sglang_remote_attn/dsv41_sparse_math.py": "174980ce3bffac2e1791c0bfdce6c6f823275a47ad0be120f3a3a110d6c9f56e",
+      "plugins/remote_attn/sglang_remote_attn/dsv41_remote.py": "f09301e8abc2e7f637325731d7c1e2bee530412394396736e709c8828997aec4",
+      "plugins/remote_attn/sglang_remote_attn/qwen_ranges.py": "ccbf557c3fd469c21993507d042d563ebf0b2863ee933d24e4f06270d381f897",
+      "plugins/remote_attn/sglang_remote_attn/dsv41_kernels.py": "5ae677e1f1c8f3a1bd06fa3127fecfa97bb414eca9dd196d7266605bb0877d9a",
+      "plugins/remote_attn/sglang_remote_attn/source_resources.py": "2e35ee2d617d45b44e3d32595f8b7a0b7434240d42349bab2ab906f004d0c418",
+      "plugins/remote_attn/sglang_remote_attn/prefill_admission.py": "4894fb9d626dfd01f9a98b483f6febd4720653f95cb8fd4454f44cf9053a9e00",
+      "plugins/remote_attn/sglang_remote_attn/dsv41_layerwise.py": "578d590a795e40377d761bc770b77d86da34becaa2eeab63fd1672d1ad784ed3",
+      "plugins/remote_attn/sglang_remote_attn/remote_data_plane.py": "6d568333e544f29a3841466d2358be0f81bb3f4ebfcdb4d5d2faac50902a903c",
+      "plugins/remote_attn/sglang_remote_attn/interfaces.py": "f04925e2fffc84bbbed5f5aa92609ef029642745843f397394e2edc7b3eeb7ef",
+      "plugins/remote_attn/sglang_remote_attn/tp.py": "766b5028a3a08a801c2891580e406a40f1868d7d21cde8ef46be1d76b86b059c",
+      "plugins/remote_attn/sglang_remote_attn/d2d_ranges.py": "c85aa311e1fd7b8f7f9b435fc20cd82d138c023b4372733694984cb02576bfee",
+      "plugins/remote_attn/sglang_remote_attn/__init__.py": "f64e878600a7775c62cd79063dbd94d92ccfd6513909f6fed3a221758ebe067f",
+      "plugins/remote_attn/sglang_remote_attn/dsv41_paged.py": "6b413fe3eeca846c51b800c32467b8779a384b91ee6765ee914987bde6412d2f",
+      "plugins/remote_attn/sglang_remote_attn/compat.py": "4d46c0037f9d59066e48edb46dabd617172a344e5f5f74b4881ce98d35d95e8d",
+      "plugins/remote_attn/sglang_remote_attn/qwen_hybrid.py": "a3773385367814170cfe78b286c66883947757a07abb083711ee73e1fce737f2",
+      "plugins/remote_attn/sglang_remote_attn/dsv41_graph.py": "997b8b89708ed3f1f7fdc756bc57c654bb0005be65b3c1f9fbac22960f04c6a4",
+      "plugins/remote_attn/sglang_remote_attn/check.py": "a7e23c69b57df34ec943df1aad40e4a4e11171fc30cb0f7fcb8ee9072bada438",
+      "plugins/remote_attn/sglang_remote_attn/qwen_reservation.py": "8efb487be2243cf3b10fbcaaf991e1e913984ced6443c59d12602ee9d8d75c6b",
+      "plugins/remote_attn/sglang_remote_attn/dsv41_progressive.py": "a0188890b56a523141f93b5d9f24d95bd1265111ba3c5f76ba674d2d60abb97b",
+      "plugins/remote_attn/sglang_remote_attn/dsv41_rpc.py": "3e5da18fa8647120237ac0fc285a40a6bf486fb94a2b7bde2c5040de23cadb38",
+      "plugins/remote_attn/sglang_remote_attn/hooks.py": "2ed2fca09009abc6c02dd3f2e13dbcb10aab73e26646e2c772dfb115e6fbfb4c",
+      "plugins/remote_attn/sglang_remote_attn/d2d_bulk.py": "d59c87bc25e8d8d6e2915a028b55fa4258d509ab12f2861efae2556244002aa6",
+      "plugins/remote_attn/sglang_remote_attn/handoff_control.py": "a907e2f78b3cc5f7c90f137588d26961e3b529f2271d265e84a41fb7aa4e42e3",
+      "plugins/remote_attn/sglang_remote_attn/retirement.py": "b8bff23a87fc6aa5b743589756dc18967fe160ccdf7de59672df178497f45f09",
+      "plugins/remote_attn/sglang_remote_attn/dsv_gateway_control.py": "641cd33e3060a5eda6cfeb9189b2efc79d46d24be2af7566aa5d648beaf3cc32",
+      "plugins/remote_attn/sglang_remote_attn/transport_failure.py": "e6b3175b84c41974944b3f490ae7d52fef63be4c44734bd9ad1bbdb4376f4291",
+      "plugins/remote_attn/sglang_remote_attn/dsv41_fast.py": "fd894d78b27530a914cd72ed19d9abcaaf137f533c1e1643be280d0623b6c470",
+      "plugins/remote_attn/sglang_remote_attn/d2d_groups.py": "1b0760336fc1c0274fafc3419e9691e7efa2bbe0564cc3c0016ffdfc7ef99949",
+      "test/manual/remote_attn/dsv41_remote_probe_support.py": "eda67756ba392faa9bba5f5f32cae68e8676547fc0838c2370bbacd32bde4bf2",
+      "test/manual/remote_attn/dsv41_graph_probe_support.py": "d6f5c7da90be77795182dcb372deb4b9c45c686386f22bcae5ee49ace4280da7",
+      "test/manual/remote_attn/remote_gpu_probe_support.py": "d57bf8cfa82447104d2968741e3b97195e6287be9ca55c21c694d6960b0e7e1f",
+      "test/manual/remote_attn/dsv41_progressive_probe_support.py": "38426dc9de227cadf2e5cc5a5fcd11f64885277677fcbf05cd72fc285fa3a7f3",
+      "test/manual/remote_attn/qwen_reservation_probe_support.py": "5c9ecb443569c1304dda26aaaf91bd6bb0120573f5da6249b06b72077dcaea28",
+      "test/manual/remote_attn/dsv41_staging_probe_support.py": "a6648119f94c48ab330128abcf5eab4b1c01abda00b43fcc5c27e2ef8087399d",
+      "test/manual/remote_attn/qwen_hybrid_probe_support.py": "94350a45244e5c2e93b1f7cd1dcc2fe13d8c09c8b711482478f3008e4cba017a",
+      "test/manual/remote_attn/dsv_d2d_probe_support.py": "175d6067677ce0c50ad94e0edb9a323182e53f6ef428d8686bf10f8d3ec642fd",
+      "test/manual/remote_attn/flash0731_probe_support.py": "baa2edee8dc696b279d1843fd10ea2359b0e0e711a1f28b693dc08b445cae178",
+      "test/manual/remote_attn/p4_dsv_probe_support.py": "ea896130ede238d079ba3c31745f83f0a96df77e8b735faf432cd6acd1215e69",
+      "test/manual/remote_attn/pd_mesh_probe_support.py": "4e7be864e3b1531534693df11a23999027ed4df52bc50214155d9f0b4638cdc4",
+      "plugins/remote_attn/control_plane/p4_dsv_gateway.py": "2dc5d96a35e21a29918b4a5280219d62473fa12c14f63fbc53e56f38b889c3aa",
+      "test/manual/remote_attn/dsv_d2d_cuda_probe.py": "feaa3655244ff1a27b7d78abee3f1a8b73b52bfe566e9e688c257b93ea0d6f6a"
+    }
+  },
+  "source_sha256": {
+    "test/manual/remote_attn/dsv_d2d_tp_worker.py": "0ea8c884f2129dbe75f73aab546dec67ac264bd44b84c3545f97eb31be293fc2",
+    "test/registered/unit/disaggregation/test_disaggregation_wire.py": "4e860af894ba06a76d0d6ecd2f2409b3c2cc0913795b60ee7ecb1e034ff17a7a",
+    "test/registered/unit/plugins/test_remote_attn.py": "fa243b2eeaa6c57f6436aad4c766fe4022c5762dae2b0aee9d6e38b94f666ec8",
+    "test/registered/unit/plugins/test_remote_main_abi.py": "45a75374115996db13d52d17110f44094115c905bda1303c36692c29aa4c8ab5",
+    "python/sglang/srt/disaggregation/common/conn.py": "b8f8ac978b496e9099721ddb2f6d270c5315ffed3efbc50f4c56544cd337fc81",
+    "plugins/remote_attn/sglang_remote_attn/dsv_d2d_reservation.py": "d50b4c6fddf825d7a08a27a90cdf08838eca70f64204f6db289e0dd1858d290e",
+    "plugins/remote_attn/sglang_remote_attn/dsv_d2d.py": "a640883dacb078e3ea08e30267b1e1ddeb5530d5f055faee37fa40bb2453b39a",
+    "plugins/remote_attn/sglang_remote_attn/dsv_gateway_control.py": "641cd33e3060a5eda6cfeb9189b2efc79d46d24be2af7566aa5d648beaf3cc32",
+    "plugins/remote_attn/control_plane/p4_dsv_gateway.py": "2dc5d96a35e21a29918b4a5280219d62473fa12c14f63fbc53e56f38b889c3aa"
+  },
+  "source_snapshot_matches_worktree": true,
+  "log_archive": "/private/tmp/h20-followup-results/results.tar.gz",
+  "limitations": [
+    "Partial-Remote source migration remains unsupported; deferral is explicit.",
+    "No H20 full-model, cross-host RDMA, or concurrency performance rerun.",
+    "Full HTTP server import is blocked by missing referencing in the test environment."
+  ]
+}

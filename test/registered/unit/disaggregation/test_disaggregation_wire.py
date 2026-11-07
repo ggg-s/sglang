@@ -884,11 +884,46 @@ class TestDisaggregationWire(unittest.TestCase):
                     peer_lens = dst_lens if decode_enabled else None
                     if prefill_enabled == decode_enabled:
                         manager.validate_aux_buffers(dst_ptrs, peer_lens)
+                        if not prefill_enabled:
+                            # DSV plugins publish actual destination strides even
+                            # without customized-info. Optional checksum differs.
+                            manager.validate_aux_buffers(dst_ptrs, dst_lens)
                     else:
                         with self.assertRaisesRegex(
                             ValueError, "metadata buffer layout mismatch"
                         ):
                             manager.validate_aux_buffers(dst_ptrs, peer_lens)
+
+    def test_aux_explicit_strides_without_customized_info_report_failed_checks(self):
+        with (
+            get_context().override_server_args(disaggregation_enable_kv_checksum=False),
+            envs.SGLANG_DISAGG_CUSTOMIZED_INFO_MAX_BYTES.override(0),
+        ):
+            src_ptrs, _, src_lens = MetadataBuffers(
+                1, 16, torch.float32, 0
+            ).get_buf_infos()
+            dst_ptrs, _, dst_lens = MetadataBuffers(
+                1, 16, torch.float32, 0
+            ).get_buf_infos()
+            manager = object.__new__(CommonKVManager)
+            manager.customized_info_enabled = False
+            manager.kv_args = SimpleNamespace(
+                aux_data_ptrs=src_ptrs, aux_item_lens=src_lens
+            )
+            manager.validate_aux_buffers(dst_ptrs, dst_lens)
+            for pointers, lens, reason in (
+                (dst_ptrs, dst_lens[:-1], "destination pointer/stride counts differ"),
+                (
+                    dst_ptrs,
+                    [dst_lens[0] + 64, *dst_lens[1:]],
+                    "metadata sizes differ with customized-info disabled",
+                ),
+                (dst_ptrs, [0, *dst_lens[1:]], "nonpositive metadata stride"),
+            ):
+                with self.subTest(reason=reason):
+                    with self.assertRaisesRegex(ValueError, reason) as error:
+                        manager.validate_aux_buffers(pointers, lens)
+                    self.assertIn("customized_info_enabled=False", str(error.exception))
 
     def test_mooncake_aux_transfer_uses_destination_row_stride(self):
         source = np.arange(192, dtype=np.uint8).reshape(3, 64)

@@ -89,9 +89,24 @@ def handle(controller, data):
             ):
                 raise ValueError("D2D plan retry identity mismatch")
             return dict(plan=plan, duplicate=True)
-        req = d2d.find_req(controller.scheduler, data["rid"])
-        if not d2d.source_local(req):
-            raise ValueError("D2D plan requires an active unowned request")
+        error, blocker = None, None
+        try:
+            req = d2d.find_req(controller.scheduler, data["rid"])
+            blocker = d2d.migration_blocker(controller.scheduler, req)
+        except Exception as exc:
+            error = repr(exc)
+        votes = controller.agree(
+            [int(error is None), int(error is None and blocker is None)]
+        )
+        if not votes[0]:
+            raise ValueError(f"TP D2D plan readiness failed: {error or 'peer failed'}")
+        if not votes[1]:
+            # Readiness can change after worker_status, especially while other
+            # requests enter/leave an overlap batch. No plan/owner was created;
+            # every TP shard defers without burning a migration attempt.
+            return dict(
+                deferred=True, migration_deferred_reason=blocker or "peer_not_ready"
+            )
         params = d2d.sampling(req)
         lower = len(req.origin_input_ids) + len(req.output_ids) - 1
         growth = data.get("growth_tokens", 64)

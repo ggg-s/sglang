@@ -345,6 +345,27 @@ class TestRemoteMainABI(CustomTestCase):
         self.assertEqual(struct.unpack("2Q", message[6]), (8, 6))
         self.assertEqual(message[:6], native(manager)[:6])
         self.assertEqual(message[7:], native(manager)[7:])
+        # Exercise the P-side consumer too: a valid wire frame alone missed
+        # the disabled-customized-info rejection in validate_aux_buffers.
+        from sglang.srt.runtime_context import get_context, get_disagg
+
+        validate = definitions(
+            NATIVE / "common/conn.py",
+            {"validate_aux_buffers"},
+            {
+                "get_disagg": get_disagg,
+                "MetadataBuffers": SimpleNamespace(CUSTOMIZED_INFO_SLOTS=slice(6, 8)),
+            },
+            owner="CommonKVManager",
+        )["validate_aux_buffers"]
+        with get_context().override_server_args(
+            disaggregation_enable_kv_checksum=False
+        ):
+            validate(
+                manager,
+                manager.kv_args.aux_data_ptrs,
+                list(struct.unpack("2Q", message[6])),
+            )
         manager.kv_args.aux_item_lens = [8]
         with self.assertRaisesRegex(ValueError, "registration strides"):
             hook(native, manager)

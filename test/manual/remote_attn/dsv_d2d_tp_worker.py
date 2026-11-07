@@ -63,6 +63,28 @@ def main():
             dist.all_gather_object(plans, plan)
             return plans
 
+        # A stale worker_status can leave just one rank with Remote entries.
+        # All shards must defer before any plan or new owner is published.
+        if args.rank == 1:
+            e.req._dsv41_remote = NS(all_local=lambda: False)
+        deferred = d2d.handle(
+            e.source,
+            dict(
+                cmd="d2d_plan",
+                migration_epoch="remote-pending",
+                rid="source",
+                destination="D1",
+                target_rid="target",
+                growth_tokens=0,
+            ),
+        )
+        assert deferred["deferred"]
+        assert deferred["migration_deferred_reason"] == (
+            "remote_entries_pending" if args.rank == 1 else "peer_not_ready"
+        )
+        assert not e.source.d2d_plans and not e.req._handoff_frozen and not e.freed
+        e.req._dsv41_remote = None
+
         # One rank lacks capacity: neither shard may freeze or allocate a row.
         plans = prepare("no-capacity")
         available = e.target.scheduler.req_to_token_pool.available_size

@@ -23,6 +23,7 @@ def instance(controller):
 
 
 def request_status(controller, req):
+    blocker = d2d.migration_blocker(controller.scheduler, req)
     return dict(
         rid=req.rid,
         output_ids=list(req.output_ids),
@@ -32,11 +33,8 @@ def request_status(controller, req):
         kv_released=not req.kv.holds_kv,
         frozen=bool(getattr(req, "_handoff_frozen", False)),
         error=getattr(req, "_d2d_submission_error", None),
-        migration_ready=bool(
-            req.output_ids
-            and d2d.source_local(req)
-            and d2d.can_quiesce(controller.scheduler)
-        ),
+        migration_ready=blocker is None,
+        migration_deferred_reason=blocker,
     )
 
 

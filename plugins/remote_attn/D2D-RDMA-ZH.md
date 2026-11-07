@@ -64,6 +64,21 @@ Remote Attention 的 RemoteHub/mesh 地址仍按 [多机部署](MULTI-PD-ZH.md) 
 
 ## 数据路径与完成顺序
 
+DSV Remote 请求只有在本 rank 的 KV entries 全部经有序切换回 Local，且前一个
+receive lifetime 可退休时，才会进入 D2D plan。当前不支持搬迁仍依赖 P 端 Remote
+entries 的请求；并发下可能一直等到源请求自然结束，不能承诺主动迁移收益。
+
+Gateway 到达 `cut` 或收到 drain 指令后，会显式等待该条件。worker status 提供
+`migration_deferred_reason`（例如 `remote_entries_pending`）；gateway journal 保存
+等待状态、计数、累计时间及本轮开始时间。SSE status、router status 与 drain status 提供 `migration_deferred`、
+`migration_deferred_reason`、`migration_deferred_count` 和 `migration_deferred_wait_ms`。
+计数按进入等待/原因变化计，不随轮询增长。若等待期间在源结束，结果为
+`migration_outcome=completed_on_source_before_migration`，不会被计为已迁移。
+
+worker status 与 plan 之间可能变化；plan 在 TP 上共同重新检查准入，返回
+`deferred=true` 时没有创建 plan、预留或冻结。gateway 回到等待状态，不消耗迁移
+重试次数。它不会用清掉 Remote 标记的方式绕过既有 KV 所有权证明。
+
 TCP 路径保留独立 D2H Host staging、连续 payload/footer、目标 H2D 和 ACK：
 
 ```text

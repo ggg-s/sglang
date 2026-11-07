@@ -10,8 +10,8 @@
 | ② `enable_pdmux` 已移除 | 直接删除三处旧检查（含 hybrid adapter）及兼容函数，不兼容旧版本。`enable_fpm` 是 Forward Pass Metrics，与此无关。 |
 | ③ staging 重复登记 | 同一 live room、同一 DecodeRequest 和 receiver 幂等，保留 token、事件、成功状态。不同请求、receiver 替换及 drain 失败后的重试仍拒绝覆盖。 |
 | ④ D ready 文件缺失 | D controller 初始化完成后 eager 建 hub；不依赖首次充当远端源。 |
-| ⑤ 首请求 aux strides 缺失 | DSV 注册消息始终携带 D 的实际 aux strides，不依赖 customized-info 开关。controller 启动安装 schema 后首个请求即生效；保留 P/D 不同 stride 的边界校验。 |
-| ⑥ remote 阻止 D2D | 状态查询、plan、freeze 使用同一 Local 判据；所有 KV entry 经 TP 切回 Local，原接收 lifetime 可退休且未冻结时才允许。freeze 前通过现有 TP retirement drain 原 owner，关闭 RPC 租约，再转交所有权。 |
+| ⑤ 首请求 aux strides 缺失 | DSV 注册消息始终携带 D 的实际 aux strides；customized-info 默认关闭时，校验显式 stride 的一致性，不要求开启该功能。错误列出具体失败条件。 |
+| ⑥ remote 阻止 D2D | 当前只迁移全部 Local 的请求。gateway 显式报告等待原因/次数/时间；plan 重新进行 TP 准入检查，竞态引起的推迟不消耗重试。等待至源结束时明确标记未迁移。部分 Remote 请求的迁移仍未实现。 |
 | ⑦ layerwise 控制语义 | layerwise 只支持 native PD/SMG。D2D 要求两个 Decode worker 都使用 remote 且禁用 D radix；不支持的命令通过 `result.<rank>.json` 返回错误。ready 文件只证明控制端已初始化。 |
 
 DSV remote/receive adapter 会安装自己的 staging ring；

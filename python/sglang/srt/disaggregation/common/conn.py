@@ -669,24 +669,46 @@ class CommonKVManager(BaseKVManager):
             get_disagg().disaggregation_enable_kv_checksum
         )
         slots = MetadataBuffers.CUSTOMIZED_INFO_SLOTS
-        if not (
-            self.customized_info_enabled
-            and dst_aux_item_lens is not None
-            and len(src_ptrs) == len(src_item_lens)
-            and len(dst_aux_ptrs) == len(dst_aux_item_lens)
-            and len(dst_aux_ptrs) in (required_buffers, required_buffers + 1)
-            and (len(dst_aux_ptrs) == required_buffers or dst_aux_item_lens[-1] == 64)
-            and min(len(src_item_lens), len(dst_aux_item_lens)) >= slots.stop
-            and src_item_lens[slots] == dst_aux_item_lens[slots]
-            and all(src <= dst for src, dst in zip(src_item_lens, dst_aux_item_lens))
-        ):
+        failed = []
+        if len(src_ptrs) != len(src_item_lens):
+            failed.append("source pointer/stride counts differ")
+        if dst_aux_item_lens is None:
+            failed.append("destination strides missing")
+        else:
+            if len(dst_aux_ptrs) != len(dst_aux_item_lens):
+                failed.append("destination pointer/stride counts differ")
+            if len(dst_aux_ptrs) not in (required_buffers, required_buffers + 1):
+                failed.append("destination buffer count differs")
+            if len(dst_aux_ptrs) == required_buffers + 1 and (
+                not dst_aux_item_lens or dst_aux_item_lens[-1] != 64
+            ):
+                failed.append("destination checksum stride must be 64")
+            if any(n <= 0 for n in (*src_item_lens, *dst_aux_item_lens)):
+                failed.append("nonpositive metadata stride")
+            if self.customized_info_enabled:
+                if min(len(src_item_lens), len(dst_aux_item_lens)) < slots.stop:
+                    failed.append("customized-info slots missing")
+                elif src_item_lens[slots] != dst_aux_item_lens[slots]:
+                    failed.append("customized-info slot sizes differ")
+                if any(src > dst for src, dst in zip(src_item_lens, dst_aux_item_lens)):
+                    failed.append("destination stride too small")
+            elif (
+                src_item_lens[:required_buffers] != dst_aux_item_lens[:required_buffers]
+            ):
+                # A plugin can publish explicit strides even when there is no
+                # customized-info payload. Do not interpret slots 6:8 as that
+                # optional payload when it is absent from the native layout.
+                failed.append("metadata sizes differ with customized-info disabled")
+        if failed:
             raise ValueError(
                 "Disaggregation metadata buffer layout mismatch: "
+                f"failed checks: {', '.join(failed)}; "
+                f"customized_info_enabled={self.customized_info_enabled}; "
                 f"prefill has {len(src_ptrs)} buffers with item sizes {src_item_lens}, "
                 f"decode has {len(dst_aux_ptrs)} buffers with item sizes {dst_aux_item_lens}. "
-                "Both servers must support and enable customized-info transfer "
-                "with the same SGLANG_DISAGG_CUSTOMIZED_INFO_MAX_BYTES and "
-                "compatible metadata buffers."
+                "Without customized-info, metadata sizes must match. When enabled, "
+                "both servers need the same SGLANG_DISAGG_CUSTOMIZED_INFO_MAX_BYTES "
+                "and compatible metadata buffers."
             )
 
     def update_status(self, bootstrap_room: int, status: KVPoll):
