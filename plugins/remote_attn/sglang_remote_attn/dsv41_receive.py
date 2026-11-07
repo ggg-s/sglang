@@ -325,6 +325,7 @@ def scatter(
     num_pages,
     decode_req,
     receiver,
+    stream=None,
     *,
     layer_ids=None,
     staging_bytes=None,
@@ -338,11 +339,11 @@ def scatter(
             num_pages,
             decode_req,
             receiver,
+            stream,
             layer_ids=layer_ids,
             staging_bytes=staging_bytes,
         )
     import torch
-
     from sglang.srt.utils import create_device_stream, device_stream_context
 
     entries = selected(manager, layer_ids or ())
@@ -373,9 +374,14 @@ def scatter(
     ):
         raise ValueError("DSV4.1 scatter layout mismatch")
     handler.device_module.set_device(handler.gpu_id)
-    if allocator._scatter_stream is None:
-        allocator._scatter_stream = create_device_stream(handler.device)
-    stream = allocator._scatter_stream
+    if stream is None:
+        if allocator._scatter_stream is None:
+            allocator._scatter_stream = create_device_stream(handler.device)
+        stream = allocator._scatter_stream
+    # Native submit_chunk_scatter retains an explicit stream on the request
+    # before entering here, and records the entry completion event on it.
+    # release_room drains that retained stream even if event.record fails;
+    # using another stream here would invalidate both completion and release.
     if decode_req._req_to_token_ready is not None:
         stream.wait_event(decode_req._req_to_token_ready)
     with device_stream_context(stream):

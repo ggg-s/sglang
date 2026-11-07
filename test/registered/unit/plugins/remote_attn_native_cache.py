@@ -19,6 +19,7 @@ import typing
 from abc import ABC, abstractmethod
 from array import array
 from collections import defaultdict
+from contextlib import nullcontext
 from enum import Enum, IntFlag, auto
 from types import SimpleNamespace as NS
 from typing import NamedTuple, Protocol
@@ -32,14 +33,14 @@ import torch
 class Pages:
     def __init__(self, size, page):
         self.size, self.page = size, page
-        self.free = set(range(page, size + page, page))
+        self.free_pages = set(range(page, size + page, page))
         self.live = set()
 
     def alloc(self, n):
         n = (n + self.page - 1) // self.page
-        assert len(self.free) >= n, "pool exhausted"
-        bases = sorted(self.free)[:n]
-        self.free.difference_update(bases)
+        assert len(self.free_pages) >= n, "pool exhausted"
+        bases = sorted(self.free_pages)[:n]
+        self.free_pages.difference_update(bases)
         self.live.update(bases)
         return torch.tensor(
             [v for b in bases for v in range(b, b + self.page)], dtype=torch.int64
@@ -50,13 +51,15 @@ class Pages:
         assert len(set(bases)) == len(bases), "duplicate pages within free"
         assert set(bases) <= self.live, "double free or foreign page"
         self.live.difference_update(bases)
-        self.free.update(bases)
+        self.free_pages.update(bases)
+
+    free = release
 
     def free_segment(self, ids, *, start_pos):
         self.release(ids)
 
     def available_size(self):
-        return len(self.free) * self.page
+        return len(self.free_pages) * self.page
 
 
 class Allocator:
@@ -67,6 +70,9 @@ class Allocator:
         self.swa_attn_allocator = Pages(swa // page * page, page)
         self.full_to_swa_index_mapping = torch.zeros(full + page, dtype=torch.int64)
         self._swa_req_ring = False
+        self.state = self.storage = None
+        self.has_window_pool = True
+        self.hands_out_virtual_ids = False
 
     def alloc(self, n):
         full = self.full_attn_allocator.alloc(n)
@@ -155,6 +161,7 @@ def fixture(root, testcase):
         NamedTuple=NamedTuple,
         defaultdict=defaultdict,
         heapq=heapq,
+        nullcontext=nullcontext,
         time=time,
         sys=sys,
         logger=logging.getLogger(__name__),
@@ -164,6 +171,7 @@ def fixture(root, testcase):
             func if func is not None else lambda f: f
         ),
         ceil_align=lambda n, p: (n + p - 1) // p * p,
+        is_cp_sharded_padded=lambda: False,
     )
     ns.update(logging=logging, enum=enum)
     ns.update({k: v for k, v in vars(typing).items() if not k.startswith("__")})
@@ -201,6 +209,12 @@ def fixture(root, testcase):
             ns,
         )
 
+    ns.update(
+        TREE_TOKEN="token", TREE_WINDOW="window", TREE_STATE="state", TREE_BLOCK="block"
+    )
+    load("mem_cache/kv/plan.py", {"TreeSlot"})
+    load("mem_cache/static_kv_storage.py", {"StaticKVStorage", "kv_storage_of"})
+    load("mem_cache/allocation.py", {"_storage", "retire_window"})
     load("mem_cache/unified_cache/component_type.py", assign=True)
     load("disaggregation/kv_events.py", {"StorageMedium"})
     load("mem_cache/base_prefix_cache.py")
@@ -234,6 +248,8 @@ def fixture(root, testcase):
         get_spec=lambda: NS(speculative_algorithm=None),
         get_serving=lambda: NS(strip_thinking_cache=False),
         is_virtual_node=lambda node: False,
+        # This fixture uses the independent static FULL/SWA allocator.
+        uses_joint_lru=lambda params, components: False,
     )
     events = NS(
         enabled=False,
@@ -249,12 +265,15 @@ def fixture(root, testcase):
     pool.free = lambda req: setattr(req.kv, "req_pool_idx", None)
     cache.req_to_token_pool = pool
     cache.token_to_kv_pool_allocator = allocator
+    cache.logical_page_size = allocator.page_size
     cache.disable = False
     cache.enable_session_radix_cache = False
     cache.is_mamba_enabled = False
     cache.is_swa_enabled = True
     cache._sliding_window_size = 128
-    cache.draft_swa_window = 0
+    cache.draft_window_reaches = {}
+    cache.uocr_doc_reuse = None
+    cache.evicts_by_joint_lru = False
     cache.decoder_swa_bounded_replay = True
     cache.buffer_pipeline = cache.linker = cache.cache_controller = None
     cache.host_memory_mode = None
@@ -265,6 +284,7 @@ def fixture(root, testcase):
     cache.ongoing_prefetch = {}
     cache.storage_prefetch_retries = NS(cancel=lambda rid: None)
     cache.session = NS(
+        slots={},
         try_checkpoint=lambda *a, **kw: False,
         try_match_prefix=lambda p: None,
         will_lend_record=lambda req: False,
@@ -272,17 +292,12 @@ def fixture(root, testcase):
     )
     ct = ns["ComponentType"]
     cache.tree_components = (ct.FULL, ct.SWA)
-    full = ns["FullComponent"](cache, NS())
-    swa = ns["SWAComponent"].__new__(ns["SWAComponent"])
-    ns["TreeComponent"].__init__(swa, cache, NS())
-    swa._session_leaf_covered_len = {}
-    swa.sliding_window_size = 128
-    swa.gates_prefix_match = True
-    swa.full_window_pages = 1
-    swa._swa_kv_pool_host = None
-    cache.components = {ct.FULL: full, ct.SWA: swa}
-    cache._components_tuple = (full, swa)
     params = NS(
+        tree_slots=(
+            ns["TreeSlot"](component="FULL", family="token"),
+            ns["TreeSlot"](component="SWA", family="window", window=128),
+        ),
+        swa_gates_prefix_match=True,
         page_size=256,
         is_eagle=False,
         enable_session_radix_cache=False,
@@ -293,6 +308,11 @@ def fixture(root, testcase):
         dynamo_kv_event_format=False,
         kv_event_lora_names=None,
     )
+    cache._index_slots(params.tree_slots)
+    full = ns["FullComponent"](cache, params, params.tree_slots[0])
+    swa = ns["SWAComponent"](cache, params, params.tree_slots[1])
+    cache.components = {ct.FULL: full, ct.SWA: swa}
+    cache._components_tuple = (full, swa)
     cache.tree_core = ns["UnifiedTreeCore"](params, cache.components)
     # Only GPU-independent import boundaries, not checkpoint/tree logic.
     common = NS(
@@ -310,14 +330,17 @@ def fixture(root, testcase):
             sys.modules,
             {
                 "sglang.srt.mem_cache.common": common,
+                "sglang.srt.mem_cache.static_kv_storage": NS(
+                    kv_storage_of=ns["kv_storage_of"]
+                ),
+                "sglang.srt.mem_cache.allocation": NS(
+                    retire_window=ns["retire_window"]
+                ),
                 "sglang.srt.mem_cache.unified_cache.component_type": NS(
                     ComponentType=ct
                 ),
                 "sglang.srt.layers.attention.dsv4.unified_kv_gate": NS(
                     is_unified_kv_triton=lambda: False
-                ),
-                "sglang.srt.mem_cache.allocator.unified_hybrid_swa": NS(
-                    UnifiedSWAAllocatorBase=type("UnifiedSWAAllocatorBase", (), {})
                 ),
             },
         )
@@ -344,6 +367,7 @@ def fixture(root, testcase):
             skip_radix_cache_insert=False,
             finished_len=None,
             refresh_fill_ids=lambda: None,
+            get_fill_ids=lambda: tokens,
             owned_kv_len=lambda: len(tokens),
         )
         prefix = 0

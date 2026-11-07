@@ -20,6 +20,7 @@ register_cpu_ci(est_time=5, suite="base-a-test-cpu")
 class TestBreakableOutput(CustomTestCase):
     def setUp(self):
         self.backend = BreakableCudaGraphBackend.__new__(BreakableCudaGraphBackend)
+        self.backend._enable_hicache_event_capture = False
         self.backend._cuda_graph_runner = SimpleNamespace(
             cuda_graph_output_rows=lambda output: None
         )

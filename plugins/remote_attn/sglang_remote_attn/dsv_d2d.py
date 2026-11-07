@@ -9,7 +9,6 @@ import json
 import re
 import threading
 import time
-from array import array
 from contextlib import nullcontext
 from dataclasses import dataclass, field
 from pathlib import Path
@@ -18,10 +17,10 @@ from types import SimpleNamespace as NS
 import torch
 
 from . import d2d_bulk as bulk
-from . import mooncake_backend as transport
 from . import d2d_groups as grouping
 from . import d2d_ranges as ranges
 from . import dsv41_remote as remote
+from . import mooncake_backend as transport
 from . import remote_data_plane as dp
 from .transport_failure import TransportFailure
 
@@ -328,17 +327,7 @@ class Source:
             output_ids=list(req.output_ids),
             kv_len=self.prefix_len,
             sampling=self.parameters,
-            detokenize={
-                name: (list(value) if isinstance(value, array) else value)
-                for name in (
-                    "decoded_text",
-                    "surr_offset",
-                    "read_offset",
-                    "cur_decode_ids_len",
-                    "surr_and_decode_ids",
-                )
-                for value in (getattr(req, name, None),)
-            },
+            detokenize={"output_prefix_len": len(req.output_ids)},
             schema=self.schema,
             tp_size=self.owner.tp_size,
             states=[d for d, t, i in self.states],
@@ -551,7 +540,9 @@ def execute(job, stream, cache):
 
 
 class Reader:
-    def __init__(self, route, destination, epoch, timeout=600, *, owner, req, offer=None):
+    def __init__(
+        self, route, destination, epoch, timeout=600, *, owner, req, offer=None
+    ):
         self.route, self.destination, self.epoch = route, destination, epoch
         self.client = remote.runtime().TargetClient(route["host"], route["port"])
         self.client.attach(route["handoff_id"], route["token"], route["epoch"])
@@ -586,7 +577,9 @@ class Reader:
             device = self.owner.pool.get_swa_key_buffer_radix(0).device
             catalog = transport.Catalog(manager(self.owner).engine, device)
             backend = catalog.select(self.offer)
-            self.bulk = bulk.Receiver(catalog.engines[backend], self.req, device, backend=backend)
+            self.bulk = bulk.Receiver(
+                catalog.engines[backend], self.req, device, backend=backend
+            )
         with self.bulk.lock:
             try:
                 h["bulk_region"] = self.bulk.prepare()
@@ -1178,7 +1171,9 @@ def import_request(controller, data):
     ):
         raise ValueError("D2D transfer epoch/TP mismatch")
     transport.validate(transfer.get("bulk_capabilities"))
-    transport.Catalog(manager(controller).engine, controller.pool.get_swa_key_buffer_radix(0).device).select(transfer["bulk_capabilities"])
+    transport.Catalog(
+        manager(controller).engine, controller.pool.get_swa_key_buffer_radix(0).device
+    ).select(transfer["bulk_capabilities"])
     ranges.check_history(
         transfer["origin_input_ids"], transfer["output_ids"], transfer["kv_len"]
     )
@@ -1205,11 +1200,11 @@ def import_request(controller, data):
         transfer["output_ids"],
         params,
     )
-    for name, value in transfer["detokenize"].items():
-        if name == "surr_and_decode_ids" and value is not None:
-            value = array("q", value)
-        if value is not None:
-            setattr(req, name, value)
+    from .compat import restore_detokenize_prefix
+
+    restore_detokenize_prefix(
+        req, transfer["detokenize"].get("output_prefix_len", len(req.output_ids))
+    )
     target = Target(
         controller,
         None,
@@ -1220,7 +1215,19 @@ def import_request(controller, data):
     )
     target.group_size = group_size
     target.token_range = token_range
-    target.queue = NS(queue=[])
+    target.queue = getattr(controller.scheduler, "disagg_decode_transfer_queue", None)
+    if target.queue is None:
+        from sglang.srt.managers.scheduler_components.request_list import (
+            IndexedReqList,
+            ListKind,
+        )
+
+        target.queue = NS(
+            queue=IndexedReqList(ListKind.PD_RECEIVING, req_of=lambda item: item.req)
+        )
+    # D2D owns its frozen manifest and pending token already. It shares the
+    # native queue interface for lifetime tracking but never enters the normal
+    # PD metadata/token-commit queue and must not sample that token a second time.
     targets[epoch] = target
     _tracked(controller.scheduler)[rid] = req
     req._pre_layerwise_target = target

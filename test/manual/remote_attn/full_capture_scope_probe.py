@@ -16,7 +16,7 @@ from pathlib import Path
 from unittest.mock import patch
 
 import torch
-from segmented_graph_probe import definitions, load
+from segmented_graph_probe import definitions, load, load_native_backend_base
 from sglang_remote_attn import segmented_graph as sg
 
 
@@ -34,7 +34,10 @@ def run(root, buckets, full_mode):
         package.__path__ = []
         sys.modules[name] = package
     sys.modules["sglang.srt.utils"] = types.SimpleNamespace(
-        get_device_module=lambda: torch.cuda, is_hip=lambda: False, is_xpu=lambda: False
+        get_device_module=lambda: torch.cuda,
+        is_hip=lambda: False,
+        is_musa=lambda: False,
+        is_xpu=lambda: False,
     )
     sys.modules["sglang.srt.model_executor.runner_backend_utils.weak_ref_tensor"] = (
         types.SimpleNamespace(weak_ref_tensors=lambda x: x)
@@ -89,6 +92,7 @@ def run(root, buckets, full_mode):
         eager_on_graph=primitive.eager_on_graph,
         enable_breakable_cuda_graph=nullcontext,
     )
+    load_native_backend_base(root, ns)
     definitions(native / "runner_backend/full_cuda_graph_backend.py", ns)
     definitions(native / "runner_backend/breakable_cuda_graph_backend.py", ns)
     runner = types.SimpleNamespace(
@@ -120,7 +124,7 @@ def run(root, buckets, full_mode):
         variant_label: object = None
         attention_variant: object = None
 
-    eager = primitive.eager_on_graph(lambda x: x + 1)
+    eager = primitive.eager_on_graph(lambda x: x + 1, output_factory=torch.empty_like)
     start, initialized, done, release = (threading.Event() for _ in range(4))
     allocation, errors = {}, []
 

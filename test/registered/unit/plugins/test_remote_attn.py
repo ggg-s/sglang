@@ -28,6 +28,7 @@ import unittest
 import uuid
 import weakref
 from array import array
+from collections import deque
 from contextlib import ExitStack, contextmanager, nullcontext
 from pathlib import Path
 from types import SimpleNamespace
@@ -84,6 +85,17 @@ def _host_staging_manager():
     )
 
 
+def _request_list(items=(), *, kind="WAITING", req_of=lambda item: item):
+    from sglang.srt.managers.scheduler_components.request_list import (
+        IndexedReqList,
+        ListKind,
+    )
+
+    result = IndexedReqList(ListKind[kind], req_of=req_of)
+    result.join(items)
+    return result
+
+
 def _source_class(relative, owner, members=None, *, strip_method_decorators=False):
     path = ROOT / "python" / "sglang" / "srt" / relative
     tree = ast.parse(path.read_text())
@@ -105,10 +117,25 @@ def _source_class(relative, owner, members=None, *, strip_method_decorators=Fals
         ],
         type_ignores=[],
     )
+    from sglang.srt.managers.scheduler_components.request_list import (
+        IndexedReqList,
+        ListKind,
+    )
+
     namespace = {
+        "IndexedReqList": IndexedReqList,
+        "ListKind": ListKind,
+        "deque": deque,
+        "pre_alloc_fill_len": _source_function(
+            "disaggregation/utils.py", "pre_alloc_fill_len"
+        ),
         "torch": torch,
         "dataclasses": dataclasses,
         "dataclass": dataclasses.dataclass,
+        # These CPU fixtures model the supported unsharded deployment.
+        "is_cp_sharded_padded": lambda: False,
+        "_SCHEDULER_WINDOW": object(),
+        "kv_storage_of": _native_storage_of,
     }
     exec(compile(ast.fix_missing_locations(module), str(path), "exec"), namespace)
     return namespace[owner]
@@ -129,9 +156,65 @@ def _source_function(relative, name, *, namespace=None):
         ],
         type_ignores=[],
     )
-    namespace = dict(namespace or {})
+    namespace = {
+        "is_cp_sharded_padded": lambda: False,
+        "kv_storage_of": _native_storage_of,
+        **(namespace or {}),
+    }
     exec(compile(ast.fix_missing_locations(module), str(path), "exec"), namespace)
     return namespace[name]
+
+
+@functools.lru_cache(None)
+def _native_storage_globals():
+    # Execute production storage lifecycle methods; only disabled CP and GPU
+    # model/type imports are omitted by the source loader.
+    import msgspec
+
+    ns = dict(
+        torch=torch, msgspec=msgspec, page_interleave_shard_size=lambda allocator: 1
+    )
+    for relative, names in (
+        ("mem_cache/kv/storage.py", {"ResumeUnits"}),
+        (
+            "mem_cache/static_kv_storage.py",
+            {"StaticKVStorage", "kv_storage_of", "acquire_rows"},
+        ),
+    ):
+        path = ROOT / "python/sglang/srt" / relative
+        nodes = [
+            n
+            for n in ast.parse(path.read_text()).body
+            if isinstance(n, (ast.ClassDef, ast.FunctionDef)) and n.name in names
+        ]
+        module = ast.Module(
+            body=[
+                ast.ImportFrom(
+                    module="__future__", names=[ast.alias(name="annotations")], level=0
+                ),
+                *nodes,
+            ],
+            type_ignores=[],
+        )
+        exec(compile(ast.fix_missing_locations(module), str(path), "exec"), ns)
+    return ns
+
+
+def _native_storage_of(*args, **kwargs):
+    return _native_storage_globals()["kv_storage_of"](*args, **kwargs)
+
+
+def _bind_window_retirement(cache, advance):
+    # This focused fixture supplies a storage boundary; retire_window is the
+    # actual native dispatcher, and advance retains the test's physical ledger.
+    cache.req_to_token_pool = getattr(cache, "req_to_token_pool", None)
+    allocator = getattr(cache, "token_to_kv_pool_allocator", SimpleNamespace())
+    allocator.storage = SimpleNamespace(
+        advance=lambda req, frontier, **kw: advance(req, frontier)
+    )
+    cache.token_to_kv_pool_allocator = allocator
+    cache.window_retention = lambda req: ((None, None, None),)
+    cache.supports_prefix_sharing = lambda: True
 
 
 def _reference_reaper_class():
@@ -175,6 +258,26 @@ class TestRemoteAttn(CustomTestCase):
                     "sglang.srt.disaggregation.base.conn": SimpleNamespace(
                         KVPoll=_source_class("disaggregation/base/conn.py", "KVPoll")
                     )
+                },
+            )
+        )
+        storage = _source_function("mem_cache/allocation.py", "_storage")
+        retire = _source_function(
+            "mem_cache/allocation.py", "retire_window", namespace={"_storage": storage}
+        )
+        cls.stack.enter_context(
+            patch.dict(
+                sys.modules,
+                {
+                    "sglang.srt.mem_cache.allocation": SimpleNamespace(
+                        retire_window=retire
+                    ),
+                    "sglang.srt.mem_cache.static_kv_storage": SimpleNamespace(
+                        kv_storage_of=_native_storage_of
+                    ),
+                    "sglang.srt.layers.cp.base": SimpleNamespace(
+                        is_cp_sharded_padded=lambda: False
+                    ),
                 },
             )
         )
@@ -223,6 +326,8 @@ class TestRemoteAttn(CustomTestCase):
         allocator.device = "cpu"
         allocator.need_sort = False
         allocator.clear()
+        allocator.storage = allocator.state = None
+        allocator.has_window_pool = False
         return allocator
 
     def _req(self, mapping=None):
@@ -265,6 +370,8 @@ class TestRemoteAttn(CustomTestCase):
             time=time,
             defaultdict=defaultdict,
             logger=logging.getLogger(__name__),
+            is_cp_sharded_padded=lambda: False,
+            kv_storage_of=_native_storage_of,
         )
 
         def load(relative, names=None):
@@ -338,6 +445,7 @@ class TestRemoteAttn(CustomTestCase):
             setattr(type(allocator), name, getattr(base, name))
         cache = ns["RadixCache"].__new__(ns["RadixCache"])
         cache.disable, cache.page_size, cache.is_eagle = False, 1, False
+        cache.logical_page_size = 1
         cache.device = "cpu"
         cache.req_to_token_pool = self._pool(8)
         cache.token_to_kv_pool_allocator = allocator
@@ -475,7 +583,13 @@ class TestRemoteAttn(CustomTestCase):
         build._build_decode_prefix_match.__globals__["DecodePrefixMatch"] = prefix
         Queue._build_decode_prefix_match = build._build_decode_prefix_match
         alloc = _source_function(
-            "disaggregation/decode.py", "alloc_for_decode_prealloc"
+            "disaggregation/decode.py",
+            "alloc_for_decode_prealloc",
+            namespace={
+                "_evicted_by_caller": _source_function(
+                    "disaggregation/decode.py", "_evicted_by_caller"
+                )
+            },
         )
         ns = Queue._pre_alloc.__globals__
         ns.update(
@@ -497,7 +611,6 @@ class TestRemoteAttn(CustomTestCase):
         queue_.token_to_kv_pool_allocator = f.allocator
         queue_._uses_swa_tail_prealloc = lambda: False
         queue_._swa_tail_len = lambda fill: fill
-        queue_._pre_alloc_fill_len = lambda req: len(req.origin_input_ids)
         queue_._required_alloc_tokens = lambda **kw: kw["fill_len"] - kw["prefix_len"]
         queue_._radix_full_available = f.allocator.available_size
         result = match_prefix(Queue._match_prefix_and_lock, queue_, req)
@@ -1299,8 +1412,9 @@ class TestRemoteAttn(CustomTestCase):
         freed = []
         tree = SimpleNamespace(
             supports_mamba=lambda: True,
-            req_to_token_pool=SimpleNamespace(
-                mamba_allocator=SimpleNamespace(free=freed.append)
+            req_to_token_pool=SimpleNamespace(),
+            token_to_kv_pool_allocator=SimpleNamespace(
+                storage=None, state_slots=SimpleNamespace(free=freed.append)
             ),
         )
         self.hooks._release_kv(release, req, tree, checkpoint=False)
@@ -1447,9 +1561,7 @@ class TestRemoteAttn(CustomTestCase):
         from enum import IntEnum, auto
 
         tree = ast.parse(
-            (
-                ROOT / "python/sglang/srt/model_executor/forward_batch_info.py"
-            ).read_text()
+            (ROOT / "python/sglang/srt/model_executor/forward_mode.py").read_text()
         )
         node = next(n for n in tree.body if getattr(n, "name", None) == "ForwardMode")
         namespace = {"IntEnum": IntEnum, "auto": auto}
@@ -1493,6 +1605,7 @@ class TestRemoteAttn(CustomTestCase):
             execute("prefill-graph"),
         )
         runner = cls()
+        runner.uocr_greedy_graph = None
         runner.model = SimpleNamespace(shared_experts_config=None)
         runner.attn_backend = runner.device_timer = runner.hisparse_coordinator = None
         runner.device = "cuda"
@@ -1615,6 +1728,8 @@ class TestRemoteAttn(CustomTestCase):
         f.manager.enable_staging = staged and not dsv
         f.manager.pp_rank = 0
         f.registration.dst_aux_ptrs = []
+        f.registration.dst_aux_item_lens = []
+        f.manager.kv_args.aux_data_ptrs = f.manager.kv_args.aux_item_lens = []
         f.registration.staging_base_ptr, f.registration.staging_total_size = 4096, 4096
         f.manager.kv_args.page_size = 8 if dsv else 1
         f.scheduler.disagg_metadata_buffers = SimpleNamespace(set_buf=lambda req: None)
@@ -2419,21 +2534,29 @@ class TestRemoteAttn(CustomTestCase):
     def _check_decode_overlap_native_loop(self, *, with_cache):
         from collections import deque
 
-        from sglang_remote_attn.decode_overlap import disable_overlap
+        from sglang_remote_attn.decode_overlap import process_last_batch_early
 
         native = _source_class(
             "disaggregation/decode.py",
             "SchedulerDisaggregationDecodeMixin",
             {"event_loop_overlap_disagg_decode"},
         )
-        native.event_loop_overlap_disagg_decode.__wrapped__.__globals__["deque"] = deque
+        native.event_loop_overlap_disagg_decode.__wrapped__.__globals__.update(
+            deque=deque,
+            envs=SimpleNamespace(
+                SGLANG_ENABLE_NV_MEGA_RUNTIME_OPTIMIZATION=SimpleNamespace(
+                    get=lambda: False
+                ),
+                SGLANG_ENABLE_NV_MEGA_PDDEC_RUNTIME_OPTIMIZATION=SimpleNamespace(
+                    get=lambda: False
+                ),
+            ),
+        )
         predicate = _source_class(
-            "managers/scheduler.py", "Scheduler", {"is_disable_overlap_for_batch"}
-        ).is_disable_overlap_for_batch
+            "managers/scheduler.py", "Scheduler", {"should_process_last_batch_early"}
+        ).should_process_last_batch_early
         predicate.__globals__["envs"] = SimpleNamespace(
-            SGLANG_DISABLE_CONSECUTIVE_PREFILL_OVERLAP=SimpleNamespace(
-                get=lambda: False
-            )
+            SGLANG_DISABLE_OVERLAP_AFTER_PREFILL=SimpleNamespace(get=lambda: False)
         )
         with tempfile.TemporaryDirectory() as directory:
             if with_cache:
@@ -2467,6 +2590,7 @@ class TestRemoteAttn(CustomTestCase):
                     name=name,
                     reqs=[target.decode_req.req],
                     spec_algorithm=SimpleNamespace(is_none=lambda: True),
+                    grammar_needs_sync=lambda: False,
                     forward_mode=SimpleNamespace(
                         is_prebuilt=lambda: False, is_extend=lambda: False
                     ),
@@ -2524,13 +2648,16 @@ class TestRemoteAttn(CustomTestCase):
                 processed.append(b.name)
 
             scheduler.ingest_requests = ingest
-            scheduler.process_decode_queue = controller.retire_targets
+            scheduler.process_decode_queue = lambda **kw: controller.retire_targets()
+            scheduler.increment_scheduler_iterations = lambda: None
+            scheduler._flush_staging_scatters = lambda: None
             scheduler.get_next_disagg_decode_batch_to_run = lambda **kw: (
                 SimpleNamespace(running_batch=None, batch_to_run=batches[iteration])
             )
-            scheduler.is_disable_overlap_for_batch = lambda b, last_batch: (
-                disable_overlap(predicate, scheduler, b, last_batch)
+            scheduler.should_process_last_batch_early = lambda last_batch: (
+                process_last_batch_early(predicate, scheduler, last_batch)
             )
+            self.assertFalse(scheduler.should_process_last_batch_early(None))
             scheduler.run_batch = lambda b: self.hooks.pre_layerwise.run_batch(
                 launch, scheduler, b
             )
@@ -2575,7 +2702,7 @@ class TestRemoteAttn(CustomTestCase):
                 for _ in range(16):
                     controller.retire_targets()
                     self.assertFalse(
-                        disable_overlap(predicate, scheduler, batches[4], batches[5])
+                        process_last_batch_early(predicate, scheduler, batches[5])
                     )
                     scheduler.run_batch(batches[4])
             if with_cache:
@@ -2623,13 +2750,17 @@ class TestRemoteAttn(CustomTestCase):
             )
             scheduler = controller.scheduler
             scheduler.enable_decode_hicache = False
-            scheduler.waiting_queue = []
+            scheduler.tree_cache = f.cache
+            scheduler.waiting_queue = _request_list()
             scheduler.disagg_decode_prealloc_queue = SimpleNamespace(
-                resume_retracted_reqs=lambda: [], retracted_queue=[object()]
+                resume_retracted_reqs=lambda: [],
+                retracted_queue=[object()],
+                publish_pending_destinations=lambda: None,
             )
             queue = SimpleNamespace(scheduler=scheduler)
             scheduler.disagg_decode_transfer_queue = SimpleNamespace(
-                resolve_deferred_releases=lambda: reap(lambda q: None, queue)
+                resolve_deferred_releases=lambda: reap(lambda q: None, queue),
+                publish_pending_metadata=lambda: None,
             )
             process_queue(scheduler)
             self._retire_step(controller)
@@ -2741,6 +2872,13 @@ class TestRemoteAttn(CustomTestCase):
         ).reset_for_retract
         req.reset_for_retract = lambda: native_reset(req)
         native_release = _source_function("managers/schedule_batch.py", "release_req")
+        retirer_cls = _source_class(
+            "managers/scheduler_components/request_retirer.py",
+            "RequestRetirer",
+            {"retract"},
+        )
+        retirer = retirer_cls()
+        retirer.tree_cache, retirer.hisparse_coordinator = f.cache, None
         with tempfile.TemporaryDirectory() as directory:
             controller, target, _ = self._overlap_target(directory, req)
             ready = SimpleNamespace(done=False)
@@ -2790,6 +2928,7 @@ class TestRemoteAttn(CustomTestCase):
                     SGLANG_RETRACT_DECODE_STEPS=SimpleNamespace(get=lambda: 1)
                 ),
             )
+            retirer_cls.retract.__globals__.update(native_release.__globals__)
             with patch.object(
                 self.hooks.pre_layerwise.time, "sleep", side_effect=device_progress
             ):
@@ -2798,10 +2937,8 @@ class TestRemoteAttn(CustomTestCase):
                         native_release,
                         req=req,
                         remaing_req_count=1,
-                        req_to_token_pool=f.cache.req_to_token_pool,
-                        token_to_kv_pool_allocator=f.allocator,
                         tree_cache=f.cache,
-                        hisparse_coordinator=None,
+                        request_retirer=retirer,
                     )
                 )
             self.assertEqual(len(backed_up), 1)
@@ -2988,6 +3125,7 @@ class TestRemoteAttn(CustomTestCase):
                 return nullcontext()
 
             def capture_one(self, key, fn, *a):
+                fn()
                 self.capturing = True
                 try:
                     self.outputs[key.size] = fn()
@@ -3013,11 +3151,22 @@ class TestRemoteAttn(CustomTestCase):
                 trace.append("clean_" + self.name)
 
         full, remote = Bank("full"), Bank("remote")
+
+        def eager(fn, *, on_capture=None, output_factory=None):
+            def wrapped(*a, **kw):
+                if remote.capturing:
+                    if on_capture is not None:
+                        on_capture(*a, **kw)
+                    return output_factory(*a, **kw) if output_factory else fn(*a, **kw)
+                return fn(*a, **kw)
+
+            return wrapped
+
         backend = sg.RemoteGraphBackend(
             runner,
             full,
             remote,
-            lambda fn: fn,
+            eager,
             lambda: remote.capturing,
             lambda: trace.append("restore"),
         )
@@ -3244,7 +3393,7 @@ class TestRemoteAttn(CustomTestCase):
                 BreakableCudaGraphBackend=lambda runner, **kw: SimpleNamespace(**kw)
             ),
             "sglang.srt.model_executor.runner_backend_utils.breakable_cuda_graph": SimpleNamespace(
-                eager_on_graph=lambda fn: fn
+                eager_on_graph=lambda fn, **kw: fn
             ),
             "sglang.srt.model_executor.runner_backend_utils.breakable_cuda_graph.breakable_cuda_graph": SimpleNamespace(
                 is_capturing=lambda: False
@@ -3337,7 +3486,12 @@ class TestRemoteAttn(CustomTestCase):
         native = _source_class(
             "model_executor/runner/decode_cuda_graph_runner.py",
             "DecodeCudaGraphRunner",
-            {"load_batch"},
+            {
+                "load_batch",
+                "_with_logits_variant",
+                "_resolve_logits_variant",
+                "_replay_pads_rows",
+            },
         )
         staged = []
         runner = f.runner
@@ -3358,6 +3512,11 @@ class TestRemoteAttn(CustomTestCase):
                 fill_from=lambda fb, **kw: staged.append(kw)
             ),
             _skips_prefilled_inputs=False,
+            _restage_skip=False,
+            _verify_logits_processor=None,
+            _with_logits_variant=native._with_logits_variant.__get__(runner),
+            _resolve_logits_variant=native._resolve_logits_variant.__get__(runner),
+            _replay_pads_rows=native._replay_pads_rows.__get__(runner),
             _set_dp_real_num_tokens=lambda n: None,
             enable_two_batch_overlap=False,
             _init_replay_attn_metadata=lambda *a, **kw: None,
@@ -3854,9 +4013,14 @@ class TestRemoteAttn(CustomTestCase):
             if payload["cmd"] == "status":
                 return copy.deepcopy(gateway._src_facts)
             if payload["cmd"] == "plan":
-                return {"plans":[dict(rid=x["rid"],target_rid=x["target_rid"],upper=32895) for x in payload["items"]]}
+                return {
+                    "plans": [
+                        dict(rid=x["rid"], target_rid=x["target_rid"], upper=32895)
+                        for x in payload["items"]
+                    ]
+                }
             if payload["cmd"] == "reservation_ready":
-                return {"confirmed":True}
+                return {"confirmed": True}
             raise AssertionError(f"unexpected source RPC {payload}")
 
         def target_send(payload, **kwargs):
@@ -3864,7 +4028,10 @@ class TestRemoteAttn(CustomTestCase):
             if payload["cmd"] == "status":
                 return {"reqs": [], "max_running": 8}
             if payload["cmd"] == "reserve":
-                return {"errors": {},"reservations":{x["target_rid"]:x for x in payload["plans"][0]}}
+                return {
+                    "errors": {},
+                    "reservations": {x["target_rid"]: x for x in payload["plans"][0]},
+                }
             if payload["cmd"] == "admit_ordinary":
                 return {"admitted": True}
             if payload["cmd"] in ("submit", "release", "capacity_cancel"):
@@ -3985,7 +4152,9 @@ class TestRemoteAttn(CustomTestCase):
                 self.assertEqual(
                     sum(role == "dst" and p["cmd"] == "submit" for role, p in calls), 8
                 )
-                self.assertFalse(any(role == "src" and p["cmd"] == "submit" for role, p in calls))
+                self.assertFalse(
+                    any(role == "src" and p["cmd"] == "submit" for role, p in calls)
+                )
                 for handler in handlers:
                     self.assertIn(b'"token_id": 42', handler.wfile.getvalue())
                     events = [
@@ -4117,7 +4286,9 @@ class TestRemoteAttn(CustomTestCase):
             thread.join(3)
         self.assertFalse(thread.is_alive())
         self.assertEqual(errors, [])
-        self.assertFalse(any(role == "src" and p["cmd"] == "submit" for role, p in calls))
+        self.assertFalse(
+            any(role == "src" and p["cmd"] == "submit" for role, p in calls)
+        )
         target_commands = [p["cmd"] for role, p in calls]
         self.assertLess(
             target_commands.index("reserve"), target_commands.index("admit_ordinary")
@@ -4545,10 +4716,16 @@ class TestRemoteAttn(CustomTestCase):
             if payload["cmd"] == "status":
                 return {"max_running": 2, "reqs": []}
             if payload["cmd"] == "reserve" and "plans" in payload:
-                certs = {x["target_rid"]:x for x in payload["plans"][0]}
-                payload = {"cmd":"reserve","items":payload["items"],"epoch":payload["epoch"]}
+                certs = {x["target_rid"]: x for x in payload["plans"][0]}
+                payload = {
+                    "cmd": "reserve",
+                    "items": payload["items"],
+                    "epoch": payload["epoch"],
+                }
                 requests.append(payload)
-                return dict(self.runtime._handle(scheduler,payload),reservations=certs)
+                return dict(
+                    self.runtime._handle(scheduler, payload), reservations=certs
+                )
             requests.append(payload)
             return self.runtime._handle(scheduler, payload)
 
@@ -4564,7 +4741,18 @@ class TestRemoteAttn(CustomTestCase):
             return role.send(payload)
 
         gateway._send_timed = timed
-        gateway.src = SimpleNamespace(send=lambda p,**kw: {"plans":[dict(rid=x["rid"],target_rid=x["target_rid"],upper=5) for x in p["items"]]} if p["cmd"]=="plan" else {"confirmed":True})
+        gateway.src = SimpleNamespace(
+            send=lambda p, **kw: (
+                {
+                    "plans": [
+                        dict(rid=x["rid"], target_rid=x["target_rid"], upper=5)
+                        for x in p["items"]
+                    ]
+                }
+                if p["cmd"] == "plan"
+                else {"confirmed": True}
+            )
+        )
         gateway._maybe_kill = lambda stage: None
         context = SimpleNamespace(
             get_schedule=lambda: SimpleNamespace(max_running_requests=2)
@@ -5298,7 +5486,9 @@ class TestRemoteAttn(CustomTestCase):
             with self.subTest(failure=failure):
                 self._fast_sender_contract(failure)
 
-    def _fast_sender_contract(self, failure=None, group=1, slots=1, reuse=False, async_=True):
+    def _fast_sender_contract(
+        self, failure=None, group=1, slots=1, reuse=False, async_=True
+    ):
         device = threading.local()
         device.value = 1
         tensors = {}
@@ -5307,7 +5497,13 @@ class TestRemoteAttn(CustomTestCase):
         controls = []
         messages = queue.Queue()
         messages.put({"token": "regression"})
-        messages.put({"session": "peer", "addrs": list(range(100, 100 + 2 * slots)), "slots": slots})
+        messages.put(
+            {
+                "session": "peer",
+                "addrs": list(range(100, 100 + 2 * slots)),
+                "slots": slots,
+            }
+        )
 
         class Stream:
             def wait_event(self, event):
@@ -5357,6 +5553,7 @@ class TestRemoteAttn(CustomTestCase):
             return tensor
 
         batches = []
+
         class Engine:
             def __init__(self):
                 self.next = 0
@@ -5369,7 +5566,9 @@ class TestRemoteAttn(CustomTestCase):
                 self.next += 1
                 bid = self.available.pop() if reuse and self.available else self.next
                 batches.append(len(addresses))
-                self.pending[bid] = [(tensors[a], tensors[a].clone()) for a in addresses]
+                self.pending[bid] = [
+                    (tensors[a], tensors[a].clone()) for a in addresses
+                ]
                 return bid
 
             def batch_transfer_sync_write(self, session, addresses, peer, sizes):
@@ -5429,7 +5628,9 @@ class TestRemoteAttn(CustomTestCase):
         original_empty = torch.empty
         with ExitStack() as stack:
             # Frozen metadata wins even if the environment changes afterward.
-            stack.enter_context(patch.dict(os.environ, HANDOFF_D2D_GROUP_SIZE="invalid"))
+            stack.enter_context(
+                patch.dict(os.environ, HANDOFF_D2D_GROUP_SIZE="invalid")
+            )
             for name, value in {
                 "FAST_BUFFERS": 3,
                 "FAST_COPY_STREAMS": 2,
@@ -5763,7 +5964,7 @@ class TestRemoteAttn(CustomTestCase):
             room = torch.zeros((1, 1), dtype=torch.int64)
             manager = SimpleNamespace(_remote_attn_send_lock=lock)
 
-            def aux(peer, idx, pointers):
+            def aux(peer, idx, pointers, item_lens):
                 def write(*args):
                     calls.append("metadata")
                     room[0, 0] = 7
@@ -5794,7 +5995,7 @@ class TestRemoteAttn(CustomTestCase):
                 "g",
                 [],
                 slice(0, 3),
-                ((object(), SimpleNamespace(dst_aux_ptrs=[2])),),
+                ((object(), SimpleNamespace(dst_aux_ptrs=[2], dst_aux_item_lens=[8])),),
                 3,
             )
             req._pre_layerwise_source = source
@@ -5815,7 +6016,7 @@ class TestRemoteAttn(CustomTestCase):
                     while not getattr(lock, which):
                         remaining = deadline - time.monotonic()
                         if remaining <= 0:
-                            raise TimeoutError(which)
+                            raise TimeoutError(f"{which}: {source.error}")
                         lock.condition.wait(min(remaining, 0.01))
 
             event = SimpleNamespace(
@@ -6124,6 +6325,10 @@ class TestRemoteAttn(CustomTestCase):
         manager_cls = _source_class(
             "disaggregation/mooncake/conn.py", "MooncakeKVManager", {"transfer_worker"}
         )
+        manager_cls.customized_info_enabled = False
+        manager_cls.validate_aux_buffers = _source_class(
+            "disaggregation/common/conn.py", "CommonKVManager", {"validate_aux_buffers"}
+        ).validate_aux_buffers
         polls = _source_class("disaggregation/base/conn.py", "KVPoll")
         manager_cls.transfer_worker.__globals__.update(
             time=time,
@@ -6184,6 +6389,8 @@ class TestRemoteAttn(CustomTestCase):
                         requires_dcp_relayout=False,
                         dst_attn_tp_size=1,
                         dst_kv_ptrs=[30, 40],
+                        dst_aux_ptrs=[],
+                        dst_aux_item_lens=None,
                         dst_kv_layer_ids=[],
                         dst_kv_item_len=8,
                     )
@@ -6706,7 +6913,7 @@ class TestRemoteAttn(CustomTestCase):
                 token_to_kv_pool_allocator=allocator,
             )
 
-        cache.evict_sliding_windows = evict
+        _bind_window_retirement(cache, evict)
 
         def checkpoint(req, *, up_to, swa_checkpoint_start=None):
             if swa_checkpoint_start is None:
@@ -6767,10 +6974,12 @@ class TestRemoteAttn(CustomTestCase):
                 "_create_match_validators",
                 "_match_prefix_helper",
                 "_match_post_processor",
+                "_device_prefix_covered_by_match",
             },
         )()
         tree.match_prefix.__globals__.update(
             BASE_COMPONENT_TYPE=0,
+            ComponentType=r.ComponentType,
             MatchResult=r.MatchResult,
             get_and_increase_time_counter=lambda: 1.0,
             LRURefreshPhase=SimpleNamespace(MATCH_END=1),
@@ -6811,11 +7020,15 @@ class TestRemoteAttn(CustomTestCase):
                 name,
                 {"create_match_validator", "finalize_match_result_in_tree_core"},
             )()
+            comp.finalize_match_result_in_tree_core.__globals__["ComponentType"] = (
+                r.ComponentType
+            )
             comp.component_type, comp.tree_core = ct, tree
             comp.sliding_window_size, comp.gates_prefix_match = 128, True
             comp.refresh_lru = lambda *a: None
             components.append(comp)
         tree.components = components
+        tree.components_by_type = {c.component_type: c for c in components}
         key_fn = _source_function(
             "mem_cache/common.py", "_req_radix_key", namespace={"RadixKey": r.RadixKey}
         )
@@ -7359,7 +7572,7 @@ class TestRemoteAttn(CustomTestCase):
             "disaggregation/prefill.py",
             "SchedulerDisaggregationPrefillMixin",
             {
-                "process_disagg_prefill_inflight_queue",
+                "process_disagg_prefill_transfer_queue",
                 "handle_inflight_transfer_failure",
             },
             strip_method_decorators=True,
@@ -7372,7 +7585,12 @@ class TestRemoteAttn(CustomTestCase):
             raise RuntimeError("unsettled DMA")
 
         freed, kv_freed = [], []
-        req = SimpleNamespace(
+
+        class Request(SimpleNamespace):
+            __hash__ = object.__hash__
+            __eq__ = object.__eq__
+
+        req = Request(
             rid="failed",
             bootstrap_room=9,
             metadata_buffer_index=7,
@@ -7403,13 +7621,17 @@ class TestRemoteAttn(CustomTestCase):
         req._pre_layerwise_source = source
         scheduler = SimpleNamespace(
             chunked_req=None,
-            disagg_prefill_inflight_queue=[req],
+            disagg_prefill_transfer_queue=_request_list([req], kind="PD_SENDING"),
             attn_cp_cpu_group=None,
             attn_tp_cpu_group=None,
             tree_cache=SimpleNamespace(finish=lambda *a: None),
             metrics_reporter=SimpleNamespace(enable_metrics=False),
             output_streamer=SimpleNamespace(stream_output=lambda *a: None),
-            _release_aborted_request=lambda req: None,
+            request_retirer=SimpleNamespace(
+                release=lambda req, **kw: defer_release(
+                    req, lambda: kv_freed.append(req), checkpoint=kw["checkpoint"]
+                )
+            ),
             req_to_metadata_buffer_idx_allocator=SimpleNamespace(free=freed.append),
         )
         scheduler.handle_inflight_transfer_failure = lambda req: (
@@ -7446,7 +7668,7 @@ class TestRemoteAttn(CustomTestCase):
             },
         ):
             quarantine(owner, source, "pending metadata DMA")
-            native.process_disagg_prefill_inflight_queue(scheduler)
+            native.process_disagg_prefill_transfer_queue(scheduler)
         retire_metadata(req)  # quarantine never supplies retirement proof
         release_metadata(
             native_meta, req, scheduler.req_to_metadata_buffer_idx_allocator
@@ -7518,7 +7740,9 @@ class TestRemoteAttn(CustomTestCase):
         )
         ceil_align = lambda n, p: (n + p - 1) // p * p
         private.__globals__["ceil_align"] = swa.__globals__["ceil_align"] = ceil_align
-        swa.__globals__["ComponentType"] = SimpleNamespace(SWA="swa")
+        swa.__globals__["ComponentType"] = SimpleNamespace(
+            SWA="swa", AUXILIARY_SWA="auxiliary_swa"
+        )
         self.Kv.swa_dead_lo.__globals__["ceil_align"] = ceil_align
         cls._get_total_uncached_sizes.__globals__.update(
             kv_private_tokens=private,
@@ -7547,14 +7771,14 @@ class TestRemoteAttn(CustomTestCase):
             ),
             get_external_kv_owners=lambda: owned_requests(owner),
             get_last_batch=lambda: SimpleNamespace(reqs=[req]),
-            get_running_batch=lambda: None,
+            get_request_lists=lambda: {"running": [req]},
             get_chunked_req=lambda: req,
             req_to_token_pool=SimpleNamespace(size=2, pre_alloc_size=0, free_slots=[1]),
             pool_stats_observer=SimpleNamespace(session_held_req_count=lambda: 0),
         )
         for name in names - {"_check_pool_invariant"}:
             setattr(checker, name, MethodType(getattr(cls, name), checker))
-        self.assertEqual(checker._get_total_uncached_sizes(), (12, 4))
+        self.assertEqual(checker._get_total_uncached_sizes(True), (12, 4))
         checker.get_last_batch, checker.get_chunked_req = lambda: None, lambda: None
         checker._check_full_pool = lambda ps, uncached=0: cls._check_pool_invariant(
             "full", ps.full_free, 0, 4, 0, 32, uncached
@@ -7562,7 +7786,9 @@ class TestRemoteAttn(CustomTestCase):
         checker._check_swa_pool = lambda ps, uncached=0: cls._check_pool_invariant(
             "swa", ps.swa_free, 0, 4, 0, 32, uncached
         )
-        stats = SimpleNamespace(full_free=16, swa_free=24)
+        stats = SimpleNamespace(
+            full_free=16, swa_free=24, is_hybrid_swa=True, is_hybrid_ssm=False
+        )
         with envs.SGLANG_ENABLE_STRICT_MEM_CHECK_DURING_IDLE.override(True):
             self.assertFalse(checker._check_all_pools(stats)[0])
             checker._check_req_pool()
@@ -7584,8 +7810,9 @@ class TestRemoteAttn(CustomTestCase):
             if getattr(n, "name", None) == "free_swa_out_of_window_slots"
         )
         namespace = dict(
-            ComponentType=SimpleNamespace(SWA="swa"),
+            ComponentType=SimpleNamespace(SWA="swa", AUXILIARY_SWA="auxiliary_swa"),
             ceil_align=lambda n, p: (n + p - 1) // p * p,
+            is_cp_sharded_padded=lambda: False,
         )
         module = ast.Module(
             body=[
@@ -7629,7 +7856,7 @@ class TestRemoteAttn(CustomTestCase):
                     reset=lambda: None,
                     lock=lambda n: object(),
                 )
-                cache.evict_sliding_windows = lambda req, end: native_free(
+                advance = lambda req, end: native_free(
                     req,
                     end,
                     sliding_window_size=512,
@@ -7641,6 +7868,7 @@ class TestRemoteAttn(CustomTestCase):
                         )
                     ),
                 )
+                _bind_window_retirement(cache, advance)
                 guard = CacheGuard(
                     cache, allow_swa=True, scheduler=self._swa_scheduler()
                 )
@@ -7668,14 +7896,18 @@ class TestRemoteAttn(CustomTestCase):
         native_free = _source_function(
             "mem_cache/common.py",
             "free_swa_out_of_window_slots",
-            namespace={"ComponentType": SimpleNamespace(SWA="swa")},
+            namespace={
+                "ComponentType": SimpleNamespace(
+                    SWA="swa", AUXILIARY_SWA="auxiliary_swa"
+                )
+            },
         )
         footprint = _source_function(
             "managers/scheduler_components/pool_stats_observer.py",
             "kv_private_swa_tokens",
         )
         ceil_align = lambda n, p: (n + p - 1) // p * p
-        component = SimpleNamespace(SWA="swa")
+        component = SimpleNamespace(SWA="swa", AUXILIARY_SWA="auxiliary_swa")
         native_free.__globals__.update(ComponentType=component, ceil_align=ceil_align)
         footprint.__globals__.update(ComponentType=component, ceil_align=ceil_align)
         self.Kv.swa_dead_lo.__globals__["ceil_align"] = ceil_align
@@ -7723,7 +7955,7 @@ class TestRemoteAttn(CustomTestCase):
                                 self.assertEqual(start_pos % page, 0)
                                 freed.update(slots)
 
-                            cache.evict_sliding_windows = lambda req, end: native_free(
+                            advance = lambda req, end: native_free(
                                 req,
                                 end,
                                 sliding_window_size=window,
@@ -7733,6 +7965,7 @@ class TestRemoteAttn(CustomTestCase):
                                     free_swa_segment=free_segment
                                 ),
                             )
+                            _bind_window_retirement(cache, advance)
                             guard = CacheGuard(
                                 cache,
                                 allow_swa=reclaim,
@@ -7833,7 +8066,6 @@ class TestRemoteAttn(CustomTestCase):
                     reset=lambda: None,
                     lock=lambda node: object(),
                     supports_swa=lambda: True,
-                    evict_sliding_windows=evict,
                 )
                 req = SimpleNamespace(
                     cache_request_handle="attempt",
@@ -7842,6 +8074,7 @@ class TestRemoteAttn(CustomTestCase):
                     origin_input_ids=range(8192),
                     finished=lambda: False,
                 )
+                _bind_window_retirement(cache, evict)
                 guard = CacheGuard(cache, allow_swa=True, scheduler=scheduler)
                 lease = guard.hold(req)
                 cache.checkpoint(req, up_to=2048)
@@ -8289,9 +8522,13 @@ class TestRemoteAttn(CustomTestCase):
         flat = _source_function(
             "disaggregation/mooncake/conn.py", "_uses_flat_entry_layout"
         )
-        flat.__globals__["StateType"] = SimpleNamespace(SWA="swa")
+        flat.__globals__["StateType"] = SimpleNamespace(
+            SWA="swa", AUXILIARY_SWA="auxiliary_swa"
+        )
         manager_cls._send_kvcache_generic.__globals__.update(
-            StateType=SimpleNamespace(SWA="swa", DSA="dsa"),
+            StateType=SimpleNamespace(
+                SWA="swa", AUXILIARY_SWA="auxiliary_swa", DSA="dsa"
+            ),
             np=np,
             group_concurrent_contiguous=group,
             _uses_flat_entry_layout=flat,
@@ -8576,7 +8813,7 @@ class TestRemoteAttn(CustomTestCase):
 
     def test_staging_bootstrap_accepts_disabled_chunking(self):
         cls = _source_class(
-            "disaggregation/prefill.py", "PrefillBootstrapQueue", {"__init__"}
+            "disaggregation/prefill.py", "PrefillBootstrapQueue", {"__init__", "_abort"}
         )
         grid = _source_function(
             "disaggregation/common/staging_buffer.py", "staging_grid_tokens"
@@ -8666,6 +8903,7 @@ class TestRemoteAttn(CustomTestCase):
                     "QSA_PENDING",
                     "QSA_COMPRESSED",
                     "SWA",
+                    "AUXILIARY_SWA",
                     "DSA",
                     "DSA_TAIL",
                     "MINIMAX_INDEX_K",
@@ -8950,6 +9188,13 @@ class TestRemoteAttn(CustomTestCase):
         )
         handler = handler_cls.__new__(handler_cls)
         handler._scatter_lock = threading.RLock()
+        handler._staging_lifecycle = threading.Condition(handler._scatter_lock)
+        handler._room_tokens = {}
+        handler._inflight_submits = {}
+        handler._claimed_chunks = set()
+        handler._closing_rooms = set()
+        handler._defer_scatter = False
+        handler._pending_scatters = deque()
         handler._room_to_decode_req, handler._room_to_receiver = {}, {}
         handler._writer_counts, handler._wm_subscribers = {}, {}
         handler.staging_allocator = allocator
@@ -9395,6 +9640,7 @@ class TestRemoteAttn(CustomTestCase):
         carry_cls.transfer_indices.__globals__["np"] = np
         pool = pool_cls()
         pool._unified_kv = pool._unified_kv_fp8 = pool.uniform_fp8 = False
+        pool.request_window = None
         pool.page_size = pool.swa_page_size = 8
         pool._stage_start, pool._stage_end = 0, 40
         pool.compression_ratios = [0] * 2 + [2] * 18 + [1] * 20
@@ -9451,6 +9697,8 @@ class TestRemoteAttn(CustomTestCase):
         kv_args = SimpleNamespace(
             kv_data_ptrs=ptrs,
             kv_data_lens=lens,
+            aux_data_ptrs=[],
+            aux_item_lens=[],
             kv_item_lens=item_lens,
             kv_layer_ids=[],
             num_draft_entries=0,
@@ -9465,6 +9713,9 @@ class TestRemoteAttn(CustomTestCase):
         ]
         registration = SimpleNamespace(
             dst_kv_ptrs=[t.data_ptr() for t in destination],
+            dst_kv_item_lens=None,
+            dst_aux_ptrs=[],
+            dst_aux_item_lens=[],
             dst_kv_layer_ids=[],
             dst_attn_tp_size=1,
             requires_dcp_relayout=False,
@@ -9609,6 +9860,8 @@ class TestRemoteAttn(CustomTestCase):
             req_to_token=(torch.arange(length, dtype=torch.int32) + 8).reshape(1, -1)
         )
         scheduler.token_to_kv_pool_allocator = SimpleNamespace(
+            storage=None,
+            state=None,
             page_size=8,
             get_kvcache=lambda: pool,
             translate_kv_indices_for_transfer=lambda x: x,
@@ -9688,6 +9941,9 @@ class TestRemoteAttn(CustomTestCase):
                 MooncakeKVSender=sender_cls
             ),
             "sglang.srt.disaggregation.utils": SimpleNamespace(
+                DisaggregationMode=SimpleNamespace(PREFILL="prefill")
+            ),
+            "sglang.srt.disaggregation.mode": SimpleNamespace(
                 DisaggregationMode=SimpleNamespace(PREFILL="prefill")
             ),
             "sglang.srt.disaggregation.base.conn": SimpleNamespace(KVPoll=polls),
@@ -9851,7 +10107,7 @@ class TestRemoteAttn(CustomTestCase):
         cache.enable_session_radix_cache = False
         slides = []
         cache.supports_swa = lambda: True
-        cache.evict_sliding_windows = lambda req, end: slides.append(end)
+        _bind_window_retirement(cache, lambda req, end: slides.append(end))
         operations = []
         cache.checkpoint = lambda req, **kw: operations.append("checkpoint")
         cache.finish = lambda *a: operations.append("finish")
@@ -10199,7 +10455,6 @@ class TestRemoteAttn(CustomTestCase):
         queue.scheduler = SimpleNamespace(sliding_window_size=8)
         queue.token_to_kv_pool_allocator = SimpleNamespace(page_size=8)
         queue.tree_cache = f.cache
-        queue._pre_alloc_fill_len = lambda r: 17
         queue._build_decode_prefix_match = lambda req, result, **kw: result
         result = queue._match_prefix_and_lock(req)
         self.assertEqual(
@@ -10242,7 +10497,7 @@ class TestRemoteAttn(CustomTestCase):
             sys.modules,
             {
                 "sglang.srt.disaggregation.base.conn": SimpleNamespace(
-                    StateType=SimpleNamespace(SWA="swa")
+                    StateType=SimpleNamespace(SWA="swa", AUXILIARY_SWA="auxiliary_swa")
                 )
             },
         ):
@@ -10668,10 +10923,13 @@ class TestRemoteAttn(CustomTestCase):
         f = self._dsv41_overlap_fixture()
         f.req.return_logprob = False
         native_abort = _source_function("disaggregation/utils.py", "prepare_abort")
-        abort_reason = _source_class("managers/schedule_batch.py", "FINISH_ABORT")
+        abort_reason = _source_class("managers/req_types.py", "FINISH_ABORT")
         f.modules["sglang.srt.disaggregation.utils"].prepare_abort = native_abort
-        f.modules["sglang.srt.managers.schedule_batch"] = SimpleNamespace(
+        f.modules["sglang.srt.managers.req_types"] = SimpleNamespace(
             FINISH_ABORT=abort_reason
+        )
+        f.req.finish_outside_step = lambda reason: setattr(
+            f.req, "finished_reason", reason
         )
         f.manager._remote_attn_send_lock = threading.Lock()
         f.manager.engine = SimpleNamespace(send_probe=lambda *a: 0)
@@ -10681,6 +10939,16 @@ class TestRemoteAttn(CustomTestCase):
             {"_publish_peer_registration"},
         )._publish_peer_registration
         f.manager.session_lock = threading.Lock()
+        f.manager._kv_layout_mismatch = _source_class(
+            "disaggregation/mooncake/conn.py",
+            "MooncakeKVManager",
+            {"_kv_layout_mismatch"},
+        )._kv_layout_mismatch.__get__(f.manager)
+        f.manager.check_peer_aux_buffer_count = _source_class(
+            "disaggregation/common/conn.py",
+            "CommonKVManager",
+            {"check_peer_aux_buffer_count"},
+        ).check_peer_aux_buffer_count.__get__(f.manager)
         f.manager._validate_peer_state_layout = lambda *a: (True, None)
         f.manager._unblacklist_session = lambda *a: None
         f.manager.state_layout_rejections = {}
@@ -12912,7 +13180,7 @@ class TestRemoteAttn(CustomTestCase):
                     "sglang.srt.disaggregation.mooncake.conn": SimpleNamespace(
                         MooncakeKVSender=sender_cls
                     ),
-                    "sglang.srt.disaggregation.utils": SimpleNamespace(
+                    "sglang.srt.disaggregation.mode": SimpleNamespace(
                         DisaggregationMode=SimpleNamespace(PREFILL="prefill")
                     ),
                 },
@@ -13050,7 +13318,7 @@ class TestRemoteAttn(CustomTestCase):
                 "return_hidden_states",
             ),
             (
-                "sglang.srt.managers.scheduler.Scheduler.is_disable_overlap_for_batch",
+                "sglang.srt.managers.scheduler.Scheduler.should_process_last_batch_early",
                 "last_batch",
             ),
             ("sglang.srt.mem_cache.radix_cache.RadixCache.checkpoint", "up_to"),
@@ -13099,7 +13367,11 @@ class TestRemoteAttn(CustomTestCase):
             ("common.staging_handler.PrefillStagingStrategy.check_ready", "chunk_idx"),
             (
                 "sglang.srt.model_executor.runner_backend_utils.breakable_cuda_graph.breakable_cuda_graph.eager_on_graph",
-                "capture_stub",
+                "on_capture",
+            ),
+            (
+                "sglang.srt.model_executor.runner_backend_utils.breakable_cuda_graph.breakable_cuda_graph.eager_on_graph",
+                "output_factory",
             ),
             (
                 "sglang.srt.model_executor.runner_backend.breakable_cuda_graph_backend.BreakableCudaGraphBackend.capture_one",
@@ -13339,6 +13611,7 @@ class TestRemoteAttn(CustomTestCase):
         f.controller.dsv41_remote = True
         f.manager._dsv41_progressive_sources = {7: source}
         f.registration.dst_aux_ptrs = []
+        f.registration.dst_aux_item_lens = []
         f.manager.maybe_send_extra = lambda peer, rows, ex, reg: (
             states.append(rows) or 0
         )
@@ -13380,6 +13653,7 @@ class TestRemoteAttn(CustomTestCase):
                 f.manager,
                 f.manager.transfer_infos[7]["peer:1"],
                 4,
+                [],
                 [],
             ),
             0,
@@ -14077,6 +14351,7 @@ class TestRemoteAttn(CustomTestCase):
                 return nullcontext()
 
             def capture_one(self, key, fn, *args):
+                fn()  # Native capture_one warms eagerly before entering capture.
                 self.capturing = True
                 self.record = []
                 try:
@@ -14103,12 +14378,17 @@ class TestRemoteAttn(CustomTestCase):
 
         full, remote = Bank(), Bank()
 
-        def eager(fn):
+        def eager(fn, *, on_capture=None, output_factory=None):
             def wrapped(*a, **kw):
-                result = fn(*a, **kw)
                 if remote.capturing:
+                    if on_capture is not None:
+                        on_capture(*a, **kw)
+                    result = (
+                        output_factory(*a, **kw) if output_factory else fn(*a, **kw)
+                    )
                     remote.record.append(lambda: fn(*a, **kw))
-                return result
+                    return result
+                return fn(*a, **kw)
 
             return wrapped
 
@@ -14219,7 +14499,7 @@ class TestRemoteAttn(CustomTestCase):
         capturing = [False]
 
         class Graph:
-            def __init__(self, *args):
+            def __init__(self, *args, **kwargs):
                 self.work = lambda: None
 
             def replay(self):
@@ -14244,6 +14524,17 @@ class TestRemoteAttn(CustomTestCase):
             ),
             current_stream=lambda: None,
         )
+
+        def eager(fn, *, on_capture=None, output_factory=None):
+            def wrapped(*a, **kw):
+                if capturing[0]:
+                    if on_capture is not None:
+                        on_capture(*a, **kw)
+                    return output_factory(*a, **kw) if output_factory else fn(*a, **kw)
+                return fn(*a, **kw)
+
+            return wrapped
+
         namespace = dict(
             torch=torch,
             contextmanager=contextmanager,
@@ -14270,7 +14561,7 @@ class TestRemoteAttn(CustomTestCase):
             set_graph_pool_id=lambda *a: None,
             graph_pool_capture_scope=nullcontext,
             graph_pool_replay_scope=nullcontext,
-            eager_on_graph=lambda fn: fn,
+            eager_on_graph=eager,
             BreakableCUDAGraph=Graph,
             BreakableCUDAGraphCapture=capture,
             enable_breakable_cuda_graph=nullcontext,
@@ -14282,7 +14573,7 @@ class TestRemoteAttn(CustomTestCase):
         full = namespace["FullCudaGraphBackend"](f.runner)
         remote = namespace["BreakableCudaGraphBackend"](f.runner)
         backend = DSV41GraphBackend(
-            f.runner, full, remote, lambda fn: fn, lambda: capturing[0], lambda: None
+            f.runner, full, remote, eager, lambda: capturing[0], lambda: None
         )
         f.attach(backend)
         self.addCleanup(backend.cleanup)
@@ -14692,7 +14983,7 @@ class TestRemoteAttn(CustomTestCase):
                 self.assertTrue(torch.all(carry[unused] == 0))
             self.assertEqual(f.metadata[-1], 7)
 
-    def test_dsv41_hopper_compressor_dispatch_avoids_sm100_fused_path(self):
+    def test_dsv41_hopper_compressor_support_preserves_sm100_only_index_store(self):
         supported = _source_function(
             "layers/attention/dsv4/dsv41_sparse.py",
             "fused_low_ratio_compress_supported",
@@ -14702,7 +14993,7 @@ class TestRemoteAttn(CustomTestCase):
             patch.object(torch.cuda, "is_available", return_value=True),
             patch.object(torch.version, "hip", None),
         ):
-            for major, expected in ((8, False), (9, False), (10, True)):
+            for major, expected in ((8, False), (9, True), (10, True)):
                 with patch.object(
                     torch.cuda, "get_device_capability", return_value=(major, 0)
                 ):
@@ -14713,7 +15004,7 @@ class TestRemoteAttn(CustomTestCase):
             {"_low_ratio_compress_decode"},
         )
         backend_cls._low_ratio_compress_decode.__globals__.update(
-            is_sm100_or_newer=lambda: False
+            current_arch=lambda: SimpleNamespace(is_sm_at_least=lambda major: False)
         )
         calls = []
         backend = backend_cls()
@@ -15539,24 +15830,40 @@ class TestRemoteAttn(CustomTestCase):
         self.assertEqual(dst[0][2].tolist(), [1])
         self.assertTrue(torch.equal(src[0][1][0], dst[0][1][1]))
 
-    def test_dsv_d2d_native_incremental_detokenization_keeps_output_cursor(self):
+    def test_dsv_d2d_native_detokenize_header_keeps_frozen_prefix_context(self):
+        from sglang.srt.managers.incremental_detokenize import build_detokenize_header
+
         e = self._d2d_env()
-        e.req.decoded_text = "already emitted"
-        e.req.surr_offset, e.req.read_offset = 2, 4
-        e.req.cur_decode_ids_len = len(e.req.output_ids)
-        e.req.surr_and_decode_ids = array("q", [7, 8, *e.req.output_ids])
+        frozen = list(e.req.output_ids)
         e.import_(e.freeze())
         req = e.target.d2d_targets[e.epoch].decode_req.req
-        req.output_ids.append(34)
-        req.output_ids_through_stop = req.output_ids
-        cls = _source_class(
-            "managers/schedule_batch.py", "Req", {"init_incremental_detokenize"}
+        self.assertEqual(req.send_token_offset, len(frozen))
+        self.assertFalse(req.detokenize_header_sent)
+        req.origin_input_ids_unpadded = array("q", req.origin_input_ids)
+        req.http_worker_ipc = None
+        req.sampling_params = SimpleNamespace(
+            skip_special_tokens=True,
+            spaces_between_special_tokens=True,
+            no_stop_trim=False,
         )
-        ids, offset = cls.init_incremental_detokenize(req)
-        self.assertEqual(req.decoded_text, "already emitted")
-        self.assertEqual(list(ids), [7, 8, 31, 32, 33, 34])
-        self.assertEqual(offset, 2)
-        self.assertEqual(req.cur_decode_ids_len, 4)
+        req.output_ids.append(34)
+        header = build_detokenize_header(req, output_prefix_len=req.send_token_offset)
+        self.assertEqual(
+            list(header.prompt_tail_ids), [*req.origin_input_ids[-5:], *frozen]
+        )
+        due = _source_class(
+            "managers/schedule_batch.py", "Req", {"take_detokenize_header_due"}
+        ).take_detokenize_header_due
+        self.assertTrue(due(req))
+        self.assertFalse(due(req))
+        # P4 status/SSE owns handoff output: native detokenizer never sees a
+        # second cumulative stream with a fresh local detokenizer state.
+        delivered = []
+        self.hooks._stream_output(
+            lambda owner, reqs: delivered.extend(reqs), None, [req]
+        )
+        self.assertEqual(delivered, [])
+        self.assertEqual(list(req.output_ids[req.send_token_offset :]), [34])
 
     def test_dsv_d2d_native_prebuilt_replays_pending_token_without_resampling(self):
         e = self._d2d_env()
@@ -16856,10 +17163,14 @@ class TestRemoteAttn(CustomTestCase):
             is_swa_req_ring=lambda allocator: False,
         )
         q = cls()
-        q._pre_alloc_fill_len = lambda req: 48
+        cls._pre_alloc.__globals__["pre_alloc_fill_len"] = _source_function(
+            "disaggregation/utils.py", "pre_alloc_fill_len"
+        )
         q._swa_tail_len = lambda length: 8
         q._uses_swa_tail_prealloc = lambda: True
-        q.token_to_kv_pool_allocator = SimpleNamespace(page_size=8)
+        q.token_to_kv_pool_allocator = SimpleNamespace(
+            page_size=8, state=None, storage=None
+        )
 
         def alloc(reqs):
             reqs[0].kv.req_pool_idx = 1
@@ -16873,7 +17184,7 @@ class TestRemoteAttn(CustomTestCase):
         q.tree_cache = SimpleNamespace(maybe_hand_to_session=lambda req: None)
         q._alloc_for_decode_prealloc = Mock(return_value=torch.arange(48))
         req = SimpleNamespace(
-            kv=SimpleNamespace(), origin_input_ids=[1], output_ids=[2]
+            kv=self.Kv(), origin_input_ids=list(range(48)), output_ids=[2]
         )
         with self.assertRaisesRegex(ValueError, "SWA window"):
             q._pre_alloc(req, swa_tail_start=25)
@@ -17229,6 +17540,7 @@ class TestRemoteAttn(CustomTestCase):
 
         f = self._p4_dsv_env(accept=False)
         from sglang.srt.mem_cache.common import release_kv_cache
+
         server = self._p4_dsv_http_server(f.gw)
         seen, errors = [], []
         connected, initial, done = (
@@ -17889,7 +18201,6 @@ class TestRemoteAttn(CustomTestCase):
                 source, [dict(entry=i, start=0, count=1) for i in entries], d2d.LIMIT
             )
 
-
     def _qwen_native_fixture(self, page=4, capacity=64):
         path = ROOT / "test/manual/remote_attn/qwen_reservation_probe_support.py"
         spec = importlib.util.spec_from_file_location(
@@ -17944,8 +18255,11 @@ class TestRemoteAttn(CustomTestCase):
             )
             self.assertEqual(before - f.allocator.available_size(), 8)
             self.assertEqual(indices.numel(), 7)
-            with self.assertRaisesRegex(ValueError,"consumed"):
-                self.runtime._handle(f.scheduler,dict(cmd="reserve_cancel",rids=["target"],epoch=p["epoch"]))
+            with self.assertRaisesRegex(ValueError, "consumed"):
+                self.runtime._handle(
+                    f.scheduler,
+                    dict(cmd="reserve_cancel", rids=["target"], epoch=p["epoch"]),
+                )
             row = native.kv.req_pool_idx
             self.runtime.bind_decode_prefix(native, f.pool, indices, 7)
             self.assertEqual(native.kv.req_pool_idx, row)
@@ -18069,16 +18383,23 @@ class TestRemoteAttn(CustomTestCase):
             reservation.consume(f.scheduler, "target", bad, p["epoch"])
         rec = f.scheduler._handoff_reserved["target"]
         self.assertFalse(rec["consumed"])
-        wrong_geometry = dict(p,kv_committed_len=7,d2d_range_protocol="layer-token-range-v1",chunks=[[7]]*2,kv_heads=1,head_dim=8,dtype="float16")
-        with self.assertRaisesRegex(ValueError,"geometry"):
-            reservation.consume(f.scheduler,"target",wrong_geometry,p["epoch"])
+        wrong_geometry = dict(
+            p,
+            kv_committed_len=7,
+            d2d_range_protocol="layer-token-range-v1",
+            chunks=[[7]] * 2,
+            kv_heads=1,
+            head_dim=8,
+            dtype="float16",
+        )
+        with self.assertRaisesRegex(ValueError, "geometry"):
+            reservation.consume(f.scheduler, "target", wrong_geometry, p["epoch"])
         self.assertFalse(rec["consumed"])
         row = rec["native_req"].kv.req_pool_idx
         reservation.cancel(f.scheduler, "target", rec)
         self.assertIsNone(rec["native_req"].kv.req_pool_idx)
         self.assertNotIn("target", f.scheduler._handoff_reserved)
         self.assertIn(row, f.pool.free_slots)
-
 
     def test_qwen_native_cancel_before_reserve_leaves_epoch_tombstone(self):
         from sglang_remote_attn import qwen_reservation as reservation
@@ -18117,7 +18438,10 @@ class TestRemoteAttn(CustomTestCase):
             reservation.check_freeze(f.scheduler, replacement, p["epoch"])
         f.scheduler.handoff_tracked_reqs["source"] = replacement
         with self.assertRaisesRegex(ValueError, "identity"):
-            reservation.plan(f.scheduler,dict(epoch=p["epoch"],items=[dict(rid="source",target_rid="target")]))
+            reservation.plan(
+                f.scheduler,
+                dict(epoch=p["epoch"], items=[dict(rid="source", target_rid="target")]),
+            )
 
     def test_qwen_native_tp2_rejects_partial_freeze_and_asymmetric_reservation(self):
         worker = ROOT / "test/manual/remote_attn/qwen_reservation_tp_worker.py"
@@ -18164,29 +18488,59 @@ class TestRemoteAttn(CustomTestCase):
                         p.kill()
                         p.communicate(timeout=5)
 
-
-    def test_qwen_range_registration_failure_keeps_host_backing_without_owner_handle(self):
+    def test_qwen_range_registration_failure_keeps_host_backing_without_owner_handle(
+        self,
+    ):
         from sglang_remote_attn import qwen_ranges, mooncake_backend as mb
-        runtime=self.runtime
-        engine=SimpleNamespace(protocol="tcp", d2d_protocol_verified=True, get_session_id=lambda: "test-registration")
-        meta=dict(d2d_capabilities=mb.tcp_offer(),chunks=[[4]],kv_committed_len=4,kv_heads=1,head_dim=1,dtype="float16",d2d_group_size=1,d2d_token_range=4,d2d_range_protocol="layer-token-range-v1")
-        original=torch.empty
-        def empty(*args,**kw):
-            kw.pop("pin_memory",None)
-            return original(*args,**kw)
-        manager=SimpleNamespace(register=Mock(side_effect=RuntimeError("registration result lost")),release_safe=Mock(return_value=True))
-        with patch.object(torch.cuda,"current_device",return_value=0),patch.object(runtime,"_get_te",return_value=engine),patch.object(runtime,"_TRANSFER_REGISTRATIONS",{}),patch.object(runtime,"_get_registration_manager",return_value=manager),patch.object(runtime,"_CTL_DIR",""),patch.object(runtime,"_TRANSFER_QUARANTINE",{}),patch.object(runtime,"_TRANSFER_RELEASES",{}),patch.object(torch,"empty",side_effect=empty),patch.object(qwen_ranges.secrets,"token_hex",return_value="reg-lost"):
-            with self.assertRaisesRegex(RuntimeError,"registration"):
-                qwen_ranges.source(None,SimpleNamespace(),meta,False)
-            self.assertIn("reg-lost",runtime._TRANSFER_QUARANTINE)
+
+        runtime = self.runtime
+        engine = SimpleNamespace(
+            protocol="tcp",
+            d2d_protocol_verified=True,
+            get_session_id=lambda: "test-registration",
+        )
+        meta = dict(
+            d2d_capabilities=mb.tcp_offer(),
+            chunks=[[4]],
+            kv_committed_len=4,
+            kv_heads=1,
+            head_dim=1,
+            dtype="float16",
+            d2d_group_size=1,
+            d2d_token_range=4,
+            d2d_range_protocol="layer-token-range-v1",
+        )
+        original = torch.empty
+
+        def empty(*args, **kw):
+            kw.pop("pin_memory", None)
+            return original(*args, **kw)
+
+        manager = SimpleNamespace(
+            register=Mock(side_effect=RuntimeError("registration result lost")),
+            release_safe=Mock(return_value=True),
+        )
+        with (
+            patch.object(torch.cuda, "current_device", return_value=0),
+            patch.object(runtime, "_get_te", return_value=engine),
+            patch.object(runtime, "_TRANSFER_REGISTRATIONS", {}),
+            patch.object(runtime, "_get_registration_manager", return_value=manager),
+            patch.object(runtime, "_CTL_DIR", ""),
+            patch.object(runtime, "_TRANSFER_QUARANTINE", {}),
+            patch.object(runtime, "_TRANSFER_RELEASES", {}),
+            patch.object(torch, "empty", side_effect=empty),
+            patch.object(qwen_ranges.secrets, "token_hex", return_value="reg-lost"),
+        ):
+            with self.assertRaisesRegex(RuntimeError, "registration"):
+                qwen_ranges.source(None, SimpleNamespace(), meta, False)
+            self.assertIn("reg-lost", runtime._TRANSFER_QUARANTINE)
             self.assertFalse(runtime._TRANSFER_RELEASES["reg-lost"]["gpu_safe"])
-            with self.assertRaisesRegex(RuntimeError,"registration"):
-                qwen_ranges.setup(None,meta,"target-lost")
-            self.assertIn("target-lost",runtime._TRANSFER_QUARANTINE)
+            with self.assertRaisesRegex(RuntimeError, "registration"):
+                qwen_ranges.setup(None, meta, "target-lost")
+            self.assertIn("target-lost", runtime._TRANSFER_QUARANTINE)
             self.assertFalse(runtime._TRANSFER_RELEASES["target-lost"]["gpu_safe"])
             runtime.reap_transfer_buffers()
             manager.release_safe.assert_not_called()
-
 
     def test_d2d_history_and_reservation_bounds_reject_before_native_allocation(self):
         from sglang_remote_attn import qwen_reservation as reservation

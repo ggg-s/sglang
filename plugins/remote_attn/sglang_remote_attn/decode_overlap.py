@@ -117,13 +117,16 @@ def install(controller, *, force=False):
     return overlap
 
 
-def disable_overlap(original, scheduler, batch, last_batch):
-    native = original(scheduler, batch, last_batch)
+def process_last_batch_early(original, scheduler, last_batch):
+    native = original(scheduler, last_batch)
     controller = getattr(scheduler, "_pre_layerwise", None)
     overlap = getattr(controller, "decode_overlap", None)
     if overlap is None:
         return native
-    return overlap.serial() or native
+    serial = overlap.serial()
+    # The native loop pops its result queue when this hook returns True.
+    # No previous batch means no queued result, even with a live Remote lease.
+    return native or (last_batch is not None and serial)
 
 
 def reap(original, queue, *args, **kwargs):

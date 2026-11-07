@@ -411,13 +411,22 @@ def send_metadata(
     kv_indices,
     page_size,
     state_indices=None,
+    metadata_buffer_preassigned=False,
+    non_blocking=False,
     **metadata_kwargs,
 ):
     """Allocation succeeded: the native request lock now owns prefix lifetime."""
     match = getattr(decode_req.req, "_remote_attn_pending_cache", None)
     if match is None:
         return original(
-            queue, decode_req, kv_indices, page_size, state_indices, **metadata_kwargs
+            queue,
+            decode_req,
+            kv_indices,
+            page_size,
+            state_indices,
+            metadata_buffer_preassigned=metadata_buffer_preassigned,
+            non_blocking=non_blocking,
+            **metadata_kwargs,
         )
     req = decode_req.req
     if (
@@ -431,7 +440,14 @@ def send_metadata(
     state_indices = cache_metadata(queue, decode_req, state_indices)
     try:
         return original(
-            queue, decode_req, kv_indices, page_size, state_indices, **metadata_kwargs
+            queue,
+            decode_req,
+            kv_indices,
+            page_size,
+            state_indices,
+            metadata_buffer_preassigned=metadata_buffer_preassigned,
+            non_blocking=non_blocking,
+            **metadata_kwargs,
         )
     finally:
         match.guard.drop_match(req)

@@ -20,6 +20,8 @@ import time
 from dataclasses import asdict, dataclass, field
 from pathlib import Path
 
+from .compat import decode_queue_items, remove_decode_items
+
 logger = logging.getLogger(__name__)
 
 
@@ -293,7 +295,10 @@ class Source:
                 ):
                     for peer, registration in self.peers:
                         rc = sender.kv_mgr.send_aux(
-                            peer, sender.aux_index, registration.dst_aux_ptrs
+                            peer,
+                            sender.aux_index,
+                            registration.dst_aux_ptrs,
+                            registration.dst_aux_item_lens,
                         )
                         if rc != 0:
                             sender.kv_mgr._poison_unsettled_send(sender.bootstrap_room)
@@ -819,8 +824,8 @@ class Controller:
         return target
 
     def prepare(self, batch):
+        from sglang.srt.disaggregation.mode import DisaggregationMode
         from sglang.srt.disaggregation.mooncake.conn import MooncakeKVSender
-        from sglang.srt.disaggregation.utils import DisaggregationMode
 
         s = self.scheduler
         if (
@@ -1003,7 +1008,6 @@ class Controller:
 
     def forward(self, original, runner, fb, *args, **kwargs):
         import torch
-
         from sglang.srt.model_executor.forward_batch_info import ForwardMode
 
         if self.plan is None:
@@ -1131,7 +1135,7 @@ class Controller:
         # prefix writes. Reap them before considering new admissions.
         if getattr(self, "decode_overlap", None) is None:
             self.retire_targets()
-        offered = [self.offer(queue, dr) for dr in queue.queue]
+        offered = [self.offer(queue, dr) for dr in decode_queue_items(queue)]
         candidates = []
         failed = []
         for target in offered:
@@ -1238,7 +1242,7 @@ class Controller:
                     ),
                 },
             )
-        queue.queue = [dr for dr in queue.queue if id(dr) not in removed]
+        remove_decode_items(queue, removed)
         return admitted, offered
 
     def poll_sources(self):
@@ -1450,9 +1454,8 @@ def pop_transferred(original, queue, rids_to_check=None):
 
 
 def defer_release(req, release, *, checkpoint=None):
-    from .transport_failure import TransportFailure, hold_release, retain_release
-
     from .source_cache import lease_for
+    from .transport_failure import TransportFailure, hold_release, retain_release
 
     cache_lease = lease_for(req)
     if cache_lease is not None and checkpoint is False:

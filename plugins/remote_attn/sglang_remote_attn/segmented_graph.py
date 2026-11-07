@@ -114,7 +114,11 @@ class RemoteGraphBackend:
         self.is_capturing = is_capturing
         self.restore_pool = restore_pool
         self._eager_on_graph = eager_on_graph
-        self.attention_break = eager_on_graph(self._attention)
+        self.attention_break = eager_on_graph(
+            self._attention,
+            on_capture=self._attention,
+            output_factory=self._attention_output,
+        )
         self.capture_remote = False
         self.capture_batch = None
         self.capturing = False
@@ -131,6 +135,31 @@ class RemoteGraphBackend:
         self.unsafe = False
         self.replays = {"remote": 0, "full": 0}
         self.attention_calls = 0
+
+    @property
+    def supports_shared_read_events(self):
+        # Remote eager metadata/attention can read scheduler-owned buffers
+        # between segments. Keep the native whole-forward WAR fence until
+        # those reads have their own event proof; a full-bank metadata event
+        # must never be reused as proof for the Remote bank.
+        return False
+
+    @property
+    def cache_loc_dtype(self):
+        return self.full.cache_loc_dtype
+
+    def prepare_replay(self, forward_batch):
+        backend = self.remote if self.use_remote else self.full
+        return backend.prepare_replay(forward_batch)
+
+    def prepare_capture_forward(self, model, enable_compile, **kwargs):
+        return self.full.prepare_capture_forward(model, enable_compile, **kwargs)
+
+    def capture_profile_context(self, options):
+        return self.full.capture_profile_context(options)
+
+    def finish_capture_profile(self, options, profile_context):
+        return self.full.finish_capture_profile(options, profile_context)
 
     @contextmanager
     def capture_session(self, stream):
@@ -186,8 +215,13 @@ class RemoteGraphBackend:
 
     def validate_capture_key(self, shape_key):
         if any(
-            getattr(shape_key, key) is not None
-            for key in ("stream_idx", "variant_label", "attention_variant")
+            getattr(shape_key, key, None) is not None
+            for key in (
+                "stream_idx",
+                "variant_label",
+                "attention_variant",
+                "logits_variant",
+            )
         ):
             raise RuntimeError("Remote graph supports only plain decode graph keys")
 
@@ -306,6 +340,12 @@ class RemoteGraphBackend:
 
     def prepare_padded_metadata(self, batch):
         self.runner.attn_backend.init_forward_metadata(batch)
+
+    def _attention_output(self, module, q, k, v, save_kv_cache=True, **kwargs):
+        # Allocate in the captured segment. The native eager body still runs
+        # via on_capture for metadata setup, but its temporary output is not
+        # retained as a graph bridge. Replay writes into this pool-owned output.
+        return q.new_empty((q.shape[0], module.tp_q_head_num * module.v_head_dim))
 
     def _attention(self, module, q, k, v, save_kv_cache=True, **kwargs):
         if self.capture_remote:

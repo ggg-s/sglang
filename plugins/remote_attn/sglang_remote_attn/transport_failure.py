@@ -56,9 +56,9 @@ def quarantine(owner, item, reason):
         record["items"].append(target)
         # Do not pass this receiver to native timeout cleanup: that would free
         # its metadata row and ring lease while an old write may still arrive.
-        target.queue.queue = [
-            dr for dr in target.queue.queue if dr is not target.decode_req
-        ]
+        from .compat import remove_decode_items
+
+        remove_decode_items(target.queue, {id(target.decode_req)})
     # Keep the original object as well as all callbacks/engine registrations.
     # It may still be referenced by an already-launched GPU batch or RPC.
     from sglang.srt.disaggregation.utils import prepare_abort

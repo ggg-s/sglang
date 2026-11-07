@@ -50,7 +50,10 @@ def fixture(
         LogitsProcessorOutput=Output,
         device_timer_ctx=lambda *args: nullcontext(),
         SharedReadEnds=SimpleNamespace(
-            PRE_REPLAY=object(), IN_REPLAY=object(), POST_REPLAY=object()
+            PRE_REPLAY=object(),
+            IN_REPLAY=object(),
+            POST_REPLAY=object(),
+            UNKNOWN=object(),
         ),
         envs=SimpleNamespace(
             SGLANG_LOG_DECODE_GRAPH_KEY=SimpleNamespace(get=lambda: False)
@@ -353,6 +356,7 @@ def fixture(
 
     decode = DecodeRunner.__new__(DecodeRunner)
     decode.model_runner = mr
+    decode.attn_backend = attn
     decode.model_context = nullcontext
     decode._resolve_shared_read_ends = lambda *args: None
     decode._replay_attn_backend = lambda: attn

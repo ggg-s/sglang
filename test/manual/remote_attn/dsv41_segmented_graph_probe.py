@@ -21,7 +21,12 @@ from unittest.mock import patch
 import torch
 from dsv41_graph_probe_support import fixture
 from dsv41_remote_probe_support import fixture as sparse_fixture
-from segmented_graph_probe import definitions, load, workspace_namespace
+from segmented_graph_probe import (
+    definitions,
+    load,
+    load_native_backend_base,
+    workspace_namespace,
+)
 from sglang_remote_attn import dsv41_graph as dg
 from sglang_remote_attn import dsv41_remote as sparse
 from sglang_remote_attn import dsv41_sparse_math as math
@@ -35,6 +40,7 @@ def load_native_backends(root, namespace):
     namespace["dataclasses"] = dataclasses
     namespace.update(workspace_namespace(root))
     native = root / "python/sglang/srt/model_executor"
+    load_native_backend_base(root, namespace)
     definitions(native / "runner_backend/full_cuda_graph_backend.py", namespace)
     definitions(native / "runner_backend/breakable_cuda_graph_backend.py", namespace)
 
@@ -79,6 +85,7 @@ def main(
         sys.modules["sglang.srt.utils"] = types.SimpleNamespace(
             get_device_module=lambda: torch.cuda,
             is_hip=lambda: False,
+            is_musa=lambda: False,
             is_xpu=lambda: False,
         )
         # Real native weak tensor views; never silently substitute strong refs.
@@ -155,6 +162,12 @@ def main(
         sf.p_controller.dsv41_remote = True
         transport = None
         if gpu_transfer:
+            # The graph fixture replaces serving package imports; load the
+            # shared lightweight transport contract explicitly from this tree.
+            load(
+                "sglang.srt.mooncake_contract",
+                root / "python/sglang/srt/mooncake_contract.py",
+            )
             from remote_gpu_probe_support import Transport
 
             transport = Transport(root)

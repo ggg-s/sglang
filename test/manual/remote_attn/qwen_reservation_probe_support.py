@@ -57,7 +57,7 @@ class Fixture:
         self.page = page
         self.root = Path(root)
         ceil = lambda a, b: (a + b - 1) // b * b
-        num = load(root, "utils/common.py", "get_num_new_pages")
+        num = load(root, "mem_cache/utils.py", "get_num_new_pages")
         kv = load(root, "managers/schedule_batch.py", "ReqKvInfo")
         Pool = load(
             root,
@@ -112,12 +112,43 @@ class Fixture:
         allocator.debug_mode = True
         allocator.use_triton_kernels = device == "cuda"
         allocator.clear()
-        allocator.prealloc_fits = load(
+        allocator.state = allocator.storage = None
+        base = load(
             root,
             "mem_cache/allocator/base.py",
             "BaseTokenToKVPoolAllocator",
-            {"prealloc_fits"},
-        ).prealloc_fits.__get__(allocator)
+            {"prealloc_fits", "get_extend_allocation_demand"},
+        )
+        for name in ("prealloc_fits", "get_extend_allocation_demand"):
+            setattr(allocator, name, getattr(base, name).__get__(allocator))
+        # Exercise main's native row/storage allocation seam, not a fixture
+        # substitute for row ownership or page accounting. This pool has no
+        # recurrent state or page-interleave sharding.
+        storage_type = load(
+            root,
+            "mem_cache/static_kv_storage.py",
+            "StaticKVStorage",
+            {
+                "__init__",
+                "acquire",
+                "release_row",
+                "take_tokens",
+                "take_extend",
+                "stated_window_lengths",
+            },
+            dict(
+                acquire_rows=load(
+                    root, "mem_cache/static_kv_storage.py", "acquire_rows"
+                ),
+                page_interleave_shard_size=lambda allocator: 1,
+            ),
+        )
+        storage_of = load(
+            root,
+            "mem_cache/static_kv_storage.py",
+            "kv_storage_of",
+            extra=dict(StaticKVStorage=storage_type),
+        )
         key = [
             torch.zeros((capacity + page, 1, 8), device=device, dtype=torch.float16)
             for _ in range(3)
@@ -130,6 +161,7 @@ class Fixture:
         allocator.get_kvcache = lambda: cache
         tree = NS(
             disable=True,
+            logical_page_size=page,
             claim_kv_row=lambda req: False,
             maybe_hand_to_session=lambda req: None,
             unlock=lambda lock: None,
@@ -150,6 +182,13 @@ class Fixture:
             ceil_align=ceil,
             get_memory=lambda: NS(disable_radix_cache=True),
             async_h2d=lambda values, **kw: torch.tensor(values, **kw),
+            pre_alloc_fill_len=load(
+                root, "disaggregation/utils.py", "pre_alloc_fill_len"
+            ),
+            kv_storage_of=storage_of,
+            _evicted_by_caller=load(
+                root, "disaggregation/decode.py", "_evicted_by_caller"
+            ),
         )
         alloc = load(
             root, "disaggregation/decode.py", "alloc_for_decode_prealloc", extra=helper
@@ -161,7 +200,6 @@ class Fixture:
             "DecodePreallocQueue",
             {
                 "_pre_alloc",
-                "_pre_alloc_fill_len",
                 "_prealloc_kv_lens",
                 "_prealloc_required_tokens",
                 "_required_alloc_tokens",
@@ -240,7 +278,9 @@ class Fixture:
             root,
             "mem_cache/common.py",
             "release_kv_cache",
-            extra=dict(_release_overallocated_kv_indices=over),
+            extra=dict(
+                _release_overallocated_kv_indices=over, kv_storage_of=storage_of
+            ),
         )
         self.stack.enter_context(
             patch.dict(

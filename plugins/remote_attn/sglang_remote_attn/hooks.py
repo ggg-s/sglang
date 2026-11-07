@@ -4,7 +4,6 @@ import inspect
 import logging
 import os
 import pkgutil
-import threading
 import time
 
 from . import (
@@ -651,7 +650,7 @@ HOOKS.update(
         "sglang.srt.managers.scheduler.Scheduler.run_batch": pre_layerwise.run_batch,
         "sglang.srt.managers.scheduler.Scheduler.process_batch_result": decode_overlap.after_result,
         "sglang.srt.managers.scheduler.Scheduler.launch_batch_sample_if_needed": prefill_overlap.after_sample,
-        "sglang.srt.managers.scheduler.Scheduler.is_disable_overlap_for_batch": decode_overlap.disable_overlap,
+        "sglang.srt.managers.scheduler.Scheduler.should_process_last_batch_early": decode_overlap.process_last_batch_early,
         "sglang.srt.managers.scheduler.Scheduler.is_fully_idle": pre_layerwise.is_fully_idle,
         "sglang.srt.model_executor.model_runner.ModelRunner.forward": pre_layerwise.forward,
         "sglang.srt.disaggregation.prefill.SchedulerDisaggregationPrefillMixin.send_kv_chunk": pre_layerwise.send_chunk,

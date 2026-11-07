@@ -14,6 +14,7 @@ import sys
 import threading
 import time
 import types
+from collections import deque
 from pathlib import Path
 
 import numpy as np
@@ -27,6 +28,7 @@ def main():
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--sglang-root", type=Path, required=True)
     parser.add_argument("--output", type=Path, required=True)
+    parser.add_argument("--defer-scatter", action="store_true")
     args = parser.parse_args()
     root = args.sglang_root.resolve()
     native = root / "python/sglang/srt"
@@ -149,6 +151,9 @@ def main():
     sys.modules["sglang.srt.utils"] = utilities
     sys.modules["sglang.srt.environ"] = types.SimpleNamespace(
         envs=types.SimpleNamespace(
+            SGLANG_PLB_SCATTER_DEFER=types.SimpleNamespace(
+                get=lambda: args.defer_scatter
+            ),
             SGLANG_DISAGGREGATION_WAITING_TIMEOUT=types.SimpleNamespace(get=lambda: 30),
             SGLANG_DISAGG_STAGING_POOL_SIZE_MB=types.SimpleNamespace(get=lambda: 1),
         )
@@ -156,7 +161,7 @@ def main():
     handler_path = native / "disaggregation/common/staging_handler.py"
     handler_cls = extract(handler_path, "DecodeStagingHandler")
     handler_cls.__init__.__globals__.update(
-        threading=threading, logger=logger, time=time, **vars(utilities)
+        threading=threading, logger=logger, time=time, deque=deque, **vars(utilities)
     )
     # Context decorators need dataclasses in the extraction namespace.
     # Native dataclass fields/defaults are preserved by this source loader.
@@ -231,7 +236,9 @@ def main():
         {"get_mla_kv_ptrs_with_pp"},
     ).get_mla_kv_ptrs_with_pp
     flat = extract(conn, "_uses_flat_entry_layout")
-    state_types = types.SimpleNamespace(DSA="DSA", SWA="SWA")
+    state_types = types.SimpleNamespace(
+        DSA="DSA", SWA="SWA", AUXILIARY_SWA="AUXILIARY_SWA"
+    )
     flat.__globals__["StateType"] = state_types
     cls._send_kvcache_generic.__globals__.update(
         group_concurrent_contiguous=extract(
@@ -297,6 +304,8 @@ def main():
     )
     rx.install(controller, d, "decode")
     handler, ring = d._staging_handler, d._staging_ctx.allocator
+    handler._defer_scatter = args.defer_scatter
+    explicit_stream = torch.cuda.Stream() if args.defer_scatter else None
     handler._scatter_region = lambda *a, **kw: rx.scatter(None, handler, *a, **kw)
     pcontroller = types.SimpleNamespace(
         pool=source_pool, _schema=lambda manager: schema
@@ -407,9 +416,15 @@ def main():
             assert rx.send_group(None, p, peer, chunk, registration, offset, None) == 0
             if ring._scatter_stream is None:
                 ring._scatter_stream = torch.cuda.Stream()
-            with torch.cuda.stream(ring._scatter_stream):
+            copy_stream = (
+                explicit_stream if args.defer_scatter else ring._scatter_stream
+            )
+            with torch.cuda.stream(copy_stream):
                 torch.cuda._sleep(500_000_000)
             handler.handle_chunk_arrived(room, ordinal, 2, 3, receiver.session)
+            if args.defer_scatter:
+                handler.flush_pending_scatters(explicit_stream)
+                assert dr._staging_scatter_streams == [explicit_stream]
             handler.submit_last_scatter_async(room)
             handler.advance_scatter(dr)
             pending_seen |= (
@@ -418,7 +433,7 @@ def main():
                 and not dr._chunk_events[-1][0].query()
             )
             assert not handler.is_done(dr) and ring.allocations
-            ring._scatter_stream.synchronize()
+            copy_stream.synchronize()
             handler.advance_scatter(dr)
         assert pending_seen and handler.is_done(dr) and not ring.allocations
         torch.cuda.synchronize()
@@ -479,9 +494,12 @@ def main():
         transfer_fn=dsv41_staging.transfer(p),
     )
     assert rx.send_group(None, p, peer, chunk, registration, offset, None) == 0
-    with torch.cuda.stream(ring._scatter_stream):
+    copy_stream = explicit_stream if args.defer_scatter else ring._scatter_stream
+    with torch.cuda.stream(copy_stream):
         torch.cuda._sleep(500_000_000)
     handler.handle_chunk_arrived(room, 0, 2, 3, receiver.session)
+    if args.defer_scatter:
+        handler.flush_pending_scatters(explicit_stream)
     pending_event = dr._chunk_events[-1][0]
     assert not pending_event.query()
     handler.unregister_decode_req(room)
@@ -489,7 +507,7 @@ def main():
     assert not handler.is_staging_room(room)
     for tensor in targets:
         tensor.fill_(201)
-    ring._scatter_stream.synchronize()
+    copy_stream.synchronize()
     torch.cuda.synchronize()
     assert all(bool((tensor == 201).all()) for tensor in targets)
     ring_ptr = ring.get_base_ptr()

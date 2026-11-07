@@ -50,3 +50,32 @@ def bind_decode_prefix(req, pool, mapping, kv_len):
     req._handoff_prefix_indices = mapping
     req.handoff_prefix_indices = None
     set_extend_range(req, kv_len, kv_len)
+
+
+def decode_queue_items(queue):
+    """Read native DecodeReq wrappers; ReqList iteration yields bare requests."""
+    pending = queue.queue
+    return tuple(pending.items()) if hasattr(pending, "items") else tuple(pending)
+
+
+def remove_decode_items(queue, ids):
+    """Keep the native request-list owner while removing admitted/quarantined rows."""
+    pending = queue.queue
+    items = decode_queue_items(queue)
+    if hasattr(pending, "leave"):
+        pending.leave([item.req for item in items if id(item) in ids])
+    else:
+        # Lightweight fixtures and callers predating the ReqList migration.
+        queue.queue = [item for item in items if id(item) not in ids]
+
+
+def restore_detokenize_prefix(req, prefix_len):
+    """Build the destination's first native header around already-owned output."""
+    if isinstance(prefix_len, bool) or not isinstance(prefix_len, int):
+        raise ValueError("D2D detokenization prefix must be an integer")
+    if not 0 <= prefix_len <= len(req.output_ids):
+        raise ValueError("D2D detokenization prefix exceeds frozen output")
+    req.send_token_offset = prefix_len
+    # Detokenizer state belongs to the destination process. Its first header
+    # carries the output prefix as context, rather than emitting it again.
+    req.detokenize_header_sent = False

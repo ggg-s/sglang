@@ -139,7 +139,7 @@ class _Fixture:
             runner,
             self.full,
             self.remote,
-            lambda fn: fn,
+            lambda fn, **kwargs: fn,
             lambda: self.stage is not None and self.stage[1] == "capture",
             lambda: self.restored.append(True),
         )

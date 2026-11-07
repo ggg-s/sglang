@@ -11,6 +11,7 @@ import time
 from dataclasses import dataclass, field
 
 from . import dsv41_progressive, dsv41_receive, dsv41_remote, dsv41_staging
+from .compat import decode_queue_items
 from .pre_layerwise import Controller, Source, read_json, write_json
 
 logger = logging.getLogger(__name__)
@@ -484,7 +485,7 @@ class DSV41Controller(Controller):
         from .pre_layerwise import _poll_success
         from .transport_failure import TransportFailure, quarantine
 
-        offered = [self.offer(queue, dr) for dr in queue.queue]
+        offered = [self.offer(queue, dr) for dr in decode_queue_items(queue)]
         failed = []
         for target in offered:
             try:

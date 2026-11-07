@@ -91,11 +91,19 @@ def candidates(controller):
         reqs.extend(getattr(batch, "reqs", ()))
     for batch, _ in getattr(scheduler, "result_queue", ()):
         reqs.extend(batch.reqs)
-    reqs.extend(getattr(scheduler, "waiting_queue", ()))
-    for name in ("disagg_decode_prealloc_queue", "disagg_decode_transfer_queue"):
-        queue = getattr(scheduler, name, None)
-        for field in ("queue", "pending_reqs", "retracted_queue"):
-            reqs.extend(getattr(r, "req", r) for r in getattr(queue, field, ()))
+    request_lists = getattr(scheduler, "request_lists", None)
+    if callable(request_lists):
+        # Native ReqList iteration yields Req, including held/restoring/releasing
+        # requests that are no longer all represented by the old three queues.
+        for queue in request_lists().values():
+            reqs.extend(queue)
+    else:
+        # Small standalone gateway fixtures may not own a native Scheduler.
+        reqs.extend(getattr(scheduler, "waiting_queue", ()))
+        for name in ("disagg_decode_prealloc_queue", "disagg_decode_transfer_queue"):
+            queue = getattr(scheduler, name, None)
+            for field in ("queue", "pending_reqs", "retracted_queue"):
+                reqs.extend(getattr(r, "req", r) for r in getattr(queue, field, ()))
     return [r for r in reqs if hasattr(r, "rid")]
 
 

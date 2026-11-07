@@ -363,7 +363,7 @@ def decode_overlap_lifetimes(args):
     from sglang_remote_attn.decode_overlap import (
         DecodeOverlap,
         before_retract,
-        disable_overlap,
+        process_last_batch_early,
     )
     from sglang_remote_attn.pre_layerwise import (
         Config,
@@ -421,6 +421,11 @@ def decode_overlap_lifetimes(args):
         dataclass=dataclasses.dataclass,
         get_parallel=lambda: parallel,
         broadcast_pyobj=broadcast,
+        # Exercise the native Gloo fallback on this two-process fixture.
+        get_shm_exchange=lambda **kwargs: None,
+        envs=SimpleNamespace(
+            SGLANG_OPT_SCHEDULER_SHM_SYNC_MULTIHOST=SimpleNamespace(get=lambda: False)
+        ),
     )
     exec(
         compile(
@@ -579,8 +584,8 @@ def decode_overlap_lifetimes(args):
             ):
                 for _ in range(32):
                     cycle()
-                    assert disable_overlap(
-                        lambda *a: False, scheduler, batch, batch
+                    assert process_last_batch_early(
+                        lambda *a: False, scheduler, batch
                     ) in (True, False)
                     run_batch(lambda *a: result, scheduler, batch)
             second, req2, io2 = target(2)
@@ -599,7 +604,7 @@ def decode_overlap_lifetimes(args):
                 reqs=[req2], forward_mode=SimpleNamespace(is_prebuilt=lambda: False)
             )
             run_batch(lambda *a: result2, scheduler, batch2)
-            reentry = disable_overlap(lambda *a: False, scheduler, batch2, batch)
+            reentry = process_last_batch_early(lambda *a: False, scheduler, batch)
 
             def backup(*, req):
                 assert req._pre_layerwise_target is None
@@ -845,6 +850,7 @@ def prefill_certificate_lifetimes(args, *, prefix_cache=False):
             origin_input_ids=list(range(1025)),
             return_logprob=False,
         )
+        req.finish_outside_step = lambda reason: setattr(req, "finished_reason", reason)
         req.disagg_kv_sender = SimpleNamespace(
             kv_mgr=manager, poll=lambda: 4, curr_idx=0
         )
@@ -975,7 +981,7 @@ def prefill_certificate_lifetimes(args, *, prefix_cache=False):
         "sglang.srt.disaggregation.utils": SimpleNamespace(
             prepare_abort=ns["prepare_abort"]
         ),
-        "sglang.srt.managers.schedule_batch": SimpleNamespace(
+        "sglang.srt.managers.req_types": SimpleNamespace(
             FINISH_ABORT=lambda message, status: SimpleNamespace(message=message)
         ),
         "sglang.srt.disaggregation.base.conn": SimpleNamespace(

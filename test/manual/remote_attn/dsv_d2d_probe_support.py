@@ -352,12 +352,15 @@ class Environment:
                 {"sglang.srt.sampling.sampling_params": NS(SamplingParams=Sampling)},
             )
         )
+        def new_handoff_req(scheduler, rid, origin, output, params, **kwargs):
+            req = request(rid, origin, output, params)
+            # Match the native handoff factory's routing marker. The P4
+            # gateway remains the owner of the outward SSE stream.
+            req._handoff_req = True
+            return req
+
         self.stack.enter_context(
-            patch.object(
-                rt,
-                "_new_req",
-                side_effect=lambda s, r, o, out, sp, **kw: request(r, o, out, sp),
-            )
+            patch.object(rt, "_new_req", side_effect=new_handoff_req)
         )
         self.stack.enter_context(
             patch.object(

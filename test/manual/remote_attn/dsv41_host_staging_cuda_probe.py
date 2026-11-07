@@ -160,7 +160,9 @@ def main():
         native / "disaggregation/common/utils.py", "group_concurrent_contiguous"
     )
     flat = extract(conn, "_uses_flat_entry_layout")
-    state_types = types.SimpleNamespace(DSA="DSA", SWA="SWA")
+    state_types = types.SimpleNamespace(
+        DSA="DSA", SWA="SWA", AUXILIARY_SWA="AUXILIARY_SWA"
+    )
     flat.__globals__["StateType"] = state_types
     generic.update(
         group_concurrent_contiguous=group,
@@ -330,14 +332,21 @@ def main():
     assert len(sender.calls) == before + 1
     assert not stager.close()
     assert stager in sender._core_staging_owners and stager.buffer.slot is slot
-    failed_again = False
-    try:
-        manager._transfer_data(
-            receiver.session, [(ptrs[0], dst_ptrs[0], strides[0])], stage=True
-        )
-    except RuntimeError:
-        failed_again = True
-    assert failed_again and len(sender.calls) == before + 1
+    # Existing CorePinnedStager retires poisoned backing and allocates a fresh
+    # registered slot for later sends. It must never reuse the unsettled slot.
+    poisoned_buffer = stager.buffer
+    rc = manager._transfer_data(
+        receiver.session, [(ptrs[0], dst_ptrs[0], strides[0])], stage=True
+    )
+    assert rc == -1 and len(sender.calls) == before + 2
+    assert stager.retired[0] is poisoned_buffer
+    assert poisoned_buffer.slot is slot and poisoned_buffer.poisoned
+    assert stager.buffer.slot.ptr != slot.ptr
+    assert all(
+        not (slot.ptr <= src < slot.ptr + slot.capacity)
+        for src, _, _ in sender.calls[-1]
+    )
+    assert not stager.close() and stager in sender._core_staging_owners
     paths = list((root / "plugins/remote_attn/sglang_remote_attn").glob("*.py")) + [
         Path(__file__).resolve()
     ]
@@ -374,7 +383,7 @@ def main():
         ordinary_middle_reuses_slot=True,
         final_state_direct=True,
         failed_slot_quarantined=True,
-        failed_retry_no_te=True,
+        failed_retry_fresh_backing=True,
         source_sha256={
             str(p.relative_to(root)): hashlib.sha256(p.read_bytes()).hexdigest()
             for p in paths

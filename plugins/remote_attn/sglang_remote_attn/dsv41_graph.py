@@ -23,18 +23,24 @@ class DSV41GraphBackend(RemoteGraphBackend):
     def __init__(self, *args):
         super().__init__(*args)
         # Reuse the native eager decorator (same bridge/pool lifetime contract).
-        self.dynamic_break = self._eager_on_graph(self._dynamic)
+        self.dynamic_break = self._eager_on_graph(
+            self._dynamic,
+            on_capture=self._dynamic,
+            output_factory=self._dynamic_output,
+        )
         self.dynamic_trace = []
         self.dynamic_boundaries = {}
         self.live_targets = {}
         self.bridge_specs = {}
+        self.bridge_layouts = {}
         self.native_keys = []
 
     def validate_capture_key(self, key):
         variants = getattr(self.runner, "attention_graph_variants", None)
         labels = getattr(variants, "capture_labels", (None,))
         if (
-            key.stream_idx is not None
+            getattr(key, "stream_idx", None) is not None
+            or getattr(key, "logits_variant", None) is not None
             or key.variant_label is not None
             or key.attention_variant not in labels
         ):
@@ -120,6 +126,22 @@ class DSV41GraphBackend(RemoteGraphBackend):
         finally:
             self.live_targets.clear()
 
+    def _dynamic_output(self, kind, owner, **arguments):
+        # Warmup executes the native method and records only its output layout.
+        # Tensor backing is allocated here, inside the graph pool, and remains
+        # separate from temporary eager outputs and their allocator lifetime.
+        layer = (
+            -1
+            if kind == "metadata"
+            else arguments["layer"].layer_id
+            if kind == "attention"
+            else owner.layer_id
+        )
+        key = (self.capture_batch.batch_size, kind, layer)
+        if key not in self.bridge_layouts:
+            raise RuntimeError("DSV graph break has no warmed output layout")
+        return allocate_output_layout(self.bridge_layouts[key])
+
     def _dynamic(self, kind, owner, **arguments):
         capture = self.capture_remote
         batch = self.capture_batch if capture else self.active_batch
@@ -179,7 +201,12 @@ class DSV41GraphBackend(RemoteGraphBackend):
             key = (bucket, kind, layer)
             spec = output_signature(result)
             if capture:
+                if self.is_capturing() and self.bridge_specs.get(key, object()) != spec:
+                    raise RuntimeError(
+                        "DSV capture output differs from its warmup layout"
+                    )
                 self.bridge_specs[key] = spec
+                self.bridge_layouts[key] = output_layout(result)
             elif self.bridge_specs.get(key, object()) != spec:
                 raise RuntimeError(
                     "DSV eager result differs from captured graph bridge"
@@ -206,6 +233,7 @@ class DSV41GraphBackend(RemoteGraphBackend):
         self.dynamic_boundaries.clear()
         self.live_targets.clear()
         self.bridge_specs.clear()
+        self.bridge_layouts.clear()
         self.native_keys.clear()
 
 
@@ -376,6 +404,30 @@ def capture_signature(model_runner, runner):
         return bool(valid), tuple(rows)
     except (AttributeError, TypeError, ValueError):
         return False, tuple(rows)
+
+
+def output_layout(value):
+    import torch
+
+    if value is None:
+        return None
+    if torch.is_tensor(value):
+        return ("tensor", tuple(value.shape), value.dtype, value.device)
+    if isinstance(value, (tuple, list)):
+        return (type(value).__name__, tuple(output_layout(v) for v in value))
+    raise TypeError(f"unsupported DSV graph bridge: {type(value)}")
+
+
+def allocate_output_layout(layout):
+    import torch
+
+    if layout is None:
+        return None
+    if layout[0] == "tensor":
+        _, shape, dtype, device = layout
+        return torch.empty(shape, dtype=dtype, device=device)
+    values = [allocate_output_layout(item) for item in layout[1]]
+    return tuple(values) if layout[0] == "tuple" else values
 
 
 def output_signature(value):

@@ -469,16 +469,17 @@ def before_mutation(scheduler, req):
     plan.controller.sources.remove(source)
 
 
-def cached_prefix(original, scheduler, req):
+def cached_prefix(original, scheduler, req, allow_send=True):
     controller = getattr(scheduler, "_pre_layerwise", None)
     if (
-        controller is None
+        not allow_send
+        or controller is None
         or not enabled()
         or controller.config.mode != "remote"
         or getattr(controller, "cache_guard", None) is None
         or req.pending_bootstrap
     ):
-        return original(scheduler, req)
+        return original(scheduler, req, allow_send=allow_send)
     if not getattr(req, "_remote_attn_prefix_stream_seen", False):
         from .pd_mesh import source_root
 
@@ -608,7 +609,7 @@ def cached_prefix(original, scheduler, req):
                 lease.source = source
         elif owned and pin is not None:
             pin.retire(lambda: None)
-    return original(scheduler, req)
+    return original(scheduler, req, allow_send=allow_send)
 
 
 def track(original, manager, room, indices, span, last, *args, **kw):

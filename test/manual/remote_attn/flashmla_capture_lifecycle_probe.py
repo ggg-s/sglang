@@ -128,7 +128,7 @@ class Fixture:
             runner,
             self.full,
             self.remote,
-            lambda fn: fn,
+            lambda fn, **kwargs: fn,
             torch.cuda.is_current_stream_capturing,
             lambda: None,
         )

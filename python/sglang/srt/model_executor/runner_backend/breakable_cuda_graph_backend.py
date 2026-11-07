@@ -27,6 +27,7 @@ import torch
 from sglang.srt.distributed.device_communicators.pynccl_allocator import (
     set_graph_pool_id,
 )
+from sglang.srt.environ import envs
 from sglang.srt.model_executor.forward_batch_info import PPProxyTensors
 from sglang.srt.model_executor.runner_backend.base_cuda_graph_backend import (
     BaseCudaGraphBackend,
@@ -43,6 +44,10 @@ from sglang.srt.model_executor.runner_backend_utils.breakable_cuda_graph import 
 from sglang.srt.model_executor.runner_backend_utils.capture_workspace import (
     CaptureWorkspacePool,
 )
+from sglang.srt.model_executor.runner_backend_utils.hicache_graph_events import (
+    HiCacheGraphEvents,
+    wait_for_layer_loads,
+)
 from sglang.srt.model_executor.runner_utils.pool import (
     GraphPoolPrecarve,
     get_or_create_global_graph_memory_pool,
@@ -50,7 +55,7 @@ from sglang.srt.model_executor.runner_utils.pool import (
     graph_pool_replay_scope,
 )
 from sglang.srt.runtime_context import get_parallel
-from sglang.srt.utils import get_bool_env_var
+from sglang.srt.utils import get_bool_env_var, is_cuda
 from sglang.srt.utils.torch_memory_saver_adapter import TorchMemorySaverAdapter
 
 if TYPE_CHECKING:
@@ -74,6 +79,7 @@ class BreakableCudaGraphBackend(DedupedCudaGraphMixin, BaseCudaGraphBackend):
         debug_eager: bool = False,
         capture_error_mode: str = "global",
         preallocate_workspaces: bool = False,
+        enable_hicache_event_capture: bool = False,
     ) -> None:
         self._cuda_graph_runner = cuda_graph_runner
         self._model_runner = cuda_graph_runner.model_runner
@@ -88,6 +94,17 @@ class BreakableCudaGraphBackend(DedupedCudaGraphMixin, BaseCudaGraphBackend):
         self._tp_group = get_parallel().tp_group
         self._capture_stream: Optional[torch.cuda.Stream] = None
         self._debug_eager = debug_eager
+        self._enable_hicache_event_capture = enable_hicache_event_capture
+        self._hicache_graph_events = None
+        # Dedup shares executables, so it must keep the ordinary load barrier.
+        if (
+            enable_hicache_event_capture
+            and is_cuda()
+            and not envs.SGLANG_ENABLE_CUDA_GRAPH_DEDUP.get()
+        ):
+            self._hicache_graph_events = HiCacheGraphEvents(
+                self._model_runner.token_to_kv_pool
+            )
         self._shared_output_buffer: Optional[Any] = None
         self._precarve = GraphPoolPrecarve()
         self._memory_saver_adapter: Optional[Any] = TorchMemorySaverAdapter.create(
@@ -142,8 +159,9 @@ class BreakableCudaGraphBackend(DedupedCudaGraphMixin, BaseCudaGraphBackend):
             if post_warmup_hook is not None:
                 post_warmup_hook()
 
-        graph = BreakableCUDAGraph(self.deduped_cuda_graph)
-        captured_fn = eager_on_graph(forward_fn) if self._debug_eager else forward_fn
+        graph = BreakableCUDAGraph(
+            self.deduped_cuda_graph, hicache_graph_events=self._hicache_graph_events
+        )
         size = shape_key.size
         if self._shared_output_buffer is None:
             capacity_rows = self._cuda_graph_runner.cuda_graph_output_capacity_rows(
@@ -154,7 +172,11 @@ class BreakableCudaGraphBackend(DedupedCudaGraphMixin, BaseCudaGraphBackend):
             self._shared_output_buffer = self._alloc_full_buffer(
                 warmup_out, capacity_rows
             )
+        buffer = self._shared_output_buffer
         with (
+            self._hicache_graph_events.capture_scope()
+            if self._hicache_graph_events is not None
+            else nullcontext(),
             graph_pool_capture_scope(),
             workspaces.scope(capturing=True)
             if workspaces is not None
@@ -163,16 +185,28 @@ class BreakableCudaGraphBackend(DedupedCudaGraphMixin, BaseCudaGraphBackend):
                 cuda_graph=graph,
                 pool=self._pool,
                 stream=self._capture_stream,
-                barrier_fn=self._tp_group.barrier,
                 capture_error_mode=self._capture_error_mode,
             ),
         ):
             self._precarve.mint()
-            out = captured_fn()
-            out_rows = self._output_rows(out, size)
-            self._copy_output_to_buffer(out, self._shared_output_buffer, out_rows)
+            if self._debug_eager:
+                # The whole forward runs as one eager break that writes the
+                # output buffer.
+                # The warmup ran the same forward, so its output gives the
+                # captured rows.
+                out_rows = self._output_rows(warmup_out, size)
 
-        stored = self._slice_output(self._shared_output_buffer, out_rows)
+                @eager_on_graph
+                def forward_into_buffer(output_buffer: Any) -> None:
+                    self._copy_output_to_buffer(forward_fn(), output_buffer, out_rows)
+
+                forward_into_buffer(buffer)
+            else:
+                out = forward_fn()
+                out_rows = self._output_rows(out, size)
+                self._copy_output_to_buffer(out, buffer, out_rows)
+
+        stored = self._slice_output(buffer, out_rows)
         self._graphs[shape_key] = graph
         self._outputs[shape_key] = stored
         # CUDA graphs retain tensor addresses, not Python tensor lifetimes.
@@ -323,6 +357,8 @@ class BreakableCudaGraphBackend(DedupedCudaGraphMixin, BaseCudaGraphBackend):
         static_forward_batch: ForwardBatch,
         **kwargs,
     ) -> Any:
+        if self._enable_hicache_event_capture and self._hicache_graph_events is None:
+            wait_for_layer_loads(self._model_runner.token_to_kv_pool)
         with graph_pool_replay_scope():
             self._graphs[shape_key].replay()
         output = self._outputs[shape_key]

@@ -135,6 +135,7 @@ CORE_CALLS = {
         "req": inspect.Parameter.empty,
         "prefill_aux_index": inspect.Parameter.empty,
         "dst_aux_ptrs": inspect.Parameter.empty,
+        "dst_aux_item_lens": inspect.Parameter.empty,
     },
     MANAGER + "_poison_unsettled_send": {},
     DISAGG + "common.conn.CommonKVManager.conclude_failure": {"targets": None},
@@ -179,6 +180,7 @@ CORE_CALLS = {
     STAGING + "init_staging_allocator": {"pin_memory": False},
     STAGING + "PrefillStagingStrategy.check_ready": {"chunk_idx": None},
     STAGING + "DecodeStagingHandler._scatter_region": {
+        "stream": None,
         "layer_ids": None,
         "staging_bytes": None,
     },
@@ -204,7 +206,9 @@ CORE_CALLS = {
     DISAGG + "pinned_staging_buffer.CudaPinnedSlot.copy": {},
     DISAGG + "pinned_staging_buffer.CudaPinnedSlot.close": {},
     "sglang.srt.model_executor.runner_backend_utils.breakable_cuda_graph.breakable_cuda_graph.eager_on_graph": {
-        "capture_stub": None,
+        "on_capture": None,
+        "output_factory": None,
+        "pass_output": False,
         "enable": None,
     },
     "sglang.srt.model_executor.runner_backend_utils.breakable_cuda_graph.breakable_cuda_graph.is_capturing": {},
@@ -233,9 +237,10 @@ CORE_CALLS = {
     "sglang.srt.model_executor.runner_backend.breakable_cuda_graph_backend.BreakableCudaGraphBackend.capture_session": {
         "stream": inspect.Parameter.empty
     },
-    "sglang.srt.mem_cache.base_prefix_cache.BasePrefixCache.evict_sliding_windows": {
+    "sglang.srt.mem_cache.allocation.retire_window": {
         "req": inspect.Parameter.empty,
-        "pre_len": inspect.Parameter.empty,
+        "frontier": inspect.Parameter.empty,
+        "tree_cache": inspect.Parameter.empty,
         "eviction_interval": 1,
     },
     "sglang.srt.mem_cache.base_prefix_cache.BasePrefixCache.lock": {
@@ -254,7 +259,8 @@ CORE_CALLS = {
     "sglang.srt.mem_cache.radix_cache.RadixCache.reset": {},
     DISAGG
     + "prefill.SchedulerDisaggregationPrefillMixin.maybe_send_cached_prefix_chunk": {
-        "req": inspect.Parameter.empty
+        "allow_send": True,
+        "req": inspect.Parameter.empty,
     },
     "sglang.srt.mem_cache.unified_radix_cache.UnifiedRadixCache.checkpoint": {
         "up_to": inspect.Parameter.empty
@@ -272,8 +278,7 @@ CORE_CALLS = {
         "lock": inspect.Parameter.empty
     },
     "sglang.srt.mem_cache.unified_radix_cache.UnifiedRadixCache.reset": {},
-    "sglang.srt.managers.scheduler.Scheduler.is_disable_overlap_for_batch": {
-        "batch": inspect.Parameter.empty,
+    "sglang.srt.managers.scheduler.Scheduler.should_process_last_batch_early": {
         "last_batch": inspect.Parameter.empty,
     },
     "sglang.srt.managers.utils.GenerationBatchResult.copy_to_cpu": {

@@ -5333,6 +5333,30 @@ def _logprob_kwargs(data):
     }
 
 
+def _join_waiting(scheduler, reqs):
+    """Keep the native request-list owner when admitting imported/resumed work."""
+    queue = scheduler.waiting_queue
+    join = getattr(queue, "join", None)
+    if callable(join):
+        join(reqs)
+    elif isinstance(queue, list):
+        # Standalone control-plane fixtures/embedders may supply a plain list.
+        queue.extend(reqs)
+    else:
+        raise TypeError("waiting queue does not implement native request-list join")
+
+
+def _leave_waiting(scheduler, req):
+    queue = scheduler.waiting_queue
+    leave = getattr(queue, "leave", None)
+    if callable(leave):
+        leave([req])
+    elif isinstance(queue, list):
+        queue[:] = [item for item in queue if item is not req]
+    else:
+        raise TypeError("waiting queue does not implement native request-list leave")
+
+
 def _remove_from_batches(scheduler, req):
     # A prefill-to-decode freeze happens before get_next_batch_to_run merges
     # last_batch, so the request may still live in last_batch rather than
@@ -5346,7 +5370,7 @@ def _remove_from_batches(scheduler, req):
             # A frozen request must not leave batch_is_full latched; otherwise
             # later sources in the same C=4 prefill can never be admitted.
             rb.batch_is_full = False
-    scheduler.waiting_queue = [r for r in scheduler.waiting_queue if r is not req]
+    _leave_waiting(scheduler, req)
 
 
 def _sampling_dict(req):
@@ -8044,7 +8068,7 @@ def _full_import_one(
             scheduler._handoff_held_reqs = getattr(scheduler, "_handoff_held_reqs", [])
             scheduler._handoff_held_reqs.append(req)
         else:
-            scheduler.waiting_queue.append(req)
+            _join_waiting(scheduler, [req])
         tracked[rid] = req
         state = _TargetHandoffState(
             None,
@@ -8200,7 +8224,7 @@ def _handle(scheduler, data):
         scheduler._handoff_held_reqs = []
         scheduler._handoff_hold_admission = False
         for req in held:
-            scheduler.waiting_queue.append(req)
+            _join_waiting(scheduler, [req])
         return {"admitted": len(held)}
 
     if cmd == "capacity":
@@ -8308,7 +8332,7 @@ def _handle(scheduler, data):
             req._handoff_pause_after_prefill = True
             req._handoff_freeze_mode = data.get("transfer", "mooncake")
             req._handoff_freeze_out = data.get("out")
-        scheduler.waiting_queue.append(req)
+        _join_waiting(scheduler, [req])
         tracked[rid] = req
         return {"rid": rid, "queued": True, "input_len": len(req.origin_input_ids)}
 
@@ -8457,7 +8481,7 @@ def _handle(scheduler, data):
                 req._handoff_pause_after_prefill = True
                 req._handoff_freeze_mode = item.get("transfer", "mooncake")
                 req._handoff_freeze_out = item.get("out")
-            scheduler.waiting_queue.append(req)
+            _join_waiting(scheduler, [req])
             tracked[rid] = req
             rids.append(rid)
         return {"rids": rids, "count": len(rids)}
@@ -8705,7 +8729,7 @@ def _handle(scheduler, data):
                     )
                     scheduler._handoff_held_reqs.append(req)
                 else:
-                    scheduler.waiting_queue.append(req)
+                    _join_waiting(scheduler, [req])
                 tracked[rid] = req
                 state.import_timeline = {
                     "cmd_recv_at": t_cmd_mono,
@@ -8864,7 +8888,7 @@ def _handle(scheduler, data):
                 )
                 scheduler._handoff_held_reqs.append(req)
             else:
-                scheduler.waiting_queue.append(req)
+                _join_waiting(scheduler, [req])
             tracked[rid] = req
             tstate = _TargetHandoffState(
                 None,
@@ -9089,7 +9113,7 @@ def _handle(scheduler, data):
             scheduler._handoff_hold_admission = False
             scheduler._handoff_held_reqs = []
             for req in held:
-                scheduler.waiting_queue.append(req)
+                _join_waiting(scheduler, [req])
         else:
             scheduler._handoff_held_reqs = prev_held + held
             scheduler._handoff_hold_admission = prev_hold
@@ -9453,7 +9477,7 @@ def _handle(scheduler, data):
                     "kv_committed_len": int(req.kv.kv_committed_len),
                 }
             if not any(r is req for r in scheduler.waiting_queue):
-                scheduler.waiting_queue.append(req)
+                _join_waiting(scheduler, [req])
             return {
                 "resumed": True,
                 "rid": rid,
@@ -9532,7 +9556,7 @@ def _handle(scheduler, data):
                 flush=True,
             )
         if not any(r is req for r in scheduler.waiting_queue):
-            scheduler.waiting_queue.append(req)
+            _join_waiting(scheduler, [req])
         return {
             "resumed": True,
             "rid": rid,

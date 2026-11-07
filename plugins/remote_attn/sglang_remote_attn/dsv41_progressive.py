@@ -10,6 +10,7 @@ from concurrent.futures import ThreadPoolExecutor
 from dataclasses import dataclass, field
 
 from . import dsv41_remote, prefill_overlap
+from .compat import decode_queue_items, remove_decode_items
 from .pre_layerwise import Target as NativeTarget
 from .pre_layerwise import (
     _check_transport_failure,
@@ -38,11 +39,24 @@ def track_transfer(original, manager, room, indices, index_slice, last, *args, *
     source.enqueue_index()
 
 
-def send_metadata(manager, peer, index, pointers):
+def send_metadata(manager, peer, index, pointers, item_lens):
     from .transfer_priority import control
 
+    source_ptrs = manager.kv_args.aux_data_ptrs
+    source_lens = manager.kv_args.aux_item_lens
+    # Native auxiliary buffers pair positionally, but P and D may allocate
+    # different row strides. The early barrier must not publish success after
+    # overwriting a neighboring D row or silently inferring its stride from P.
+    if (
+        len(source_ptrs) != len(source_lens)
+        or item_lens is None
+        or len(pointers) != len(item_lens)
+        or any(length <= 0 for length in (*source_lens, *item_lens))
+        or any(dst < src for src, dst in zip(source_lens, item_lens))
+    ):
+        raise ValueError("DSV auxiliary destination strides are missing or too small")
     with control(manager):
-        return manager.send_aux(peer, index, pointers)
+        return manager.send_aux(peer, index, pointers, item_lens)
 
 
 def send_states(source):
@@ -58,7 +72,11 @@ def send_states(source):
                 )
                 != 0
                 or send_metadata(
-                    manager, peer, payload["aux_index"], registration.dst_aux_ptrs
+                    manager,
+                    peer,
+                    payload["aux_index"],
+                    registration.dst_aux_ptrs,
+                    registration.dst_aux_item_lens,
                 )
                 != 0
             ):
@@ -314,7 +332,7 @@ class ProgressiveTarget(NativeTarget):
 def early_targets(controller, queue, rids_to_check):
     from .transport_failure import TransportFailure, quarantine
 
-    offered = [controller.offer(queue, dr) for dr in queue.queue]
+    offered = [controller.offer(queue, dr) for dr in decode_queue_items(queue)]
     candidates = []
     failed = []
     for offer in offered:
@@ -403,11 +421,13 @@ def early_targets(controller, queue, rids_to_check):
                 at=time.monotonic(),
             ),
         )
-    queue.queue = [dr for dr in queue.queue if id(dr) not in removed]
+    remove_decode_items(queue, removed)
     return admitted, offered
 
 
-def send_aux(original, manager, req, prefill_aux_index, dst_aux_ptrs):
+def send_aux(
+    original, manager, req, prefill_aux_index, dst_aux_ptrs, dst_aux_item_lens
+):
     peer, aux_index = req, prefill_aux_index
     # The canonical final marker must not race a second metadata DMA against
     # D's early native commit. The successful sideband already sent these bytes.
@@ -419,7 +439,7 @@ def send_aux(original, manager, req, prefill_aux_index, dst_aux_ptrs):
             and any(peer is p for p, _ in source.peers)
         ):
             return 0
-    return original(manager, peer, aux_index, dst_aux_ptrs)
+    return original(manager, peer, aux_index, dst_aux_ptrs, dst_aux_item_lens)
 
 
 def poll_responses(controller):

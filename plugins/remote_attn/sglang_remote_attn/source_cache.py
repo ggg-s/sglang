@@ -166,7 +166,9 @@ class CacheGuard:
             from .swa_checkpoints import retain
 
             retain(self, req, min(up_to, len(req.origin_input_ids)))
-            self.cache.evict_sliding_windows(req, pre_len)
+            from sglang.srt.mem_cache.allocation import retire_window
+
+            retire_window(req, pre_len, self.cache)
 
     def _finish(self, handle, outcome):
         lease = self.leases.get(handle)

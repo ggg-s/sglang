@@ -17,6 +17,7 @@ import sys
 import threading
 import types
 import typing
+from abc import ABC, abstractmethod
 from contextlib import contextmanager, nullcontext
 from pathlib import Path
 from unittest.mock import patch
@@ -49,6 +50,16 @@ def definitions(path, namespace, names=None):
         type_ignores=[],
     )
     exec(compile(ast.fix_missing_locations(tree), str(path), "exec"), namespace)
+
+
+def load_native_backend_base(root, namespace):
+    namespace.update(ABC=ABC, abstractmethod=abstractmethod)
+    definitions(
+        root
+        / "python/sglang/srt/model_executor/runner_backend/base_cuda_graph_backend.py",
+        namespace,
+        names={"BaseCudaGraphBackend"},
+    )
 
 
 def workspace_namespace(root):
@@ -136,6 +147,7 @@ def run(root, allow_strong_refs, dtype, logits_output=False, marlin_workspaces=F
         sys.modules["sglang.srt.utils"] = types.SimpleNamespace(
             get_device_module=lambda: torch.cuda,
             is_hip=lambda: False,
+            is_musa=lambda: False,
             is_xpu=lambda: False,
         )
         strong = False
@@ -214,6 +226,7 @@ def run(root, allow_strong_refs, dtype, logits_output=False, marlin_workspaces=F
             namespace,
             names={"LogitsProcessorOutput"},
         )
+        load_native_backend_base(root, namespace)
         definitions(native / "runner_backend/full_cuda_graph_backend.py", namespace)
         definitions(
             native / "runner_backend/breakable_cuda_graph_backend.py", namespace
