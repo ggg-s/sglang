@@ -42,7 +42,9 @@ def load(name, rel, **env):
     module.__file__ = str(path)
     module.__dict__.update(env)
     sys.modules[name] = module
-    exec(compile(tree, str(path), "exec"), module.__dict__)
+    # Preserve the source module's own annotation semantics. Inheriting this
+    # harness's future-annotations flag breaks TileLang's nested dynamic shapes.
+    exec(compile(tree, str(path), "exec", dont_inherit=True), module.__dict__)
     return module
 
 

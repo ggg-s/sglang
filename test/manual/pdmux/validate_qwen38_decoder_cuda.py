@@ -63,6 +63,11 @@ def main():
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--output", type=Path, required=True)
     parser.add_argument("--rounds", type=int, default=32)
+    parser.add_argument(
+        "--debug",
+        action="store_true",
+        help="Use kernel API logging configured by SGLANG_KERNEL_API_*.",
+    )
     parser.add_argument("--only", choices=("mqa", "decoder", "all"), default="all")
     args = parser.parse_args()
     if args.rounds < 1:
@@ -85,6 +90,18 @@ def main():
         )
         if not mqa.HAS_TILELANG:
             raise RuntimeError("TileLang is required; no Torch fallback is accepted")
+        if args.debug:
+            api = ops.load(
+                "qwen38_kernel_api", "python/sglang/kernels/kernel_api_logging.py"
+            )
+            for name in (
+                "tilelang_qsa_mqa_prefill",
+                "tilelang_qsa_mqa_prefill_relative",
+                "tilelang_qsa_mqa_decode",
+            ):
+                setattr(
+                    mqa, name, api.debug_kernel_api(getattr(mqa, name), op_name=name)
+                )
         report["tilelang"] = mqa.tilelang.__version__
         for dtype in (torch.bfloat16, torch.float8_e4m3fn):
             for relative in (False, True):
