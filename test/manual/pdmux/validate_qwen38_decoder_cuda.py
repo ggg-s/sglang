@@ -63,6 +63,11 @@ def main():
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--output", type=Path, required=True)
     parser.add_argument("--rounds", type=int, default=32)
+    parser.add_argument(
+        "--canonical-topk",
+        action="store_true",
+        help="Control experiment: sort the same selected token set before sparse attention.",
+    )
     parser.add_argument("--dtype", choices=("bf16", "fp8", "both"), default="both")
     parser.add_argument(
         "--layout", choices=("absolute", "relative", "both"), default="both"
@@ -133,7 +138,7 @@ def main():
         from qwen38_small_decoder import run_decoder
 
         try:
-            result = run_decoder(args.rounds)
+            result = run_decoder(args.rounds, canonical_topk=args.canonical_topk)
             report["cases"].append(result)
             print(json.dumps(result), flush=True)
         except Exception as exc:

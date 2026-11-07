@@ -461,6 +461,7 @@ class QSACore(nn.Module):
         )
         self.initial = self.k.clone(), self.v.clone()
         self.index_proj = Linear(256, 8 * 128)
+        self.canonical_topk = False
 
     def reset(self, lane):
         self.k[lane].copy_(self.initial[0][lane])
@@ -489,7 +490,7 @@ class QSACore(nn.Module):
                 max_row_keys=1024,
             )
         b.selected_tokens = result.sort(dim=-1).values
-        return result
+        return b.selected_tokens if self.canonical_topk else result
 
     def forward(self, q, k, v, b, topk_indices):
         rows = q.shape[0]
@@ -691,8 +692,9 @@ def prepare_batch(tokens, lane):
 
 
 @torch.inference_mode()
-def run_decoder(rounds):
+def run_decoder(rounds, canonical_topk=False):
     stack, gdn, qsa = build_stack()
+    qsa.canonical_topk = canonical_topk
     batches = [prepare_batch(t, lane) for lane, t in enumerate((65, 1))]
     inputs = [
         torch.randn(t, 256, device="cuda", dtype=torch.bfloat16) * 0.1 for t in (65, 1)
@@ -800,6 +802,8 @@ def run_decoder(rounds):
         rounds=rounds,
         decode_cuda_graph=True,
         split_at_layer=1,
+        canonical_topk=canonical_topk,
+        comparison_names=names,
         max_abs=max_abs,
         untouched_slots_exact=True,
         hidden_size=256,
