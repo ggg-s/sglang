@@ -227,6 +227,7 @@ class TestPrefillCudaGraphRunnerChunkedPrefix(CustomTestCase):
             global_num_tokens_cpu=None,
             return_logprob=False,
             extend_prefix_lens_cpu=[0],
+            contains_mm_inputs=lambda: False,
         )
 
         with patch.object(runner_module, "get_current_stream_idx", return_value=0):

@@ -55,6 +55,39 @@ def load_method(path, owner, name, **namespace):
 
 
 class TestPdmuxMainCompat(unittest.TestCase):
+    def test_prefill_bcg_admits_plain_tp_and_rejects_unisolated_profiles(self):
+        """BCG must not accidentally admit shared speculative/DP/EP state."""
+        check = load_method(
+            "python/sglang/srt/arg_groups/validation_hook.py",
+            None,
+            "check_pdmux_prefill_bcg",
+        )
+        valid = dict(
+            cuda_graph_config=SimpleNamespace(
+                prefill=SimpleNamespace(backend="breakable")
+            ),
+            speculative_algorithm=None,
+            tp_size=8,
+            pp_size=1,
+            ep_size=1,
+            attn_cp_size=1,
+            dcp_size=1,
+            enable_dp_attention=False,
+        )
+        check(SimpleNamespace(**valid))
+        for field, value in (
+            ("speculative_algorithm", "EAGLE"),
+            ("enable_dp_attention", True),
+            ("ep_size", 2),
+            ("attn_cp_size", 2),
+            ("dcp_size", 2),
+            ("pp_size", 2),
+            ("enable_prefill_cp", True),
+        ):
+            with self.subTest(field=field):
+                with self.assertRaises(AssertionError):
+                    check(SimpleNamespace(**(valid | {field: value})))
+
     @staticmethod
     def bind_inflight_batches(scheduler):
         method = load_method(

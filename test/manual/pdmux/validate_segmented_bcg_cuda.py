@@ -39,7 +39,8 @@ def load_bcg():
         "at::Tensor weak_ref_tensor(const at::Tensor&);\n"
         "TORCH_LIBRARY(pdmux_bcg_validation, m) {\n"
         'm.def("weak_ref_tensor(Tensor x) -> Tensor");\n'
-        'm.impl("weak_ref_tensor", torch::kCUDA, &weak_ref_tensor); }\n'
+        '}\nTORCH_LIBRARY_IMPL(pdmux_bcg_validation, CUDA, m) {\n'
+        'm.impl("weak_ref_tensor", &weak_ref_tensor); }\n'
     )
     load(
         "pdmux_bcg_native_weak_ref",
