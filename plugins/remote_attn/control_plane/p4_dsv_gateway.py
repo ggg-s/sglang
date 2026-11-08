@@ -23,6 +23,7 @@ from urllib.parse import parse_qs
 PROTOCOL = "dsv-d2d-v2"
 TERMINAL = {"DONE", "CANCELLED"}
 PRECOMMIT = {"PLAN", "RESERVE", "WAIT_CUT", "FREEZE", "IMPORT"}
+STATUS_VISIBILITY_GRACE_S = 30
 WAVE_SIZE = 8
 WAVE_PHASES = {"RESERVE", "WAIT_CUT", "FREEZE", "IMPORT", "COMMIT"}
 Command = namedtuple("Command", "role name epoch payload")
@@ -923,9 +924,28 @@ class DsvGateway:
                             for p in rows
                         ),
                     )
-            self._update(rid, phase="SOURCE" if role == "src" else "DIRECT")
+            self._update(
+                rid,
+                phase="SOURCE" if role == "src" else "DIRECT",
+                submission_confirmed_at=time.time(),
+                request_seen=request is not None,
+            )
             return
         if phase in {"SOURCE", "DIRECT"}:
+            if request is None:
+                confirmed = entry.get("submission_confirmed_at")
+                if (
+                    not entry.get("request_seen", False)
+                    and confirmed is not None
+                    and time.time() - confirmed < STATUS_VISIBILITY_GRACE_S
+                ):
+                    # The submit reply can precede the next advisory snapshot.
+                    # Wait without resubmitting or emitting a terminal error.
+                    self._update(rid, awaiting_visibility=True, error=None)
+                    return
+                raise RuntimeError("native request missing; refusing resubmission")
+            if not entry.get("request_seen", False) or entry.get("awaiting_visibility"):
+                self._update(rid, request_seen=True, awaiting_visibility=False)
             if (
                 phase == "SOURCE"
                 and entry.get("admission_plans")
@@ -934,8 +954,6 @@ class DsvGateway:
             ):
                 self._begin(entry)
                 return
-            if request is None:
-                raise RuntimeError("native request missing; refusing resubmission")
             if entry["cancel_requested"] and not request["finished"]:
                 role = entry["owner"]
                 backend_rid = (

@@ -25,6 +25,27 @@ def rpc(url, path, body=None, timeout=600):
         return json.loads(response.read())
 
 
+def sse_events(response):
+    """Dispatch complete SSE events; event names reset at each blank line."""
+    kind, data = "message", []
+    for raw in response:
+        line = raw.decode("utf-8").rstrip("\r\n")
+        if not line:
+            if data:
+                yield kind, "\n".join(data)
+            kind, data = "message", []
+            continue
+        if line.startswith(":"):
+            continue
+        field, _, value = line.partition(":")
+        if value.startswith(" "):
+            value = value[1:]
+        if field == "event":
+            kind = value
+        elif field == "data":
+            data.append(value)
+
+
 def stream(url, body, row, lock, timeout):
     request = urllib.request.Request(
         url.rstrip("/") + "/v1/completions",
@@ -33,19 +54,22 @@ def stream(url, body, row, lock, timeout):
     )
     try:
         with urllib.request.urlopen(request, timeout=timeout) as response:
-            for line in response:
-                if not line.startswith(b"data:"):
-                    continue
-                data = line[5:].strip()
+            for kind, data in sse_events(response):
                 with lock:
-                    if data == b"[DONE]":
+                    if kind == "status":
+                        row["last_status"] = json.loads(data)
+                        continue
+                    if kind == "error":
+                        raise RuntimeError(data)
+                    if data == "[DONE]":
                         row["done"] = True
                         return
                     event = json.loads(data)
-                    if "error" in event:
+                    if event.get("error"):
                         raise RuntimeError(event["error"])
                     if "token_id" in event:
                         row["tokens"].append(dict(event, at=time.monotonic()))
+            raise ConnectionError("SSE EOF before [DONE]")
     except Exception as exc:
         with lock:
             row["error"] = repr(exc)
@@ -60,7 +84,7 @@ def run(url, prompt, concurrency, max_new, trigger, mode, timeout):
     warm = dict(tokens=[], done=False)
     stream(
         url,
-        dict(rid=warm_rid, prompt_ids=prompt, max_new_tokens=1, cut=1),
+        dict(rid=warm_rid, prompt_ids=prompt, max_new_tokens=8, cut=8),
         warm,
         lock,
         timeout,
@@ -137,12 +161,14 @@ def run(url, prompt, concurrency, max_new, trigger, mode, timeout):
                 owner_monotonic="dst" not in owners
                 or "src" not in owners[owners.index("dst") :],
                 migrated=first is not None,
-                first_target_from_drain_ms=None
-                if first is None
-                else (first["at"] - t0) * 1000,
-                last_source_to_first_target_ms=None
-                if first is None or last is None
-                else (first["at"] - last["at"]) * 1000,
+                first_target_from_drain_ms=(
+                    None if first is None else (first["at"] - t0) * 1000
+                ),
+                last_source_to_first_target_ms=(
+                    None
+                    if first is None or last is None
+                    else (first["at"] - last["at"]) * 1000
+                ),
                 max_token_gap_ms=max(
                     ((b["at"] - a["at"]) * 1000 for a, b in zip(tokens, tokens[1:])),
                     default=None,
