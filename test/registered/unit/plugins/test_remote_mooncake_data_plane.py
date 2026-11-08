@@ -217,6 +217,72 @@ class TestRemoteMooncakeDataPlane(CustomTestCase):
                 self.fail("condition did not become true")
             time.sleep(0.005)
 
+    def test_private_transfer_lock_bypasses_kv_lock_but_serializes_qo(self):
+        """KV publication cannot block Q/O; concurrent Q/O still shares a mutex."""
+        fixture = self.fixture()
+        shared = threading.Lock()
+        fixture.pp.manager._remote_attn_send_lock = shared
+        fixture.dd.manager._remote_attn_send_lock = shared
+        client = fixture.dd.client(fixture.route)
+        client.connect()  # registration must finish before holding the KV lock
+        fixture.p.started, fixture.p.gate = threading.Event(), threading.Event()
+        results, errors = [], []
+
+        def run():
+            try:
+                results.append(self.call(fixture, client=client))
+            except Exception as exc:
+                errors.append(exc)
+
+        shared.acquire()
+        thread = threading.Thread(target=run)
+        thread.start()
+        try:
+            self.assertTrue(fixture.p.started.wait(2))
+            acquired = fixture.pp.send_guard().acquire(blocking=False)
+            if acquired:
+                fixture.pp.send_guard().release()
+            self.assertFalse(acquired)
+            fixture.p.gate.set()
+            thread.join(3)
+            self.assertFalse(thread.is_alive())
+            self.assertFalse(errors)
+            self.assertEqual(len(results), 1)
+        finally:
+            shared.release()
+            fixture.p.gate.set()
+            thread.join(3)
+        client.close()
+
+    def test_registration_and_deregistration_keep_shared_guard(self):
+        fixture = self.fixture()
+        entered = []
+
+        class Shared:
+            def priority(self):
+                return self
+
+            def __enter__(self):
+                entered.append(True)
+
+            def __exit__(self, *args):
+                entered.pop()
+
+        for plane, nic in ((fixture.pp, fixture.p), (fixture.dd, fixture.d)):
+            plane.manager._remote_attn_send_lock = Shared()
+            for name in ("batch_register", "batch_deregister"):
+                original = getattr(nic, name)
+
+                def checked(*args, original=original):
+                    self.assertTrue(entered)
+                    return original(*args)
+
+                self.enterContext(patch.object(nic, name, side_effect=checked))
+        client, _, _ = self.call(fixture)
+        client.close()
+        self.assertFalse(fixture.p.regions or fixture.d.regions)
+        self.assertFalse(entered)
+
     def test_tcp_return_layout_negotiation_and_inline_ack_use_single_submit(self):
         for mode in ("packed", "legacy_client", "legacy_server"):
             for inline_ack in (False, True):

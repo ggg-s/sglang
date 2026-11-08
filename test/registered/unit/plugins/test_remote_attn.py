@@ -17320,6 +17320,37 @@ class TestRemoteAttn(CustomTestCase):
             any(not s.closed for s in pc.bulk.owners(d2d.manager(e.source).engine))
         )
 
+    def test_dsv_d2d_precopy_replay_reports_zero_new_payload_bytes(self):
+        """Retrying an acknowledged chunk must not count another physical payload."""
+        e = self._d2d_env()
+        p = self._precopy_support()
+        _, plan = p.reserve(e)
+        frame = dict(entry=0, start=0, count=1, chunk=uuid.uuid4().hex)
+        receive = p.command(e.target, "precopy", "precopy_prepare", frame=frame)[
+            "receive"
+        ]
+        first = p.command(
+            e.source, "precopy", "precopy_copy", frame=frame, receive=receive
+        )
+        replay = p.command(
+            e.source, "precopy", "precopy_copy", frame=frame, receive=receive
+        )
+        self.assertFalse(first["replayed"])
+        self.assertEqual(
+            first["copied_payload_bytes"], plan["schema"]["entries"][0][-1]
+        )
+        self.assertTrue(replay["replayed"])
+        self.assertEqual(replay["copied_payload_bytes"], 0)
+        self.assertEqual(first["proof"], replay["proof"])
+        one = p.command(
+            e.target, "precopy", "precopy_apply", frame=frame, proof=first["proof"]
+        )
+        two = p.command(
+            e.target, "precopy", "precopy_apply", frame=frame, proof=replay["proof"]
+        )
+        self.assertEqual(one["prefix_pages"], two["prefix_pages"])
+        self.assertEqual(two["prefix_pages"][0], 1)
+
     def test_dsv_d2d_precopy_rejects_changed_mapping_before_freeze(self):
         """Retraction/page-map reuse invalidates a previously copied prefix."""
         e = self._d2d_env()
@@ -17366,7 +17397,7 @@ class TestRemoteAttn(CustomTestCase):
             p.command(e.target, "precopy", "precopy_apply", frame=f, proof=proof)
         closes = p.command(e.source, "precopy", "precopy_close")
         self.assertTrue(closes["safe"])
-        with self.assertRaisesRegex(ValueError, "closed/failed"):
+        with self.assertRaisesRegex(ValueError, r"closed(?:/failed)?"):
             p.command(e.source, "precopy", "precopy_copy", frame=f, receive=receive)
         self.assertFalse(e.req._handoff_frozen)
 

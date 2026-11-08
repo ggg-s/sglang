@@ -135,6 +135,7 @@ class DsvGateway:
         out=None,
         autostart=True,
         async_handoff=False,
+        disable_precopy=False,
     ):
         self.driver, self.tokenizer = driver, tokenizer
         self.prefill_url, self.bootstrap_host = prefill_url, bootstrap_host
@@ -148,6 +149,10 @@ class DsvGateway:
         self.tick_samples = deque(maxlen=256)
         self.precopy_frame_samples = deque(maxlen=256)
         self.precopy_stage_samples = {}
+        self.disable_precopy = disable_precopy
+        self.precopy_events = deque(maxlen=256)
+        self.precopy_active = {}
+        self.precopy_ready = {}
         self.lock = threading.RLock()
         self.work_lock = threading.Lock()
         self.cv = threading.Condition(self.lock)
@@ -284,6 +289,29 @@ class DsvGateway:
             os.close(directory)
 
     def _update(self, rid, **changes):
+        started = time.monotonic()
+        try:
+            result = self._update_impl(rid, **changes)
+            if "phase" in changes and changes["phase"] != "WAIT_CUT":
+                epoch = self.journal["entries"][rid].get("epoch")
+                for key in list(self.precopy_ready):
+                    if key[0] == epoch:
+                        self.precopy_ready.pop(key, None)
+            return result
+        finally:
+            trace = self.precopy_active.get(rid)
+            if trace is not None:
+                trace["journal_ms"] += (time.monotonic() - started) * 1000
+                pending = changes.get("precopy_pending")
+                if pending is not None and trace.get("frame") is None:
+                    trace["frame"] = dict(pending["frame"])
+                    trace["available_pages"] = pending.get("available_pages")
+                    trace["available_pages_by_rank"] = pending.get("available_pages_by_rank")
+                    trace["reservation_upper_pages"] = pending.get(
+                        "reservation_upper_pages"
+                    )
+
+    def _update_impl(self, rid, **changes):
         with self.cv:
             changes = self.payloads.pack(changes)
             if all(
@@ -449,6 +477,22 @@ class DsvGateway:
             )
             return rows
         finally:
+            ended = time.monotonic()
+            commands = (
+                payload.get("commands", [])
+                if cmd == "d2d_control_wave"
+                else [dict(migration_epoch=epoch, cmd=cmd)]
+            )
+            for trace in list(self.precopy_active.values()):
+                if any(c.get("migration_epoch") == trace["epoch"] for c in commands):
+                    trace["slot_wait_ms"] += (
+                        (submitted if acquired else ended) - started
+                    ) * 1000
+                    if acquired:
+                        trace["rpc_ms"] += (ended - submitted) * 1000
+                    trace["rpc_attempts"] += 1
+                    if cmd == "d2d_control_wave":
+                        trace["wave_envelope"] = True
             if acquired:
                 self.role_locks[role].release()
             with self.lock:
@@ -495,6 +539,9 @@ class DsvGateway:
                 control_wave_sizes=copy.deepcopy(self.control_wave_sizes),
                 control_wave_members=dict(self.control_wave_members),
                 precopy_stage_wait_ms=copy.deepcopy(self.precopy_stage_samples),
+                precopy_enabled=not self.disable_precopy,
+                precopy_frame_events=copy.deepcopy(list(self.precopy_events)),
+                precopy_bytes_scope="applied_payload_sum_across_tp_ranks",
                 tick_recent_latency_ms=latency_histogram(self.tick_samples),
                 journal_bytes=self.path.stat().st_size if self.path.exists() else 0,
                 journal_version=self.journal["version"],
@@ -769,6 +816,102 @@ class DsvGateway:
         return None
 
     def _precopy(self, entry, *, cut_due=False):
+        rid, epoch = entry["rid"], entry["epoch"]
+        pending = entry.get("precopy_pending")
+        if pending is None and self.disable_precopy:
+            if cut_due:
+                self._update(rid, phase="FREEZE")
+            return
+        started = time.monotonic()
+        frame = pending["frame"] if pending else None
+        key = (epoch, frame["chunk"]) if frame else None
+        ready = self.precopy_ready.pop(key, None)
+        trace = dict(
+            type="precopy_stage",
+            rid=rid,
+            epoch=epoch,
+            frame=dict(frame) if frame else None,
+            available_pages=(pending or {}).get("available_pages"),
+            available_pages_by_rank=(pending or {}).get("available_pages_by_rank"),
+            reservation_upper_pages=(pending or {}).get("reservation_upper_pages"),
+            stage=pending["stage"] if pending else "PREPARE",
+            tick_wait_ms=(started - ready) * 1000 if ready is not None else None,
+            timing_recovered=pending is not None and ready is None,
+            rpc_ms=0.0,
+            slot_wait_ms=0.0,
+            journal_ms=0.0,
+            dispatch_wait_ms=0.0,
+            rpc_attempts=0,
+            wave_envelope=False,
+        )
+        self.precopy_active[rid] = trace
+        step = self._precopy_step(entry, cut_due=cut_due)
+        yielded_ms = 0.0
+        try:
+            cmd = next(step)
+            while True:
+                sent = time.monotonic()
+                measured = trace["rpc_ms"] + trace["slot_wait_ms"]
+                try:
+                    try:
+                        result = yield cmd
+                    finally:
+                        elapsed = (time.monotonic() - sent) * 1000
+                        yielded_ms += elapsed
+                        trace["dispatch_wait_ms"] += max(
+                            0,
+                            elapsed
+                            - (trace["rpc_ms"] + trace["slot_wait_ms"] - measured),
+                        )
+                except Exception as exc:
+                    cmd = step.throw(exc)
+                else:
+                    cmd = step.send(result)
+        except StopIteration:
+            trace["ok"] = True
+        except BaseException:
+            trace["ok"] = False
+            raise
+        finally:
+            step.close()
+            self.precopy_active.pop(rid, None)
+            ended = time.monotonic()
+            trace["active_ms"] = (ended - started) * 1000
+            trace["processing_ms"] = max(
+                0, trace["active_ms"] - yielded_ms - trace["journal_ms"]
+            )
+            current = self._entry(rid)
+            trace["phase"] = current["phase"]
+            frame = trace["frame"]
+            if frame is not None:
+                plans = entry["plans"]
+                index = frame["entry"]
+                trace["page_bytes_by_rank"] = [
+                    p["schema"]["entries"][index][-1] for p in plans
+                ]
+                trace["payload_bytes_by_rank"] = [
+                    frame["count"] * n for n in trace["page_bytes_by_rank"]
+                ]
+                trace["payload_bytes_tp_sum"] = sum(trace["payload_bytes_by_rank"])
+                trace["page_unit"] = "native_pool_page"
+                trace["applied_pages_before"] = (
+                    entry.get("precopy_pages")
+                    or [0] * len(plans[0]["schema"]["entries"])
+                )[index]
+                trace["applied_bytes_tp_sum_after"] = current.get("precopy_bytes", 0)
+                key = (epoch, frame["chunk"])
+                if current["phase"] == "WAIT_CUT" and current.get("precopy_pending"):
+                    self.precopy_ready[key] = ended
+                with self.lock:
+                    self.precopy_events.append(trace)
+                if self.out is not None:
+                    try:
+                        with self.out.open("a") as stream:
+                            stream.write(json.dumps(trace) + "\n")
+                    except OSError:
+                        pass
+
+    def _precopy_step(self, entry, *, cut_due=False):
         """Advance one bounded, durable frame; Decode runs between commands."""
         rid, epoch = entry["rid"], entry["epoch"]
         pending = entry.get("precopy_pending")
@@ -782,7 +925,7 @@ class DsvGateway:
                 for r in self.facts.get(role, [])
             ):
                 return
-            rows = (yield from self._precopy_source(entry, "d2d_precopy_status"))
+            rows = yield from self._precopy_source(entry, "d2d_precopy_status")
             if rows is None:
                 return
             available = [
@@ -800,6 +943,10 @@ class DsvGateway:
                 if count > 0:
                     pending = dict(
                         stage="PREPARE",
+                        available_pages=available[i],
+                        available_pages_by_rank=[r["available"][i] for r in rows],
+                        reservation_upper_pages=entry["plans"][0]["upper"]
+                        // schema["page_size"],
                         started_at=time.time(),
                         stage_at=time.time(),
                         frame=dict(
@@ -819,31 +966,41 @@ class DsvGateway:
                     max(0, (time.time() - pending["stage_at"]) * 1000),
                 )
         if pending["stage"] == "PREPARE":
-            rows = (yield self._command("dst", "d2d_precopy_prepare", epoch, frame=frame))
+            rows = yield self._command("dst", "d2d_precopy_prepare", epoch, frame=frame)
             self._update(
                 rid,
                 precopy_pending=dict(
-                    pending, stage="COPY", stage_at=time.time(),
+                    pending,
+                    stage="COPY",
+                    stage_at=time.time(),
                     receives=[r["receive"] for r in rows],
                 ),
             )
         elif pending["stage"] == "COPY":
-            rows = (yield from self._precopy_source(
+            rows = yield from self._precopy_source(
                 entry, "d2d_precopy_copy", frame=frame, receives=pending["receives"]
-            ))
+            )
             if rows is None:
                 return
+            trace = self.precopy_active.get(rid)
+            if trace is not None:
+                trace["copied_payload_bytes_by_rank"] = [
+                    r.get("copied_payload_bytes") for r in rows
+                ]
+                trace["copy_replayed_by_rank"] = [r.get("replayed") for r in rows]
             self._update(
                 rid,
                 precopy_pending=dict(
-                    pending, stage="APPLY", stage_at=time.time(),
+                    pending,
+                    stage="APPLY",
+                    stage_at=time.time(),
                     proofs=[r["proof"] for r in rows],
                 ),
             )
         else:
-            rows = (yield self._command(
+            rows = yield self._command(
                 "dst", "d2d_precopy_apply", epoch, frame=frame, proofs=pending["proofs"]
-            ))
+            )
             if any(r["prefix_pages"] != rows[0]["prefix_pages"] for r in rows):
                 raise RuntimeError("TP precopy installed coverage disagreed")
             receipts = copy.deepcopy(
@@ -870,9 +1027,11 @@ class DsvGateway:
         rid, phase = entry["rid"], entry["phase"]
         self._bound(
             entry,
-            roles=[entry["owner"]]
-            if phase in {"SUBMIT", "SOURCE", "DIRECT", "LOCAL"}
-            else None,
+            roles=(
+                [entry["owner"]]
+                if phase in {"SUBMIT", "SOURCE", "DIRECT", "LOCAL"}
+                else None
+            ),
         )
         request = self._request(entry, entry["owner"])
         if (

@@ -138,6 +138,143 @@ class TestDsvGatewayStatus(CustomTestCase):
         self.assertIn("native request missing", self.gw.entry(rid)["error"])
         self.assertEqual(len(self.driver.submissions), 1)
 
+    def test_precopy_frame_timing_bytes_and_disabled_recovery(self):
+        """Frame bytes follow available pages, not max_new/reservation capacity."""
+        for budget, wave in ((128, False), (512, True)):
+            with self.subTest(budget=budget, wave=wave):
+                rid = self.gw.accept(
+                    dict(rid=f"copy-{budget}", prompt_ids=[1], max_new_tokens=budget)
+                )
+                schema = dict(page_size=8, entries=[[64]])
+                plans = [dict(schema=schema, upper=budget)] * 2
+                self.gw._update(
+                    rid, phase="WAIT_CUT", epoch=rid, plans=plans, precopy_pages=None
+                )
+                for role in ("src", "dst"):
+                    self.gw.facts[role][0][
+                        "precopy_protocol"
+                    ] = "closed-page-precopy-v1"
+                clock = [100.0]
+                calls = []
+                persist = self.gw._persist
+
+                def write_journal():
+                    clock[0] += 0.003
+                    persist()
+
+                def command(payload):
+                    name = payload["cmd"]
+                    calls.append(name)
+                    if name.endswith("status"):
+                        return dict(available=[4])
+                    if name.endswith("prepare"):
+                        return dict(receive={})
+                    if name.endswith("copy"):
+                        return dict(proof={}, replayed=False, copied_payload_bytes=256)
+                    return dict(receipt=dict(bytes=256), prefix_pages=[4])
+
+                def send(role, payload, timeout):
+                    clock[0] += 0.002
+                    if payload["cmd"] == "d2d_control_wave":
+                        result = dict(
+                            results={
+                                c["migration_epoch"]: command(c)
+                                for c in payload["commands"]
+                            }
+                        )
+                    else:
+                        result = command(payload)
+                    return dict(tp_rank_results=[result, copy.deepcopy(result)])
+
+                def advance(cut=False):
+                    step = self.gw._precopy(self.gw.entry(rid), cut_due=cut)
+                    cmd = next(step, None)
+                    while cmd is not None:
+                        clock[0] += 0.005  # command waits for dispatch
+                        if wave:
+                            rows = self.gw._call(
+                                cmd.role,
+                                "d2d_control_wave",
+                                commands=[
+                                    dict(
+                                        cmd=cmd.name,
+                                        migration_epoch=cmd.epoch,
+                                        **cmd.payload,
+                                    )
+                                ],
+                            )
+                            rows = [r["results"][cmd.epoch] for r in rows]
+                        else:
+                            rows = self.gw._call(
+                                cmd.role, cmd.name, cmd.epoch, **cmd.payload
+                            )
+                        try:
+                            cmd = step.send(rows)
+                        except StopIteration:
+                            break
+
+                with patch.object(
+                    self.module.time, "monotonic", side_effect=lambda: clock[0]
+                ), patch.object(self.driver, "send", side_effect=send), patch.object(
+                    self.gw, "_persist", side_effect=write_journal
+                ):
+                    self.gw.disable_precopy = True
+                    advance()
+                    self.assertFalse(calls)
+                    self.gw.disable_precopy = False
+                    advance()
+                    self.assertEqual(
+                        self.gw.entry(rid)["precopy_pending"]["stage"], "COPY"
+                    )
+                    self.gw.disable_precopy = (
+                        True  # finish durable frame despite toggle
+                    )
+                    if wave:
+                        self.gw.precopy_ready.clear()  # restored journal, new process clock
+                    clock[0] += 0.010
+                    advance()
+                    clock[0] += 0.010
+                    advance(cut=True)
+                self.assertEqual(self.gw.entry(rid)["phase"], "FREEZE")
+                self.assertEqual(self.gw.entry(rid)["precopy_bytes"], 512)
+                self.assertEqual(self.gw.entry(rid)["precopy_pages"], [4])
+                traces = [t for t in self.gw.precopy_events if t["rid"] == rid]
+                self.assertEqual(
+                    [t["stage"] for t in traces], ["PREPARE", "COPY", "APPLY"]
+                )
+                for t in traces:
+                    self.assertEqual(t["payload_bytes_by_rank"], [256, 256])
+                    self.assertEqual(t["available_pages"], 4)
+                    self.assertGreater(t["journal_ms"], 0)
+                    self.assertAlmostEqual(
+                        t["active_ms"],
+                        sum(
+                            t[k]
+                            for k in (
+                                "rpc_ms",
+                                "slot_wait_ms",
+                                "journal_ms",
+                                "dispatch_wait_ms",
+                                "processing_ms",
+                            )
+                        ),
+                    )
+                    self.assertEqual(t["wave_envelope"], wave)
+                if wave:
+                    self.assertIsNone(traces[1]["tick_wait_ms"])
+                    self.assertTrue(traces[1]["timing_recovered"])
+                else:
+                    self.assertAlmostEqual(traces[1]["tick_wait_ms"], 10)
+                self.assertAlmostEqual(traces[1]["rpc_ms"], 2)
+                self.assertAlmostEqual(traces[1]["dispatch_wait_ms"], 5)
+                self.assertEqual(traces[1]["copied_payload_bytes_by_rank"], [256, 256])
+                self.assertFalse(self.gw.precopy_active or self.gw.precopy_ready)
+        rid = self.gw.accept(dict(rid="disabled-cut", prompt_ids=[1]))
+        self.gw._update(rid, phase="WAIT_CUT", epoch=rid)
+        self.gw.disable_precopy = True
+        self.gw._drive(self.gw._precopy(self.gw.entry(rid), cut_due=True))
+        self.assertEqual(self.gw.entry(rid)["phase"], "FREEZE")
+
     def test_status_timeout_preserves_facts_and_recovers_without_changing_owner(self):
         """A slow advisory poll must not poison every request on its worker."""
         for role in ("src", "dst"):

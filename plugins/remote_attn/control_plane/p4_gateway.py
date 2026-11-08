@@ -5043,6 +5043,8 @@ def main():
         default=os.environ.get("HANDOFF_D2D_ASYNC_HANDOFF") == "1",
         help="Batch DSV/hybrid control and overlap import/commit I/O across epochs",
     )
+    p.add_argument("--disable-precopy", action="store_true",
+                   help="Disable new DSV/hybrid precopy frames for freeze-only comparisons")
     p.add_argument("--out", default=str(STATE / "p4_gateway.jsonl"))
     args = p.parse_args()
     for role in ("src", "dst"):
@@ -5056,6 +5058,7 @@ def main():
             d, TOK, STATE, prefill_url=PD_PREFILL_URL,
             bootstrap_host=PD_BOOTSTRAP_HOST, bootstrap_port=PD_BOOTSTRAP_PORT,
             poll_ms=args.poll_ms, out=args.out, async_handoff=args.async_handoff,
+            disable_precopy=args.disable_precopy,
         )
     else:
         gw = Gateway(Path(args.out), args.poll_ms)

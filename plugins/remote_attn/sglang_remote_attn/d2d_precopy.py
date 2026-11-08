@@ -320,7 +320,9 @@ def handle(controller, data):
                         stable_pages(controller, record.req)[f["entry"]]
                         < f["start"] + f["count"]
                     ):
-                        raise ValueError("precopy page is still mutable or remotely owned")
+                        raise ValueError(
+                            "precopy page is still mutable or remotely owned"
+                        )
         else:
             t = ticket(controller, epoch)
             state = getattr(t, "precopy", None)
@@ -386,6 +388,7 @@ def handle(controller, data):
                 )
             result = dict(receive=state.pending)
         elif cmd.endswith("copy"):
+            replayed = saved is not None
             if saved is None:
                 device = d2d.pool_device(controller)
                 # Scheduler's current stream is ordered after model submission;
@@ -419,7 +422,11 @@ def handle(controller, data):
                     record.proofs[f["chunk"]] = saved
                     record.mappings[f["chunk"]] = ids.cpu().tolist()
                     record.pointers[f["chunk"]] = table.data_ptr()
-            result = dict(proof=saved)
+            result = dict(
+                proof=saved,
+                replayed=replayed,
+                copied_payload_bytes=0 if replayed else saved["bytes"],
+            )
         else:
             if old is None:
                 receiver = state.receiver

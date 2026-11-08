@@ -191,7 +191,7 @@ class Slab:
             self.initialized.synchronize()
             if plane.device.type == "cuda":
                 self.stream = torch.cuda.Stream(device=plane.device)
-            with plane.send_guard():
+            with plane.send_guard(shared=True):
                 rc = self.engine.batch_register(
                     [self.wire.data_ptr()], [self.wire.numel()]
                 )
@@ -330,7 +330,7 @@ class Slab:
             return
         try:
             self.drain()
-            with self.plane.send_guard():
+            with self.plane.send_guard(shared=True):
                 rc = self.engine.batch_deregister([self.wire.data_ptr()])
             if rc != 0:
                 raise RuntimeError("Mooncake Q/O deregistration failed")
@@ -437,6 +437,7 @@ class Plane:
                     )
         self.clients, self.lanes, self.quarantine = {}, set(), []
         self.lock = threading.RLock()
+        self._transfer_lock = threading.Lock()
         self.closed = False
         self.transfers = self.payload_bytes = 0
         self.transfer_regions = self.packed_returns = 0
@@ -447,7 +448,11 @@ class Plane:
             flush=True,
         )
 
-    def send_guard(self):
+    def send_guard(self, shared=False):
+        # Serialize Q/O traffic without queuing behind native KV pushes.
+        # Registration lifetime changes still coordinate with peer publication.
+        if not shared:
+            return self._transfer_lock
         lock = getattr(self.manager, "_remote_attn_send_lock", None)
         if lock is not None and hasattr(lock, "priority"):
             return lock.priority()
