@@ -259,6 +259,10 @@ def attention(controller, original, module, q, k, v, fb, save_kv_cache=True, **k
     remote_rows = [
         t is not None and not entries <= t.local_entries for t in active
     ]
+    for target, remote in zip(active, remote_rows):
+        trace = getattr(target, "pd_trace", None)
+        if trace is not None:
+            trace.layer(module.layer_id, remote)
     if not any(remote_rows):
         return original(q, k, v, fb, save_kv_cache=save_kv_cache, **kw)
     if (

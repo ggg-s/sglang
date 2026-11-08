@@ -873,6 +873,9 @@ def update(target):
                 piece["hi"] - piece["lo"],
             )
             if index not in target._range_events:
+                trace = getattr(target, "pd_trace", None)
+                if trace is not None:
+                    trace.received(piece, h)
                 from .remote_data_plane import Visibility
                 from .remote_data_plane import event as completion_event
 

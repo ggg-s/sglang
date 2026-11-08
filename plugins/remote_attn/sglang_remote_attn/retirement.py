@@ -152,6 +152,9 @@ class Retirement:
     def observe(self):
         from .transport_failure import TransportFailure
 
+        # Advisory snapshots live only for this observe pass. Final votes and
+        # finish() must independently revalidate transport/GPU readiness.
+        observations = {}
         # Empty Local does not query events, touch sockets, or enter a collective.
         for target in self.owner.targets:
             entry = self.registered.get(target.admission_id)
@@ -163,7 +166,12 @@ class Retirement:
             transport_failure = False
             try:
                 gpu_ready = target.gpu_ready()  # Advisory; never retires KV.
-                ready = target.transport_ready()
+                observe_ready = getattr(target, "observe_transport_ready", None)
+                ready = (
+                    observe_ready(observations)
+                    if observe_ready is not None
+                    else target.transport_ready()
+                )
                 cache = cache_intent(target)
                 if target.admission_id in self.needs_gpu_notice and not gpu_ready:
                     continue

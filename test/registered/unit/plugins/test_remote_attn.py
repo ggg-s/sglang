@@ -2249,6 +2249,9 @@ class TestRemoteAttn(CustomTestCase):
                 )
             ),
         )
+        from sglang_remote_attn.pd_window import WindowTrace
+
+        target.pd_trace = WindowTrace({0: (0,), 1: (1,)})
         ready = [False]
         from sglang_remote_attn import remote_data_plane
 
@@ -2264,6 +2267,10 @@ class TestRemoteAttn(CustomTestCase):
         ):
             coverage = f.ps.update(target)
             self.assertEqual(coverage.intervals, {})
+            self.assertEqual(
+                target.pd_trace.receipts.intervals, {0: [(0, 4)], 1: [(0, 4)]}
+            )
+            self.assertIsNone(target.pd_trace.snapshot()["layers"]["0"]["visible_ms"])
             ready[0] = True
             coverage = f.ps.update(target)
             self.assertEqual(coverage.intervals, {0: [(0, 4)], 1: [(0, 4)]})
@@ -13874,6 +13881,149 @@ class TestRemoteAttn(CustomTestCase):
                                     )
                                 )
                     self.assertTrue(torch.equal(dst[~mask], before[~mask]))
+
+    def _hybrid_observation_fixture(self):
+        from sglang_remote_attn import qwen_hybrid_pd as pd
+        from sglang_remote_attn.pre_layerwise import LayerCoverage
+        from sglang_remote_attn.retirement import Retirement
+
+        state = SimpleNamespace(refreshes=0, error=None, gpu=True)
+        parent = SimpleNamespace(
+            closed=False,
+            decode_req=SimpleNamespace(
+                req=SimpleNamespace(rid="hybrid", bootstrap_room=7)
+            ),
+            generation="g",
+            coverage=LayerCoverage(8, 2),
+            rpc=SimpleNamespace(local_entries=set()),
+            gpu_ready=lambda: state.gpu,
+        )
+
+        def refresh():
+            # External receive boundary: receipts can fail between advisory
+            # observation and the final retirement vote.
+            state.refreshes += 1
+            if state.error is not None:
+                raise state.error
+
+        parent.refresh = refresh
+        resources = [pd.Resource(parent, i, i + 1) for i in range(2)]
+        owner = SimpleNamespace(
+            rank=0,
+            tp_size=1,
+            scheduler=SimpleNamespace(),
+            config=SimpleNamespace(drain_timeout=0.01),
+            targets=resources[:],
+            agree=lambda flags: flags,
+        )
+        protocol = Retirement(owner)
+        self.addCleanup(protocol.close)
+        for resource in resources:
+            protocol.register(resource)
+        return state, parent, resources, protocol
+
+    def test_hybrid_observe_snapshot_expires_and_final_gpu_proof_is_fresh(self):
+        """Sibling K/V resources share a scan, never a retirement authorization."""
+        state, parent, resources, protocol = self._hybrid_observation_fixture()
+        protocol.observe()
+        self.assertIsNone(protocol.poll_command())
+        self.assertEqual(state.refreshes, 1)
+        for entry in range(2):
+            parent.coverage.complete(entry, 0, 8)
+        protocol.observe()
+        self.assertEqual(state.refreshes, 2)
+        self.assertEqual(parent.rpc.local_entries, set())
+        command = protocol.poll_command()
+        self.assertEqual(command["kind"], "retire")
+        state.gpu = False
+        protocol.arm(command)
+        protocol.finalize()
+        self.assertEqual(parent.rpc.local_entries, set())
+        self.assertEqual(protocol.retries, 1)
+        state.gpu = True
+        protocol.observe()
+        protocol.arm(protocol.poll_command())
+        before = state.refreshes
+        protocol.finalize()
+        self.assertGreater(state.refreshes, before)
+        self.assertEqual(parent.rpc.local_entries, {0, 1})
+        self.assertEqual(protocol.owner.targets, [])
+
+    def test_hybrid_observe_shares_failure_but_does_not_cache_it_across_passes(self):
+        """A failed shared refresh poisons all siblings, then can recover."""
+        state, parent, resources, protocol = self._hybrid_observation_fixture()
+        state.error = RuntimeError("receive failed")
+        protocol.observe()
+        self.assertEqual(state.refreshes, 1)
+        for resource in resources:
+            self.assertIn(
+                "receive failed", protocol.reports[resource.admission_id][0]["error"]
+            )
+        state.error = None
+        for entry in range(2):
+            parent.coverage.complete(entry, 0, 8)
+        protocol.observe()
+        self.assertEqual(state.refreshes, 2)
+        command = protocol.poll_command()
+        self.assertEqual(command["kind"], "retire")
+        # A new failure after observe must not be masked by its cached success.
+        state.error = RuntimeError("late receive failure")
+        protocol.arm(command)
+        with self.assertRaisesRegex(RuntimeError, "retaining KV"):
+            protocol.finalize()
+        self.assertEqual(parent.rpc.local_entries, set())
+        self.assertFalse(any(r.closed for r in resources))
+
+    def test_hybrid_window_trace_requires_both_kv_and_keeps_bounded_step_history(self):
+        """A receipt is not GPU visibility; partial K/V is not a local layer."""
+        from sglang_remote_attn.pd_window import WindowTrace
+        from sglang_remote_attn.pre_layerwise import LayerCoverage
+
+        with patch(
+            "sglang_remote_attn.pd_window.time.monotonic", return_value=10.0
+        ) as clock:
+            trace = WindowTrace({3: (0, 1), 7: (2, 3)})
+            header = dict(length=8, resources=4, base=2, page=1)
+            clock.return_value = 10.01
+            trace.received(dict(resources=[0, 1], lo=2, hi=6), header)
+            self.assertIsNone(trace.snapshot()["layers"]["3"]["receipt_ms"])
+            trace.received(dict(resources=[0], lo=0, hi=2), header)
+            self.assertIsNone(trace.snapshot()["layers"]["3"]["receipt_ms"])
+            clock.return_value = 10.02
+            trace.received(dict(resources=[1], lo=0, hi=2), header)
+            record = trace.snapshot()["layers"]["3"]
+            self.assertAlmostEqual(record["receipt_ms"], 20)
+            self.assertIsNone(record["visible_ms"])
+            coverage = LayerCoverage(8, 4)
+            coverage.complete(0, 0, 8)
+            trace.visible(coverage)
+            trace.local(0)
+            self.assertIsNone(trace.snapshot()["layers"]["3"]["local_ms"])
+            clock.return_value = 10.03
+            coverage.complete(1, 0, 8)
+            trace.visible(coverage)
+            clock.return_value = 10.05
+            trace.local(1)
+            # Repeated receipts/observations must not move the first timestamp.
+            trace.received(dict(resources=[0, 1], lo=0, hi=6), header)
+            trace.visible(coverage)
+            trace.local(1)
+            record = trace.snapshot()["layers"]["3"]
+            self.assertAlmostEqual(record["receipt_to_visible_ms"], 10)
+            self.assertAlmostEqual(record["visible_to_local_ms"], 20)
+            for step in range(300):
+                trace.layer(3, step < 5)
+                trace.layer(7, step < 10)
+            result = trace.snapshot()
+            self.assertEqual(result["remote_steps"], 10)
+            self.assertEqual(result["remote_layer_calls"], 15)
+            self.assertEqual(result["layers"]["3"]["remote_after_visible"], 5)
+            self.assertEqual(result["layers"]["7"]["remote_after_visible"], 0)
+            self.assertEqual(result["observed_steps"], 300)
+            self.assertEqual(result["dropped_steps"], 44)
+            self.assertEqual(len(result["recent_steps"]), 256)
+            self.assertEqual(result["recent_steps"][0]["step"], 45)
+            self.assertEqual(result["recent_steps"][-1]["layers_seen"], [3, 7])
 
     def test_dsv41_progressive_resource_switch_waits_ordered_vote_and_final_gpu_proof(
         self,

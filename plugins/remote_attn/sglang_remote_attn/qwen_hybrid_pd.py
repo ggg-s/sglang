@@ -261,6 +261,20 @@ def prepare(controller, reqs):
         )
 
 
+def _observe_refresh(parent, observations):
+    key = id(parent)
+    if key not in observations:
+        try:
+            parent.refresh()
+        except Exception as exc:
+            observations[key] = exc
+        else:
+            observations[key] = None
+    error = observations[key]
+    if error is not None:
+        raise error
+
+
 class Resource:
     def __init__(self, parent, entry, admission_id):
         self.parent, self.entry, self.admission_id = parent, entry, admission_id
@@ -281,6 +295,10 @@ class Resource:
         self.parent.refresh()
         return self.parent.closed or self.parent.coverage.ready(self.entry)
 
+    def observe_transport_ready(self, observations):
+        _observe_refresh(self.parent, observations)
+        return self.parent.closed or self.parent.coverage.ready(self.entry)
+
     def ready_to_finish(self):
         return self.gpu_ready() and self.transport_ready()
 
@@ -289,6 +307,9 @@ class Resource:
             raise RuntimeError("hybrid entry has no GPU/transport proof")
         if not self.parent.closed:
             self.parent.rpc.local_entries.add(self.entry)
+            trace = getattr(self.parent, "pd_trace", None)
+            if trace is not None:
+                trace.local(self.entry)
         self.closed = True
 
 
@@ -296,6 +317,15 @@ class Target(NativeTarget):
     def refresh(self):
         super().refresh()
         self.owner.pd_visibility.receive()
+        trace = getattr(self, "pd_trace", None)
+        if trace is not None:
+            trace.visible(self.coverage)
+
+    def observe_transport_ready(self, observations):
+        _observe_refresh(self, observations)
+        # Hybrid PD explicitly disables native staging; canonical native
+        # success is still required for retirement of the whole request.
+        return _poll_success(self.decode_req.kv_receiver)
 
     def finish(self, *, wait=False):
         if self.closed:
@@ -306,7 +336,10 @@ class Target(NativeTarget):
         super().finish(wait=wait)
         value = read_json(self.path / "done.json")
         value.update(
-            hybrid_pd=True, rid=self.decode_req.req.rid, remote_calls=self.rpc.calls
+            hybrid_pd=True,
+            rid=self.decode_req.req.rid,
+            remote_calls=self.rpc.calls,
+            pd_window=self.pd_trace.snapshot(),
         )
         write_json(self.path / "done.json", value)
 
@@ -388,6 +421,9 @@ def early_targets(controller, queue, rids_to_check):
         parent = Target(
             controller, queue, dr, target.path, target.generation, target.coverage
         )
+        from .pd_window import WindowTrace
+
+        parent.pd_trace = rpc.pd_trace = WindowTrace(controller.layer_entries)
         parent.rpc = rpc
         dr.req._pre_layerwise_target, dr.req._dsv41_remote = parent, rpc
         controller.remote_targets[rpc.row] = rpc
