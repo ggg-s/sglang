@@ -40,6 +40,63 @@ PAYLOAD_FIELDS = (
 )
 
 
+HANDOFF_MARKERS = (
+    "cut_observed_at",
+    "freeze_requested_at",
+    "freeze_descriptor_ready_at",
+    "import_ready_at",
+    "target_admitted_at",
+    "dst_first_token_observed_at",
+)
+
+
+def handoff_timing(entry):
+    timing = {key: entry.get(key) for key in HANDOFF_MARKERS}
+    for name, start, end in zip(
+        (
+            "cut_to_freeze_request",
+            "freeze_request_to_descriptor",
+            "descriptor_to_import",
+            "import_to_target",
+            "target_to_first_token",
+        ),
+        HANDOFF_MARKERS,
+        HANDOFF_MARKERS[1:],
+    ):
+        a, b = timing[start], timing[end]
+        timing[name + "_ms"] = (
+            (b - a) * 1000 if a is not None and b is not None and b >= a else None
+        )
+    a, b = timing[HANDOFF_MARKERS[0]], timing[HANDOFF_MARKERS[-1]]
+    timing["cut_to_first_token_ms"] = (
+        (b - a) * 1000 if a is not None and b is not None and b >= a else None
+    )
+    return timing
+
+
+def remaining_copy_bytes(transfers):
+    """Unique planned payload after sealed precopy, including import state."""
+    by_rank = []
+    for t in transfers:
+        try:
+            schema = t["schema"]
+            page = schema["page_size"]
+            pages = (t["kv_len"] + page - 1) // page
+            entries = schema["entries"]
+            prefixes = (t.get("precopy") or {}).get("prefix_pages", [0] * len(entries))
+            if len(prefixes) != len(entries) or any(
+                not 0 <= n <= pages for n in prefixes
+            ):
+                return None
+            by_rank.append(
+                sum((pages - n) * e[-1] for e, n in zip(entries, prefixes))
+                + sum(d["rows"] * d["stride"] for d in t["states"])
+            )
+        except (KeyError, TypeError, ValueError, ZeroDivisionError):
+            return None
+    return dict(by_rank=by_rank, tp_sum=sum(by_rank))
+
+
 class Payloads:
     def __init__(self, root):
         self.root, self.cache = root, {}
@@ -161,6 +218,8 @@ class DsvGateway:
         self.connections = set()
         self.role_locks = {role: threading.Lock() for role in ("src", "dst")}
         self.command_waiters = dict(src=0, dst=0)
+        self.dst_slot_holder = None
+        self.dst_slot_history = deque(maxlen=256)
         self.control_latencies = {}
         self.control_breakdown = {}
         self.control_wave_sizes = {}
@@ -327,6 +386,20 @@ class DsvGateway:
                 self.journal = previous
                 raise
             self.cv.notify_all()
+            if (
+                self.out is not None
+                and changes.get("dst_first_token_observed_at") is not None
+            ):
+                state = self._entry(rid)
+                self._log_trace(
+                    dict(
+                        type="handoff_timing",
+                        rid=rid,
+                        epoch=state["epoch"],
+                        handoff_timing=handoff_timing(state),
+                        remaining_copy_bytes=state.get("remaining_copy_bytes"),
+                    )
+                )
             if self.out is not None and any(
                 previous["entries"][rid].get(key)
                 != self.journal["entries"][rid].get(key)
@@ -343,31 +416,37 @@ class DsvGateway:
                     with self.out.open("a") as metrics:
                         metrics.write(
                             json.dumps(
-                                {
-                                    key: state.get(key)
-                                    for key in (
-                                        "rid",
-                                        "epoch",
-                                        "phase",
-                                        "owner",
-                                        "updated_at",
-                                        "error",
-                                        "migration_deferred",
-                                        "migration_deferred_reason",
-                                        "migration_deferred_count",
-                                        "migration_deferred_wait_ms",
-                                        "migration_outcome",
-                                        "freeze_pending",
-                                        "source_partial_remote",
-                                        "migration_skip_reason",
-                                        "plan_before_first_token",
-                                        "freeze_ack_latency_ms",
-                                        "prepare_latency_ms",
-                                        "handoff_latency_ms",
-                                        "precopy_bytes",
-                                        "precopy_pages",
-                                    )
-                                }
+                                dict(
+                                    handoff_timing=handoff_timing(state),
+                                    remaining_copy_bytes=state.get(
+                                        "remaining_copy_bytes"
+                                    ),
+                                    **{
+                                        key: state.get(key)
+                                        for key in (
+                                            "rid",
+                                            "epoch",
+                                            "phase",
+                                            "owner",
+                                            "updated_at",
+                                            "error",
+                                            "migration_deferred",
+                                            "migration_deferred_reason",
+                                            "migration_deferred_count",
+                                            "migration_deferred_wait_ms",
+                                            "migration_outcome",
+                                            "freeze_pending",
+                                            "source_partial_remote",
+                                            "migration_skip_reason",
+                                            "plan_before_first_token",
+                                            "freeze_ack_latency_ms",
+                                            "prepare_latency_ms",
+                                            "handoff_latency_ms",
+                                            "precopy_bytes",
+                                            "precopy_pages",
+                                        )
+                                    },
+                                )
                             )
                             + "\n"
                         )
@@ -434,6 +513,8 @@ class DsvGateway:
             handoff_latency_ms=entry.get("handoff_latency_ms"),
             precopy_bytes=entry.get("precopy_bytes", 0),
             precopy_pages=entry.get("precopy_pages"),
+            handoff_timing=handoff_timing(entry),
+            remaining_copy_bytes=entry.get("remaining_copy_bytes"),
         )
 
     @staticmethod
@@ -448,6 +529,15 @@ class DsvGateway:
         started = time.monotonic()
         acquired = False
         rows = ()
+        slot_trace = holder = None
+        commands = (
+            [
+                dict(cmd=c.get("cmd"), epoch=c.get("migration_epoch"))
+                for c in payload.get("commands", [])
+            ]
+            if cmd == "d2d_control_wave"
+            else [dict(cmd=cmd, epoch=epoch)]
+        )
         with self.lock:
             if status and self.command_waiters[role]:
                 raise StatusBusy()
@@ -468,6 +558,11 @@ class DsvGateway:
                     raise StatusBusy()
                 raise TimeoutError(f"{role} control busy; command not submitted")
             submitted = time.monotonic()
+            submitted_at = time.time()
+            if role == "dst":
+                holder = dict(cmd=cmd, members=commands, started=submitted)
+                with self.lock:
+                    self.dst_slot_holder = holder
             rows = self.rows(
                 self.driver.send(
                     role,
@@ -478,24 +573,53 @@ class DsvGateway:
             return rows
         finally:
             ended = time.monotonic()
-            commands = (
-                payload.get("commands", [])
-                if cmd == "d2d_control_wave"
-                else [dict(migration_epoch=epoch, cmd=cmd)]
-            )
-            for trace in list(self.precopy_active.values()):
-                if any(c.get("migration_epoch") == trace["epoch"] for c in commands):
-                    trace["slot_wait_ms"] += (
-                        (submitted if acquired else ended) - started
-                    ) * 1000
-                    if acquired:
-                        trace["rpc_ms"] += (ended - submitted) * 1000
-                    trace["rpc_attempts"] += 1
-                    if cmd == "d2d_control_wave":
-                        trace["wave_envelope"] = True
-            if acquired:
-                self.role_locks[role].release()
             with self.lock:
+                if role == "dst" and not status:
+                    waited_until = submitted if acquired else ended
+                    blockers = []
+                    holders = list(self.dst_slot_history)
+                    if (
+                        self.dst_slot_holder is not None
+                        and self.dst_slot_holder is not holder
+                    ):
+                        holders.append(dict(self.dst_slot_holder, ended=ended))
+                    for previous in reversed(holders):
+                        if previous["ended"] <= started:
+                            break
+                        overlap = min(previous["ended"], waited_until) - max(
+                            previous["started"], started
+                        )
+                        if overlap > 0:
+                            blockers.append(
+                                dict(
+                                    cmd=previous["cmd"],
+                                    members=previous["members"],
+                                    overlap_ms=overlap * 1000,
+                                )
+                            )
+                    slot_trace = dict(
+                        slot_wait_ms=(waited_until - started) * 1000,
+                        holders=blockers,
+                    )
+                if holder is not None:
+                    self.dst_slot_history.append(dict(holder, ended=ended))
+                    self.dst_slot_holder = None
+                if acquired:
+                    self.role_locks[role].release()
+                for trace in list(self.precopy_active.values()):
+                    if any(c["epoch"] == trace["epoch"] for c in commands):
+                        trace["slot_wait_ms"] += (
+                            (submitted if acquired else ended) - started
+                        ) * 1000
+                        if acquired:
+                            trace["rpc_ms"] += (ended - submitted) * 1000
+                        trace["rpc_attempts"] += 1
+                        if slot_trace is not None:
+                            trace.setdefault("dst_slot_waits", []).append(
+                                dict(cmd=cmd, members=commands, **slot_trace)
+                            )
+                        if cmd == "d2d_control_wave":
+                            trace["wave_envelope"] = True
                 if not status:
                     self.command_waiters[role] -= 1
                 if acquired:
@@ -509,6 +633,37 @@ class DsvGateway:
                         times = [r.get("_ctl", {}).get(field) for r in rows]
                         if times and all(t is not None for t in times):
                             self._observe(breakdown, field, max(times))
+            if slot_trace is not None or any(
+                c["cmd"] == "d2d_freeze" for c in commands
+            ):
+                self._log_trace(
+                    dict(
+                        type="d2d_control_slot",
+                        role=role,
+                        cmd=cmd,
+                        members=commands,
+                        submitted_at=submitted_at if acquired else None,
+                        rpc_ms=(ended - submitted) * 1000 if acquired else None,
+                        **(
+                            slot_trace
+                            or dict(
+                                slot_wait_ms=(
+                                    (submitted if acquired else ended) - started
+                                )
+                                * 1000,
+                                holders=[],
+                            )
+                        ),
+                    )
+                )
+
+    def _log_trace(self, trace):
+        if self.out is not None:
+            try:
+                with self.out.open("a") as stream:
+                    stream.write(json.dumps(trace) + "\n")
+            except OSError:
+                pass
 
     @staticmethod
     def _observe(metrics, key, value):
@@ -763,6 +918,11 @@ class DsvGateway:
             source_partial_remote=False,
             prepare_started_at=time.time(),
             freeze_requested_at=None,
+            freeze_descriptor_ready_at=None,
+            import_ready_at=None,
+            target_admitted_at=None,
+            dst_first_token_observed_at=None,
+            remaining_copy_bytes=None,
             freeze_ack_latency_ms=None,
             plan_before_first_token=False,
             precopy_pending=None,
@@ -1034,6 +1194,25 @@ class DsvGateway:
             ),
         )
         request = self._request(entry, entry["owner"])
+        if (
+            phase in {"SOURCE", "PLAN", "RESERVE", "WAIT_CUT", "FREEZE"}
+            and not entry.get("cut_observed_at")
+            and request is not None
+            and not entry["cancel_requested"]
+            and (entry["cut"] < entry["max_new"] or entry["migration_requested"])
+            and self._cut_due(entry, request)
+        ):
+            self._update(rid, cut_observed_at=time.time())
+        if (
+            phase in {"TARGET", "LOCAL"}
+            and entry.get("target_admitted_at") is not None
+            and entry.get("dst_first_token_observed_at") is None
+            and request is not None
+        ):
+            frozen = entry["frozen_output"]
+            ids = request["output_ids"]
+            if len(ids) > len(frozen) and ids[: len(frozen)] == frozen:
+                self._update(rid, dst_first_token_observed_at=time.time())
         if (
             request
             and request["error"]
@@ -1313,6 +1492,8 @@ class DsvGateway:
             self._update(
                 rid,
                 transfers=transfers,
+                freeze_descriptor_ready_at=time.time(),
+                remaining_copy_bytes=remaining_copy_bytes(transfers),
                 frozen_output=transfers[0]["output_ids"],
                 phase="IMPORT",
                 freeze_pending=False,
@@ -1351,6 +1532,7 @@ class DsvGateway:
             self._update(
                 rid,
                 phase="ROLLBACK" if self._entry(rid)["cancel_requested"] else "COMMIT",
+                import_ready_at=time.time(),
             )
         elif phase == "COMMIT":
             # A timeout, partial TP commit or gateway crash can never send us
@@ -1373,6 +1555,7 @@ class DsvGateway:
                 rid,
                 owner="dst",
                 phase="TARGET",
+                target_admitted_at=time.time(),
                 error=None,
                 blocked=False,
                 migration_outcome="migrated",

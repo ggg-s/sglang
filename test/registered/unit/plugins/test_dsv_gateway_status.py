@@ -8,6 +8,7 @@ import json
 import tempfile
 import threading
 import unittest
+from concurrent.futures import ThreadPoolExecutor
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 from types import SimpleNamespace
@@ -137,6 +138,139 @@ class TestDsvGatewayStatus(CustomTestCase):
         self.gw.tick()
         self.assertIn("native request missing", self.gw.entry(rid)["error"])
         self.assertEqual(len(self.driver.submissions), 1)
+
+    def test_handoff_timing_excludes_frozen_tokens_and_pending_ack(self):
+        """A pending FREEZE reply and replayed source tokens are not milestones."""
+        rid = "timed"
+        self.request(rid, "src")
+        src = self.gw.entry(rid)
+        self.gw._update(
+            rid,
+            cut=2,
+            epoch="move",
+            phase="WAIT_CUT",
+            reservations=[{}],
+            instances={role: [role + "-instance"] for role in ("src", "dst")},
+        )
+        self.gw.disable_precopy = True
+        self.gw.out = self.gw.path.parent / "timing.jsonl"
+        transfer = dict(
+            output_ids=[31, 32],
+            kv_len=17,
+            schema=dict(page_size=8, entries=[["kv", 64], ["index", 16]]),
+            precopy=dict(prefix_pages=[2, 1]),
+            states=[dict(rows=2, stride=8)],
+        )
+        freezes = iter(
+            [
+                dict(frozen=True, pending_retirement=True),
+                dict(transfer=transfer),
+            ]
+        )
+        original_send = self.driver.send
+
+        def send(role, payload, timeout):
+            cmd = payload["cmd"]
+            if cmd == "d2d_freeze":
+                return next(freezes)
+            if cmd == "d2d_import":
+                return dict(imported=True)
+            if cmd == "d2d_commit":
+                return dict(admitted=True, source_confirmed=True)
+            return original_send(role, payload, timeout)
+
+        def advance(at):
+            with patch.object(self.module.time, "time", return_value=at):
+                self.gw._drive(self.gw._advance(self.gw.entry(rid)))
+
+        with patch.object(self.driver, "send", side_effect=send):
+            self.gw._refresh()
+            advance(100)
+            advance(101)
+            pending = self.gw.entry(rid)
+            self.assertEqual(pending["freeze_ack_latency_ms"], 0)
+            self.assertIsNone(pending.get("freeze_descriptor_ready_at"))
+            advance(102)
+            advance(103)
+            advance(104)
+            native = src["target_rid"]
+            self.driver.rows["dst"]["requests"][native] = dict(
+                output_ids=[31, 32],
+                finished=False,
+                kv_released=False,
+            )
+            self.gw._refresh()
+            advance(105)
+            self.assertIsNone(self.gw.entry(rid).get("dst_first_token_observed_at"))
+            self.driver.rows["dst"]["requests"][native]["output_ids"].append(33)
+            self.gw._refresh()
+            advance(106)
+            advance(107)
+        rows = [json.loads(line) for line in self.gw.out.read_text().splitlines()]
+        observed = [r for r in rows if r.get("type") == "handoff_timing"]
+        self.assertEqual(len(observed), 1)
+        self.assertEqual(
+            observed[0]["remaining_copy_bytes"], dict(by_rank=[112], tp_sum=112)
+        )
+        timing = observed[0]["handoff_timing"]
+        self.assertEqual(timing["cut_to_freeze_request_ms"], 1000)
+        self.assertEqual(timing["freeze_request_to_descriptor_ms"], 1000)
+        self.assertEqual(timing["descriptor_to_import_ms"], 1000)
+        self.assertEqual(timing["import_to_target_ms"], 1000)
+        self.assertEqual(timing["target_to_first_token_ms"], 2000)
+        self.assertEqual(timing["cut_to_first_token_ms"], 6000)
+        rank_without_precopy = dict(transfer, precopy=None)
+        self.assertEqual(
+            self.module.remaining_copy_bytes([transfer, rank_without_precopy]),
+            dict(by_rank=[112, 256], tp_sum=368),
+        )
+
+    def test_dst_wait_identifies_control_wave_holder_and_members(self):
+        """Attribution joins the waiting request to the RPC actually holding dst."""
+        self.gw.out = self.gw.path.parent / "slots.jsonl"
+        entered = threading.Event()
+        waiting = threading.Event()
+        real_lock = self.gw.role_locks["dst"]
+
+        class Slot:
+            def acquire(self, **kwargs):
+                if entered.is_set():
+                    waiting.set()
+                return real_lock.acquire(**kwargs)
+
+            def release(self):
+                real_lock.release()
+
+        def send(role, payload, timeout):
+            if payload["cmd"] == "d2d_control_wave":
+                entered.set()
+                if not waiting.wait(2):
+                    raise AssertionError("contender did not arrive")
+            return dict(ok=True)
+
+        self.gw.role_locks["dst"] = Slot()
+        members = [dict(cmd="d2d_commit", migration_epoch="holding")]
+        with patch.object(self.driver, "send", side_effect=send):
+            with ThreadPoolExecutor(max_workers=1) as pool:
+                future = pool.submit(
+                    self.gw._call,
+                    "dst",
+                    "d2d_control_wave",
+                    commands=members,
+                )
+                self.assertTrue(entered.wait(2))
+                self.gw._call("dst", "d2d_precopy_prepare", "waiting")
+                future.result()
+        rows = [json.loads(line) for line in self.gw.out.read_text().splitlines()]
+        trace = next(r for r in rows if r["cmd"] == "d2d_precopy_prepare")
+        self.assertEqual(
+            trace["members"], [dict(cmd="d2d_precopy_prepare", epoch="waiting")]
+        )
+        (holder,) = trace["holders"]
+        self.assertEqual(holder["cmd"], "d2d_control_wave")
+        self.assertEqual(holder["members"], [dict(cmd="d2d_commit", epoch="holding")])
+        self.assertGreater(holder["overlap_ms"], 0)
+        self.assertLessEqual(holder["overlap_ms"], trace["slot_wait_ms"])
 
     def test_precopy_frame_timing_bytes_and_disabled_recovery(self):
         """Frame bytes follow available pages, not max_new/reservation capacity."""

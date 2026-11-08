@@ -48,3 +48,38 @@ Q/O 的提交和完成等待持有 Plane 私有 mutex，不再排队等待 KV �
 ## 验证范围
 
 CPU 真实 tensor/控制 socket、显式 fake NIC 的合约测试覆盖：128/512 相同可用页复制量、sync/wave 计时对账、关闭后 pending 帧完成、恢复时间戳未知、COPY 重放 0 新字节、Q/O 不等待 KV 锁、Q/O 仍串行、注册/注销持共享锁。轻量入口绕过 SGLang 顶层初始化和 CI test base；不等于 CUDA/Mooncake 注册风暴或真实性能验证。
+
+## 从 cut 到 D1 首 token
+
+状态行和 `/v1/router/status` 中每个请求的 `handoff_timing` 记录以下 gateway
+时钟上的事件，缺失的阶段为 null。D1 首 token 可见时额外写一条
+`type=handoff_timing`，按 rid/epoch 关联。
+
+| 字段 | 口径 |
+|---|---|
+| `cut_observed_at` | gateway 首次通过 TP 共同输出观察到请求达到 cut 或显式迁移条件，含状态轮询延迟。请求重试时保留这个起点 |
+| `freeze_requested_at` | 首次持久化 FREEZE 意图。实际 RPC 提交时间看对应 epoch 的 `d2d_control_slot.submitted_at` |
+| `freeze_descriptor_ready_at` | 所有 rank 返回完整 descriptor 且冻结 token 历史和 KV 长度一致。pending retirement ACK 不计 |
+| `import_ready_at` | 所有 rank 确认 import 成功。异步 pending 回包不计 |
+| `target_admitted_at` | 全部目标 rank 确认接纳与源端确认，gateway 切换输出所有权 |
+| `dst_first_token_observed_at` | TARGET 或 LOCAL 状态推进时，gateway 首次观察到 D1 的 TP 共同输出在冻结前缀之后新增 token。包括轮询和调度延迟 |
+
+相邻阶段和端到端差值以 ms 给出。时间点是 gateway Unix 时间，随 journal 持久化。
+缺少任一端点或时间倒退时差值为 null。旧 journal 没有记录过的端点不会补造。
+
+`remaining_copy_bytes.by_rank` / `tp_sum` 是完整 descriptor 冻结时计划的
+剩余唯一 payload。按各 rank 的冻结 KV 页数减去封存的 precopy prefix 页，
+再乘 schema 每页字节，并加请求状态的 rows × stride。它涵盖后续 import
+和 bulk materialization，不含协议头、对齐、重传或远程 attention 流量。
+缺少字节计算所需 descriptor 字段时为 null。
+
+`type=d2d_control_slot` 对每个 dst 非 status RPC（以及 src 的 FREEZE RPC）
+记一次 envelope，成员用 cmd/epoch 关联请求。每个 `holders` 项给出等槽期间
+重叠的 dst 持槽命令、wave 成员及 `overlap_ms`。status 也可出现在持槽者列表。
+未提交的超时尝试 `submitted_at` 和 `rpc_ms` 为 null。记录使用有限的近期持槽
+历史，未归因的等待包含线程调度与记账边界。precopy 阶段的 `dst_slot_waits`
+带同一份归因。多个成员共享 wave 的等待与 RPC 时间，分析吞吐时只计算一次。
+
+跑 m128/m512、c=8、cut32 的热缓存 ON/OFF 对照时，按完整请求对比上述阶段、
+剩余字节、D1 首 token 和 safe-to-stop。按 epoch 关联 PREPARE 的持槽记录，
+再分辨它在等 precopy、IMPORT/COMMIT 或 status。
