@@ -118,33 +118,31 @@ def send(role: str, payload: dict, timeout: float = 300.0) -> dict:
     # The file control protocol has a single command slot per role.  The
     # Router (b1_proxy) and the Migration Controller (p4_gateway) can both be
     # alive after a failover, so serialize cross-process access with flock.
-    with _role_lock(role):
+    advisory = payload["cmd"] == "d2d_worker_status"
+    with _role_lock(role, blocking=not advisory):
         return _send_unlocked(role, payload, timeout)
 
 
 @contextlib.contextmanager
-def _role_lock(role: str):
+def _role_lock(role: str, *, blocking: bool = True):
     if fcntl is None:
         yield
         return
     d = control_dir(role)
     d.mkdir(parents=True, exist_ok=True)
     fh = open(d / ".control.lock", "a+")
-    try:
-        fcntl.flock(fh.fileno(), fcntl.LOCK_EX)
+    with fh:
+        flags = fcntl.LOCK_EX if blocking else fcntl.LOCK_EX | fcntl.LOCK_NB
+        fcntl.flock(fh.fileno(), flags)
         yield
-    finally:
-        try:
-            fcntl.flock(fh.fileno(), fcntl.LOCK_UN)
-        finally:
-            fh.close()
 
 
 def _send_unlocked(role: str, payload: dict, timeout: float = 300.0) -> dict:
     d = control_dir(role)
     d.mkdir(parents=True, exist_ok=True)
+    advisory = payload["cmd"] == "d2d_worker_status"
     infos = _ready(role)
-    if not infos:
+    if not infos and not advisory:
         # A new server may still be creating its Hub/ready file, but an old
         # single-rank server never publishes one: cap the wait, then go legacy.
         deadline = time.time() + _BARE_LEGACY_WAIT_S
@@ -159,7 +157,7 @@ def _send_unlocked(role: str, payload: dict, timeout: float = 300.0) -> dict:
 
     expected = max(1, max(int(i.get("tp_size", 1)) for i in infos))
     ranks = [int(i.get("rank", 0)) for i in infos]
-    if ranks != list(range(expected)):
+    if ranks != list(range(expected)) and not advisory:
         # A rank may still be bringing its Hub up; give it a bounded window.
         deadline = time.time() + _READY_WAIT_S
         while time.time() < deadline:
@@ -174,7 +172,7 @@ def _send_unlocked(role: str, payload: dict, timeout: float = 300.0) -> dict:
     if ranks != list(range(expected)):
         raise RuntimeError(
             f"{role}: expected TP ranks 0..{expected - 1}, ready={ranks} "
-            f"(ready files incomplete after {_READY_WAIT_S:.0f}s)"
+            "(ready files incomplete)"
         )
 
     # Tag this fan-out so a late result from an earlier command is never

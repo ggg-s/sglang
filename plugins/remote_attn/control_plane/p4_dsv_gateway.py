@@ -141,6 +141,7 @@ class DsvGateway:
         self.payloads = Payloads(self.path.parent / "dsv_payloads")
         self.tick_cursor = 0
         self.tick_samples = deque(maxlen=256)
+        self.precopy_frame_samples = deque(maxlen=256)
         self.lock = threading.RLock()
         self.work_lock = threading.Lock()
         self.cv = threading.Condition(self.lock)
@@ -325,6 +326,8 @@ class DsvGateway:
                                         "freeze_ack_latency_ms",
                                         "prepare_latency_ms",
                                         "handoff_latency_ms",
+                                        "precopy_bytes",
+                                        "precopy_pages",
                                     )
                                 }
                             )
@@ -453,8 +456,11 @@ class DsvGateway:
     def latency_metrics(self):
         with self.lock:
             entries = list(self.journal["entries"].values())
-            skipped = {}
+            skipped, outcomes = {}, {}
             for entry in entries:
+                outcome = entry.get("migration_outcome")
+                if outcome:
+                    outcomes[outcome] = outcomes.get(outcome, 0) + 1
                 reason = entry.get("migration_skip_reason")
                 if reason:
                     skipped[reason] = skipped.get(reason, 0) + 1
@@ -469,6 +475,10 @@ class DsvGateway:
                     if e.get("handoff_latency_ms") is not None
                 ),
                 migration_skip_reasons=skipped,
+                migration_outcomes=outcomes,
+                precopy_frame_recent_latency_ms=latency_histogram(
+                    self.precopy_frame_samples
+                ),
             )
 
     def _refresh_role(self, role):
@@ -489,7 +499,7 @@ class DsvGateway:
                 self.facts[role] = rows
                 self.fact_errors.pop(role, None)
                 self.cv.notify_all()
-        except StatusBusy:
+        except (StatusBusy, BlockingIOError):
             return
         except Exception as exc:
             with self.cv:
@@ -508,7 +518,7 @@ class DsvGateway:
     def _bound(self, entry, roles=None):
         for role in roles or entry["instances"]:
             if role in self.fact_errors or role not in self.facts:
-                raise RuntimeError(f"{role} unavailable; ownership unchanged")
+                raise ConnectionError(f"{role} unavailable; ownership unchanged")
             actual = [r["instance_id"] for r in self.facts[role]]
             if actual != entry["instances"][role]:
                 raise RuntimeError(
@@ -680,8 +690,7 @@ class DsvGateway:
             precopy_receipts=None,
             precopy_bytes=0,
             precopy_pages=None,
-            precopy_goal=None,
-            precopy_done=False,
+            migration_outcome=None,
             prepare_latency_ms=None,
             handoff_latency_ms=None,
             migration_skip_reason=None,
@@ -693,29 +702,46 @@ class DsvGateway:
             entry["migration_requested"] or len(request["output_ids"]) >= entry["cut"]
         )
 
-    def _precopy(self, entry, stop_after_snapshot=False):
+    def _precopy_source(self, entry, cmd, **payload):
+        rows = self._call("src", cmd, entry["epoch"], **payload)
+        if not any(r.get("deferred") for r in rows):
+            return rows
+        if not all(
+            r.get("deferred") and r.get("migration_deferred_reason") == "request_finished"
+            for r in rows
+        ):
+            raise RuntimeError("TP precopy source completion disagreed")
+        self._update(
+            entry["rid"],
+            phase="ROLLBACK",
+            migration_skip_reason="request_finished",
+            migration_outcome="migration_cancelled_by_finish",
+            error=None,
+        )
+        return None
+
+    def _precopy(self, entry, *, cut_due=False):
         """Advance one bounded, durable frame; Decode runs between commands."""
         rid, epoch = entry["rid"], entry["epoch"]
         pending = entry.get("precopy_pending")
         if pending is None:
+            if cut_due:
+                self._update(rid, phase="FREEZE")
+                return
             if not all(
                 r.get("precopy_protocol") == "closed-page-precopy-v1"
                 for role in ("src", "dst")
                 for r in self.facts.get(role, [])
             ):
                 return
-            rows = self._call("src", "d2d_precopy_status", epoch)
+            rows = self._precopy_source(entry, "d2d_precopy_status")
+            if rows is None:
+                return
             available = [
                 min(r["available"][i] for r in rows)
                 for i in range(len(rows[0]["available"]))
             ]
             ends = entry.get("precopy_pages") or [0] * len(available)
-            if stop_after_snapshot:
-                goal = entry.get("precopy_goal")
-                if goal is None:
-                    goal = [max(a, b) for a, b in zip(available, ends)]
-                    self._update(rid, precopy_goal=goal)
-                available = [min(a, b) for a, b in zip(available, goal)]
             schema = entry["plans"][0]["schema"]
             # Same frame on every shard; each has its own authenticated slot.
             for i, end in enumerate(available):
@@ -726,6 +752,7 @@ class DsvGateway:
                 if count > 0:
                     pending = dict(
                         stage="PREPARE",
+                        started_at=time.time(),
                         frame=dict(
                             entry=i, start=ends[i], count=count, chunk=uuid.uuid4().hex
                         ),
@@ -733,8 +760,6 @@ class DsvGateway:
                     self._update(rid, precopy_pending=pending)
                     break
             if pending is None:
-                if stop_after_snapshot:
-                    self._update(rid, precopy_done=True)
                 return
         frame = pending["frame"]
         if pending["stage"] == "PREPARE":
@@ -746,13 +771,11 @@ class DsvGateway:
                 ),
             )
         elif pending["stage"] == "COPY":
-            rows = self._call(
-                "src",
-                "d2d_precopy_copy",
-                epoch,
-                frame=frame,
-                receives=pending["receives"],
+            rows = self._precopy_source(
+                entry, "d2d_precopy_copy", frame=frame, receives=pending["receives"]
             )
+            if rows is None:
+                return
             self._update(
                 rid,
                 precopy_pending=dict(
@@ -772,12 +795,18 @@ class DsvGateway:
                 receipt.append(row["receipt"])
             self._update(
                 rid,
+                phase="FREEZE" if cut_due else "WAIT_CUT",
                 precopy_pending=None,
                 precopy_pages=rows[0]["prefix_pages"],
                 precopy_receipts=receipts,
                 precopy_bytes=entry.get("precopy_bytes", 0)
                 + sum(r["receipt"]["bytes"] for r in rows),
             )
+            if pending.get("started_at") is not None:
+                with self.lock:
+                    self.precopy_frame_samples.append(
+                        max(0, (time.time() - pending["started_at"]) * 1000)
+                    )
 
     def _advance(self, entry):
         rid, phase = entry["rid"], entry["phase"]
@@ -960,29 +989,25 @@ class DsvGateway:
         elif phase == "WAIT_CUT":
             if request is None:
                 raise RuntimeError("prepared source request missing")
+            cut_due = self._cut_due(entry, request)
             if request["finished"]:
+                if entry.get("precopy_pending") is not None:
+                    outcome = "migration_cancelled_by_finish"
+                elif cut_due:
+                    outcome = "window_missed_request_finished"
+                else:
+                    outcome = "completed_on_source_before_cut"
                 self._update(
                     rid,
                     phase="ROLLBACK",
                     migration_skip_reason="request_finished",
-                    migration_outcome="window_missed_request_finished"
-                    if self._cut_due(entry, request)
-                    else "completed_on_source_before_cut",
+                    migration_outcome=outcome,
+                    error=None,
                 )
-            elif entry.get("precopy_pending") is not None:
-                self._precopy(entry)
-            elif self._cut_due(entry, request):
-                supported = all(
-                    r.get("precopy_protocol") == "closed-page-precopy-v1"
-                    for role in ("src", "dst")
-                    for r in self.facts.get(role, [])
-                )
-                if not supported or entry.get("precopy_done"):
-                    self._update(rid, phase="FREEZE")
-                else:
-                    self._precopy(entry, stop_after_snapshot=True)
             else:
-                self._precopy(entry)
+                # At the cut, finish only an already durable frame. Its APPLY
+                # receipt must be sealed by FREEZE, including after a restart.
+                self._precopy(entry, cut_due=cut_due)
         elif phase == "FREEZE":
             if entry.get("freeze_requested_at") is None:
                 self._update(rid, freeze_requested_at=time.time())
@@ -1204,9 +1229,13 @@ class DsvGateway:
                     rollback = phase in PRECOMMIT and not isinstance(
                         exc, (TimeoutError, ConnectionError)
                     )
+                    outcome = current.get("migration_outcome")
+                    if rollback and outcome is None:
+                        outcome = "precommit_failed"
                     self._update(
                         entry["rid"],
                         phase="ROLLBACK" if rollback else phase,
+                        migration_outcome=outcome,
                         error=repr(exc),
                         blocked=not rollback,
                     )

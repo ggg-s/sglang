@@ -18014,6 +18014,58 @@ class TestRemoteAttn(CustomTestCase):
         )
         f.e.gate.set()
 
+    def test_p4_dsv_cut_finishes_pending_frame_without_copying_to_snapshot(self):
+        """A cut must freeze after the active frame, even with more stable KV."""
+        f = self._p4_dsv_env()
+        f.gw._update(f.rid, cut=7)
+        f.support.until(f.gw, f.rid, "WAIT_CUT")
+        f.gw.tick()
+        entry = f.gw.entry(f.rid)
+        self.assertEqual(entry["precopy_pending"]["stage"], "COPY")
+        frame = entry["precopy_pending"]["frame"]
+        req = f.e.req
+        req.output_ids.extend([64] * (7 - len(req.output_ids)))
+        req.kv.kv_committed_len = req.kv.kv_allocated_len = (
+            len(req.origin_input_ids) + len(req.output_ids) - 1
+        )
+        self._p4_dsv_restart(f)
+        f.support.until(f.gw, f.rid, "FREEZE")
+        entry = f.gw.entry(f.rid)
+        self.assertIsNone(entry["precopy_pending"])
+        self.assertEqual(len(entry["precopy_receipts"][0]), 1)
+        self.assertEqual(entry["precopy_pages"][frame["entry"]], frame["count"])
+        self.assertEqual(sum(entry["precopy_pages"]), frame["count"])
+        self.assertFalse(req._handoff_frozen)
+        f.support.until(f.gw, f.rid, "TARGET")
+        self.assertEqual(f.gw.entry(f.rid)["migration_outcome"], "migrated")
+
+    def test_p4_dsv_source_finishes_between_status_and_precopy_copy(self):
+        """A stale running snapshot cannot turn normal completion into an error."""
+        from sglang_remote_attn import d2d_precopy
+
+        f = self._p4_dsv_env()
+        f.gw._update(f.rid, cut=7)
+        f.support.until(f.gw, f.rid, "WAIT_CUT")
+        f.gw.tick()
+        entry = f.gw.entry(f.rid)
+        self.assertEqual(entry["precopy_pending"]["stage"], "COPY")
+        req = f.e.req
+        req.finished = lambda: True
+        d2d_precopy.release_source(req, lambda: None)
+        # The previous status still described a runnable request.
+        with patch.object(f.gw, "_refresh"):
+            f.gw.tick()
+        entry = f.gw.entry(f.rid)
+        self.assertEqual(entry["phase"], "ROLLBACK")
+        self.assertEqual(entry["migration_outcome"], "migration_cancelled_by_finish")
+        self.assertIsNone(entry["error"])
+        f.gw.tick()
+        ticket = f.e.target.d2d_reservations[entry["epoch"]]
+        self.assertTrue(ticket.cancelled)
+        self.assertFalse(ticket.req.kv.holds_kv)
+        self.assertTrue(req.kv.holds_kv)
+        self.assertFalse(req._handoff_frozen)
+
     def test_p4_dsv_finished_window_is_classified_and_reservation_cancelled(self):
         f = self._p4_dsv_env()
         f.support.until(f.gw, f.rid, "FREEZE")
@@ -18407,12 +18459,21 @@ class TestRemoteAttn(CustomTestCase):
         ):
             with self.subTest(command=command):
                 f = self._p4_dsv_env()
+                precopy = command.startswith("d2d_precopy_")
+                if precopy:
+                    f.gw._update(f.rid, cut=7)
                 f.driver.after[command] = [TimeoutError("reply lost")]
                 for _ in range(40):
                     f.gw.tick()
                     if f.gw.entry(f.rid)["blocked"]:
                         break
                 self.assertTrue(f.gw.entry(f.rid)["blocked"])
+                if precopy:
+                    req = f.e.req
+                    req.output_ids.extend([64] * (7 - len(req.output_ids)))
+                    req.kv.kv_committed_len = req.kv.kv_allocated_len = (
+                        len(req.origin_input_ids) + len(req.output_ids) - 1
+                    )
                 self._p4_dsv_restart(f)
                 f.support.until(f.gw, f.rid, "TARGET")
                 self.assertEqual(len(f.e.target.d2d_targets), 1)

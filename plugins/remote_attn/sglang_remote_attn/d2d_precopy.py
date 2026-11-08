@@ -25,6 +25,7 @@ COMMANDS = {"d2d_precopy_" + s for s in ("status", "prepare", "copy", "apply", "
 class Source:
     req: object
     attempt: tuple
+    plan_digest: str
     sender: object = None
     closed: bool = False
     failed: bool = False
@@ -38,6 +39,7 @@ class Source:
 class Destination:
     receiver: object
     ends: list
+    plan_digest: str
     pending: dict | None = None
     receipts: dict = field(default_factory=dict)
     closed: bool = False
@@ -129,7 +131,7 @@ def source_record(controller, epoch):
     plan, req, attempt = reservation.records(controller)[0][epoch]
     record = sources(controller).get(epoch)
     if record is None:
-        record = sources(controller)[epoch] = Source(req, attempt)
+        record = sources(controller)[epoch] = Source(req, attempt, plan_hash(plan))
         if not hasattr(req, "_d2d_precopies"):
             req._d2d_precopies = []
         req._d2d_precopies.append((controller, record))
@@ -139,7 +141,7 @@ def source_record(controller, epoch):
         or reservation.source_attempt(req) != attempt
     ):
         raise ValueError("precopy source attempt changed")
-    return plan, record
+    return record
 
 
 def ticket(controller, epoch):
@@ -282,39 +284,43 @@ def close_destination(controller, t, proof=None):
 def handle(controller, data):
     epoch, cmd = data["migration_epoch"], data["cmd"]
     error, result = None, None
+    finished = False
     # Every command has exactly two collective boundaries, including retries
     # and failures. No rank may enter a native mutation when a peer rejects.
     try:
         if cmd == "d2d_precopy_close":
             pass
         elif cmd in ("d2d_precopy_status", "d2d_precopy_copy"):
-            plan, record = source_record(controller, epoch)
-            if (
-                epoch in getattr(controller, "d2d_precopy_closed", ())
-                or record.closed
-                or record.failed
-            ):
-                raise ValueError("precopy source closed/failed")
-            if cmd.endswith("status"):
-                ends = stable_pages(controller, record.req)
-            else:
-                f = frame(controller, data["frame"])
-                dest = reservation.select(controller, data, "receive")
+            record = source_record(controller, epoch)
+            if record.failed:
+                raise ValueError("precopy source failed")
+            finished = record.req.finished()
+            if not finished:
                 if (
-                    dest["frame"] != f
-                    or dest["epoch"] != epoch
-                    or dest["plan_hash"] != plan_hash(plan)
+                    epoch in getattr(controller, "d2d_precopy_closed", ())
+                    or record.closed
                 ):
-                    raise ValueError("precopy destination certificate mismatch")
-                saved = record.proofs.get(f["chunk"])
-                if saved is not None:
-                    if saved["receive"] != dest:
-                        raise ValueError("precopy retry changed descriptor")
-                elif (
-                    stable_pages(controller, record.req)[f["entry"]]
-                    < f["start"] + f["count"]
-                ):
-                    raise ValueError("precopy page is still mutable or remotely owned")
+                    raise ValueError("precopy source closed")
+                if cmd.endswith("status"):
+                    ends = stable_pages(controller, record.req)
+                else:
+                    f = frame(controller, data["frame"])
+                    dest = reservation.select(controller, data, "receive")
+                    if (
+                        dest["frame"] != f
+                        or dest["epoch"] != epoch
+                        or dest["plan_hash"] != record.plan_digest
+                    ):
+                        raise ValueError("precopy destination certificate mismatch")
+                    saved = record.proofs.get(f["chunk"])
+                    if saved is not None:
+                        if saved["receive"] != dest:
+                            raise ValueError("precopy retry changed descriptor")
+                    elif (
+                        stable_pages(controller, record.req)[f["entry"]]
+                        < f["start"] + f["count"]
+                    ):
+                        raise ValueError("precopy page is still mutable or remotely owned")
         else:
             t = ticket(controller, epoch)
             state = getattr(t, "precopy", None)
@@ -349,8 +355,11 @@ def handle(controller, data):
                 raise ValueError("unsupported precopy command")
     except Exception as exc:
         error = repr(exc)
-    if not controller.agree([int(error is None)])[0]:
+    healthy, running = controller.agree([int(error is None), int(not finished)])
+    if not healthy:
         raise ValueError(f"TP precopy preflight rejected: {error or 'peer rejected'}")
+    if not running:
+        return dict(deferred=True, migration_deferred_reason="request_finished")
     scatter_started = False
     try:
         if cmd.endswith("close"):
@@ -363,12 +372,14 @@ def handle(controller, data):
                     d2d.manager(controller).engine, NS(), d2d.pool_device(controller)
                 )
                 state = t.precopy = Destination(
-                    receiver, [0] * len(t.plan["schema"]["entries"])
+                    receiver,
+                    [0] * len(t.plan["schema"]["entries"]),
+                    plan_hash(t.plan),
                 )
             if state.pending is None:
                 state.pending = dict(
                     epoch=epoch,
-                    plan_hash=plan_hash(t.plan),
+                    plan_hash=state.plan_digest,
                     frame=f,
                     region=state.receiver.prepare(),
                     sequence=state.receiver.sequence,
