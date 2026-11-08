@@ -179,9 +179,18 @@ class Plan:
             if not getattr(controller, "hybrid_gdn", False):
                 install(controller, self.manager, "prefill")
             schema = controller._schema(self.manager)
-            self.groups = [
-                ((i,), (i,), e[0] == "index") for i, e in enumerate(schema["entries"])
-            ]
+            if getattr(controller, "hybrid_gdn", False):
+                # Decode can retire a full layer only when both K and V are
+                # complete. Submit their ranges together before the next layer.
+                pairs = {}
+                for i, entry in enumerate(schema["entries"]):
+                    pairs.setdefault(entry[2], []).append(i)
+                self.groups = [(tuple(pair), tuple(pair), False) for pair in pairs.values()]
+            else:
+                self.groups = [
+                    ((i,), (i,), e[0] == "index")
+                    for i, e in enumerate(schema["entries"])
+                ]
             resources = len(schema["entries"])
         else:
             size = controller.config.select_group_size(

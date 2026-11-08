@@ -194,6 +194,28 @@ def compute(root, pd_mode=False):
         )
         assert target.rpc.calls == 1
         if pd_mode:
+            # Multiple queries for the same immutable source row, with
+            # distinct Q values. Verify real wire packing and scatter order.
+            q4 = torch.cat([q, -q, q * 0.5, q * 2])
+            fb4 = NS(
+                **vars(fb)
+                | dict(
+                    req_pool_indices=fb.req_pool_indices.repeat(4),
+                    seq_lens=fb.seq_lens.repeat(4),
+                )
+            )
+            batch_o = hybrid.attention(
+                d, native, module, q4, k, v, fb4, save_kv_cache=False
+            ).reshape(4, 6, 256)
+            for query, output in zip(q4.reshape(4, 6, 256), batch_o):
+                reference, _ = flashinfer.single_decode_with_kv_cache(
+                    query, full_k, full_v, kv_layout="NHD", pos_encoding_mode="NONE",
+                    sm_scale=256**-0.5, return_lse=True,
+                )
+                torch.testing.assert_close(output, reference, rtol=0.02, atol=0.001)
+            timing = d.gpu_data_plane.stats()
+            assert (timing["attention_frames"], timing["attention_rows"]) == (2, 5)
+            assert target.rpc.calls == 5
             f.local(target)
         else:
             f.gate.set()
@@ -205,7 +227,7 @@ def compute(root, pd_mode=False):
         torch.testing.assert_close(
             local_o.reshape_as(expected), expected, rtol=0, atol=0
         )
-        assert target.rpc.calls == 1
+        assert target.rpc.calls == (5 if pd_mode else 1)
         assert torch.equal(d.pool.get_key_buffer(3)[location.long()], k)
         if not pd_mode:
             target.finish()
@@ -233,6 +255,7 @@ def compute(root, pd_mode=False):
             "distinct_source_target_slots": [int(si.item()), int(di.item())],
             "pd_remote": pd_mode,
             "remote_calls": target.rpc.calls,
+            "remote_frames": d.gpu_data_plane.stats()["attention_frames"],
             "layer_group_size": getattr(target, "group_size", None),
             "token_range": getattr(target, "token_range", None),
             "bulk_group_frames": getattr(target, "group_frames", None),

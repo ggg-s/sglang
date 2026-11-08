@@ -17,6 +17,7 @@ import torch
 from . import mooncake_backend as transport
 
 WIRE_VERSION = "remote-mooncake-v1"
+MAX_ROWS = 4
 FOOTER = 32
 
 Q_BYTES = 2 * 1024 * 1024
@@ -122,7 +123,8 @@ class RequestIO:
     def finish(self, proof):
         with self.lock:
             self.pending -= 1
-            self.events.append(proof)
+            if proof is not None:
+                self.events.append(proof)
 
     def poison(self):
         with self.lock:
@@ -158,6 +160,9 @@ class Slab:
         self.copy_owner = None
         self.tensor = torch.empty(TOTAL, dtype=torch.uint8, device=plane.device)
         self.initialized = event(plane.device)
+        # Only reused under the lane's exclusive write ownership. RequestIO
+        # completion proofs have a different lifetime and stay single-use.
+        self.producer = event(plane.device) if plane.device.type == "cuda" else None
         self.wire = (
             self.tensor
             if backend == transport.GPU
@@ -222,10 +227,15 @@ class Slab:
         if self.stream is not None:
             self.stream.synchronize()
 
+    def record_producer(self):
+        if self.producer is not None:
+            self.producer.record(torch.cuda.current_stream(self.plane.device))
+        return self.producer
+
     def prepare(self, remote, entries, sequence):
         sizes = [tensor_spec(value, region)[2] for region, value in entries]
+        producer = self.record_producer()
         if self.backend == transport.TCP:
-            producer = event(self.plane.device)
             with self.copy_context():
                 if self.stream is not None:
                     self.stream.wait_event(producer)
@@ -244,9 +254,12 @@ class Slab:
                     )
                 )
             sizes = [size + FOOTER for size in sizes]
+        elif producer is not None:
+            # RDMA reads the GPU slab directly. TCP already fenced its D2H.
+            producer.synchronize()
         return sizes
 
-    def receive(self, entries, sequence):
+    def receive(self, entries, sequence, *, owned=False):
         if self.quarantined or self.closed:
             raise RuntimeError("Q/O slot is quarantined/closed")
         if self.backend == transport.GPU:
@@ -265,16 +278,32 @@ class Slab:
                 if self.quarantined or time.monotonic() >= deadline:
                     raise TimeoutError("Q/O Host payload arrival unproven")
                 time.sleep(0.001)
+        outputs = []
+        if owned:
+            self.copy_owner = outputs
         with self.copy_context():
             if self.stream is not None:
                 self.stream.wait_event(self.initialized)
             for region, value in entries:
-                size = tensor_spec(value, region)[2]
-                self.tensor[OFFSETS[region] : OFFSETS[region] + size].copy_(
+                shape, dtype, size = tensor_spec(value, region)
+                if owned:
+                    dst = torch.empty(shape, device=self.plane.device, dtype=dtype)
+                    outputs.append(dst)
+                    dst = dst.view(torch.uint8).reshape(-1)
+                else:
+                    dst = self.tensor[OFFSETS[region] : OFFSETS[region] + size]
+                dst.copy_(
                     self.wire[self.offsets[region] : self.offsets[region] + size],
                     non_blocking=True,
                 )
-        self.drain()  # Prove H2D before another stream consumes or sender reuses.
+        self.drain()  # Prove H2D before consumers run or the sender reuses Host.
+        if owned:
+            if self.stream is not None:
+                consumer = torch.cuda.current_stream(self.plane.device)
+                for output in outputs:
+                    output.record_stream(consumer)
+            self.copy_owner = None
+            return outputs
 
     def close(self):
         if self.closed or self.quarantined:
@@ -322,6 +351,20 @@ def tensor_spec(spec, region):
 
 def spec(tensor):
     return dict(shape=list(tensor.shape), dtype=str(tensor.dtype).split(".")[-1])
+
+
+def pack(slab, region, tensors):
+    first = tensors[0]
+    if any(t.shape != first.shape or t.dtype != first.dtype for t in tensors):
+        raise ValueError("Q/O frame rows have different shapes or dtypes")
+    value = spec(first)
+    value["shape"].insert(0, len(tensors))
+    dst = slab.view(region, value)
+    if len(tensors) == 1:
+        dst[0].copy_(first)
+    else:
+        torch.stack(tensors, out=dst)
+    return value
 
 
 def descriptor(value, backend=None):
@@ -376,6 +419,8 @@ class Plane:
         self.lock = threading.RLock()
         self.closed = False
         self.transfers = self.payload_bytes = 0
+        self.attention_frames = self.attention_rows = 0
+        self.attention_ms = {}
         print(
             f"[remote-gpu] native Mooncake GPU payloads session={self.session}",
             flush=True,
@@ -392,6 +437,9 @@ class Plane:
             return dict(
                 transfers=self.transfers,
                 payload_bytes=self.payload_bytes,
+                attention_frames=self.attention_frames,
+                attention_rows=self.attention_rows,
+                attention_ms=dict(self.attention_ms),
                 clients=len(self.clients),
                 lanes=len(self.lanes),
                 quarantined=len(self.quarantine),
@@ -404,6 +452,13 @@ class Plane:
                     )
                 ),
             )
+
+    def record_attention(self, rows, timings):
+        with self.lock:
+            self.attention_frames += 1
+            self.attention_rows += rows
+            for key, value in timings.items():
+                self.attention_ms[key] = self.attention_ms.get(key, 0.0) + value
 
     def write(self, slab, remote, session, entries, sequence):
         remote = descriptor(remote, slab.backend)
@@ -469,6 +524,7 @@ class Client:
         self.lock = threading.Lock()
         self.sock, self.remote, self.session = None, None, None
         self.sequence = 0
+        self.inline_ack = False
         self.consumed = None
         self.closed = False
 
@@ -503,6 +559,7 @@ class Client:
             dict(
                 cmd="te_negotiate",
                 version=WIRE_VERSION,
+                inline_ack=True,
                 route=self.route,
                 native_session=self.plane.session,
                 capabilities=self.plane.catalog.offer,
@@ -516,6 +573,7 @@ class Client:
         if result.get("version") != WIRE_VERSION or result.get("backend") != backend:
             raise ValueError("Q/O backend negotiation mismatch")
         self.session = result["session"]
+        self.inline_ack = result.get("inline_ack") is True
         self.slab = Slab(self.plane, backend)
         result = self.rpc(
             dict(
@@ -535,7 +593,7 @@ class Client:
 
     def call(self, queries, rows, reqs):
         if (
-            not 1 <= len(rows) <= 4
+            not 1 <= len(rows) <= MAX_ROWS
             or len(rows) != len(queries)
             or len(reqs) != len(rows)
         ):
@@ -549,17 +607,15 @@ class Client:
                     io.begin()
                 if self.sock is None:
                     self.connect()
+                t0 = time.perf_counter()
                 if self.consumed is not None:
                     self.consumed.synchronize()
                     self.slab.copy_owner = None
                 if any(q.device != self.plane.device for q in queries):
                     raise ValueError("Q belongs to another GPU")
-                query = torch.stack(queries)
-                query_spec = spec(query)
-                self.slab.copy_owner = query
-                self.slab.view(0, query_spec).copy_(query)
-                event(self.plane.device).synchronize()
-                self.slab.copy_owner = None
+                self.slab.copy_owner = queries
+                query_spec = pack(self.slab, 0, queries)
+                t_pack = time.perf_counter()
                 self.plane.write(
                     self.slab,
                     self.remote,
@@ -567,26 +623,53 @@ class Client:
                     [(0, query_spec)],
                     self.sequence + 1,
                 )
-                self.sequence += 1
-                result = self.rpc(
-                    dict(cmd="te_attn", sequence=self.sequence, q=query_spec, rows=rows)
+                self.slab.copy_owner = None
+                t_write = time.perf_counter()
+                frame = dict(
+                    cmd="te_attn", sequence=self.sequence + 1, q=query_spec, rows=rows
                 )
+                if self.inline_ack and self.sequence:
+                    frame["ack_sequence"] = self.sequence
+                self.sequence += 1
+                result = self.rpc(frame)
+                t_reply = time.perf_counter()
                 if result.get("sequence") != self.sequence:
                     raise ValueError("GPU result sequence changed")
-                self.slab.receive([(1, result["o"]), (2, result["lse"])], self.sequence)
-                # Return owned tensors; the arena never aliases a future graph
-                # segment. Reuse waits for the final slot->owned D2D reads.
-                self.slab.copy_owner = []
-                out = self.slab.view(1, result["o"]).clone()
-                self.slab.copy_owner.append(out)
-                lse = self.slab.view(2, result["lse"]).clone()
-                self.slab.copy_owner.append(lse)
-                if out.shape != query.shape or lse.shape != query.shape[:-1]:
+                entries = [(1, result["o"]), (2, result["lse"])]
+                if self.slab.backend == transport.TCP:
+                    # Copy registered Host data straight into owned outputs.
+                    # The H2D fence in receive proves the slab has no readers.
+                    out, lse = self.slab.receive(entries, self.sequence, owned=True)
+                    self.consumed = None
+                else:
+                    self.slab.receive(entries, self.sequence)
+                    # RDMA writes the registered GPU slab. Keep the backing
+                    # and its consumption proof until the owned D2D reads finish.
+                    self.slab.copy_owner = []
+                    out = self.slab.view(1, result["o"]).clone()
+                    self.slab.copy_owner.append(out)
+                    lse = self.slab.view(2, result["lse"]).clone()
+                    self.slab.copy_owner.append(lse)
+                    self.consumed = event(self.plane.device)
+                shape = tuple(query_spec["shape"])
+                if out.shape != shape or lse.shape != shape[:-1]:
                     raise ValueError("GPU result shape changed")
-                self.consumed = event(self.plane.device)
-                self.rpc(dict(cmd="te_ack", sequence=self.sequence))
+                t_receive = time.perf_counter()
+                if not self.inline_ack:
+                    self.rpc(dict(cmd="te_ack", sequence=self.sequence))
                 for io in ios:
                     io.finish(self.consumed)
+                self.plane.record_attention(
+                    len(rows),
+                    dict(
+                        pack=(t_pack - t0) * 1000,
+                        write=(t_write - t_pack) * 1000,
+                        rpc=(t_reply - t_write) * 1000,
+                        receive=(t_receive - t_reply) * 1000,
+                        ack=(time.perf_counter() - t_receive) * 1000,
+                        **result.get("source_timing_ms", {}),
+                    ),
+                )
                 return result, out, lse
             except BaseException:
                 if self.slab is not None:
@@ -613,7 +696,10 @@ class Client:
                 if self.consumed is not None:
                     self.consumed.synchronize()
                 if self.sock is not None:
-                    self.rpc(dict(cmd="te_close", sequence=self.sequence))
+                    frame = dict(cmd="te_close", sequence=self.sequence)
+                    if self.inline_ack and self.sequence:
+                        frame["ack_sequence"] = self.sequence
+                    self.rpc(frame)
                     self.sock.close()
                 self.slab.copy_owner = None
                 self.slab.close()
@@ -624,7 +710,8 @@ class Client:
 
 class Lane:
     def __init__(
-        self, plane, remote, session, backend=transport.TCP, native_session=None
+        self, plane, remote, session, backend=transport.TCP, native_session=None,
+        inline_ack=False,
     ):
         self.plane, self.remote, self.session = (
             plane,
@@ -632,6 +719,7 @@ class Lane:
             session,
         )
         self.native_session = native_session or session
+        self.inline_ack = inline_ack
         self.slab = Slab(plane, backend)
         self.sequence = 0
         self.state = "idle"
@@ -649,7 +737,11 @@ class Lane:
 
     def ack(self, sequence):
         with self.lock:
-            if self.state != "returned" or sequence != self.sequence:
+            if (
+                self.state != "returned"
+                or type(sequence) is not int
+                or sequence != self.sequence
+            ):
                 raise RuntimeError("GPU lane ACK is stale/unproven")
             self.state = "idle"
 
@@ -668,13 +760,16 @@ class Job:
         self.contexts, self.stream = contexts, None
         self.done = False
         self.unsafe = False
+        self.return_fenced = False
 
     def execute(self, stream, cache):
         from . import dsv41_remote
         from .handoff_control import execute_remote_attention_batch
 
         plane = self.lane.plane
+        t_start = time.perf_counter()
         self.lane.slab.receive([(0, self.header["q"])], self.lane.sequence)
+        t_receive = time.perf_counter()
         with (
             torch.cuda.stream(stream) if plane.device.type == "cuda" else nullcontext()
         ):
@@ -687,6 +782,7 @@ class Job:
                     header=row,
                     q_cpu=query[i],
                     gpu_transport=True,
+                    fence_output_at_write=True,
                     rpc_id=self.lane.sequence,
                     recv_delay_ms=0,
                     recv_ms=0,
@@ -714,23 +810,20 @@ class Job:
                     stream,
                     cache,
                 )
-            out, lse = (
-                torch.stack([o for _, o, _ in outs]),
-                torch.stack([l for _, _, l in outs]),
-            )
-            self.lane.slab.copy_owner = (outs, out, lse)
-            o_spec, l_spec = spec(out), spec(lse)
-            self.lane.slab.view(1, o_spec).copy_(out)
-            self.lane.slab.view(2, l_spec).copy_(lse)
-            event(plane.device).synchronize()
-            self.lane.slab.copy_owner = None
+            slab = self.lane.slab
+            slab.copy_owner = outs
+            o_spec = pack(slab, 1, [o for _, o, _ in outs])
+            l_spec = pack(slab, 2, [l for _, _, l in outs])
+            t_compute = time.perf_counter()
             plane.write(
-                self.lane.slab,
-                self.lane.remote,
-                self.lane.session,
-                [(1, o_spec), (2, l_spec)],
-                self.lane.sequence,
+                slab, self.lane.remote, self.lane.session,
+                [(1, o_spec), (2, l_spec)], self.lane.sequence,
             )
+            # A successful write already fenced the attention stream before
+            # D2H/RDMA. Registry release need not synchronize it a second time.
+            self.return_fenced = True
+            slab.copy_owner = None
+        t_write = time.perf_counter()
         with self.lane.lock:
             if self.lane.state != "running":
                 raise RuntimeError("GPU connection dropped during DMA")
@@ -744,6 +837,12 @@ class Job:
                 o=o_spec,
                 lse=l_spec,
                 rows=[r for r, _, _ in outs],
+                source_timing_ms=dict(
+                    source_queue=(t_start - self.t_enqueue) * 1000,
+                    source_receive=(t_receive - t_start) * 1000,
+                    source_compute_submit=(t_compute - t_receive) * 1000,
+                    source_return=(t_write - t_compute) * 1000,
+                ),
             ),
         )
 
@@ -765,7 +864,9 @@ class Job:
         if self.done:
             return
         self.done = True
-        if self.unsafe or not _fence_remote_job(self, self.contexts):
+        if self.unsafe or (
+            not self.return_fenced and not _fence_remote_job(self, self.contexts)
+        ):
             return
         for ctx in self.contexts:
             self.hub.registry.release_ref(ctx.handoff_id, ctx.owner_epoch)
@@ -809,7 +910,8 @@ def handle(hub, hc, frame):
         session = sessions.get(backend)
         if not isinstance(session, str) or not 0 < len(session) <= 512:
             raise ValueError("Q/O capability endpoint invalid")
-        hc.gpu_negotiation = (backend, native_session, session)
+        inline_ack = frame.get("inline_ack") is True
+        hc.gpu_negotiation = (backend, native_session, session, inline_ack)
         hub._send(
             hc,
             dict(
@@ -817,6 +919,7 @@ def handle(hub, hc, frame):
                 cmd=command,
                 version=WIRE_VERSION,
                 capabilities=plane.catalog.offer,
+                inline_ack=inline_ack,
                 backend=backend,
                 session=plane.catalog.engines[backend].session,
             ),
@@ -825,7 +928,7 @@ def handle(hub, hc, frame):
     if command == "te_open":
         if hc.gpu_negotiation is None or frame.get("version") != WIRE_VERSION:
             raise ValueError("Q/O open requires capability negotiation")
-        backend, native_session, session = hc.gpu_negotiation
+        backend, native_session, session, inline_ack = hc.gpu_negotiation
         if (
             frame.get("backend") != backend
             or frame.get("session") != session
@@ -837,7 +940,8 @@ def handle(hub, hc, frame):
             if len(plane.lanes) >= 16 or hc.gpu_lane is not None:
                 raise RuntimeError("GPU lane capacity/binding exceeded")
             lane = hc.gpu_lane = Lane(
-                plane, frame["region"], frame["session"], backend, native_session
+                plane, frame["region"], frame["session"], backend, native_session,
+                inline_ack=inline_ack,
             )
             plane.lanes.add(lane)
         hub._send(
@@ -854,6 +958,10 @@ def handle(hub, hc, frame):
     lane = getattr(hc, "gpu_lane", None)
     if lane is None:
         raise RuntimeError("GPU command has no registered lane")
+    if "ack_sequence" in frame:
+        if not lane.inline_ack or command not in ("te_attn", "te_close"):
+            raise ValueError("inline Q/O ACK was not negotiated")
+        lane.ack(frame["ack_sequence"])
     if command == "te_ack":
         lane.ack(frame["sequence"])
         hub._send(hc, dict(ok=True, cmd=command))
@@ -869,7 +977,7 @@ def handle(hub, hc, frame):
     elif command == "te_attn":
         rows = frame["rows"]
         shape, _, _ = tensor_spec(frame["q"], 0)
-        if len(shape) != 3 or not 1 <= len(rows) <= 4 or shape[0] != len(rows):
+        if len(shape) != 3 or not 1 <= len(rows) <= MAX_ROWS or shape[0] != len(rows):
             raise ValueError("GPU RPC row/shape mismatch")
         lane.begin(frame["sequence"])
         contexts = []

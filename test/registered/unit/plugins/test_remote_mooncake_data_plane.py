@@ -217,14 +217,37 @@ class TestRemoteMooncakeDataPlane(unittest.TestCase):
             time.sleep(0.005)
 
     def test_tcp_q_and_two_descriptor_return_use_single_submit(self):
-        fixture = self.fixture()
-        client, req, _ = self.call(fixture)
-        self.assertEqual([len(call[1]) for call in fixture.d.calls], [1])
-        self.assertEqual([len(call[1]) for call in fixture.p.calls], [2])
-        self.assertEqual(fixture.p.sync_calls + fixture.d.sync_calls, 0)
-        self.assertTrue(dp.ready(req))
-        client.close()
-        self.assertFalse(fixture.p.regions or fixture.d.regions)
+        for inline_ack in (False, True):
+            with self.subTest(inline_ack=inline_ack):
+                fixture = self.fixture()
+                client = fixture.dd.client(fixture.route)
+                rpc = client.rpc
+                frames = []
+
+                def capture(frame):
+                    frame = dict(frame)
+                    if not inline_ack and frame["cmd"] == "te_negotiate":
+                        frame.pop("inline_ack", None)  # Legacy peer.
+                    frames.append(frame)
+                    return rpc(frame)
+
+                with patch.object(client, "rpc", side_effect=capture):
+                    _, req, _ = self.call(fixture, client=client)
+                    self.call(fixture, client=client)
+                    client.close()
+                self.assertEqual([len(call[1]) for call in fixture.d.calls], [1, 1])
+                self.assertEqual([len(call[1]) for call in fixture.p.calls], [2, 2])
+                self.assertEqual(fixture.p.sync_calls + fixture.d.sync_calls, 0)
+                self.assertTrue(dp.ready(req))
+                self.assertFalse(fixture.p.regions or fixture.d.regions)
+                self.assertEqual(client.inline_ack, inline_ack)
+                self.assertEqual(
+                    [f["ack_sequence"] for f in frames if "ack_sequence" in f],
+                    [1, 2] if inline_ack else [],
+                )
+                self.assertEqual(
+                    sum(f["cmd"] == "te_ack" for f in frames), 0 if inline_ack else 2
+                )
 
     def test_mixed_gpu_capabilities_fall_back_before_any_payload(self):
         fixture = self.fixture("rdma", server_gpu=False, client_gpu=True)
@@ -546,18 +569,15 @@ class TestRemoteMooncakeDataPlane(unittest.TestCase):
         client, req = fixture.dd.client(fixture.route), NS()
         client.connect()
 
-        def failed_event(device):
-            def synchronize():
-                raise RuntimeError("injected producer event failure")
+        def fail():
+            raise RuntimeError("injected producer event failure")
 
-            return NS(synchronize=synchronize, query=lambda: False)
-
-        with patch.object(dp, "event", side_effect=failed_event):
+        with patch.object(client.slab, "record_producer", return_value=NS(synchronize=fail)):
             with self.assertRaisesRegex(RuntimeError, "producer event"):
                 self.call(fixture, req, client)
-        self.assertIsInstance(client.slab.copy_owner, torch.Tensor)
+        (query,) = client.slab.copy_owner
         torch.testing.assert_close(
-            client.slab.copy_owner, torch.arange(16).reshape(1, 2, 8).to(torch.bfloat16)
+            query, torch.arange(16).reshape(2, 8).to(torch.bfloat16)
         )
         self.assertTrue(client.slab.quarantined)
         self.assertIn(client.slab, client.slab.engine._qo_slabs)
@@ -572,7 +592,7 @@ class TestRemoteMooncakeDataPlane(unittest.TestCase):
         client, req = fixture.dd.client(fixture.route), NS()
         client.connect()
         armed = threading.Event()
-        real_event = dp.event
+        real_producer = dp.Slab.record_producer
 
         def compute(job, stream, cache):
             armed.set()
@@ -583,25 +603,25 @@ class TestRemoteMooncakeDataPlane(unittest.TestCase):
                 torch.zeros(query.shape[0], dtype=torch.float32),
             )
 
-        def gate_event(device):
-            if not armed.is_set():
-                return real_event(device)
+        def gate_producer(slab):
+            if not armed.is_set() or slab.plane is not fixture.pp:
+                return real_producer(slab)
 
             def synchronize():
                 raise RuntimeError("injected output event failure")
 
-            return NS(synchronize=synchronize, query=lambda: False)
+            return NS(synchronize=synchronize)
 
         with (
             patch.object(dsv41_remote, "execute", side_effect=compute),
-            patch.object(dp, "event", side_effect=gate_event),
+            patch.object(dp.Slab, "record_producer", gate_producer),
         ):
             with self.assertRaisesRegex(RuntimeError, "output event"):
                 self.call(fixture, req, client)
         self.wait(lambda: bool(fixture.pp.quarantine))
         slab = fixture.pp.quarantine[0]
-        self.assertIsInstance(slab.copy_owner, tuple)
-        self.assertEqual(len(slab.copy_owner), 3)
+        [(_, o, lse)] = slab.copy_owner
+        self.assertEqual((o.shape, lse.shape), ((2, 8), (2,)))
         self.assertIn(slab, slab.engine._qo_slabs)
         self.assertFalse(fixture.p.calls)
         self.assertFalse(

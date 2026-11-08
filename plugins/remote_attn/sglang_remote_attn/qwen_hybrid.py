@@ -212,15 +212,14 @@ def state_capacity(controller, req):
 
 class Target(dsv41_remote.Target):
     def call(self, query, layer, scale):
-        from . import remote_data_plane as dp
+        out, lse = call_batch([self], [query], layer, scale)
+        return out[0], lse[0]
 
+    def header(self, layer, scale):
         self.check()
         if self.closed:
             raise RuntimeError("hybrid Remote target retired")
-        # Both RDMA and host-staged TCP use the common single-submit Q/O plane.
-        if not dp.enabled():
-            raise RuntimeError("hybrid Remote requires HANDOFF_REMOTE_GPU_TRANSFER=1")
-        header = {
+        return {
             "handoff_id": self.route["handoff_id"],
             "epoch": self.route["epoch"],
             "token": self.route["token"],
@@ -228,14 +227,25 @@ class Target(dsv41_remote.Target):
             "layer": int(layer),
             "sm_scale": float(scale),
         }
-        _, out, lse = dp.call(
-            self.controller, self.route, [query], [header], [self.req]
-        )
-        if out[0].shape != query.shape or lse[0].shape != query.shape[:1]:
-            raise RuntimeError("hybrid Remote reply shape changed; retaining source")
-        self.calls += 1
-        self.touched.add(layer)
-        return out[0], lse[0]
+
+
+def call_batch(targets, queries, layer, scale):
+    from . import remote_data_plane as dp
+
+    if not dp.enabled():
+        raise RuntimeError("hybrid Remote requires HANDOFF_REMOTE_GPU_TRANSFER=1")
+    first = targets[0]
+    _, out, lse = dp.call(
+        first.controller,
+        first.route,
+        queries,
+        [t.header(layer, scale) for t in targets],
+        [t.req for t in targets],
+    )
+    for target in targets:
+        target.calls += 1
+        target.touched.add(layer)
+    return out, lse
 
 
 def attention(controller, original, module, q, k, v, fb, save_kv_cache=True, **kw):
@@ -245,8 +255,11 @@ def attention(controller, original, module, q, k, v, fb, save_kv_cache=True, **k
         return original(q, k, v, fb, save_kv_cache=save_kv_cache, **kw)
     rows = fb.req_pool_indices.cpu().tolist()
     active = [targets.get(int(row)) for row in rows]
-    entries = controller.layer_entries[module.layer_id]
-    if not any(t is not None and not set(entries) <= t.local_entries for t in active):
+    entries = set(controller.layer_entries[module.layer_id])
+    remote_rows = [
+        t is not None and not entries <= t.local_entries for t in active
+    ]
+    if not any(remote_rows):
         return original(q, k, v, fb, save_kv_cache=save_kv_cache, **kw)
     if (
         not fb.forward_mode.is_decode()
@@ -259,6 +272,8 @@ def attention(controller, original, module, q, k, v, fb, save_kv_cache=True, **k
         raise ValueError("hybrid Remote supports ordinary one-token text Decode only")
     import flashinfer
 
+    from .remote_data_plane import MAX_ROWS
+
     pool = controller.pool
     queries = q.reshape(len(rows), module.tp_q_head_num, module.qk_head_dim)
     if save_kv_cache:
@@ -268,10 +283,12 @@ def attention(controller, original, module, q, k, v, fb, save_kv_cache=True, **k
             k.reshape(-1, module.tp_k_head_num, module.qk_head_dim),
             v.reshape(-1, module.tp_v_head_num, module.v_head_dim),
         )
-    seqs = fb.seq_lens.cpu().tolist()
-    output = []
-    for i, (row, length, target) in enumerate(zip(rows, seqs, active)):
-        remote = target is not None and not set(entries) <= target.local_entries
+    seq_lens_cpu = getattr(fb, "seq_lens_cpu", None)
+    seqs = (fb.seq_lens.cpu() if seq_lens_cpu is None else seq_lens_cpu).tolist()
+    output, local_lses, groups = [], [], {}
+    for i, (row, length, target, remote) in enumerate(
+        zip(rows, seqs, active, remote_rows)
+    ):
         if target is not None:
             target.check()
         start = target.prefix_len if remote else 0
@@ -289,18 +306,37 @@ def attention(controller, original, module, q, k, v, fb, save_kv_cache=True, **k
             sm_scale=float(module.scaling),
             return_lse=True,
         )
+        output.append(local_o)
+        local_lses.append(local_lse)
         if remote:
-            remote_o, remote_lse = target.call(
-                queries[i], module.layer_id, module.scaling
+            endpoint = target.route["host"], int(target.route["port"])
+            groups.setdefault(endpoint, []).append(i)
+    for group in groups.values():
+        for start in range(0, len(group), MAX_ROWS):
+            indices = group[start : start + MAX_ROWS]
+            remote_o, remote_lse = call_batch(
+                [active[i] for i in indices],
+                [queries[i] for i in indices],
+                module.layer_id,
+                module.scaling,
+            )
+            i = indices[0]
+            local_o, local_lse = (
+                (output[i].unsqueeze(0), local_lses[i].unsqueeze(0))
+                if len(indices) == 1
+                else (
+                    torch.stack([output[i] for i in indices]),
+                    torch.stack([local_lses[i] for i in indices]),
+                )
             )
             merged, _ = flashinfer.merge_state(
-                local_o.unsqueeze(0),
-                local_lse.unsqueeze(0),
-                remote_o.unsqueeze(0),
-                remote_lse.unsqueeze(0),
+                local_o,
+                local_lse,
+                remote_o,
+                remote_lse,
             )
-            local_o = merged[0]
-        output.append(local_o)
+            for i, item in zip(indices, merged):
+                output[i] = item
     return torch.stack(output).reshape(len(rows), -1)
 
 

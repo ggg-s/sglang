@@ -1496,10 +1496,13 @@ def execute_remote_attention(job, stream, cache):
         t_d2h_lse = time.perf_counter()
 
     t_sync0 = time.perf_counter()
-    if stream is not None:
-        stream.synchronize()
-    else:
-        torch.cuda.current_stream().synchronize()
+    # The Q/O job packs and fences every row together before native transport.
+    # Keep the fence here for profiling and callers that own their own output.
+    if PROFILE or not getattr(job, "fence_output_at_write", False):
+        if stream is not None:
+            stream.synchronize()
+        else:
+            torch.cuda.current_stream().synchronize()
     t_done = time.perf_counter()
 
     if PROFILE:
@@ -9941,6 +9944,9 @@ def _handle(scheduler, data):
         hub = getattr(scheduler, "_handoff_hub", None)
         result["handoff_registry"] = hub.registry.stats() if hub is not None else None
         result["hub_stats"] = hub.stats() if hub is not None else None
+        plane = getattr(getattr(scheduler, "_pre_layerwise", None), "gpu_data_plane", None)
+        if plane is not None:
+            result["remote_data_plane"] = plane.stats()
         with _TRANSFER_RELEASE_LOCK:
             result["quarantined_transfers"] = {
                 key: reason for key, (_, reason) in _TRANSFER_QUARANTINE.items()
