@@ -527,7 +527,10 @@ class DsvGateway:
                 self.facts[role] = rows
                 self.fact_errors.pop(role, None)
                 self.cv.notify_all()
-        except (StatusBusy, BlockingIOError):
+        except (StatusBusy, BlockingIOError, TimeoutError):
+            # Advisory status may miss its short deadline while a control wave
+            # or KV copy occupies the worker. Keep the last validated facts and
+            # any existing error until a successful poll; this is not death proof.
             return
         except Exception as exc:
             with self.cv:
@@ -1650,7 +1653,7 @@ class DsvGateway:
             while not self.stop.is_set():
                 try:
                     events, finished = self.events(rid, after)
-                except RuntimeError:
+                except (ConnectionError, RuntimeError):
                     # Backend unreachability/identity mismatch never permits
                     # changing the output owner. Keep the client connection alive.
                     events, finished = [], False
