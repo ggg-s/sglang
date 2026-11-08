@@ -43,7 +43,7 @@ def run(concurrency):
         driver.env = e
         driver.calls, driver.before, driver.after = [], {}, {}
         driver.controllers = dict(src=e.source, dst=e.target)
-        gw = gateway(driver, ROOT, Path(e.tmp) / "gateway")
+        gw = gateway(driver, ROOT, Path(e.tmp) / "gateway", async_handoff=True)
         gw.tick()
         rids = []
         for i, req in enumerate(e.requests):
@@ -57,6 +57,8 @@ def run(concurrency):
             )
             gw._update(rid, phase="SOURCE", source_rid=req.rid)
             rids.append(rid)
+        # Drive the serving gateway's precopy scheduler with explicit polls.
+        gw.background = True
         # Source can have no sampled token while closed PD pages are copied.
         deadline = time.monotonic() + 30
         while not all(
@@ -65,6 +67,7 @@ def run(concurrency):
             for rid in rids
         ):
             assert time.monotonic() < deadline, [gw.entry(r) for r in rids]
+            gw._refresh()
             gw.tick()
         assert not e.freed and not any(req._handoff_frozen for req in e.requests)
         assert all(not req.output_ids for req in e.requests)
@@ -75,9 +78,15 @@ def run(concurrency):
             req.kv.kv_committed_len = req.kv.kv_allocated_len = 62
         while not all(gw.entry(r)["phase"] == "FREEZE" for r in rids):
             assert time.monotonic() < deadline, [gw.entry(r) for r in rids]
+            gw._refresh()
             gw.tick()
         freeze_dispatched = time.monotonic()
-        gw.tick()
+        # Freeze every member for the partial-PD fixture before allowing the
+        # prior receiver to retire, regardless of the serving tick budget.
+        while not all(req._handoff_frozen for req in e.requests):
+            assert time.monotonic() < deadline
+            gw._refresh()
+            gw.tick()
         epochs = [gw.entry(r)["epoch"] for r in rids]
         sources = [e.source.d2d_sources[x] for x in epochs]
         assert all(s.partial_remote and s.service is None for s in sources)
@@ -88,8 +97,10 @@ def run(concurrency):
         e.gate.set()
         while not all(gw.entry(r)["phase"] == "TARGET" for r in rids):
             assert time.monotonic() < deadline, [gw.entry(r) for r in rids]
+            gw._refresh()
             gw.tick()
         targets = [e.target.d2d_targets[x] for x in epochs]
+        assert all(t.async_handoff and t.source_confirmed for t in targets)
         for source, target in zip(sources, targets):
             target.worker.join(10)
             assert not target.error and not target.worker.is_alive(), target.error
@@ -138,6 +149,7 @@ def run(concurrency):
             source_continued_after_precopy=True,
             partial_remote_at_freeze=True,
             source_frees=len(e.freed),
+            async_handoff=True,
             precopy_bytes=before,
             postfreeze_bytes=after,
             full_snapshot_bytes=full_global + state_bytes,

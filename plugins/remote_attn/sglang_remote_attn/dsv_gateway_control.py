@@ -81,6 +81,12 @@ def migration_status(controller, epoch, *, include_transfer=True):
         else dict(
             rid=target.decode_req.req.rid,
             admitted=target.admitted,
+            import_pending=(
+                target.setup_worker is not None and target.setup_worker.is_alive()
+            ),
+            commit_pending=(
+                target.commit_worker is not None and target.commit_worker.is_alive()
+            ),
             group_size=target.group_size,
             group_frames=target.group_frames,
             max_entries_per_frame=target.grouped_entries,
@@ -137,6 +143,7 @@ def handle(controller, data):
             protocol=d2d.VERSION,
             precopy_protocol="closed-page-precopy-v1",
             admission_plan_supported=True,
+            async_handoff_supported=True,
             instance_id=instance(controller),
             rank=controller.rank,
             tp_size=controller.tp_size,

@@ -18909,10 +18909,142 @@ class TestRemoteAttn(CustomTestCase):
         )
         self.assertEqual(bodies[0]["sampling_params"]["max_new_tokens"], 1)
 
+    def test_p4_dsv_async_import_cancel_waits_for_target_producer(self):
+        """A cancelled async import retains its native row while setup can write."""
+        from sglang_remote_attn import dsv_d2d as d2d
+
+        f = self._p4_dsv_env()
+        entry = f.support.until(f.gw, f.rid, "IMPORT")
+        f.gw.async_handoff = True
+        f.gw.background = True
+        entered, release = threading.Event(), threading.Event()
+        call = d2d.Reader.call
+
+        def delayed(reader, action, **fields):
+            if action == "manifest":
+                entered.set()
+                if not release.wait(10):
+                    raise TimeoutError("test did not release import")
+            return call(reader, action, **fields)
+
+        def tick():
+            f.gw._refresh()
+            f.gw.tick()
+
+        with patch.object(d2d.Reader, "call", delayed):
+            try:
+                tick()
+                self.assertTrue(entered.wait(5))
+                target = f.e.target.d2d_targets[entry["epoch"]]
+                f.gw.cancel(f.rid)
+                tick()
+                tick()
+                self.assertEqual(f.gw.entry(f.rid)["phase"], "ROLLBACK")
+                self.assertTrue(target.decode_req.req.kv.holds_kv)
+                self.assertFalse(target.admitted or f.e.resumed)
+            finally:
+                release.set()
+            target.setup_worker.join(5)
+            self.assertFalse(target.setup_worker.is_alive())
+            tick()
+            self.assertEqual(f.gw.entry(f.rid)["phase"], "SOURCE")
+            f.e.target.drain_targets(required=target)
+            self.assertFalse(target.decode_req.req.kv.holds_kv)
+            self.assertTrue(f.e.req.kv.holds_kv)
+            self.assertFalse(f.e.req._handoff_frozen)
+
+    def test_p4_dsv_async_handoff_overlaps_epochs_and_recovers_commit(self):
+        """Neither a blocked import nor a blocked commit may hold D1's command slot."""
+        from sglang_remote_attn import dsv_d2d as d2d
+
+        _, e = self._partial_d2d_env(2)
+        with patch.object(
+            sys, "path", [str(ROOT / "test/manual/remote_attn"), *sys.path]
+        ):
+            from p4_dsv_probe_support import Driver, gateway
+
+        for i in range(2):
+            e.arrive(i)
+        e.complete_pd()
+        e.gate.set()
+        driver = Driver.__new__(Driver)
+        driver.controllers = dict(src=e.source, dst=e.target)
+        driver.calls, driver.before, driver.after = [], {}, {}
+        folder = self.enterContext(tempfile.TemporaryDirectory())
+
+        def start():
+            gw = gateway(driver, ROOT, folder, async_handoff=True)
+            self.addCleanup(gw.close)
+            gw.background = True  # Run production reconciliation with explicit ticks.
+            gw._refresh()
+            return gw
+
+        gw = start()
+        rids = []
+        for req in e.requests:
+            rid = gw.accept(
+                dict(
+                    rid=req.rid,
+                    prompt_ids=list(req.origin_input_ids),
+                    cut=2,
+                    max_new_tokens=8,
+                )
+            )
+            gw._update(rid, phase="SOURCE", source_rid=req.rid)
+            rids.append(rid)
+
+        gates = {action: threading.Event() for action in ("manifest", "commit")}
+        entered = {action: set() for action in gates}
+        lock = threading.Lock()
+        call = d2d.Reader.call
+
+        def delayed(reader, action, **fields):
+            if action in gates:
+                with lock:
+                    entered[action].add(reader.epoch)
+                if not gates[action].wait(15):
+                    raise TimeoutError(f"test did not release {action}")
+            return call(reader, action, **fields)
+
+        def until(predicate):
+            deadline = time.monotonic() + 5
+            while not predicate():
+                phases = [gw.entry(r)["phase"] for r in rids]
+                self.assertLess(time.monotonic(), deadline, phases)
+                gw._refresh()
+                gw.tick()
+                time.sleep(0.001)
+
+        with patch.object(d2d.Reader, "call", delayed):
+            try:
+                until(lambda: len(entered["manifest"]) == 2)
+                self.assertTrue(all(gw.entry(r)["phase"] == "IMPORT" for r in rids))
+                self.assertFalse(e.resumed)
+                gates["manifest"].set()
+                until(lambda: len(entered["commit"]) == 2)
+                self.assertTrue(all(gw.entry(r)["phase"] == "COMMIT" for r in rids))
+                self.assertFalse(e.resumed)
+                epoch = gw.entry(rids[0])["epoch"]
+                with self.assertRaisesRegex(ValueError, "pending commit"):
+                    d2d.handle(e.target, dict(cmd="d2d_abort", migration_epoch=epoch))
+                gw.close()
+                gw = start()
+                self.assertTrue(all(gw.entry(r)["owner"] == "src" for r in rids))
+                gates["commit"].set()
+                until(lambda: all(gw.entry(r)["owner"] == "dst" for r in rids))
+                self.assertEqual(len(e.resumed), 2)
+                self.assertEqual(len(e.target.d2d_targets), 2)
+                self.assertFalse(any(p["cmd"] == "d2d_resume" for _, p in driver.calls))
+            finally:
+                for gate in gates.values():
+                    gate.set()
+
     def test_p4_dsv_background_pollers_execute_native_migration(self):
         f = self._p4_dsv_env(accept=False)
         f.gw.close()
-        f.gw = f.support.gateway(f.driver, ROOT, f.folder, autostart=True)
+        f.gw = f.support.gateway(
+            f.driver, ROOT, f.folder, autostart=True, async_handoff=True
+        )
         self.addCleanup(f.gw.close)
         deadline = time.monotonic() + 5
         while len(f.gw.facts) < 2 and time.monotonic() < deadline:

@@ -388,16 +388,20 @@ def main():
         )["transfer"]
         transfers = [None, None]
         dist.all_gather_object(transfers, meta)
-        d2d.handle(
+        assert d2d.handle(
             e.target,
             dict(
                 cmd="d2d_import",
                 migration_epoch=e.epoch,
                 destination="D1",
                 transfers=transfers,
+                async_handoff=True,
             ),
-        )
+        )["import_pending"]
         target = e.target.d2d_targets[e.epoch]
+        target.setup_worker.join(5)
+        assert not target.setup_worker.is_alive()
+        assert e.command(e.target, "d2d_import")["imported"]
         call = target.reader.call
 
         def partial_commit(action, **fields):
@@ -406,6 +410,9 @@ def main():
             return call(action, **fields)
 
         target.reader.call = partial_commit
+        assert e.command(e.target, "d2d_commit")["commit_pending"]
+        target.commit_worker.join(5)
+        assert not target.commit_worker.is_alive()
         try:
             e.command(e.target, "d2d_commit")
             raise AssertionError("partial TP commit admitted")
@@ -413,7 +420,11 @@ def main():
             pass
         assert not target.admitted and not e.resumed
         target.reader.call = call
-        e.command(e.target, "d2d_commit")
+        assert e.command(e.target, "d2d_commit")["commit_pending"]
+        if target.commit_worker is not None:
+            target.commit_worker.join(5)
+            assert not target.commit_worker.is_alive()
+        assert e.command(e.target, "d2d_commit")["admitted"]
         assert len(e.resumed) == 1
         source = e.source.d2d_sources[e.epoch]
         assert not target.copied and not e.freed

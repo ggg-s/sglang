@@ -130,6 +130,7 @@ class DsvGateway:
         poll_ms=10,
         out=None,
         autostart=True,
+        async_handoff=False,
     ):
         self.driver, self.tokenizer = driver, tokenizer
         self.prefill_url, self.bootstrap_host = prefill_url, bootstrap_host
@@ -152,6 +153,7 @@ class DsvGateway:
         self.command_waiters = dict(src=0, dst=0)
         self.control_latencies = {}
         self.background = autostart
+        self.async_handoff = async_handoff
         self.status_threads = []
         self.fd = os.open(str(self.path) + ".lock", os.O_CREAT | os.O_RDWR, 0o600)
         try:
@@ -702,6 +704,12 @@ class DsvGateway:
             entry["migration_requested"] or len(request["output_ids"]) >= entry["cut"]
         )
 
+    def _async_handoff(self):
+        workers = self.facts.get("dst", ())
+        return self.async_handoff and bool(workers) and all(
+            r.get("async_handoff_supported") for r in workers
+        )
+
     def _precopy_source(self, entry, cmd, **payload):
         rows = self._call("src", cmd, entry["epoch"], **payload)
         if not any(r.get("deferred") for r in rows):
@@ -1088,14 +1096,30 @@ class DsvGateway:
                 **self._end_deferral(entry),
             )
         elif phase == "IMPORT":
-            self._call(
+            async_handoff = self._async_handoff()
+            targets = [r.get("target") for r in self._states(entry, "dst")]
+            if async_handoff and any(t and t.get("import_pending") for t in targets):
+                return
+            payload = (
+                {}
+                if async_handoff and targets and all(targets)
+                else {"transfers": entry["transfers"]}
+            )
+            rows = self._call(
                 "dst",
                 "d2d_import",
                 epoch,
                 destination="D1",
                 require_reservation=True,
-                transfers=entry["transfers"],
+                async_handoff=async_handoff,
+                **payload,
             )
+            if any(r.get("import_pending") for r in rows):
+                if not all(r.get("import_pending") for r in rows):
+                    raise RuntimeError("TP import readiness disagreed")
+                return
+            if not all(r.get("imported") for r in rows):
+                raise RuntimeError("D2D target did not confirm import")
             # Persist irreversible intent BEFORE the first possible commit RPC.
             self._update(
                 rid,
@@ -1104,7 +1128,14 @@ class DsvGateway:
         elif phase == "COMMIT":
             # A timeout, partial TP commit or gateway crash can never send us
             # back to SOURCE. The per-rank backend commit is idempotent.
+            if self.background and any(
+                (r.get("target") or {}).get("commit_pending")
+                for r in self._states(entry, "dst")
+            ):
+                return
             rows = self._call("dst", "d2d_commit", epoch)
+            if all(r.get("commit_pending") for r in rows):
+                return
             if not all(r.get("admitted") and r.get("source_confirmed") for r in rows):
                 raise RuntimeError("TP commit not yet confirmed; keeping commit intent")
             # The backend's collective commit certificate confirms ALL source
@@ -1219,7 +1250,26 @@ class DsvGateway:
                 entry = self.payloads.view(raw_entry)
                 try:
                     self._advance(entry)
-                    if self._entry(entry["rid"])["blocked"]:
+                    current = self._entry(entry["rid"])
+                    while self.background and time.monotonic() - started < 0.05:
+                        continue_frame = (
+                            entry["phase"] == current["phase"] == "WAIT_CUT"
+                            and current.get("precopy_pending") is not None
+                            and current["precopy_pending"] != entry.get("precopy_pending")
+                        )
+                        start_commit = (
+                            entry["phase"] == "IMPORT"
+                            and current["phase"] == "COMMIT"
+                            and self._async_handoff()
+                        )
+                        if not (continue_frame or start_commit):
+                            break
+                        # Continue the same frame or send a durable COMMIT
+                        # without waiting for another round through all rids.
+                        entry = current
+                        self._advance(entry)
+                        current = self._entry(entry["rid"])
+                    if current["blocked"]:
                         self._update(entry["rid"], blocked=False, error=None)
                 except Exception as exc:
                     current = self._entry(entry["rid"])

@@ -26,6 +26,7 @@ from .transport_failure import TransportFailure
 
 VERSION = "dsv-d2d-v2"
 LIMIT = bulk.CAPACITY
+ASYNC_HANDOFF_LIMIT = 8
 COMMANDS = {
     "d2d_worker_status",
     "d2d_submit_pd",
@@ -788,6 +789,12 @@ class Target(NativeTarget):
     rpc: object = None
     events: dict = field(default_factory=dict)
     worker: object = None
+    setup_worker: object = None
+    commit_worker: object = None
+    async_handoff: bool = False
+    commit_started: bool = False
+    source_confirmed: bool = False
+    commit_error: str | None = None
     error: object = None
     copied: bool = False
     admitted: bool = False
@@ -1214,13 +1221,22 @@ def handle(controller, data):
         return import_request(controller, data)
     if cmd == "d2d_abort":
         target = targets.get(epoch)
-        if not controller.agree([int(target is None or not target.admitted)])[0]:
+        abortable = target is None or not (target.admitted or target.commit_started)
+        if not controller.agree([int(abortable)])[0]:
             raise ValueError(
-                "committed D2D target must use native request cancellation"
+                "committed D2D target or pending commit must use native cancellation"
             )
         if not hasattr(controller, "d2d_cancelled_epochs"):
             controller.d2d_cancelled_epochs = set()
         controller.d2d_cancelled_epochs.add(epoch)
+        if target is not None:
+            target.stop.set()
+        producers_idle = target is None or not target.async_handoff or not any(
+            thread is not None and thread.is_alive()
+            for thread in (target.setup_worker, target.worker)
+        )
+        if not controller.agree([int(producers_idle)])[0]:
+            return dict(aborted=False, pending_reader=True)
         result = (
             dict(aborted=True) if target is None else abort_import(controller, target)
         )
@@ -1245,7 +1261,8 @@ def handle(controller, data):
                 raise ValueError("D2D commit epoch aborted/cancelled or target failed")
             if not target.admitted:
                 if (
-                    target.cancelled
+                    target.rpc is None
+                    or target.cancelled
                     or target.closed
                     or target.decode_req.req.finished()
                 ):
@@ -1255,20 +1272,20 @@ def handle(controller, data):
             error = repr(exc)
         if not controller.agree([int(error is None)])[0]:
             raise ValueError(f"TP D2D commit rejected: {error or 'peer rejected'}")
-        confirmed = target.admitted or getattr(target, "source_confirmed", False)
-        if not confirmed:
-            try:
-                target.reader.call("commit")
-                target.source_confirmed = confirmed = True
-            except Exception as exc:
-                error = repr(exc)
-        # Never publish a rank-local Decode batch after only a subset of
-        # source shards acknowledged ownership. Partial confirmation can only
-        # roll forward; all target shards remain unadmitted until this vote.
-        if not controller.agree([int(confirmed)])[0]:
-            raise TransportFailure(
-                f"TP D2D commit confirmation pending: {error or 'peer pending'}"
-            )
+        # All source shards must confirm ownership before any target admits.
+        # A partially confirmed commit can only roll forward.
+        if target.async_handoff:
+            if not poll_commit(controller, target, targets):
+                return dict(commit_pending=True)
+        else:
+            if not target.admitted and not target.source_confirmed:
+                target.commit_started = True
+                confirm_source(target)
+            confirmed = target.admitted or target.source_confirmed
+            if not controller.agree([int(confirmed)])[0]:
+                raise TransportFailure(
+                    f"TP D2D commit confirmation pending: {target.commit_error or 'peer pending'}"
+                )
         error = None
         req = target.decode_req.req
         if not target.admitted:
@@ -1346,6 +1363,148 @@ def allocation_preflight(controller, req, required=None):
         raise ValueError("D2D target native KV/state/request-row budget unavailable")
 
 
+def handoff_capacity(controller, targets):
+    active = sum(
+        thread is not None and thread.is_alive()
+        for target in targets.values()
+        for thread in (target.setup_worker, target.commit_worker)
+    )
+    return controller.agree([int(active < ASYNC_HANDOFF_LIMIT)])[0]
+
+
+def confirm_source(target):
+    try:
+        target.reader.call("commit")
+        target.source_confirmed = True
+        target.commit_error = None
+    except Exception as exc:
+        target.commit_error = repr(exc)
+
+
+def poll_commit(controller, target, targets):
+    # All ranks must finish the same attempt before retrying a failed shard.
+    settled, confirmed, healthy = controller.agree(
+        [
+            int(target.commit_worker is None or not target.commit_worker.is_alive()),
+            int(target.admitted or target.source_confirmed),
+            int(target.commit_worker is None or target.source_confirmed),
+        ]
+    )
+    if not settled:
+        return False
+    if confirmed:
+        return True
+    if not healthy:
+        target.commit_worker = None
+        raise TransportFailure(
+            f"TP D2D commit confirmation pending: {target.commit_error or 'peer failed'}"
+        )
+    if not handoff_capacity(controller, targets):
+        return False
+    target.commit_started = True
+    if not target.source_confirmed:
+        target.commit_worker = threading.Thread(
+            target=confirm_source, args=(target,), name="dsv-d2d-commit", daemon=True
+        )
+        target.commit_worker.start()
+    return False
+
+
+def prepare_import_io(target, transfer, session, jobs):
+    controller, req = target.owner, target.decode_req.req
+    device = pool_device(controller)
+    try:
+        with on_device(device), on_stream(device, target.setup_stream):
+            if target.stop.is_set():
+                return
+            reader = target.reader = Reader(
+                transfer["route"],
+                transfer["destination"],
+                target.generation,
+                controller.config.drain_timeout,
+                owner=controller,
+                req=req,
+                offer=transfer["bulk_capabilities"],
+            )
+            meta, _ = reader.call("manifest", gpu_session=session)
+            if meta["manifest"] != transfer:
+                raise ValueError("D2D frozen manifest changed")
+            for args in jobs:
+                if target.stop.is_set():
+                    return
+                copy_rows(reader, *args)
+            target.decode_req.ready = dp.event(device)
+            target.decode_req.ready.synchronize()
+    except BaseException as exc:
+        target.error = repr(exc)
+        dp.io_for(req).poison()
+        if not target.async_handoff:
+            raise
+
+
+def finish_import(controller, target):
+    req = target.decode_req.req
+    if target.async_handoff:
+        healthy, ready = controller.agree(
+            [
+                int(not target.error and not target.cancelled),
+                int(
+                    target.setup_worker is not None
+                    and not target.setup_worker.is_alive()
+                    and getattr(target.decode_req, "ready", None) is not None
+                ),
+            ]
+        )
+        if not healthy:
+            raise TransportFailure(
+                f"TP D2D import failed: {target.error or 'peer failed'}"
+            )
+        if not ready:
+            return dict(import_pending=True)
+    try:
+        if getattr(controller, "hybrid_gdn", False):
+            req.kv.mamba_needs_clear = False
+            from .qwen_hybrid import Target as rpc_class
+        else:
+            rpc_class = remote.Target
+        kv_len = target.coverage.prefix_len
+        rpc = target.rpc = rpc_class(
+            controller,
+            req,
+            target.path,
+            target.generation,
+            target.reader.route,
+            kv_len,
+            progressive=True,
+        )
+        req._dsv41_remote = rpc
+        controller.remote_targets[rpc.row] = rpc
+        req.prefix_len = req.extend_end = kv_len
+        req._handoff_epoch = target.generation
+        req._handoff_base_output_len = len(req.output_ids)
+        retirement = controller.decode_overlap.retirement
+        for i, entry in enumerate(controller._schema(manager(controller))["entries"]):
+            if entry[0] == "kv":
+                resource = Resource(target, i, retirement.last_admission + 1)
+                retirement.register(resource)
+                target.resources.append(resource)
+                controller.targets.append(resource)
+        target.admission_id = retirement.last_admission + 1
+        retirement.register(target)
+        controller.targets.append(target)
+        target.worker = threading.Thread(
+            target=target.transfer, daemon=True, name="dsv-d2d-copy"
+        )
+        target.worker.start()
+        return dict(
+            rid=req.rid, imported=True, kv_len=kv_len, output_len=len(req.output_ids)
+        )
+    except BaseException as exc:
+        target.error = repr(exc)
+        dp.io_for(req).poison()
+        raise
+
+
 def import_request(controller, data):
     from sglang.srt.sampling.sampling_params import SamplingParams
 
@@ -1361,9 +1520,14 @@ def import_request(controller, data):
         raise ValueError("migration epoch was already used by a D2D source")
     if epoch in targets:
         target = targets[epoch]
+        if target.async_handoff and target.rpc is None:
+            return finish_import(controller, target)
         if target.error or target.cancelled:
             raise ValueError("D2D import has failed/aborted; cannot retry allocation")
         return dict(rid=target.decode_req.req.rid, imported=True, duplicate=True)
+    async_handoff = data.get("async_handoff") is True
+    if async_handoff and not handoff_capacity(controller, targets):
+        return dict(import_pending=True)
     transfer = _select_transfer(data, controller.rank, controller.tp_size)
     if (
         transfer["version"] != VERSION
@@ -1421,6 +1585,7 @@ def import_request(controller, data):
     )
     target.group_size = group_size
     target.token_range = token_range
+    target.async_handoff = async_handoff
     target.queue = getattr(controller.scheduler, "disagg_decode_transfer_queue", None)
     if target.queue is None:
         from sglang.srt.managers.scheduler_components.request_list import (
@@ -1438,9 +1603,9 @@ def import_request(controller, data):
     targets[epoch] = target
     _tracked(controller.scheduler)[rid] = req
     req._pre_layerwise_target = target
-    reader = None
     try:
-        target.setup_stream = current_stream(pool_device(controller))
+        device = pool_device(controller)
+        target.setup_stream = current_stream(device)
         prealloc = controller.scheduler.disagg_decode_prealloc_queue
         from . import dsv_d2d_reservation as reservation
 
@@ -1450,21 +1615,9 @@ def import_request(controller, data):
         target.allocation_complete = True
         if req.kv.kv_committed_len != transfer["kv_len"]:
             raise RuntimeError("native D2D committed length mismatch")
-        reader = target.reader = Reader(
-            transfer["route"],
-            destination,
-            epoch,
-            controller.config.drain_timeout,
-            owner=controller,
-            req=req,
-            offer=transfer["bulk_capabilities"],
-        )
         session = (
             dp.plane_for(controller).engine.get_session_id() if dp.enabled() else None
         )
-        meta, _ = reader.call("manifest", gpu_session=session)
-        if meta["manifest"] != transfer:
-            raise ValueError("D2D frozen manifest changed")
         pool = controller.pool
         if getattr(controller, "hybrid_gdn", False):
             from .qwen_hybrid import clear_state
@@ -1475,71 +1628,48 @@ def import_request(controller, data):
         states = state_rows(controller, req, transfer["kv_len"])
         if [d for d, t, i in states] != transfer["states"]:
             raise ValueError("native D2D state layout/count changed")
-        for i, (desc, table, indices) in enumerate(states):
-            copy_rows(reader, "state", i, table, indices, desc["rows"])
+        jobs = [
+            ("state", i, table, indices, desc["rows"])
+            for i, (desc, table, indices) in enumerate(states)
+        ]
         pages = (
             controller.scheduler.req_to_token_pool.req_to_token[
                 req.kv.req_pool_idx, : transfer["kv_len"] : pool.page_size
             ]
             // pool.page_size
         ).long()
+        entries = transfer["schema"]["entries"]
+        prefixes = (target.precopy or {}).get("prefix_pages", [0] * len(entries))
         for i, (tensor, entry) in enumerate(
-            zip(buffers(pool, manager(controller)), transfer["schema"]["entries"])
+            zip(buffers(pool, manager(controller)), entries)
         ):
             if entry[0] == "index":
-                copy_rows(
-                    reader,
-                    "global",
-                    i,
-                    matrix(tensor, entry[-1]),
-                    pages,
-                    pages.numel(),
-                    start=(transfer.get("precopy") or {}).get(
-                        "prefix_pages", [0] * len(transfer["schema"]["entries"])
-                    )[i],
+                jobs.append(
+                    (
+                        "global",
+                        i,
+                        matrix(tensor, entry[-1]),
+                        pages,
+                        pages.numel(),
+                        prefixes[i],
+                    )
                 )
-        target.decode_req.ready = dp.event(pages.device)
-        target.decode_req.ready.synchronize()
-        if getattr(controller, "hybrid_gdn", False):
-            req.kv.mamba_needs_clear = False
-        rpc_class = remote.Target
-        if getattr(controller, "hybrid_gdn", False):
-            from .qwen_hybrid import Target as rpc_class
-
-        rpc = target.rpc = rpc_class(
-            controller,
-            req,
-            target.path,
-            epoch,
-            transfer["route"],
-            transfer["kv_len"],
-            progressive=True,
-        )
-        req._dsv41_remote = rpc
-        controller.remote_targets[rpc.row] = rpc
-        req.prefix_len = req.extend_end = transfer["kv_len"]
-        req._handoff_epoch = epoch
-        req._handoff_base_output_len = len(req.output_ids)
-        retirement = controller.decode_overlap.retirement
-        for i, entry in enumerate(transfer["schema"]["entries"]):
-            if entry[0] == "kv":
-                resource = Resource(target, i, retirement.last_admission + 1)
-                retirement.register(resource)
-                target.resources.append(resource)
-                controller.targets.append(resource)
-        target.admission_id = retirement.last_admission + 1
-        retirement.register(target)
-        controller.targets.append(target)
-        target.worker = threading.Thread(
-            target=target.transfer, daemon=True, name="dsv-d2d-copy"
-        )
-        target.worker.start()
-        return dict(
-            rid=rid,
-            imported=True,
-            kv_len=transfer["kv_len"],
-            output_len=len(req.output_ids),
-        )
+        if async_handoff:
+            setup_stream = new_stream(device)
+            # Fence writes issued on the scheduler stream even if launching the
+            # worker fails or abort arrives before the worker begins.
+            setup_stream.wait_event(dp.event(device))
+            target.setup_stream = setup_stream
+            target.setup_worker = threading.Thread(
+                target=prepare_import_io,
+                args=(target, transfer, session, jobs),
+                daemon=True,
+                name="dsv-d2d-import",
+            )
+            target.setup_worker.start()
+            return dict(import_pending=True)
+        prepare_import_io(target, transfer, session, jobs)
+        return finish_import(controller, target)
     except BaseException as exc:
         target.error = repr(exc)
         # The target row may already contain GPU writes. Preserve it for an

@@ -5038,6 +5038,11 @@ def main():
     p.add_argument("--dst-control-dir", type=Path)
     p.add_argument("--port", type=int, default=31080)
     p.add_argument("--poll-ms", type=float, default=3.0)
+    p.add_argument(
+        "--async-handoff", action="store_true",
+        default=os.environ.get("HANDOFF_D2D_ASYNC_HANDOFF") == "1",
+        help="Overlap DSV/hybrid import and commit I/O across migration epochs",
+    )
     p.add_argument("--out", default=str(STATE / "p4_gateway.jsonl"))
     args = p.parse_args()
     for role in ("src", "dst"):
@@ -5050,7 +5055,7 @@ def main():
         gw = DsvGateway(
             d, TOK, STATE, prefill_url=PD_PREFILL_URL,
             bootstrap_host=PD_BOOTSTRAP_HOST, bootstrap_port=PD_BOOTSTRAP_PORT,
-            poll_ms=args.poll_ms, out=args.out,
+            poll_ms=args.poll_ms, out=args.out, async_handoff=args.async_handoff,
         )
     else:
         gw = Gateway(Path(args.out), args.poll_ms)

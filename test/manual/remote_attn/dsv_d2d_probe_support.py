@@ -573,8 +573,9 @@ class Environment:
         self.gate.set()
         for controller in self.nodes:
             for t in getattr(controller, "d2d_targets", {}).values():
-                if t.worker is not None:
-                    t.worker.join(5)
+                for worker in (t.setup_worker, t.commit_worker, t.worker):
+                    if worker is not None:
+                        worker.join(5)
                 if t.reader is not None:
                     t.reader.close()
             if hasattr(controller, "dsv41_rpc_batches"):
