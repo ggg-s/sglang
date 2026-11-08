@@ -74,7 +74,9 @@ class Visibility:
             )
             if int(rc):
                 raise RuntimeError("cannot query GPUDirect write ordering")
-            scope = cuda.cudaFlushGPUDirectRDMAWritesScope.cudaFlushGPUDirectRDMAWritesToOwner
+            scope = (
+                cuda.cudaFlushGPUDirectRDMAWritesScope.cudaFlushGPUDirectRDMAWritesToOwner
+            )
             if int(ordering) >= int(scope):
                 return
             rc, options = cuda.cudaDeviceGetAttribute(
@@ -84,7 +86,9 @@ class Visibility:
                 raise RuntimeError(
                     "GPU payload transport lacks receive-side RDMA visibility support"
                 )
-            target = cuda.cudaFlushGPUDirectRDMAWritesTarget.cudaFlushGPUDirectRDMAWritesTargetCurrentDevice
+            target = (
+                cuda.cudaFlushGPUDirectRDMAWritesTarget.cudaFlushGPUDirectRDMAWritesTargetCurrentDevice
+            )
 
             def flush():
                 result = cuda.cudaDeviceFlushGPUDirectRDMAWrites(target, scope)
@@ -232,36 +236,53 @@ class Slab:
             self.producer.record(torch.cuda.current_stream(self.plane.device))
         return self.producer
 
-    def prepare(self, remote, entries, sequence):
+    def wire_layout(self, entries, *, packed=False):
         sizes = [tensor_spec(value, region)[2] for region, value in entries]
+        offsets = [self.offsets[region] for region, _ in entries]
+        if packed:
+            if self.backend != transport.TCP or [r for r, _ in entries] != [1, 2]:
+                raise ValueError("packed return requires TCP O/LSE regions")
+            # Only the actual O bytes precede LSE, never the 4 MiB O capacity.
+            # Tag 3 identifies a single ordered O+LSE+footer descriptor.
+            offsets[1] = offsets[0] + sizes[0]
+            spans = [(offsets[0], sum(sizes), 3)]
+        else:
+            spans = [
+                (offset, size, r)
+                for offset, size, (r, _) in zip(offsets, sizes, entries)
+            ]
+        return sizes, offsets, spans
+
+    def prepare(self, remote, entries, sequence, *, packed=False):
+        sizes, offsets, spans = self.wire_layout(entries, packed=packed)
         producer = self.record_producer()
         if self.backend == transport.TCP:
             with self.copy_context():
                 if self.stream is not None:
                     self.stream.wait_event(producer)
-                for (region, _), size in zip(entries, sizes):
-                    self.wire[self.offsets[region] : self.offsets[region] + size].copy_(
+                for (region, _), size, offset in zip(entries, sizes, offsets):
+                    self.wire[offset : offset + size].copy_(
                         self.tensor[OFFSETS[region] : OFFSETS[region] + size],
                         non_blocking=True,
                     )
             self.drain()  # Independent D2H must finish before native reads Host.
-            for (region, _), size in zip(entries, sizes):
-                offset = self.offsets[region] + size
-                self.wire[offset : offset + FOOTER].copy_(
+            for offset, size, tag in spans:
+                self.wire[offset + size : offset + size + FOOTER].copy_(
                     torch.tensor(
-                        list(self.stamp(remote["nonce"], sequence, region, size)),
+                        list(self.stamp(remote["nonce"], sequence, tag, size)),
                         dtype=torch.uint8,
                     )
                 )
-            sizes = [size + FOOTER for size in sizes]
         elif producer is not None:
             # RDMA reads the GPU slab directly. TCP already fenced its D2H.
             producer.synchronize()
-        return sizes
+        footer = FOOTER if self.backend == transport.TCP else 0
+        return [(offset, size + footer) for offset, size, _ in spans]
 
-    def receive(self, entries, sequence, *, owned=False):
+    def receive(self, entries, sequence, *, owned=False, packed=False):
         if self.quarantined or self.closed:
             raise RuntimeError("Q/O slot is quarantined/closed")
+        sizes, offsets, spans = self.wire_layout(entries, packed=packed)
         if self.backend == transport.GPU:
             self.visibility.receive()
             return
@@ -270,10 +291,9 @@ class Slab:
         deadline = time.monotonic() + float(
             os.environ.get("HANDOFF_PD_DRAIN_TIMEOUT_S", "300")
         )
-        for region, value in entries:
-            size = tensor_spec(value, region)[2]
-            offset = self.offsets[region] + size
-            stamp = self.stamp(self.nonce, sequence, region, size)
+        for start, size, tag in spans:
+            offset = start + size
+            stamp = self.stamp(self.nonce, sequence, tag, size)
             while bytes(self.wire[offset : offset + FOOTER].tolist()) != stamp:
                 if self.quarantined or time.monotonic() >= deadline:
                     raise TimeoutError("Q/O Host payload arrival unproven")
@@ -284,8 +304,8 @@ class Slab:
         with self.copy_context():
             if self.stream is not None:
                 self.stream.wait_event(self.initialized)
-            for region, value in entries:
-                shape, dtype, size = tensor_spec(value, region)
+            for (region, value), size, offset in zip(entries, sizes, offsets):
+                shape, dtype, _ = tensor_spec(value, region)
                 if owned:
                     dst = torch.empty(shape, device=self.plane.device, dtype=dtype)
                     outputs.append(dst)
@@ -293,7 +313,7 @@ class Slab:
                 else:
                     dst = self.tensor[OFFSETS[region] : OFFSETS[region] + size]
                 dst.copy_(
-                    self.wire[self.offsets[region] : self.offsets[region] + size],
+                    self.wire[offset : offset + size],
                     non_blocking=True,
                 )
         self.drain()  # Prove H2D before consumers run or the sender reuses Host.
@@ -419,6 +439,7 @@ class Plane:
         self.lock = threading.RLock()
         self.closed = False
         self.transfers = self.payload_bytes = 0
+        self.transfer_regions = self.packed_returns = 0
         self.attention_frames = self.attention_rows = 0
         self.attention_ms = {}
         print(
@@ -436,6 +457,8 @@ class Plane:
         with self.lock:
             return dict(
                 transfers=self.transfers,
+                transfer_regions=self.transfer_regions,
+                packed_returns=self.packed_returns,
                 payload_bytes=self.payload_bytes,
                 attention_frames=self.attention_frames,
                 attention_rows=self.attention_rows,
@@ -460,24 +483,34 @@ class Plane:
             for key, value in timings.items():
                 self.attention_ms[key] = self.attention_ms.get(key, 0.0) + value
 
-    def write(self, slab, remote, session, entries, sequence):
+    def write(self, slab, remote, session, entries, sequence, *, packed=False):
         remote = descriptor(remote, slab.backend)
         if slab.quarantined or slab.closed:
             raise RuntimeError("GPU slot is not reusable")
+        started = time.perf_counter()
         try:
-            lengths = slab.prepare(remote, entries, sequence)
-            local = [
-                slab.wire.data_ptr() + slab.offsets[region] for region, _ in entries
-            ]
-            target = [remote["base"] + slab.offsets[region] for region, _ in entries]
+            spans = slab.prepare(remote, entries, sequence, packed=packed)
+            local = [slab.wire.data_ptr() + offset for offset, _ in spans]
+            target = [remote["base"] + offset for offset, _ in spans]
+            lengths = [size for _, size in spans]
+            prepared = time.perf_counter()
             with self.send_guard():
+                submitted = time.perf_counter()
                 slab.engine.batch_transfer_sync(session, local, target, lengths)
+            completed = time.perf_counter()
         except BaseException:
             slab.poison()  # Includes partial submit, hidden receiver work and CUDA failure.
             raise
         with self.lock:
             self.transfers += 1
             self.payload_bytes += sum(lengths)
+            self.transfer_regions += len(lengths)
+            self.packed_returns += int(packed)
+        return dict(
+            source_return_prepare=(prepared - started) * 1000,
+            source_return_slot_wait=(submitted - prepared) * 1000,
+            source_return_transfer=(completed - submitted) * 1000,
+        )
 
     def client(self, route):
         key = route["host"], int(route["port"])
@@ -525,6 +558,7 @@ class Client:
         self.sock, self.remote, self.session = None, None, None
         self.sequence = 0
         self.inline_ack = False
+        self.packed_return = False
         self.consumed = None
         self.closed = False
 
@@ -560,6 +594,7 @@ class Client:
                 cmd="te_negotiate",
                 version=WIRE_VERSION,
                 inline_ack=True,
+                packed_return=True,
                 route=self.route,
                 native_session=self.plane.session,
                 capabilities=self.plane.catalog.offer,
@@ -574,6 +609,9 @@ class Client:
             raise ValueError("Q/O backend negotiation mismatch")
         self.session = result["session"]
         self.inline_ack = result.get("inline_ack") is True
+        self.packed_return = result.get("packed_return") is True
+        if self.packed_return and backend != transport.TCP:
+            raise ValueError("packed return requires TCP backend")
         self.slab = Slab(self.plane, backend)
         result = self.rpc(
             dict(
@@ -639,7 +677,9 @@ class Client:
                 if self.slab.backend == transport.TCP:
                     # Copy registered Host data straight into owned outputs.
                     # The H2D fence in receive proves the slab has no readers.
-                    out, lse = self.slab.receive(entries, self.sequence, owned=True)
+                    out, lse = self.slab.receive(
+                        entries, self.sequence, owned=True, packed=self.packed_return
+                    )
                     self.consumed = None
                 else:
                     self.slab.receive(entries, self.sequence)
@@ -710,8 +750,14 @@ class Client:
 
 class Lane:
     def __init__(
-        self, plane, remote, session, backend=transport.TCP, native_session=None,
+        self,
+        plane,
+        remote,
+        session,
+        backend=transport.TCP,
+        native_session=None,
         inline_ack=False,
+        packed_return=False,
     ):
         self.plane, self.remote, self.session = (
             plane,
@@ -720,6 +766,7 @@ class Lane:
         )
         self.native_session = native_session or session
         self.inline_ack = inline_ack
+        self.packed_return = packed_return
         self.slab = Slab(plane, backend)
         self.sequence = 0
         self.state = "idle"
@@ -815,9 +862,13 @@ class Job:
             o_spec = pack(slab, 1, [o for _, o, _ in outs])
             l_spec = pack(slab, 2, [l for _, _, l in outs])
             t_compute = time.perf_counter()
-            plane.write(
-                slab, self.lane.remote, self.lane.session,
-                [(1, o_spec), (2, l_spec)], self.lane.sequence,
+            return_timing = plane.write(
+                slab,
+                self.lane.remote,
+                self.lane.session,
+                [(1, o_spec), (2, l_spec)],
+                self.lane.sequence,
+                packed=self.lane.packed_return,
             )
             # A successful write already fenced the attention stream before
             # D2H/RDMA. Registry release need not synchronize it a second time.
@@ -842,6 +893,7 @@ class Job:
                     source_receive=(t_receive - t_start) * 1000,
                     source_compute_submit=(t_compute - t_receive) * 1000,
                     source_return=(t_write - t_compute) * 1000,
+                    **return_timing,
                 ),
             ),
         )
@@ -911,7 +963,14 @@ def handle(hub, hc, frame):
         if not isinstance(session, str) or not 0 < len(session) <= 512:
             raise ValueError("Q/O capability endpoint invalid")
         inline_ack = frame.get("inline_ack") is True
-        hc.gpu_negotiation = (backend, native_session, session, inline_ack)
+        packed_return = frame.get("packed_return") is True and backend == transport.TCP
+        hc.gpu_negotiation = (
+            backend,
+            native_session,
+            session,
+            inline_ack,
+            packed_return,
+        )
         hub._send(
             hc,
             dict(
@@ -920,6 +979,7 @@ def handle(hub, hc, frame):
                 version=WIRE_VERSION,
                 capabilities=plane.catalog.offer,
                 inline_ack=inline_ack,
+                packed_return=packed_return,
                 backend=backend,
                 session=plane.catalog.engines[backend].session,
             ),
@@ -928,7 +988,7 @@ def handle(hub, hc, frame):
     if command == "te_open":
         if hc.gpu_negotiation is None or frame.get("version") != WIRE_VERSION:
             raise ValueError("Q/O open requires capability negotiation")
-        backend, native_session, session, inline_ack = hc.gpu_negotiation
+        backend, native_session, session, inline_ack, packed_return = hc.gpu_negotiation
         if (
             frame.get("backend") != backend
             or frame.get("session") != session
@@ -940,8 +1000,13 @@ def handle(hub, hc, frame):
             if len(plane.lanes) >= 16 or hc.gpu_lane is not None:
                 raise RuntimeError("GPU lane capacity/binding exceeded")
             lane = hc.gpu_lane = Lane(
-                plane, frame["region"], frame["session"], backend, native_session,
+                plane,
+                frame["region"],
+                frame["session"],
+                backend,
+                native_session,
                 inline_ack=inline_ack,
+                packed_return=packed_return,
             )
             plane.lanes.add(lane)
         hub._send(

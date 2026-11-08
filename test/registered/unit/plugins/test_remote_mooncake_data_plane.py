@@ -13,8 +13,9 @@ from unittest.mock import patch
 
 import torch
 from sglang.test.ci.ci_register import register_cpu_ci
+from sglang.test.test_utils import CustomTestCase
 
-register_cpu_ci(est_time=4, suite="base-a-test-cpu")
+register_cpu_ci(est_time=30, suite="base-a-test-cpu")
 sys.path.insert(0, str(Path(__file__).resolve().parents[4] / "plugins/remote_attn"))
 
 from sglang_remote_attn import dsv41_remote
@@ -106,7 +107,7 @@ class NIC:
         self.pending.clear()
 
 
-class TestRemoteMooncakeDataPlane(unittest.TestCase):
+class TestRemoteMooncakeDataPlane(CustomTestCase):
     def setUp(self):
         self.enterContext(
             patch.dict(
@@ -216,38 +217,60 @@ class TestRemoteMooncakeDataPlane(unittest.TestCase):
                 self.fail("condition did not become true")
             time.sleep(0.005)
 
-    def test_tcp_q_and_two_descriptor_return_use_single_submit(self):
-        for inline_ack in (False, True):
-            with self.subTest(inline_ack=inline_ack):
-                fixture = self.fixture()
-                client = fixture.dd.client(fixture.route)
-                rpc = client.rpc
-                frames = []
+    def test_tcp_return_layout_negotiation_and_inline_ack_use_single_submit(self):
+        for mode in ("packed", "legacy_client", "legacy_server"):
+            for inline_ack in (False, True):
+                self.check_tcp_return(mode, inline_ack)
 
-                def capture(frame):
-                    frame = dict(frame)
-                    if not inline_ack and frame["cmd"] == "te_negotiate":
-                        frame.pop("inline_ack", None)  # Legacy peer.
-                    frames.append(frame)
-                    return rpc(frame)
+    def check_tcp_return(self, mode, inline_ack):
+        with self.subTest(mode=mode, inline_ack=inline_ack):
+            fixture = self.fixture()
+            client = fixture.dd.client(fixture.route)
+            rpc = client.rpc
+            frames = []
 
-                with patch.object(client, "rpc", side_effect=capture):
-                    _, req, _ = self.call(fixture, client=client)
-                    self.call(fixture, client=client)
-                    client.close()
-                self.assertEqual([len(call[1]) for call in fixture.d.calls], [1, 1])
-                self.assertEqual([len(call[1]) for call in fixture.p.calls], [2, 2])
-                self.assertEqual(fixture.p.sync_calls + fixture.d.sync_calls, 0)
-                self.assertTrue(dp.ready(req))
-                self.assertFalse(fixture.p.regions or fixture.d.regions)
-                self.assertEqual(client.inline_ack, inline_ack)
-                self.assertEqual(
-                    [f["ack_sequence"] for f in frames if "ack_sequence" in f],
-                    [1, 2] if inline_ack else [],
-                )
-                self.assertEqual(
-                    sum(f["cmd"] == "te_ack" for f in frames), 0 if inline_ack else 2
-                )
+            def capture(frame):
+                frame = dict(frame)
+                if not inline_ack and frame["cmd"] == "te_negotiate":
+                    frame.pop("inline_ack", None)  # Legacy peer.
+                if mode != "packed" and frame["cmd"] == "te_negotiate":
+                    frame.pop("packed_return", None)
+                frames.append(frame)
+                result = rpc(frame)
+                if mode == "legacy_server" and frame["cmd"] == "te_negotiate":
+                    result.pop("packed_return", None)
+                return result
+
+            with patch.object(client, "rpc", side_effect=capture):
+                _, req, result = self.call(fixture, client=client)
+                self.call(fixture, client=client)
+                client.close()
+            self.assertEqual([len(call[1]) for call in fixture.d.calls], [1, 1])
+            count = 1 if mode == "packed" else 2
+            self.assertEqual([len(call[1]) for call in fixture.p.calls], [count, count])
+            self.assertEqual(client.packed_return, mode == "packed")
+            self.assertEqual(
+                fixture.pp.stats()["packed_returns"], 2 if mode == "packed" else 0
+            )
+            self.assertEqual(fixture.pp.stats()["transfer_regions"], 2 * count)
+            timing = result["source_timing_ms"]
+            parts = [
+                timing["source_return_" + part]
+                for part in ("prepare", "slot_wait", "transfer")
+            ]
+            self.assertTrue(all(part >= 0 for part in parts))
+            self.assertLessEqual(sum(parts), timing["source_return"])
+            self.assertEqual(fixture.p.sync_calls + fixture.d.sync_calls, 0)
+            self.assertTrue(dp.ready(req))
+            self.assertFalse(fixture.p.regions or fixture.d.regions)
+            self.assertEqual(client.inline_ack, inline_ack)
+            self.assertEqual(
+                [f["ack_sequence"] for f in frames if "ack_sequence" in f],
+                [1, 2] if inline_ack else [],
+            )
+            self.assertEqual(
+                sum(f["cmd"] == "te_ack" for f in frames), 0 if inline_ack else 2
+            )
 
     def test_mixed_gpu_capabilities_fall_back_before_any_payload(self):
         fixture = self.fixture("rdma", server_gpu=False, client_gpu=True)
@@ -256,6 +279,8 @@ class TestRemoteMooncakeDataPlane(unittest.TestCase):
         self.assertEqual(len(fixture.pt.calls), 1)
         self.assertEqual(len(fixture.dt.calls), 1)
         self.assertTrue(dp.ready(req))
+        self.assertTrue(client.packed_return)
+        self.assertEqual(len(fixture.pt.calls[0][1]), 1)
         client.close()
         self.assertFalse(fixture.pt.regions or fixture.dt.regions)
 
@@ -266,6 +291,8 @@ class TestRemoteMooncakeDataPlane(unittest.TestCase):
         self.assertEqual(len(fixture.d.calls), 1)
         self.assertFalse(fixture.pt.calls or fixture.dt.calls)
         self.assertTrue(dp.ready(req))
+        self.assertFalse(client.packed_return)
+        self.assertEqual(len(fixture.p.calls[0][1]), 2)
         client.close()
 
     def test_late_q_write_keeps_both_backings_and_request_quarantined(self):
@@ -464,7 +491,16 @@ class TestRemoteMooncakeDataPlane(unittest.TestCase):
 
     def test_tcp_markers_bind_each_region_size_nonce_and_sequence(self):
         fixture = self.fixture()
-        client, _, result = self.call(fixture)
+        client = fixture.dd.client(fixture.route)
+        rpc = client.rpc
+
+        def legacy(frame):
+            frame = dict(frame)
+            frame.pop("packed_return", None)
+            return rpc(frame)
+
+        with patch.object(client, "rpc", side_effect=legacy):
+            _, _, result = self.call(fixture, client=client)
         lane = next(iter(fixture.pp.lanes))
         query_spec = dict(shape=[1, 2, 8], dtype="bfloat16")
         for slab, entries in (
@@ -496,6 +532,119 @@ class TestRemoteMooncakeDataPlane(unittest.TestCase):
                 for region, key in ((1, "o"), (2, "lse"))
             ],
         )
+
+    def test_packed_return_preserves_lse_bits_and_owned_outputs_across_shapes(self):
+        """Compact LSE offsets follow actual O length, including batched frames."""
+        fixture = self.fixture()
+        client = fixture.dd.client(fixture.route)
+        saved = []
+
+        def compute(job, stream, cache):
+            lse = torch.tensor([float("-inf"), -0.0, 1.25, float("nan")])
+            return {}, job.q_cpu.clone(), lse
+
+        with patch.object(dsv41_remote, "execute", compute):
+            for count, width in ((1, 8), (4, 128), (2, 16), (1, 8)):
+                q = [
+                    torch.full((4, width), i + width, dtype=torch.bfloat16)
+                    for i in range(count)
+                ]
+                _, out, lse = client.call(
+                    q,
+                    [{**fixture.route, "dsv41_sparse": True}] * count,
+                    [NS() for _ in q],
+                )
+                expected_lse = torch.tensor(
+                    [float("-inf"), -0.0, 1.25, float("nan")]
+                ).repeat(count, 1)
+                saved.append((out, torch.stack(q), lse, expected_lse))
+                nbytes = (
+                    out.numel() * out.element_size() + lse.numel() * lse.element_size()
+                )
+                self.assertEqual(fixture.p.calls[-1][3], [nbytes + dp.FOOTER])
+                offset = dp.WIRE_OFFSETS[1] + nbytes
+                stamp = client.slab.stamp(client.slab.nonce, client.sequence, 3, nbytes)
+                self.assertEqual(
+                    bytes(client.slab.wire[offset : offset + dp.FOOTER].tolist()), stamp
+                )
+        client.close()
+        for out, expected, lse, expected_lse in saved:
+            torch.testing.assert_close(out, expected)
+            self.assertTrue(
+                torch.equal(lse.view(torch.int32), expected_lse.view(torch.int32))
+            )
+
+    def test_packed_return_waits_for_combined_footer_after_sender_completion(self):
+        """O bytes alone cannot publish a return whose LSE/footer are still in flight."""
+        fixture = self.fixture()
+        # Initialize the reused slot with a valid footer from the previous sequence.
+        client, _, _ = self.call(fixture)
+        fixture.p.failure = "delivery"
+        req, results, errors = NS(), [], []
+        waiting, deliver = threading.Event(), threading.Event()
+        sleep = time.sleep
+
+        def wait_for_delivery(delay):
+            if threading.current_thread() is thread:
+                # Gate only after receive rejected the previous frame's footer.
+                waiting.set()
+                if not deliver.wait(3):
+                    raise TimeoutError("test return delivery gate")
+            else:
+                sleep(delay)
+
+        def run():
+            try:
+                results.append(self.call(fixture, req, client))
+            except Exception as exc:
+                errors.append(exc)
+
+        with patch.object(dp.time, "sleep", side_effect=wait_for_delivery):
+            thread = threading.Thread(target=run)
+            thread.start()
+            try:
+                self.assertTrue(waiting.wait(3))
+                self.assertFalse(results or errors)
+                self.assertFalse(dp.ready(req))
+                _, sources, targets, sizes = next(iter(fixture.p.pending.values()))
+                self.assertEqual(len(sources), 1)
+                # Deliver the payload, but leave the previous sequence's footer.
+                ctypes.memmove(targets[0], sources[0], sizes[0] - dp.FOOTER)
+                self.assertFalse(dp.ready(req))
+                fixture.p.flush_late()
+                deliver.set()
+                thread.join(3)
+                self.assertFalse(thread.is_alive())
+                self.assertFalse(errors)
+                self.assertEqual(len(results), 1)
+                self.assertTrue(dp.ready(req))
+            finally:
+                if fixture.p.pending:
+                    fixture.p.flush_late()
+                deliver.set()
+                thread.join(3)
+        client.close()
+
+    def test_failed_packed_return_retains_dma_backing_and_source_lease(self):
+        """A failed single-region return must quarantine both ends just like RDMA."""
+        fixture = self.fixture()
+        fixture.p.failure = "late"
+        client, req = fixture.dd.client(fixture.route), NS()
+        with self.assertRaises(RuntimeError):
+            self.call(fixture, req, client)
+        self.assertEqual(len(fixture.p.calls[0][1]), 1)
+        self.assertFalse(
+            fixture.hub.registry.release("qo", expected_req=fixture.source)
+        )
+        before = dict(fixture.p.regions), dict(fixture.d.regions)
+        self.assertTrue(before[0] and before[1])
+        client.close()
+        fixture.p.flush_late()
+        self.assertEqual((fixture.p.regions, fixture.d.regions), before)
+        self.assertFalse(fixture.freed)
+        self.assertTrue(client.slab.quarantined)
+        with self.assertRaisesRegex(RuntimeError, "unproven"):
+            dp.ready(req)
 
     def test_failed_negotiation_without_slab_does_not_reuse_bad_socket(self):
         fixture = self.fixture()
@@ -572,7 +721,9 @@ class TestRemoteMooncakeDataPlane(unittest.TestCase):
         def fail():
             raise RuntimeError("injected producer event failure")
 
-        with patch.object(client.slab, "record_producer", return_value=NS(synchronize=fail)):
+        with patch.object(
+            client.slab, "record_producer", return_value=NS(synchronize=fail)
+        ):
             with self.assertRaisesRegex(RuntimeError, "producer event"):
                 self.call(fixture, req, client)
         (query,) = client.slab.copy_owner
