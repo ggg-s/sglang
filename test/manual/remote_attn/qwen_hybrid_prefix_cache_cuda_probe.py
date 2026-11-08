@@ -127,7 +127,7 @@ class Probe(PD):
             size=8,
             mamba_size=24,
             mamba_spec_state_size=8,
-            max_context_len=64,
+            max_context_len=192,
             device="cuda",
             enable_memory_saver=False,
             cache_params=text.mamba2_cache_params,
@@ -136,7 +136,7 @@ class Probe(PD):
             speculative_num_draft_tokens=0,
         )
         self.pool = HybridLinearKVPool(
-            size=128,
+            size=512,
             page_size=1,
             dtype=torch.bfloat16,
             head_num=1,
@@ -147,7 +147,7 @@ class Probe(PD):
             mamba_pool=self.req_to_token_pool.mamba_pool,
         )
         self.token_to_kv_pool_allocator = TokenToKVPoolAllocator(
-            size=128,
+            size=512,
             dtype=torch.bfloat16,
             device="cuda",
             kvcache=self.pool,
@@ -226,9 +226,9 @@ class Probe(PD):
         self.m.mamba_cache.conv[0].zero_()
         self.m.mamba_cache.temporal.zero_()
         torch.manual_seed(20261107)
-        self.inputs = torch.randn(12, 1, 640, device="cuda", dtype=torch.bfloat16) * 0.1
+        self.inputs = torch.randn(128, 1, 640, device="cuda", dtype=torch.bfloat16) * 0.1
         self.weight = torch.randn(640, 4, device="cuda", dtype=torch.bfloat16) * 0.1
-        self.a = torch.randn(12, 1, 3, device="cuda", dtype=torch.bfloat16)
+        self.a = torch.randn(128, 1, 3, device="cuda", dtype=torch.bfloat16)
         self.b = torch.randn_like(self.a)
         self.A_log = torch.randn(3, device="cuda")
         self.dt_bias = torch.randn(3, device="cuda", dtype=torch.bfloat16)
@@ -361,12 +361,71 @@ class Probe(PD):
         self.tree_cache.shutdown()
 
 
+
+def check_chunked_checkpoint(probe, guard=None):
+    start = 1000 if guard is None else 2000
+    tokens = range(start, start + 128)
+    req = probe.new("chunked", tokens)
+    lease = None if guard is None else guard.hold(req)
+    if lease is not None:
+        req._remote_attn_prefix_stream = NS(
+            controller=probe._pre_layerwise,
+            source=NS(finalized=False),
+            aborted=False,
+            error=None,
+        )
+    req.extend_end = 64
+    req.kv.kv_committed_len = 64
+    probe.step(req, range(64))
+    probe.checkpoint_disagg_prefill(req)
+    first_node = req.last_node
+    first_slot = probe.tree_cache.tree_core.get_component_device_value(
+        first_node, ComponentType.MAMBA
+    )
+    probe._send_kv_chunk(req)
+    assert req.start_send_idx == 64 and req.disagg_kv_sender.pending
+    first_pages = probe.req_to_token_pool.req_to_token[req.kv.req_pool_idx, :64].clone()
+
+    req.extend_end = req.kv.kv_committed_len = 128
+    expected = probe.step(req, range(64, 128))
+    probe.checkpoint_disagg_prefill(req)
+    row = probe.req_to_token_pool.req_to_token[req.kv.req_pool_idx]
+    assert torch.equal(row[:64], first_pages)
+    probe.pd(req, 0)
+    assert lease is None or lease.closed
+
+    # The next request's key stops at 127, inside the last cache node.
+    # Its restart state must still come from the actual 64-token checkpoint.
+    again = probe.new("chunked-hit", tokens, hit=True)
+    hit = again.prefix_len
+    assert hit == 64, hit
+    assert first_slot is not None and again.last_node == first_node
+    for a, b in zip(probe.step(again, range(64, 128)), expected):
+        torch.testing.assert_close(a, b, atol=0, rtol=0)
+    probe.pd(again, 64)
+
+    if guard is not None:
+        # A competing cache entry exists, but this cold request has already
+        # queued its private pages. A dedup here would free those DMA pages.
+        private = probe.new("queued-private", range(start, start + 64))
+        pin = guard.hold(private)
+        probe.step(private, range(64))
+        probe._send_kv_chunk(private)
+        row = probe.req_to_token_pool.req_to_token[private.kv.req_pool_idx, :64]
+        pages = row.clone()
+        probe.checkpoint_disagg_prefill(private)
+        assert pin.pending_checkpoint[0] == 64 and private.kv.cache_protected_len == 0
+        assert torch.equal(row, pages)
+        probe.pd(private, 0)
+    return hit
+
 def run(folder):
     probe = Probe(folder)
     try:
         warm = probe.new("warm", range(8))
         probe.step(warm, range(8))
         probe.pd(warm, 0)
+        native_chunked_hit = check_chunked_checkpoint(probe)
         from sglang_remote_attn.source_cache import install
 
         guard = install(probe.tree_cache, allow_mamba=True, scheduler=probe)
@@ -405,8 +464,14 @@ def run(folder):
             and lease.closed
             and not lease.replayed_checkpoint
         )
+        chunked_hit = check_chunked_checkpoint(probe, guard)
         return dict(
             prefix_hits=[8, 10],
+            chunked_warm_prompt=128,
+            chunked_match_key=127,
+            native_chunked_hit=native_chunked_hit,
+            chunked_hit=chunked_hit,
+            queued_prefix_indices_preserved=True,
             native_cache=True,
             remote_read_pin_preserves_final_frontier=True,
             cached_gdn_matches_cold_exactly=True,
@@ -449,6 +514,7 @@ def main():
     root = Path(__file__).resolve().parents[3]
     files = [
         "plugins/remote_attn/sglang_remote_attn/qwen_hybrid.py",
+        "plugins/remote_attn/sglang_remote_attn/source_cache.py",
         "test/manual/remote_attn/qwen_hybrid_prefix_cache_cuda_probe.py",
     ]
     result["sha256"] = {

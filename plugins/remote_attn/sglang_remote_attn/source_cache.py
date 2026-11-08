@@ -1,7 +1,8 @@
 """P-only radix read leases; ordinary requests retain the native cache path.
 
 Pin the cached prefix independently. Keep the suffix request-owned by delaying
-checkpoint/dedup/release until transfers and Remote readers drain across TP.
+unsafe checkpoint/dedup/release until transfers and Remote readers drain across TP.
+Hybrid MAMBA can publish current chunk state while all queued pages are protected.
 """
 
 from dataclasses import dataclass
@@ -119,6 +120,26 @@ class CacheGuard:
         self.by_req[id(req)] = lease
         return lease
 
+    def _can_checkpoint_mamba(self, lease, up_to):
+        from .prefix_stream import stream_for
+
+        req = lease.req
+        plan = stream_for(req)
+        protected = req.kv.cache_protected_len
+        # Native checkpoint can dedup/rebind only the unprotected suffix.
+        # start_send_idx covers queued DMA, including work the pump has not
+        # submitted yet. Before finalization, no Remote reader has its row.
+        ready = (
+            not lease.abort
+            and not req.finished()
+            and up_to == req.extend_end
+            and req.start_send_idx <= protected <= up_to
+        )
+        if plan is None:
+            return ready
+        ready = ready and not (plan.aborted or plan.error or plan.source.finalized)
+        return plan.controller.agree([int(ready)])[0]
+
     def _checkpoint(self, req, *, up_to, **kwargs):
         lease = self.by_req.get(id(req)) or self.leases.get(req.cache_request_handle)
         if lease is not None:
@@ -128,6 +149,14 @@ class CacheGuard:
                 )
             lease.check()
             if not lease.retiring:
+                if self.allow_mamba and self._can_checkpoint_mamba(lease, up_to):
+                    # Fork the state for this exact frontier while it is live.
+                    # The native lock moves to the published descendant.
+                    try:
+                        return self.checkpoint(req, up_to=up_to, **kwargs)
+                    except BaseException:
+                        lease.failed = True
+                        raise
                 self._evict_swa(req, up_to)
                 lease.checkpoints += 1
                 lease.defer_checkpoint(up_to, kwargs)

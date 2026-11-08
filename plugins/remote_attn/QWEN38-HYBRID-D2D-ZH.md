@@ -18,7 +18,8 @@ P 只计算未命中的后缀，但 D 没有 prefix cache，仍需传送完整 p
 不能把缓存 checkpoint 的 slot id 当作最终工作 slot，也不能用 P 命中长度偏移 D 接收位置。
 
 P 安装支持 `(FULL, MAMBA)` 的读 lease，独立固定缓存前缀、保留请求私有后缀和工作 slot。
-中间 checkpoint 延期；最终原生回收只发布与最终 GDN 状态对应的前沿，不重放较早 checkpoint。
+当已排队的 KV 都处于原生缓存锁的保护范围内，P 在 chunk 完成时发布对应的原生 GDN checkpoint。
+已排队的私有页会阻止会重绑它们的发布。最终回收使用原生 checkpoint 处理当前工作状态。
 全部 KV 写、Remote 读、GPU forward 与 TP 退休证明完成后，才调用原生释放/状态 donation。
 D 传输中完成或取消也先延期回收，避免工作 slot 或请求行提前复用。
 P 当前要求内置、device-only `(FULL, MAMBA)` UnifiedRadixCache；HiCache、
@@ -120,3 +121,18 @@ P prefix cache 的原生 CUDA/PD 验证见 [专项验证](validation/qwen-hybrid
 
 本次 PD Remote、缓存读 lease 与网关 journal 修复的验证见
 [专项记录](validation/gateway-journal-hybrid-pd-4060.md)。
+
+
+## 对比原生 PD 和 Hybrid Remote
+
+两臂使用同一批输入 token、唯一的测量后缀、相同的 chunk 大小及采样设置。分别先预热同样的共享
+前缀，再开始计时。每档并发独立预热，测量前清点预热请求已经完成。
+
+- 在 P 上打开 `--enable-metrics`，在测量前后抓取 P 的 `/metrics`。核对完成请求数和
+  `sglang:cached_tokens_total` 的增量。先确认两臂实际复用的 token 数相同，再比较延迟。
+  共享前缀比例由输入构造决定，实际命中长度由可恢复的 GDN checkpoint 决定。
+- Remote 臂的 P 端 `[handoff-src]` 和对应 `ready.json` 记录首 chunk 的 `p_cached_tokens`。
+  D 端退休的 `done.json` 提供 `rid`、`hybrid_pd` 和 `remote_calls`。
+  统计同一测量窗口的请求，按 `rid` 去重 TP 副本，并分别报告 Remote 实际执行占比和调用次数。
+- 对相同并发分别报告 TTFT、E2E 和 ITL 的分位数，并附两臂的实际 P 命中数及 Remote 执行占比。
+  命中不匹配或 Remote 调用为零的结果只用于排查配置和缓存。

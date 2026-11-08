@@ -133,6 +133,7 @@ class Source(NativeSource):
             _poll_success(sender)  # Check failure; success is NOT required here.
             self.barrier_ready = True
             dsv41_remote.register(self)
+            cached_tokens = getattr(self.req, "cached_tokens_device", None)
             write_json(
                 self.path / "ready.json",
                 dict(
@@ -141,13 +142,15 @@ class Source(NativeSource):
                     service=self.service,
                     range_stream=True,
                     hybrid_state_ready=True,
+                    p_cached_tokens=cached_tokens,
                     schema=self.owner.schema_signature,
                 ),
             )
             logger.info(
-                "[handoff-src] hybrid PD rid=%s prefix=%s",
+                "[handoff-src] hybrid PD rid=%s prefix=%s p_cached_tokens=%s",
                 self.req.rid,
                 self.prefix_len,
+                cached_tokens,
             )
         except BaseException as exc:
             self.error = repr(exc)
@@ -302,7 +305,9 @@ class Target(NativeTarget):
         self.rpc.close("hybrid-pd-tp-local")
         super().finish(wait=wait)
         value = read_json(self.path / "done.json")
-        value.update(hybrid_pd=True, remote_calls=self.rpc.calls)
+        value.update(
+            hybrid_pd=True, rid=self.decode_req.req.rid, remote_calls=self.rpc.calls
+        )
         write_json(self.path / "done.json", value)
 
 
