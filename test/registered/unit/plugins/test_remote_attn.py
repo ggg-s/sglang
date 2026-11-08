@@ -19031,8 +19031,24 @@ class TestRemoteAttn(CustomTestCase):
                 gw = start()
                 self.assertTrue(all(gw.entry(r)["owner"] == "src" for r in rids))
                 gates["commit"].set()
-                until(lambda: all(gw.entry(r)["owner"] == "dst" for r in rids))
-                self.assertEqual(len(e.resumed), 2)
+                for target in e.target.d2d_targets.values():
+                    target.commit_worker.join(5)
+                    self.assertTrue(target.source_confirmed)
+                    self.assertFalse(target.admitted)
+                    self.assertIsNone(target.worker)  # Bulk cannot crowd out COMMIT.
+                from sglang_remote_attn import handoff_control as rt
+
+                # The first COMMIT wave admits both requests, but its reply is
+                # lost. Retrying the same epochs must not enqueue them twice.
+                driver.after["d2d_control_wave"] = [TimeoutError("lost commit wave reply")]
+                with patch.object(
+                    rt, "_flush_decode_resume", wraps=rt._flush_decode_resume
+                ) as admit:
+                    until(lambda: all(gw.entry(r)["owner"] == "dst" for r in rids))
+                self.assertEqual(admit.call_count, 1)
+                self.assertEqual(len(admit.call_args.args[1]), 2)
+                self.assertEqual(len(e.resumed), 1)
+                self.assertEqual(len(e.resumed[0][1]), 2)
                 self.assertEqual(len(e.target.d2d_targets), 2)
                 self.assertFalse(any(p["cmd"] == "d2d_resume" for _, p in driver.calls))
             finally:

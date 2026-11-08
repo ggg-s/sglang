@@ -1,4 +1,4 @@
-"""c=4/8 live stable-page copies using real CUDA scatters and Mooncake TCP.
+"""c=4/8/16 live stable-page copies using real CUDA scatters and Mooncake TCP.
 
 Native allocator/sampler ABI fixtures, not full model serving or H20/RDMA.
 """
@@ -218,7 +218,7 @@ def main():
     parser = argparse.ArgumentParser()
     parser.add_argument("--output", type=Path, required=True)
     args = parser.parse_args()
-    results = [run(c) for c in (4, 8)]
+    results = [run(c) for c in (4, 8, 16)]
     cancellation = cancelled_slot()
     files = [
         "plugins/remote_attn/sglang_remote_attn/" + name + ".py"

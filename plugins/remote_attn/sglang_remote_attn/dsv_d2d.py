@@ -27,8 +27,20 @@ from .transport_failure import TransportFailure
 VERSION = "dsv-d2d-v2"
 LIMIT = bulk.CAPACITY
 ASYNC_HANDOFF_LIMIT = 8
+CONTROL_WAVE_LIMIT = 8
+CONTROL_WAVE_COMMANDS = {
+    "d2d_reserve",
+    "d2d_freeze",
+    "d2d_import",
+    "d2d_commit",
+    "d2d_precopy_status",
+    "d2d_precopy_prepare",
+    "d2d_precopy_copy",
+    "d2d_precopy_apply",
+}
 COMMANDS = {
     "d2d_worker_status",
+    "d2d_control_wave",
     "d2d_submit_pd",
     "d2d_cancel",
     "d2d_plan",
@@ -792,6 +804,7 @@ class Target(NativeTarget):
     setup_worker: object = None
     commit_worker: object = None
     async_handoff: bool = False
+    defer_bulk: bool = False
     commit_started: bool = False
     source_confirmed: bool = False
     commit_error: str | None = None
@@ -1057,6 +1070,8 @@ def handle(controller, data):
             raise ValueError("D2D worker instance changed; refusing stale command")
     from . import d2d_precopy as precopy
 
+    if cmd == "d2d_control_wave":
+        return control_wave(controller, data, targets)
     if cmd in precopy.COMMANDS:
         return precopy.handle(controller, data)
     if cmd in gateway.COMMANDS:
@@ -1252,65 +1267,12 @@ def handle(controller, data):
             )
         return result
     if cmd == "d2d_commit":
-        target = targets.get(epoch)
-        error = None
-        try:
-            if target is None:
-                raise ValueError("D2D target not prepared")
-            if epoch in getattr(controller, "d2d_cancelled_epochs", ()) or target.error:
-                raise ValueError("D2D commit epoch aborted/cancelled or target failed")
-            if not target.admitted:
-                if (
-                    target.rpc is None
-                    or target.cancelled
-                    or target.closed
-                    or target.decode_req.req.finished()
-                ):
-                    raise ValueError("cannot commit aborted/finished D2D import")
-                target.refresh()
-        except Exception as exc:
-            error = repr(exc)
-        if not controller.agree([int(error is None)])[0]:
-            raise ValueError(f"TP D2D commit rejected: {error or 'peer rejected'}")
-        # All source shards must confirm ownership before any target admits.
-        # A partially confirmed commit can only roll forward.
-        if target.async_handoff:
-            if not poll_commit(controller, target, targets):
-                return dict(commit_pending=True)
-        else:
-            if not target.admitted and not target.source_confirmed:
-                target.commit_started = True
-                confirm_source(target)
-            confirmed = target.admitted or target.source_confirmed
-            if not controller.agree([int(confirmed)])[0]:
-                raise TransportFailure(
-                    f"TP D2D commit confirmation pending: {target.commit_error or 'peer pending'}"
-                )
-        error = None
-        req = target.decode_req.req
-        if not target.admitted:
-            target.admitted = True
-            from .handoff_control import _flush_decode_resume
-
-            try:
-                _flush_decode_resume(controller.scheduler, [req])
-            except BaseException as exc:
-                error = repr(exc)
-        if not controller.agree([int(error is None)])[0]:
-            target.error = f"native D2D admission failed: {error or 'peer failed'}"
-            dp.io_for(req).poison()
-            # The control was broadcast and this failure was TP-agreed. Use
-            # the existing native abort/quarantine boundary to stop every
-            # shard and retain rows, readers, registrations and free callbacks.
-            from .transport_failure import quarantine, request_of
-
-            quarantine(controller, target, target.error)
-            protocol = controller.decode_overlap.retirement
-            for index, entry in list(protocol.registered.items()):
-                if request_of(entry[0]) is req:
-                    protocol.registered.pop(index)
-            raise TransportFailure(target.error)
-        return dict(admitted=True, source_confirmed=True, rid=req.rid)
+        result = commit_wave(controller, [epoch], targets)[epoch]
+        if "error" in result:
+            if result.get("rejected"):
+                raise ValueError(result["error"])
+            raise TransportFailure(result["error"])
+        return result
     if cmd == "d2d_release":
         source = sources[epoch]
         return dict(
@@ -1334,6 +1296,143 @@ def handle(controller, data):
             return dict(resumed=True, never_frozen=True)
         return resume_source(controller, source)
     raise ValueError("unsupported D2D command")
+
+
+def control_wave(controller, data, targets):
+    commands = data.get("commands")
+    if not isinstance(commands, list) or not 1 <= len(commands) <= CONTROL_WAVE_LIMIT:
+        raise ValueError("invalid D2D control wave size")
+    epochs = set()
+    for item in commands:
+        if not isinstance(item, dict):
+            raise ValueError("invalid D2D control wave member")
+        epoch = item.get("migration_epoch")
+        if (
+            item.get("cmd") not in CONTROL_WAVE_COMMANDS
+            or not isinstance(epoch, str)
+            or re.fullmatch(r"[A-Za-z0-9_-]{1,128}", epoch) is None
+            or epoch in epochs
+            or "expected_instances" in item
+        ):
+            raise ValueError("invalid D2D control wave member")
+        epochs.add(epoch)
+
+    commits = [
+        item["migration_epoch"] for item in commands if item["cmd"] == "d2d_commit"
+    ]
+    results = commit_wave(controller, commits, targets) if commits else {}
+    for item in commands:
+        epoch = item["migration_epoch"]
+        if item["cmd"] == "d2d_commit":
+            continue
+        try:
+            result = handle(controller, item)
+        except Exception as exc:
+            result = dict(error=repr(exc))
+        ok = "error" not in result
+        success, failure = controller.agree([int(ok), int(not ok)])
+        if not (success or failure):
+            # Never enter the next member's collectives after an asymmetric
+            # failure. The outer control handler also checks scheduling state.
+            return dict(ok=False, fatal=True, error="TP D2D control wave diverged")
+        results[epoch] = result
+    return dict(results=results)
+
+
+def commit_wave(controller, epochs, targets):
+    errors = []
+    for epoch in epochs:
+        target = targets.get(epoch)
+        try:
+            if target is None:
+                raise ValueError("D2D target not prepared")
+            if epoch in getattr(controller, "d2d_cancelled_epochs", ()) or target.error:
+                raise ValueError("D2D commit epoch aborted/cancelled or target failed")
+            if not target.admitted:
+                if (
+                    target.rpc is None
+                    or target.cancelled
+                    or target.closed
+                    or target.decode_req.req.finished()
+                ):
+                    raise ValueError("cannot commit aborted/finished D2D import")
+                target.refresh()
+        except Exception as exc:
+            errors.append(repr(exc))
+        else:
+            errors.append(None)
+    votes = []
+    for epoch, error in zip(epochs, errors):
+        admitted = error is None and targets[epoch].admitted
+        votes.extend((int(error is None), int(admitted), int(not admitted)))
+    agreed = controller.agree(votes)
+    results, confirmed = {}, []
+    for i, (epoch, error) in enumerate(zip(epochs, errors)):
+        valid, admitted, pending = agreed[3 * i : 3 * i + 3]
+        if not valid or not (admitted or pending):
+            results[epoch] = dict(
+                rejected=True,
+                error=f"TP D2D commit rejected: {error or 'peer rejected'}",
+            )
+            continue
+        target = targets[epoch]
+        try:
+            if target.async_handoff:
+                if not poll_commit(controller, target, targets):
+                    results[epoch] = dict(commit_pending=True)
+                    continue
+            else:
+                if not target.admitted and not target.source_confirmed:
+                    target.commit_started = True
+                    confirm_source(target)
+                if not controller.agree([int(target.admitted or target.source_confirmed)])[0]:
+                    raise TransportFailure(
+                        f"TP D2D commit confirmation pending: {target.commit_error or 'peer pending'}"
+                    )
+        except TransportFailure as exc:
+            results[epoch] = dict(error=str(exc))
+            continue
+        confirmed.append((epoch, target))
+
+    # Only shards with a collective confirmation may join native Decode.
+    # Build one batch in command order on every rank.
+    new = [target for _, target in confirmed if not target.admitted]
+    if new:
+        from .handoff_control import _flush_decode_resume
+
+        error = None
+        try:
+            _flush_decode_resume(
+                controller.scheduler, [target.decode_req.req for target in new]
+            )
+            for target in new:
+                if target.defer_bulk:
+                    start_bulk(target)
+        except BaseException as exc:
+            error = repr(exc)
+        if not controller.agree([int(error is None)])[0]:
+            from .transport_failure import quarantine, request_of
+
+            for target in new:
+                req = target.decode_req.req
+                target.error = f"native D2D admission failed: {error or 'peer failed'}"
+                dp.io_for(req).poison()
+                quarantine(controller, target, target.error)
+                protocol = controller.decode_overlap.retirement
+                for index, entry in list(protocol.registered.items()):
+                    if request_of(entry[0]) is req:
+                        protocol.registered.pop(index)
+        else:
+            for target in new:
+                target.admitted = True
+
+    for epoch, target in confirmed:
+        results[epoch] = (
+            dict(admitted=True, source_confirmed=True, rid=target.decode_req.req.rid)
+            if target.admitted
+            else dict(error=target.error)
+        )
+    return results
 
 
 def allocation_preflight(controller, req, required=None):
@@ -1442,6 +1541,13 @@ def prepare_import_io(target, transfer, session, jobs):
             raise
 
 
+def start_bulk(target):
+    target.worker = threading.Thread(
+        target=target.transfer, daemon=True, name="dsv-d2d-copy"
+    )
+    target.worker.start()
+
+
 def finish_import(controller, target):
     req = target.decode_req.req
     if target.async_handoff:
@@ -1492,10 +1598,8 @@ def finish_import(controller, target):
         target.admission_id = retirement.last_admission + 1
         retirement.register(target)
         controller.targets.append(target)
-        target.worker = threading.Thread(
-            target=target.transfer, daemon=True, name="dsv-d2d-copy"
-        )
-        target.worker.start()
+        if not target.defer_bulk:
+            start_bulk(target)
         return dict(
             rid=req.rid, imported=True, kv_len=kv_len, output_len=len(req.output_ids)
         )
@@ -1586,6 +1690,7 @@ def import_request(controller, data):
     target.group_size = group_size
     target.token_range = token_range
     target.async_handoff = async_handoff
+    target.defer_bulk = async_handoff and data.get("defer_bulk") is True
     target.queue = getattr(controller.scheduler, "disagg_decode_transfer_queue", None)
     if target.queue is None:
         from sglang.srt.managers.scheduler_components.request_list import (

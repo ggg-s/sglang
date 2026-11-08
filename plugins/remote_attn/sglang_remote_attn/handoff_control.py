@@ -1188,11 +1188,11 @@ class RemoteJob:
         with self.hub._stats_lock:
             self.hub.rpc_failed += 1
 
-    def finish(self) -> None:
+    def finish(self, *, fence=True) -> None:
         if self.done:
             return
         self.done = True
-        if not _fence_remote_job(self, [self.ctx]):
+        if fence and not _fence_remote_job(self, [self.ctx]):
             return
         try:
             self.hub.registry.release_ref(self.ctx.handoff_id, self.epoch)
@@ -1780,6 +1780,7 @@ class RemoteHub:
         n = max(1, int(os.environ.get("HANDOFF_HUB_STREAMS", "2")))
         factory = stream_factory or _create_hub_streams
         self._pool = RemoteStreamPool(n, executor or _execute_hub_job, factory(n))
+        self._inline_d2d_control = executor is None
         self.rpc_completed = 0
         self.rpc_failed = 0
         self.idle_closes = 0
@@ -2175,7 +2176,20 @@ class RemoteHub:
             with self._active_lock:
                 self._in_flight += 1
                 self.scheduler._handoff_remote_active = True
-            self._pool.submit(job)
+            if self._inline_d2d_control and header.get("dsv_d2d") in (
+                "manifest", "commit", "copied", "done", "abort"
+            ):
+                # These authenticated RPCs only update the source lease. A
+                # full GPU/Mooncake queue must not delay commit or retirement.
+                try:
+                    resp, out, lse = _execute_hub_job(job, None, None)
+                    job.reply(resp, out, lse)
+                except Exception as exc:
+                    job.fail(exc)
+                finally:
+                    job.finish(fence=False)
+            else:
+                self._pool.submit(job)
         except Exception:
             if job is None:
                 self.registry.release_ref(hid, int(epoch_i))
@@ -5120,6 +5134,7 @@ def execute_handoff_control(scheduler, data):
         group=parallel.tp_group.cpu_group if parallel.tp_size > 1 else None,
         world_size=parallel.tp_size,
     )
+    fatal = fatal or bool(result.get("fatal"))
     _write_result(result_path, result)
     if resume_claim:
         # Retire the durable claim only after the command actually ran.

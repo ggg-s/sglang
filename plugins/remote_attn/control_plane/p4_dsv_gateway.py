@@ -7,7 +7,7 @@ sequence ids; a reconnect supplies Last-Event-ID/after to acknowledge receipt.
 
 from __future__ import annotations
 
-from collections import deque
+from collections import deque, namedtuple
 import copy
 import fcntl
 import hashlib
@@ -23,6 +23,9 @@ from urllib.parse import parse_qs
 PROTOCOL = "dsv-d2d-v2"
 TERMINAL = {"DONE", "CANCELLED"}
 PRECOMMIT = {"PLAN", "RESERVE", "WAIT_CUT", "FREEZE", "IMPORT"}
+WAVE_SIZE = 8
+WAVE_PHASES = {"RESERVE", "WAIT_CUT", "FREEZE", "IMPORT", "COMMIT"}
+Command = namedtuple("Command", "role name epoch payload")
 
 
 # Immutable large fields never participate in hot intent rewrites/deepcopies.
@@ -143,6 +146,7 @@ class DsvGateway:
         self.tick_cursor = 0
         self.tick_samples = deque(maxlen=256)
         self.precopy_frame_samples = deque(maxlen=256)
+        self.precopy_stage_samples = {}
         self.lock = threading.RLock()
         self.work_lock = threading.Lock()
         self.cv = threading.Condition(self.lock)
@@ -152,6 +156,9 @@ class DsvGateway:
         self.role_locks = {role: threading.Lock() for role in ("src", "dst")}
         self.command_waiters = dict(src=0, dst=0)
         self.control_latencies = {}
+        self.control_breakdown = {}
+        self.control_wave_sizes = {}
+        self.control_wave_members = {}
         self.background = autostart
         self.async_handoff = async_handoff
         self.status_threads = []
@@ -411,13 +418,14 @@ class DsvGateway:
         status = cmd == "d2d_worker_status"
         started = time.monotonic()
         acquired = False
+        rows = ()
         with self.lock:
             if status and self.command_waiters[role]:
                 raise StatusBusy()
             if not status:
                 self.command_waiters[role] += 1
         try:
-            if not status:
+            if not status and "expected_instances" not in payload:
                 payload["expected_instances"] = [
                     r["instance_id"] for r in self.facts[role]
                 ]
@@ -430,13 +438,15 @@ class DsvGateway:
                 if status:
                     raise StatusBusy()
                 raise TimeoutError(f"{role} control busy; command not submitted")
-            return self.rows(
+            submitted = time.monotonic()
+            rows = self.rows(
                 self.driver.send(
                     role,
                     dict(cmd=cmd, migration_epoch=epoch, **payload),
                     timeout=2 if status else 30,
                 )
             )
+            return rows
         finally:
             if acquired:
                 self.role_locks[role].release()
@@ -444,16 +454,28 @@ class DsvGateway:
                 if not status:
                     self.command_waiters[role] -= 1
                 if acquired:
-                    sample = latency_histogram([(time.monotonic() - started) * 1000])
                     key = role + "/" + cmd
-                    old = self.control_latencies.get(key)
-                    if old:
-                        sample["count"] += old["count"]
-                        sample["sum_ms"] += old["sum_ms"]
-                        sample["max_ms"] = max(sample["max_ms"], old["max_ms"])
-                        for bucket in sample["buckets"]:
-                            sample["buckets"][bucket] += old["buckets"][bucket]
-                    self.control_latencies[key] = sample
+                    self._observe(
+                        self.control_latencies, key, (time.monotonic() - started) * 1000
+                    )
+                    breakdown = self.control_breakdown.setdefault(key, {})
+                    self._observe(breakdown, "gateway_slot_wait", (submitted - started) * 1000)
+                    for field in ("wait_before_exec_ms", "exec_ms"):
+                        times = [r.get("_ctl", {}).get(field) for r in rows]
+                        if times and all(t is not None for t in times):
+                            self._observe(breakdown, field, max(times))
+
+    @staticmethod
+    def _observe(metrics, key, value):
+        sample = latency_histogram([value])
+        old = metrics.get(key)
+        if old:
+            sample["count"] += old["count"]
+            sample["sum_ms"] += old["sum_ms"]
+            sample["max_ms"] = max(sample["max_ms"], old["max_ms"])
+            for bucket in sample["buckets"]:
+                sample["buckets"][bucket] += old["buckets"][bucket]
+        metrics[key] = sample
 
     def latency_metrics(self):
         with self.lock:
@@ -468,6 +490,10 @@ class DsvGateway:
                     skipped[reason] = skipped.get(reason, 0) + 1
             return dict(
                 control_latency_ms=copy.deepcopy(self.control_latencies),
+                control_breakdown_ms=copy.deepcopy(self.control_breakdown),
+                control_wave_sizes=copy.deepcopy(self.control_wave_sizes),
+                control_wave_members=dict(self.control_wave_members),
+                precopy_stage_wait_ms=copy.deepcopy(self.precopy_stage_samples),
                 tick_recent_latency_ms=latency_histogram(self.tick_samples),
                 journal_bytes=self.path.stat().st_size if self.path.exists() else 0,
                 journal_version=self.journal["version"],
@@ -710,8 +736,18 @@ class DsvGateway:
             r.get("async_handoff_supported") for r in workers
         )
 
+    def _control_waves(self):
+        return self._async_handoff() and all(
+            rows and all(row.get("control_wave_supported") for row in rows)
+            for rows in (self.facts.get("src"), self.facts.get("dst"))
+        )
+
+    @staticmethod
+    def _command(role, name, epoch, **payload):
+        return Command(role, name, epoch, payload)
+
     def _precopy_source(self, entry, cmd, **payload):
-        rows = self._call("src", cmd, entry["epoch"], **payload)
+        rows = (yield self._command("src", cmd, entry["epoch"], **payload))
         if not any(r.get("deferred") for r in rows):
             return rows
         if not all(
@@ -742,7 +778,7 @@ class DsvGateway:
                 for r in self.facts.get(role, [])
             ):
                 return
-            rows = self._precopy_source(entry, "d2d_precopy_status")
+            rows = (yield from self._precopy_source(entry, "d2d_precopy_status"))
             if rows is None:
                 return
             available = [
@@ -761,6 +797,7 @@ class DsvGateway:
                     pending = dict(
                         stage="PREPARE",
                         started_at=time.time(),
+                        stage_at=time.time(),
                         frame=dict(
                             entry=i, start=ends[i], count=count, chunk=uuid.uuid4().hex
                         ),
@@ -770,30 +807,39 @@ class DsvGateway:
             if pending is None:
                 return
         frame = pending["frame"]
+        if "stage_at" in pending:
+            with self.lock:
+                self._observe(
+                    self.precopy_stage_samples,
+                    pending["stage"],
+                    max(0, (time.time() - pending["stage_at"]) * 1000),
+                )
         if pending["stage"] == "PREPARE":
-            rows = self._call("dst", "d2d_precopy_prepare", epoch, frame=frame)
+            rows = (yield self._command("dst", "d2d_precopy_prepare", epoch, frame=frame))
             self._update(
                 rid,
                 precopy_pending=dict(
-                    pending, stage="COPY", receives=[r["receive"] for r in rows]
+                    pending, stage="COPY", stage_at=time.time(),
+                    receives=[r["receive"] for r in rows],
                 ),
             )
         elif pending["stage"] == "COPY":
-            rows = self._precopy_source(
+            rows = (yield from self._precopy_source(
                 entry, "d2d_precopy_copy", frame=frame, receives=pending["receives"]
-            )
+            ))
             if rows is None:
                 return
             self._update(
                 rid,
                 precopy_pending=dict(
-                    pending, stage="APPLY", proofs=[r["proof"] for r in rows]
+                    pending, stage="APPLY", stage_at=time.time(),
+                    proofs=[r["proof"] for r in rows],
                 ),
             )
         else:
-            rows = self._call(
+            rows = (yield self._command(
                 "dst", "d2d_precopy_apply", epoch, frame=frame, proofs=pending["proofs"]
-            )
+            ))
             if any(r["prefix_pages"] != rows[0]["prefix_pages"] for r in rows):
                 raise RuntimeError("TP precopy installed coverage disagreed")
             receipts = copy.deepcopy(
@@ -982,7 +1028,7 @@ class DsvGateway:
                 **self._end_deferral(entry),
             )
         elif phase == "RESERVE":
-            rows = self._call("dst", "d2d_reserve", epoch, plans=entry["plans"])
+            rows = (yield self._command("dst", "d2d_reserve", epoch, plans=entry["plans"]))
             if not all(r.get("reserved") for r in rows):
                 raise RuntimeError("target did not reserve on every rank")
             self._update(
@@ -1015,11 +1061,11 @@ class DsvGateway:
             else:
                 # At the cut, finish only an already durable frame. Its APPLY
                 # receipt must be sealed by FREEZE, including after a restart.
-                self._precopy(entry, cut_due=cut_due)
+                yield from self._precopy(entry, cut_due=cut_due)
         elif phase == "FREEZE":
             if entry.get("freeze_requested_at") is None:
                 self._update(rid, freeze_requested_at=time.time())
-            rows = self._call(
+            rows = (yield self._command(
                 "src",
                 "d2d_freeze",
                 epoch,
@@ -1027,7 +1073,7 @@ class DsvGateway:
                 precopy_receipts=entry.get("precopy_receipts")
                 or [[] for _ in entry["reservations"]],
                 **common,
-            )
+            ))
             if any(r.get("deferred") for r in rows):
                 if not all(r.get("deferred") for r in rows):
                     raise RuntimeError("TP freeze deferral disagreed")
@@ -1105,15 +1151,16 @@ class DsvGateway:
                 if async_handoff and targets and all(targets)
                 else {"transfers": entry["transfers"]}
             )
-            rows = self._call(
+            rows = (yield self._command(
                 "dst",
                 "d2d_import",
                 epoch,
                 destination="D1",
                 require_reservation=True,
                 async_handoff=async_handoff,
+                defer_bulk=self._control_waves(),
                 **payload,
-            )
+            ))
             if any(r.get("import_pending") for r in rows):
                 if not all(r.get("import_pending") for r in rows):
                     raise RuntimeError("TP import readiness disagreed")
@@ -1133,7 +1180,7 @@ class DsvGateway:
                 for r in self._states(entry, "dst")
             ):
                 return
-            rows = self._call("dst", "d2d_commit", epoch)
+            rows = (yield self._command("dst", "d2d_commit", epoch))
             if all(r.get("commit_pending") for r in rows):
                 return
             if not all(r.get("admitted") and r.get("source_confirmed") for r in rows):
@@ -1232,6 +1279,161 @@ class DsvGateway:
                 elif phase != "LOCAL":
                     self._update(rid, phase="LOCAL")
 
+    def _drive(self, step):
+        try:
+            cmd = next(step)
+            while True:
+                try:
+                    rows = self._call(cmd.role, cmd.name, cmd.epoch, **cmd.payload)
+                except Exception as exc:
+                    cmd = step.throw(exc)
+                else:
+                    cmd = step.send(rows)
+        except StopIteration:
+            pass
+
+    def _advance_one(self, entry, started):
+        self._drive(self._step(entry))
+        while self.background and time.monotonic() - started < 0.05:
+            current = self._entry(entry["rid"])
+            continue_frame = (
+                entry["phase"] == current["phase"] == "WAIT_CUT"
+                and current.get("precopy_pending") is not None
+                and current["precopy_pending"] != entry.get("precopy_pending")
+            )
+            start_commit = (
+                entry["phase"] == "IMPORT"
+                and current["phase"] == "COMMIT"
+                and self._async_handoff()
+            )
+            if not (continue_frame or start_commit):
+                break
+            entry = current
+            self._drive(self._step(entry))
+
+    def _advance_error(self, rid, exc):
+        current = self._entry(rid)
+        # A timed-out mutation may have completed. Retry the same epoch.
+        phase = current["phase"]
+        rollback = phase in PRECOMMIT and not isinstance(
+            exc, (TimeoutError, ConnectionError)
+        )
+        outcome = current.get("migration_outcome")
+        if rollback and outcome is None:
+            outcome = "precommit_failed"
+        self._update(
+            rid,
+            phase="ROLLBACK" if rollback else phase,
+            migration_outcome=outcome,
+            error=repr(exc),
+            blocked=not rollback,
+        )
+
+    def _step(self, entry):
+        rid = entry["rid"]
+        try:
+            yield from self._advance(entry)
+            current = self._entry(rid)
+            if current["blocked"]:
+                self._update(rid, blocked=False, error=None)
+        except Exception as exc:
+            self._advance_error(rid, exc)
+
+    def _wave_priority(self, entry):
+        phase = entry["phase"]
+        if phase in {"COMMIT", "IMPORT", "FREEZE"}:
+            return ("COMMIT", "IMPORT", "FREEZE").index(phase)
+        if phase == "WAIT_CUT":
+            # Advisory priority only. _advance validates the common history
+            # and classifies divergence before issuing any mutation.
+            rows = [
+                row.get("requests", {}).get(entry["source_rid"])
+                for row in self.facts.get("src", ())
+            ]
+            if rows and all(
+                row and (row["finished"] or self._cut_due(entry, row))
+                for row in rows
+            ):
+                return 2
+            if entry.get("precopy_pending") is not None:
+                return 3
+        return 4
+
+    def _wave_results(self, role, members):
+        expected = members[0][2][role]
+        if any(instances[role] != expected for _, _, instances in members):
+            raise ConnectionError("D2D wave contains different worker instances")
+        commands = [
+            dict(cmd=cmd.name, migration_epoch=cmd.epoch, **cmd.payload)
+            for _, cmd, _ in members
+        ]
+        with self.lock:
+            sizes = self.control_wave_sizes.setdefault(role, {})
+            size = str(len(commands))
+            sizes[size] = sizes.get(size, 0) + 1
+            for item in commands:
+                key = role + "/" + item["cmd"]
+                self.control_wave_members[key] = self.control_wave_members.get(key, 0) + 1
+        return self._call(
+            role, "d2d_control_wave", commands=commands, expected_instances=expected
+        )
+
+    def _run_wave(self, entries):
+        steps = []
+        copies = 0
+        for entry in sorted(entries, key=self._wave_priority):
+            # An already durable COPY can wait for the next round. Bound
+            # synchronous CUDA/TE time so one slice cannot hold both slots.
+            if (
+                copies == 2
+                and entry["phase"] == "WAIT_CUT"
+                and (entry.get("precopy_pending") or {}).get("stage") == "COPY"
+            ):
+                continue
+            step = self._step(entry)
+            cmd = next(step, None)
+            if cmd is not None:
+                copies += int(cmd.name == "d2d_precopy_copy")
+                steps.append((step, cmd, entry["instances"]))
+        while steps:
+            following = []
+            # Keep destination admission ahead of speculative source copying.
+            for role in ("dst", "src"):
+                wave = [
+                    (step, cmd, instances)
+                    for step, cmd, instances in steps
+                    if cmd.role == role
+                ]
+                if not wave:
+                    continue
+                try:
+                    rows = self._wave_results(role, wave)
+                    results = [
+                        [row["results"][cmd.epoch] for row in rows]
+                        for _, cmd, _ in wave
+                    ]
+                except Exception as exc:
+                    # A lost envelope can follow successful member mutations.
+                    # Reconcile each same durable phase/epoch, including precopy.
+                    for step, _, _ in wave:
+                        try:
+                            step.throw(
+                                ConnectionError(f"D2D control wave unacknowledged: {exc}")
+                            )
+                        except StopIteration:
+                            pass
+                    continue
+                for (step, _, instances), replies in zip(wave, results):
+                    try:
+                        error = next((r["error"] for r in replies if "error" in r), None)
+                        cmd = (
+                            step.throw(RuntimeError(error)) if error else step.send(replies)
+                        )
+                        following.append((step, cmd, instances))
+                    except StopIteration:
+                        pass
+            steps = following
+
     def tick(self):
         with self.work_lock:
             if not self.background:
@@ -1242,54 +1444,25 @@ class DsvGateway:
                     for e in self.journal["entries"].values()
                     if e["phase"] not in TERMINAL
                 ]
-            if entries:
-                offset = self.tick_cursor % len(entries)
-                entries = entries[offset:] + entries[:offset]
+            offset = self.tick_cursor % len(entries) if entries else 0
+            entries = entries[offset:] + entries[:offset]
             started, served = time.monotonic(), 0
-            for raw_entry in entries:
-                entry = self.payloads.view(raw_entry)
-                try:
-                    self._advance(entry)
-                    current = self._entry(entry["rid"])
-                    while self.background and time.monotonic() - started < 0.05:
-                        continue_frame = (
-                            entry["phase"] == current["phase"] == "WAIT_CUT"
-                            and current.get("precopy_pending") is not None
-                            and current["precopy_pending"] != entry.get("precopy_pending")
-                        )
-                        start_commit = (
-                            entry["phase"] == "IMPORT"
-                            and current["phase"] == "COMMIT"
-                            and self._async_handoff()
-                        )
-                        if not (continue_frame or start_commit):
-                            break
-                        # Continue the same frame or send a durable COMMIT
-                        # without waiting for another round through all rids.
-                        entry = current
-                        self._advance(entry)
-                        current = self._entry(entry["rid"])
-                    if current["blocked"]:
-                        self._update(entry["rid"], blocked=False, error=None)
-                except Exception as exc:
-                    current = self._entry(entry["rid"])
-                    # RPC timeouts have unknown completion. Retrying the SAME
-                    # epoch is safe; only explicit precommit errors roll back.
-                    phase = current["phase"]
-                    rollback = phase in PRECOMMIT and not isinstance(
-                        exc, (TimeoutError, ConnectionError)
-                    )
-                    outcome = current.get("migration_outcome")
-                    if rollback and outcome is None:
-                        outcome = "precommit_failed"
-                    self._update(
-                        entry["rid"],
-                        phase="ROLLBACK" if rollback else phase,
-                        migration_outcome=outcome,
-                        error=repr(exc),
-                        blocked=not rollback,
-                    )
-                served += 1
+            waves = self._control_waves()
+            while served < len(entries):
+                entry = self.payloads.view(entries[served])
+                if waves:
+                    slice_entries = [
+                        self.payloads.view(raw)
+                        for raw in entries[served : served + WAVE_SIZE]
+                    ]
+                    self._run_wave([e for e in slice_entries if e["phase"] in WAVE_PHASES])
+                    for item in slice_entries:
+                        if item["phase"] not in WAVE_PHASES:
+                            self._drive(self._step(item))
+                    served += len(slice_entries)
+                else:
+                    self._advance_one(entry, started)
+                    served += 1
                 if self.background and time.monotonic() - started >= 0.05:
                     break
             if entries:

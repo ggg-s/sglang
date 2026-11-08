@@ -144,6 +144,7 @@ def handle(controller, data):
             precopy_protocol="closed-page-precopy-v1",
             admission_plan_supported=True,
             async_handoff_supported=True,
+            control_wave_supported=True,
             instance_id=instance(controller),
             rank=controller.rank,
             tp_size=controller.tp_size,

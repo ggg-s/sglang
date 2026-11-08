@@ -409,22 +409,33 @@ def main():
                 raise ConnectionError("injected missing source confirmation")
             return call(action, **fields)
 
+        def commit():
+            return d2d.handle(
+                e.target,
+                dict(
+                    cmd="d2d_control_wave",
+                    migration_epoch="worker",
+                    commands=[
+                        dict(cmd="d2d_commit", migration_epoch=e.epoch),
+                        dict(cmd="d2d_commit", migration_epoch="absent-epoch"),
+                    ],
+                ),
+            )["results"]
+
         target.reader.call = partial_commit
-        assert e.command(e.target, "d2d_commit")["commit_pending"]
+        reply = commit()
+        assert reply[e.epoch]["commit_pending"]
+        assert reply["absent-epoch"]["rejected"]
         target.commit_worker.join(5)
         assert not target.commit_worker.is_alive()
-        try:
-            e.command(e.target, "d2d_commit")
-            raise AssertionError("partial TP commit admitted")
-        except d2d.TransportFailure:
-            pass
+        assert "confirmation pending" in commit()[e.epoch]["error"]
         assert not target.admitted and not e.resumed
         target.reader.call = call
-        assert e.command(e.target, "d2d_commit")["commit_pending"]
+        assert commit()[e.epoch]["commit_pending"]
         if target.commit_worker is not None:
             target.commit_worker.join(5)
             assert not target.commit_worker.is_alive()
-        assert e.command(e.target, "d2d_commit")["admitted"]
+        assert commit()[e.epoch]["admitted"]
         assert len(e.resumed) == 1
         source = e.source.d2d_sources[e.epoch]
         assert not target.copied and not e.freed

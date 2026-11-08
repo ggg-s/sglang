@@ -5041,7 +5041,7 @@ def main():
     p.add_argument(
         "--async-handoff", action="store_true",
         default=os.environ.get("HANDOFF_D2D_ASYNC_HANDOFF") == "1",
-        help="Overlap DSV/hybrid import and commit I/O across migration epochs",
+        help="Batch DSV/hybrid control and overlap import/commit I/O across epochs",
     )
     p.add_argument("--out", default=str(STATE / "p4_gateway.jsonl"))
     args = p.parse_args()
