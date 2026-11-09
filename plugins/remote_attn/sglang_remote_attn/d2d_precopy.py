@@ -40,10 +40,29 @@ class Destination:
     receiver: object
     ends: list
     plan_digest: str
+    explicit_tcp: bool = False
     pending: dict | None = None
     receipts: dict = field(default_factory=dict)
     closed: bool = False
     failed: bool = False
+
+
+def rdma_available(controller):
+    from . import mooncake_backend as transport
+
+    return transport.policy() != "tcp" and transport.gpu_capability(
+        transport.handle(d2d.manager(controller).engine), d2d.pool_device(controller)
+    )
+
+
+def tcp_engine(controller):
+    from . import mooncake_backend as transport
+
+    native = d2d.manager(controller).engine
+    engine = transport.handle(native)
+    if engine.protocol == "tcp":
+        return engine
+    return transport.tcp_engine(getattr(engine.native, "hostname", "127.0.0.1"))
 
 
 def plan_hash(plan):
@@ -104,7 +123,7 @@ def stable_pages(controller, req):
     return ends
 
 
-def frame(controller, value):
+def frame(controller, value, *, rdma=False):
     if not isinstance(value, dict) or set(value) != {
         "entry",
         "start",
@@ -119,7 +138,7 @@ def frame(controller, value):
         or not 0 <= entry < len(entries)
         or start < 0
         or count < 1
-        or count * entries[entry][-1] > d2d.LIMIT
+        or count * entries[entry][-1] > (bulk.RDMA_CAPACITY if rdma else d2d.LIMIT)
         or not isinstance(value["chunk"], str)
         or len(value["chunk"]) != 32
     ):
@@ -282,6 +301,8 @@ def close_destination(controller, t, proof=None):
 
 
 def handle(controller, data):
+    from . import mooncake_backend as transport
+
     epoch, cmd = data["migration_epoch"], data["cmd"]
     error, result = None, None
     finished = False
@@ -304,8 +325,15 @@ def handle(controller, data):
                 if cmd.endswith("status"):
                     ends = stable_pages(controller, record.req)
                 else:
-                    f = frame(controller, data["frame"])
                     dest = reservation.select(controller, data, "receive")
+                    region = bulk.descriptor(dest["region"])
+                    rdma = region["protocol"] == transport.GPU
+                    explicit_tcp = dest.get("tcp") is True
+                    if explicit_tcp and (rdma or transport.policy() == "rdma"):
+                        raise ValueError("precopy source did not offer TCP fallback")
+                    f = frame(controller, data["frame"], rdma=rdma)
+                    if rdma and not rdma_available(controller):
+                        raise ValueError("precopy source did not offer GPU RDMA")
                     if (
                         dest["frame"] != f
                         or dest["epoch"] != epoch
@@ -327,14 +355,26 @@ def handle(controller, data):
             t = ticket(controller, epoch)
             state = getattr(t, "precopy", None)
             if cmd.endswith("prepare"):
+                rdma = data.get("rdma") is True
+                explicit_tcp = data.get("tcp") is True
+                if explicit_tcp and (rdma or transport.policy() == "rdma"):
+                    raise ValueError("precopy destination did not offer TCP fallback")
+                if rdma and not rdma_available(controller):
+                    raise ValueError("precopy destination did not offer GPU RDMA")
                 capacity = bulk.frame_capacity(
-                    data.get("capacity", bulk.LEGACY_CAPACITY)
+                    data.get("capacity", bulk.LEGACY_CAPACITY), rdma=rdma
                 )
-                if state is not None and state.receiver.capacity != capacity:
-                    raise ValueError("precopy slot capacity changed")
+                if state is not None and (
+                    state.receiver.capacity != capacity
+                    or rdma != (state.receiver.backend == transport.GPU)
+                    or explicit_tcp != state.explicit_tcp
+                ):
+                    raise ValueError("precopy slot capacity/backend changed")
+            else:
+                rdma = state is not None and state.receiver.backend == transport.GPU
             if state is not None and (state.closed or state.failed):
                 raise ValueError("precopy destination closed/failed")
-            f = frame(controller, data["frame"])
+            f = frame(controller, data["frame"], rdma=rdma)
             if cmd.endswith("prepare") and (
                 f["count"] * t.plan["schema"]["entries"][f["entry"]][-1] > capacity
             ):
@@ -381,13 +421,21 @@ def handle(controller, data):
         elif cmd.endswith("prepare"):
             if state is None:
                 receiver = bulk.Receiver(
-                    d2d.manager(controller).engine, NS(), d2d.pool_device(controller),
+                    (
+                        transport.handle(d2d.manager(controller).engine)
+                        if rdma
+                        else d2d.manager(controller).engine
+                    ),
+                    NS(),
+                    d2d.pool_device(controller),
+                    backend=transport.GPU if rdma else transport.TCP,
                     capacity=capacity,
                 )
                 state = t.precopy = Destination(
                     receiver,
                     [0] * len(t.plan["schema"]["entries"]),
                     plan_hash(t.plan),
+                    explicit_tcp=explicit_tcp,
                 )
             if state.pending is None:
                 state.pending = dict(
@@ -397,6 +445,8 @@ def handle(controller, data):
                     region=state.receiver.prepare(),
                     sequence=state.receiver.sequence,
                 )
+                if explicit_tcp:
+                    state.pending["tcp"] = True
             result = dict(receive=state.pending)
         elif cmd.endswith("copy"):
             replayed = saved is not None
@@ -411,25 +461,45 @@ def handle(controller, data):
                         )
                     table = tables(controller)[f["entry"]]
                     ids = page_ids(controller, record.req, f["start"], f["count"])
-                    data_tensor = ready = None
-                    try:
-                        data_tensor = table.index_select(0, ids)
-                        ready = d2d.dp.event(device)
-                        ready.synchronize()
-                    except BaseException:
-                        d2d.dp.io_for(record.req).poison()
-                        record.req._handoff_transfer_unsafe = True
-                        # Retain the view and gather if a GPU read is unproven.
-                        record.gpu_hold = (table, ids, data_tensor, ready)
-                        raise
-                    if record.sender is None:
-                        record.sender = bulk.Sender(
-                            d2d.manager(controller).engine, NS(), device,
-                            capacity=dest["region"]["size"] - bulk.FOOTER,
-                        )
-                    size = record.sender.write(
-                        data_tensor, ready, dest["region"], dest["sequence"]
+                    engine = (
+                        tcp_engine(controller) if explicit_tcp
+                        else d2d.manager(controller).engine
                     )
+                    capacity = region["size"] - bulk.FOOTER
+                    if record.sender is None:
+                        catalog = transport.Catalog(engine, device) if rdma else None
+                        record.sender = bulk.Sender(
+                            engine,
+                            NS(),
+                            device,
+                            catalog=catalog,
+                            capacity=min(capacity, bulk.CAPACITY),
+                            rdma_capacity=capacity if rdma else None,
+                        )
+                    if rdma:
+                        ready = d2d.dp.event(device)
+                        try:
+                            size = record.sender.write_rows(
+                                [(table, ids)], ready, region, dest["sequence"]
+                            )
+                        except BaseException:
+                            if record.sender.copy_owner is not None:
+                                record.gpu_hold = record.sender.copy_owner
+                            raise
+                    else:
+                        data_tensor = ready = None
+                        try:
+                            data_tensor = table.index_select(0, ids)
+                            ready = d2d.dp.event(device)
+                            ready.synchronize()
+                        except BaseException:
+                            d2d.dp.io_for(record.req).poison()
+                            record.req._handoff_transfer_unsafe = True
+                            record.gpu_hold = (table, ids, data_tensor, ready)
+                            raise
+                        size = record.sender.write(
+                            data_tensor, ready, region, dest["sequence"]
+                        )
                     saved = dict(receive=dest, bytes=size)
                     record.proofs[f["chunk"]] = saved
                     record.mappings[f["chunk"]] = ids.cpu().tolist()
@@ -449,25 +519,39 @@ def handle(controller, data):
                         bulk_nonce=receiver.nonce,
                         bulk_sequence=receiver.sequence,
                     )
-                    copied = receiver.consume(
-                        header, proof["bytes"], controller.config.drain_timeout
-                    )
                     from .dsv41_receive import scatter_prefix
 
                     table = tables(controller)[f["entry"]]
                     entry = t.plan["schema"]["entries"][f["entry"]]
                     ids = page_ids(controller, t.req, f["start"], f["count"])
-                    scatter_started = True
-                    scatter_prefix(
-                        table,
-                        copied.reshape(f["count"], -1),
-                        ids,
-                        f["start"],
-                        (f["start"] + f["count"]) * controller.pool.page_size,
-                        controller.pool.page_size,
-                        entry[1],
-                        d2d.key_layout(controller, entry[2]),
-                    )
+
+                    def scatter(copied):
+                        nonlocal scatter_started
+                        scatter_started = True
+                        scatter_prefix(
+                            table,
+                            copied.reshape(f["count"], -1),
+                            ids,
+                            f["start"],
+                            (f["start"] + f["count"]) * controller.pool.page_size,
+                            controller.pool.page_size,
+                            entry[1],
+                            d2d.key_layout(controller, entry[2]),
+                        )
+
+                    if rdma:
+                        receiver.consume(
+                            header,
+                            proof["bytes"],
+                            controller.config.drain_timeout,
+                            apply=scatter,
+                        )
+                    else:
+                        scatter(
+                            receiver.consume(
+                                header, proof["bytes"], controller.config.drain_timeout
+                            )
+                        )
                     # Native row reuse must wait for the scatter, independently
                     # of private Receiver retirement.
                     t.ready = d2d.dp.event(table.device)

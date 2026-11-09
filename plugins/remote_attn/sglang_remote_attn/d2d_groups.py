@@ -23,7 +23,9 @@ def layers(count, width):
     return [tuple(range(lo, min(lo + width, count))) for lo in range(0, count, width)]
 
 
-def frames(entries, pages, width, capacity, *, start_page=0, only_group=None):
+def frames(
+    entries, pages, width, capacity, *, start_page=0, only_group=None, prefixes=None
+):
     """Pack rows of distinct native KV producers within logical layer ranges.
 
     A producer is sent once even if multiple logical layers share its KV.
@@ -40,7 +42,7 @@ def frames(entries, pages, width, capacity, *, start_page=0, only_group=None):
         for i, stride in groups[group]:
             if not 0 < stride <= capacity:
                 raise ValueError("D2D global row exceeds frame budget")
-            start = start_page
+            start = max(start_page, prefixes[i]) if prefixes is not None else start_page
             while start < pages:
                 count = min(pages - start, (capacity - used) // stride)
                 if not count or len(frame) == MAX_SEGMENTS:
@@ -100,3 +102,16 @@ def range_frames(entries, prefix, page, width, token_range, capacity):
                 only_group=group,
             ):
                 yield dict(layer_group=group, token_range=[lo, hi], segments=segments)
+
+
+def rdma_frames(entries, prefix, page, width, capacity, prefixes):
+    """Pack remaining pages across the old token rectangles, layer group first."""
+    pages = (prefix + page - 1) // page
+    for segments in frames(entries, pages, width, capacity, prefixes=prefixes):
+        group = entries[segments[0]["entry"]][2] // width
+        yield dict(
+            layer_group=group,
+            token_range=[0, prefix],
+            segments=segments,
+            wide_range=True,
+        )

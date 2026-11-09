@@ -209,9 +209,10 @@ class Slab:
             backend=self.backend,
         )
 
-    def view(self, region, spec):
+    def view(self, region, spec, *, offset=None):
         shape, dtype, size = tensor_spec(spec, region)
-        return self.tensor.narrow(0, OFFSETS[region], size).view(dtype).reshape(shape)
+        offset = OFFSETS[region] if offset is None else offset
+        return self.tensor.narrow(0, offset, size).view(dtype).reshape(shape)
 
     def stamp(self, nonce, sequence, region, size):
         if type(sequence) is not int or not 0 < sequence < 2**64:
@@ -240,12 +241,16 @@ class Slab:
         sizes = [tensor_spec(value, region)[2] for region, value in entries]
         offsets = [self.offsets[region] for region, _ in entries]
         if packed:
-            if self.backend != transport.TCP or [r for r, _ in entries] != [1, 2]:
-                raise ValueError("packed return requires TCP O/LSE regions")
-            # Only the actual O bytes precede LSE, never the 4 MiB O capacity.
-            # Tag 3 identifies a single ordered O+LSE+footer descriptor.
-            offsets[1] = offsets[0] + sizes[0]
-            spans = [(offsets[0], sum(sizes), 3)]
+            if [r for r, _ in entries] != [1, 2]:
+                raise ValueError("packed return requires O/LSE regions")
+            # Align GPU LSE for typed FP32 access. TCP keeps its exact byte
+            # layout, including the existing arrival footer on the descriptor.
+            offsets[1] = (
+                packed_lse_offset(sizes[0])
+                if self.backend == transport.GPU
+                else offsets[0] + sizes[0]
+            )
+            spans = [(offsets[0], offsets[1] + sizes[1] - offsets[0], 3)]
         else:
             spans = [
                 (offset, size, r)
@@ -373,13 +378,17 @@ def spec(tensor):
     return dict(shape=list(tensor.shape), dtype=str(tensor.dtype).split(".")[-1])
 
 
-def pack(slab, region, tensors):
+def packed_lse_offset(o_size):
+    return OFFSETS[1] + (o_size + 3) // 4 * 4
+
+
+def pack(slab, region, tensors, *, offset=None):
     first = tensors[0]
     if any(t.shape != first.shape or t.dtype != first.dtype for t in tensors):
         raise ValueError("Q/O frame rows have different shapes or dtypes")
     value = spec(first)
     value["shape"].insert(0, len(tensors))
-    dst = slab.view(region, value)
+    dst = slab.view(region, value, offset=offset)
     if len(tensors) == 1:
         dst[0].copy_(first)
     else:
@@ -600,6 +609,7 @@ class Client:
                 version=WIRE_VERSION,
                 inline_ack=True,
                 packed_return=True,
+                gpu_packed_return=True,
                 route=self.route,
                 native_session=self.plane.session,
                 capabilities=self.plane.catalog.offer,
@@ -615,8 +625,6 @@ class Client:
         self.session = result["session"]
         self.inline_ack = result.get("inline_ack") is True
         self.packed_return = result.get("packed_return") is True
-        if self.packed_return and backend != transport.TCP:
-            raise ValueError("packed return requires TCP backend")
         self.slab = Slab(self.plane, backend)
         result = self.rpc(
             dict(
@@ -691,10 +699,26 @@ class Client:
                     # RDMA writes the registered GPU slab. Keep the backing
                     # and its consumption proof until the owned D2D reads finish.
                     self.slab.copy_owner = []
-                    out = self.slab.view(1, result["o"]).clone()
-                    self.slab.copy_owner.append(out)
-                    lse = self.slab.view(2, result["lse"]).clone()
-                    self.slab.copy_owner.append(lse)
+                    if self.packed_return:
+                        sizes, offsets, spans = self.slab.wire_layout(
+                            entries, packed=True
+                        )
+                        start, size, _tag = spans[0]
+                        owned = self.slab.tensor.narrow(0, start, size).clone()
+                        self.slab.copy_owner.append(owned)
+                        out, lse = [
+                            owned.narrow(0, offset - start, length)
+                            .view(tensor_spec(value, region)[1])
+                            .reshape(value["shape"])
+                            for (region, value), offset, length in zip(
+                                entries, offsets, sizes
+                            )
+                        ]
+                    else:
+                        out = self.slab.view(1, result["o"]).clone()
+                        self.slab.copy_owner.append(out)
+                        lse = self.slab.view(2, result["lse"]).clone()
+                        self.slab.copy_owner.append(lse)
                     self.consumed = event(self.plane.device)
                 shape = tuple(query_spec["shape"])
                 if out.shape != shape or lse.shape != shape[:-1]:
@@ -865,7 +889,14 @@ class Job:
             slab = self.lane.slab
             slab.copy_owner = outs
             o_spec = pack(slab, 1, [o for _, o, _ in outs])
-            l_spec = pack(slab, 2, [l for _, _, l in outs])
+            lse_offset = None
+            if slab.backend == transport.GPU and self.lane.packed_return:
+                o_size = tensor_spec(o_spec, 1)[2]
+                o_end = OFFSETS[1] + o_size
+                lse_offset = packed_lse_offset(o_size)
+                if o_end != lse_offset:
+                    slab.tensor[o_end:lse_offset].zero_()
+            l_spec = pack(slab, 2, [l for _, _, l in outs], offset=lse_offset)
             t_compute = time.perf_counter()
             return_timing = plane.write(
                 slab,
@@ -968,7 +999,9 @@ def handle(hub, hc, frame):
         if not isinstance(session, str) or not 0 < len(session) <= 512:
             raise ValueError("Q/O capability endpoint invalid")
         inline_ack = frame.get("inline_ack") is True
-        packed_return = frame.get("packed_return") is True and backend == transport.TCP
+        packed_return = frame.get("packed_return") is True and (
+            backend == transport.TCP or frame.get("gpu_packed_return") is True
+        )
         hc.gpu_negotiation = (
             backend,
             native_session,

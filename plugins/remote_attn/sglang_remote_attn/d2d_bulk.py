@@ -16,6 +16,7 @@ from . import remote_data_plane as dp
 
 LEGACY_CAPACITY = 4 * 1024 * 1024
 CAPACITY = 16 * 1024 * 1024
+RDMA_CAPACITY = 64 * 1024 * 1024
 PROTOCOL = "mooncake-host-v1"
 FOOTER = 32
 WIRE_CAPACITY = CAPACITY + FOOTER
@@ -59,19 +60,30 @@ def descriptor(value):
         or type(value.get("base")) is not int
         or value["base"] <= 0
         or type(value.get("size")) is not int
-        or value["size"] not in (LEGACY_CAPACITY + FOOTER, WIRE_CAPACITY)
+        or (
+            value["size"] not in (LEGACY_CAPACITY + FOOTER, WIRE_CAPACITY)
+            and not (
+                value["protocol"] == transport.GPU
+                and value["size"] == RDMA_CAPACITY + FOOTER
+            )
+        )
         or not isinstance(value.get("session"), str)
         or not 0 < len(value["session"]) <= 512
         or not isinstance(value.get("nonce"), str)
         or len(value["nonce"]) != 32
         or any(c not in "0123456789abcdef" for c in value["nonce"])
     ):
-        raise ValueError("invalid D2D Mooncake host region")
+        raise ValueError("invalid D2D Mooncake bulk region")
     return dict(value)
 
 
-def frame_capacity(value):
-    if type(value) is not int or value not in (LEGACY_CAPACITY, CAPACITY):
+def frame_capacity(value, *, rdma=False):
+    allowed = (
+        (LEGACY_CAPACITY, CAPACITY, RDMA_CAPACITY)
+        if rdma
+        else (LEGACY_CAPACITY, CAPACITY)
+    )
+    if type(value) is not int or value not in allowed:
         raise ValueError("unsupported D2D bulk frame capacity")
     return value
 
@@ -134,8 +146,22 @@ class Registered:
 
 
 class Sender(Registered):
-    def __init__(self, engine, req, device, catalog=None, *, capacity=CAPACITY):
+    def __init__(
+        self,
+        engine,
+        req,
+        device,
+        catalog=None,
+        *,
+        capacity=CAPACITY,
+        rdma_capacity=None
+    ):
         self.capacity = frame_capacity(capacity)
+        self.rdma_capacity = (
+            self.capacity
+            if rdma_capacity is None
+            else frame_capacity(rdma_capacity, rdma=True)
+        )
         super().__init__(engine, req)
         self.catalog = catalog
         self.device = torch.device(device)
@@ -166,7 +192,7 @@ class Sender(Registered):
         try:
             if backend == transport.GPU:
                 self.tensor = torch.empty(
-                    self.capacity + FOOTER, dtype=torch.uint8, device=self.device
+                    self.rdma_capacity + FOOTER, dtype=torch.uint8, device=self.device
                 )
                 dp.event(self.device).synchronize()
                 self.stream = torch.cuda.Stream(device=self.device)
@@ -181,17 +207,27 @@ class Sender(Registered):
     def write(self, data, ready, region, sequence):
         region = descriptor(region)
         size = data.numel() * data.element_size()
+        return self._write(data, None, size, ready, region, sequence)
+
+    def write_rows(self, rows, ready, region, sequence):
+        region = descriptor(region)
+        if region["protocol"] != transport.GPU:
+            raise ValueError("direct D2D gather requires a GPU region")
+        size = sum(table.shape[1] * indices.numel() for table, indices in rows)
+        return self._write(None, rows, size, ready, region, sequence)
+
+    def _write(self, data, rows, size, ready, region, sequence):
+        gpu = region["protocol"] == transport.GPU
+        capacity = self.rdma_capacity if gpu else self.capacity
         if (
-            not 0 < size <= min(self.capacity, region["size"] - FOOTER)
+            not 0 < size <= min(capacity, region["size"] - FOOTER)
             or type(sequence) is not int
             or not 0 < sequence < 2**64
         ):
             raise ValueError("invalid D2D bulk size/sequence")
         with self.lock:
             self.check()
-            self.configure(
-                transport.GPU if region["protocol"] == transport.GPU else transport.TCP
-            )
+            self.configure(transport.GPU if gpu else transport.TCP)
             if self.session is not None and self.session != region["session"]:
                 raise ValueError("D2D bulk destination session changed")
             lane = self.lanes.get(region["nonce"])
@@ -207,13 +243,22 @@ class Sender(Registered):
             try:
                 # CudaPinnedSlot uses a private nonblocking D2H stream, waits
                 # only for the producing event and proves completion before TE.
-                self.copy_owner = (data, ready)
-                if self.backend == transport.GPU:
+                self.copy_owner = (data, rows, ready)
+                if gpu:
                     with torch.cuda.stream(self.stream):
                         self.stream.wait_event(ready)
-                        self.tensor[:size].copy_(
-                            data.reshape(-1).view(torch.uint8), non_blocking=True
-                        )
+                        if rows is None:
+                            self.tensor[:size].copy_(
+                                data.reshape(-1).view(torch.uint8), non_blocking=True
+                            )
+                        else:
+                            offset = 0
+                            for table, indices in rows:
+                                count, stride = indices.numel(), table.shape[1]
+                                end = offset + count * stride
+                                dst = self.tensor[offset:end].view(count, stride)
+                                torch.index_select(table, 0, indices, out=dst)
+                                offset = end
                         copied = dp.event(self.device)
                     copied.synchronize()
                     self.copy_owner = None
@@ -258,8 +303,10 @@ class Sender(Registered):
 
 
 class Receiver(Registered):
-    def __init__(self, engine, req, device, backend=transport.TCP, *, capacity=CAPACITY):
-        self.capacity = frame_capacity(capacity)
+    def __init__(
+        self, engine, req, device, backend=transport.TCP, *, capacity=CAPACITY
+    ):
+        self.capacity = frame_capacity(capacity, rdma=backend == transport.GPU)
         super().__init__(engine, req)
         self.device = torch.device(device)
         self.backend = backend
@@ -296,7 +343,7 @@ class Receiver(Registered):
             nonce=self.nonce,
         )
 
-    def consume(self, header, size, timeout):
+    def consume(self, header, size, timeout, *, apply=None):
         self.check()
         if (
             type(size) is not int
@@ -321,6 +368,14 @@ class Receiver(Registered):
                 if time.monotonic() >= deadline:
                     raise TimeoutError("D2D bulk host arrival is unproven")
                 time.sleep(0.001)
+        if apply is not None:
+            # The callback enqueues all readers on this copy stream. The slot
+            # stays registered and cannot be overwritten before that fence.
+            if self.backend != transport.GPU:
+                raise ValueError("direct D2D consumption requires a GPU slot")
+            apply(self.tensor[:size])
+            self.consumed = dp.event(self.device)
+            return None
         # Return independent GPU backing; slot reuse waits for this copy event.
         data = self.tensor[:size].to(self.device, non_blocking=True, copy=True)
         self.consumed = dp.event(self.device)

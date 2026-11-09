@@ -378,11 +378,15 @@ class Source:
     remote_entries_at_freeze: tuple = ()
     frozen_output: tuple = ()
 
-    def bulk_capacity(self):
+    def bulk_capacity(self, *, rdma=False):
         # Size the registration from the largest possible frame, not total KV.
         # Small plans and small token rectangles stay on the legacy-size slot.
         pages = self.pages.numel()
-        span = min(pages, max(1, self.token_range // self.owner.pool.page_size))
+        span = (
+            pages
+            if rdma
+            else min(pages, max(1, self.token_range // self.owner.pool.page_size))
+        )
         groups = {}
         largest = max((d["rows"] * d["stride"] for d, _, _ in self.states), default=0)
         for kind, _, layer, *_, stride in self.schema["entries"]:
@@ -392,6 +396,8 @@ class Source:
             else:
                 largest = max(largest, pages * stride)
         largest = max(largest, span * max(groups.values(), default=0))
+        if rdma and largest > bulk.CAPACITY:
+            return bulk.RDMA_CAPACITY
         return bulk.CAPACITY if largest > bulk.LEGACY_CAPACITY else bulk.LEGACY_CAPACITY
 
     def initialize(self):
@@ -428,9 +434,18 @@ class Source:
         self.final_event = dp.event(self.pages.device)
         catalog = transport.Catalog(manager(self.owner).engine, self.pages.device)
         capacity = self.bulk_capacity()
+        rdma_capacity = (
+            self.bulk_capacity(rdma=True)
+            if self.token_range and transport.GPU in catalog.engines
+            else None
+        )
         self.bulk_sender = bulk.Sender(
-            manager(self.owner).engine, req, self.pages.device, catalog=catalog,
+            manager(self.owner).engine,
+            req,
+            self.pages.device,
+            catalog=catalog,
             capacity=capacity,
+            rdma_capacity=rdma_capacity,
         )
         hub = remote.runtime().get_remote_hub(s)
         isolated = hub.prepare_d2d_bulk()
@@ -462,7 +477,8 @@ class Source:
             source_partial_remote=self.partial_remote,
             source_remote_entries=list(self.remote_entries_at_freeze),
         )
-        self.meta["route"] = self.service
+        if rdma_capacity is not None:
+            self.meta["bulk_rdma_frame_bytes"] = rdma_capacity
 
     def check_read(self, *, allow_aborted=False):
         if (
@@ -597,9 +613,21 @@ def execute(job, stream, cache):
             return reply(torch.empty(0, dtype=torch.uint8))
         if action not in {"read", "read_group"}:
             raise ValueError("unknown D2D snapshot action")
+    region = bulk.descriptor(h.get("bulk_region"))
+    sequence = h.get("bulk_sequence")
+    wide = h.get("wide_range") is True
+    if wide and (
+        action != "read_group"
+        or region["protocol"] != transport.GPU
+        or "bulk_rdma_frame_bytes" not in source.meta
+    ):
+        raise ValueError("D2D wide frame requires the RDMA capability")
     selected = None
     if action == "read_group":
-        selected = grouping.validate_segments(source, h.get("segments"), LIMIT)
+        capacity = source.bulk_sender.rdma_capacity if wide else LIMIT
+        selected = grouping.validate_segments(
+            source, h.get("segments"), min(capacity, region["size"] - bulk.FOOTER)
+        )
         rectangle = h.get("token_range")
         if (
             not isinstance(rectangle, list)
@@ -611,7 +639,12 @@ def execute(job, stream, cache):
         lo, hi = rectangle
         page = source.owner.pool.page_size
         step = max(page, source.token_range // page * page)
-        if lo < 0 or lo % step or hi != min(lo + step, source.prefix_len) or lo >= hi:
+        valid_range = (
+            lo == 0 and hi == source.prefix_len
+            if wide
+            else lo >= 0 and lo % step == 0 and hi == min(lo + step, source.prefix_len)
+        )
+        if not valid_range or lo >= hi:
             raise ValueError("D2D token range outside frozen plan")
         for segment in h["segments"]:
             if (
@@ -640,13 +673,19 @@ def execute(job, stream, cache):
             or count * table.shape[1] > LIMIT
         ):
             raise ValueError("D2D read range exceeds frozen ownership/budget")
-    region = bulk.descriptor(h.get("bulk_region"))
-    sequence = h.get("bulk_sequence")
     device = source.globals[0].device if selected is not None else table.device
     with on_device(device), on_stream(device, stream):
         if stream is not None:
             stream.wait_event(source.final_event)
-        if selected is None:
+        if wide:
+            rows = [
+                (t, source.pages[start : start + n].to(torch.int64))
+                for t, start, n in selected
+            ]
+            size = source.bulk_sender.write_rows(
+                rows, dp.event(device), region, sequence
+            )
+        elif selected is None:
             data = table.index_select(
                 0, indices[lo : lo + count].to(torch.int64)
             ).contiguous()
@@ -660,8 +699,8 @@ def execute(job, stream, cache):
                     for t, start, n in selected
                 ]
             )
-        ready = dp.event(device)
-        size = source.bulk_sender.write(data, ready, region, sequence)
+        if not wide:
+            size = source.bulk_sender.write(data, dp.event(device), region, sequence)
         source.postfreeze_bytes += size
     # Empty tensor envelope preserves the authenticated RemoteHub request lease;
     # Receiver checks the host arrival footer before consuming any KV bytes.
@@ -676,8 +715,17 @@ def execute(job, stream, cache):
 
 class Reader:
     def __init__(
-        self, route, destination, epoch, timeout=600, *, owner, req, offer=None,
+        self,
+        route,
+        destination,
+        epoch,
+        timeout=600,
+        *,
+        owner,
+        req,
+        offer=None,
         capacity=bulk.LEGACY_CAPACITY,
+        rdma_capacity=None,
     ):
         self.route, self.destination, self.epoch = route, destination, epoch
         self.client = remote.runtime().TargetClient(route["host"], route["port"])
@@ -688,12 +736,33 @@ class Reader:
         self.owner, self.req = owner, req
         self.offer = offer if offer is not None else transport.tcp_offer()
         self.capacity = bulk.frame_capacity(capacity)
+        self.rdma_capacity = rdma_capacity
+        self.catalog = self.backend = None
+        self.wide = False
         self.bulk = None
-        self.read_timing_ns = dict(count=0, slot_setup=0, slot_wait=0, rpc=0,
-                                   source_queue=0, source_exec=0, receive=0,
-                                   max_frame=0)
+        self.read_timing_ns = dict(
+            count=0,
+            bytes=0,
+            max_frame_bytes=0,
+            slot_setup=0,
+            slot_wait=0,
+            rpc=0,
+            source_queue=0,
+            source_exec=0,
+            receive=0,
+            max_frame=0,
+        )
 
-    def call(self, action, **fields):
+    def select_backend(self):
+        if self.catalog is None:
+            device = pool_device(self.owner)
+            self.catalog = transport.Catalog(manager(self.owner).engine, device)
+            self.backend = self.catalog.select(self.offer)
+            if self.backend == transport.GPU and self.rdma_capacity is not None:
+                self.capacity = bulk.frame_capacity(self.rdma_capacity, rdma=True)
+                self.wide = True
+
+    def call(self, action, *, apply=None, **fields):
         if self.closed:
             raise RuntimeError("D2D reader already closed")
         h = dict(
@@ -715,11 +784,12 @@ class Reader:
             return response, out.view(torch.uint8)[: response["bytes"]]
         started = time.perf_counter_ns()
         if self.bulk is None:
-            device = pool_device(self.owner)
-            catalog = transport.Catalog(manager(self.owner).engine, device)
-            backend = catalog.select(self.offer)
+            self.select_backend()
             self.bulk = bulk.Receiver(
-                catalog.engines[backend], self.req, device, backend=backend,
+                self.catalog.engines[self.backend],
+                self.req,
+                pool_device(self.owner),
+                backend=self.backend,
                 capacity=self.capacity,
             )
         setup_at = time.perf_counter_ns()
@@ -741,10 +811,12 @@ class Reader:
                 size = response.get("bulk_bytes")
                 # Existing callers validate row counts against their own schema.
                 header = dict(response, bytes=size)
-                data = self.bulk.consume(header, size, self.timeout)
+                data = self.bulk.consume(header, size, self.timeout, apply=apply)
                 done = time.perf_counter_ns()
                 timings = self.read_timing_ns
                 timings["count"] += 1
+                timings["bytes"] += size
+                timings["max_frame_bytes"] = max(timings["max_frame_bytes"], size)
                 timings["slot_setup"] += setup_at - started
                 timings["slot_wait"] += send_at - setup_at
                 timings["rpc"] += reply_at - send_at
@@ -866,6 +938,7 @@ class Target(NativeTarget):
     token_range: int = 1024
     group_frames: int = 0
     grouped_entries: int = 0
+    rdma_frame_capacity: int | None = None
     import_timing_ns: dict = field(default_factory=dict)
 
     def refresh(self):
@@ -954,7 +1027,9 @@ class Target(NativeTarget):
                 req=req,
                 offer=self.reader.offer,
                 capacity=self.reader.capacity,
+                rdma_capacity=self.rdma_frame_capacity,
             )
+            self.bulk_reader.select_backend()
             copy_device = pool_device(self.owner)
             self.copy_stream = new_stream(copy_device)
             with on_device(copy_device), on_stream(copy_device, self.copy_stream):
@@ -976,48 +1051,25 @@ class Target(NativeTarget):
                     for i, end in enumerate(prefixes):
                         if end == pages.numel() and entries[i][0] == "kv":
                             self.events[i] = dp.event(copy_device)
-                    for rectangle in grouping.range_frames(
-                        entries,
-                        self.coverage.prefix_len,
-                        pool.page_size,
-                        self.group_size,
-                        self.token_range,
-                        self.bulk_reader.capacity,
-                    ):
-                        frame = []
-                        for segment in rectangle["segments"]:
-                            lo = max(segment["start"], prefixes[segment["entry"]])
-                            hi = segment["start"] + segment["count"]
-                            if lo < hi:
-                                frame.append(dict(segment, start=lo, count=hi - lo))
-                        if not frame:
-                            continue
-                        rectangle = dict(rectangle, segments=frame)
-                        if self.stop.is_set():
-                            return  # Abort joins this worker and fences its copy stream.
-                        _h, data = self.bulk_reader.call("read_group", **rectangle)
+
+                    def apply_frame(data, segments):
                         expected = sum(
                             segment["count"] * entries[segment["entry"]][-1]
-                            for segment in frame
+                            for segment in segments
                         )
                         if data.numel() != expected:
                             raise ValueError("truncated D2D packed frame")
-                        self.group_frames += 1
-                        self.grouped_entries = max(
-                            self.grouped_entries, len({p["entry"] for p in frame})
-                        )
                         offset = 0
-                        for segment in frame:
+                        for segment in segments:
                             i, lo, count = (
                                 segment[k] for k in ("entry", "start", "count")
                             )
                             entry = entries[i]
                             dst = matrix(tensors[i], entry[-1])
                             size = count * dst.shape[1]
-                            src = data[offset : offset + size].reshape(count, -1)
                             scatter_prefix(
                                 dst,
-                                src,
+                                data[offset : offset + size].reshape(count, -1),
                                 pages[lo : lo + count],
                                 lo,
                                 self.coverage.prefix_len,
@@ -1028,6 +1080,47 @@ class Target(NativeTarget):
                             offset += size
                             if coverage.add(i, lo, lo + count):
                                 self.events[i] = dp.event(copy_device)
+
+                    layout = (
+                        entries,
+                        self.coverage.prefix_len,
+                        pool.page_size,
+                        self.group_size,
+                    )
+                    capacity = self.bulk_reader.capacity
+                    wide = self.bulk_reader.wide
+                    rectangles = (
+                        grouping.rdma_frames(*layout, capacity, prefixes)
+                        if wide
+                        else grouping.range_frames(*layout, self.token_range, capacity)
+                    )
+                    for rectangle in rectangles:
+                        frame = rectangle["segments"]
+                        if not wide:
+                            frame = []
+                            for segment in rectangle["segments"]:
+                                lo = max(segment["start"], prefixes[segment["entry"]])
+                                hi = segment["start"] + segment["count"]
+                                if lo < hi:
+                                    frame.append(dict(segment, start=lo, count=hi - lo))
+                            if not frame:
+                                continue
+                            rectangle = dict(rectangle, segments=frame)
+                        if self.stop.is_set():
+                            return  # Abort joins this worker and fences its copy stream.
+                        if wide:
+                            self.bulk_reader.call(
+                                "read_group",
+                                apply=lambda data: apply_frame(data, frame),
+                                **rectangle,
+                            )
+                        else:
+                            _h, data = self.bulk_reader.call("read_group", **rectangle)
+                            apply_frame(data, frame)
+                        self.group_frames += 1
+                        self.grouped_entries = max(
+                            self.grouped_entries, len({p["entry"] for p in frame})
+                        )
                 else:
                     for i, (tensor, entry) in enumerate(
                         zip(
@@ -1571,6 +1664,7 @@ def prepare_import_io(target, transfer, session, jobs):
                 offer=transfer["bulk_capabilities"],
                 capacity=transfer.get("bulk_frame_bytes", bulk.LEGACY_CAPACITY),
             )
+            target.rdma_frame_capacity = transfer.get("bulk_rdma_frame_bytes")
             attached = time.perf_counter_ns()
             target.import_timing_ns["attach"] = attached - started
             meta, _ = reader.call("manifest", gpu_session=session)
@@ -1694,6 +1788,8 @@ def import_request(controller, data):
     ):
         raise ValueError("D2D transfer epoch/TP mismatch")
     bulk.frame_capacity(transfer.get("bulk_frame_bytes", bulk.LEGACY_CAPACITY))
+    if "bulk_rdma_frame_bytes" in transfer:
+        bulk.frame_capacity(transfer["bulk_rdma_frame_bytes"], rdma=True)
     transport.validate(transfer.get("bulk_capabilities"))
     transport.Catalog(manager(controller).engine, pool_device(controller)).select(
         transfer["bulk_capabilities"]

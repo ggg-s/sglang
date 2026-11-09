@@ -156,11 +156,23 @@ TCP 路径保留独立 D2H Host staging、连续 payload/footer、目标 H2D 和
 GPU backend 使用独立、已注册的 GPU staging：
 
 ```text
-原生 GPU KV → gather → GPU staging → GPUDirect RDMA → GPU staging → owned GPU copy → scatter
+原生 GPU KV → gather 到注册 GPU 槽 → GPUDirect RDMA → 注册 GPU 槽 → scatter
 ```
 
-GPU staging 不直接别名原生 KV 页，目标独立 copy 保持原有 slot 与 scatter 生命周期。
-DSV 每个 slot payload 上限 4 MiB；Qwen 每层 slot 的 token 数同时受 4 MiB 上限限制。
+GPU staging 与原生 KV 使用独立分配。旧 GPU wire 和状态安装保留独立 copy。
+DSV4／DSV4.1 和 Qwen hybrid 共用的 bulk 路径，在 GPU RDMA 上按需要选择
+4、16 或 64 MiB 帧。冻结后在同一层组内跨 token 小区间打包，打包前跳过已封存
+的 precopy 页。源端直接 gather 到注册槽，目标端在接收槽上 scatter，复用槽前等待
+消费事件。每帧由一条 Mooncake 写描述符提交。TCP 沿用 4／16 MiB、原 token 区间
+和有序 footer。Qwen dense 的每层 slot 仍受原有 4 MiB 上限约束。
+
+precopy 在源和目标的所有 rank 都报告 GPU RDMA 可用时选择 GPU 槽，并在首次
+PREPARE 时记录传输方式和容量。混合节点可协商双方的 TCP engine。Remote Attention 的 GPU RDMA 端双方协商后将
+O/LSE 合成一个描述符，旧端点沿用分别写入，TCP 保持现有封包。
+
+`bulk_backend`、`bulk_frame_capacity`、`group_frames` 和 `bulk_reads_ns.max_frame_bytes`
+可核对实际帧口径。Gateway 的 `handoff_timing` 还记录接纳后观察到 D1 复制完成、
+D1 全本地与 D0 KV 释放的时间，包含状态轮询延迟。
 CPU snapshot 诊断输入仍需要一次 H2D，不能作为全 GPU 数据路径的性能样本。
 
 严格顺序：

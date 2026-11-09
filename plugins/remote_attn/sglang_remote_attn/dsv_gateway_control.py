@@ -92,6 +92,10 @@ def migration_status(controller, epoch, *, include_transfer=True):
             bulk_reads_ns=dict(target.bulk_reader.read_timing_ns) if target.bulk_reader else {},
             group_size=target.group_size,
             group_frames=target.group_frames,
+            bulk_backend=target.bulk_reader.backend if target.bulk_reader else None,
+            bulk_frame_capacity=(
+                target.bulk_reader.capacity if target.bulk_reader else None
+            ),
             max_entries_per_frame=target.grouped_entries,
             prepared=target.allocation_complete
             and target.rpc is not None
@@ -133,6 +137,9 @@ def handle(controller, data):
     scheduler, cmd = controller.scheduler, data["cmd"]
     epoch = data["migration_epoch"]
     if cmd == "d2d_worker_status":
+        from .d2d_precopy import rdma_available
+        from .mooncake_backend import policy
+
         sources, targets = d2d.records(controller)
         _, tickets = reservations.records(controller)
         epochs = set(sources) | set(targets) | set(tickets)
@@ -146,6 +153,8 @@ def handle(controller, data):
             protocol=d2d.VERSION,
             precopy_protocol="closed-page-precopy-v1",
             precopy_frame_bytes=d2d.bulk.CAPACITY,
+            precopy_rdma=rdma_available(controller),
+            precopy_tcp=policy() != "rdma",
             decode_timing=dict(getattr(controller, "decode_timing", {})),
             sparse_timing=dict(getattr(controller, "sparse_stats", {})),
             iter_period_ms=getattr(scheduler, "_handoff_iter_period_ms", None),

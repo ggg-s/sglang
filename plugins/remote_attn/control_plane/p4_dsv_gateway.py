@@ -71,6 +71,16 @@ def handoff_timing(entry):
     timing["cut_to_first_token_ms"] = (
         (b - a) * 1000 if a is not None and b is not None and b >= a else None
     )
+    admitted = timing["target_admitted_at"]
+    for marker in (
+        "dst_copy_observed_at", "dst_local_observed_at", "src_release_observed_at"
+    ):
+        observed = timing[marker] = entry.get(marker)
+        timing["target_to_" + marker.removesuffix("_at") + "_ms"] = (
+            (observed - admitted) * 1000
+            if observed is not None and admitted is not None and observed >= admitted
+            else None
+        )
     return timing
 
 
@@ -388,7 +398,9 @@ class DsvGateway:
             self.cv.notify_all()
             if (
                 self.out is not None
-                and changes.get("dst_first_token_observed_at") is not None
+                and any(changes.get(key) is not None for key in (
+                    "dst_first_token_observed_at", "src_release_observed_at"
+                ))
             ):
                 state = self._entry(rid)
                 self._log_trace(
@@ -922,11 +934,15 @@ class DsvGateway:
             import_ready_at=None,
             target_admitted_at=None,
             dst_first_token_observed_at=None,
+            dst_copy_observed_at=None,
+            dst_local_observed_at=None,
+            src_release_observed_at=None,
             remaining_copy_bytes=None,
             freeze_ack_latency_ms=None,
             plan_before_first_token=False,
             precopy_pending=None,
             precopy_capacity=None,
+            precopy_backend=None,
             precopy_receipts=None,
             precopy_bytes=0,
             precopy_pages=None,
@@ -1077,6 +1093,7 @@ class DsvGateway:
         rid, epoch = entry["rid"], entry["epoch"]
         pending = entry.get("precopy_pending")
         capacity = entry.get("precopy_capacity")
+        backend = entry.get("precopy_backend")
         if pending is None:
             if cut_due:
                 self._update(rid, phase="FREEZE")
@@ -1096,13 +1113,28 @@ class DsvGateway:
             if capacity is None:
                 max_bytes = upper_pages * max(e[-1] for e in schema["entries"])
                 cap = 16 * 1024 * 1024 if max_bytes > 4 * 1024 * 1024 else 4 * 1024 * 1024
-                capacity = min(
-                    [cap] + [
-                        row.get("precopy_frame_bytes", 4 * 1024 * 1024)
-                        for role in ("src", "dst")
-                        for row in self.facts[role]
-                    ]
-                )
+                facts = [self.facts.get(role, []) for role in ("src", "dst")]
+                if all(facts) and all(
+                    row.get("precopy_rdma") is True for rows in facts for row in rows
+                ):
+                    backend = "rdma"
+                elif all(facts) and all(
+                    row.get("precopy_tcp") is True for rows in facts for row in rows
+                ):
+                    backend = "tcp"
+                elif all(facts) and all(
+                    "precopy_tcp" in row for rows in facts for row in rows
+                ):
+                    return  # No common transport. Leave native cut handling intact.
+                if backend == "rdma":
+                    capacity = 64 * 1024 * 1024 if max_bytes > cap else cap
+                else:
+                    capacity = min(
+                        [cap] + [
+                            row.get("precopy_frame_bytes", 4 * 1024 * 1024)
+                            for rows in facts for row in rows
+                        ]
+                    )
             rows = yield from self._precopy_source(entry, "d2d_precopy_status")
             if rows is None:
                 return
@@ -1130,7 +1162,10 @@ class DsvGateway:
                             entry=i, start=ends[i], count=count, chunk=uuid.uuid4().hex
                         ),
                     )
-                    self._update(rid, precopy_pending=pending, precopy_capacity=capacity)
+                    self._update(
+                        rid, precopy_pending=pending, precopy_capacity=capacity,
+                        precopy_backend=backend,
+                    )
                     break
             if pending is None:
                 return
@@ -1146,6 +1181,7 @@ class DsvGateway:
             rows = yield self._command(
                 "dst", "d2d_precopy_prepare", epoch, frame=frame,
                 capacity=capacity or 4 * 1024 * 1024,
+                **({backend: True} if backend else {}),
             )
             self._update(
                 rid,
@@ -1650,17 +1686,31 @@ class DsvGateway:
                 raise RuntimeError(
                     "D2D transport/retirement failed; retaining ownership"
                 )
-            local = all(t and t["local"] for t in targets)
-            released = all(s and s["released"] and s["kv_released"] for s in sources)
+            local = bool(targets) and all(t and t["local"] for t in targets)
+            released = bool(sources) and all(
+                s and s["released"] and s["kv_released"] for s in sources
+            )
+            copied = bool(targets) and all(t and t.get("copied") for t in targets)
+            observed_at = time.time()
+            updates = {
+                marker: observed_at
+                for marker, seen in (
+                    ("dst_copy_observed_at", copied),
+                    ("dst_local_observed_at", local),
+                    ("src_release_observed_at", released),
+                )
+                if seen and entry.get(marker) is None
+            }
             if local and released:
                 if request["finished"] and request["kv_released"]:
-                    self._update(
-                        rid,
+                    updates.update(
                         phase="CANCELLED" if entry["cancel_requested"] else "DONE",
                         final_output_ids=request["output_ids"],
                     )
-                elif phase != "LOCAL":
-                    self._update(rid, phase="LOCAL")
+                else:
+                    updates["phase"] = "LOCAL"
+            if updates:
+                self._update(rid, **updates)
 
     def _drive(self, step):
         try:
