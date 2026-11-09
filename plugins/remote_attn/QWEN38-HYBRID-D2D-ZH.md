@@ -158,13 +158,62 @@ peer schema 中的 `family=qwen-gdn-d2d-v1` 防止把 DSV 或不同模型状态�
 回归与 4060 结果见 [验证记录](validation/qwen38-hybrid-4060.md) 和
 [原生配置启动回归](validation/qwen38-native-layer-mapping-4060.md)。8 GB 4060
 验证小尺寸原生池、实际 CUDA GDN/FlashInfer 和 Mooncake TCP；不等于完整 27B
-权重、TP 多卡或真实 RDMA HCA/CQ 验收。整模型部署仍需目标显存与 TP 配置实测。
+权重、TP 多卡或真实 RDMA HCA/CQ 验收。完整 27B 的 TP2+TP2 TCP 实测见下节。
 
 P prefix cache 的原生 CUDA/PD 验证见 [专项验证](validation/qwen-hybrid-prefill-cache-4060.md)。
 
 本次 PD Remote、缓存读 lease 与网关 journal 修复的验证见
 [专项记录](validation/gateway-journal-hybrid-pd-4060.md)。
 
+
+## 39 机 Qwen3.8-27B-FP8 PD 实测
+
+39 机使用 RTX 5090，P TP2 + D TP2，开启 CUDA Graph 和 overlap schedule。
+Mooncake 使用 TCP（`MC_FORCE_TCP=1`），机器没有 RDMA 或 GPU P2P。
+负载为 64K 输入、128 输出、单波次 4 并发。延迟单位为 ms，尾延迟沿用原测量口径。
+
+### 冷缓存（0% 命中，`2b859c206f`）
+
+分段臂在 P、D 两端显式开启 `HANDOFF_HYBRID_SPLIT_PREFILL=1`
+（本次测试脚本用 `SPLIT_PREFILL=1`），切分比例由 D 端设置。
+分段默认关闭，冷请求在默认门控下走原生 PD。
+
+| 指标 | 原生 PD | cut 0.5 | cut 0.75 |
+| --- | ---: | ---: | ---: |
+| TTFT 均值 | 28,283 | **20,630（−27.1%）** | 24,281（−14.1%） |
+| TTFT 尾 | 40,505 | **30,145（−25.6%）** | 33,785（−16.6%） |
+| E2E 均值 | 29,870 | 28,885（−3.3%） | **26,937（−9.8%）** |
+| E2E 尾 | 42,315 | **32,313（−23.6%）** | 35,837（−15.3%） |
+| ITL p90 | 26.1 | **18.5** | 26.1 |
+| 波次墙钟 | 42.2 s | **31.5 s（吞吐 +34%）** | 35.4 s（+19%） |
+
+在这组负载下，cut 0.5 的 TTFT、E2E 尾和波次吞吐更好，cut 0.75 的平均 E2E 更低。
+收益主要来自跨请求流水线。C=1 的独立对照中，分段与原生 PD 的 TTFT 分别为
+10,027 和 10,052 ms，基本持平。
+
+分段续算会占用 D 的 GPU。冷缓存测量中，ITL p50 从 14.0 ms 升至 17.2 ms，
+16 条请求中有 2 条的逐请求 ITL p90 达到约 600 ms。每波最早进入 Decode 的请求
+容易遇到后续请求的续算。比较全局 p90 时，同时检查逐请求 ITL 和最大 token 间隔。
+
+### 热缓存（90% 命中，旧构建）
+
+下表为此前构建的 Hybrid Remote 结果。`2b859c206f` 尚未复测热缓存。
+
+| 指标 | 原生 PD | Hybrid Remote |
+| --- | ---: | ---: |
+| TTFT p50 | 10,460 | **4,233（−59.5%）** |
+| E2E p50 | 12,477 | **11,117（−10.9%）** |
+| ITL p90 | 16.2 | 88.5 |
+
+热缓存下，Remote 早接纳缩短了首 token 等待，Decode 步内的远程读取增加了 token 间隔。
+
+### 传输边界
+
+39 机上 KV 搬运与 Prefill 的等效速率都约为 6,000 token/s。冷缓存时，普通
+Hybrid Remote 仍要等 P 完成整个 prompt 的 GDN 状态，大部分 KV 搬运可被 P 的计算
+覆盖。分段臂在切点交接原生 KV 和 Conv/SSM，收益主要来自 P、D 同时处理不同请求。
+RDMA 会改变交接和 Remote 读的成本，也可能改变原生 PD 基线。冷缓存 Remote 能否
+获得净收益，以及哪种切分比例更合适，需在 RDMA 上复测。
 
 ## 对比原生 PD 和 Hybrid Remote
 
@@ -178,4 +227,5 @@ P prefix cache 的原生 CUDA/PD 验证见 [专项验证](validation/qwen-hybrid
   D 端退休的 `done.json` 提供 `rid`、`hybrid_pd` 和 `remote_calls`。
   统计同一测量窗口的请求，按 `rid` 去重 TP 副本，并分别报告 Remote 实际执行占比和调用次数。
 - 对相同并发分别报告 TTFT、E2E 和 ITL 的分位数，并附两臂的实际 P 命中数及 Remote 执行占比。
-  命中不匹配或 Remote 调用为零的结果只用于排查配置和缓存。
+  热缓存 Remote 臂若命中不匹配或 Remote 调用为零，应先排查配置和缓存。
+  冷缓存门控与分段臂应单独统计，Remote 调用为零符合这两条路径的预期。
