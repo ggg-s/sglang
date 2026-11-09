@@ -6,6 +6,7 @@ The shared D2D protocol owns allocation, transport and quarantine, not this adap
 """
 
 import functools
+import os
 
 import torch
 
@@ -399,6 +400,7 @@ def validate_prefill_cache(cache):
 class Controller(pre_layerwise.Controller):
     # Reuse the native-state D2D command/lifetime path, never DSV sparse math.
     hybrid_gdn = True
+    remote_min_cache_hit_ratio = 0.5
     dsv41_layerwise = True
     dsv41_remote = True
 
@@ -441,6 +443,12 @@ class Controller(pre_layerwise.Controller):
                 )
         else:
             validate_prefill_cache(s.tree_cache)
+            name = "HANDOFF_HYBRID_REMOTE_MIN_CACHE_HIT_RATIO"
+            self.remote_min_cache_hit_ratio = float(
+                os.environ.get(name, str(self.remote_min_cache_hit_ratio))
+            )
+            if not 0 <= self.remote_min_cache_hit_ratio <= 1:
+                raise ValueError(f"{name} must be between 0 and 1")
         if (
             type(pool) is not HybridLinearKVPool
             or type(pool.full_kv_pool) is not MHATokenToKVPool

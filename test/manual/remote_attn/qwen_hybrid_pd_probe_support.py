@@ -45,7 +45,9 @@ class Environment(HybridEnvironment):
                 c.config, directory=__import__("pathlib").Path(self.tmp) / "hybrid-pd"
             )
         self.prefix = 8
+        p.remote_min_cache_hit_ratio = hybrid.Controller.remote_min_cache_hit_ratio
         self.req.origin_input_ids = list(range(8))
+        self.req.cached_tokens_device = 6
         self.req.output_ids = __import__("array").array("q", [31])
         self.req.extend_end = 8
         self.req.kv.kv_committed_len = 8

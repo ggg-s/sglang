@@ -659,13 +659,43 @@ class TestQwenHybridD2D(CustomTestCase):
 
     def test_hybrid_pd_requires_gdn_barrier_and_retires_remote_before_free(self):
         """PD must use P attention while K/V is incomplete, with GDN already local."""
-        from sglang_remote_attn import qwen_hybrid as hybrid, qwen_hybrid_pd as pd
+        from sglang_remote_attn import pre_layerwise
+        from sglang_remote_attn import qwen_hybrid as hybrid
+        from sglang_remote_attn import qwen_hybrid_pd as pd
         from sglang_remote_attn.dsv_d2d_partial import can_freeze
 
         with patch.object(
             sys, "path", [str(ROOT / "test/manual/remote_attn"), *sys.path]
         ):
             from qwen_hybrid_pd_probe_support import Environment
+        with self.subTest(cache_hit="cold-or-threshold"):
+            e = Environment(ROOT, device=getattr(self, "device", "cpu"))
+            self.addCleanup(e.close)
+            for cached in (0, e.prefix // 2):
+                e.req.cached_tokens_device = cached
+                # A prior chunk can already have populated nearly the whole
+                # prefix even though there was no cross-request cache hit.
+                e.req.prefix_len = e.prefix - 1
+                pd.prepare(e.source, [e.req])
+                self.assertIsNone(getattr(e.req, "_pre_layerwise_source", None))
+                self.assertFalse(getattr(e.pm, "_prefix_streams", {}))
+                self.assertFalse(e.source.sources)
+                self.assertEqual(pd.early_targets(e.target, e.queue, None)[0], [])
+
+            def native_pop(queue, rids):
+                self.assertEqual(queue.queue, [e.dr])
+                if e.sender_status != e.poll.Success:
+                    return []
+                queue.queue.clear()
+                return [e.dr_req]
+
+            self.assertEqual(pre_layerwise.pop_transferred(native_pop, e.queue), [])
+            e.sender_status = e.poll.Success
+            self.assertEqual(
+                pre_layerwise.pop_transferred(native_pop, e.queue), [e.dr_req]
+            )
+            self.assertFalse(e.target.remote_targets)
+
         for cancel in (False, True):
             with self.subTest(cancel=cancel):
                 e = Environment(ROOT, device=getattr(self, "device", "cpu"))

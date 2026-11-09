@@ -176,6 +176,7 @@ def prepare(controller, reqs):
     from .prefix_stream import Plan
     import numpy as np
 
+    min_ratio = controller.remote_min_cache_hit_ratio
     candidates = []
     for req in reqs:
         candidate = None
@@ -185,7 +186,13 @@ def prepare(controller, reqs):
             and not req.pending_bootstrap
             and req.kv.holds_kv
             and req.start_send_idx == 0
+            and (
+                min_ratio == 0
+                or req.cached_tokens_device > len(req.origin_input_ids) * min_ratio
+            )
         ):
+            # Native prepare_for_extend computes cached_tokens_device on the
+            # first chunk. Later chunks' own KV must never qualify as a hit.
             # Earlier native chunks have no range receipts in this plan. Never
             # create a late stream that cannot prove coverage of its prefix.
             sender = getattr(req, "disagg_kv_sender", None)
@@ -218,6 +225,8 @@ def prepare(controller, reqs):
                     candidate = root, offer, peers
         candidates.append(candidate)
     accepted = controller.agree([int(c is not None) for c in candidates])
+    if not any(accepted):
+        return
     error = None
     for req, candidate, take in zip(reqs, candidates, accepted):
         if not take:
@@ -348,15 +357,14 @@ def offer(controller, queue, dr):
     from .pre_layerwise import Controller
 
     target = Controller.offer(controller, queue, dr)
-    if target is not None:
+    if target is not None and getattr(target, "_hybrid_coverage", None) is None:
         schema = controller.schema_signature
-        target.coverage = getattr(target, "_hybrid_coverage", None) or LayerCoverage(
-            len(dr.req.origin_input_ids), len(schema["entries"])
-        )
-        target._hybrid_coverage = target.coverage
         value = read_json(target.path.parent / "offer.json")
         value.update(hybrid_schema=schema, remote_boundary="hybrid-gdn-state")
         write_json(target.path.parent / "offer.json", value)
+        target.coverage = target._hybrid_coverage = LayerCoverage(
+            len(dr.req.origin_input_ids), len(schema["entries"])
+        )
     return target
 
 

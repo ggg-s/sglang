@@ -108,6 +108,12 @@ export HANDOFF_D2D_GROUP_SIZE=8
 export HANDOFF_D2D_TOKEN_RANGE=1024
 ```
 
+P 默认只为首个 chunk 的 device cache 命中率 **大于 50%** 的请求启用 Remote
+早接纳。分母为完整 prompt token 数，首 chunk 后请求自己算出的 KV 不计入命中。
+其余请求由原生 PD 等待完整 KV，TP 任一 rank 未达到门槛时同样走原生 PD。
+P 上可用 `HANDOFF_HYBRID_REMOTE_MIN_CACHE_HIT_RATIO` 调整门槛，设为 `0` 可恢复
+所有合格请求都尝试 Remote 的对照行为。该门槛只作用于 P→D Hybrid PD。
+
 不要开启原生 disaggregation staging ring；D2D 的私有 staging 由共用数据面管理。
 原生 Mooncake transport、bootstrap、SMG、control directory 配置沿用现有部署。
 主动在线迁移使用 P4 的 `--backend hybrid`，显式设置 `--src-control-dir` /
