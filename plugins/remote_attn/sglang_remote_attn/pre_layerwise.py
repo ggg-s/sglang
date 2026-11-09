@@ -1442,6 +1442,10 @@ def send_chunk(original, scheduler, req, last_chunk=False, end_idx=None):
         return overlap.send_chunk(
             original, scheduler, req, last_chunk=last_chunk, end_idx=end_idx
         )
+    if last_chunk and getattr(req, "_hybrid_split_at", 0):
+        from .qwen_split_prefill import seal
+
+        seal(req, end_idx)
     source = getattr(req, "_pre_layerwise_source", None)
     if source is None or not last_chunk:
         return original(scheduler, req, last_chunk=last_chunk, end_idx=end_idx)

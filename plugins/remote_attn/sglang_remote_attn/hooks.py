@@ -18,6 +18,7 @@ from . import (
     pre_layerwise,
     prefill_overlap,
     prefix_stream,
+    qwen_split_prefill,
     segmented_graph,
     source_cache,
     source_resources,
@@ -667,6 +668,11 @@ HOOKS.update(
         "sglang.srt.disaggregation.prefill.SchedulerDisaggregationPrefillMixin.send_kv_chunk": pre_layerwise.send_chunk,
         "sglang.srt.disaggregation.decode.DecodeTransferQueue.pop_transferred": pre_layerwise.pop_transferred,
         "sglang.srt.disaggregation.decode.DecodeTransferQueue.resolve_deferred_releases": decode_overlap.reap,
+        "sglang.srt.disaggregation.decode.SchedulerDisaggregationDecodeMixin.get_next_disagg_decode_batch_to_run": qwen_split_prefill.next_batch,
+        "sglang.srt.disaggregation.decode.SchedulerDisaggregationDecodeMixin._get_new_prebuilt_batch": qwen_split_prefill.prebuilt,
+        "sglang.srt.disaggregation.prefill.PrefillBootstrapQueue.finalize_bootstrap": qwen_split_prefill.finalize_bootstrap,
+        "sglang.srt.disaggregation.utils.MetadataBuffers.set_buf": qwen_split_prefill.set_metadata,
+        "sglang.srt.managers.schedule_batch.Req.init_next_round_input": qwen_split_prefill.init_input,
     }
 )
 

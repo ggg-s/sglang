@@ -416,6 +416,9 @@ def send_metadata(
     **metadata_kwargs,
 ):
     """Allocation succeeded: the native request lock now owns prefix lifetime."""
+    from .qwen_split_prefill import advertise
+
+    advertise(queue, decode_req, metadata_kwargs.get("decode_prefix_len"))
     match = getattr(decode_req.req, "_remote_attn_pending_cache", None)
     if match is None:
         return original(

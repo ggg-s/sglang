@@ -183,6 +183,7 @@ def prepare(controller, reqs):
         source = getattr(req, "_pre_layerwise_source", None)
         if (
             source is None
+            and not getattr(req, "_hybrid_split_at", 0)
             and not req.pending_bootstrap
             and req.kv.holds_kv
             and req.start_send_idx == 0

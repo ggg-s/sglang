@@ -114,6 +114,20 @@ P 默认只为首个 chunk 的 device cache 命中率 **大于 50%** 的请求�
 P 上可用 `HANDOFF_HYBRID_REMOTE_MIN_CACHE_HIT_RATIO` 调整门槛，设为 `0` 可恢复
 所有合格请求都尝试 Remote 的对照行为。该门槛只作用于 P→D Hybrid PD。
 
+### 实验性分段 Prefill
+
+P、D 同时设置 `HANDOFF_HYBRID_SPLIT_PREFILL=1` 开启。当前使用固定 50/50 切点，
+仅接受至少 4096 token 的纯文本请求，且 D 的 `--max-prefill-tokens` 必须容纳整个后半段
+（64K prompt 需至少 32768）。沿用同 TP 的原生 Mooncake、early device allocation 和
+D 端禁用 radix cache 的配置。高命中、请求输出 logprobs、结构化生成或对端未协商时，
+继续使用既有 PD 路径。
+
+P 发出前半段 KV 和 Conv／SSM 后完成原生传输。D 在已有预留中续算整个后半段，
+并从完整 prompt 的末尾采样首 token。前缀 KV 在 D 本地读取。每个续算 batch 最多处理
+一个请求，已有 decode batch 会在两个续算 batch 之间获得执行机会。
+验收时用相同的缓存冷热顺序和并发，对比分段开关的 TTFT 与 D 上其他请求的 ITL。
+D 日志 `[handoff-split]` 会记录实际切点和续算 token 数。
+
 不要开启原生 disaggregation staging ring；D2D 的私有 staging 由共用数据面管理。
 原生 Mooncake transport、bootstrap、SMG、control directory 配置沿用现有部署。
 主动在线迁移使用 P4 的 `--backend hybrid`，显式设置 `--src-control-dir` /

@@ -274,6 +274,7 @@ class ReqKvInfo:
     cache_inserted_len: int = 0
     kv_committed_len: int = 0  # KV content committed up to here, <= kv_allocated_len
     kv_allocated_len: int = 0
+    reserved_prefill_suffix: bool = False
 
     # SWA slots in [swa_dead_lo(page_size), get_evicted_seqlen(SWA)) are freed,
     # except for swa_retained_ranges below.
@@ -372,6 +373,7 @@ class ReqKvInfo:
 
     def mark_kv_released(self) -> None:
         self.kv_allocated_len = 0
+        self.reserved_prefill_suffix = False
         self.component_evicted_seqlens.clear()
         self.swa_retained_ranges.clear()
 
@@ -2294,7 +2296,7 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
                 continue
             req.logprob_start_len = max(req.logprob_start_len, encoder_len)
 
-    def prepare_for_extend(self):
+    def prepare_for_extend(self, *, reuse_preallocated_kv: bool = False):
         self.forward_mode = ForwardMode.EXTEND
 
         if self.is_dllm():
@@ -2361,9 +2363,39 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
                     )
             self.encoder_swa_reset = [resets_swa_window(r) for r in reqs]
         # Allocate memory
-        out_cache_loc, req_pool_indices_tensor, req_pool_indices_cpu = alloc_for_extend(
-            self
-        )
+        if reuse_preallocated_kv:
+            # PD continuation already owns the full destination, including the
+            # unwritten suffix. Reuse those slots without allocating a second row.
+            rows = [req.kv.req_pool_idx for req in reqs]
+            if any(
+                row is None
+                or not req.kv.reserved_prefill_suffix
+                or req.kv.kv_committed_len != req.prefix_len
+                or req.kv.kv_allocated_len != req.extend_end
+                for req, row in zip(reqs, rows)
+            ):
+                raise RuntimeError("extend requires a reserved KV suffix")
+            req_pool_indices_cpu = torch.tensor(
+                rows, dtype=torch.int64, pin_memory=_pin
+            )
+            req_pool_indices_tensor = req_pool_indices_cpu.to(
+                self.device, non_blocking=True
+            )
+            out_cache_loc = torch.cat(
+                [
+                    self.req_to_token_pool.req_to_token[
+                        row, req.prefix_len : req.extend_end
+                    ]
+                    for req, row in zip(reqs, rows)
+                ]
+            ).to(torch.int64)
+            for req in reqs:
+                req.kv.commit_prealloc(req.extend_end)
+                req.kv.reserved_prefill_suffix = False
+        else:
+            out_cache_loc, req_pool_indices_tensor, req_pool_indices_cpu = (
+                alloc_for_extend(self)
+            )
 
         # Set fields
         input_embeds = []

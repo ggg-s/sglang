@@ -438,6 +438,11 @@ class Target:
 
 def commit(original, queue, dr, *, keep_receiver=False):
     controller = getattr(queue.scheduler, "_pre_layerwise", None)
+    if getattr(controller, "split_prefill", False):
+        from . import qwen_split_prefill
+
+        if qwen_split_prefill.commit(queue, dr, keep_receiver=keep_receiver):
+            return None
     result = original(queue, dr, keep_receiver=keep_receiver)
     if not getattr(controller, "dsv41_remote", False) or getattr(
         controller, "hybrid_gdn", False

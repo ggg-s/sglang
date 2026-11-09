@@ -473,6 +473,9 @@ class Controller(pre_layerwise.Controller):
             if field == "temporal"
         ):
             raise ValueError("hybrid Remote first supports FP32 GDN SSM state")
+        from . import qwen_split_prefill
+
+        qwen_split_prefill.configure(self)
         self.executing = None
         self.remote_targets = {}
         self.pd_visibility = dp.Visibility(pool.full_kv_pool.k_buffer[0].device)
