@@ -29,6 +29,7 @@ from sglang.srt.model_executor.cuda_graph_buffer_registry import (
 )
 from sglang.srt.model_executor.input_buffers import ForwardInputBuffers
 from sglang.test.ci.ci_register import register_cpu_ci
+from sglang.test.test_utils import CustomTestCase
 
 register_cpu_ci(est_time=6, suite="base-a-test-cpu")
 
@@ -138,9 +139,31 @@ class TestRegistryRegister(unittest.TestCase):
         self.assertNotIn("off", r.slot_names())
 
 
-class TestFillFromAndExtract(unittest.TestCase):
+class TestFillFromAndExtract(CustomTestCase):
     """End-to-end exercise: register a representative slot set, fill from
     a mini FB, then extract a FB view and assert all field-views match."""
+
+    def test_oversized_request_axis_reports_slot_before_copy(self):
+        """An oversized decode batch must identify the overflowing request slot."""
+        registry = _make_registry(max_bs=16, max_num_tokens=64)
+        slot = registry.register_slot(
+            GraphSlot(
+                name="req_pool_indices",
+                shape_fn=lambda bs, mt: (bs,),
+                dtype=torch.int64,
+                axis="bs",
+            )
+        )
+        batch = _MiniForwardBatch(
+            batch_size=32, req_pool_indices=torch.ones(32, dtype=torch.int64)
+        )
+        with self.assertRaisesRegex(
+            RuntimeError, "req_pool_indices.*needs 32 rows, capacity 16"
+        ):
+            registry.fill_from(
+                batch, raw_bs=32, padded_bs=32, raw_num_tokens=32, padded_num_tokens=32
+            )
+        self.assertEqual(slot.buffer.count_nonzero().item(), 0)
 
     def _build_registry(self):
         r = _make_registry(max_bs=4, max_num_tokens=8)

@@ -190,35 +190,32 @@ def init_input(original, req, tree_cache=None, cow_mamba=None):
     cut = getattr(req, "_hybrid_split_at", 0)
     proposal = getattr(req, "_hybrid_split_proposal", 0)
     if (
-        tree_cache is not None
+        proposal
+        and tree_cache is not None
         and cow_mamba is not False
         and not req.kv.holds_kv
         and not req.retracted_stain
         and not hasattr(req, "_hybrid_prefill_cached_tokens")
     ):
-        # Native lookup may run repeatedly while the request is queued. Only
-        # the match used by the first actual forward becomes the snapshot.
-        req._hybrid_prefill_cache_match = req.prefix_len
-        if proposal:
-            hot = req.prefix_len > (
-                len(req.origin_input_ids) * controller.remote_min_cache_hit_ratio
-            )
-            split = not hot and req.prefix_len < proposal
-            accepted = controller.agree([int(split)])[0]
-            cut = req._hybrid_split_at = proposal if accepted else 0
-            req._hybrid_split_match_reason = (
-                "selected"
-                if accepted
+        hot = req.kv.cache_protected_len > (
+            len(req.origin_input_ids) * controller.remote_min_cache_hit_ratio
+        )
+        split = not hot and req.prefix_len < proposal
+        accepted = controller.agree([int(split)])[0]
+        cut = req._hybrid_split_at = proposal if accepted else 0
+        req._hybrid_split_match_reason = (
+            "selected"
+            if accepted
+            else (
+                "warm_cache"
+                if hot
                 else (
-                    "warm_cache"
-                    if hot
-                    else (
-                        "matched_prefix_reaches_cut"
-                        if not split
-                        else "tp_match_disagreement"
-                    )
+                    "matched_prefix_reaches_cut"
+                    if not split
+                    else "tp_match_disagreement"
                 )
             )
+        )
     if cut:
         req.full_untruncated_fill_ids = req.full_untruncated_fill_ids[:cut]
 
@@ -296,17 +293,21 @@ def next_batch(original, scheduler, running_batch):
         return original(scheduler, running_batch)
 
     last = scheduler.last_batch
-    if last is not None and getattr(last, "_hybrid_split_extend", False):
-        last.filter_batch()
-        if not last.is_empty():
-            scheduler.prefill_launched_reqs.leave(last.reqs)
-            scheduler.running_reqs.join(last.reqs)
-            if running_batch.is_empty():
-                running_batch = last
-            else:
-                running_batch.merge_batch(last)
-        # Give existing decodes a turn between suffix batches.
-        return original(scheduler, running_batch)
+    if getattr(last, "_hybrid_split_extend", False):
+        # A promoted batch may become running_batch itself. Consume the
+        # marker before native Decode reuses that object on subsequent ticks.
+        last._hybrid_split_extend = False
+        if last is not running_batch and last.forward_mode.is_extend():
+            last.filter_batch()
+            if not last.is_empty():
+                scheduler.prefill_launched_reqs.leave(last.reqs)
+                scheduler.running_reqs.join(last.reqs)
+                if running_batch.is_empty():
+                    running_batch = last
+                else:
+                    running_batch.merge_batch(last)
+            # Give existing decodes a turn between suffix batches.
+            return original(scheduler, running_batch)
 
     req = next(
         (r for r in scheduler.waiting_queue if r.kv.reserved_prefill_suffix),
@@ -335,7 +336,7 @@ def next_batch(original, scheduler, running_batch):
     batch._hybrid_split_extend = True
     set_schedule_time_batch(batch)
     logger.info(
-        "[handoff-split] hybrid PD rid=%s cut=%s suffix=%s",
+        "[handoff-split] hybrid PD rid=%s cut=%s suffix=%s path=eager",
         req.rid,
         req.prefix_len,
         req.extend_len,

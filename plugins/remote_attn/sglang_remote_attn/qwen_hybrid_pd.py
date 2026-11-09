@@ -133,7 +133,7 @@ class Source(NativeSource):
             _poll_success(sender)  # Check failure; success is NOT required here.
             self.barrier_ready = True
             dsv41_remote.register(self)
-            cached_tokens = self.req._hybrid_prefill_cached_tokens
+            cached_tokens = getattr(self.req, "_hybrid_prefill_cached_tokens", 0)
             write_json(
                 self.path / "ready.json",
                 dict(
@@ -170,37 +170,46 @@ class Source(NativeSource):
             priority.__exit__(None, None, None)
 
 
-def prepare(controller, reqs):
-    """Called in the existing TP batch order, before native cached-prefix sends."""
-    from .pd_mesh import source_root
-    from .prefix_stream import Plan
+def snapshot_prefill_admission(original, scheduler, running_batch):
+    plan = original(scheduler, running_batch)
+    controller = getattr(scheduler, "_pre_layerwise", None)
+    batch = plan.batch_to_run
+    if (
+        batch is None
+        or not getattr(controller, "hybrid_gdn", False)
+        or scheduler.disaggregation_mode.value != "prefill"
+    ):
+        return plan
+
     from .qwen_split_prefill import log_decision
-    import numpy as np
 
     min_ratio = controller.remote_min_cache_hit_ratio
-    candidates = []
-    for req in reqs:
-        first = not hasattr(req, "_hybrid_prefill_cached_tokens")
-        if first:
-            req._hybrid_prefill_cached_tokens = getattr(
-                req, "_hybrid_prefill_cache_match", 0
-            )
-        cached = req._hybrid_prefill_cached_tokens
-        hot = min_ratio == 0 or cached > len(req.origin_input_ids) * min_ratio
-        if first and hasattr(req, "_hybrid_split_match_reason"):
+    for req in batch.reqs:
+        if hasattr(req, "_hybrid_prefill_cached_tokens"):
+            continue
+        # prepare_for_extend has advanced extend_batch_idx, but no forward has
+        # run yet. A continuation or retry may already own its own cached KV.
+        cached = (
+            req.kv.cache_protected_len
+            if req.extend_batch_idx == 1 and not req.retracted_stain
+            else 0
+        )
+        req._hybrid_prefill_cached_tokens = cached
+        cut = getattr(req, "_hybrid_split_at", 0)
+        if hasattr(req, "_hybrid_split_match_reason"):
             log_decision(
                 controller,
                 req,
                 "prefill_match",
                 req._hybrid_split_match_reason,
-                cut=getattr(req, "_hybrid_split_at", 0),
+                cut=cut,
                 p_cached_tokens=cached,
             )
         if (
-            first
-            and controller.rank == 0
-            and not hot
-            and not getattr(req, "_hybrid_split_at", 0)
+            controller.rank == 0
+            and not cut
+            and min_ratio
+            and (cached <= len(req.origin_input_ids) * min_ratio)
         ):
             logger.info(
                 "[handoff-cache-gate] route=native rid=%s room=%s p_cached_tokens=%s "
@@ -211,6 +220,20 @@ def prepare(controller, reqs):
                 len(req.origin_input_ids),
                 min_ratio,
             )
+    return plan
+
+
+def prepare(controller, reqs):
+    """Called in the existing TP batch order, before native cached-prefix sends."""
+    from .pd_mesh import source_root
+    from .prefix_stream import Plan
+    import numpy as np
+
+    min_ratio = controller.remote_min_cache_hit_ratio
+    candidates = []
+    for req in reqs:
+        cached = getattr(req, "_hybrid_prefill_cached_tokens", 0)
+        hot = min_ratio == 0 or cached > len(req.origin_input_ids) * min_ratio
         candidate = None
         source = getattr(req, "_pre_layerwise_source", None)
         if (

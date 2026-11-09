@@ -673,14 +673,26 @@ class TestQwenHybridD2D(CustomTestCase):
             self.addCleanup(e.close)
             for cached in (0, e.prefix // 2):
                 e.req.__dict__.pop("_hybrid_prefill_cached_tokens", None)
-                e.req._hybrid_prefill_cache_match = cached
+                scheduler = NS(
+                    _pre_layerwise=e.source, disaggregation_mode=NS(value="prefill")
+                )
+                schedule = lambda *_: NS(batch_to_run=NS(reqs=[e.req]))
+                e.req.kv.cache_protected_len = cached
+                e.req.extend_batch_idx = 1
+                e.req.retracted_stain = False
+                pd.snapshot_prefill_admission(schedule, scheduler, None)
                 # The request's own chunks can make the live counters look hot.
                 e.req.cached_tokens_device = e.req.prefix_len = e.prefix - 1
+                e.req.kv.cache_protected_len = e.prefix - 1
+                e.req.extend_batch_idx = 15
+                pd.snapshot_prefill_admission(schedule, scheduler, None)
                 pd.prepare(e.source, [e.req])
+                self.assertEqual(e.req._hybrid_prefill_cached_tokens, cached)
                 self.assertIsNone(getattr(e.req, "_pre_layerwise_source", None))
                 self.assertFalse(getattr(e.pm, "_prefix_streams", {}))
                 self.assertFalse(e.source.sources)
                 self.assertEqual(pd.early_targets(e.target, e.queue, None)[0], [])
+            e.req.kv.cache_protected_len = 0
 
             def native_pop(queue, rids):
                 self.assertEqual(queue.queue, [e.dr])
@@ -823,6 +835,48 @@ class TestQwenHybridD2D(CustomTestCase):
         hf.model_type = "MuseGlimmer"
         with self.assertRaisesRegex(ValueError, "disaggregation-mode"):
             native.handle_language_model_only(args)
+
+    def test_split_prefill_promotes_decode_rows_once(self):
+        """Reusing the first Decode batch must not double its request rows."""
+        from sglang.srt.model_executor.forward_mode import ForwardMode
+        from sglang_remote_attn.qwen_split_prefill import next_batch
+
+        class Batch:
+            def __init__(self, reqs, mode):
+                self.reqs = reqs
+                self.forward_mode = mode
+
+            def filter_batch(self):
+                pass
+
+            def is_empty(self):
+                return not self.reqs
+
+            def merge_batch(self, other):
+                self.reqs = self.reqs + other.reqs
+
+        req = object()
+        suffix = Batch([req], ForwardMode.EXTEND)
+        suffix._hybrid_split_extend = True
+        promoted = []
+        scheduler = NS(
+            _pre_layerwise=NS(split_prefill=True),
+            last_batch=suffix,
+            waiting_queue=[],
+            prefill_launched_reqs=NS(leave=lambda _: None),
+            running_reqs=NS(join=promoted.extend),
+        )
+
+        def decode(_, running_batch):
+            running_batch.forward_mode = ForwardMode.DECODE
+            return running_batch
+
+        running_batch = Batch([], ForwardMode.DECODE)
+        for _ in range(6):
+            running_batch = next_batch(decode, scheduler, running_batch)
+            scheduler.last_batch = running_batch
+        self.assertEqual(running_batch.reqs, [req])
+        self.assertEqual(promoted, [req])
 
     def test_native_text_batch_accepts_none_multimodal_placeholders(self):
         from sglang_remote_attn.qwen_hybrid import Controller

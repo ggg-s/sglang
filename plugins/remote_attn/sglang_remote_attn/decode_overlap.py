@@ -140,7 +140,10 @@ def install(controller, *, force=False):
 
 
 def process_last_batch_early(original, scheduler, last_batch):
-    if getattr(last_batch, "_hybrid_split_extend", False):
+    if (
+        getattr(last_batch, "_hybrid_split_extend", False)
+        and last_batch.forward_mode.is_extend()
+    ):
         return True
     native = original(scheduler, last_batch)
     controller = getattr(scheduler, "_pre_layerwise", None)

@@ -484,7 +484,7 @@ class CudaGraphBufferRegistry:
                 src = slot.source_fn(forward_batch, ctx)
                 if src is None:
                     continue
-                dst = slot.buffer[: src.shape[0]]
+                raw_n = src.shape[0]
             else:
                 src = getattr(forward_batch, slot.name, None)
                 if src is None:
@@ -494,12 +494,19 @@ class CudaGraphBufferRegistry:
                     # auto-copied — caller handles via source_fn or post_fill.
                     continue
                 raw_n = slot._raw_n(raw_bs, raw_num_tokens)
-                if slot.slice_fn is not None:
-                    dst = slot.slice_fn(slot.buffer, raw_n)
-                elif slot.axis == "none":
-                    dst = slot.buffer
-                else:
-                    dst = slot.buffer[:raw_n]
+            if slot.source_fn is None and slot.slice_fn is not None:
+                dst = slot.slice_fn(slot.buffer, raw_n)
+            elif slot.source_fn is None and slot.axis == "none":
+                dst = slot.buffer
+            else:
+                capacity = slot.buffer.shape[0]
+                if raw_n > capacity:
+                    raise RuntimeError(
+                        f"GraphSlot {slot.name!r}: {slot.axis} axis needs {raw_n} rows, "
+                        f"capacity {capacity} (raw_bs={raw_bs}, "
+                        f"raw_num_tokens={raw_num_tokens})"
+                    )
+                dst = slot.buffer[:raw_n]
             # foreach_copy_ requires same-device tensors per call — bucket
             # by device.
             if dst.device.type == "cpu":

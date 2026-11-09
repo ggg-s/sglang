@@ -18,6 +18,7 @@ from . import (
     pre_layerwise,
     prefill_overlap,
     prefix_stream,
+    qwen_hybrid_pd,
     qwen_split_prefill,
     segmented_graph,
     source_cache,
@@ -406,6 +407,11 @@ def _decode_graph(original, runner, forward_batch):
 
 
 def _prefill_graph(original, runner, forward_batch):
+    from sglang.srt.runtime_context import get_forward
+
+    if get_forward().force_eager_prefill:
+        forward_batch._remote_attn_graph_fallback = "hybrid_split_prefill"
+        return False
     return _graph_decision(original, runner, forward_batch, "prefill")
 
 
@@ -659,6 +665,7 @@ HOOKS.update(
         "sglang.srt.disaggregation.common.staging_handler.init_staging_allocator": pre_layerwise.init_staging_allocator,
         "sglang.srt.disaggregation.common.staging_handler.init_staging_buffers": pre_layerwise.init_staging_buffers,
         "sglang.srt.managers.scheduler.Scheduler.run_batch": pre_layerwise.run_batch,
+        "sglang.srt.managers.scheduler.Scheduler.get_new_batch_prefill": qwen_hybrid_pd.snapshot_prefill_admission,
         "sglang.srt.managers.scheduler.Scheduler.process_batch_result": decode_overlap.after_result,
         "sglang.srt.managers.scheduler.Scheduler.launch_batch_sample_if_needed": prefill_overlap.after_sample,
         "sglang.srt.managers.scheduler.Scheduler.should_process_last_batch_early": decode_overlap.process_last_batch_early,

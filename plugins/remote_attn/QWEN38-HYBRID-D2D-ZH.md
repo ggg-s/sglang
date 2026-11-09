@@ -109,7 +109,8 @@ export HANDOFF_D2D_TOKEN_RANGE=1024
 ```
 
 P 默认只为第一次实际 Prefill 调度时 device cache 命中率 **大于 50%** 的请求启用
-Remote 早接纳。命中数来自这次调度使用的原生查找快照，后续 chunk 和重试沿用该值。
+Remote 早接纳。P 在首次 Prefill 批次准入时快照原生 `cache_protected_len`，
+后续 chunk 和重试沿用该值。
 分母为完整 prompt token 数。冷请求回退时由 `[handoff-cache-gate]` 记录命中数。
 其余请求由原生 PD 等待完整 KV，TP 任一 rank 未达到门槛时同样走原生 PD。
 P 上可用 `HANDOFF_HYBRID_REMOTE_MIN_CACHE_HIT_RATIO` 调整门槛，设为 `0` 可恢复
@@ -129,7 +130,8 @@ P 发出切点前的 KV 和 Conv／SSM 后完成原生传输。D 在已有预留
 一个请求，已有 decode batch 会在两个续算 batch 之间获得执行机会。
 验收时用相同的缓存冷热顺序和并发，对比分段开关的 TTFT 与 D 上其他请求的 ITL。
 P、D 的 `[handoff-split-decision]` 记录协商与回退原因，可按 bootstrap room 对照。
-D 的 `[handoff-split]` 记录实际开始续算时的切点和 token 数。
+D 的 `[handoff-split]` 记录实际开始续算时的切点和 token 数。D 续算 batch 走
+eager，结果结算后只交接一次给正常 Decode 调度，后续 Decode 可按原生规则回放图。
 
 不要开启原生 disaggregation staging ring；D2D 的私有 staging 由共用数据面管理。
 原生 Mooncake transport、bootstrap、SMG、control directory 配置沿用现有部署。

@@ -1409,6 +1409,14 @@ def run_batch(original, scheduler, batch, *args, **kwargs):
         controller, "decode_overlap", None
     )
     if overlap is not None:
+        if (
+            getattr(batch, "_hybrid_split_extend", False)
+            and batch.forward_mode.is_extend()
+        ):
+            from sglang.srt.runtime_context import get_forward
+
+            with get_forward().scoped(force_eager_prefill=True):
+                return overlap.run_batch(original, scheduler, batch, *args, **kwargs)
         return overlap.run_batch(original, scheduler, batch, *args, **kwargs)
     if getattr(controller, "cache_guard", None) is not None and not getattr(
         controller, "hybrid_gdn", False
