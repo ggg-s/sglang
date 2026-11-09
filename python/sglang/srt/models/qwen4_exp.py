@@ -2101,7 +2101,9 @@ class Qwen4ExpModel(Qwen3_5ForCausalLM):
         continuation = split_interval is not None and start > self.start_layer
         split_state = None
         if continuation:
-            split_state = forward_batch.model_specific_states["qwen4_pdmux"]
+            # Consume the carry so it cannot pin the entry activations for
+            # the rest of this interval.
+            split_state = forward_batch.model_specific_states.pop("qwen4_pdmux")
             hidden_states = split_state["hidden_states"]
             positions = split_state["positions"]
         elif self.pp_group.is_first_rank:
@@ -2154,6 +2156,7 @@ class Qwen4ExpModel(Qwen3_5ForCausalLM):
             split_state["aux_hidden_states"] if continuation else AuxHiddenStateList()
         )
         normalized_input = split_state["normalized_input"] if continuation else None
+        del split_state
         for i in range(start, end):
             layer = self.layers[i]
             if i + 1 < self.end_layer:
@@ -2203,12 +2206,6 @@ class Qwen4ExpModel(Qwen3_5ForCausalLM):
                 "normalized_input": normalized_input,
             }
             return None
-        if (
-            split_interval is not None
-            and forward_batch.model_specific_states is not None
-        ):
-            forward_batch.model_specific_states.pop("qwen4_pdmux", None)
-
         if breakable_ple:
             _breakable_commit_ple_batch(batch=ple_batch)
         else:

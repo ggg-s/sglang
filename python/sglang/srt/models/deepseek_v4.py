@@ -4756,7 +4756,6 @@ class DeepseekV4Model(nn.Module):
 
             # Cross-layer mHC fusion defers hc_post until the next layer, so the
             # pending tensors must survive scheduler yields between split calls.
-            forward_batch.hidden_states = hidden_states
             forward_batch.model_specific_states = {
                 "positions": positions,
                 "input_ids": input_ids,
@@ -4770,12 +4769,16 @@ class DeepseekV4Model(nn.Module):
                     else None
                 ),
             }
+        else:
+            # Consume the carry on entry so the batch does not keep the old
+            # activation alive after the next layer replaces it.
+            hidden_states = forward_batch.hidden_states
+            forward_batch.hidden_states = None
 
         states = forward_batch.model_specific_states
-        hidden_states = forward_batch.hidden_states
-        prev_residual = states["prev_residual"]
-        prev_post = states["prev_post"]
-        prev_comb = states["prev_comb"]
+        prev_residual = states.pop("prev_residual")
+        prev_post = states.pop("prev_post")
+        prev_comb = states.pop("prev_comb")
         last_layer = None
         capture_dspark = self.dspark_layers_to_capture is not None
         dspark_aux_hidden_states = states["dspark_aux_hidden_states"]
@@ -4805,6 +4808,7 @@ class DeepseekV4Model(nn.Module):
                         prev_post=prev_post,
                         prev_comb=prev_comb,
                     )
+            del layer_kwargs
             if capture_dspark and i in self.dspark_layers_to_capture:
                 if _is_cuda:
                     completed = hc_boundary.materialize(
@@ -4822,12 +4826,11 @@ class DeepseekV4Model(nn.Module):
                     completed, out=dspark_aux_hidden_states.slot(completed[:, 0])
                 )
 
-        forward_batch.hidden_states = hidden_states
-        states["prev_residual"] = prev_residual
-        states["prev_post"] = prev_post
-        states["prev_comb"] = prev_comb
-
         if end != self.end_layer:
+            forward_batch.hidden_states = hidden_states
+            states["prev_residual"] = prev_residual
+            states["prev_post"] = prev_post
+            states["prev_comb"] = prev_comb
             return None
 
         if _is_cuda:
