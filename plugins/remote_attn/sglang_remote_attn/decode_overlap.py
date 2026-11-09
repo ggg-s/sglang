@@ -1,6 +1,7 @@
 """D scheduler overlap policy; reuse native result completion, not extra fences."""
 
 import logging
+import time
 from dataclasses import dataclass
 
 logger = logging.getLogger(__name__)
@@ -96,7 +97,17 @@ class DecodeOverlap:
         for target in targets:
             target.forward_proofs.append(proof)
             target.forward_count += 1
-        proof.result = original(scheduler, batch, *args, **kwargs)
+        started = time.perf_counter_ns()
+        try:
+            proof.result = original(scheduler, batch, *args, **kwargs)
+        finally:
+            timing = getattr(self.controller, "decode_timing", None)
+            if timing is None:
+                timing = self.controller.decode_timing = {}
+            timing["remote_batches"] = timing.get("remote_batches", 0) + 1
+            timing["run_batch_ns"] = timing.get("run_batch_ns", 0) + (
+                time.perf_counter_ns() - started
+            )
         if not overlap_enabled:
             # The normal scheduler samples on its forward stream; no native
             # overlap copy_done is submitted. Fence that actual stream instead.

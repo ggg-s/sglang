@@ -339,8 +339,10 @@ def early_targets(controller, queue, rids_to_check):
         ready = None
         try:
             if offer is not None:
-                _poll_success(offer.decode_req.kv_receiver)
-                if rids_to_check is None or offer.decode_req.req.rid in rids_to_check:
+                complete = _poll_success(offer.decode_req.kv_receiver)
+                if not complete and (
+                    rids_to_check is None or offer.decode_req.req.rid in rids_to_check
+                ):
                     ready = barrier_ready(offer)
             failed.append(0)
         except TransportFailure:

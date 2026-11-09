@@ -6,6 +6,7 @@ full-graph/eager execution retains the core's original prepare dispatch.
 """
 
 import inspect
+import time
 import types
 from contextlib import contextmanager
 
@@ -34,6 +35,7 @@ class DSV41GraphBackend(RemoteGraphBackend):
         self.bridge_specs = {}
         self.bridge_layouts = {}
         self.native_keys = []
+        self.dynamic_ns = {}
 
     def validate_capture_key(self, key):
         variants = getattr(self.runner, "attention_graph_variants", None)
@@ -75,8 +77,24 @@ class DSV41GraphBackend(RemoteGraphBackend):
             raise RuntimeError("DSV replay has an uncaptured native candidate variant")
         # All candidate-dependent work is eager. One Remote bank per batch can
         # serve every native label, while retaining the native per-token policy.
-        with attention_variant(shape_key.attention_variant):
-            return super().replay(self.active_key, batch, **kwargs)
+        controller = self.runner.model_runner._pre_layerwise
+        timing = getattr(controller, "decode_timing", None)
+        if timing is None:
+            timing = controller.decode_timing = {}
+        self.dynamic_ns.clear()
+        started = time.perf_counter_ns()
+        try:
+            with attention_variant(shape_key.attention_variant):
+                return super().replay(self.active_key, batch, **kwargs)
+        finally:
+            total = time.perf_counter_ns() - started
+            timing["segmented_steps"] = timing.get("segmented_steps", 0) + 1
+            for key, ns in (
+                ("segmented_total_ns", total),
+                ("outside_callbacks_ns", max(0, total - sum(self.dynamic_ns.values()))),
+                *self.dynamic_ns.items(),
+            ):
+                timing[key] = timing.get(key, 0) + ns
 
     def begin_remote_capture(self):
         self.dynamic_trace = []
@@ -108,7 +126,7 @@ class DSV41GraphBackend(RemoteGraphBackend):
             raise RuntimeError("DSV graph lacks progressive ownership")
         rows = getattr(batch, "req_pool_indices_cpu", None)
         if rows is None:
-            rows = batch.req_pool_indices.cpu().tolist()
+            rows = batch.req_pool_indices.cpu()
         self.live_targets = {}
         for row in rows:
             target = controller.remote_targets.get(int(row))
@@ -117,6 +135,7 @@ class DSV41GraphBackend(RemoteGraphBackend):
                     raise RuntimeError("DSV graph requires live TP progressive targets")
                 target.check()
                 self.live_targets[int(row)] = (target, frozenset(target.local_entries))
+        return rows
 
     @contextmanager
     def execution(self, batch):
@@ -144,6 +163,7 @@ class DSV41GraphBackend(RemoteGraphBackend):
 
     def _dynamic(self, kind, owner, **arguments):
         capture = self.capture_remote
+        started = time.perf_counter_ns() if not capture else 0
         batch = self.capture_batch if capture else self.active_batch
         if batch is None or (not capture and not self.use_remote):
             raise RuntimeError("DSV dynamic break has no live decode batch")
@@ -195,7 +215,17 @@ class DSV41GraphBackend(RemoteGraphBackend):
                 if kind == "state"
                 else owner._dsv41_graph_originals[kind]
             )
-            result = function(**arguments)
+            if not capture and kind == "attention":
+                # Only the eager attention break uses the live host mirror.
+                # Native graph input staging still owns its padded device view.
+                previous = getattr(batch, "req_pool_indices_cpu", None)
+                batch.req_pool_indices_cpu = self.live_rows
+                try:
+                    result = function(**arguments)
+                finally:
+                    batch.req_pool_indices_cpu = previous
+            else:
+                result = function(**arguments)
             if not capture and kind == "attention":
                 result = pad_attention_output(result, batch.batch_size, bucket)
             key = (bucket, kind, layer)
@@ -219,8 +249,13 @@ class DSV41GraphBackend(RemoteGraphBackend):
                 self.unsafe = True
             raise
         finally:
-            if not capture and kind == "attention":
-                self.attention_calls += 1
+            if not capture:
+                key = kind + "_callback_ns"
+                self.dynamic_ns[key] = self.dynamic_ns.get(key, 0) + (
+                    time.perf_counter_ns() - started
+                )
+                if kind == "attention":
+                    self.attention_calls += 1
 
     def manifest(self):
         return (

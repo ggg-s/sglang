@@ -12493,6 +12493,16 @@ class TestRemoteAttn(CustomTestCase):
             self.assertEqual(result["reason"], "first-post-PD-eager-decode-complete")
             self.assertEqual(result["generation"], "g")
 
+            self.hooks.pre_layerwise.write_json(
+                path / "remote-service.json",
+                dict(generation="g", prefix_len=33, route={}, boundary="progressive-sparse"),
+            )
+            remote.commit(lambda *a, **kw: None, queue, dr)
+            self.assertFalse(f.controller.remote_targets)
+            self.assertTrue(self.hooks._decode_graph(lambda *a: True, runner, f.fb))
+            result = json.loads((path / "remote-done.json").read_text())
+            self.assertEqual(result["reason"], "native-pd-complete")
+
     def _dsv41_receive_fixture(self, *, capacity=128):
         import struct
 

@@ -448,6 +448,14 @@ def commit(original, queue, dr, *, keep_receiver=False):
         return result
     data = read_json(offer.path / "remote-service.json")
     if data is not None and data.get("generation") == offer.generation:
+        if not keep_receiver and data.get("boundary") == "progressive-sparse":
+            # Native pop commits only after TP transport completion. There is
+            # no Remote read lease to start when the entire prefix is local.
+            write_json(
+                offer.path / "remote-done.json",
+                dict(generation=offer.generation, reason="native-pd-complete"),
+            )
+            return result
         target = Target(
             controller,
             dr.req,
@@ -481,15 +489,18 @@ def forward(controller, original, runner, fb, *args, **kwargs):
     # A complete first decode consumes the same model-layer sequence on ranks.
     if not controller.remote_targets or not fb.forward_mode.is_decode():
         return original(runner, fb, *args, **kwargs)
-    rows = (
-        [int(x) for x in fb.req_pool_indices_cpu]
-        if getattr(fb, "req_pool_indices_cpu", None) is not None
-        else fb.req_pool_indices.cpu().tolist()
-    )
+    previous = getattr(fb, "req_pool_indices_cpu", None)
+    rows = fb.req_pool_indices.cpu() if previous is None else previous
     active = [
-        controller.remote_targets[x] for x in rows if x in controller.remote_targets
+        controller.remote_targets[row]
+        for row in map(int, rows)
+        if row in controller.remote_targets
     ]
-    result = original(runner, fb, *args, **kwargs)
+    fb.req_pool_indices_cpu = rows
+    try:
+        result = original(runner, fb, *args, **kwargs)
+    finally:
+        fb.req_pool_indices_cpu = previous
     for target in active:
         if not getattr(target, "progressive", False):
             target.close("first-post-PD-eager-decode-complete")
@@ -579,7 +590,12 @@ def attention(
             cos_sin_cache=cos_sin_cache,
             **kwargs,
         )
-    req_rows = forward_batch.req_pool_indices.cpu().tolist()
+    host_rows = getattr(forward_batch, "req_pool_indices_cpu", None)
+    req_rows = (
+        forward_batch.req_pool_indices.cpu().tolist()
+        if host_rows is None
+        else list(map(int, host_rows))
+    )
     native_rows = [int(rpi) not in controller.remote_targets for rpi in req_rows]
     if not compress_ratio or all(native_rows):
         return original(

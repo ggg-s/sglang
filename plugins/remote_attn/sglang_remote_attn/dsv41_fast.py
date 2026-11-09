@@ -108,7 +108,11 @@ def attention(
     packed = torch.cat(
         (remote_ids.reshape(-1).to(torch.int64), torch.cat(errors).to(torch.int64))
     )
+    started = time.perf_counter_ns()
     host = packed.cpu().tolist()
+    stats["index_readback_ns"] = stats.get("index_readback_ns", 0) + (
+        time.perf_counter_ns() - started
+    )
     stats["index_readbacks"] += 1
     n = remote_ids.numel()
     if any(host[n:]):
