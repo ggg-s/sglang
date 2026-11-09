@@ -556,7 +556,9 @@ class TestPdmuxSxfPort(unittest.TestCase):
 
     def test_standard_accepts_dp_and_retains_other_parallelism_guards(self):
         backend_module = types.ModuleType("sglang.srt.model_executor.cuda_graph_config")
-        backend_module.Backend = SimpleNamespace(DISABLED="disabled")
+        backend_module.Backend = SimpleNamespace(
+            DISABLED="disabled", BREAKABLE="breakable"
+        )
         method = load_methods(
             "arg_groups/validation_hook.py", None, ["check_pdmux_standard_prefill"]
         )["check_pdmux_standard_prefill"]

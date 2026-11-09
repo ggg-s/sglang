@@ -839,38 +839,33 @@ def check_two_batch_overlap(server_args: Any):
 def check_pdmux_overlap(cfg):
     """Admit plain TP or DSV4 interleave PCP over the full TP group.
 
-    Subgroup parallelism needs its own lane-specific communicators before it
-    can use the asynchronous speculative scheduler. Without speculation the
-    decode relay uses the non-spec FutureMap path, which the PDMux loop drives
-    the same way, so it is admitted for plain TP (no prefill CP).
+    Full-width CP uses the same lane-local TP communicators with or without
+    DSpark. Subgroup parallelism needs its own lane-specific communicators.
     """
     assert cfg.pdmux_prefill_mode in (
         "layer_split",
         "standard",
     ), "PD-Multiplexing overlap schedule requires layer_split or standard prefill."
-    if cfg.speculative_algorithm is None:
-        assert not cfg.enable_prefill_cp, (
-            "PD-Multiplexing overlap schedule without speculation does not "
-            "support prefill CP."
-        )
-    else:
-        assert cfg.speculative_algorithm in ("DFLASH", "DSPARK", "EAGLE"), (
-            "PD-Multiplexing overlap schedule supports no speculation, DFLASH, "
-            f"DSPARK or EAGLE; got {cfg.speculative_algorithm}."
-        )
+    algorithm = cfg.speculative_algorithm
+    assert algorithm in (None, "DFLASH", "DSPARK", "EAGLE"), (
+        "PD-Multiplexing overlap schedule supports no speculation, DFLASH, "
+        f"DSPARK or EAGLE; got {algorithm}."
+    )
+    prefill_cp = cfg.enable_prefill_cp
+    if prefill_cp and algorithm is None:
+        assert cfg.tp_size > 1, "PD-Multiplexing overlap prefill CP requires TP>1."
     if cfg.tp_size > 1:
-        prefill_cp = getattr(cfg, "enable_prefill_cp", False)
         if prefill_cp:
             assert (
-                cfg.speculative_algorithm == "DSPARK"
+                algorithm in (None, "DSPARK")
                 and cfg.cp_strategy == "interleave"
                 and num_dp_ranks_of(cfg) == 1
                 and cfg.attn_cp_size == cfg.tp_size
                 and model_config_of(cfg).hf_config.architectures
                 == ["DeepseekV4ForCausalLM"]
             ), (
-                "PD-Multiplexing overlap prefill CP requires DeepSeek-V4 DSPARK, "
-                "interleave, DP=1 and attention CP=TP."
+                "PD-Multiplexing overlap prefill CP requires DeepSeek-V4 with "
+                "no speculation or DSPARK, interleave, DP=1 and attention CP=TP."
             )
             assert cfg.moe_a2a_backend == "none", (
                 "PD-Multiplexing overlap prefill CP requires --moe-a2a-backend none: "
@@ -888,7 +883,10 @@ def check_pdmux_overlap(cfg):
                 "--enable-two-batch-overlap: PDMux backends are per lane, "
                 "not TBO micro-batch backends."
             )
-            assert envs.SGLANG_RAGGED_VERIFY_MODE.get() != "compact", (
+            assert (
+                algorithm != "DSPARK"
+                or envs.SGLANG_RAGGED_VERIFY_MODE.get() != "compact"
+            ), (
                 "PD-Multiplexing overlap prefill CP cannot use "
                 "SGLANG_RAGGED_VERIFY_MODE=compact: DSV4 ragged verify "
                 "does not support CP. Use SGLANG_RAGGED_VERIFY_MODE=static."
@@ -971,7 +969,7 @@ def check_pdmux_standard_prefill(cfg):
     prefill_cp = getattr(cfg, "enable_prefill_cp", False)
     if prefill_cp:
         # Both modes share lane-isolated full-TP/CP communicators. Keep the
-        # same DSV4/DSPARK/interleave/DP1/CP=TP restrictions in standard mode,
+        # same DSV4/interleave/DP1/CP=TP restrictions in standard mode,
         # including when the caller disables CPU overlap.
         check_pdmux_overlap(cfg)
     for name, value in (

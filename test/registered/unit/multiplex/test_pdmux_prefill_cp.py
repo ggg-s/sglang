@@ -53,6 +53,8 @@ class TestPdmuxPrefillCPAdmission(unittest.TestCase):
             enable_cp_decode_attn_tp=False,
             enable_torch_compile=False,
             enable_two_batch_overlap=False,
+            enable_multi_layer_eagle=False,
+            enable_unified_memory=False,
             enable_hierarchical_cache=True,
             cuda_graph_config=NS(prefill=NS(backend="disabled")),
         )
@@ -60,30 +62,46 @@ class TestPdmuxPrefillCPAdmission(unittest.TestCase):
         methods = load_methods(
             "arg_groups/validation_hook.py",
             None,
-            ["check_pdmux_overlap"],
+            ["check_pdmux_overlap", "check_pdmux_standard_prefill"],
             num_dp_ranks_of=lambda cfg: cfg.dp_size * cfg.attn_dp_size,
             attn_dp_enabled_of=lambda cfg: cfg.attn_dp_size > 1,
             model_config_of=lambda _: NS(hf_config=NS(architectures=[arch])),
             envs=NS(SGLANG_RAGGED_VERIFY_MODE=NS(get=lambda: ragged_mode)),
         )
-        methods["check_pdmux_overlap"](cfg)
+        if cfg.pdmux_prefill_mode == "standard":
+            graph_config_module = "sglang.srt.model_executor.cuda_graph_config"
+            backend = NS(DISABLED="disabled", BREAKABLE="breakable")
+            with patch.dict(sys.modules, {graph_config_module: NS(Backend=backend)}):
+                methods["check_pdmux_standard_prefill"](cfg)
+        else:
+            methods["check_pdmux_overlap"](cfg)
 
     def test_full_width_cp_with_hicache_is_admitted(self):
         for mode in ("layer_split", "standard"):
-            for size in (2, 4, 8):
-                for decode_tp in (False, True):
-                    with self.subTest(mode=mode, size=size, decode_tp=decode_tp):
-                        self.check(
-                            pdmux_prefill_mode=mode,
-                            tp_size=size,
-                            attn_cp_size=size,
-                            enable_cp_decode_attn_tp=decode_tp,
-                        )
+            for algorithm in (None, "DSPARK"):
+                for size in (2, 4, 8):
+                    for decode_tp in (False, True):
+                        with self.subTest(
+                            mode=mode,
+                            size=size,
+                            decode_tp=decode_tp,
+                            algorithm=algorithm,
+                        ):
+                            self.check(
+                                pdmux_prefill_mode=mode,
+                                tp_size=size,
+                                attn_cp_size=size,
+                                enable_cp_decode_attn_tp=decode_tp,
+                                speculative_algorithm=algorithm,
+                                ragged_mode="compact" if algorithm is None else "static",
+                            )
 
     def test_other_topologies_and_shared_resources_remain_rejected(self):
         for overrides in (
             dict(arch="GlmMoeDsaForCausalLM"),
             dict(speculative_algorithm="DFLASH"),
+            dict(speculative_algorithm="EAGLE"),
+            dict(tp_size=1, attn_cp_size=1, speculative_algorithm=None),
             dict(cp_strategy="zigzag"),
             dict(dp_size=2),
             dict(attn_cp_size=1),
@@ -96,6 +114,7 @@ class TestPdmuxPrefillCPAdmission(unittest.TestCase):
             dict(enable_torch_compile=True),
             dict(enable_two_batch_overlap=True),
             dict(ragged_mode="compact"),
+            dict(cuda_graph_config=NS(prefill=NS(backend="breakable"))),
             dict(cuda_graph_config=NS(prefill=NS(backend="tc_piecewise"))),
             dict(cuda_graph_config=NS(prefill=NS(backend="full"))),
             dict(pdmux_prefill_mode="unknown"),

@@ -24,6 +24,9 @@ from __future__ import annotations
 
 import os
 import unittest
+
+import requests
+import torch
 from test_pdmux_hicache import (
     SPLIT_FORWARD_TOKEN_BUDGET,
     PDMuxHiCacheMixin,
@@ -85,8 +88,6 @@ class TestDSV4PDMuxOverlappedMasksHiCache(DSV4PDMuxHiCacheMixin, CustomTestCase)
 
     @classmethod
     def pdmux_config_body(cls) -> str:
-        import torch
-
         total_sm = torch.cuda.get_device_properties(0).multi_processor_count
         divisions = [
             (sm_multiple(total_sm // 4), 1),
@@ -118,6 +119,39 @@ class TestDSV4PDMuxOverlappedMasksHiCacheStandardPrefill(
     """Overlapped layout, prefill submitted as one standard EXTEND."""
 
     pdmux_prefill_mode = "standard"
+
+
+@unittest.skipUnless(
+    torch.cuda.device_count() >= 8 and os.environ.get("SGLANG_TEST_DSV4_FLASH_MODEL_PATH"),
+    "Eight CUDA GPUs and SGLANG_TEST_DSV4_FLASH_MODEL_PATH are required",
+)
+class TestDSV4PDMuxPCPHiCache(TestDSV4PDMuxExclusivePartitionsHiCache):
+    """Exercise host reload and concurrent requests with PCP and no draft worker."""
+
+    disable_overlap_schedule = False
+    extra_server_args = [
+        *DSV4PDMuxHiCacheMixin.extra_server_args,
+        "--enable-prefill-cp",
+        "--cp-strategy",
+        "interleave",
+        "--moe-a2a-backend",
+        "none",
+        "--cuda-graph-backend-prefill",
+        "disabled",
+    ]
+
+    @classmethod
+    def setUpClass(cls):
+        super().setUpClass()
+        try:
+            info = requests.get(cls.base_url + "/get_server_info", timeout=120).json()
+            assert info["speculative_algorithm"] is None, info
+            assert info["enable_prefill_cp"], info
+            assert info["attn_cp_size"] == info["tp_size"] == 8, info
+            assert info["dp_size"] == 1 and info["cp_strategy"] == "interleave", info
+        except Exception:
+            cls.tearDownClass()
+            raise
 
 
 if __name__ == "__main__":
