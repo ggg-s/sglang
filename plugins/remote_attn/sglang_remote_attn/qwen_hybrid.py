@@ -153,7 +153,9 @@ def freeze_ready(controller):
     device = controller.pool.full_kv_pool.k_buffer[0].device
     if device.type == "cuda":
         runner = controller.scheduler.tp_worker.model_runner
-        torch.cuda.current_stream(device).wait_stream(runner.forward_stream)
+        stream = torch.cuda.current_stream(device)
+        if stream != runner.forward_stream:
+            stream.wait_stream(runner.forward_stream)
 
 
 def state_rows(controller, req, length):
@@ -248,12 +250,14 @@ def call_batch(targets, queries, layer, scale):
     return out, lse
 
 
-def attention(controller, original, module, q, k, v, fb, save_kv_cache=True, **kw):
+def attention(
+    controller, original, module, q, k, v, fb, save_kv_cache=True, *, graph_rows=None, **kw
+):
     """Exact prefix/suffix GQA merge; GDN layers never enter this hook."""
     targets = controller.remote_targets
-    if not targets:
+    if not targets and graph_rows is None:
         return original(q, k, v, fb, save_kv_cache=save_kv_cache, **kw)
-    rows = fb.req_pool_indices.cpu().tolist()
+    rows = fb.req_pool_indices.cpu().tolist() if graph_rows is None else graph_rows
     active = [targets.get(int(row)) for row in rows]
     entries = set(controller.layer_entries[module.layer_id])
     remote_rows = [
@@ -263,7 +267,7 @@ def attention(controller, original, module, q, k, v, fb, save_kv_cache=True, **k
         trace = getattr(target, "pd_trace", None)
         if trace is not None:
             trace.layer(module.layer_id, remote)
-    if not any(remote_rows):
+    if graph_rows is None and not any(remote_rows):
         return original(q, k, v, fb, save_kv_cache=save_kv_cache, **kw)
     if (
         not fb.forward_mode.is_decode()
@@ -406,7 +410,6 @@ class Controller(pre_layerwise.Controller):
         from sglang.srt.runtime_context import (
             get_disagg,
             get_memory,
-            get_schedule,
             get_spec,
         )
 
@@ -426,10 +429,9 @@ class Controller(pre_layerwise.Controller):
             or runner.lora_manager is not None
             or s.kv_checksum_computer is not None
             or self.config.recv_host_staging
-            or not get_schedule().disable_overlap_schedule
         ):
             raise ValueError(
-                "hybrid Remote requires text-only native PD, remote GPU plane, overlap/MTP/LoRA disabled"
+                "hybrid Remote requires text-only native PD, remote GPU plane, MTP/LoRA disabled"
             )
         if s.disaggregation_mode.value == "decode":
             if not get_memory().disable_radix_cache or not s.tree_cache.disable:
@@ -496,8 +498,9 @@ class Controller(pre_layerwise.Controller):
                     or module.pos_encoding_mode != "NONE"
                 ):
                     raise ValueError("hybrid full-attention operator is incompatible")
-                original = module.forward
-                module.forward = functools.partial(attention, self, original, module)
+                if not getattr(module, "_handoff_hybrid_graph_wrapped", False):
+                    original = module.forward
+                    module.forward = functools.partial(attention, self, original, module)
                 self.attention_modules.append(module)
         if sorted(m.layer_id for m in self.attention_modules) != expected:
             raise ValueError("hybrid full-attention module map is incomplete")
@@ -539,16 +542,20 @@ class Controller(pre_layerwise.Controller):
             or getattr(fb, "replace_embeds", None) is not None
         ):
             raise ValueError("hybrid Remote first supports pure-text inputs only")
+        jobs = (
+            self.plan if self.scheduler.disaggregation_mode.value == "prefill" else None
+        )
         result = original(runner, fb, *args, **kwargs)
-        if self.scheduler.disaggregation_mode.value == "prefill" and self.plan:
+        if jobs:
             from .remote_data_plane import event
 
+            # Native overlap and graph replay enqueue on the current model
+            # stream. Capture a proof after the whole forward, including GDN.
             freeze_ready(self)
-            for source in self.plan:
-                if source.req.extend_end == source.prefix_len and not source.finalized:
-                    source.final_event = event(
-                        self.pool.full_kv_pool.k_buffer[0].device
-                    )
+            done = event(self.pool.full_kv_pool.k_buffer[0].device)
+            for source in jobs:
+                if not source.finalized:
+                    source.final_event = done
                     source.prefill_complete = True
                     source.prefix_stream.bound = True
         return result

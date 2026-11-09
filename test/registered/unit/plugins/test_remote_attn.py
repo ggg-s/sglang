@@ -2567,12 +2567,14 @@ class TestRemoteAttn(CustomTestCase):
 
     def test_decode_overlap_native_loop_serializes_remote_and_restores_local(self):
         """Native PD loop must drain before Remote launches, then pipeline Local again."""
-        self._check_decode_overlap_native_loop(with_cache=False)
+        for hybrid in (False, True):
+            with self.subTest(hybrid=hybrid):
+                self._check_decode_overlap_native_loop(with_cache=False, hybrid=hybrid)
 
     def test_d_cache_native_overlap_restores_pipeline_only_after_cache_commit(self):
         self._check_decode_overlap_native_loop(with_cache=True)
 
-    def _check_decode_overlap_native_loop(self, *, with_cache):
+    def _check_decode_overlap_native_loop(self, *, with_cache, hybrid=False):
         from collections import deque
 
         from sglang_remote_attn.decode_overlap import process_last_batch_early
@@ -2609,6 +2611,7 @@ class TestRemoteAttn(CustomTestCase):
             else:
                 controller, target, freed = self._overlap_target(directory)
             controller.targets = []
+            controller.hybrid_gdn = hybrid
             scheduler = native()
             scheduler.enable_overlap = True
             controller.scheduler = scheduler
@@ -2718,7 +2721,7 @@ class TestRemoteAttn(CustomTestCase):
                 [
                     ("local-0", []),
                     ("remote-1", []),
-                    ("remote-2", []),
+                    ("remote-2", ["remote-1"] if hybrid else []),
                     ("local-3", []),
                     ("local-4", ["local-3"]),
                 ],
@@ -13125,6 +13128,13 @@ class TestRemoteAttn(CustomTestCase):
                 self.hooks._prefill_graph(lambda *a: True, runner, f.batch)
             )
             f.controller.executing = None
+            f.controller.hybrid_gdn = True
+            f.controller.plan = [object()]
+            self.assertTrue(
+                self.hooks._prefill_graph(lambda *a: True, runner, f.batch)
+            )
+            f.controller.plan = None
+            f.controller.hybrid_gdn = False
             with patch.object(
                 self.runtime,
                 "has_remote_work",

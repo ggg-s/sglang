@@ -42,12 +42,23 @@ class DecodeOverlap:
         from .retirement import Retirement
 
         self.retirement = Retirement(controller)
-        logger.info("[remote-attn-overlap] D enabled: Remote serial, Local native")
+        logger.info("[remote-attn-overlap] D lifetime tracking enabled")
 
     def serial(self):
         if not self.controller.graph_fast_path:
             raise RuntimeError("D overlap requires TP-agreed progressive lifetimes")
-        if self.controller.targets or self.retirement.pending is not None:
+        remote = bool(self.controller.targets)
+        if getattr(self.controller, "hybrid_gdn", False):
+            # Native result ownership and BatchProof cover the previous and
+            # current launch, including segmented replay and delayed sampling.
+            # Drain on bank transitions or an ordered retirement command.
+            serial = remote != self.exit_boundary or self.retirement.pending is not None
+            self.exit_boundary = remote
+            policy = (
+                "hybrid-boundary" if serial else
+                "hybrid-remote-native" if remote else "local-native"
+            )
+        elif remote or self.retirement.pending is not None:
             self.exit_boundary = True
             policy = "remote-serial"
             serial = True

@@ -4,8 +4,7 @@
 `Qwen/Qwen3.8-27B-FP8`。复用原生模型加载与 FP8 权重计算，不新增模型类。
 
 当前阶段：纯文本、P/D0/D1 同 TP。**P 支持原生 FULL+MAMBA prefix cache；D0/D1 关闭 radix cache**。
-关闭 MTP/推测、调度 overlap、
-ReplaySSM、LoRA、HiCache 和 unified memory。完整 attention 使用 page-size=1 的
+关闭 MTP/推测、ReplaySSM、LoRA、HiCache 和 unified memory。完整 attention 使用 page-size=1 的
 原生 NHD BF16/FP16 KV；SSM 使用 FP32。**FP8 权重不等于 FP8 KV。**
 
 P→D 先使用原生 `MAMBA` 状态规划和传输安装全部 Conv/SSM 与采样 metadata。
@@ -24,8 +23,11 @@ P 安装支持 `(FULL, MAMBA)` 的读 lease，独立固定缓存前缀、保留�
 D 传输中完成或取消也先延期回收，避免工作 slot 或请求行提前复用。
 P 当前要求内置、device-only `(FULL, MAMBA)` UnifiedRadixCache；HiCache、
 外部 storage/linker、session cache 和第三方 radix backend 不在此支持范围。
-D0→D1 支持 Remote attention 与逐 entry 渐进 Local。Remote 期间使用 eager，
-全部资源经 TP 退休后恢复原生 Local CUDA graph；本阶段不提供混合模型的 Remote 分段图。
+P 支持原生 Prefill CUDA Graph 和 overlap schedule。最后一批 forward（含图回放）结束后，
+以实际生产流上的完成事件约束 KV、Conv 和 SSM 的发布。
+D 的 Remote 窗口支持 overlap schedule 和 Decode 分段图。只有 full-attention 层进入 eager
+回调，GDN 和其他算子留在图内。D 在进入或离开窗口时先处理上一批结果，稳定窗口使用原生
+overlap。全部资源经 TP 退休后切回原生全量 Decode 图。
 
 ## 分配和冻结边界
 
@@ -72,16 +74,21 @@ group 根据逻辑模型 layer id 分组。每个 entry/range 的覆盖证明保
 ```bash
 --model-path Qwen/Qwen3.8-27B-FP8 \
 --language-model-only \
---disable-overlap-schedule \
 --page-size 1 \
 --kv-cache-dtype bfloat16 \
 --mamba-ssm-dtype float32
 ```
 
-**P 端不传 `--disable-radix-cache`**。当前 page-size=1、overlap 关闭的默认
-`auto` 策略解析为 `no_buffer`，也可显式传 `--mamba-radix-cache-strategy no_buffer`。
-**D0、D1 额外添加 `--disable-radix-cache`**；插件仍会拒绝 D 开启 radix。
-不要在共用启动参数中给三侧统一关闭 radix，否则 P 也不会有缓存命中。
+- **P** 保留 device radix cache。启用 overlap 时使用 Triton GDN 和
+  `--mamba-radix-cache-strategy extra_buffer`（原生 `auto` 在适用时也会选择它）。
+  Prefill Graph 使用 `--cuda-graph-backend-prefill breakable`。
+- **D0、D1** 添加 `--disable-radix-cache --cuda-graph-backend-decode full`。
+  Decode 捕获 bucket 至少包含 1、2、4，Remote 分段图使用其中的 1、2、4、8、16。
+  超出已捕获 bucket 的 Remote batch 走 eager。
+- 两端使用上述配置时去掉 `--disable-overlap-schedule` 和 `--disable-cuda-graph`。
+  `HANDOFF_REMOTE_SEGMENTED_GRAPH=0` 可作为 D 端 Remote eager 的对照。
+- 主动 D2D 冻结依赖源端的原生结果队列排空。D2D 独立验证仍使用源 D 的
+  `--disable-overlap-schedule`。
 
 不传 speculative/MTP 开关；保留模型原生的 attention/linear-attention 后端。
 插件环境：

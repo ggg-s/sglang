@@ -418,6 +418,7 @@ def _graph_decision(original, runner, forward_batch, kind):
     if (
         kind == "prefill"
         and getattr(controller, "dsv41_layerwise", False)
+        and not getattr(controller, "hybrid_gdn", False)
         and (
             controller.plan is not None
             or controller.executing is not None

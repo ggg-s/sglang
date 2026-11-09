@@ -41,18 +41,30 @@ def compute(root, pd_mode=False):
         producer = torch.cuda.Stream()
         producer.wait_stream(torch.cuda.current_stream())
         p.scheduler.tp_worker.model_runner.forward_stream = producer
-        with torch.cuda.stream(producer):
-            torch.cuda._sleep(300_000_000)
+        def produce():
             m.mamba_cache.conv[0].normal_(std=0.1)
             m.mamba_cache.temporal.normal_(std=0.1)
             for tensor in hybrid.kv_buffers(p.pool):
                 tensor.normal_(std=0.2)
+
         if pd_mode:
-            f.start()
+            graph = torch.cuda.CUDAGraph()
+            with torch.cuda.graph(graph, stream=producer):
+                produce()
+
+            def replay(runner, batch):
+                with torch.cuda.stream(producer):
+                    torch.cuda._sleep(300_000_000)
+                    graph.replay()
+
+            f.start(forward=replay)
             f.wait_barrier()
             target = f.admit()
             assert not f.canonical and not target.rpc.all_local()
         else:
+            with torch.cuda.stream(producer):
+                torch.cuda._sleep(300_000_000)
+                produce()
             tr = f.reserve_and_freeze(growth=2)
             f.import_(tr)
             target = d.d2d_targets[f.epoch]
@@ -205,7 +217,8 @@ def compute(root, pd_mode=False):
                 )
             )
             batch_o = hybrid.attention(
-                d, native, module, q4, k, v, fb4, save_kv_cache=False
+                d, native, module, q4, k, v, fb4,
+                save_kv_cache=False, graph_rows=[row] * 4,
             ).reshape(4, 6, 256)
             for query, output in zip(q4.reshape(4, 6, 256), batch_o):
                 reference, _ = flashinfer.single_decode_with_kv_cache(
@@ -261,6 +274,7 @@ def compute(root, pd_mode=False):
             "bulk_group_frames": getattr(target, "group_frames", None),
             "max_entries_per_frame": getattr(target, "grouped_entries", None),
             "producer_stream_fenced": True,
+            "prefill_producer_graph_replayed": pd_mode,
             "tail_preserved": True,
         }
     finally:

@@ -123,6 +123,7 @@ class RemoteGraphBackend:
         self.capture_batch = None
         self.capturing = False
         self.active_batch = None
+        self.live_rows = None
         self.active_key = None
         self.use_remote = False
         self.capture_layers = []
@@ -199,7 +200,7 @@ class RemoteGraphBackend:
         finally:
             self.capture_remote = False
             self.restore_pool()
-        expected = list(range(self.runner.model_runner.model_config.num_hidden_layers))
+        expected = self.expected_layers()
         if self.capture_layers != expected:
             raise RuntimeError(
                 f"Remote graph attention boundaries differ: {self.capture_layers}, expected {expected}"
@@ -212,6 +213,9 @@ class RemoteGraphBackend:
             shape_key.size,
             len(expected),
         )
+
+    def expected_layers(self):
+        return list(range(self.runner.model_runner.model_config.num_hidden_layers))
 
     def validate_capture_key(self, shape_key):
         if any(
@@ -282,7 +286,7 @@ class RemoteGraphBackend:
         if use_remote:
             # Freeze the per-token layer masks before the first segment. Never
             # retain a Req or a capture-time dummy ForwardBatch in the callback.
-            self.validate_live(batch)
+            self.live_rows = self.validate_live(batch)
         self.use_remote, self.active_batch = use_remote, batch
         self.active_key = self.remote_key(batch) if use_remote else None
         # Native load_batch must stage exactly the bucket that eligibility and
@@ -305,6 +309,7 @@ class RemoteGraphBackend:
                 raise
             finally:
                 self.active_batch = None
+                self.live_rows = None
                 self.active_key = None
                 self.use_remote = False
                 self.runner.capture_bs = native_buckets
@@ -364,7 +369,7 @@ class RemoteGraphBackend:
         if q.shape[0] != bucket:
             raise RuntimeError("Remote attention break has a mismatched bucket")
         raw_bs = batch.batch_size
-        result = _runtime()._handoff_attention_forward(
+        result = self.live_attention(
             module,
             q[:raw_bs],
             k[:raw_bs] if k is not None else None,
@@ -380,6 +385,9 @@ class RemoteGraphBackend:
             raise RuntimeError("Remote attention output differs from its graph bridge")
         self.attention_calls += 1
         return pad_attention_output(result, raw_bs, bucket)
+
+    def live_attention(self, module, q, k, v, batch, **kwargs):
+        return _runtime()._handoff_attention_forward(module, q, k, v, batch, **kwargs)
 
     def manifest(self):
         return tuple(sorted(self.boundaries.items()))
@@ -410,8 +418,43 @@ class RemoteGraphBackend:
         self.closed = True
 
 
-def install_attention(model_runner):
+class HybridGraphBackend(RemoteGraphBackend):
+    def expected_layers(self):
+        from .qwen_hybrid import text_config
+
+        return list(text_config(self.runner.model_runner).full_attention_layer_ids)
+
+    def validate_live(self, batch):
+        controller = self.runner.model_runner._pre_layerwise
+        rows = batch.req_pool_indices.cpu().tolist()
+        for row in rows:
+            target = controller.remote_targets.get(row)
+            if target is not None:
+                target.check()
+        return rows
+
+    def prepare_padded_metadata(self, batch):
+        # The break uses the live real rows and never the native full-attention
+        # backend's padded metadata. Keep captured GDN metadata untouched.
+        pass
+
+    def live_attention(self, module, q, k, v, batch, **kwargs):
+        from .qwen_hybrid import attention
+
+        return attention(
+            self.runner.model_runner._pre_layerwise,
+            module._handoff_orig_forward,
+            module, q, k, v, batch,
+            graph_rows=self.live_rows,
+            **kwargs,
+        )
+
+
+def install_attention(model_runner, *, hybrid=False):
     from sglang.srt.layers.radix_attention import RadixAttention
+
+    if hybrid:
+        from .qwen_hybrid import attention as hybrid_attention
 
     for module in model_runner.model.modules():
         if not isinstance(module, RadixAttention):
@@ -431,7 +474,14 @@ def install_attention(model_runner):
                     )
                 finally:
                     backend.capture_batch = previous
-            if backend.capturing or not _runtime().has_target_states():
+            if hybrid:
+                controller = getattr(model_runner, "_pre_layerwise", None)
+                if controller is not None and not backend.capturing:
+                    return hybrid_attention(
+                        controller, self._handoff_orig_forward, self,
+                        q, k, v, batch, save_kv_cache=save_kv_cache, **kwargs,
+                    )
+            if hybrid or backend.capturing or not _runtime().has_target_states():
                 return self._handoff_orig_forward(
                     q, k, v, batch, save_kv_cache=save_kv_cache, **kwargs
                 )
@@ -441,12 +491,13 @@ def install_attention(model_runner):
 
         module.forward = types.MethodType(forward, module)
         module._handoff_wrapped = True
+        module._handoff_hybrid_graph_wrapped = hybrid
 
 
 def resolve_backend(original, runner):
     from sglang.srt.runtime_context import get_disagg, get_exec, get_parallel
 
-    from . import dsv41_graph, dsv41_remote
+    from . import dsv41_graph, dsv41_remote, qwen_hybrid
 
     dsv41 = dsv41_graph.is_model(runner)
     flash = (
@@ -466,6 +517,7 @@ def resolve_backend(original, runner):
     except ModuleNotFoundError:
         cuda_python = False
     mr = runner.model_runner
+    hybrid = qwen_hybrid.matches(mr)
     controller = getattr(mr, "_pre_layerwise", None)
     live = bool(
         _runtime().has_target_states()
@@ -493,8 +545,9 @@ def resolve_backend(original, runner):
         mr.model_config.num_hidden_layers,
         mr.lora_manager is not None,
         getattr(mr.model_config.hf_config, "model_type", None)
-        if dsv41 or flash
+        if dsv41 or flash or hybrid
         else None,
+        tuple(qwen_hybrid.text_config(mr).full_attention_layer_ids) if hybrid else None,
         tuple(getattr(mr.model_config.hf_config, "compress_ratios", ()))
         if dsv41 or flash
         else None,
@@ -522,10 +575,6 @@ def resolve_backend(original, runner):
             "DSV Remote graph native metadata/prepare/attention ABI is incompatible"
         )
     full = original(runner)
-    from .qwen_hybrid import matches as is_hybrid
-
-    if is_hybrid(mr):
-        return full
     if settings != ("decode", "remote", "1"):
         return full
     if not cuda_python:
@@ -559,9 +608,9 @@ def resolve_backend(original, runner):
             "Remote segments require native full decode graphs without torch.compile, debug-eager or memory saver"
         )
     if (
-        not dsv41 and type(mr.model).__name__ != "Qwen3ForCausalLM"
+        not (dsv41 or hybrid) and type(mr.model).__name__ != "Qwen3ForCausalLM"
     ) or mr.lora_manager is not None:
-        raise ValueError("Remote segments require Qwen3ForCausalLM without LoRA")
+        raise ValueError("Remote segments require a supported model without LoRA")
     if not set(MIN_REMOTE_BATCHES).issubset(runner.capture_bs):
         raise ValueError(
             "Native decode capture buckets must include 1, 2, 4 for Remote segments"
@@ -575,7 +624,11 @@ def resolve_backend(original, runner):
         runner, capture_error_mode="thread_local", preallocate_workspaces=True
     )
     remote._pool = runner.device_module.graph_pool_handle()
-    cls = dsv41_graph.DSV41GraphBackend if dsv41 else RemoteGraphBackend
+    cls = (
+        dsv41_graph.DSV41GraphBackend
+        if dsv41
+        else HybridGraphBackend if hybrid else RemoteGraphBackend
+    )
     backend = cls(
         runner,
         full,
@@ -588,5 +641,5 @@ def resolve_backend(original, runner):
     if dsv41:
         dsv41_graph.install(mr, runner)
     else:
-        install_attention(mr)
+        install_attention(mr, hybrid=hybrid)
     return backend

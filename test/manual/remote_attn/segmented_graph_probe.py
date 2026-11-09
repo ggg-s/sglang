@@ -127,7 +127,10 @@ def background_allocation_probe(primitive):
         raise RuntimeError(f"background CUDA worker failed: {errors}")
 
 
-def run(root, allow_strong_refs, dtype, logits_output=False, marlin_workspaces=False):
+def run(
+    root, allow_strong_refs, dtype, logits_output=False, marlin_workspaces=False,
+    hybrid=False,
+):
     if not torch.cuda.is_available():
         raise RuntimeError("CUDA is required")
     prefix = "sglang.srt.model_executor.runner_backend_utils.breakable_cuda_graph"
@@ -238,7 +241,8 @@ def run(root, allow_strong_refs, dtype, logits_output=False, marlin_workspaces=F
         torch.manual_seed(19)
         callbacks = []
         inputs = {}
-        layers = 3
+        layers = 4 if hybrid else 3
+        attention_ids = [0, 2] if hybrid else list(range(layers))
         width = 8
         marlin_allocations = []
 
@@ -284,8 +288,8 @@ def run(root, allow_strong_refs, dtype, logits_output=False, marlin_workspaces=F
         class Model(torch.nn.Module):
             def __init__(self):
                 super().__init__()
-                self.attentions = torch.nn.ModuleList(
-                    Attention(i) for i in range(layers)
+                self.attentions = torch.nn.ModuleDict(
+                    {str(i): Attention(i) for i in attention_ids}
                 )
                 self.weights = [
                     torch.randn(width, width, device="cuda", dtype=dtype) * 0.1
@@ -293,7 +297,7 @@ def run(root, allow_strong_refs, dtype, logits_output=False, marlin_workspaces=F
                 ]
 
             def forward(self, x, batch, reference=False):
-                for module, weight in zip(self.attentions, self.weights):
+                for i, weight in enumerate(self.weights):
                     q = torch.nn.functional.linear(x, weight) + 0.1
                     if marlin_workspaces:
                         scratch = marlin_namespace["marlin_make_workspace"](x.device, 4)
@@ -301,7 +305,14 @@ def run(root, allow_strong_refs, dtype, logits_output=False, marlin_workspaces=F
                         # Simulate dirty reduction locks. Repeated replay must
                         # execute the captured reset before reading this slot.
                         scratch.fill_(7)
-                    x = q if reference else module(q, q, q, batch)
+                    if i not in attention_ids:
+                        # Keep a distinct recurrent-like GPU operation in the
+                        # graph between full-attention callbacks.
+                        q = q + x * 0.125
+                    x = (
+                        q if reference or i not in attention_ids
+                        else self.attentions[str(i)](q, q, q, batch)
+                    )
                     x = torch.relu(x) + 0.2
                 if logits_output:
                     return namespace["LogitsProcessorOutput"](
@@ -334,10 +345,15 @@ def run(root, allow_strong_refs, dtype, logits_output=False, marlin_workspaces=F
                 output.sampling_mask_output = object()
 
         model = Model()
-        controller = types.SimpleNamespace(graph_fast_path=True, targets=[])
+        controller = types.SimpleNamespace(
+            graph_fast_path=True, targets=[], remote_targets={},
+        )
         mr = types.SimpleNamespace(
             model=model,
-            model_config=types.SimpleNamespace(num_hidden_layers=layers),
+            model_config=types.SimpleNamespace(
+                num_hidden_layers=layers,
+                hf_config=types.SimpleNamespace(full_attention_layer_ids=attention_ids),
+            ),
             _pre_layerwise=controller,
             device_timer=None,
             is_draft_worker=False,
@@ -357,7 +373,8 @@ def run(root, allow_strong_refs, dtype, logits_output=False, marlin_workspaces=F
             runner, capture_error_mode="thread_local", preallocate_workspaces=True
         )
         remote._pool = torch.cuda.graph_pool_handle()
-        backend = sg.RemoteGraphBackend(
+        backend_type = sg.HybridGraphBackend if hybrid else sg.RemoteGraphBackend
+        backend = backend_type(
             runner,
             full,
             remote,
@@ -374,6 +391,7 @@ def run(root, allow_strong_refs, dtype, logits_output=False, marlin_workspaces=F
                 input_ids=torch.zeros(size, dtype=torch.int64, device="cuda"),
                 input_embeds=None,
                 replace_embeds=None,
+                req_pool_indices=torch.arange(size, dtype=torch.int32, device="cuda"),
                 forward_mode=types.SimpleNamespace(is_decode=lambda: True),
                 marker=marker,
                 local_layers=local,
@@ -410,8 +428,25 @@ def run(root, allow_strong_refs, dtype, logits_output=False, marlin_workspaces=F
                 SGLANG_LOG_DECODE_GRAPH_KEY=types.SimpleNamespace(get=lambda: False)
             )
         )
-        with patch.object(sg, "_runtime", return_value=runtime), torch.inference_mode():
-            sg.install_attention(mr)
+        hybrid_context = nullcontext()
+        if hybrid:
+            from sglang_remote_attn import qwen_hybrid
+
+            def hybrid_attention(owner, original, module, q, k, v, live,
+                                 graph_rows=None, **kwargs):
+                assert owner is controller
+                if graph_rows is None:
+                    return original(q, k, v, live, **kwargs)
+                assert graph_rows == list(range(live.batch_size))
+                return attention(module, q, k, v, live, **kwargs)
+
+            hybrid_context = patch.object(qwen_hybrid, "attention", hybrid_attention)
+        with (
+            patch.object(sg, "_runtime", return_value=runtime),
+            hybrid_context,
+            torch.inference_mode(),
+        ):
+            sg.install_attention(mr, hybrid=hybrid)
             stream = torch.cuda.Stream()
             with backend.capture_session(stream):
                 for size in reversed(runner.capture_bs):
@@ -430,16 +465,13 @@ def run(root, allow_strong_refs, dtype, logits_output=False, marlin_workspaces=F
                 for key, graph in remote._graphs.items()
             }
             assert segment_counts == {
-                "1": layers + 1,
-                "2": layers + 1,
-                "4": layers + 1,
-                "8": layers + 1,
-                "16": layers + 1,
+                str(size): len(attention_ids) + 1 for size in (1, 2, 4, 8, 16)
             }, segment_counts
+            assert all(ids == tuple(attention_ids) for ids in backend.boundaries.values())
             controller.targets.append(object())
             padded_replays = []
             for size in (16, 3, 5, 6, 7, 13, 14, 15, 8, 4, 1, 2, 16, 3):
-                for marker, local in ((11, ()), (12, (0,)), (13, (0, 1, 2))):
+                for marker, local in ((11, ()), (12, (0,)), (13, attention_ids)):
                     live = batch(size, marker, local)
                     key = backend.remote_key(live)
                     inputs[key.size].normal_()
@@ -476,7 +508,7 @@ def run(root, allow_strong_refs, dtype, logits_output=False, marlin_workspaces=F
                 check_output(output, expected)
             assert len(callbacks) == before, "Local full replay invoked RPC"
             controller.targets.append(object())
-            live = batch(1, 99, fail=1)
+            live = batch(1, 99, fail=attention_ids[1])
             before = len(callbacks)
             try:
                 with backend.execution(live), backend.replay_session():
@@ -484,7 +516,7 @@ def run(root, allow_strong_refs, dtype, logits_output=False, marlin_workspaces=F
                 raise AssertionError("RPC failure was swallowed")
             except RuntimeError as error:
                 assert str(error) == "injected RPC failure"
-            assert callbacks[before:] == [(99, 0), (99, 1)]
+            assert callbacks[before:] == [(99, i) for i in attention_ids[:2]]
             assert backend.active_batch is None and not backend.use_remote
             replay_counts = dict(backend.replays)
             backend.cleanup()
@@ -495,6 +527,8 @@ def run(root, allow_strong_refs, dtype, logits_output=False, marlin_workspaces=F
             "dtype": str(dtype),
             "output_type": "LogitsProcessorOutput" if logits_output else "Tensor",
             "layers": layers,
+            "hybrid": hybrid,
+            "attention_layers": attention_ids,
             "remote_segments": segment_counts,
             "replays": replay_counts,
             "padded_replays": padded_replays,
@@ -532,6 +566,7 @@ if __name__ == "__main__":
     parser.add_argument("--allow-strong-refs", action="store_true")
     parser.add_argument("--logits-output", action="store_true")
     parser.add_argument("--marlin-workspaces", action="store_true")
+    parser.add_argument("--hybrid", action="store_true")
     parser.add_argument(
         "--dtype", choices=("bfloat16", "float16", "float32"), default="bfloat16"
     )
@@ -544,6 +579,7 @@ if __name__ == "__main__":
                 getattr(torch, args.dtype),
                 args.logits_output,
                 args.marlin_workspaces,
+                args.hybrid,
             ),
             indent=2,
         )

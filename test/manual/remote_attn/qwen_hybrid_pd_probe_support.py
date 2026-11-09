@@ -207,13 +207,13 @@ class Environment(HybridEnvironment):
         self.workers.append(worker)
         worker.start()
 
-    def start(self):
+    def start(self, forward=None):
         pd.prepare(self.source, [self.req])
         self.source_actor = self.req._pre_layerwise_source
         self.source.plan = [self.source_actor]
         hybrid.Controller.forward(
             self.source,
-            lambda runner, fb: None,
+            forward or (lambda runner, fb: None),
             self.source.scheduler.tp_worker.model_runner,
             NS(input_embeds=None, replace_embeds=None),
         )
