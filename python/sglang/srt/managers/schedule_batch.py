@@ -2371,7 +2371,7 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
                 row is None
                 or not req.kv.reserved_prefill_suffix
                 or req.kv.kv_committed_len != req.prefix_len
-                or req.kv.kv_allocated_len != req.extend_end
+                or not req.prefix_len < req.extend_end <= req.kv.kv_allocated_len
                 for req, row in zip(reqs, rows)
             ):
                 raise RuntimeError("extend requires a reserved KV suffix")
@@ -2391,7 +2391,9 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
             ).to(torch.int64)
             for req in reqs:
                 req.kv.commit_prealloc(req.extend_end)
-                req.kv.reserved_prefill_suffix = False
+                req.kv.reserved_prefill_suffix = (
+                    req.extend_end < req.kv.kv_allocated_len
+                )
         else:
             out_cache_loc, req_pool_indices_tensor, req_pool_indices_cpu = (
                 alloc_for_extend(self)

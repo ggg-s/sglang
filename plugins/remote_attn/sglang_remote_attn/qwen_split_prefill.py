@@ -26,15 +26,22 @@ def configure(controller):
         ):
             raise ValueError("hybrid split prefill requires early device KV allocation")
     controller.split_prefill = value == "1"
+    scheduler = controller.scheduler
     controller.split_prefill_budget = (
-        controller.scheduler.max_prefill_tokens if controller.split_prefill else None
+        scheduler.max_prefill_tokens if controller.split_prefill else None
+    )
+    controller.split_prefill_chunk_size = (
+        min(scheduler.chunked_prefill_size, controller.split_prefill_budget)
+        if controller.split_prefill and scheduler.chunked_prefill_size
+        else None
     )
     if controller.rank == 0:
         logger.info(
-            "[handoff-split-config] role=%s enabled=%s max_prefill_tokens=%s",
-            controller.scheduler.disaggregation_mode.value,
+            "[handoff-split-config] role=%s enabled=%s max_prefill_tokens=%s chunk_size=%s",
+            scheduler.disaggregation_mode.value,
             controller.split_prefill,
             controller.split_prefill_budget,
+            controller.split_prefill_chunk_size,
         )
 
 
@@ -112,7 +119,10 @@ def advertise(queue, dr, decode_prefix_len):
     receiver._hybrid_split_offer_checked = True
     length = len(req.origin_input_ids)
     budget = controller.split_prefill_budget
-    suffix = min(length - length // 2, budget)
+    chunk_size = controller.split_prefill_chunk_size
+    suffix = length - length // 2
+    if chunk_size is None:
+        suffix = min(suffix, budget)
     reason = request_blocker(req)
     if dr.is_rebootstrap or decode_prefix_len:
         reason = "decode_already_owns_prefix"
@@ -124,7 +134,13 @@ def advertise(queue, dr, decode_prefix_len):
     if reason is None:
         cut = receiver._hybrid_split_offer = length - suffix
     log_decision(
-        controller, req, "decode_offer", reason or "offered", cut=cut, budget=budget
+        controller,
+        req,
+        "decode_offer",
+        reason or "offered",
+        cut=cut,
+        budget=budget,
+        chunk_size=chunk_size,
     )
 
 
@@ -298,16 +314,27 @@ def next_batch(original, scheduler, running_batch):
         # marker before native Decode reuses that object on subsequent ticks.
         last._hybrid_split_extend = False
         if last is not running_batch and last.forward_mode.is_extend():
-            last.filter_batch()
-            if not last.is_empty():
-                scheduler.prefill_launched_reqs.leave(last.reqs)
-                scheduler.running_reqs.join(last.reqs)
-                if running_batch.is_empty():
-                    running_batch = last
-                else:
-                    running_batch.merge_batch(last)
-            # Give existing decodes a turn between suffix batches.
-            return original(scheduler, running_batch)
+            if last.chunked_req is not None:
+                # Serial processing or the early overlap result hook has drained
+                # this forward. It is now safe to reuse or release its KV/state.
+                req = last.chunked_req
+                scheduler.process_pending_chunked_abort()
+                scheduler.chunked_req = None
+                if not req.finished():
+                    req.prefix_len = req.kv.kv_committed_len
+                    scheduler.waiting_queue.prepend([req])
+                if not running_batch.is_empty():
+                    return original(scheduler, running_batch)
+            else:
+                last.filter_batch()
+                if not last.is_empty():
+                    scheduler.prefill_launched_reqs.leave(last.reqs)
+                    scheduler.running_reqs.join(last.reqs)
+                    if running_batch.is_empty():
+                        running_batch = last
+                    else:
+                        running_batch.merge_batch(last)
+                return original(scheduler, running_batch)
 
     req = next(
         (r for r in scheduler.waiting_queue if r.kv.reserved_prefill_suffix),
@@ -321,7 +348,11 @@ def next_batch(original, scheduler, running_batch):
 
     scheduler.waiting_queue.leave([req])
     req.refresh_fill_ids()
-    req.extend_end = len(req.origin_input_ids)
+    prompt_len = len(req.origin_input_ids)
+    chunk_size = controller.split_prefill_chunk_size or controller.split_prefill_budget
+    req.extend_end = min(req.prefix_len + chunk_size, prompt_len)
+    middle = req.extend_end < prompt_len
+    scheduler.chunked_req = req if middle else None
     req.time_stats.set_forward_entry_time()
     batch = ScheduleBatch.init_new(
         [req],
@@ -331,16 +362,32 @@ def next_batch(original, scheduler, running_batch):
         scheduler.model_config,
         scheduler.enable_overlap,
         scheduler.spec_algorithm,
+        chunked_req=scheduler.chunked_req,
     )
+    # The native middle-chunk result path skips token publication. Also avoid
+    # sampling here so intermediate forwards do not advance the request RNG.
+    batch.is_prefill_only = middle
+    first_chunk = req.extend_batch_idx == 0
     batch.prepare_for_extend(reuse_preallocated_kv=True)
     batch._hybrid_split_extend = True
     set_schedule_time_batch(batch)
-    logger.info(
-        "[handoff-split] hybrid PD rid=%s cut=%s suffix=%s path=eager",
-        req.rid,
-        req.prefix_len,
-        req.extend_len,
-    )
+    if first_chunk:
+        logger.info(
+            "[handoff-split] hybrid PD rid=%s cut=%s suffix=%s path=eager",
+            req.rid,
+            req.prefix_len,
+            prompt_len - req.prefix_len,
+        )
+    if controller.rank == 0:
+        logger.info(
+            "[handoff-split-chunk] hybrid PD rid=%s prefix=%s suffix_chunk=%s end=%s "
+            "remaining=%s path=eager",
+            req.rid,
+            req.prefix_len,
+            req.extend_len,
+            req.extend_end,
+            prompt_len - req.extend_end,
+        )
     return NextBatchPlan(batch_to_run=batch, running_batch=running_batch)
 
 

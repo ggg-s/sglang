@@ -845,6 +845,7 @@ class TestQwenHybridD2D(CustomTestCase):
             def __init__(self, reqs, mode):
                 self.reqs = reqs
                 self.forward_mode = mode
+                self.chunked_req = None
 
             def filter_batch(self):
                 pass

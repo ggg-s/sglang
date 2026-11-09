@@ -119,9 +119,11 @@ P 上可用 `HANDOFF_HYBRID_REMOTE_MIN_CACHE_HIT_RATIO` 调整门槛，设为 `0
 ### 实验性分段 Prefill
 
 P、D 同时设置 `HANDOFF_HYBRID_SPLIT_PREFILL=1` 开启。至少 4096 token 的纯文本
-请求可参与协商。D 按 `--max-prefill-tokens` 将续算段限制在 2048 token 至 prompt
-后半段之间。64K prompt 在默认 16384 的 D 预算下约按 48K／16K 切分，预算达到
-32768 时按 50/50 切分。沿用同 TP 的原生 Mooncake、early device allocation 和
+请求可参与协商。D 启用 `--chunked-prefill-size` 时，P 和 D 各计算约半条 prompt。
+D 的单次续算以 `--chunked-prefill-size` 和 `--max-prefill-tokens` 中较小的值为上限。
+例如 64K prompt、D 的两个上限均为 16384 时，D 分两批各续算 16K。D 禁用
+chunked prefill 时，沿用 `--max-prefill-tokens` 限制整个续算段，且续算段至少
+需要 2048 token。沿用同 TP 的原生 Mooncake、early device allocation 和
 D 端禁用 radix cache 的配置。P 等到 bootstrap 后再为可协商请求启动 Prefill。
 高命中、请求输出 logprobs、结构化生成或对端未协商时，走既有 PD 路径。
 
@@ -130,8 +132,10 @@ P 发出切点前的 KV 和 Conv／SSM 后完成原生传输。D 在已有预留
 一个请求，已有 decode batch 会在两个续算 batch 之间获得执行机会。
 验收时用相同的缓存冷热顺序和并发，对比分段开关的 TTFT 与 D 上其他请求的 ITL。
 P、D 的 `[handoff-split-decision]` 记录协商与回退原因，可按 bootstrap room 对照。
-D 的 `[handoff-split]` 记录实际开始续算时的切点和 token 数。D 续算 batch 走
-eager，结果结算后只交接一次给正常 Decode 调度，后续 Decode 可按原生规则回放图。
+D 的 `[handoff-split]` 记录切点和总续算量，`[handoff-split-chunk]` 记录每块的起止
+位置和剩余 token 数。D 复用同一份 KV 预留和 Conv／SSM 状态，各块均走 eager。
+只在最后一块结算后进入正常 Decode 调度，
+后续 Decode 可按原生规则回放图。
 
 不要开启原生 disaggregation staging ring；D2D 的私有 staging 由共用数据面管理。
 原生 Mooncake transport、bootstrap、SMG、control directory 配置沿用现有部署。
