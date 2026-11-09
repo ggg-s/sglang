@@ -27,21 +27,39 @@ def configure(controller):
             raise ValueError("hybrid split prefill requires early device KV allocation")
     controller.split_prefill = value == "1"
     scheduler = controller.scheduler
-    controller.split_prefill_budget = (
-        scheduler.max_prefill_tokens if controller.split_prefill else None
-    )
-    controller.split_prefill_chunk_size = (
-        min(scheduler.chunked_prefill_size, controller.split_prefill_budget)
-        if controller.split_prefill and scheduler.chunked_prefill_size
-        else None
-    )
+    role = scheduler.disaggregation_mode.value
+    controller.split_prefill_budget = None
+    controller.split_prefill_chunk_size = None
+    controller.split_prefill_cut_ratio = None
+    if controller.split_prefill and role == "decode":
+        chunk_env = "HANDOFF_HYBRID_SPLIT_PREFILL_CHUNK_SIZE"
+        cut_env = "HANDOFF_HYBRID_SPLIT_PREFILL_CUT_RATIO"
+        try:
+            chunk_size = int(os.environ.get(chunk_env, "8192"))
+        except ValueError as exc:
+            raise ValueError(f"{chunk_env} must be a positive integer") from exc
+        if chunk_size <= 0:
+            raise ValueError(f"{chunk_env} must be a positive integer")
+        try:
+            cut_ratio = float(os.environ.get(cut_env, "0.5"))
+        except ValueError as exc:
+            raise ValueError(f"{cut_env} must be in [0.5, 1)") from exc
+        if not 0.5 <= cut_ratio < 1:
+            raise ValueError(f"{cut_env} must be in [0.5, 1)")
+        controller.split_prefill_budget = scheduler.max_prefill_tokens
+        controller.split_prefill_chunk_size = min(
+            chunk_size, controller.split_prefill_budget
+        )
+        controller.split_prefill_cut_ratio = cut_ratio
     if controller.rank == 0:
         logger.info(
-            "[handoff-split-config] role=%s enabled=%s max_prefill_tokens=%s chunk_size=%s",
-            scheduler.disaggregation_mode.value,
+            "[handoff-split-config] role=%s enabled=%s max_prefill_tokens=%s "
+            "chunk_size=%s cut_ratio=%s",
+            role,
             controller.split_prefill,
             controller.split_prefill_budget,
             controller.split_prefill_chunk_size,
+            controller.split_prefill_cut_ratio,
         )
 
 
@@ -118,29 +136,26 @@ def advertise(queue, dr, decode_prefix_len):
         return
     receiver._hybrid_split_offer_checked = True
     length = len(req.origin_input_ids)
-    budget = controller.split_prefill_budget
-    chunk_size = controller.split_prefill_chunk_size
-    suffix = length - length // 2
-    if chunk_size is None:
-        suffix = min(suffix, budget)
+    proposed_cut = int(length * controller.split_prefill_cut_ratio)
     reason = request_blocker(req)
     if dr.is_rebootstrap or decode_prefix_len:
         reason = "decode_already_owns_prefix"
     elif type(receiver) is not MooncakeKVReceiver:
         reason = "non_mooncake_receiver"
-    elif reason is None and suffix < MIN_PROMPT_TOKENS // 2:
-        reason = "decode_prefill_budget_too_small"
+    elif reason is None and length - proposed_cut < MIN_PROMPT_TOKENS // 2:
+        reason = "decode_suffix_too_short"
     cut = 0
     if reason is None:
-        cut = receiver._hybrid_split_offer = length - suffix
+        cut = receiver._hybrid_split_offer = proposed_cut
     log_decision(
         controller,
         req,
         "decode_offer",
         reason or "offered",
         cut=cut,
-        budget=budget,
-        chunk_size=chunk_size,
+        budget=controller.split_prefill_budget,
+        chunk_size=controller.split_prefill_chunk_size,
+        cut_ratio=controller.split_prefill_cut_ratio,
     )
 
 
@@ -349,7 +364,7 @@ def next_batch(original, scheduler, running_batch):
     scheduler.waiting_queue.leave([req])
     req.refresh_fill_ids()
     prompt_len = len(req.origin_input_ids)
-    chunk_size = controller.split_prefill_chunk_size or controller.split_prefill_budget
+    chunk_size = controller.split_prefill_chunk_size
     req.extend_end = min(req.prefix_len + chunk_size, prompt_len)
     middle = req.extend_end < prompt_len
     scheduler.chunked_req = req if middle else None
