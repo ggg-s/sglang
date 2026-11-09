@@ -14,7 +14,8 @@ import torch
 from . import mooncake_backend as transport
 from . import remote_data_plane as dp
 
-CAPACITY = 4 * 1024 * 1024
+LEGACY_CAPACITY = 4 * 1024 * 1024
+CAPACITY = 16 * 1024 * 1024
 PROTOCOL = "mooncake-host-v1"
 FOOTER = 32
 WIRE_CAPACITY = CAPACITY + FOOTER
@@ -57,7 +58,8 @@ def descriptor(value):
         or value.get("protocol") not in (PROTOCOL, transport.GPU)
         or type(value.get("base")) is not int
         or value["base"] <= 0
-        or value.get("size") != WIRE_CAPACITY
+        or type(value.get("size")) is not int
+        or value["size"] not in (LEGACY_CAPACITY + FOOTER, WIRE_CAPACITY)
         or not isinstance(value.get("session"), str)
         or not 0 < len(value["session"]) <= 512
         or not isinstance(value.get("nonce"), str)
@@ -66,6 +68,12 @@ def descriptor(value):
     ):
         raise ValueError("invalid D2D Mooncake host region")
     return dict(value)
+
+
+def frame_capacity(value):
+    if type(value) is not int or value not in (LEGACY_CAPACITY, CAPACITY):
+        raise ValueError("unsupported D2D bulk frame capacity")
+    return value
 
 
 class Registered:
@@ -85,7 +93,7 @@ class Registered:
         # A failed registration can have an uncertain native outcome too.
         self.registered = True
         try:
-            rc = self.engine.batch_register([self.tensor.data_ptr()], [WIRE_CAPACITY])
+            rc = self.engine.batch_register([self.tensor.data_ptr()], [self.tensor.numel()])
             if rc != 0:
                 raise RuntimeError("D2D bulk registration failed")
         except BaseException:
@@ -126,7 +134,8 @@ class Registered:
 
 
 class Sender(Registered):
-    def __init__(self, engine, req, device, catalog=None):
+    def __init__(self, engine, req, device, catalog=None, *, capacity=CAPACITY):
+        self.capacity = frame_capacity(capacity)
         super().__init__(engine, req)
         self.catalog = catalog
         self.device = torch.device(device)
@@ -157,12 +166,12 @@ class Sender(Registered):
         try:
             if backend == transport.GPU:
                 self.tensor = torch.empty(
-                    WIRE_CAPACITY, dtype=torch.uint8, device=self.device
+                    self.capacity + FOOTER, dtype=torch.uint8, device=self.device
                 )
                 dp.event(self.device).synchronize()
                 self.stream = torch.cuda.Stream(device=self.device)
             else:
-                self.slot = new_slot(WIRE_CAPACITY, self.device)
+                self.slot = new_slot(self.capacity + FOOTER, self.device)
                 self.tensor = self.slot.host
             self.register()
         except BaseException:
@@ -173,7 +182,7 @@ class Sender(Registered):
         region = descriptor(region)
         size = data.numel() * data.element_size()
         if (
-            not 0 < size <= CAPACITY
+            not 0 < size <= min(self.capacity, region["size"] - FOOTER)
             or type(sequence) is not int
             or not 0 < sequence < 2**64
         ):
@@ -249,7 +258,8 @@ class Sender(Registered):
 
 
 class Receiver(Registered):
-    def __init__(self, engine, req, device, backend=transport.TCP):
+    def __init__(self, engine, req, device, backend=transport.TCP, *, capacity=CAPACITY):
+        self.capacity = frame_capacity(capacity)
         super().__init__(engine, req)
         self.device = torch.device(device)
         self.backend = backend
@@ -261,7 +271,7 @@ class Receiver(Registered):
         self.nonce = secrets.token_hex(16)
         try:
             self.tensor = torch.empty(
-                WIRE_CAPACITY,
+                self.capacity + FOOTER,
                 dtype=torch.uint8,
                 device=self.device if backend == transport.GPU else "cpu",
                 pin_memory=backend == transport.TCP and self.device.type == "cuda",
@@ -281,7 +291,7 @@ class Receiver(Registered):
         return dict(
             protocol=self.protocol,
             base=self.tensor.data_ptr(),
-            size=WIRE_CAPACITY,
+            size=self.capacity + FOOTER,
             session=self.engine.get_session_id(),
             nonce=self.nonce,
         )
@@ -294,7 +304,7 @@ class Receiver(Registered):
             or header.get("bulk_nonce") != self.nonce
             or header.get("bulk_sequence") != self.sequence
             or header.get("bytes") != size
-            or not 0 < size <= CAPACITY
+            or not 0 < size <= self.capacity
         ):
             raise ValueError("D2D bulk completion does not match receive slot")
         if self.backend == transport.GPU:

@@ -378,6 +378,22 @@ class Source:
     remote_entries_at_freeze: tuple = ()
     frozen_output: tuple = ()
 
+    def bulk_capacity(self):
+        # Size the registration from the largest possible frame, not total KV.
+        # Small plans and small token rectangles stay on the legacy-size slot.
+        pages = self.pages.numel()
+        span = min(pages, max(1, self.token_range // self.owner.pool.page_size))
+        groups = {}
+        largest = max((d["rows"] * d["stride"] for d, _, _ in self.states), default=0)
+        for kind, _, layer, *_, stride in self.schema["entries"]:
+            if kind == "kv" and self.token_range:
+                group = layer // self.group_size
+                groups[group] = groups.get(group, 0) + stride
+            else:
+                largest = max(largest, pages * stride)
+        largest = max(largest, span * max(groups.values(), default=0))
+        return bulk.CAPACITY if largest > bulk.LEGACY_CAPACITY else bulk.LEGACY_CAPACITY
+
     def initialize(self):
         from .dsv41_staging import buffers
 
@@ -411,13 +427,19 @@ class Source:
         ]
         self.final_event = dp.event(self.pages.device)
         catalog = transport.Catalog(manager(self.owner).engine, self.pages.device)
+        capacity = self.bulk_capacity()
         self.bulk_sender = bulk.Sender(
-            manager(self.owner).engine, req, self.pages.device, catalog=catalog
+            manager(self.owner).engine, req, self.pages.device, catalog=catalog,
+            capacity=capacity,
         )
+        hub = remote.runtime().get_remote_hub(s)
+        isolated = hub.prepare_d2d_bulk()
         remote.register(self)
         self.meta = dict(
             version=VERSION,
             bulk_transport=bulk.PROTOCOL,
+            bulk_frame_bytes=capacity,
+            bulk_isolated=isolated,
             bulk_capabilities=catalog.offer,
             d2d_group_size=self.group_size,
             d2d_group_protocol=grouping.PACKED,
@@ -654,7 +676,8 @@ def execute(job, stream, cache):
 
 class Reader:
     def __init__(
-        self, route, destination, epoch, timeout=600, *, owner, req, offer=None
+        self, route, destination, epoch, timeout=600, *, owner, req, offer=None,
+        capacity=bulk.LEGACY_CAPACITY,
     ):
         self.route, self.destination, self.epoch = route, destination, epoch
         self.client = remote.runtime().TargetClient(route["host"], route["port"])
@@ -664,7 +687,11 @@ class Reader:
         self.closed = False
         self.owner, self.req = owner, req
         self.offer = offer if offer is not None else transport.tcp_offer()
+        self.capacity = bulk.frame_capacity(capacity)
         self.bulk = None
+        self.read_timing_ns = dict(count=0, slot_setup=0, slot_wait=0, rpc=0,
+                                   source_queue=0, source_exec=0, receive=0,
+                                   max_frame=0)
 
     def call(self, action, **fields):
         if self.closed:
@@ -686,20 +713,25 @@ class Reader:
             if not response.get("ok"):
                 raise RuntimeError(response.get("error", "D2D snapshot failed"))
             return response, out.view(torch.uint8)[: response["bytes"]]
+        started = time.perf_counter_ns()
         if self.bulk is None:
             device = pool_device(self.owner)
             catalog = transport.Catalog(manager(self.owner).engine, device)
             backend = catalog.select(self.offer)
             self.bulk = bulk.Receiver(
-                catalog.engines[backend], self.req, device, backend=backend
+                catalog.engines[backend], self.req, device, backend=backend,
+                capacity=self.capacity,
             )
+        setup_at = time.perf_counter_ns()
         with self.bulk.lock:
             try:
                 h["bulk_region"] = self.bulk.prepare()
                 h["bulk_sequence"] = self.bulk.sequence
+                send_at = time.perf_counter_ns()
                 response, out, lse = self.client.call(
                     h, self.query, deadline_s=self.timeout, retry_on_disconnect=False
                 )
+                reply_at = time.perf_counter_ns()
                 if not response.get("ok"):
                     raise RuntimeError(response.get("error", "D2D snapshot failed"))
                 if response.get("bulk_rejected") is True:
@@ -710,6 +742,16 @@ class Reader:
                 # Existing callers validate row counts against their own schema.
                 header = dict(response, bytes=size)
                 data = self.bulk.consume(header, size, self.timeout)
+                done = time.perf_counter_ns()
+                timings = self.read_timing_ns
+                timings["count"] += 1
+                timings["slot_setup"] += setup_at - started
+                timings["slot_wait"] += send_at - setup_at
+                timings["rpc"] += reply_at - send_at
+                timings["source_queue"] += int(response.get("queue_ms", 0) * 1e6)
+                timings["source_exec"] += int(response.get("exec_ms", 0) * 1e6)
+                timings["receive"] += done - reply_at
+                timings["max_frame"] = max(timings["max_frame"], done - started)
                 return header, data
             except bulk.ReadRejected:
                 raise
@@ -735,7 +777,7 @@ def copy_rows(reader, kind, entry, dst, indices, rows, start=0):
     if indices.numel() != rows:
         raise ValueError("D2D native source/destination state counts differ")
     stride = dst.shape[1]
-    chunk = LIMIT // stride
+    chunk = reader.capacity // stride
     if not chunk:
         raise ValueError("native D2D row exceeds transfer budget")
     for lo in range(start, rows, chunk):
@@ -824,6 +866,7 @@ class Target(NativeTarget):
     token_range: int = 1024
     group_frames: int = 0
     grouped_entries: int = 0
+    import_timing_ns: dict = field(default_factory=dict)
 
     def refresh(self):
         if (
@@ -910,6 +953,7 @@ class Target(NativeTarget):
                 owner=self.owner,
                 req=req,
                 offer=self.reader.offer,
+                capacity=self.reader.capacity,
             )
             copy_device = pool_device(self.owner)
             self.copy_stream = new_stream(copy_device)
@@ -938,7 +982,7 @@ class Target(NativeTarget):
                         pool.page_size,
                         self.group_size,
                         self.token_range,
-                        LIMIT,
+                        self.bulk_reader.capacity,
                     ):
                         frame = []
                         for segment in rectangle["segments"]:
@@ -950,7 +994,7 @@ class Target(NativeTarget):
                             continue
                         rectangle = dict(rectangle, segments=frame)
                         if self.stop.is_set():
-                            raise RuntimeError("D2D prepared import cancelled")
+                            return  # Abort joins this worker and fences its copy stream.
                         _h, data = self.bulk_reader.call("read_group", **rectangle)
                         expected = sum(
                             segment["count"] * entries[segment["entry"]][-1]
@@ -994,12 +1038,12 @@ class Target(NativeTarget):
                         if entry[0] != "kv":
                             continue
                         dst = matrix(tensor, entry[-1])
-                        chunk = LIMIT // dst.shape[1]
+                        chunk = self.bulk_reader.capacity // dst.shape[1]
                         if not chunk:
                             raise ValueError("D2D global row exceeds budget")
                         for lo in range(prefixes[i], pages.numel(), chunk):
                             if self.stop.is_set():
-                                raise RuntimeError("D2D prepared import cancelled")
+                                return  # Abort joins this worker and fences its copy stream.
                             n = min(chunk, pages.numel() - lo)
                             _h, data = self.bulk_reader.call(
                                 "read", kind="global", entry=i, start=lo, count=n
@@ -1512,6 +1556,7 @@ def poll_commit(controller, target, targets):
 def prepare_import_io(target, transfer, session, jobs):
     controller, req = target.owner, target.decode_req.req
     device = pool_device(controller)
+    started = time.perf_counter_ns()
     try:
         with on_device(device), on_stream(device, target.setup_stream):
             if target.stop.is_set():
@@ -1524,16 +1569,24 @@ def prepare_import_io(target, transfer, session, jobs):
                 owner=controller,
                 req=req,
                 offer=transfer["bulk_capabilities"],
+                capacity=transfer.get("bulk_frame_bytes", bulk.LEGACY_CAPACITY),
             )
+            attached = time.perf_counter_ns()
+            target.import_timing_ns["attach"] = attached - started
             meta, _ = reader.call("manifest", gpu_session=session)
+            manifest_at = time.perf_counter_ns()
+            target.import_timing_ns["manifest"] = manifest_at - attached
             if meta["manifest"] != transfer:
                 raise ValueError("D2D frozen manifest changed")
             for args in jobs:
                 if target.stop.is_set():
                     return
                 copy_rows(reader, *args)
+            queued = time.perf_counter_ns()
+            target.import_timing_ns["state_index_copy"] = queued - manifest_at
             target.decode_req.ready = dp.event(device)
             target.decode_req.ready.synchronize()
+            target.import_timing_ns["setup_gpu_fence"] = time.perf_counter_ns() - queued
     except BaseException as exc:
         target.error = repr(exc)
         dp.io_for(req).poison()
@@ -1640,6 +1693,7 @@ def import_request(controller, data):
         or transfer["tp_size"] != controller.tp_size
     ):
         raise ValueError("D2D transfer epoch/TP mismatch")
+    bulk.frame_capacity(transfer.get("bulk_frame_bytes", bulk.LEGACY_CAPACITY))
     transport.validate(transfer.get("bulk_capabilities"))
     transport.Catalog(manager(controller).engine, pool_device(controller)).select(
         transfer["bulk_capabilities"]
@@ -1690,7 +1744,11 @@ def import_request(controller, data):
     target.group_size = group_size
     target.token_range = token_range
     target.async_handoff = async_handoff
-    target.defer_bulk = async_handoff and data.get("defer_bulk") is True
+    target.defer_bulk = (
+        async_handoff
+        and data.get("defer_bulk") is True
+        and not transfer.get("bulk_isolated")
+    )
     target.queue = getattr(controller.scheduler, "disagg_decode_transfer_queue", None)
     if target.queue is None:
         from sglang.srt.managers.scheduler_components.request_list import (
@@ -1708,6 +1766,7 @@ def import_request(controller, data):
     targets[epoch] = target
     _tracked(controller.scheduler)[rid] = req
     req._pre_layerwise_target = target
+    started = time.perf_counter_ns()
     try:
         device = pool_device(controller)
         target.setup_stream = current_stream(device)
@@ -1759,6 +1818,7 @@ def import_request(controller, data):
                         prefixes[i],
                     )
                 )
+        target.import_timing_ns["native_prepare"] = time.perf_counter_ns() - started
         if async_handoff:
             setup_stream = new_stream(device)
             # Fence writes issued on the scheduler stream even if launching the

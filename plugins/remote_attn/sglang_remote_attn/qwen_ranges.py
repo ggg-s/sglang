@@ -10,7 +10,7 @@ import torch
 
 from . import d2d_ranges as plan
 from . import mooncake_backend as transport
-from .d2d_bulk import CAPACITY, FOOTER, marker
+from .d2d_bulk import FOOTER, LEGACY_CAPACITY, marker
 from .d2d_groups import size
 from .remote_data_plane import Visibility
 
@@ -38,7 +38,7 @@ def source(scheduler, req, meta, remote, snapshot=None):
     meta = r._with_transfer_ticket(token, dict(meta))
     group = min(size(meta["d2d_group_size"]), len(meta["chunks"]))
     row_bytes = meta["kv_heads"] * meta["head_dim"] * 4  # K + V, FP16/BF16
-    width = min(plan.tokens(meta["d2d_token_range"]), CAPACITY // row_bytes)
+    width = min(plan.tokens(meta["d2d_token_range"]), LEGACY_CAPACITY // row_bytes)
     if not width:
         raise ValueError("Qwen KV row exceeds bounded D2D slot")
     meta["d2d_token_range"] = width
@@ -325,7 +325,7 @@ def setup(conn, meta, owner):
     group = min(size(meta["d2d_group_size"]), len(meta["chunks"]))
     slots = min(group, max(1, int(r.TARGET_STAGING_SLOTS) or group))
     capacity = width * meta["kv_heads"] * meta["head_dim"] * 4
-    if not 0 < capacity <= CAPACITY or meta["dtype"] not in ("float16", "bfloat16"):
+    if not 0 < capacity <= LEGACY_CAPACITY or meta["dtype"] not in ("float16", "bfloat16"):
         raise ValueError("invalid bounded Qwen range manifest")
     device = torch.device("cuda", torch.cuda.current_device())
     catalog = transport.Catalog(r._get_te(), device)

@@ -326,9 +326,19 @@ def handle(controller, data):
         else:
             t = ticket(controller, epoch)
             state = getattr(t, "precopy", None)
+            if cmd.endswith("prepare"):
+                capacity = bulk.frame_capacity(
+                    data.get("capacity", bulk.LEGACY_CAPACITY)
+                )
+                if state is not None and state.receiver.capacity != capacity:
+                    raise ValueError("precopy slot capacity changed")
             if state is not None and (state.closed or state.failed):
                 raise ValueError("precopy destination closed/failed")
             f = frame(controller, data["frame"])
+            if cmd.endswith("prepare") and (
+                f["count"] * t.plan["schema"]["entries"][f["entry"]][-1] > capacity
+            ):
+                raise ValueError("precopy frame exceeds destination slot")
             if (f["start"] + f["count"]) * controller.pool.page_size > t.plan["upper"]:
                 raise ValueError("precopy frame exceeds reservation")
             if cmd.endswith("prepare"):
@@ -371,7 +381,8 @@ def handle(controller, data):
         elif cmd.endswith("prepare"):
             if state is None:
                 receiver = bulk.Receiver(
-                    d2d.manager(controller).engine, NS(), d2d.pool_device(controller)
+                    d2d.manager(controller).engine, NS(), d2d.pool_device(controller),
+                    capacity=capacity,
                 )
                 state = t.precopy = Destination(
                     receiver,
@@ -413,7 +424,8 @@ def handle(controller, data):
                         raise
                     if record.sender is None:
                         record.sender = bulk.Sender(
-                            d2d.manager(controller).engine, NS(), device
+                            d2d.manager(controller).engine, NS(), device,
+                            capacity=dest["region"]["size"] - bulk.FOOTER,
                         )
                     size = record.sender.write(
                         data_tensor, ready, dest["region"], dest["sequence"]

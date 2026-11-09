@@ -926,6 +926,7 @@ class DsvGateway:
             freeze_ack_latency_ms=None,
             plan_before_first_token=False,
             precopy_pending=None,
+            precopy_capacity=None,
             precopy_receipts=None,
             precopy_bytes=0,
             precopy_pages=None,
@@ -1075,6 +1076,7 @@ class DsvGateway:
         """Advance one bounded, durable frame; Decode runs between commands."""
         rid, epoch = entry["rid"], entry["epoch"]
         pending = entry.get("precopy_pending")
+        capacity = entry.get("precopy_capacity")
         if pending is None:
             if cut_due:
                 self._update(rid, phase="FREEZE")
@@ -1085,6 +1087,22 @@ class DsvGateway:
                 for r in self.facts.get(role, [])
             ):
                 return
+            # A reservation owns one receiver for all frames. Pin its negotiated
+            # size with the first durable PREPARE, including across retries.
+            if capacity is None and entry.get("precopy_receipts"):
+                capacity = 4 * 1024 * 1024
+            schema = entry["plans"][0]["schema"]
+            upper_pages = entry["plans"][0]["upper"] // schema["page_size"]
+            if capacity is None:
+                max_bytes = upper_pages * max(e[-1] for e in schema["entries"])
+                cap = 16 * 1024 * 1024 if max_bytes > 4 * 1024 * 1024 else 4 * 1024 * 1024
+                capacity = min(
+                    [cap] + [
+                        row.get("precopy_frame_bytes", 4 * 1024 * 1024)
+                        for role in ("src", "dst")
+                        for row in self.facts[role]
+                    ]
+                )
             rows = yield from self._precopy_source(entry, "d2d_precopy_status")
             if rows is None:
                 return
@@ -1093,12 +1111,11 @@ class DsvGateway:
                 for i in range(len(rows[0]["available"]))
             ]
             ends = entry.get("precopy_pages") or [0] * len(available)
-            schema = entry["plans"][0]["schema"]
             # Same frame on every shard; each has its own authenticated slot.
             for i, end in enumerate(available):
-                end = min(end, entry["plans"][0]["upper"] // schema["page_size"])
+                end = min(end, upper_pages)
                 count = min(
-                    end - ends[i], (4 * 1024 * 1024) // schema["entries"][i][-1]
+                    end - ends[i], capacity // schema["entries"][i][-1]
                 )
                 if count > 0:
                     pending = dict(
@@ -1113,7 +1130,7 @@ class DsvGateway:
                             entry=i, start=ends[i], count=count, chunk=uuid.uuid4().hex
                         ),
                     )
-                    self._update(rid, precopy_pending=pending)
+                    self._update(rid, precopy_pending=pending, precopy_capacity=capacity)
                     break
             if pending is None:
                 return
@@ -1126,7 +1143,10 @@ class DsvGateway:
                     max(0, (time.time() - pending["stage_at"]) * 1000),
                 )
         if pending["stage"] == "PREPARE":
-            rows = yield self._command("dst", "d2d_precopy_prepare", epoch, frame=frame)
+            rows = yield self._command(
+                "dst", "d2d_precopy_prepare", epoch, frame=frame,
+                capacity=capacity or 4 * 1024 * 1024,
+            )
             self._update(
                 rid,
                 precopy_pending=dict(

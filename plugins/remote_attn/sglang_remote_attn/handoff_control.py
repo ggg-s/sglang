@@ -25,6 +25,7 @@ This is a test control surface, not a production API.
 from __future__ import annotations
 
 import errno
+import functools
 import hashlib
 import hmac
 import http.client
@@ -1784,6 +1785,11 @@ class RemoteHub:
         factory = stream_factory or _create_hub_streams
         self._pool = RemoteStreamPool(n, executor or _execute_hub_job, factory(n))
         self._inline_d2d_control = executor is None
+        self._bulk_pool = None
+        self._bulk_lock = threading.Lock()
+        self._bulk_streams = stream_factory or functools.partial(
+            _create_hub_streams, bulk=True
+        )
         self.rpc_completed = 0
         self.rpc_failed = 0
         self.idle_closes = 0
@@ -1835,6 +1841,18 @@ class RemoteHub:
             if self._in_flight > 0:
                 self._in_flight = max(0, self._in_flight - int(n))
             self.scheduler._handoff_remote_active = self._in_flight > 0
+
+    def prepare_d2d_bulk(self):
+        # Called on the source scheduler's CUDA device before publishing its
+        # route. A distinct stream bank keeps frozen KV reads out of Q/O FIFO.
+        with self._bulk_lock:
+            if self._closed or not self._inline_d2d_control:
+                return False
+            if self._bulk_pool is None:
+                self._bulk_pool = RemoteStreamPool(
+                    2, _execute_hub_job, self._bulk_streams(2), name="handoff-bulk"
+                )
+            return True
 
     def register_handoff(self, req, meta: dict, *, on_release=None) -> dict:
         """Register a frozen request and return the target-side route info."""
@@ -2192,7 +2210,12 @@ class RemoteHub:
                 finally:
                     job.finish(fence=False)
             else:
-                self._pool.submit(job)
+                pool = self._pool
+                if self._bulk_pool is not None and header.get("dsv_d2d") in (
+                    "read", "read_group",
+                ):
+                    pool = self._bulk_pool
+                pool.submit(job)
         except Exception:
             if job is None:
                 self.registry.release_ref(hid, int(epoch_i))
@@ -2360,6 +2383,7 @@ class RemoteHub:
             "rpc_completed": self.rpc_completed,
             "rpc_failed": self.rpc_failed,
             "pool": self._pool.stats(),
+            "bulk_pool": self._bulk_pool.stats() if self._bulk_pool is not None else None,
         }
 
     def close(self) -> None:
@@ -2387,6 +2411,9 @@ class RemoteHub:
             except OSError:
                 pass
         self._pool.close()
+        with self._bulk_lock:
+            if self._bulk_pool is not None:
+                self._bulk_pool.close()
         # The accept loop only notices the closed listener when its accept
         # timeout expires (closing a listening socket does not wake a blocked
         # accept on Linux), so allow one full timeout plus margin.
@@ -2503,7 +2530,7 @@ _HUB_STREAM_CACHE: dict[tuple, list] = {}
 _HUB_STREAM_LOCK = threading.Lock()
 
 
-def _create_hub_streams(n: int):
+def _create_hub_streams(n: int, *, bulk=False):
     """Create (or reuse) ``n`` highest-priority non-blocking CUDA streams.
 
     Streams are created once per process on the hub thread. Creating them per
@@ -2511,12 +2538,14 @@ def _create_hub_streams(n: int):
     when the source is busy with prefill (M1 root cause).
     """
     n = max(1, int(n))
-    priority = -1 if os.environ.get("HANDOFF_REMOTE_HIGH_PRIORITY", "0") == "1" else 0
+    priority = -1 if (
+        not bulk and os.environ.get("HANDOFF_REMOTE_HIGH_PRIORITY", "0") == "1"
+    ) else 0
     try:
         _device = int(torch.cuda.current_device())
     except Exception:
         _device = -1
-    key = (_device, n, priority)
+    key = (_device, n, priority, bulk)
     with _HUB_STREAM_LOCK:
         cached = _HUB_STREAM_CACHE.get(key)
         if cached is not None:

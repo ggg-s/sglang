@@ -15770,7 +15770,10 @@ class TestRemoteAttn(CustomTestCase):
         e = self._d2d_env()
         e.freeze()
         sender = e.source.d2d_sources[e.epoch].bulk_sender
-        receiver = bulk.Receiver(d2d.manager(e.target).engine, SimpleNamespace(), "cpu")
+        engine = d2d.manager(e.target).engine
+        receiver = bulk.Receiver(
+            engine, SimpleNamespace(), "cpu", capacity=bulk.LEGACY_CAPACITY
+        )
         self.addCleanup(receiver.close)
         region = receiver.prepare()
         value = torch.arange(16, dtype=torch.uint8)
@@ -15784,6 +15787,24 @@ class TestRemoteAttn(CustomTestCase):
             sender.write(value, ready, dict(region, session="changed-peer"), 2)
         self.assertEqual(len(sender.engine.calls), 1)
         self.assertFalse(sender.unsafe)
+        large = torch.ones(bulk.LEGACY_CAPACITY + 1, dtype=torch.uint8)
+        with self.assertRaisesRegex(ValueError, "size"):
+            sender.write(large, ready, region, 2)
+        wide = bulk.Receiver(engine, SimpleNamespace(), "cpu")
+        self.addCleanup(wide.close)
+        wide_region = wide.prepare()
+        wide_sender = bulk.Sender(d2d.manager(e.source).engine, SimpleNamespace(), "cpu")
+        self.addCleanup(wide_sender.close)
+        size = wide_sender.write(large, ready, wide_region, 1)
+        received = wide.consume(
+            dict(
+                bytes=size, bulk_protocol=wide.protocol,
+                bulk_nonce=wide.nonce, bulk_sequence=wide.sequence,
+            ),
+            size,
+            1,
+        )
+        self.assertTrue(torch.equal(received, large))
 
     def test_dsv_d2d_bulk_failed_deregister_blocks_prepared_free(self):
         from sglang_remote_attn import dsv_d2d as d2d
@@ -19237,7 +19258,8 @@ class TestRemoteAttn(CustomTestCase):
                     target.commit_worker.join(5)
                     self.assertTrue(target.source_confirmed)
                     self.assertFalse(target.admitted)
-                    self.assertIsNone(target.worker)  # Bulk cannot crowd out COMMIT.
+                    self.assertIsNotNone(target.worker)
+                    self.assertFalse(target.defer_bulk)  # The source has a separate bulk queue.
                 from sglang_remote_attn import handoff_control as rt
 
                 # The first COMMIT wave admits both requests, but its reply is

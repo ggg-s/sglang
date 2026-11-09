@@ -87,6 +87,9 @@ def migration_status(controller, epoch, *, include_transfer=True):
             commit_pending=(
                 target.commit_worker is not None and target.commit_worker.is_alive()
             ),
+            import_timing_ns=dict(target.import_timing_ns),
+            setup_reads_ns=dict(target.reader.read_timing_ns) if target.reader else {},
+            bulk_reads_ns=dict(target.bulk_reader.read_timing_ns) if target.bulk_reader else {},
             group_size=target.group_size,
             group_frames=target.group_frames,
             max_entries_per_frame=target.grouped_entries,
@@ -142,6 +145,10 @@ def handle(controller, data):
             idle=bool(getattr(scheduler, "is_fully_idle", lambda: False)()),
             protocol=d2d.VERSION,
             precopy_protocol="closed-page-precopy-v1",
+            precopy_frame_bytes=d2d.bulk.CAPACITY,
+            decode_timing=dict(getattr(controller, "decode_timing", {})),
+            sparse_timing=dict(getattr(controller, "sparse_stats", {})),
+            iter_period_ms=getattr(scheduler, "_handoff_iter_period_ms", None),
             admission_plan_supported=True,
             async_handoff_supported=True,
             control_wave_supported=True,
