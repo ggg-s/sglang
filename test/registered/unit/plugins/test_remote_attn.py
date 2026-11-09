@@ -1474,11 +1474,20 @@ class TestRemoteAttn(CustomTestCase):
             tempfile.TemporaryDirectory() as directory,
             patch.object(self.runtime, "_CTL_DIR", directory),
         ):
-            path = Path(directory) / "cmd.0.json"
+            root = Path(directory)
+            for rank in (0, 1):
+                for i in range(203):
+                    (root / f"cmd.{rank}.123.{i}.done").touch()
+            tombstone = root / "cancel.owner.epoch.json"
+            tombstone.touch()
+            path = root / "cmd.0.json"
             path.write_text(
                 json.dumps({"cmd": "freeze", "rid": "one", "nonce": "first"})
             )
             sentinel = self.runtime.poll_broadcast_control()
+            for rank in (0, 1):
+                self.assertEqual(len(list(root.glob(f"cmd.{rank}.*.done"))), 200)
+            self.assertTrue(tombstone.exists())
             path.write_text(json.dumps({"cmd": "status", "nonce": "second"}))
             ranks = [pickle.loads(pickle.dumps(sentinel)) for _ in range(2)]
             for copy in ranks:
@@ -1490,6 +1499,8 @@ class TestRemoteAttn(CustomTestCase):
             second = self.runtime.poll_broadcast_control()
             self.assertEqual(second["data"]["nonce"], "second")
             self.assertIsNone(self.runtime.poll_broadcast_control())
+            self.runtime.enqueue_broadcast_control_once({"cmd": "resume"}, "test")
+            self.assertEqual(self.runtime.poll_broadcast_control()["data"]["cmd"], "resume")
 
     def test_controls_execute_after_regular_input_and_before_housekeeping(self):
         order = []

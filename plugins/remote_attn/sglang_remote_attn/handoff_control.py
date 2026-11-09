@@ -4669,6 +4669,8 @@ _HANDOFF_CTL_KEY = "__handoff_ctl__"
 _HANDOFF_CLAIM_KEY = "__handoff_claimed__"
 _CTRL_RANK = 0
 _CTL_QUEUE_PREFIX = "ctlq."
+_CTL_MAINTENANCE_ROOT = None
+_CTL_MAINTENANCE_AT = 0.0
 _RESUME_CLAIM_TTL_S = float(os.environ.get("HANDOFF_RESUME_CLAIM_TTL_S", "30"))
 _WD_FENCE_TIMEOUT_S = float(os.environ.get("HANDOFF_WD_FENCE_TIMEOUT_S", "30"))
 _RESUME_BLOCK_TTL_S = float(os.environ.get("HANDOFF_RESUME_BLOCK_TTL_S", "600"))
@@ -4869,23 +4871,36 @@ def poll_broadcast_control():
     publishes the next command while this one is being parsed cannot have its
     file renamed away by this poll.
     """
-    global _SEQ, _ITER
+    global _ITER, _CTL_MAINTENANCE_ROOT, _CTL_MAINTENANCE_AT
     if not _CTL_DIR:
         return None
     _ITER += 1
     iter_id = _ITER
     root = Path(_CTL_DIR)
-    _prune_stale_control_files(root)
+    now = time.monotonic()
+    if now >= _CTL_MAINTENANCE_AT or root != _CTL_MAINTENANCE_ROOT:
+        if root.is_dir():
+            if root != _CTL_MAINTENANCE_ROOT:
+                _prune_done_files(root)
+                _CTL_MAINTENANCE_ROOT = root
+            _prune_stale_control_files(root)
+            _CTL_MAINTENANCE_AT = now + min(30, max(1, _RESUME_CLAIM_TTL_S))
+
+    # Scan once. Do not cache an empty result by directory mtime: multiple
+    # atomic renames can have identical timestamps on a busy control filesystem.
     data = None
     queue = []
     try:
-        queue = sorted(
-            root.glob(f"{_CTL_QUEUE_PREFIX}*.json"),
-            key=lambda p: p.stat().st_mtime,
-        )
+        with os.scandir(root) as files:
+            for entry in files:
+                if entry.name.startswith(_CTL_QUEUE_PREFIX) and entry.name.endswith(".json"):
+                    try:
+                        queue.append((entry.stat().st_mtime_ns, Path(entry.path)))
+                    except FileNotFoundError:
+                        continue
     except OSError:
-        queue = []
-    for path in queue:
+        pass
+    for _, path in sorted(queue):
         data = _claim_control_file(path, root)
         if data is not None:
             break
@@ -5159,7 +5174,7 @@ def execute_handoff_control(scheduler, data):
         except OSError:
             pass
         if _SEQ % 256 == 0:
-            _prune_done_files(root, _CTRL_RANK)
+            _prune_done_files(root)
     if fatal:
         raise RuntimeError(result["error"])
 
@@ -5214,19 +5229,31 @@ def maybe_handle_handoff_control(scheduler):
     _iter_profile(scheduler)
 
 
-def _prune_done_files(root: Path, rank: int, keep: int = 200) -> None:
-    """Bound the per-rank done/bad marker files in the control directory."""
+def _prune_done_files(root: Path, keep: int = 200) -> None:
+    """Keep recent completion markers for every writer rank, including watchdogs."""
+    by_rank = {}
     try:
-        files = list(root.glob(f"cmd.{rank}.*.done")) + list(
-            root.glob(f"cmd.{rank}.*.bad")
-        )
-        files.sort(key=lambda p: p.stat().st_mtime, reverse=True)
-        for path in files[keep:]:
-            try:
-                path.unlink()
-            except OSError:
-                pass
-    except Exception:
+        with os.scandir(root) as entries:
+            for entry in entries:
+                parts = entry.name.split(".")
+                if (
+                    len(parts) != 5 or parts[0] != "cmd"
+                    or parts[-1] not in ("done", "bad")
+                    or not all(part.isdecimal() for part in parts[1:4])
+                ):
+                    continue
+                try:
+                    record = entry.stat(follow_symlinks=False).st_mtime_ns, entry.path
+                except OSError:
+                    continue
+                by_rank.setdefault(parts[1], []).append(record)
+        for files in by_rank.values():
+            for _, path in sorted(files, reverse=True)[keep:]:
+                try:
+                    os.unlink(path)
+                except OSError:
+                    pass
+    except OSError:
         pass
 
 
