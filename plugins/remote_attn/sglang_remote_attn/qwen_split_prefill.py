@@ -26,27 +26,78 @@ def configure(controller):
         ):
             raise ValueError("hybrid split prefill requires early device KV allocation")
     controller.split_prefill = value == "1"
-
-
-def eligible(req):
-    return (
-        len(req.origin_input_ids) >= MIN_PROMPT_TOKENS
-        and not req.output_ids
-        and not req.is_retracted
-        and not req.return_logprob
-        and not req.return_hidden_states
-        and not req.return_sampling_mask
-        and not req.return_routed_experts
-        and not req.return_indexer_topk
-        and req.custom_logit_processor is None
-        and req.sampling_params.max_new_tokens > 0
-        and req.session is None
-        and req.grammar is None
-        and req.beam_group is None
-        and req.multimodal_inputs is None
-        and req.input_embeds is None
-        and req.positional_embed_overrides is None
+    controller.split_prefill_budget = (
+        controller.scheduler.max_prefill_tokens if controller.split_prefill else None
     )
+    if controller.rank == 0:
+        logger.info(
+            "[handoff-split-config] role=%s enabled=%s max_prefill_tokens=%s",
+            controller.scheduler.disaggregation_mode.value,
+            controller.split_prefill,
+            controller.split_prefill_budget,
+        )
+
+
+def request_blocker(req):
+    if len(req.origin_input_ids) < MIN_PROMPT_TOKENS:
+        return "prompt_too_short"
+    if req.output_ids or req.is_retracted or req.retracted_stain:
+        return "request_already_started"
+    if req.return_logprob:
+        return "return_logprob"
+    if (
+        req.return_hidden_states_mode.need_capture()
+        or req.return_sampling_mask
+        or req.return_routed_experts
+        or req.return_indexer_topk
+    ):
+        return "auxiliary_outputs"
+    if (
+        req.grammar is not None
+        or req.beam_group is not None
+        or req.custom_logit_processor
+    ):
+        return "structured_or_custom_sampling"
+    if req.session is not None:
+        return "session_request"
+    if (
+        req.multimodal_inputs is not None
+        or req.input_embeds is not None
+        or req.positional_embed_overrides is not None
+    ):
+        return "non_token_inputs"
+    if req.sampling_params.max_new_tokens <= 0:
+        return "no_generation"
+    return None
+
+
+def log_decision(controller, req, stage, reason, **details):
+    if controller.rank == 0:
+        logger.info(
+            "[handoff-split-decision] stage=%s reason=%s rid=%s room=%s prompt=%s %s",
+            stage,
+            reason,
+            req.rid,
+            req.bootstrap_room,
+            len(req.origin_input_ids),
+            " ".join(f"{k}={v}" for k, v in details.items()),
+        )
+
+
+def create_sender(original, queue, req, num_kv_heads):
+    created = original(queue, req, num_kv_heads)
+    controller = getattr(queue.scheduler, "_pre_layerwise", None)
+    if created and getattr(controller, "hybrid_gdn", False):
+        req._hybrid_prefill_controller = controller
+    return created
+
+
+def can_prefill_before_bootstrap(original, queue, req):
+    controller = getattr(req, "_hybrid_prefill_controller", None)
+    if getattr(controller, "split_prefill", False) and request_blocker(req) is None:
+        # An optimistic forward can pass the cut before D publishes its offer.
+        return False
+    return original(queue, req)
 
 
 def advertise(queue, dr, decode_prefix_len):
@@ -56,73 +107,118 @@ def advertise(queue, dr, decode_prefix_len):
     from sglang.srt.disaggregation.mooncake.conn import MooncakeKVReceiver
 
     receiver, req = dr.kv_receiver, dr.req
+    if getattr(receiver, "_hybrid_split_offer_checked", False):
+        return
+    receiver._hybrid_split_offer_checked = True
+    length = len(req.origin_input_ids)
+    budget = controller.split_prefill_budget
+    suffix = min(length - length // 2, budget)
+    reason = request_blocker(req)
+    if dr.is_rebootstrap or decode_prefix_len:
+        reason = "decode_already_owns_prefix"
+    elif type(receiver) is not MooncakeKVReceiver:
+        reason = "non_mooncake_receiver"
+    elif reason is None and suffix < MIN_PROMPT_TOKENS // 2:
+        reason = "decode_prefill_budget_too_small"
+    cut = 0
+    if reason is None:
+        cut = receiver._hybrid_split_offer = length - suffix
+    log_decision(
+        controller, req, "decode_offer", reason or "offered", cut=cut, budget=budget
+    )
+
+
+def offered_cut(req, tp_size):
+    from sglang.srt.disaggregation.mooncake.conn import MooncakeKVSender
+
+    reason = request_blocker(req)
+    if reason is not None:
+        return 0, reason
+    sender = req.disagg_kv_sender
+    if type(sender) is not MooncakeKVSender:
+        return 0, "non_mooncake_sender"
+    if req.start_send_idx or req.kv.holds_kv:
+        return 0, "prefill_already_started"
+    manager = sender.kv_mgr
+    peers = tuple(manager.transfer_infos.get(req.bootstrap_room, {}).values())
+    if len(peers) != 1 or peers[0].is_dummy:
+        return 0, "unexpected_destination_peers"
+    peer = peers[0]
+    cut = getattr(peer, "_hybrid_split_offer", 0)
+    if not cut:
+        return 0, "decode_did_not_offer"
+    length = len(req.origin_input_ids)
+    if not length // 2 <= cut <= length - MIN_PROMPT_TOKENS // 2:
+        return 0, "invalid_decode_cut"
+    if len(peer.dst_kv_indices) != length:
+        return 0, "destination_kv_length_mismatch"
+    registration = manager.decode_kv_args_table.get(peer.mooncake_session_id)
     if (
-        type(receiver) is MooncakeKVReceiver
-        and not dr.is_rebootstrap
-        and not decode_prefix_len
-        and eligible(req)
+        registration is None
+        or registration.requires_dcp_relayout
+        or registration.dst_attn_tp_size != tp_size
     ):
-        length = len(req.origin_input_ids)
-        cut = length // 2
-        if length - cut <= queue.scheduler.max_prefill_tokens:
-            receiver._hybrid_split_offer = cut
+        return 0, "incompatible_destination_registration"
+    return cut, None
 
 
 def finalize_bootstrap(original, queue, req):
     result = original(queue, req)
-    controller = getattr(queue.scheduler, "_pre_layerwise", None)
+    controller = getattr(req, "_hybrid_prefill_controller", None)
     if not result or not getattr(controller, "split_prefill", False):
         return result
-    from sglang.srt.disaggregation.mooncake.conn import MooncakeKVSender
-
-    sender = req.disagg_kv_sender
-    cut = len(req.origin_input_ids) // 2
-    offered = False
-    if (
-        type(sender) is MooncakeKVSender
-        and not req.start_send_idx
-        and not req.kv.holds_kv
-        and eligible(req)
-    ):
-        manager = sender.kv_mgr
-        peers = tuple(manager.transfer_infos.get(req.bootstrap_room, {}).values())
-        if len(peers) == 1:
-            peer = peers[0]
-            registration = manager.decode_kv_args_table.get(peer.mooncake_session_id)
-            offered = (
-                getattr(peer, "_hybrid_split_offer", 0) == cut
-                and not peer.is_dummy
-                and len(peer.dst_kv_indices) == len(req.origin_input_ids)
-                and registration is not None
-                and not registration.requires_dcp_relayout
-                and registration.dst_attn_tp_size == controller.tp_size
-            )
-    if controller.agree([int(offered)])[0]:
-        req._hybrid_split_proposal = cut
-        req._hybrid_split_hot_ratio = controller.remote_min_cache_hit_ratio
+    cut, reason = offered_cut(req, controller.tp_size)
+    agreed, negative_max = controller.agree([cut, -cut])
+    if agreed > 0 and agreed == -negative_max:
+        req._hybrid_split_proposal = agreed
+    else:
+        log_decision(
+            controller,
+            req,
+            "prefill_bootstrap",
+            reason or "tp_offer_disagreement",
+            cut=cut,
+        )
     return result
 
 
 def init_input(original, req, tree_cache=None, cow_mamba=None):
     original(req, tree_cache, cow_mamba)
+    controller = getattr(req, "_hybrid_prefill_controller", None)
+    if controller is None:
+        return
     cut = getattr(req, "_hybrid_split_at", 0)
     proposal = getattr(req, "_hybrid_split_proposal", 0)
     if (
-        proposal
-        and tree_cache is not None
+        tree_cache is not None
         and cow_mamba is not False
         and not req.kv.holds_kv
+        and not req.retracted_stain
+        and not hasattr(req, "_hybrid_prefill_cached_tokens")
     ):
-        # Let native matching and CoW see the full prompt. Preserve the existing
-        # warm-cache Remote path and always leave at least one token to run on P.
-        if (
-            req.prefix_len < proposal
-            and req.prefix_len
-            <= len(req.origin_input_ids) * req._hybrid_split_hot_ratio
-        ):
-            cut = req._hybrid_split_at = proposal
-        else:
-            cut = req._hybrid_split_at = 0
+        # Native lookup may run repeatedly while the request is queued. Only
+        # the match used by the first actual forward becomes the snapshot.
+        req._hybrid_prefill_cache_match = req.prefix_len
+        if proposal:
+            hot = req.prefix_len > (
+                len(req.origin_input_ids) * controller.remote_min_cache_hit_ratio
+            )
+            split = not hot and req.prefix_len < proposal
+            accepted = controller.agree([int(split)])[0]
+            cut = req._hybrid_split_at = proposal if accepted else 0
+            req._hybrid_split_match_reason = (
+                "selected"
+                if accepted
+                else (
+                    "warm_cache"
+                    if hot
+                    else (
+                        "matched_prefix_reaches_cut"
+                        if not split
+                        else "tp_match_disagreement"
+                    )
+                )
+            )
     if cut:
         req.full_untruncated_fill_ids = req.full_untruncated_fill_ids[:cut]
 

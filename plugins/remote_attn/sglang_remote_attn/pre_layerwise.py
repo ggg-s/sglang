@@ -681,6 +681,7 @@ class Controller:
             else None,
             getattr(self, "schema_signature", None),
             startup_signature(self.config),
+            getattr(self, "split_prefill_budget", None),
             ("destination-cache-v1", "prefix-range-v1", prefix_enabled()),
             (
                 "sparse-fast-v3-d2d",

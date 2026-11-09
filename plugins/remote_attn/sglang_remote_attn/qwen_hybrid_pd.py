@@ -133,7 +133,7 @@ class Source(NativeSource):
             _poll_success(sender)  # Check failure; success is NOT required here.
             self.barrier_ready = True
             dsv41_remote.register(self)
-            cached_tokens = getattr(self.req, "cached_tokens_device", None)
+            cached_tokens = self.req._hybrid_prefill_cached_tokens
             write_json(
                 self.path / "ready.json",
                 dict(
@@ -174,11 +174,43 @@ def prepare(controller, reqs):
     """Called in the existing TP batch order, before native cached-prefix sends."""
     from .pd_mesh import source_root
     from .prefix_stream import Plan
+    from .qwen_split_prefill import log_decision
     import numpy as np
 
     min_ratio = controller.remote_min_cache_hit_ratio
     candidates = []
     for req in reqs:
+        first = not hasattr(req, "_hybrid_prefill_cached_tokens")
+        if first:
+            req._hybrid_prefill_cached_tokens = getattr(
+                req, "_hybrid_prefill_cache_match", 0
+            )
+        cached = req._hybrid_prefill_cached_tokens
+        hot = min_ratio == 0 or cached > len(req.origin_input_ids) * min_ratio
+        if first and hasattr(req, "_hybrid_split_match_reason"):
+            log_decision(
+                controller,
+                req,
+                "prefill_match",
+                req._hybrid_split_match_reason,
+                cut=getattr(req, "_hybrid_split_at", 0),
+                p_cached_tokens=cached,
+            )
+        if (
+            first
+            and controller.rank == 0
+            and not hot
+            and not getattr(req, "_hybrid_split_at", 0)
+        ):
+            logger.info(
+                "[handoff-cache-gate] route=native rid=%s room=%s p_cached_tokens=%s "
+                "prompt=%s min_ratio=%s",
+                req.rid,
+                req.bootstrap_room,
+                cached,
+                len(req.origin_input_ids),
+                min_ratio,
+            )
         candidate = None
         source = getattr(req, "_pre_layerwise_source", None)
         if (
@@ -187,13 +219,9 @@ def prepare(controller, reqs):
             and not req.pending_bootstrap
             and req.kv.holds_kv
             and req.start_send_idx == 0
-            and (
-                min_ratio == 0
-                or req.cached_tokens_device > len(req.origin_input_ids) * min_ratio
-            )
+            and hot
         ):
-            # Native prepare_for_extend computes cached_tokens_device on the
-            # first chunk. Later chunks' own KV must never qualify as a hit.
+            # The first-forward lookup snapshot survives chunking and native retries.
             # Earlier native chunks have no range receipts in this plan. Never
             # create a late stream that cannot prove coverage of its prefix.
             sender = getattr(req, "disagg_kv_sender", None)

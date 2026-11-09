@@ -108,25 +108,28 @@ export HANDOFF_D2D_GROUP_SIZE=8
 export HANDOFF_D2D_TOKEN_RANGE=1024
 ```
 
-P 默认只为首个 chunk 的 device cache 命中率 **大于 50%** 的请求启用 Remote
-早接纳。分母为完整 prompt token 数，首 chunk 后请求自己算出的 KV 不计入命中。
+P 默认只为第一次实际 Prefill 调度时 device cache 命中率 **大于 50%** 的请求启用
+Remote 早接纳。命中数来自这次调度使用的原生查找快照，后续 chunk 和重试沿用该值。
+分母为完整 prompt token 数。冷请求回退时由 `[handoff-cache-gate]` 记录命中数。
 其余请求由原生 PD 等待完整 KV，TP 任一 rank 未达到门槛时同样走原生 PD。
 P 上可用 `HANDOFF_HYBRID_REMOTE_MIN_CACHE_HIT_RATIO` 调整门槛，设为 `0` 可恢复
 所有合格请求都尝试 Remote 的对照行为。该门槛只作用于 P→D Hybrid PD。
 
 ### 实验性分段 Prefill
 
-P、D 同时设置 `HANDOFF_HYBRID_SPLIT_PREFILL=1` 开启。当前使用固定 50/50 切点，
-仅接受至少 4096 token 的纯文本请求，且 D 的 `--max-prefill-tokens` 必须容纳整个后半段
-（64K prompt 需至少 32768）。沿用同 TP 的原生 Mooncake、early device allocation 和
-D 端禁用 radix cache 的配置。高命中、请求输出 logprobs、结构化生成或对端未协商时，
-继续使用既有 PD 路径。
+P、D 同时设置 `HANDOFF_HYBRID_SPLIT_PREFILL=1` 开启。至少 4096 token 的纯文本
+请求可参与协商。D 按 `--max-prefill-tokens` 将续算段限制在 2048 token 至 prompt
+后半段之间。64K prompt 在默认 16384 的 D 预算下约按 48K／16K 切分，预算达到
+32768 时按 50/50 切分。沿用同 TP 的原生 Mooncake、early device allocation 和
+D 端禁用 radix cache 的配置。P 等到 bootstrap 后再为可协商请求启动 Prefill。
+高命中、请求输出 logprobs、结构化生成或对端未协商时，走既有 PD 路径。
 
-P 发出前半段 KV 和 Conv／SSM 后完成原生传输。D 在已有预留中续算整个后半段，
+P 发出切点前的 KV 和 Conv／SSM 后完成原生传输。D 在已有预留中续算剩余 prompt，
 并从完整 prompt 的末尾采样首 token。前缀 KV 在 D 本地读取。每个续算 batch 最多处理
 一个请求，已有 decode batch 会在两个续算 batch 之间获得执行机会。
 验收时用相同的缓存冷热顺序和并发，对比分段开关的 TTFT 与 D 上其他请求的 ITL。
-D 日志 `[handoff-split]` 会记录实际切点和续算 token 数。
+P、D 的 `[handoff-split-decision]` 记录协商与回退原因，可按 bootstrap room 对照。
+D 的 `[handoff-split]` 记录实际开始续算时的切点和 token 数。
 
 不要开启原生 disaggregation staging ring；D2D 的私有 staging 由共用数据面管理。
 原生 Mooncake transport、bootstrap、SMG、control directory 配置沿用现有部署。

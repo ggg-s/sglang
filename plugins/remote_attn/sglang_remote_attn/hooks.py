@@ -670,6 +670,8 @@ HOOKS.update(
         "sglang.srt.disaggregation.decode.DecodeTransferQueue.resolve_deferred_releases": decode_overlap.reap,
         "sglang.srt.disaggregation.decode.SchedulerDisaggregationDecodeMixin.get_next_disagg_decode_batch_to_run": qwen_split_prefill.next_batch,
         "sglang.srt.disaggregation.decode.SchedulerDisaggregationDecodeMixin._get_new_prebuilt_batch": qwen_split_prefill.prebuilt,
+        "sglang.srt.disaggregation.prefill.PrefillBootstrapQueue.create_sender": qwen_split_prefill.create_sender,
+        "sglang.srt.disaggregation.prefill.PrefillBootstrapQueue.can_prefill_before_bootstrap": qwen_split_prefill.can_prefill_before_bootstrap,
         "sglang.srt.disaggregation.prefill.PrefillBootstrapQueue.finalize_bootstrap": qwen_split_prefill.finalize_bootstrap,
         "sglang.srt.disaggregation.utils.MetadataBuffers.set_buf": qwen_split_prefill.set_metadata,
         "sglang.srt.managers.schedule_batch.Req.init_next_round_input": qwen_split_prefill.init_input,

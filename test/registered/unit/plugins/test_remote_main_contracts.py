@@ -672,10 +672,10 @@ class TestQwenHybridD2D(CustomTestCase):
             e = Environment(ROOT, device=getattr(self, "device", "cpu"))
             self.addCleanup(e.close)
             for cached in (0, e.prefix // 2):
-                e.req.cached_tokens_device = cached
-                # A prior chunk can already have populated nearly the whole
-                # prefix even though there was no cross-request cache hit.
-                e.req.prefix_len = e.prefix - 1
+                e.req.__dict__.pop("_hybrid_prefill_cached_tokens", None)
+                e.req._hybrid_prefill_cache_match = cached
+                # The request's own chunks can make the live counters look hot.
+                e.req.cached_tokens_device = e.req.prefix_len = e.prefix - 1
                 pd.prepare(e.source, [e.req])
                 self.assertIsNone(getattr(e.req, "_pre_layerwise_source", None))
                 self.assertFalse(getattr(e.pm, "_prefix_streams", {}))
@@ -828,6 +828,7 @@ class TestQwenHybridD2D(CustomTestCase):
         from sglang_remote_attn.qwen_hybrid import Controller
 
         controller = Controller.__new__(Controller)
+        controller.scheduler = NS(disaggregation_mode=NS(value="decode"))
         sentinel = object()
         forward = lambda runner, batch: sentinel
         self.assertIs(
