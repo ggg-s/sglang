@@ -159,12 +159,16 @@ GPU backend 使用独立、已注册的 GPU staging：
 原生 GPU KV → gather 到注册 GPU 槽 → GPUDirect RDMA → 注册 GPU 槽 → scatter
 ```
 
-GPU staging 与原生 KV 使用独立分配。旧 GPU wire 和状态安装保留独立 copy。
-DSV4／DSV4.1 和 Qwen hybrid 共用的 bulk 路径，在 GPU RDMA 上按需要选择
+GPU staging 与原生 KV 使用独立分配。DSV4／DSV4.1 和 Qwen hybrid 共用的 bulk
+路径在 GPU RDMA 上按需要选择
 4、16 或 64 MiB 帧。冻结后在同一层组内跨 token 小区间打包，打包前跳过已封存
 的 precopy 页。源端直接 gather 到注册槽，目标端在接收槽上 scatter，复用槽前等待
 消费事件。每帧由一条 Mooncake 写描述符提交。TCP 沿用 4／16 MiB、原 token 区间
 和有序 footer。Qwen dense 的每层 slot 仍受原有 4 MiB 上限约束。
+
+源端声明 `state-row-pack-v1` 且双方选中 GPU RDMA 时，导入阶段也用协商的槽容量
+打包原生状态行和全局索引行，每帧提交一次 Mooncake 写入。TCP 或源端未声明该能力时，
+导入阶段逐项读取。
 
 precopy 在源和目标的所有 rank 都报告 GPU RDMA 可用时选择 GPU 槽，并在首次
 PREPARE 时记录传输方式和容量。混合节点可协商双方的 TCP engine。Remote Attention 的 GPU RDMA 端双方协商后将
@@ -206,6 +210,39 @@ TCP fallback 只在数据提交前协商。已经提交的 RDMA 如果状态不�
 Qwen 注册 owner 绑定本次选中的 engine，正常释放和延迟 reaper 都调用同一个 engine
 的 unregister，避免降级后误用原生 RDMA engine 注销 TCP region。GPU/Host 注册失败
 没有返回 owner 时，仍保留 backing；后续 completion ticket 不能解除这种隔离。
+
+## 161 H20-3e 实测
+
+2026-11-11 内网对照使用 DSV4-Flash、P TP2 + D0 TP2 + D1 TP2、Mooncake RDMA。
+输入 64K token，输出 512 token，c=4，cut=32，每组 4 条请求。
+优化后数据对应状态行打包补丁，该补丁已合入 `e9a45d107a`。延迟单位均为 ms。
+
+### 自然排空与优化后主动迁移
+
+| 指标 | 自然排空 | 优化后主动迁移 | 变化 |
+| --- | ---: | ---: | ---: |
+| `safe_to_stop`（D0 可停机） | 4,998 | **1,643** | **−67%** |
+| 客户端 E2EL p50 | 4,976 | 6,070 | +22% |
+| 客户端 E2EL max | 4,986 | 6,082 | +22% |
+| ITL p50 | 0.49 | 0.58 | +18% |
+| ITL p95 | 20.86 | 21.68 | +4% |
+| ITL p99 | 31.54 | 46.51 | +47% |
+| ITL max | 103 | 956 | ×9.3 |
+| 切换期 ITL（4 条） | — | 956 / 938 / 951 / 949 | — |
+
+### 主动迁移优化前后
+
+| 指标 | 优化前 | 优化后 | 变化 |
+| --- | ---: | ---: | ---: |
+| `safe_to_stop` | 2,631 | **1,643** | −38% |
+| 客户端 E2EL p50 | 7,032 | **6,070** | −14% |
+| ITL max | 1,920 | **956** | −50% |
+| 切换期 ITL 范围 | 1,617–1,920 | **938–956** | 下界 −42%，上界 −50% |
+| ITL p95 | 21.29 | 21.68 | +2% |
+
+这组负载下，主动迁移让 D0 提前约 3.36 s 腾空，可停机用时约为自然排空的三分之一。
+客户端 E2EL p50 增加约 1.09 s，量级与切换期约 0.95 s 的停顿接近。两组 ITL p95
+都在 21 ms 左右，差距主要出现在 p99 和最大间隔。
 
 ## 验证与当前边界
 
