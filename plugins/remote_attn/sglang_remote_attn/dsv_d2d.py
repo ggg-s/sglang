@@ -26,6 +26,7 @@ from .transport_failure import TransportFailure
 
 VERSION = "dsv-d2d-v2"
 LIMIT = bulk.CAPACITY
+BULK_READ_ACTIONS = {"read", "read_group", "read_pack"}
 ASYNC_HANDOFF_LIMIT = 8
 CONTROL_WAVE_LIMIT = 8
 CONTROL_WAVE_COMMANDS = {
@@ -166,11 +167,13 @@ def state_rows(controller, req, length):
                 device=swa.device,
                 dtype=torch.int64,
             )
+        # Each group shares one index vector across its state tables.
+        low, high = (
+            torch.stack(torch.aminmax(indices)).tolist() if indices.numel() else (0, -1)
+        )
         for i, (pointer, stride) in enumerate(zip(pointers, strides)):
             table = matrix(views[pointer], int(stride))
-            if indices.numel() and bool(
-                ((indices < 0) | (indices >= table.shape[0])).any()
-            ):
+            if low < 0 or high >= table.shape[0]:
                 raise ValueError("native D2D state index outside registration")
             groups.append(
                 (
@@ -479,6 +482,7 @@ class Source:
         )
         if rdma_capacity is not None:
             self.meta["bulk_rdma_frame_bytes"] = rdma_capacity
+            self.meta["bulk_row_protocol"] = grouping.PACKED_ROWS
 
     def check_read(self, *, allow_aborted=False):
         if (
@@ -577,7 +581,7 @@ def execute(job, stream, cache):
         try:
             source.check_read()
         except TransportFailure:
-            if action in {"read", "read_group"}:
+            if action in BULK_READ_ACTIONS:
                 # Positive proof for prepared cancellation: this invocation
                 # never reached a native write. A socket error is NOT this proof.
                 return reply(torch.empty(0, dtype=torch.uint8), bulk_rejected=True)
@@ -611,7 +615,7 @@ def execute(job, stream, cache):
                 job.ctx.handoff_id, expected_req=source.req
             )
             return reply(torch.empty(0, dtype=torch.uint8))
-        if action not in {"read", "read_group"}:
+        if action not in BULK_READ_ACTIONS:
             raise ValueError("unknown D2D snapshot action")
     region = bulk.descriptor(h.get("bulk_region"))
     sequence = h.get("bulk_sequence")
@@ -622,8 +626,20 @@ def execute(job, stream, cache):
         or "bulk_rdma_frame_bytes" not in source.meta
     ):
         raise ValueError("D2D wide frame requires the RDMA capability")
-    selected = None
-    if action == "read_group":
+    selected = packed = None
+    if action == "read_pack":
+        if (
+            region["protocol"] != transport.GPU
+            or source.meta.get("bulk_row_protocol") != grouping.PACKED_ROWS
+        ):
+            raise ValueError("D2D packed rows require the RDMA capability")
+        packed = grouping.validate_rows(
+            source,
+            h.get("segments"),
+            min(source.bulk_sender.rdma_capacity, region["size"] - bulk.FOOTER),
+        )
+        device = packed[0][0].device
+    elif action == "read_group":
         capacity = source.bulk_sender.rdma_capacity if wide else LIMIT
         selected = grouping.validate_segments(
             source, h.get("segments"), min(capacity, region["size"] - bulk.FOOTER)
@@ -657,6 +673,7 @@ def execute(job, stream, cache):
             entry = source.schema["entries"][segment["entry"]]
             if entry[2] // source.group_size != h["layer_group"]:
                 raise ValueError("D2D segment outside layer group")
+        device = source.pages.device
     else:
         kind, entry = h.get("kind"), int(h["entry"])
         if kind == "global" and 0 <= entry < len(source.globals):
@@ -673,11 +690,15 @@ def execute(job, stream, cache):
             or count * table.shape[1] > LIMIT
         ):
             raise ValueError("D2D read range exceeds frozen ownership/budget")
-    device = source.globals[0].device if selected is not None else table.device
+        device = table.device
     with on_device(device), on_stream(device, stream):
         if stream is not None:
             stream.wait_event(source.final_event)
-        if wide:
+        if packed is not None:
+            size = source.bulk_sender.write_rows(
+                packed, dp.event(device), region, sequence
+            )
+        elif wide:
             rows = [
                 (t, source.pages[start : start + n].to(torch.int64))
                 for t, start, n in selected
@@ -699,7 +720,7 @@ def execute(job, stream, cache):
                     for t, start, n in selected
                 ]
             )
-        if not wide:
+        if packed is None and not wide:
             size = source.bulk_sender.write(data, dp.event(device), region, sequence)
         source.postfreeze_bytes += size
     # Empty tensor envelope preserves the authenticated RemoteHub request lease;
@@ -735,7 +756,8 @@ class Reader:
         self.closed = False
         self.owner, self.req = owner, req
         self.offer = offer if offer is not None else transport.tcp_offer()
-        self.capacity = bulk.frame_capacity(capacity)
+        self.base_capacity = bulk.frame_capacity(capacity)
+        self.capacity = self.base_capacity
         self.rdma_capacity = rdma_capacity
         self.catalog = self.backend = None
         self.wide = False
@@ -775,7 +797,7 @@ class Reader:
             q_bytes=1024,
             **fields,
         )
-        if action not in {"read", "read_group"}:
+        if action not in BULK_READ_ACTIONS:
             response, out, _lse = self.client.call(
                 h, self.query, deadline_s=self.timeout
             )
@@ -1026,7 +1048,7 @@ class Target(NativeTarget):
                 owner=self.owner,
                 req=req,
                 offer=self.reader.offer,
-                capacity=self.reader.capacity,
+                capacity=self.reader.base_capacity,
                 rdma_capacity=self.rdma_frame_capacity,
             )
             self.bulk_reader.select_backend()
@@ -1654,6 +1676,8 @@ def prepare_import_io(target, transfer, session, jobs):
         with on_device(device), on_stream(device, target.setup_stream):
             if target.stop.is_set():
                 return
+            target.rdma_frame_capacity = transfer.get("bulk_rdma_frame_bytes")
+            packed_rows = transfer.get("bulk_row_protocol") == grouping.PACKED_ROWS
             reader = target.reader = Reader(
                 transfer["route"],
                 transfer["destination"],
@@ -1663,8 +1687,8 @@ def prepare_import_io(target, transfer, session, jobs):
                 req=req,
                 offer=transfer["bulk_capabilities"],
                 capacity=transfer.get("bulk_frame_bytes", bulk.LEGACY_CAPACITY),
+                rdma_capacity=target.rdma_frame_capacity if packed_rows else None,
             )
-            target.rdma_frame_capacity = transfer.get("bulk_rdma_frame_bytes")
             attached = time.perf_counter_ns()
             target.import_timing_ns["attach"] = attached - started
             meta, _ = reader.call("manifest", gpu_session=session)
@@ -1672,10 +1696,22 @@ def prepare_import_io(target, transfer, session, jobs):
             target.import_timing_ns["manifest"] = manifest_at - attached
             if meta["manifest"] != transfer:
                 raise ValueError("D2D frozen manifest changed")
-            for args in jobs:
-                if target.stop.is_set():
-                    return
-                copy_rows(reader, *args)
+            if jobs and not target.stop.is_set():
+                reader.select_backend()
+            if reader.wide:
+                for frame in grouping.row_frames(jobs, reader.capacity):
+                    if target.stop.is_set():
+                        return
+                    reader.call(
+                        "read_pack",
+                        apply=lambda data: grouping.scatter_rows(data, frame),
+                        segments=[segment for segment, _, _ in frame],
+                    )
+            else:
+                for args in jobs:
+                    if target.stop.is_set():
+                        return
+                    copy_rows(reader, *args)
             queued = time.perf_counter_ns()
             target.import_timing_ns["state_index_copy"] = queued - manifest_at
             target.decode_req.ready = dp.event(device)
@@ -1745,7 +1781,7 @@ def finish_import(controller, target):
         target.admission_id = retirement.last_admission + 1
         retirement.register(target)
         controller.targets.append(target)
-        if not target.defer_bulk:
+        if not target.defer_bulk and target.worker is None:
             start_bulk(target)
         return dict(
             rid=req.rid, imported=True, kv_len=kv_len, output_len=len(req.output_ids)

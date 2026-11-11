@@ -3,7 +3,9 @@
 import os
 
 PACKED = "kv-entry-pack-v1"
+PACKED_ROWS = "state-row-pack-v1"
 MAX_SEGMENTS = 64
+MAX_ROW_SEGMENTS = 256
 
 
 def size(value=None):
@@ -24,7 +26,15 @@ def layers(count, width):
 
 
 def frames(
-    entries, pages, width, capacity, *, start_page=0, only_group=None, prefixes=None
+    entries,
+    pages,
+    width,
+    capacity,
+    *,
+    start_page=0,
+    only_group=None,
+    prefixes=None,
+    sort_by_stride=False,
 ):
     """Pack rows of distinct native KV producers within logical layer ranges.
 
@@ -39,7 +49,10 @@ def frames(
         if only_group is not None and group != only_group:
             continue
         frame, used = [], 0
-        for i, stride in groups[group]:
+        producers = groups[group]
+        if sort_by_stride:
+            producers.sort(key=lambda item: item[1])
+        for i, stride in producers:
             if not 0 < stride <= capacity:
                 raise ValueError("D2D global row exceeds frame budget")
             start = max(start_page, prefixes[i]) if prefixes is not None else start_page
@@ -54,6 +67,80 @@ def frames(
                 start += count
         if frame:
             yield frame
+
+
+def row_frames(jobs, capacity):
+    """Pack bounded runs of native state and index rows into one RDMA slot."""
+    if type(capacity) is not int or capacity <= 0:
+        raise ValueError("D2D packed row budget must be positive")
+    frame, used = [], 0
+    for job in jobs:
+        kind, entry, dst, indices, rows, *prefix = job
+        start = prefix[0] if prefix else 0
+        if indices.numel() != rows or not 0 <= start <= rows:
+            raise ValueError("invalid D2D destination row range")
+        stride = dst.shape[1]
+        if not 0 < stride <= capacity:
+            raise ValueError("D2D state/global row exceeds frame budget")
+        while start < rows:
+            count = min(rows - start, (capacity - used) // stride)
+            if not count or len(frame) == MAX_ROW_SEGMENTS:
+                yield frame
+                frame, used = [], 0
+                continue
+            segment = dict(kind=kind, entry=entry, start=start, count=count)
+            frame.append((segment, dst, indices))
+            used += count * stride
+            start += count
+    if frame:
+        yield frame
+
+
+def validate_rows(source, segments, capacity):
+    """Resolve packed state/index rows within the frozen source ownership."""
+    if not isinstance(segments, list) or not 0 < len(segments) <= MAX_ROW_SEGMENTS:
+        raise ValueError("invalid D2D packed row count")
+    total, selected = 0, []
+    for segment in segments:
+        if not isinstance(segment, dict):
+            raise ValueError("invalid D2D packed row segment")
+        kind = segment.get("kind")
+        i, start, count = (segment.get(k) for k in ("entry", "start", "count"))
+        if not all(type(x) is int for x in (i, start, count)):
+            raise ValueError("invalid D2D packed row segment")
+        if kind == "state" and 0 <= i < len(source.states):
+            _, table, indices = source.states[i]
+        elif (
+            kind == "global"
+            and 0 <= i < len(source.globals)
+            and source.schema["entries"][i][0] == "index"
+        ):
+            table, indices = source.globals[i], source.pages
+        else:
+            raise ValueError("invalid D2D packed row entry")
+        if start < 0 or count < 1 or start + count > indices.numel():
+            raise ValueError("D2D packed rows outside frozen rows")
+        total += count * table.shape[1]
+        if total > capacity:
+            raise ValueError("D2D packed rows exceed budget")
+        selected.append((table, indices[start : start + count]))
+    return selected
+
+
+def scatter_rows(data, frame):
+    """Scatter a complete packed frame into the reserved native rows."""
+    sizes = [segment["count"] * dst.shape[1] for segment, dst, _ in frame]
+    if data.numel() != sum(sizes):
+        raise ValueError("D2D packed row frame size does not match destination")
+    offset = 0
+    for (segment, dst, indices), size in zip(frame, sizes):
+        start, count = segment["start"], segment["count"]
+        dst.index_copy_(
+            0,
+            indices[start : start + count],
+            data[offset : offset + size].reshape(count, dst.shape[1]),
+        )
+        offset += size
 
 
 def validate_segments(source, segments, capacity):
@@ -107,7 +194,9 @@ def range_frames(entries, prefix, page, width, token_range, capacity):
 def rdma_frames(entries, prefix, page, width, capacity, prefixes):
     """Pack remaining pages across the old token rectangles, layer group first."""
     pages = (prefix + page - 1) // page
-    for segments in frames(entries, pages, width, capacity, prefixes=prefixes):
+    for segments in frames(
+        entries, pages, width, capacity, prefixes=prefixes, sort_by_stride=True
+    ):
         group = entries[segments[0]["entry"]][2] // width
         yield dict(
             layer_group=group,

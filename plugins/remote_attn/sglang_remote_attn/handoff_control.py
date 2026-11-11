@@ -2212,7 +2212,7 @@ class RemoteHub:
             else:
                 pool = self._pool
                 if self._bulk_pool is not None and header.get("dsv_d2d") in (
-                    "read", "read_group",
+                    "read", "read_group", "read_pack",
                 ):
                     pool = self._bulk_pool
                 pool.submit(job)

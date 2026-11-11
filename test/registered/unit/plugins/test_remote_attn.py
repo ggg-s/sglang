@@ -15927,7 +15927,7 @@ class TestRemoteAttn(CustomTestCase):
         gc.collect()
         self.assertIsNotNone(ref())
         self.assertIs(sender.copy_owner[0], ref())
-        self.assertIs(sender.copy_owner[1], proof)
+        self.assertIs(sender.copy_owner[2], proof)
         self.assertTrue(sender.unsafe)
         self.assertIn(sender, sender.engine._d2d_bulk_owners)
         with self.assertRaises(RuntimeError):
