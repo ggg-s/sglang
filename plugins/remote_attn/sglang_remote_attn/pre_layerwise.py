@@ -630,6 +630,10 @@ class Controller:
     def __init__(self, scheduler, config):
         self.scheduler = scheduler
         self.config = config
+        pd_remote = os.environ.get("HANDOFF_EXPERIMENTAL_PD_REMOTE", "0")
+        if pd_remote not in ("0", "1"):
+            raise ValueError("HANDOFF_EXPERIMENTAL_PD_REMOTE must be 0 or 1")
+        self.pd_remote = config.mode != "remote" or pd_remote == "1"
         self.rank = _runtime()._tp_rank(scheduler)
         self.tp_size = _runtime()._tp_size(scheduler)
         self.layers = scheduler.tp_worker.model_runner.model_config.num_hidden_layers
@@ -682,9 +686,12 @@ class Controller:
             getattr(self, "schema_signature", None),
             startup_signature(self.config),
             (
+                self.pd_remote,
+                getattr(self, "split_prefill", False),
                 getattr(self, "split_prefill_budget", None),
                 getattr(self, "split_prefill_chunk_size", None),
-                getattr(self, "split_prefill_cut_ratio", None),
+                getattr(self, "split_prefill_cut_ratios", ()),
+                getattr(self, "split_prefill_max_outstanding", None),
             ),
             ("destination-cache-v1", "prefix-range-v1", prefix_enabled()),
             (
@@ -1340,6 +1347,18 @@ def initialize(scheduler):
     )
     controller = cls(scheduler, config)
     controller.validate()
+    from . import qwen_split_prefill
+
+    qwen_split_prefill.configure(controller)
+    if (
+        cls is Controller
+        and scheduler.disaggregation_mode.value == "prefill"
+        and scheduler.enable_overlap
+        and (controller.pd_remote or not controller.split_prefill)
+    ):
+        raise RuntimeError(
+            "Dense MHA P overlap requires split prefill with native P-to-D transfer"
+        )
     controller.validate_graphs()
     from . import pd_mesh
 
@@ -1369,7 +1388,8 @@ def initialize(scheduler):
         )
         from .prefill_overlap import install as install_prefill_overlap
 
-        controller.prefill_overlap = install_prefill_overlap(controller)
+        if controller.pd_remote:
+            controller.prefill_overlap = install_prefill_overlap(controller)
     if not getattr(controller, "dsv41_layerwise", False):
         if scheduler.disaggregation_mode.value == "prefill":
             controller.cache_guard = install(scheduler.tree_cache)
@@ -1417,11 +1437,21 @@ def run_batch(original, scheduler, batch, *args, **kwargs):
             getattr(batch, "_hybrid_split_extend", False)
             and batch.forward_mode.is_extend()
         ):
-            from sglang.srt.runtime_context import get_forward
+            from sglang.srt.model_executor.cuda_graph_config import (
+                Backend,
+                Phase,
+                check_cuda_graph_backend,
+            )
 
-            with get_forward().scoped(force_eager_prefill=True):
-                return overlap.run_batch(original, scheduler, batch, *args, **kwargs)
+            if not check_cuda_graph_backend(Phase.PREFILL, Backend.BREAKABLE):
+                from sglang.srt.runtime_context import get_forward
+
+                with get_forward().scoped(force_eager_prefill=True):
+                    return overlap.run_batch(original, scheduler, batch, *args, **kwargs)
         return overlap.run_batch(original, scheduler, batch, *args, **kwargs)
+    if not getattr(controller, "pd_remote", True):
+        # Native scheduling owns cached-prefix readiness and transfer fences.
+        return original(scheduler, batch, *args, **kwargs)
     if getattr(controller, "cache_guard", None) is not None and not getattr(
         controller, "hybrid_gdn", False
     ):
@@ -1474,7 +1504,7 @@ def send_chunk(original, scheduler, req, last_chunk=False, end_idx=None):
 
 def pop_transferred(original, queue, rids_to_check=None):
     controller = getattr(queue.scheduler, "_pre_layerwise", None)
-    if controller is None:
+    if controller is None or not getattr(controller, "pd_remote", True):
         return original(queue, rids_to_check)
     admitted, offered = controller.early_targets(queue, rids_to_check)
     ordinary = original(queue, rids_to_check)

@@ -52,6 +52,7 @@ def startup_signature(config):
             "HANDOFF_CTL_DIR",
             "HANDOFF_REMOTE_GPU_TRANSFER",
             "HANDOFF_HYBRID_SPLIT_PREFILL",
+            "HANDOFF_EXPERIMENTAL_PD_REMOTE",
         )
     ), str(config.directory) if enabled() else None
 
@@ -498,7 +499,7 @@ def bootstrap(original, receiver, *, bootstrap_info, message, operation):
         receiver._remote_attn_room = room
         if room is not None:
             message = [*message, MAGIC + json.dumps(room.descriptor).encode()]
-    cut = getattr(receiver, "_hybrid_split_offer", 0)
+    cut = getattr(receiver, "_hybrid_split_min_cut", 0)
     if cut and operation == "send_metadata" and not bootstrap_info["is_dummy"]:
         from .qwen_split_prefill import WIRE
 
@@ -514,9 +515,11 @@ def parse_transfer(original, *args, **kwargs):
     from .qwen_split_prefill import WIRE
 
     extensions = message[10:]
-    cut = next((frame[len(WIRE) :] for frame in extensions if frame.startswith(WIRE)), b"")
+    cut = next(
+        (frame[len(WIRE) :] for frame in extensions if frame.startswith(WIRE)), b""
+    )
     if 0 < len(cut) <= 10 and cut.isdigit():
-        value._hybrid_split_offer = int(cut)
+        value._hybrid_split_min_cut = int(cut)
     journal = next((frame for frame in extensions if frame.startswith(MAGIC)), None)
     if journal is not None:
         try:

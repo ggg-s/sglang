@@ -62,13 +62,8 @@ def _scheduler_init(original, scheduler, *args, **kwargs):
             raise RuntimeError("DSV4.1 layerwise requires the native DSV4 KV pool")
         pre_layerwise.initialize(scheduler)
         return
-    from sglang.srt.runtime_context import get_disagg, get_schedule
+    from sglang.srt.runtime_context import get_schedule
 
-    if (
-        get_disagg().disaggregation_mode == "prefill"
-        and not get_schedule().disable_overlap_schedule
-    ):
-        raise RuntimeError("P overlap is supported only for the DSV4.1 PD adapter")
     if (
         get_schedule().page_size != 1
         or type(pool) is not MHATokenToKVPool
@@ -78,10 +73,8 @@ def _scheduler_init(original, scheduler, *args, **kwargs):
         raise RuntimeError(
             "remote_attn currently requires dense NHD MHA KV in BF16/FP16"
         )
+    pre_layerwise.initialize(scheduler)
     _runtime().get_remote_hub(scheduler)
-    from .pre_layerwise import initialize
-
-    initialize(scheduler)
 
 
 def validate_config():
@@ -124,7 +117,7 @@ def validate_config():
         )
     ):
         raise RuntimeError(
-            "remote_attn requires --disable-overlap-schedule except progressive D or DSV4.1 PD P"
+            "remote_attn overlap requires PD with HANDOFF_PRE_LAYERWISE=layerwise or remote"
         )
     if not memory.disable_radix_cache and not (
         os.environ.get("HANDOFF_PRE_LAYERWISE", "off") in ("remote", "layerwise")
@@ -342,6 +335,7 @@ def _reset_retracted(original, req):
 def _release_kv(original, req, tree_cache, *, checkpoint):
     from .pre_layerwise import defer_release
 
+    qwen_split_prefill.release_reservation(req)
     cache_lease = destination_cache.lease_for(req)
     if cache_lease is not None and not checkpoint:
         destination_cache.suppress(req)

@@ -23,9 +23,12 @@ def request_of(item):
 
 
 def quarantine(owner, item, reason):
+    from .qwen_split_prefill import release_reservation
+
     # SourceOwner wraps the P overlap controller for ordered retirement.
     controller = getattr(owner, "controller", owner)
     req = request_of(item)
+    release_reservation(req)
     records = getattr(controller, "transport_quarantine", None)
     if records is None:
         records = controller.transport_quarantine = {}

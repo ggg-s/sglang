@@ -176,14 +176,17 @@ def snapshot_prefill_admission(original, scheduler, running_batch):
     batch = plan.batch_to_run
     if (
         batch is None
-        or not getattr(controller, "hybrid_gdn", False)
+        or not (
+            getattr(controller, "hybrid_gdn", False)
+            or getattr(controller, "split_prefill", False)
+        )
         or scheduler.disaggregation_mode.value != "prefill"
     ):
         return plan
 
     from .qwen_split_prefill import log_decision
 
-    min_ratio = controller.remote_min_cache_hit_ratio
+    min_ratio = getattr(controller, "remote_min_cache_hit_ratio", 0)
     for req in batch.reqs:
         if hasattr(req, "_hybrid_prefill_cached_tokens"):
             continue
@@ -208,6 +211,7 @@ def snapshot_prefill_admission(original, scheduler, running_batch):
         if (
             controller.rank == 0
             and not cut
+            and getattr(controller, "pd_remote", True)
             and min_ratio
             and (cached <= len(req.origin_input_ids) * min_ratio)
         ):

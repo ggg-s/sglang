@@ -108,30 +108,36 @@ export HANDOFF_D2D_GROUP_SIZE=8
 export HANDOFF_D2D_TOKEN_RANGE=1024
 ```
 
-P 默认只为第一次实际 Prefill 调度时 device cache 命中率 **大于 50%** 的请求启用
-Remote 早接纳。P 在首次 Prefill 批次准入时快照原生 `cache_protected_len`，
-后续 chunk 和重试沿用该值。
-分母为完整 prompt token 数。冷请求回退时由 `[handoff-cache-gate]` 记录命中数。
-其余请求由原生 PD 等待完整 KV，TP 任一 rank 未达到门槛时同样走原生 PD。
-P 上可用 `HANDOFF_HYBRID_REMOTE_MIN_CACHE_HIT_RATIO` 调整门槛，设为 `0` 可恢复
-所有合格请求都尝试 Remote 的对照行为。该门槛只作用于 P→D Hybrid PD。
+Remote PD 默认开启分段 Prefill。P 在真实 Prefix Cache Match 后决定切点，
+所有已支持的 dense MHA 和 FULL+MAMBA 布局共用规则，不按模型或并发分档。
+Remote attention 用于 D2D 迁移。P→D Remote 早接纳作为实验功能，需在两端设置
+`HANDOFF_EXPERIMENTAL_PD_REMOTE=1`。对比该实验路径时，同时设置
+`HANDOFF_HYBRID_SPLIT_PREFILL=0`。Hybrid PD 的实验 Remote 仍使用
+`HANDOFF_HYBRID_REMOTE_MIN_CACHE_HIT_RATIO`，默认仅尝试首次实际 Prefill 时
+命中率大于 50% 的请求。
 
-### 实验性分段 Prefill
+### 分段 Prefill
 
-P、D 同时设置 `HANDOFF_HYBRID_SPLIT_PREFILL=1` 开启。至少 4096 token 的纯文本
-请求可参与协商。切点和续算批大小只在 D 端配置。
+`HANDOFF_HYBRID_SPLIT_PREFILL` 默认 `1`，在 P、D 两端设为 `0` 可做原生 PD 对照。
+至少 4096 token 的纯文本请求可参与协商。P 配置切点，D 配置续算批大小。
 
-- `HANDOFF_HYBRID_SPLIT_PREFILL_CUT_RATIO` 是 P 计算的 prompt 比例，范围
-  `[0.5, 1)`，默认 `0.5`。可用 `0.75` 恢复约 75/25 的切分。D 续算段不足
-  2048 token 时按既有 PD 路径处理。
-- `HANDOFF_HYBRID_SPLIT_PREFILL_CHUNK_SIZE` 默认 `8192`，以 D 的
-  `--max-prefill-tokens` 为上限。这个设置独立于原生 `--chunked-prefill-size`。
-  若要复现约 64K prompt 的 75/25 单次续算，设切点为 `0.75`，块大小为 `16384`，
-  并让 D 的 `--max-prefill-tokens` 至少为 `16384`。
+- P 的 `HANDOFF_HYBRID_SPLIT_PREFILL_CUT_RATIO` 范围为 `[0.5, 1)`，默认 `0.85`。
+  P 从配置比例开始，依次尝试 `0.5 / 0.75 / 0.85 / 0.93` 中更高的比例。
+  切点必须越过实际命中前缀，满足 D 声明的下界，并留下至少 2048 token 的后缀。
+  例如 32K prompt 命中 90% 时，默认配置会选择 `0.93`。没有合法切点时走原生 PD。
+- D 的 `HANDOFF_HYBRID_SPLIT_PREFILL_MAX_OUTSTANDING` 默认 `4`。每次发出 offer
+  预留一个名额，涵盖等待 P 传输和 D 续算的请求。D 达到该上限或 decode 批次已满时，
+  新请求走原生 PD。续算完成、原生 PD 完成或请求终止清理时归还名额。
+  默认上限是压测起点，可按在途 decode 的 token 间隔调整。
+- D 的 `HANDOFF_HYBRID_SPLIT_PREFILL_CHUNK_SIZE` 默认 `8192`，以 D 的
+  `--max-prefill-tokens` 为上限。D 声明最多承接半个 prompt，分块完成续算。
+  这个设置独立于原生 `--chunked-prefill-size`。
 
-沿用同 TP 的原生 Mooncake、early device allocation 和
-D 端禁用 radix cache 的配置。P 等到 bootstrap 后再为可协商请求启动 Prefill。
-高命中、请求输出 logprobs、结构化生成或对端未协商时，走既有 PD 路径。
+沿用同 TP 的原生 Mooncake、early device allocation 和 page-1 KV 配置。
+D 命中已有前缀、请求输出 logprobs、结构化生成或对端未协商时走原生 PD。
+P 等到 bootstrap 后再为可协商请求启动 Prefill，首次 Forward 前对实际 cut 做
+TP 一致性检查。V2 Bootstrap 传递最小切点，完成 metadata 传递实际切点。
+新旧版本协商不匹配时走原生 PD。
 
 P 发出切点前的 KV 和 Conv／SSM 后完成原生传输。D 在已有预留中续算剩余 prompt，
 并从完整 prompt 的末尾采样首 token。前缀 KV 在 D 本地读取。每个续算 batch 最多处理
@@ -140,9 +146,15 @@ P 发出切点前的 KV 和 Conv／SSM 后完成原生传输。D 在已有预留
 增大续算块会减少停顿次数，单次停顿仍可能变长，因此同时记录最大 token 间隔。
 P、D 的 `[handoff-split-decision]` 记录协商与回退原因，可按 bootstrap room 对照。
 D 的 `[handoff-split]` 记录切点和总续算量，`[handoff-split-chunk]` 记录每块的起止
-位置和剩余 token 数。D 复用同一份 KV 预留和 Conv／SSM 状态，各块均走 eager。
-只在最后一块结算后进入正常 Decode 调度，
-后续 Decode 可按原生规则回放图。
+位置和剩余 token 数。D 复用同一份 KV 预留和 Conv／SSM 状态。
+
+- P 可用 `--cuda-graph-backend-prefill breakable` 运行 prefill 图。D 同时配置
+  `--cuda-graph-backend-prefill breakable --cuda-graph-backend-decode full`，
+  让满足原生 replay 条件的续算块走 breakable 图，普通 decode 走 full 图。
+  D 未显式开启 prefill 图时，续算走 eager。
+- D 开启原生 overlap schedule 时，如果已有请求在 decode，可以先提交下一批 decode，
+  再在 CPU 上结算中间续算块的结果。续算和 decode 按顺序提交到原生 forward stream。
+  当前块结算后才能重排该请求，最后一块结算后才能加入普通 decode 批次。
 
 不要开启原生 disaggregation staging ring；D2D 的私有 staging 由共用数据面管理。
 原生 Mooncake transport、bootstrap、SMG、control directory 配置沿用现有部署。

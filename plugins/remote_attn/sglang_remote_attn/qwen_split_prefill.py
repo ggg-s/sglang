@@ -1,21 +1,34 @@
-"""Opt-in token-axis Hybrid PD using native Mooncake completion and local KV."""
+"""Cache-aware split PD using native Mooncake completion and local KV."""
 
 import logging
 import os
 from http import HTTPStatus
 
 logger = logging.getLogger(__name__)
-WIRE = b"REMOTE_ATTN_HYBRID_SPLIT_V1:"
+# V2 advertises a lower bound. V1 peers interpret their offer as an exact cut.
+WIRE = b"REMOTE_ATTN_HYBRID_SPLIT_V2:"
 # output_ids rows are already transferred in full; native uses only slot 0.
 CUT_SLOT = 1
 MIN_PROMPT_TOKENS = 4096
+MIN_SUFFIX_TOKENS = 2048
+CUT_RATIOS = (0.5, 0.75, 0.85, 0.93)
 
 
 def configure(controller):
-    value = os.environ.get("HANDOFF_HYBRID_SPLIT_PREFILL", "0")
+    value = os.environ.get("HANDOFF_HYBRID_SPLIT_PREFILL", "1")
     if value not in ("0", "1"):
         raise ValueError("HANDOFF_HYBRID_SPLIT_PREFILL must be 0 or 1")
-    if value == "1":
+    # Dense MHA and native FULL+MAMBA have a continuation adapter. Compressed
+    # DSV KV/state layouts retain native PD until their adapter supports cuts.
+    controller.split_prefill = (
+        value == "1"
+        and controller.config.mode == "remote"
+        and (
+            getattr(controller, "hybrid_gdn", False)
+            or not getattr(controller, "dsv41_layerwise", False)
+        )
+    )
+    if controller.split_prefill:
         from sglang.srt.runtime_context import get_disagg
 
         disagg = get_disagg()
@@ -24,42 +37,62 @@ def configure(controller):
             or disagg.disaggregation_decode_host_receive_threshold != 1
             or disagg.disaggregation_decode_enable_offload_kvcache
         ):
-            raise ValueError("hybrid split prefill requires early device KV allocation")
-    controller.split_prefill = value == "1"
+            raise ValueError("split prefill requires early device KV allocation")
     scheduler = controller.scheduler
     role = scheduler.disaggregation_mode.value
     controller.split_prefill_budget = None
     controller.split_prefill_chunk_size = None
-    controller.split_prefill_cut_ratio = None
+    controller.split_prefill_cut_ratios = ()
+    controller.split_prefill_max_outstanding = None
+    if controller.split_prefill:
+        cut_env = "HANDOFF_HYBRID_SPLIT_PREFILL_CUT_RATIO"
+        try:
+            cut_ratio = float(os.environ.get(cut_env, "0.85"))
+        except ValueError as exc:
+            raise ValueError(f"{cut_env} must be in [0.5, 1)") from exc
+        if not 0.5 <= cut_ratio < 1:
+            raise ValueError(f"{cut_env} must be in [0.5, 1)")
+        controller.split_prefill_cut_ratios = (
+            cut_ratio,
+            *(ratio for ratio in CUT_RATIOS if ratio > cut_ratio),
+        )
     if controller.split_prefill and role == "decode":
         chunk_env = "HANDOFF_HYBRID_SPLIT_PREFILL_CHUNK_SIZE"
-        cut_env = "HANDOFF_HYBRID_SPLIT_PREFILL_CUT_RATIO"
         try:
             chunk_size = int(os.environ.get(chunk_env, "8192"))
         except ValueError as exc:
             raise ValueError(f"{chunk_env} must be a positive integer") from exc
         if chunk_size <= 0:
             raise ValueError(f"{chunk_env} must be a positive integer")
+        limit_env = "HANDOFF_HYBRID_SPLIT_PREFILL_MAX_OUTSTANDING"
         try:
-            cut_ratio = float(os.environ.get(cut_env, "0.5"))
+            limit = int(os.environ.get(limit_env, "4"))
         except ValueError as exc:
-            raise ValueError(f"{cut_env} must be in [0.5, 1)") from exc
-        if not 0.5 <= cut_ratio < 1:
-            raise ValueError(f"{cut_env} must be in [0.5, 1)")
+            raise ValueError(f"{limit_env} must be a positive integer") from exc
+        if limit <= 0:
+            raise ValueError(f"{limit_env} must be a positive integer")
+        controller.split_prefill_max_outstanding = limit
+        controller.split_prefill_outstanding = 0
         controller.split_prefill_budget = scheduler.max_prefill_tokens
         controller.split_prefill_chunk_size = min(
             chunk_size, controller.split_prefill_budget
         )
-        controller.split_prefill_cut_ratio = cut_ratio
+        if not getattr(controller, "hybrid_gdn", False):
+            from .remote_data_plane import Visibility
+
+            controller.pd_visibility = Visibility(
+                scheduler.req_to_token_pool.req_to_token.device
+            )
     if controller.rank == 0:
         logger.info(
             "[handoff-split-config] role=%s enabled=%s max_prefill_tokens=%s "
-            "chunk_size=%s cut_ratio=%s",
+            "chunk_size=%s cut_ratios=%s max_outstanding=%s",
             role,
             controller.split_prefill,
             controller.split_prefill_budget,
             controller.split_prefill_chunk_size,
-            controller.split_prefill_cut_ratio,
+            controller.split_prefill_cut_ratios,
+            controller.split_prefill_max_outstanding,
         )
 
 
@@ -112,7 +145,10 @@ def log_decision(controller, req, stage, reason, **details):
 def create_sender(original, queue, req, num_kv_heads):
     created = original(queue, req, num_kv_heads)
     controller = getattr(queue.scheduler, "_pre_layerwise", None)
-    if created and getattr(controller, "hybrid_gdn", False):
+    if created and (
+        getattr(controller, "hybrid_gdn", False)
+        or getattr(controller, "split_prefill", False)
+    ):
         req._hybrid_prefill_controller = controller
     return created
 
@@ -126,7 +162,8 @@ def can_prefill_before_bootstrap(original, queue, req):
 
 
 def advertise(queue, dr, decode_prefix_len):
-    controller = getattr(queue.scheduler, "_pre_layerwise", None)
+    scheduler = queue.scheduler
+    controller = getattr(scheduler, "_pre_layerwise", None)
     if not getattr(controller, "split_prefill", False):
         return
     from sglang.srt.disaggregation.mooncake.conn import MooncakeKVReceiver
@@ -136,30 +173,47 @@ def advertise(queue, dr, decode_prefix_len):
         return
     receiver._hybrid_split_offer_checked = True
     length = len(req.origin_input_ids)
-    proposed_cut = int(length * controller.split_prefill_cut_ratio)
+    # D accepts up to half the prompt as suffix, processed in bounded chunks.
+    # P chooses the actual cut after matching its own prefix cache.
+    min_cut = (length + 1) // 2
     reason = request_blocker(req)
     if dr.is_rebootstrap or decode_prefix_len:
         reason = "decode_already_owns_prefix"
     elif type(receiver) is not MooncakeKVReceiver:
         reason = "non_mooncake_receiver"
-    elif reason is None and length - proposed_cut < MIN_PROMPT_TOKENS // 2:
+    elif reason is None and length - min_cut < MIN_SUFFIX_TOKENS:
         reason = "decode_suffix_too_short"
-    cut = 0
-    if reason is None:
-        cut = receiver._hybrid_split_offer = proposed_cut
+    if reason is None and (
+        controller.split_prefill_outstanding >= controller.split_prefill_max_outstanding
+        or scheduler.running_batch.batch_size() >= scheduler.max_running_requests
+    ):
+        reason = "decode_busy"
+    # D commits metadata collectively, so every TP rank must publish the same
+    # admission decision even if its local capacity check differs.
+    allowed = length >= MIN_PROMPT_TOKENS and controller.agree([int(reason is None)])[0]
+    if allowed:
+        controller.split_prefill_outstanding += 1
+        req._hybrid_split_reservation = controller
+        receiver._hybrid_split_min_cut = min_cut
     log_decision(
         controller,
         req,
         "decode_offer",
-        reason or "offered",
-        cut=cut,
-        budget=controller.split_prefill_budget,
+        "offered" if allowed else reason or "decode_peer_rejected",
+        min_cut=min_cut if allowed else 0,
+        outstanding=controller.split_prefill_outstanding,
         chunk_size=controller.split_prefill_chunk_size,
-        cut_ratio=controller.split_prefill_cut_ratio,
     )
 
 
-def offered_cut(req, tp_size):
+def release_reservation(req):
+    controller = getattr(req, "_hybrid_split_reservation", None)
+    if controller is not None:
+        req._hybrid_split_reservation = None
+        controller.split_prefill_outstanding -= 1
+
+
+def offered_min_cut(req, tp_size):
     from sglang.srt.disaggregation.mooncake.conn import MooncakeKVSender
 
     reason = request_blocker(req)
@@ -175,11 +229,11 @@ def offered_cut(req, tp_size):
     if len(peers) != 1 or peers[0].is_dummy:
         return 0, "unexpected_destination_peers"
     peer = peers[0]
-    cut = getattr(peer, "_hybrid_split_offer", 0)
+    cut = getattr(peer, "_hybrid_split_min_cut", 0)
     if not cut:
         return 0, "decode_did_not_offer"
     length = len(req.origin_input_ids)
-    if not length // 2 <= cut <= length - MIN_PROMPT_TOKENS // 2:
+    if not (length + 1) // 2 <= cut <= length - MIN_SUFFIX_TOKENS:
         return 0, "invalid_decode_cut"
     if len(peer.dst_kv_indices) != length:
         return 0, "destination_kv_length_mismatch"
@@ -198,17 +252,17 @@ def finalize_bootstrap(original, queue, req):
     controller = getattr(req, "_hybrid_prefill_controller", None)
     if not result or not getattr(controller, "split_prefill", False):
         return result
-    cut, reason = offered_cut(req, controller.tp_size)
-    agreed, negative_max = controller.agree([cut, -cut])
+    min_cut, reason = offered_min_cut(req, controller.tp_size)
+    agreed, negative_max = controller.agree([min_cut, -min_cut])
     if agreed > 0 and agreed == -negative_max:
-        req._hybrid_split_proposal = agreed
+        req._hybrid_split_min_cut = agreed
     else:
         log_decision(
             controller,
             req,
             "prefill_bootstrap",
             reason or "tp_offer_disagreement",
-            cut=cut,
+            min_cut=min_cut,
         )
     return result
 
@@ -219,34 +273,36 @@ def init_input(original, req, tree_cache=None, cow_mamba=None):
     if controller is None:
         return
     cut = getattr(req, "_hybrid_split_at", 0)
-    proposal = getattr(req, "_hybrid_split_proposal", 0)
+    min_cut = getattr(req, "_hybrid_split_min_cut", 0)
     if (
-        proposal
+        min_cut
         and tree_cache is not None
         and cow_mamba is not False
         and not req.kv.holds_kv
         and not req.retracted_stain
         and not hasattr(req, "_hybrid_prefill_cached_tokens")
     ):
-        hot = req.kv.cache_protected_len > (
-            len(req.origin_input_ids) * controller.remote_min_cache_hit_ratio
-        )
-        split = not hot and req.prefix_len < proposal
-        accepted = controller.agree([int(split)])[0]
-        cut = req._hybrid_split_at = proposal if accepted else 0
-        req._hybrid_split_match_reason = (
-            "selected"
-            if accepted
-            else (
-                "warm_cache"
-                if hot
-                else (
-                    "matched_prefix_reaches_cut"
-                    if not split
-                    else "tp_match_disagreement"
-                )
-            )
-        )
+        length = len(req.origin_input_ids)
+        prefix = max(req.prefix_len, req.kv.cache_protected_len)
+        selected = 0
+        for ratio in controller.split_prefill_cut_ratios:
+            candidate = max((length + 1) // 2, int(length * ratio))
+            if (
+                prefix < candidate
+                and min_cut <= candidate <= length - MIN_SUFFIX_TOKENS
+            ):
+                selected = candidate
+                break
+        agreed, negative_max = controller.agree([selected, -selected])
+        accepted = agreed > 0 and agreed == -negative_max
+        cut = req._hybrid_split_at = agreed if accepted else 0
+        if accepted:
+            reason = "selected"
+        elif selected:
+            reason = "tp_cut_disagreement"
+        else:
+            reason = "no_legal_cut"
+        req._hybrid_split_match_reason = reason
     if cut:
         req.full_untruncated_fill_ids = req.full_untruncated_fill_ids[:cut]
 
@@ -273,24 +329,33 @@ def set_metadata(original, buffers, req):
 
 def commit(queue, dr, *, keep_receiver):
     receiver = dr.kv_receiver
-    offered = getattr(receiver, "_hybrid_split_offer", 0)
-    if not offered or keep_receiver:
+    offered = getattr(receiver, "_hybrid_split_min_cut", 0)
+    if not offered:
         return False
     req = dr.req
+    if keep_receiver:
+        release_reservation(req)
+        return False
     idx = dr.metadata_buffer_index
     cut = int(queue.metadata_buffers.output_ids[idx, CUT_SLOT].item())
     controller = queue.scheduler._pre_layerwise
-    split, ordinary = controller.agree([int(cut == offered), int(cut == 0)])
+    length = len(req.origin_input_ids)
+    split, ordinary, agreed, negative_max = controller.agree(
+        [int(offered <= cut <= length - MIN_SUFFIX_TOKENS), int(cut == 0), cut, -cut]
+    )
     if ordinary:
+        release_reservation(req)
         return False
     room = int(queue.metadata_buffers.bootstrap_room[idx, 0].item())
-    length = len(req.origin_input_ids)
     valid = (
         split
+        and agreed == -negative_max
         and room == req.bootstrap_room
         and req.kv.holds_kv
-        and req.kv.holds_mamba
-        and req.kv.mamba_cow_src_index is None
+        and (
+            not getattr(controller, "hybrid_gdn", False)
+            or (req.kv.holds_mamba and req.kv.mamba_cow_src_index is None)
+        )
         and req.kv.kv_allocated_len == length
         and not req.kv.cache_protected_len
     )
@@ -299,6 +364,7 @@ def commit(queue, dr, *, keep_receiver):
     if not controller.agree([int(valid)])[0]:
         from sglang.srt.disaggregation.utils import prepare_abort
 
+        release_reservation(req)
         prepare_abort(
             req,
             "Invalid hybrid split-prefill transfer",
@@ -324,32 +390,38 @@ def next_batch(original, scheduler, running_batch):
         return original(scheduler, running_batch)
 
     last = scheduler.last_batch
-    if getattr(last, "_hybrid_split_extend", False):
+    last_was_split = getattr(last, "_hybrid_split_extend", False)
+    chunked = scheduler.chunked_req
+    if chunked is not None:
+        if chunked.inflight_steps:
+            # The overlap loop consumes the suffix result after submitting
+            # the independent decode batch on the native forward stream.
+            return original(scheduler, running_batch)
+        scheduler.process_pending_chunked_abort()
+        scheduler.chunked_req = None
+        if not chunked.finished():
+            chunked.prefix_len = chunked.kv.kv_committed_len
+            scheduler.waiting_queue.prepend([chunked])
+        if last_was_split:
+            last._hybrid_split_extend = False
+            if not running_batch.is_empty():
+                return original(scheduler, running_batch)
+    elif last_was_split:
         # A promoted batch may become running_batch itself. Consume the
         # marker before native Decode reuses that object on subsequent ticks.
         last._hybrid_split_extend = False
         if last is not running_batch and last.forward_mode.is_extend():
-            if last.chunked_req is not None:
-                # Serial processing or the early overlap result hook has drained
-                # this forward. It is now safe to reuse or release its KV/state.
-                req = last.chunked_req
-                scheduler.process_pending_chunked_abort()
-                scheduler.chunked_req = None
-                if not req.finished():
-                    req.prefix_len = req.kv.kv_committed_len
-                    scheduler.waiting_queue.prepend([req])
-                if not running_batch.is_empty():
-                    return original(scheduler, running_batch)
-            else:
-                last.filter_batch()
-                if not last.is_empty():
-                    scheduler.prefill_launched_reqs.leave(last.reqs)
-                    scheduler.running_reqs.join(last.reqs)
-                    if running_batch.is_empty():
-                        running_batch = last
-                    else:
-                        running_batch.merge_batch(last)
-                return original(scheduler, running_batch)
+            for req in last.reqs:
+                release_reservation(req)
+            last.filter_batch()
+            if not last.is_empty():
+                scheduler.prefill_launched_reqs.leave(last.reqs)
+                scheduler.running_reqs.join(last.reqs)
+                if running_batch.is_empty():
+                    running_batch = last
+                else:
+                    running_batch.merge_batch(last)
+            return original(scheduler, running_batch)
 
     req = next(
         (r for r in scheduler.waiting_queue if r.kv.reserved_prefill_suffix),
@@ -388,7 +460,7 @@ def next_batch(original, scheduler, running_batch):
     set_schedule_time_batch(batch)
     if first_chunk:
         logger.info(
-            "[handoff-split] hybrid PD rid=%s cut=%s suffix=%s path=eager",
+            "[handoff-split] hybrid PD rid=%s cut=%s suffix=%s",
             req.rid,
             req.prefix_len,
             prompt_len - req.prefix_len,
@@ -396,7 +468,7 @@ def next_batch(original, scheduler, running_batch):
     if controller.rank == 0:
         logger.info(
             "[handoff-split-chunk] hybrid PD rid=%s prefix=%s suffix_chunk=%s end=%s "
-            "remaining=%s path=eager",
+            "remaining=%s",
             req.rid,
             req.prefix_len,
             req.extend_len,
@@ -409,6 +481,10 @@ def next_batch(original, scheduler, running_batch):
 def prebuilt(original, scheduler, running_batch):
     if not getattr(getattr(scheduler, "_pre_layerwise", None), "split_prefill", False):
         return original(scheduler, running_batch)
+    if scheduler.chunked_req is not None:
+        # Native PREBUILT admission requires chunked_req to be clear. While
+        # the previous chunk is in flight, only the running decode batch runs.
+        return None
     # Native prebuilt admission assumes a sampled token. Keep split requests on
     # the real waiting list for abort/accounting, but exclude them from PREBUILT.
     pending = scheduler.waiting_queue.take(lambda req: req.kv.reserved_prefill_suffix)

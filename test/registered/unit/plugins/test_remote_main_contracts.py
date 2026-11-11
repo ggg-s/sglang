@@ -2,8 +2,10 @@
 
 import ast
 import inspect
+import os
 import sys
 import unittest
+from contextlib import ExitStack
 from pathlib import Path
 from types import SimpleNamespace as NS
 from unittest.mock import Mock, patch
@@ -22,6 +24,41 @@ with patch.object(sys, "path", [str(ROOT / "plugins/remote_attn"), *sys.path]):
 
 
 class TestRemoteMainContracts(CustomTestCase):
+    def test_split_suffix_uses_native_breakable_prefill_eligibility(self):
+        from sglang.srt.model_executor import cuda_graph_config
+        from sglang.srt.runtime_context import get_forward
+
+        def launch(original, scheduler, batch):
+            return original(scheduler, batch)
+
+        controller = NS(decode_overlap=NS(run_batch=launch))
+        scheduler = NS(_pre_layerwise=controller)
+        batch = NS(_hybrid_split_extend=True, forward_mode=NS(is_extend=lambda: True))
+        for backend, expected in (
+            ("disabled", False),
+            ("full", False),
+            ("breakable", True),
+        ):
+            with self.subTest(backend=backend):
+                config = NS(prefill=NS(backend=backend))
+                with (
+                    patch.object(
+                        cuda_graph_config,
+                        "get_exec",
+                        return_value=NS(graph=NS(cuda_graph_config=config)),
+                    ),
+                    patch.object(hooks, "_graph_decision", return_value=True),
+                ):
+                    self.assertEqual(
+                        hooks.pre_layerwise.run_batch(
+                            lambda *_: hooks._prefill_graph(None, None, NS()),
+                            scheduler,
+                            batch,
+                        ),
+                        expected,
+                    )
+                self.assertFalse(get_forward().force_eager_prefill)
+
     def test_every_native_decode_backend_access_is_implemented(self):
         source = (
             ROOT / "python/sglang/srt/model_executor/runner/decode_cuda_graph_runner.py"
@@ -856,13 +893,15 @@ class TestQwenHybridD2D(CustomTestCase):
             def merge_batch(self, other):
                 self.reqs = self.reqs + other.reqs
 
-        req = object()
+        controller = NS(split_prefill=True, split_prefill_outstanding=1)
+        req = NS(_hybrid_split_reservation=controller)
         suffix = Batch([req], ForwardMode.EXTEND)
         suffix._hybrid_split_extend = True
         promoted = []
         scheduler = NS(
-            _pre_layerwise=NS(split_prefill=True),
+            _pre_layerwise=controller,
             last_batch=suffix,
+            chunked_req=None,
             waiting_queue=[],
             prefill_launched_reqs=NS(leave=lambda _: None),
             running_reqs=NS(join=promoted.extend),
@@ -878,6 +917,7 @@ class TestQwenHybridD2D(CustomTestCase):
             scheduler.last_batch = running_batch
         self.assertEqual(running_batch.reqs, [req])
         self.assertEqual(promoted, [req])
+        self.assertEqual(controller.split_prefill_outstanding, 0)
 
     def test_native_text_batch_accepts_none_multimodal_placeholders(self):
         from sglang_remote_attn.qwen_hybrid import Controller
@@ -1178,6 +1218,414 @@ class TestQwenHybridD2D(CustomTestCase):
         self.assertFalse(f.target.d2d_reservations[f.epoch].consumed)
         self.assertNotIn(f.epoch, f.target.d2d_targets)
         self.assertLess(allocated, before)
+
+
+class TestSplitPD(CustomTestCase):
+    """The bootstrap bound and matched prefix must constrain one TP-agreed cut."""
+
+    @classmethod
+    def setUpClass(cls):
+        super().setUpClass()
+        with patch.object(
+            sys, "path", [str(ROOT / "test/manual/remote_attn"), *sys.path]
+        ):
+            from dsv41_remote_probe_support import definitions
+
+        cls.Kv = definitions(
+            ROOT, "python/sglang/srt/managers/schedule_batch.py", owner="ReqKvInfo"
+        )
+
+    def setUp(self):
+        self.stack = ExitStack()
+        self.addCleanup(self.stack.close)
+        from sglang_remote_attn import pd_mesh, pre_layerwise, qwen_split_prefill
+
+        self.split, self.mesh, self.pl = qwen_split_prefill, pd_mesh, pre_layerwise
+        self.sender_type = type("MooncakeKVSender", (), {})
+        self.receiver_type = type("MooncakeKVReceiver", (), {})
+        self.stack.enter_context(
+            patch.dict(
+                sys.modules,
+                {
+                    "sglang.srt.disaggregation.mooncake.conn": NS(
+                        MooncakeKVSender=self.sender_type,
+                        MooncakeKVReceiver=self.receiver_type,
+                    ),
+                    "sglang.srt.runtime_context": NS(
+                        get_disagg=lambda: NS(
+                            disaggregation_decode_allocation_policy="early",
+                            disaggregation_decode_host_receive_threshold=1,
+                            disaggregation_decode_enable_offload_kvcache=False,
+                        )
+                    ),
+                },
+            )
+        )
+        self.stack.enter_context(patch.dict(os.environ, {}, clear=True))
+
+    def controller(self, role="prefill", *, hybrid=False):
+        scheduler = NS(
+            disaggregation_mode=NS(value=role),
+            max_prefill_tokens=4096,
+            max_running_requests=16,
+            running_batch=NS(batch_size=lambda: 0),
+            req_to_token_pool=NS(req_to_token=torch.zeros((1, 1))),
+        )
+        controller = NS(
+            scheduler=scheduler,
+            config=NS(mode="remote"),
+            rank=0,
+            tp_size=1,
+            hybrid_gdn=hybrid,
+            agree=lambda flags: flags,
+            pd_visibility=NS(receive=lambda: None),
+        )
+        scheduler._pre_layerwise = controller
+        self.split.configure(controller)
+        return controller
+
+    def request(self, *, prefix=0):
+        return NS(
+            rid="split",
+            bootstrap_room=7,
+            origin_input_ids=list(range(32768)),
+            output_ids=[],
+            kv=self.Kv(cache_protected_len=prefix),
+            prefix_len=prefix,
+            start_send_idx=0,
+            is_retracted=False,
+            retracted_stain=False,
+            return_logprob=False,
+            return_hidden_states_mode=NS(need_capture=lambda: False),
+            return_sampling_mask=False,
+            return_routed_experts=False,
+            return_indexer_topk=False,
+            grammar=None,
+            beam_group=None,
+            custom_logit_processor=None,
+            session=None,
+            multimodal_inputs=None,
+            input_embeds=None,
+            positional_embed_overrides=None,
+            sampling_params=NS(max_new_tokens=16),
+        )
+
+    def offer(self, d):
+        dr = NS(
+            req=self.request(), kv_receiver=self.receiver_type(), is_rebootstrap=False
+        )
+        self.split.advertise(NS(scheduler=d.scheduler), dr, 0)
+        return dr
+
+    def bootstrap(self, *, prefix=0, hybrid=False):
+        p, d = self.controller(hybrid=hybrid), self.controller("decode", hybrid=hybrid)
+        req = self.request(prefix=prefix)
+        dr = self.offer(d)
+        receiver = dr.kv_receiver
+        receiver.kv_mgr = NS()
+        frames = self.mesh.bootstrap(
+            lambda _, **kwargs: kwargs["message"],
+            receiver,
+            bootstrap_info={"is_dummy": False},
+            message=[b""] * 10,
+            operation="send_metadata",
+        )
+        peer = self.mesh.parse_transfer(lambda **_: NS(), msg=frames)
+        peer.is_dummy = False
+        peer.mooncake_session_id = "decode"
+        peer.dst_kv_indices = list(range(32768))
+        sender = self.sender_type()
+        sender.kv_mgr = NS(
+            transfer_infos={7: {"decode": peer}},
+            decode_kv_args_table={
+                "decode": NS(requires_dcp_relayout=False, dst_attn_tp_size=1)
+            },
+        )
+        sender.curr_idx = 0
+        req.disagg_kv_sender = sender
+        self.split.create_sender(lambda *_: True, NS(scheduler=p.scheduler), req, 8)
+        self.split.finalize_bootstrap(lambda *_: True, None, req)
+        return p, d, req, dr
+
+    @staticmethod
+    def match(req, *_):
+        req.full_untruncated_fill_ids = list(req.origin_input_ids)
+
+    def test_default_cut_moves_past_real_cache_match_for_dense_and_hybrid(self):
+        """A warm match above 85% previously disabled split instead of moving cut."""
+        for hybrid in (False, True):
+            for prefix, expected in ((0, 27852), (26214, 27852), (29491, 30474)):
+                with self.subTest(hybrid=hybrid, prefix=prefix):
+                    p, d, req, dr = self.bootstrap(prefix=prefix, hybrid=hybrid)
+                    self.assertTrue(p.split_prefill)
+                    self.assertEqual(d.split_prefill_chunk_size, 4096)
+                    self.assertFalse(
+                        self.split.can_prefill_before_bootstrap(
+                            lambda *_: True, None, req
+                        )
+                    )
+                    self.split.init_input(self.match, req, object())
+                    self.assertEqual(req._hybrid_split_at, expected)
+                    self.assertEqual(len(req.full_untruncated_fill_ids), expected)
+                    self.assertGreater(expected, req.kv.cache_protected_len)
+                    self.assertGreaterEqual(
+                        expected, dr.kv_receiver._hybrid_split_min_cut
+                    )
+
+    def test_small_suffix_and_tp_cut_disagreement_use_full_native_input(self):
+        for prefix, disagreement in ((30500, False), (32000, False), (0, True)):
+            with self.subTest(prefix=prefix, disagreement=disagreement):
+                p, _, req, _ = self.bootstrap(prefix=prefix)
+                if disagreement:
+                    p.agree = lambda flags: [flags[0], -flags[0] - 1]
+                self.split.init_input(self.match, req, object())
+                self.assertEqual(req._hybrid_split_at, 0)
+                self.assertEqual(req.full_untruncated_fill_ids, req.origin_input_ids)
+
+    def test_split_opt_out_and_prefill_cut_override(self):
+        with patch.dict(os.environ, {"HANDOFF_HYBRID_SPLIT_PREFILL": "0"}):
+            self.assertFalse(self.controller().split_prefill)
+            self.assertFalse(self.controller("decode").split_prefill)
+        with patch.dict(os.environ, {"HANDOFF_HYBRID_SPLIT_PREFILL_CUT_RATIO": "0.75"}):
+            _, _, req, _ = self.bootstrap()
+            self.split.init_input(self.match, req, object())
+            self.assertEqual(req._hybrid_split_at, 24576)
+
+    def test_probe_and_admission_retry_preserve_native_matching_order(self):
+        _, _, req, _ = self.bootstrap()
+        cache = object()
+        self.split.init_input(self.match, req, cache, cow_mamba=False)
+        self.assertEqual(len(req.full_untruncated_fill_ids), 32768)
+        self.assertFalse(hasattr(req, "_hybrid_split_at"))
+        self.split.init_input(self.match, req, cache)
+        self.assertEqual(req._hybrid_split_at, 27852)
+        req.prefix_len = req.kv.cache_protected_len = 29491
+        self.split.init_input(self.match, req, cache)
+        self.assertEqual(req._hybrid_split_at, 30474)
+        req.kv.req_pool_idx = 0
+        req.prefix_len = req.kv.cache_protected_len = 30000
+        self.split.init_input(self.match, req, cache)
+        self.assertEqual(req._hybrid_split_at, 30474)
+
+    def test_decode_offers_reserve_capacity_before_transfer(self):
+        d = self.controller("decode")
+        active = [self.offer(d) for _ in range(4)]
+        self.split.advertise(NS(scheduler=d.scheduler), active[0], 0)
+        self.assertTrue(all(dr.kv_receiver._hybrid_split_min_cut for dr in active))
+        self.assertEqual(d.split_prefill_outstanding, 4)
+        self.assertFalse(hasattr(self.offer(d).kv_receiver, "_hybrid_split_min_cut"))
+        req = active[0].req
+        req.kv.req_pool_idx = 0
+        req.kv.set_row_len(32768)
+        with (
+            patch.object(self.pl, "defer_release", return_value=False),
+            patch.object(
+                hooks, "_runtime", return_value=NS(stop_target_receivers=lambda _: None)
+            ),
+        ):
+            hooks._release_kv(lambda *_, **__: None, req, None, checkpoint=False)
+        self.split.release_reservation(req)
+        self.assertEqual(d.split_prefill_outstanding, 3)
+        self.assertTrue(self.offer(d).kv_receiver._hybrid_split_min_cut)
+
+    def test_decode_capacity_and_tp_rejection_do_not_create_reservations(self):
+        d = self.controller("decode")
+        d.scheduler.running_batch.batch_size = lambda: d.scheduler.max_running_requests
+        self.assertFalse(hasattr(self.offer(d).kv_receiver, "_hybrid_split_min_cut"))
+        d.scheduler.running_batch.batch_size = lambda: 0
+        d.agree = lambda _: [0]
+        self.assertFalse(hasattr(self.offer(d).kv_receiver, "_hybrid_split_min_cut"))
+        self.assertEqual(d.split_prefill_outstanding, 0)
+
+    def test_inflight_suffix_chunk_allows_decode_before_result_processing(self):
+        from sglang_remote_attn import decode_overlap
+
+        class Waiting(list):
+            def prepend(self, reqs):
+                self[:0] = reqs
+
+        req = self.request()
+        req.inflight_steps = 1
+        req.kv.kv_committed_len = 30000
+        req.kv.reserved_prefill_suffix = True
+        req.finished = lambda: False
+        running = NS(is_empty=lambda: False, batch_size=lambda: 4)
+        suffix = NS(
+            _hybrid_split_extend=True,
+            forward_mode=NS(is_extend=lambda: True),
+            chunked_req=req,
+        )
+        abort_checks = []
+        scheduler = NS(
+            _pre_layerwise=NS(split_prefill=True),
+            last_batch=suffix,
+            chunked_req=req,
+            running_batch=running,
+            max_running_requests=4,
+            waiting_queue=Waiting(),
+            process_pending_chunked_abort=lambda: abort_checks.append(req),
+        )
+        self.assertFalse(
+            decode_overlap.process_last_batch_early(lambda *_: False, scheduler, suffix)
+        )
+        self.assertTrue(
+            decode_overlap.process_last_batch_early(lambda *_: True, scheduler, suffix)
+        )
+        self.assertIsNone(
+            self.split.prebuilt(
+                lambda *_: self.fail("prebuilt admission"), scheduler, running
+            )
+        )
+
+        self.assertIs(
+            self.split.next_batch(lambda _, batch: batch, scheduler, running), running
+        )
+        self.assertIs(scheduler.chunked_req, req)
+        self.assertEqual(scheduler.waiting_queue, [])
+        self.assertEqual(abort_checks, [])
+
+        # The overlap loop consumed the suffix result after launching decode.
+        scheduler.last_batch = running
+        req.inflight_steps = 0
+        self.split.next_batch(lambda _, batch: batch, scheduler, running)
+        self.assertIsNone(scheduler.chunked_req)
+        self.assertEqual(scheduler.waiting_queue, [req])
+        self.assertEqual(req.prefix_len, 30000)
+        self.assertEqual(abort_checks, [req])
+
+        suffix.chunked_req = None
+        self.assertTrue(
+            decode_overlap.process_last_batch_early(lambda *_: False, scheduler, suffix)
+        )
+
+    def test_v1_and_malformed_offers_cannot_be_interpreted_as_v2_bounds(self):
+        for extension in (
+            b"REMOTE_ATTN_HYBRID_SPLIT_V1:16384",
+            self.split.WIRE + b"-1",
+            self.split.WIRE + b"99999999999",
+        ):
+            with self.subTest(extension=extension):
+                peer = self.mesh.parse_transfer(
+                    lambda **_: NS(), msg=[b""] * 10 + [extension]
+                )
+                self.assertFalse(hasattr(peer, "_hybrid_split_min_cut"))
+
+    def commit_fixture(self, cut, *, hybrid=False, room=7):
+        _, d, _, dr = self.bootstrap(hybrid=hybrid)
+        dr.metadata_buffer_index = 0
+        dr.req.kv.req_pool_idx = 0
+        dr.req.kv.set_row_len(32768)
+        if hybrid:
+            dr.req.kv.mamba_pool_idx = torch.tensor([0])
+        dr.req.time_stats = NS(set_wait_queue_entry_time=lambda: None)
+        buffers = NS(
+            output_ids=torch.tensor([[0, cut]], dtype=torch.int64),
+            bootstrap_room=torch.tensor([[room]]),
+            cached_tokens=torch.zeros((1, 2), dtype=torch.int64),
+        )
+        dr.kv_receiver.clear = lambda: None
+        return d, NS(scheduler=d.scheduler, metadata_buffers=buffers), dr
+
+    def test_dynamic_cut_commit_keeps_full_reservation_and_native_state(self):
+        for hybrid in (False, True):
+            with self.subTest(hybrid=hybrid):
+                d, queue, dr = self.commit_fixture(30474, hybrid=hybrid)
+                self.assertTrue(self.split.commit(queue, dr, keep_receiver=False))
+                self.assertEqual(dr.req.kv.kv_committed_len, 30474)
+                self.assertEqual(dr.req.kv.kv_allocated_len, 32768)
+                self.assertTrue(dr.req.kv.reserved_prefill_suffix)
+                self.assertEqual(dr.req.prefix_len, 30474)
+                self.assertIsNone(dr.kv_receiver)
+                self.assertEqual(d.split_prefill_outstanding, 1)
+
+    def test_invalid_transfer_or_tp_cut_mismatch_aborts_before_continuation(self):
+        for cut, room, mismatch, missing_state in (
+            (16000, 7, False, False),
+            (32000, 7, False, False),
+            (27852, 8, False, False),
+            (27852, 7, True, False),
+            (27852, 7, False, True),
+        ):
+            with self.subTest(
+                cut=cut, room=room, mismatch=mismatch, state=missing_state
+            ):
+                d, queue, dr = self.commit_fixture(cut, hybrid=True, room=room)
+                if mismatch:
+                    d.agree = lambda flags: (
+                        [flags[0], flags[1], flags[2], -flags[2] - 1]
+                        if len(flags) == 4
+                        else flags
+                    )
+                if missing_state:
+                    dr.req.kv.mamba_pool_idx = None
+                aborted = []
+                with patch.dict(
+                    sys.modules,
+                    {
+                        "sglang.srt.disaggregation.utils": NS(
+                            prepare_abort=lambda *args, aborted=aborted, **kwargs: (
+                                aborted.append(args[0])
+                            )
+                        )
+                    },
+                ):
+                    self.assertTrue(self.split.commit(queue, dr, keep_receiver=False))
+                self.assertEqual(aborted, [dr.req])
+                self.assertFalse(dr.req.kv.reserved_prefill_suffix)
+                self.assertEqual(dr.req.kv.kv_committed_len, 32768)
+                self.assertEqual(d.split_prefill_outstanding, 0)
+
+    def test_native_completion_clears_reused_cut_metadata(self):
+        d, queue, dr = self.commit_fixture(0)
+        receiver = dr.kv_receiver
+        self.assertFalse(self.split.commit(queue, dr, keep_receiver=False))
+        self.assertIs(dr.kv_receiver, receiver)
+        self.assertEqual(d.split_prefill_outstanding, 0)
+        req = self.request()
+        req.metadata_buffer_index = 0
+        buffers = NS(output_ids=torch.tensor([[0, 27852]]), _hybrid_split_used=True)
+        self.split.set_metadata(lambda *_: None, buffers, req)
+        self.assertEqual(buffers.output_ids[0, self.split.CUT_SLOT].item(), 0)
+
+    def test_pd_remote_requires_opt_in_while_native_pd_remains_available(self):
+        runtime = NS(_tp_rank=lambda _: 0, _tp_size=lambda _: 1)
+        scheduler = NS(
+            tp_worker=NS(model_runner=NS(model_config=NS(num_hidden_layers=2)))
+        )
+        with patch.object(self.pl, "_runtime", return_value=runtime):
+            controller = self.pl.Controller(scheduler, NS(mode="remote"))
+            self.assertFalse(controller.pd_remote)
+            scheduler._pre_layerwise = controller
+            native = object()
+            self.assertIs(
+                self.pl.pop_transferred(lambda *_: native, NS(scheduler=scheduler)),
+                native,
+            )
+            self.assertIs(
+                prefix_stream.cached_prefix(lambda *_, **__: native, scheduler, NS()),
+                native,
+            )
+            controller.prepare = lambda _: self.fail("experimental PD prepare")
+            controller.cache_guard = object()
+            prefix_sends = []
+            scheduler.maybe_send_cached_prefix_chunk = (
+                lambda req, allow_send=True: prefix_sends.append((req, allow_send))
+            )
+            batch = NS(reqs=[NS()])
+
+            def native_run(s, b):
+                s.maybe_send_cached_prefix_chunk(b.reqs[0], allow_send=False)
+                return native
+
+            self.assertIs(self.pl.run_batch(native_run, scheduler, batch), native)
+            self.assertEqual(prefix_sends, [(batch.reqs[0], False)])
+            with patch.dict(os.environ, {"HANDOFF_EXPERIMENTAL_PD_REMOTE": "1"}):
+                self.assertTrue(
+                    self.pl.Controller(scheduler, NS(mode="remote")).pd_remote
+                )
+            self.assertTrue(
+                self.pl.Controller(scheduler, NS(mode="layerwise")).pd_remote
+            )
 
 
 if __name__ == "__main__":

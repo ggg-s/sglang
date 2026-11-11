@@ -37,6 +37,7 @@ class Environment(HybridEnvironment):
         self.pm.get_session_id = self.pm.engine.get_session_id
         self.dm.get_session_id = self.dm.engine.get_session_id
         for c in (p, d):
+            c.pd_remote = True  # This probe exercises the experimental PD path.
             c.schema_signature = c._schema(d2d.manager(c))
             c.cache_guard = None
             c.plan = None

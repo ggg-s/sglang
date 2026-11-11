@@ -237,6 +237,9 @@ class TestRemoteAttn(CustomTestCase):
     def setUpClass(cls):
         super().setUpClass()
         cls.stack = ExitStack()
+        cls.stack.enter_context(
+            patch.dict(os.environ, {"HANDOFF_EXPERIMENTAL_PD_REMOTE": "1"})
+        )
         cls.stack.enter_context(patch.dict(sys.modules, {}))
         spec = importlib.util.spec_from_file_location(
             "sglang_remote_attn",
@@ -8234,6 +8237,8 @@ class TestRemoteAttn(CustomTestCase):
                 finished=lambda: False,
             )
             owner, target, freed = self._overlap_target(directory, req)
+            owner.split_prefill_outstanding = 1
+            req._hybrid_split_reservation = owner
             target.queue.queue = [target.decode_req]
             outputs = []
             owner.scheduler.output_streamer = SimpleNamespace(
@@ -8263,6 +8268,7 @@ class TestRemoteAttn(CustomTestCase):
             self.assertIs(target.decode_req.kv_receiver, receiver)
             self.assertEqual(target.queue.queue, [])
             self.assertEqual(req.finished_reason[1], 503)
+            self.assertEqual(owner.split_prefill_outstanding, 0)
             self.assertEqual(len(outputs), 1)
             self.assertTrue(hold_release(req, lambda: freed.append("unsafe")))
             self.assertEqual(freed, [])
@@ -11919,14 +11925,37 @@ class TestRemoteAttn(CustomTestCase):
         spec.loader.exec_module(module)
         return module
 
-    def test_dsv41_remote_does_not_enable_qwen_prefill_overlap(self):
-        f = self._dsv41_fixture()
-        f.runner.model_config.hf_config.model_type = "qwen3"
+    def test_dense_prefill_overlap_requires_native_split(self):
+        pool_type = type("MHATokenToKVPool", (), {})
+        pool = pool_type()
+        pool.kv_cache_layout = "nhd"
+        pool.dtype = torch.bfloat16
+        model_type = type("Qwen3ForCausalLM", (), {"forward_split_prefill": Mock()})
+        runner = SimpleNamespace(
+            model=model_type(),
+            model_config=SimpleNamespace(
+                num_hidden_layers=2, hf_config=SimpleNamespace(model_type="qwen3")
+            ),
+            lora_manager=None,
+        )
+        scheduler = SimpleNamespace(
+            tp_worker=SimpleNamespace(model_runner=runner),
+            token_to_kv_pool_allocator=SimpleNamespace(get_kvcache=lambda: pool),
+            disaggregation_mode=SimpleNamespace(value="prefill"),
+            enable_overlap=True,
+            kv_checksum_computer=None,
+            tree_cache=SimpleNamespace(disable=True),
+            invariant_checker=SimpleNamespace(),
+        )
         schedule = SimpleNamespace(
             disable_overlap_schedule=False, enable_mixed_chunk=False, page_size=1
         )
         disagg = SimpleNamespace(
-            disaggregation_mode="prefill", enable_pd_role_switch=False
+            disaggregation_mode="prefill",
+            enable_pd_role_switch=False,
+            disaggregation_decode_allocation_policy="early",
+            disaggregation_decode_host_receive_threshold=1,
+            disaggregation_decode_enable_offload_kvcache=False,
         )
         context = SimpleNamespace(
             get_parallel=lambda: SimpleNamespace(
@@ -11935,12 +11964,18 @@ class TestRemoteAttn(CustomTestCase):
                 attn_cp_size=1,
                 dcp_enabled=False,
                 attn_dp_enabled=False,
+                tp_rank=0,
+                tp_size=1,
             ),
-            get_memory=f.context.get_memory,
+            get_memory=lambda: SimpleNamespace(
+                disable_radix_cache=True,
+                enable_unified_memory=False,
+                enable_hierarchical_cache=False,
+            ),
             get_device=lambda: SimpleNamespace(device="cuda"),
             get_schedule=lambda: schedule,
             get_disagg=lambda: disagg,
-            get_spec=f.context.get_spec,
+            get_spec=lambda: SimpleNamespace(speculative_algorithm=None),
             get_exec=lambda: SimpleNamespace(
                 overlap=SimpleNamespace(enable_two_batch_overlap=False)
             ),
@@ -11951,18 +11986,45 @@ class TestRemoteAttn(CustomTestCase):
                 HookRegistry=SimpleNamespace(_patched=set(self.hooks.HOOKS))
             ),
             "sglang.srt.mem_cache.memory_pool": SimpleNamespace(
-                MHATokenToKVPool=object
+                MHATokenToKVPool=pool_type
             ),
             "mooncake.engine": SimpleNamespace(
                 TransferEngine=SimpleNamespace(send_probe=lambda: 0)
             ),
         }
         with (
+            tempfile.TemporaryDirectory() as root,
             patch.dict(sys.modules, modules),
-            patch.dict(os.environ, {"HANDOFF_PRE_LAYERWISE": "remote"}),
+            patch.dict(
+                os.environ,
+                {"HANDOFF_PRE_LAYERWISE": "remote", "HANDOFF_PD_DIR": root},
+                clear=True,
+            ),
+            patch.object(self.hooks.pre_layerwise.Controller, "validate_graphs"),
+            patch.object(self.hooks._runtime(), "get_remote_hub") as hub,
         ):
-            with self.assertRaisesRegex(RuntimeError, "P overlap is supported only"):
-                self.hooks._scheduler_init(lambda *a, **kw: None, f.scheduler)
+            for env in (
+                {"HANDOFF_EXPERIMENTAL_PD_REMOTE": "1"},
+                {"HANDOFF_HYBRID_SPLIT_PREFILL": "0"},
+                {"HANDOFF_PRE_LAYERWISE": "layerwise"},
+            ):
+                with (
+                    self.subTest(env=env),
+                    patch.dict(os.environ, env),
+                    self.assertRaisesRegex(
+                        RuntimeError, "Dense MHA P overlap requires split prefill"
+                    ),
+                ):
+                    self.hooks._scheduler_init(lambda _: None, scheduler)
+            hub.assert_not_called()
+
+            self.hooks._scheduler_init(lambda _: None, scheduler)
+            controller = scheduler._pre_layerwise
+            self.assertTrue(controller.split_prefill)
+            self.assertFalse(controller.pd_remote)
+            self.assertIsNone(controller.prefill_overlap)
+            self.assertTrue(scheduler.enable_overlap)
+            hub.assert_called_once_with(scheduler)
 
     def test_dsv41_remote_startup_preserves_overlap_and_binds_only_native_backend(self):
         f = self._dsv41_fixture()

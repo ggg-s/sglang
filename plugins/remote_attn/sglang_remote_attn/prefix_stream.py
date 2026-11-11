@@ -483,6 +483,8 @@ def before_mutation(scheduler, req):
 
 def cached_prefix(original, scheduler, req, allow_send=True):
     controller = getattr(scheduler, "_pre_layerwise", None)
+    if controller is not None and not getattr(controller, "pd_remote", True):
+        return original(scheduler, req, allow_send=allow_send)
     if getattr(controller, "hybrid_gdn", False):
         if allow_send:
             from .qwen_hybrid_pd import prepare
