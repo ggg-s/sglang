@@ -31,7 +31,8 @@ N3 比较每请求的 `freeze_ack_latency_ms`、`handoff_latency_ms`、D 首 tok
 - frame.entry/start/count、available_pages、applied_pages_before 均以该 entry 的 native pool page 为单位；available_pages_by_rank 保留各 rank 值，available_pages 是其最小值。
 - reservation_upper_pages 是预留上界，不是可复制范围。
 - page_bytes_by_rank 是 schema 的每页 payload 字节。
-- payload_bytes_by_rank = count × page_bytes；payload_bytes_tp_sum 是所有 TP shard 的和。这是帧计划 payload，不是每个阶段都实际发送一次。
+- RDMA 多 entry 帧用 frame.segments 列出每个 entry/start/count。其 payload_bytes_by_rank 是对应 shard 各段的 count × page_bytes 之和，单 entry 的页级标量只在单 entry 帧上记录。
+- payload_bytes_tp_sum 是所有 TP shard 的计划 payload 之和，每帧只传一次。
 - COPY 成功回包的 copied_payload_bytes_by_rank 是本次新发送并确认完成的 payload；copy_replayed_by_rank=true 时为 0，proof 仍保留原字节数。
 - precopy_bytes / applied_bytes_tp_sum_after 是已 APPLY receipt 的跨 TP payload 总和，不能作为单 shard 字节或预留容量。
 

@@ -212,11 +212,13 @@ class DsvGateway:
         disable_precopy=False,
         decode_workers=None,
         precopy_window_ms=0,
+        packed_precopy=False,
     ):
         self.driver, self.tokenizer = driver, tokenizer
         self.decode_workers = decode_workers or {}
         self.control_workers = tuple(self.decode_workers or ("src", "dst"))
         self.precopy_window_s = precopy_window_ms / 1000
+        self.packed_precopy = packed_precopy
         if precopy_window_ms < 0:
             raise ValueError("precopy window must be nonnegative")
         self.prefill_url, self.bootstrap_host = prefill_url, bootstrap_host
@@ -1044,6 +1046,7 @@ class DsvGateway:
             precopy_pending=None,
             precopy_capacity=None,
             precopy_backend=None,
+            precopy_packed=False,
             precopy_receipts=None,
             precopy_bytes=0,
             precopy_pages=None,
@@ -1196,19 +1199,25 @@ class DsvGateway:
             frame = trace["frame"]
             if frame is not None:
                 plans = entry["plans"]
-                index = frame["entry"]
-                trace["page_bytes_by_rank"] = [
-                    p["schema"]["entries"][index][-1] for p in plans
-                ]
+                parts = frame.get("segments", [frame])
                 trace["payload_bytes_by_rank"] = [
-                    frame["count"] * n for n in trace["page_bytes_by_rank"]
+                    sum(
+                        part["count"] * p["schema"]["entries"][part["entry"]][-1]
+                        for part in parts
+                    )
+                    for p in plans
                 ]
                 trace["payload_bytes_tp_sum"] = sum(trace["payload_bytes_by_rank"])
                 trace["page_unit"] = "native_pool_page"
-                trace["applied_pages_before"] = (
-                    entry.get("precopy_pages")
-                    or [0] * len(plans[0]["schema"]["entries"])
-                )[index]
+                if "entry" in frame:
+                    index = frame["entry"]
+                    trace["page_bytes_by_rank"] = [
+                        p["schema"]["entries"][index][-1] for p in plans
+                    ]
+                    trace["applied_pages_before"] = (
+                        entry.get("precopy_pages")
+                        or [0] * len(plans[0]["schema"]["entries"])
+                    )[index]
                 trace["applied_bytes_tp_sum_after"] = current.get("precopy_bytes", 0)
                 key = (epoch, frame["chunk"])
                 if current["phase"] == "WAIT_CUT" and current.get("precopy_pending"):
@@ -1228,6 +1237,7 @@ class DsvGateway:
         pending = entry.get("precopy_pending")
         capacity = entry.get("precopy_capacity")
         backend = entry.get("precopy_backend")
+        packed = entry.get("precopy_packed", False)
         if pending is None:
             if cut_due:
                 self._update_after_precopy(entry, cut_due)
@@ -1246,11 +1256,11 @@ class DsvGateway:
             # size with the first durable PREPARE, including across retries.
             if capacity is None and entry.get("precopy_receipts"):
                 capacity = 4 * 1024 * 1024
-            schema = entry["plans"][0]["schema"]
-            upper_pages = entry["plans"][0]["upper"] // schema["page_size"]
+            plans = entry["plans"]
+            schema = plans[0]["schema"]
+            upper_pages = plans[0]["upper"] // schema["page_size"]
+            strides = [e[-1] for e in schema["entries"]]
             if capacity is None:
-                max_bytes = upper_pages * max(e[-1] for e in schema["entries"])
-                cap = 16 * 1024 * 1024 if max_bytes > 4 * 1024 * 1024 else 4 * 1024 * 1024
                 facts = [
                     self.facts.get(self._worker(entry, role), ())
                     for role in ("src", "dst")
@@ -1267,6 +1277,24 @@ class DsvGateway:
                     "precopy_tcp" in row for rows in facts for row in rows
                 ):
                     return  # No common transport. Leave native cut handling intact.
+                packed = (
+                    backend == "rdma"
+                    and self.packed_precopy
+                    and all(len(rows) == len(plans) for rows in facts)
+                    and all(
+                        row.get("precopy_packed_supported") is True
+                        for rows in facts for row in rows
+                    )
+                )
+            if packed:
+                # All TP ranks share logical ranges, even if row sizes differ.
+                strides = [
+                    max(plan["schema"]["entries"][i][-1] for plan in plans)
+                    for i in range(len(strides))
+                ]
+            if capacity is None:
+                max_bytes = upper_pages * (sum(strides) if packed else max(strides))
+                cap = 16 * 1024 * 1024 if max_bytes > 4 * 1024 * 1024 else 4 * 1024 * 1024
                 if backend == "rdma":
                     capacity = 64 * 1024 * 1024 if max_bytes > cap else cap
                 else:
@@ -1287,31 +1315,38 @@ class DsvGateway:
             ]
             ends = entry.get("precopy_pages") or [0] * len(available)
             # Same frame on every shard; each has its own authenticated slot.
-            for i, end in enumerate(available):
-                end = min(end, upper_pages)
-                count = min(
-                    end - ends[i], capacity // schema["entries"][i][-1]
-                )
+            parts = []
+            remaining = capacity
+            for i, (end, stride) in enumerate(zip(available, strides)):
+                count = min(min(end, upper_pages) - ends[i], remaining // stride)
                 if count > 0:
-                    pending = dict(
-                        stage="PREPARE",
-                        available_pages=available[i],
-                        available_pages_by_rank=[r["available"][i] for r in rows],
-                        reservation_upper_pages=entry["plans"][0]["upper"]
-                        // schema["page_size"],
-                        started_at=time.time(),
-                        stage_at=time.time(),
-                        frame=dict(
-                            entry=i, start=ends[i], count=count, chunk=uuid.uuid4().hex
-                        ),
-                    )
-                    self._update(
-                        rid, precopy_pending=pending, precopy_capacity=capacity,
-                        precopy_backend=backend,
-                    )
-                    break
-            if pending is None:
+                    parts.append(dict(entry=i, start=ends[i], count=count))
+                    remaining -= count * stride
+                    if not packed:
+                        break
+            if not parts:
                 return
+            frame = dict(chunk=uuid.uuid4().hex)
+            pending = dict(
+                stage="PREPARE",
+                reservation_upper_pages=upper_pages,
+                started_at=time.time(),
+                stage_at=time.time(),
+                frame=frame,
+            )
+            if len(parts) == 1:
+                frame.update(parts[0])
+                i = frame["entry"]
+                pending.update(
+                    available_pages=available[i],
+                    available_pages_by_rank=[r["available"][i] for r in rows],
+                )
+            else:
+                frame["segments"] = parts
+            self._update(
+                rid, precopy_pending=pending, precopy_capacity=capacity,
+                precopy_backend=backend, precopy_packed=packed,
+            )
         frame = pending["frame"]
         if "stage_at" in pending:
             with self.lock:

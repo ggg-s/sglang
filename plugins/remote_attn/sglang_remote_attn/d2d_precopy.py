@@ -30,8 +30,7 @@ class Source:
     closed: bool = False
     failed: bool = False
     proofs: dict = field(default_factory=dict)
-    mappings: dict = field(default_factory=dict)
-    pointers: dict = field(default_factory=dict)
+    bindings: dict = field(default_factory=dict)
     close_id: str = field(default_factory=lambda: uuid.uuid4().hex)
 
 
@@ -123,27 +122,46 @@ def stable_pages(controller, req):
     return ends
 
 
-def frame(controller, value, *, rdma=False):
-    if not isinstance(value, dict) or set(value) != {
-        "entry",
-        "start",
-        "count",
-        "chunk",
-    }:
+def frame_layout(value, entries, *, rdma):
+    """Return validated native ranges and their shard-local byte lengths."""
+    if not isinstance(value, dict):
         raise ValueError("invalid precopy frame")
-    entry, start, count = (value[k] for k in ("entry", "start", "count"))
-    entries = controller._schema(d2d.manager(controller))["entries"]
-    if (
-        any(type(x) is not int for x in (entry, start, count))
-        or not 0 <= entry < len(entries)
-        or start < 0
-        or count < 1
-        or count * entries[entry][-1] > (bulk.RDMA_CAPACITY if rdma else d2d.LIMIT)
-        or not isinstance(value["chunk"], str)
-        or len(value["chunk"]) != 32
+    if set(value) == {"entry", "start", "count", "chunk"}:
+        parts = (value,)
+    elif (
+        rdma
+        and set(value) == {"segments", "chunk"}
+        and isinstance(value["segments"], list)
+        and 2 <= len(value["segments"]) <= len(entries)
     ):
+        parts = value["segments"]
+        if any(
+            not isinstance(part, dict) or set(part) != {"entry", "start", "count"}
+            for part in parts
+        ):
+            raise ValueError("invalid packed precopy segment")
+    else:
+        raise ValueError("invalid precopy frame")
+    if not isinstance(value["chunk"], str) or len(value["chunk"]) != 32:
+        raise ValueError("invalid precopy chunk")
+
+    layout = []
+    previous = -1
+    for part in parts:
+        i, start, count = (part[k] for k in ("entry", "start", "count"))
+        if (
+            any(type(x) is not int for x in (i, start, count))
+            or not previous < i < len(entries)
+            or start < 0
+            or count < 1
+        ):
+            raise ValueError("precopy frame outside bounded native layout")
+        layout.append((i, start, count, count * entries[i][-1]))
+        previous = i
+    size = sum(nbytes for _, _, _, nbytes in layout)
+    if size > (bulk.RDMA_CAPACITY if rdma else d2d.LIMIT):
         raise ValueError("precopy frame outside bounded native layout")
-    return value
+    return layout, size
 
 
 def source_record(controller, epoch):
@@ -331,7 +349,11 @@ def handle(controller, data):
                     explicit_tcp = dest.get("tcp") is True
                     if explicit_tcp and (rdma or transport.policy() == "rdma"):
                         raise ValueError("precopy source did not offer TCP fallback")
-                    f = frame(controller, data["frame"], rdma=rdma)
+                    f = data["frame"]
+                    entries = controller._schema(d2d.manager(controller))["entries"]
+                    layout, size = frame_layout(f, entries, rdma=rdma)
+                    if size > region["size"] - bulk.FOOTER:
+                        raise ValueError("precopy frame exceeds published slot")
                     if rdma and not rdma_available(controller):
                         raise ValueError("precopy source did not offer GPU RDMA")
                     if (
@@ -344,13 +366,12 @@ def handle(controller, data):
                     if saved is not None:
                         if saved["receive"] != dest:
                             raise ValueError("precopy retry changed descriptor")
-                    elif (
-                        stable_pages(controller, record.req)[f["entry"]]
-                        < f["start"] + f["count"]
-                    ):
-                        raise ValueError(
-                            "precopy page is still mutable or remotely owned"
-                        )
+                    else:
+                        available = stable_pages(controller, record.req)
+                        if any(available[i] < lo + count for i, lo, count, _ in layout):
+                            raise ValueError(
+                                "precopy page is still mutable or remotely owned"
+                            )
         else:
             t = ticket(controller, epoch)
             state = getattr(t, "precopy", None)
@@ -374,14 +395,17 @@ def handle(controller, data):
                 rdma = state is not None and state.receiver.backend == transport.GPU
             if state is not None and (state.closed or state.failed):
                 raise ValueError("precopy destination closed/failed")
-            f = frame(controller, data["frame"], rdma=rdma)
-            if cmd.endswith("prepare") and (
-                f["count"] * t.plan["schema"]["entries"][f["entry"]][-1] > capacity
+            f = data["frame"]
+            entries = t.plan["schema"]["entries"]
+            layout, size = frame_layout(f, entries, rdma=rdma)
+            if any(
+                (lo + count) * controller.pool.page_size > t.plan["upper"]
+                for _, lo, count, _ in layout
             ):
-                raise ValueError("precopy frame exceeds destination slot")
-            if (f["start"] + f["count"]) * controller.pool.page_size > t.plan["upper"]:
                 raise ValueError("precopy frame exceeds reservation")
             if cmd.endswith("prepare"):
+                if size > capacity:
+                    raise ValueError("precopy frame exceeds destination slot")
                 if state is not None and f["chunk"] in state.receipts:
                     raise ValueError("precopy chunk already applied; reconcile receipt")
                 if (
@@ -390,17 +414,17 @@ def handle(controller, data):
                     and state.pending["frame"] != f
                 ):
                     raise ValueError("precopy slot already published")
-                if f["start"] != (state.ends[f["entry"]] if state is not None else 0):
+                if any(
+                    lo != (state.ends[i] if state is not None else 0)
+                    for i, lo, _, _ in layout
+                ):
                     raise ValueError("precopy prefix gap/duplicate")
             elif cmd.endswith("apply"):
                 proof = reservation.select(controller, data, "proof")
                 if state is None:
                     raise ValueError("precopy receive slot missing")
                 old = state.receipts.get(f["chunk"])
-                expected = old or dict(
-                    receive=state.pending,
-                    bytes=f["count"] * t.plan["schema"]["entries"][f["entry"]][-1],
-                )
+                expected = old or dict(receive=state.pending, bytes=size)
                 if proof != expected or proof["receive"]["frame"] != f:
                     raise ValueError("precopy send proof differs from published slot")
             else:
@@ -459,10 +483,14 @@ def handle(controller, data):
                         torch.cuda.current_stream(device).wait_stream(
                             controller.scheduler.forward_stream
                         )
-                    table = tables(controller)[f["entry"]]
-                    ids = page_ids(controller, record.req, f["start"], f["count"])
+                    native = tables(controller)
+                    rows = [
+                        (native[i], page_ids(controller, record.req, lo, count))
+                        for i, lo, count, _ in layout
+                    ]
                     engine = (
-                        tcp_engine(controller) if explicit_tcp
+                        tcp_engine(controller)
+                        if explicit_tcp
                         else d2d.manager(controller).engine
                     )
                     capacity = region["size"] - bulk.FOOTER
@@ -480,13 +508,14 @@ def handle(controller, data):
                         ready = d2d.dp.event(device)
                         try:
                             size = record.sender.write_rows(
-                                [(table, ids)], ready, region, dest["sequence"]
+                                rows, ready, region, dest["sequence"]
                             )
                         except BaseException:
                             if record.sender.copy_owner is not None:
                                 record.gpu_hold = record.sender.copy_owner
                             raise
                     else:
+                        ((table, ids),) = rows
                         data_tensor = ready = None
                         try:
                             data_tensor = table.index_select(0, ids)
@@ -501,9 +530,10 @@ def handle(controller, data):
                             data_tensor, ready, region, dest["sequence"]
                         )
                     saved = dict(receive=dest, bytes=size)
+                    record.bindings[f["chunk"]] = [
+                        (ids.cpu().tolist(), table.data_ptr()) for table, ids in rows
+                    ]
                     record.proofs[f["chunk"]] = saved
-                    record.mappings[f["chunk"]] = ids.cpu().tolist()
-                    record.pointers[f["chunk"]] = table.data_ptr()
             result = dict(
                 proof=saved,
                 replayed=replayed,
@@ -512,7 +542,8 @@ def handle(controller, data):
         else:
             if old is None:
                 receiver = state.receiver
-                with d2d.on_device(d2d.pool_device(controller)):
+                device = d2d.pool_device(controller)
+                with d2d.on_device(device):
                     header = dict(
                         bytes=proof["bytes"],
                         bulk_protocol=receiver.protocol,
@@ -521,23 +552,35 @@ def handle(controller, data):
                     )
                     from .dsv41_receive import scatter_prefix
 
-                    table = tables(controller)[f["entry"]]
-                    entry = t.plan["schema"]["entries"][f["entry"]]
-                    ids = page_ids(controller, t.req, f["start"], f["count"])
+                    native = tables(controller)
+                    page_size = controller.pool.page_size
+                    rows = [
+                        (
+                            native[i],
+                            page_ids(controller, t.req, lo, count),
+                            d2d.key_layout(controller, entries[i][2]),
+                        )
+                        for i, lo, count, _ in layout
+                    ]
 
                     def scatter(copied):
                         nonlocal scatter_started
                         scatter_started = True
-                        scatter_prefix(
-                            table,
-                            copied.reshape(f["count"], -1),
-                            ids,
-                            f["start"],
-                            (f["start"] + f["count"]) * controller.pool.page_size,
-                            controller.pool.page_size,
-                            entry[1],
-                            d2d.key_layout(controller, entry[2]),
-                        )
+                        offset = 0
+                        for (i, lo, count, nbytes), (table, ids, key_layout) in zip(
+                            layout, rows
+                        ):
+                            scatter_prefix(
+                                table,
+                                copied[offset : offset + nbytes].reshape(count, -1),
+                                ids,
+                                lo,
+                                (lo + count) * page_size,
+                                page_size,
+                                entries[i][1],
+                                key_layout,
+                            )
+                            offset += nbytes
 
                     if rdma:
                         receiver.consume(
@@ -554,9 +597,10 @@ def handle(controller, data):
                         )
                     # Native row reuse must wait for the scatter, independently
                     # of private Receiver retirement.
-                    t.ready = d2d.dp.event(table.device)
+                    t.ready = d2d.dp.event(device)
                     t.ready.synchronize()
-                state.ends[f["entry"]] += f["count"]
+                for i, _, count, _ in layout:
+                    state.ends[i] += count
                 state.receipts[f["chunk"]] = proof
                 state.pending = None
             result = dict(receipt=proof, prefix_pages=state.ends)
@@ -614,19 +658,25 @@ def seal(controller, source, receipts):
         return dict(protocol=PROTOCOL, prefix_pages=ends, receipts=[])
     if record.failed or reservation.source_attempt(source.req) != record.attempt:
         raise ValueError("precopy source failed/attempt changed at seal")
+    native = tables(controller)
+    page_size = controller.pool.page_size
     for proof in receipts:
         f = proof["receive"]["frame"]
-        i, lo, count, chunk = (f[k] for k in ("entry", "start", "count", "chunk"))
-        if record.proofs.get(chunk) != proof or lo != ends[i]:
+        chunk = f["chunk"]
+        if record.proofs.get(chunk) != proof:
             raise ValueError("precopy receipt not a contiguous acknowledged send")
-        ids = page_ids(controller, source.req, lo, count)
-        if (
-            record.mappings[chunk] != ids.cpu().tolist()
-            or record.pointers[chunk] != tables(controller)[i].data_ptr()
-            or (lo + count) * controller.pool.page_size > source.prefix_len
-        ):
-            raise ValueError("precopy source page ownership changed before freeze")
-        ends[i] += count
+        for position, part in enumerate(f.get("segments", (f,))):
+            i, lo, count = (part[k] for k in ("entry", "start", "count"))
+            if lo != ends[i]:
+                raise ValueError("precopy receipt not a contiguous acknowledged send")
+            ids = page_ids(controller, source.req, lo, count)
+            if (
+                record.bindings[chunk][position]
+                != (ids.cpu().tolist(), native[i].data_ptr())
+                or (lo + count) * page_size > source.prefix_len
+            ):
+                raise ValueError("precopy source page ownership changed before freeze")
+            ends[i] += count
     close_source(controller, source.epoch)
     return dict(protocol=PROTOCOL, prefix_pages=ends, receipts=receipts)
 

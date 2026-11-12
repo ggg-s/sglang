@@ -468,6 +468,11 @@ def main():
     )
     parser.add_argument("--precopy-window-ms", type=int, default=0)
     parser.add_argument(
+        "--packed-precopy",
+        action="store_true",
+        help="Pack closed KV ranges into one RDMA frame when all ranks support it",
+    )
+    parser.add_argument(
         "--max-concurrent-migrations",
         type=int,
         choices=(1, 2, 4),
@@ -526,6 +531,7 @@ def main():
         poll_ms=args.poll_ms,
         natural_drain_ms=args.natural_drain_ms,
         precopy_window_ms=args.precopy_window_ms,
+        packed_precopy=args.packed_precopy,
         max_concurrent_migrations=args.max_concurrent_migrations,
         max_preparing_migrations=args.max_preparing_migrations,
         out=args.out,

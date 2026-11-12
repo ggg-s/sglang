@@ -409,6 +409,57 @@ class TestDsvGatewayStatus(CustomTestCase):
         self.gw._drive(self.gw._precopy(self.gw.entry(rid), cut_due=True))
         self.assertEqual(self.gw.entry(rid)["phase"], "FREEZE")
 
+    def test_packed_precopy_respects_all_shards_and_old_worker_fallback(self):
+        """Both the page watermark and the byte budget must hold on every rank."""
+        self.gw.packed_precopy = True
+        mib = 1024 * 1024
+        for compatible in (False, True):
+            with self.subTest(compatible=compatible):
+                rid = self.gw.accept(dict(rid=f"packed-{compatible}", prompt_ids=[1]))
+                plans = [
+                    dict(schema=dict(page_size=8, entries=[[stride]] * 3), upper=32)
+                    for stride in (8 * mib, 12 * mib)
+                ]
+                self.gw._update(rid, phase="WAIT_CUT", epoch=rid, plans=plans)
+                for role in ("src", "dst"):
+                    self.gw.facts[role] = [
+                        dict(
+                            instance_id=f"{role}-{rank}",
+                            precopy_protocol="closed-page-precopy-v1",
+                            precopy_rdma=True,
+                            precopy_packed_supported=compatible
+                            or role == "src"
+                            or rank == 0,
+                        )
+                        for rank in range(2)
+                    ]
+                stage = self.gw._precopy(self.gw.entry(rid))
+                self.assertEqual(next(stage).name, "d2d_precopy_status")
+                prepare = stage.send(
+                    [dict(available=[4, 4, 4]), dict(available=[3, 4, 4])]
+                )
+                self.assertEqual(prepare.name, "d2d_precopy_prepare")
+                frame = prepare.payload["frame"]
+                if compatible:
+                    # TP rank 1 can fit five 12 MiB pages. Its entry 0 has three.
+                    self.assertEqual(
+                        frame["segments"],
+                        [
+                            dict(entry=0, start=0, count=3),
+                            dict(entry=1, start=0, count=2),
+                        ],
+                    )
+                    self.assertEqual(prepare.payload["capacity"], 64 * mib)
+                else:
+                    self.assertNotIn("segments", frame)
+                    self.assertEqual((frame["entry"], frame["count"]), (0, 3))
+                with self.assertRaises(StopIteration):
+                    stage.send([dict(receive={})] * 2)
+                self.assertEqual(
+                    self.gw.precopy_events[-1]["payload_bytes_by_rank"],
+                    [40 * mib, 60 * mib] if compatible else [24 * mib, 36 * mib],
+                )
+
     def test_status_timeout_preserves_facts_and_recovers_without_changing_owner(self):
         """A slow advisory poll must not poison every request on its worker."""
         for role in ("src", "dst"):

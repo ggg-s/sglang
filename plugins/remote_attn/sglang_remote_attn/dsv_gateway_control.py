@@ -156,6 +156,7 @@ def handle(controller, data):
             protocol=d2d.VERSION,
             precopy_protocol="closed-page-precopy-v1",
             precopy_frame_bytes=d2d.bulk.CAPACITY,
+            precopy_packed_supported=True,
             precopy_rdma=rdma_available(controller),
             precopy_tcp=policy() != "rdma",
             decode_timing=dict(getattr(controller, "decode_timing", {})),

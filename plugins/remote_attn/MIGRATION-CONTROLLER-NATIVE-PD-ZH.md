@@ -190,3 +190,27 @@ jq '{mode, valid_run, source_safe_to_stop_ms, activate_to_safe_to_stop_ms,
 `source_safe_to_stop_ms` 从 POST 发出前计时，含 SMG 摘流。 `activate_to_safe_to_stop_ms` 从控制器确认摘流并封入口的边界计时，包含自然等待、迁移和源端回收。Pre-copy 对照同时看 `moved_precopy_bytes`、冻结剩余字节和切换时间。按 `initial_decode` 看未迁请求携带新增 token 的 SSE chunk 最大间隔，单 token ITL 以引擎计时为准。
 
 本地回归覆盖三个回环监听端口、bootstrap 透传、同一 SSE 的 D2D 续流、摘流撤销、四路控制 RPC 打包、阶段额度及固定 Pre-copy 窗口。真实 3P3D GPU/RDMA 性能在目标环境验收。
+
+### RDMA Pre-copy 多 entry 打包 A/B
+
+部署同一构建的控制器和 Decode worker。沿用上面的四条长请求全迁与长短混跑命令。每组先把 PREPARE 和切换并发都设为 2，使用相同的输入、自然排空时间和正的 Pre-copy 窗口。每轮恢复 D1 的可路由状态，使用新的 state 目录，并检查 benchmark 的 `valid_run`。
+
+| 组 | 控制器参数 |
+|---|---|
+| A | `--max-preparing-migrations 2 --max-concurrent-migrations 2 --precopy-window-ms 800` |
+| B | `--max-preparing-migrations 2 --max-concurrent-migrations 2 --precopy-window-ms 800 --packed-precopy` |
+
+`--packed-precopy` 默认关闭，仅在源和目标的全部 TP rank 都支持打包且使用 GPU RDMA 时生效。每个请求仍只有一个接收槽，每 rank 的帧上限为 64 MiB。窗口到期后不发新帧，已发布的帧按原流程处理。
+
+从控制器的 `--out` JSONL 确认 B 出现 `frame.segments`，按 `epoch + frame.chunk` 统计成功 APPLY 的帧：
+
+```bash
+jq -s '[.[] | select(.type == "precopy_stage" and .stage == "APPLY" and .ok)]
+  | unique_by([.epoch, .frame.chunk])
+  | {frames: length,
+     packed_frames: (map(select(.frame.segments != null)) | length),
+     applied_mib: ((map(.payload_bytes_tp_sum) | add // 0) / 1048576)}' \
+  "$state_dir/handoff.jsonl"
+```
+
+同时对照已迁请求的冻结剩余字节、`activate_to_safe_to_stop_ms`、同实例前台请求的 `max_chunk_gap_ms`。另看 `source_safe_to_stop_ms`，它包含 cordon 等待。固定窗口下即使 B 的帧数相近，每帧字节和总覆盖也可能增加。确认这组变化后再测并发 4。

@@ -17522,6 +17522,97 @@ class TestRemoteAttn(CustomTestCase):
             any(not s.closed for s in pc.bulk.owners(d2d.manager(e.source).engine))
         )
 
+    def test_dsv_d2d_precopy_packed_rdma_seals_exact_ranges_and_replays(self):
+        """Distinct row widths share one transfer and seal with the frozen tail."""
+        from contextlib import nullcontext
+
+        from sglang_remote_attn import d2d_precopy as pc
+        from sglang_remote_attn import dsv_d2d as d2d
+        from sglang_remote_attn import mooncake_backend as transport
+
+        e = self._d2d_env()
+        p = self._precopy_support()
+        common, plan = p.reserve(e)
+        entries = plan["schema"]["entries"]
+        first, second = next(
+            (i, j)
+            for i, a in enumerate(entries)
+            for j, b in enumerate(entries)
+            if i < j and a[-1] != b[-1]
+        )
+        parts = [
+            dict(entry=first, start=0, count=4),
+            dict(entry=second, start=0, count=2),
+        ]
+        frame = dict(chunk=uuid.uuid4().hex, segments=parts)
+        engine = d2d.manager(e.source).engine
+        stream = SimpleNamespace(wait_event=lambda _: None, synchronize=lambda: None)
+        # Retain actual gather, scatter, region registration, and byte copies.
+        with (
+            patch.dict(os.environ, {"HANDOFF_D2D_BACKEND": "rdma"}),
+            patch.object(transport, "gpu_capability", return_value=True),
+            patch.object(torch.cuda, "Stream", return_value=stream),
+            patch.object(torch.cuda, "stream", return_value=nullcontext()),
+        ):
+            invalid = dict(frame, segments=[parts[0], dict(parts[1], entry=first)])
+            with self.assertRaisesRegex(ValueError, "bounded native layout"):
+                p.command(
+                    e.target, "precopy", "precopy_prepare", frame=invalid, rdma=True
+                )
+            receive = p.command(
+                e.target, "precopy", "precopy_prepare", frame=frame, rdma=True
+            )["receive"]
+            changed = dict(frame, segments=[parts[0], dict(parts[1], count=3)])
+            with self.assertRaisesRegex(ValueError, "certificate mismatch"):
+                p.command(
+                    e.source, "precopy", "precopy_copy", frame=changed, receive=receive
+                )
+
+            copied = p.command(
+                e.source, "precopy", "precopy_copy", frame=frame, receive=receive
+            )
+            replay = p.command(
+                e.source, "precopy", "precopy_copy", frame=frame, receive=receive
+            )
+            size = 4 * entries[first][-1] + 2 * entries[second][-1]
+            self.assertEqual(engine.calls, [(receive["region"]["session"], [size])])
+            self.assertEqual(copied["copied_payload_bytes"], size)
+            self.assertEqual(replay["copied_payload_bytes"], 0)
+
+            proof = copied["proof"]
+            applied = p.command(
+                e.target, "precopy", "precopy_apply", frame=frame, proof=proof
+            )
+            coverage = [0] * len(entries)
+            coverage[first], coverage[second] = 4, 2
+            self.assertEqual(applied["prefix_pages"], coverage)
+            self.assertEqual(
+                p.command(
+                    e.target, "precopy", "precopy_apply", frame=frame, proof=proof
+                ),
+                applied,
+            )
+
+        # Verify the live prefix itself before the frozen copy can fill any holes.
+        ticket = e.target.d2d_reservations["precopy"]
+        source_tables, target_tables = pc.tables(e.source), pc.tables(e.target)
+        for part in parts:
+            i, count = part["entry"], part["count"]
+            src = pc.page_ids(e.source, e.req, 0, count)
+            dst = pc.page_ids(e.target, ticket.req, 0, count)
+            self.assertTrue(torch.equal(source_tables[i][src], target_tables[i][dst]))
+
+        transfer = p.command(
+            e.source,
+            "precopy",
+            "freeze",
+            reservation=plan,
+            precopy_receipts=[[applied["receipt"]]],
+            **common,
+        )["transfer"]
+        self.assertEqual(transfer["precopy"]["prefix_pages"], coverage)
+        self.assertTrue(p.finish(e, "precopy", transfer).closed)
+
     def test_dsv_d2d_precopy_replay_reports_zero_new_payload_bytes(self):
         """Retrying an acknowledged chunk must not count another physical payload."""
         e = self._d2d_env()
