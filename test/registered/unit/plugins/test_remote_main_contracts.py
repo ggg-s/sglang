@@ -141,7 +141,7 @@ class TestRemoteMainContracts(CustomTestCase):
 
     def test_destination_metadata_preserves_preassigned_and_async_flags(self):
         req = NS()
-        queue, indices = object(), object()
+        queue, indices = NS(scheduler=NS()), object()
         decode_req = NS(req=req)
         original = Mock(return_value="submitted")
         self.assertEqual(
@@ -1263,10 +1263,10 @@ class TestSplitPD(CustomTestCase):
         )
         self.stack.enter_context(patch.dict(os.environ, {}, clear=True))
 
-    def controller(self, role="prefill", *, hybrid=False):
+    def controller(self, role="prefill", *, hybrid=False, max_prefill_tokens=16384):
         scheduler = NS(
             disaggregation_mode=NS(value=role),
-            max_prefill_tokens=4096,
+            max_prefill_tokens=max_prefill_tokens,
             max_running_requests=16,
             running_batch=NS(batch_size=lambda: 0),
             req_to_token_pool=NS(req_to_token=torch.zeros((1, 1))),
@@ -1284,11 +1284,11 @@ class TestSplitPD(CustomTestCase):
         self.split.configure(controller)
         return controller
 
-    def request(self, *, prefix=0):
+    def request(self, *, prefix=0, length=32768):
         return NS(
             rid="split",
             bootstrap_room=7,
-            origin_input_ids=list(range(32768)),
+            origin_input_ids=list(range(length)),
             output_ids=[],
             kv=self.Kv(cache_protected_len=prefix),
             prefix_len=prefix,
@@ -1310,17 +1310,20 @@ class TestSplitPD(CustomTestCase):
             sampling_params=NS(max_new_tokens=16),
         )
 
-    def offer(self, d):
+    def offer(self, d, *, length=32768):
         dr = NS(
-            req=self.request(), kv_receiver=self.receiver_type(), is_rebootstrap=False
+            req=self.request(length=length),
+            kv_receiver=self.receiver_type(),
+            is_rebootstrap=False,
         )
         self.split.advertise(NS(scheduler=d.scheduler), dr, 0)
         return dr
 
-    def bootstrap(self, *, prefix=0, hybrid=False):
-        p, d = self.controller(hybrid=hybrid), self.controller("decode", hybrid=hybrid)
-        req = self.request(prefix=prefix)
-        dr = self.offer(d)
+    def bootstrap(self, *, prefix=0, length=32768, hybrid=False, decode_budget=16384):
+        p = self.controller(hybrid=hybrid)
+        d = self.controller("decode", hybrid=hybrid, max_prefill_tokens=decode_budget)
+        req = self.request(prefix=prefix, length=length)
+        dr = self.offer(d, length=length)
         receiver = dr.kv_receiver
         receiver.kv_mgr = NS()
         frames = self.mesh.bootstrap(
@@ -1333,7 +1336,7 @@ class TestSplitPD(CustomTestCase):
         peer = self.mesh.parse_transfer(lambda **_: NS(), msg=frames)
         peer.is_dummy = False
         peer.mooncake_session_id = "decode"
-        peer.dst_kv_indices = list(range(32768))
+        peer.dst_kv_indices = list(range(length))
         sender = self.sender_type()
         sender.kv_mgr = NS(
             transfer_infos={7: {"decode": peer}},
@@ -1351,12 +1354,20 @@ class TestSplitPD(CustomTestCase):
     def match(req, *_):
         req.full_untruncated_fill_ids = list(req.origin_input_ids)
 
-    def test_default_cut_moves_past_real_cache_match_for_dense_and_hybrid(self):
-        """A warm match above 85% previously disabled split instead of moving cut."""
+    def test_default_cut_uses_misses_and_caps_short_or_warm_suffixes(self):
         for hybrid in (False, True):
-            for prefix, expected in ((0, 27852), (26214, 27852), (29491, 30474)):
-                with self.subTest(hybrid=hybrid, prefix=prefix):
-                    p, d, req, dr = self.bootstrap(prefix=prefix, hybrid=hybrid)
+            for length, prefix, expected in (
+                (16384, 0, 13927),
+                (16384, 14745, 15360),
+                (32768, 0, 22938),
+                (32768, 13107, 28672),
+                (32768, 26214, 30720),
+                (65536, 26214, 61440),
+            ):
+                with self.subTest(hybrid=hybrid, length=length, prefix=prefix):
+                    p, d, req, dr = self.bootstrap(
+                        prefix=prefix, length=length, hybrid=hybrid
+                    )
                     self.assertTrue(p.split_prefill)
                     self.assertEqual(d.split_prefill_chunk_size, 4096)
                     self.assertFalse(
@@ -1369,11 +1380,17 @@ class TestSplitPD(CustomTestCase):
                     self.assertEqual(len(req.full_untruncated_fill_ids), expected)
                     self.assertGreater(expected, req.kv.cache_protected_len)
                     self.assertGreaterEqual(
-                        expected, dr.kv_receiver._hybrid_split_min_cut
+                        expected, dr.kv_receiver._hybrid_split_limits[0]
                     )
 
+    def test_prefill_cap_uses_the_decode_budget_from_bootstrap(self):
+        _, d, req, _ = self.bootstrap(prefix=13107, decode_budget=1024)
+        self.assertEqual(d.split_prefill_chunk_size, 1024)
+        self.split.init_input(self.match, req, object())
+        self.assertEqual(req._hybrid_split_at, 30720)
+
     def test_small_suffix_and_tp_cut_disagreement_use_full_native_input(self):
-        for prefix, disagreement in ((30500, False), (32000, False), (0, True)):
+        for prefix, disagreement in ((30720, False), (32000, False), (0, True)):
             with self.subTest(prefix=prefix, disagreement=disagreement):
                 p, _, req, _ = self.bootstrap(prefix=prefix)
                 if disagreement:
@@ -1390,6 +1407,18 @@ class TestSplitPD(CustomTestCase):
             _, _, req, _ = self.bootstrap()
             self.split.init_input(self.match, req, object())
             self.assertEqual(req._hybrid_split_at, 24576)
+        with patch.dict(os.environ, {"HANDOFF_SPLIT_CUT_BASIS": "whole"}):
+            _, _, req, _ = self.bootstrap(prefix=26214)
+            self.split.init_input(self.match, req, object())
+            self.assertEqual(req._hybrid_split_at, 27238)
+        for suffix, expected in ((8192, 8192), (1023, 0)):
+            with (
+                self.subTest(suffix=suffix),
+                patch.dict(os.environ, {"HANDOFF_SPLIT_SUFFIX_TOKENS": str(suffix)}),
+            ):
+                _, _, req, _ = self.bootstrap(length=16384, prefix=6553)
+                self.split.init_input(self.match, req, object())
+                self.assertEqual(req._hybrid_split_at, expected)
 
     def test_probe_and_admission_retry_preserve_native_matching_order(self):
         _, _, req, _ = self.bootstrap()
@@ -1398,22 +1427,22 @@ class TestSplitPD(CustomTestCase):
         self.assertEqual(len(req.full_untruncated_fill_ids), 32768)
         self.assertFalse(hasattr(req, "_hybrid_split_at"))
         self.split.init_input(self.match, req, cache)
-        self.assertEqual(req._hybrid_split_at, 27852)
+        self.assertEqual(req._hybrid_split_at, 22938)
         req.prefix_len = req.kv.cache_protected_len = 29491
         self.split.init_input(self.match, req, cache)
-        self.assertEqual(req._hybrid_split_at, 30474)
+        self.assertEqual(req._hybrid_split_at, 30720)
         req.kv.req_pool_idx = 0
         req.prefix_len = req.kv.cache_protected_len = 30000
         self.split.init_input(self.match, req, cache)
-        self.assertEqual(req._hybrid_split_at, 30474)
+        self.assertEqual(req._hybrid_split_at, 30720)
 
     def test_decode_offers_reserve_capacity_before_transfer(self):
         d = self.controller("decode")
         active = [self.offer(d) for _ in range(4)]
         self.split.advertise(NS(scheduler=d.scheduler), active[0], 0)
-        self.assertTrue(all(dr.kv_receiver._hybrid_split_min_cut for dr in active))
+        self.assertTrue(all(dr.kv_receiver._hybrid_split_limits for dr in active))
         self.assertEqual(d.split_prefill_outstanding, 4)
-        self.assertFalse(hasattr(self.offer(d).kv_receiver, "_hybrid_split_min_cut"))
+        self.assertFalse(hasattr(self.offer(d).kv_receiver, "_hybrid_split_limits"))
         req = active[0].req
         req.kv.req_pool_idx = 0
         req.kv.set_row_len(32768)
@@ -1426,15 +1455,15 @@ class TestSplitPD(CustomTestCase):
             hooks._release_kv(lambda *_, **__: None, req, None, checkpoint=False)
         self.split.release_reservation(req)
         self.assertEqual(d.split_prefill_outstanding, 3)
-        self.assertTrue(self.offer(d).kv_receiver._hybrid_split_min_cut)
+        self.assertTrue(self.offer(d).kv_receiver._hybrid_split_limits)
 
     def test_decode_capacity_and_tp_rejection_do_not_create_reservations(self):
         d = self.controller("decode")
         d.scheduler.running_batch.batch_size = lambda: d.scheduler.max_running_requests
-        self.assertFalse(hasattr(self.offer(d).kv_receiver, "_hybrid_split_min_cut"))
+        self.assertFalse(hasattr(self.offer(d).kv_receiver, "_hybrid_split_limits"))
         d.scheduler.running_batch.batch_size = lambda: 0
         d.agree = lambda _: [0]
-        self.assertFalse(hasattr(self.offer(d).kv_receiver, "_hybrid_split_min_cut"))
+        self.assertFalse(hasattr(self.offer(d).kv_receiver, "_hybrid_split_limits"))
         self.assertEqual(d.split_prefill_outstanding, 0)
 
     def test_inflight_suffix_chunk_allows_decode_before_result_processing(self):
@@ -1498,23 +1527,25 @@ class TestSplitPD(CustomTestCase):
             decode_overlap.process_last_batch_early(lambda *_: False, scheduler, suffix)
         )
 
-    def test_v1_and_malformed_offers_cannot_be_interpreted_as_v2_bounds(self):
+    def test_legacy_and_malformed_offers_leave_native_pd_available(self):
         for extension in (
             b"REMOTE_ATTN_HYBRID_SPLIT_V1:16384",
-            self.split.WIRE + b"-1",
-            self.split.WIRE + b"99999999999",
+            b"REMOTE_ATTN_HYBRID_SPLIT_V2:16384",
+            self.split.WIRE + b"-1:4096",
+            self.split.WIRE + b"16384",
+            self.split.WIRE + b"16384:99999999999",
         ):
             with self.subTest(extension=extension):
                 peer = self.mesh.parse_transfer(
                     lambda **_: NS(), msg=[b""] * 10 + [extension]
                 )
-                self.assertFalse(hasattr(peer, "_hybrid_split_min_cut"))
+                self.assertFalse(hasattr(peer, "_hybrid_split_limits"))
 
-    def commit_fixture(self, cut, *, hybrid=False, room=7):
-        _, d, _, dr = self.bootstrap(hybrid=hybrid)
+    def commit_fixture(self, cut, *, hybrid=False, room=7, length=32768):
+        _, d, _, dr = self.bootstrap(hybrid=hybrid, length=length)
         dr.metadata_buffer_index = 0
         dr.req.kv.req_pool_idx = 0
-        dr.req.kv.set_row_len(32768)
+        dr.req.kv.set_row_len(length)
         if hybrid:
             dr.req.kv.mamba_pool_idx = torch.tensor([0])
         dr.req.time_stats = NS(set_wait_queue_entry_time=lambda: None)
@@ -1529,27 +1560,34 @@ class TestSplitPD(CustomTestCase):
     def test_dynamic_cut_commit_keeps_full_reservation_and_native_state(self):
         for hybrid in (False, True):
             with self.subTest(hybrid=hybrid):
-                d, queue, dr = self.commit_fixture(30474, hybrid=hybrid)
+                d, queue, dr = self.commit_fixture(15360, hybrid=hybrid, length=16384)
                 self.assertTrue(self.split.commit(queue, dr, keep_receiver=False))
-                self.assertEqual(dr.req.kv.kv_committed_len, 30474)
-                self.assertEqual(dr.req.kv.kv_allocated_len, 32768)
+                self.assertEqual(dr.req.kv.kv_committed_len, 15360)
+                self.assertEqual(dr.req.kv.kv_allocated_len, 16384)
                 self.assertTrue(dr.req.kv.reserved_prefill_suffix)
-                self.assertEqual(dr.req.prefix_len, 30474)
+                self.assertEqual(dr.req.prefix_len, 15360)
                 self.assertIsNone(dr.kv_receiver)
                 self.assertEqual(d.split_prefill_outstanding, 1)
 
     def test_invalid_transfer_or_tp_cut_mismatch_aborts_before_continuation(self):
-        for cut, room, mismatch, missing_state in (
-            (16000, 7, False, False),
-            (32000, 7, False, False),
-            (27852, 8, False, False),
-            (27852, 7, True, False),
-            (27852, 7, False, True),
+        for length, cut, room, mismatch, missing_state in (
+            (16384, 15361, 7, False, False),
+            (32768, 16000, 7, False, False),
+            (32768, 32000, 7, False, False),
+            (32768, 27852, 8, False, False),
+            (32768, 27852, 7, True, False),
+            (32768, 27852, 7, False, True),
         ):
             with self.subTest(
-                cut=cut, room=room, mismatch=mismatch, state=missing_state
+                length=length,
+                cut=cut,
+                room=room,
+                mismatch=mismatch,
+                state=missing_state,
             ):
-                d, queue, dr = self.commit_fixture(cut, hybrid=True, room=room)
+                d, queue, dr = self.commit_fixture(
+                    cut, hybrid=True, room=room, length=length
+                )
                 if mismatch:
                     d.agree = lambda flags: (
                         [flags[0], flags[1], flags[2], -flags[2] - 1]
@@ -1572,7 +1610,7 @@ class TestSplitPD(CustomTestCase):
                     self.assertTrue(self.split.commit(queue, dr, keep_receiver=False))
                 self.assertEqual(aborted, [dr.req])
                 self.assertFalse(dr.req.kv.reserved_prefill_suffix)
-                self.assertEqual(dr.req.kv.kv_committed_len, 32768)
+                self.assertEqual(dr.req.kv.kv_committed_len, length)
                 self.assertEqual(d.split_prefill_outstanding, 0)
 
     def test_native_completion_clears_reused_cut_metadata(self):

@@ -121,22 +121,27 @@ Remote attention 用于 D2D 迁移。P→D Remote 早接纳作为实验功能，
 `HANDOFF_HYBRID_SPLIT_PREFILL` 默认 `1`，在 P、D 两端设为 `0` 可做原生 PD 对照。
 至少 4096 token 的纯文本请求可参与协商。P 配置切点，D 配置续算批大小。
 
-- P 的 `HANDOFF_HYBRID_SPLIT_PREFILL_CUT_RATIO` 范围为 `[0.5, 1)`，默认 `0.85`。
-  P 从配置比例开始，依次尝试 `0.5 / 0.75 / 0.85 / 0.93` 中更高的比例。
-  切点必须越过实际命中前缀，满足 D 声明的下界，并留下至少 2048 token 的后缀。
-  例如 32K prompt 命中 90% 时，默认配置会选择 `0.93`。没有合法切点时走原生 PD。
+- P 的 `HANDOFF_HYBRID_SPLIT_PREFILL_CUT_RATIO` 范围为 `[0.5, 1)`，默认 `0.70`。
+  默认按实际未命中量分配，D 接手其中 30%，后缀下限为
+  `min(2048, max(prompt_tokens // 16, 1))`。有缓存命中或 prompt 短于 32K 时，
+  后缀再受 D 声明的 chunk cap 和 prompt 长度的 15% 限制。切点须越过命中前缀，
+  满足 D 声明的下界，并留下足够的后缀。没有合法切点时走原生 PD。
+- P 可用 `HANDOFF_SPLIT_CUT_BASIS=whole` 对照整段比例。该臂的切点取
+  整段比例切点与命中前缀后 1024 token 的较大值。`HANDOFF_SPLIT_SUFFIX_TOKENS`
+  默认 `0`，设为正整数可钉住后缀长度，用于标定。两个对照都检查切点边界。
 - D 的 `HANDOFF_HYBRID_SPLIT_PREFILL_MAX_OUTSTANDING` 默认 `4`。每次发出 offer
   预留一个名额，涵盖等待 P 传输和 D 续算的请求。D 达到该上限或 decode 批次已满时，
   新请求走原生 PD。续算完成、原生 PD 完成或请求终止清理时归还名额。
   默认上限是压测起点，可按在途 decode 的 token 间隔调整。
-- D 的 `HANDOFF_HYBRID_SPLIT_PREFILL_CHUNK_SIZE` 默认 `8192`，以 D 的
-  `--max-prefill-tokens` 为上限。D 声明最多承接半个 prompt，分块完成续算。
+- D 的 `HANDOFF_HYBRID_SPLIT_PREFILL_CHUNK_SIZE` 默认 `4096`，以 D 的
+  `--max-prefill-tokens` 为上限。D 声明最多承接半个 prompt，分块完成续算，
+  并向 P 声明 `max(实际续算块上限, 2048)` 作为 chunk cap。
   这个设置独立于原生 `--chunked-prefill-size`。
 
 沿用同 TP 的原生 Mooncake、early device allocation 和 page-1 KV 配置。
 D 命中已有前缀、请求输出 logprobs、结构化生成或对端未协商时走原生 PD。
 P 等到 bootstrap 后再为可协商请求启动 Prefill，首次 Forward 前对实际 cut 做
-TP 一致性检查。V2 Bootstrap 传递最小切点，完成 metadata 传递实际切点。
+TP 一致性检查。V3 Bootstrap 传递最小切点和 chunk cap，完成 metadata 传递实际切点。
 新旧版本协商不匹配时走原生 PD。
 
 P 发出切点前的 KV 和 Conv／SSM 后完成原生传输。D 在已有预留中续算剩余 prompt，
@@ -179,6 +184,9 @@ P prefix cache 的原生 CUDA/PD 验证见 [专项验证](validation/qwen-hybrid
 
 
 ## 39 机 Qwen3.8-27B-FP8 PD 实测
+
+当前默认策略的长度、命中率和 ITL 对照见 [分段 Prefill V1 实测](validation/qwen-split-prefill-v1-5090.md)。
+以下保留此前构建的实验记录。
 
 39 机使用 RTX 5090，P TP2 + D TP2，开启 CUDA Graph 和 overlap schedule。
 Mooncake 使用 TCP（`MC_FORCE_TCP=1`），机器没有 RDMA 或 GPU P2P。

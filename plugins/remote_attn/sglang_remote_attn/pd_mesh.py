@@ -499,11 +499,16 @@ def bootstrap(original, receiver, *, bootstrap_info, message, operation):
         receiver._remote_attn_room = room
         if room is not None:
             message = [*message, MAGIC + json.dumps(room.descriptor).encode()]
-    cut = getattr(receiver, "_hybrid_split_min_cut", 0)
-    if cut and operation == "send_metadata" and not bootstrap_info["is_dummy"]:
+    limits = getattr(receiver, "_hybrid_split_limits", None)
+    if (
+        limits is not None
+        and operation == "send_metadata"
+        and not bootstrap_info["is_dummy"]
+    ):
         from .qwen_split_prefill import WIRE
 
-        message = [*message, WIRE + str(cut).encode("ascii")]
+        min_cut, chunk_cap = limits
+        message = [*message, WIRE + f"{min_cut}:{chunk_cap}".encode("ascii")]
     return original(
         receiver, bootstrap_info=bootstrap_info, message=message, operation=operation
     )
@@ -515,11 +520,12 @@ def parse_transfer(original, *args, **kwargs):
     from .qwen_split_prefill import WIRE
 
     extensions = message[10:]
-    cut = next(
+    split_offer = next(
         (frame[len(WIRE) :] for frame in extensions if frame.startswith(WIRE)), b""
     )
-    if 0 < len(cut) <= 10 and cut.isdigit():
-        value._hybrid_split_min_cut = int(cut)
+    min_cut, _, chunk_cap = split_offer.partition(b":")
+    if all(0 < len(field) <= 10 and field.isdigit() for field in (min_cut, chunk_cap)):
+        value._hybrid_split_limits = int(min_cut), int(chunk_cap)
     journal = next((frame for frame in extensions if frame.startswith(MAGIC)), None)
     if journal is not None:
         try:

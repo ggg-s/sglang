@@ -56,19 +56,19 @@ P5.19 now has an opt-in same-host pre-layerwise PD prototype; see the
 It inherits the model deployment's token chunking and selects layer groups from
 the scheduler's actual batch lengths. No separate chunk-size setting is needed.
 Small tails use native transfer in `layerwise` mode. In `remote` mode, dense MHA
-and FULL+MAMBA PD default to split prefill with a base cut ratio of `0.85`.
-After cache matching, P tries the base cut and higher candidates in ascending
-order. D bounds outstanding offers and continuations with
-`HANDOFF_HYBRID_SPLIT_PREFILL_MAX_OUTSTANDING` (default `4`).
-The existing `HANDOFF_HYBRID_SPLIT_PREFILL_CUT_RATIO` setting applies on P to
-both layouts. D accepts a bounded suffix and executes it in chunks. Requests
-without a valid split use native PD. Set `HANDOFF_HYBRID_SPLIT_PREFILL=0` on
-both roles for the native-PD control.
+and FULL+MAMBA PD default to split prefill. After cache matching, P assigns 30%
+of the uncached tokens to D by default (`HANDOFF_HYBRID_SPLIT_PREFILL_CUT_RATIO=0.70`).
+The suffix floor scales up to 2,048 tokens. Warm prompts and prompts shorter
+than 32K also cap the suffix by D's advertised chunk cap and 15% of the prompt.
+D uses 4,096-token chunks by default and caps outstanding offers and continuations
+at four. Requests without a valid split use native PD. Set
+`HANDOFF_HYBRID_SPLIT_PREFILL=0` on both roles for the native-PD control.
+See the [RTX 5090 measurements](validation/qwen-split-prefill-v1-5090.md).
 Remote attention serves D2D migrations. Experimental P-to-D Remote attention
 requires `HANDOFF_EXPERIMENTAL_PD_REMOTE=1` on both roles. To compare it with
-split, also set `HANDOFF_HYBRID_SPLIT_PREFILL=0`. The V2 split bootstrap
-advertises a minimum cut, with the actual cut carried in completion metadata.
-V1 and V2 peers fall back to native PD when their split versions differ.
+split, also set `HANDOFF_HYBRID_SPLIT_PREFILL=0`. The V3 split bootstrap
+advertises a minimum cut and D's chunk cap. Completion metadata carries the
+actual cut. Peers with different split versions use native PD.
 With `MC_FORCE_TCP=1`, pre-layerwise groups stage source bytes through a private
 nonblocking CUDA stream and registered pinned host storage before native TE sends.
 This preserves native batching and the send lock; ordinary PD is also staged when `SGLANG_MOONCAKE_HOST_STAGING_ALL=1`.
