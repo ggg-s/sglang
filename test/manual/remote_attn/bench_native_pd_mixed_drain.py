@@ -10,13 +10,14 @@ from urllib.request import Request, urlopen
 from bench_p4_dsv_drain import rpc, sse_events
 
 
-def completion(url, body, first_content, timeout):
+def stream_generate(url, body, first_content, timeout):
     request = Request(
-        url.rstrip("/") + "/v1/completions",
+        url.rstrip("/") + "/generate",
         data=json.dumps(body).encode(),
         headers={"Content-Type": "application/json"},
     )
-    completion_id, finish_reason = None, None
+    rid, finish_reason = None, None
+    output_ids = []
     chunks, last_chunk, max_gap_ms = 0, None, None
     try:
         with urlopen(request, timeout=timeout) as response:
@@ -29,24 +30,27 @@ def completion(url, body, first_content, timeout):
                             "SSE completed without content or finish_reason"
                         )
                     return {
-                        "rid": completion_id.removeprefix("cmpl-"),
+                        "rid": rid,
                         "finish_reason": finish_reason,
                         "content_chunks": chunks,
+                        "completion_tokens": len(output_ids),
                         "max_chunk_gap_ms": max_gap_ms,
                     }
                 event = json.loads(data)
                 if event.get("error"):
                     raise RuntimeError(event["error"])
-                if completion_id is None:
-                    completion_id = event["id"]
-                    if not completion_id.startswith("cmpl-pd-"):
-                        raise RuntimeError(
-                            f"unexpected native PD completion id: {completion_id}"
-                        )
-                elif event["id"] != completion_id:
-                    raise RuntimeError("completion id changed during SSE")
-                choice = event["choices"][0]
-                if choice["text"]:
+                meta = event["meta_info"]
+                if rid is None:
+                    rid = meta["id"]
+                    if not rid.startswith("pd-"):
+                        raise RuntimeError(f"unexpected native PD request id: {rid}")
+                elif meta["id"] != rid:
+                    raise RuntimeError("request id changed during SSE")
+                current_ids = event["output_ids"]
+                if current_ids[: len(output_ids)] != output_ids:
+                    raise RuntimeError("generated token prefix changed during SSE")
+                if len(current_ids) > len(output_ids):
+                    output_ids = current_ids
                     now = time.monotonic()
                     if last_chunk is not None:
                         max_gap_ms = max(max_gap_ms or 0, (now - last_chunk) * 1000)
@@ -54,10 +58,12 @@ def completion(url, body, first_content, timeout):
                     chunks += 1
                     if not first_content.done():
                         first_content.set_result(None)
-                if choice["finish_reason"] is not None:
+                if meta["finish_reason"] is not None:
                     if finish_reason is not None:
                         raise RuntimeError("duplicate finish_reason")
-                    finish_reason = choice["finish_reason"]
+                    finish_reason = meta["finish_reason"]["type"]
+                    if finish_reason not in {"stop", "length"}:
+                        raise RuntimeError(meta["finish_reason"])
         raise ConnectionError("SSE EOF before [DONE]")
     except Exception as exc:
         if not first_content.done():
@@ -94,13 +100,16 @@ def run(args, prompt):
                 first_content = Future()
                 body = {
                     "model": args.model,
-                    "prompt": prompt,
+                    "input_ids": prompt,
                     "stream": True,
-                    "max_tokens": limit,
-                    "temperature": 0,
+                    "sampling_params": {
+                        "max_new_tokens": limit,
+                        "temperature": 0,
+                        "ignore_eos": args.mode == "all-long",
+                    },
                 }
                 stream = pool.submit(
-                    completion, args.smg, body, first_content, args.timeout
+                    stream_generate, args.smg, body, first_content, args.timeout
                 )
                 jobs.append((group, first_content, stream))
         deadline = time.monotonic() + args.timeout

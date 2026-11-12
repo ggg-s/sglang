@@ -40,28 +40,73 @@ class CompletionFrames:
             ensure_ascii=False,
         ).encode()
 
+    def _decode_token(self, event):
+        token = event["token_id"]
+        self.output_ids.append(token)
+        self.cursor = event["seq"]
+        text = self.decoder.step(self.tokenizer, token)
+        if text:
+            self.emitted.append(text)
+        return text
+
     def tokens(self, events):
         for event in events:
-            token = event["token_id"]
-            self.output_ids.append(token)
-            self.cursor = event["seq"]
-            text = self.decoder.step(self.tokenizer, token)
-            if text:
-                self.emitted.append(text)
+            if text := self._decode_token(event):
                 yield self.chunk(text)
+
+    def _final_text(self):
+        prefix = "".join(self.emitted)
+        final = self.tokenizer.decode(self.output_ids, skip_special_tokens=True)
+        if not final.startswith(prefix):
+            raise RuntimeError("incremental decode changed the output prefix")
+        return prefix, final
 
     def finish(self, reason):
         if reason == "abort":
             yield b'{"error":{"message":"generation aborted","type":"server_error"}}'
             return
         # A final incomplete byte sequence may still be buffered.
-        prefix = "".join(self.emitted)
-        final = self.tokenizer.decode(self.output_ids, skip_special_tokens=True)
-        if not final.startswith(prefix):
-            raise RuntimeError("incremental decode changed the output prefix")
+        prefix, final = self._final_text()
         if final[len(prefix) :]:
             yield self.chunk(final[len(prefix) :])
         yield self.chunk("", reason)
+        yield b"[DONE]"
+
+
+class GenerateFrames(CompletionFrames):
+    def __init__(self, tokenizer, rid, prompt_tokens):
+        super().__init__(tokenizer, rid, model=None)
+        self.prompt_tokens = prompt_tokens
+
+    def _chunk(self, text, reason=None):
+        return json.dumps(
+            {
+                "text": text,
+                "output_ids": self.output_ids,
+                "meta_info": {
+                    "id": self.rid,
+                    "prompt_tokens": self.prompt_tokens,
+                    "completion_tokens": len(self.output_ids),
+                    "finish_reason": reason,
+                },
+            },
+            ensure_ascii=False,
+        ).encode()
+
+    def tokens(self, events):
+        if events:
+            for event in events:
+                self._decode_token(event)
+            yield self._chunk("".join(self.emitted))
+
+    def finish(self, reason):
+        finish = {"type": reason}
+        if reason == "length":
+            finish["length"] = len(self.output_ids)
+        if reason == "abort":
+            finish.update(message="generation aborted", status_code=503)
+        _, final = self._final_text()
+        yield self._chunk(final, finish)
         yield b"[DONE]"
 
 

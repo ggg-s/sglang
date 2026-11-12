@@ -38,6 +38,22 @@ python -m sglang_router.launch_router \
 
 控制器用 `/workers` 中已注册 Decode 的 `is_healthy: false` 确认摘流。部署时保留摘流 worker 的注册记录。可用 `curl http://127.0.0.1:32000/workers` 核对六个 P/D 地址。
 
+## SMG 0.3.2 HTTP PD 入口
+
+使用 `POST /generate`，请求体带一维 `input_ids`、`sampling_params.max_new_tokens` 和 `stream: true`。SMG 给 P/D 两路注入同一组标量 bootstrap 字段。控制器返回原生 SSE，`output_ids` 累积增长，`meta_info.id` 在迁移前后保持一致。
+
+PyPI 的 `sglang-router==0.3.2` 在 `/v1/completions` 上接受字符串和字符串数组。传整数数组会在 SMG 返回 HTTP 422。当前控制器的旧 `/v1/completions` 只接受预分词输入，因此该版本的 SMG 验收统一用 `/generate`。本地已用 PyPI 0.3.2 的 arm64 macOS release wheel、模拟 P 和模拟 Decode worker 跑通真实 SMG 1P2D HTTP 转发和迁移续流。Linux/GPU 的 1P2D 和 3P3D 仍需现场验收。
+
+压测前可先使用部署模型生成的 token ID 文件发一个小请求。
+
+```bash
+jq -nc --slurpfile ids /pool/bench/prompt-64k.ids.json \
+  '{model:"dsv4-flash",input_ids:$ids[0][:16],stream:true,
+    sampling_params:{max_new_tokens:8,temperature:0}}' |
+  curl -iN --max-time 30 http://127.0.0.1:32000/generate \
+    -H 'Content-Type: application/json' --data-binary @-
+```
+
 ## 确认 Decode 身份
 
 以示例配置为准，D1 的逻辑地址是 `127.0.0.1:31118`，实际控制目录是 `/pool/ctl/D1`。D2 分别是 `127.0.0.1:31119` 和 `/pool/ctl/D2`。引擎启动时设置相应的 `HANDOFF_INSTANCE_ID`。先查控制器加载的标签，再确认 SMG 识别了两个逻辑地址。
@@ -53,7 +69,7 @@ curl -fsS http://127.0.0.1:32000/workers |
 
 ## 验收 D1 → D2
 
-先通过 SMG 发送 `/v1/completions`，请求体使用当前模型 tokenizer 生成的一维 `prompt` token ID 列表，设置 `stream: true`、`n: 1`。第一版覆盖预分词纯文本流，提供 `temperature`、`top_p` 和 `max_tokens`，高级采样、chat、批量、logprobs 和 usage 扩展留待接入。
+先通过 SMG 发送 `/generate` 流式请求。第一版覆盖单条预分词纯文本流，支持 `max_new_tokens`、`temperature`、`top_p` 和 `ignore_eos`。
 
 确认 D1 有流式输出后，从控制器所在环境下发：
 
@@ -67,7 +83,7 @@ curl -fsS http://127.0.0.1:31081/v1/drain/status
 
 1. `CORDONING` 期间 D1 的逻辑地址返回健康检查 503。已经配对的请求仍可进入 D1。
 2. 所有 SMG 副本确认摘流后，控制器持久化源端封锁、成员清单和自然排空截止时间。启用 `--natural-drain-ms` 时，`NATURAL_DRAINING` 期间源端继续 Decode。成员全部结束且源端空闲时可提前进入 `SAFE_TO_STOP`。此后迟到的已配对请求沿用原 room，进入显式指定的可用目的 D。
-3. 比较同一请求的 SSE ID、文本和 `[DONE]`。用下方命令确认该轮源/目的和迁移结果。至少一条成员同时出现 `owner=D2` 和 `migration_outcome=migrated`，才说明有在途请求实际迁到 D2。成员为空只证明摘流。只有 `SAFE_TO_STOP` 才能停物理 D1。控制器和逻辑 D1 监听进程继续服务迁走的流。
+3. 比较同一请求的 `meta_info.id`、累积 token 前缀和 `[DONE]`。用下方命令确认该轮源/目的和迁移结果。至少一条成员同时出现 `owner=D2` 和 `migration_outcome=migrated`，才说明有在途请求实际迁到 D2。成员为空只证明摘流。只有 `SAFE_TO_STOP` 才能停物理 D1。控制器和逻辑 D1 监听进程继续服务迁走的流。
 4. 再验证 P leg 失败导致 SMG 关闭 Decode HTTP 连接。确认首 token 前的 D 请求也会取消，原生 KV 走正常回收。
 
 ```bash
@@ -131,7 +147,7 @@ python plugins/remote_attn/control_plane/migration_controller.py \
 
 启动本轮 SMG，确认三个 Decode 在 `/workers` 均为健康。终端二设置本轮的 `variant` 和控制器打印的 `state_dir`。输入文件是一份由部署模型 tokenizer 生成的一维 token ID JSON 数组，复现 64K 用例时提供 65,536 个 ID。脚本通过 SMG 发起流式请求，观察到每条流有文本后，从本机管理端口下发一次 D1→D2。传入同轮 journal 可按请求记录初始 Decode，区分源、目标和池中其他前台请求。
 
-四条长请求全迁时发 12 条长请求，三个健康 Decode 轮询各接四条。
+四条长请求全迁时发 12 条长请求，三个健康 Decode 轮询各接四条。脚本在此模式设置 `ignore_eos: true`。1P2D 下用 `--per-group 8`。
 
 ```bash
 variant=all-long-k1-precopy0
@@ -144,7 +160,7 @@ python test/manual/remote_attn/bench_native_pd_mixed_drain.py \
   --output "/pool/bench/${variant}.json"
 ```
 
-长短混跑时发六条短请求和六条长请求。
+长短混跑时发六条短请求和六条长请求，允许 EOS 自然结束。1P2D 下可用 `--per-group 4`。
 
 ```bash
 variant=mixed-k2-precopy400
@@ -171,6 +187,6 @@ jq '{mode, valid_run, source_safe_to_stop_ms, activate_to_safe_to_stop_ms,
 
 两种模式都要求所有流收到一次结束原因和 `[DONE]`。全迁样本需要 D1 四条全部迁到 D2，源和目的端均有控制 wave，且 Freeze 意图到目标接管的重叠峰值达到本轮切换额度。混跑样本需要 D1 至少有一条短请求以零次迁移尝试自然完成、一条长请求实际迁到 D2。源端请求提前 EOS 或分流导致样本不满足条件时，脚本仍输出结果并返回非零。若 512 的输出不足以维持四条在途，成组用同一个更长输出上限重跑，并记录实际配置。
 
-`source_safe_to_stop_ms` 从 POST 发出前计时，含 SMG 摘流。 `activate_to_safe_to_stop_ms` 从控制器确认摘流并封入口的边界计时，包含自然等待、迁移和源端回收。Pre-copy 对照同时看 `moved_precopy_bytes`、冻结剩余字节和切换时间。按 `initial_decode` 看未迁请求的最大文本 chunk 间隔，单 token ITL 以引擎计时为准。
+`source_safe_to_stop_ms` 从 POST 发出前计时，含 SMG 摘流。 `activate_to_safe_to_stop_ms` 从控制器确认摘流并封入口的边界计时，包含自然等待、迁移和源端回收。Pre-copy 对照同时看 `moved_precopy_bytes`、冻结剩余字节和切换时间。按 `initial_decode` 看未迁请求携带新增 token 的 SSE chunk 最大间隔，单 token ITL 以引擎计时为准。
 
-本地回归覆盖三个回环监听端口、bootstrap 透传、同一 SSE 的 D2D 续流、摘流撤销、四路控制 RPC 打包、阶段额度及固定 Pre-copy 窗口。SMG 原生进程与真实 3P3D GPU/RDMA 性能在目标环境验收。
+本地回归覆盖三个回环监听端口、bootstrap 透传、同一 SSE 的 D2D 续流、摘流撤销、四路控制 RPC 打包、阶段额度及固定 Pre-copy 窗口。真实 3P3D GPU/RDMA 性能在目标环境验收。

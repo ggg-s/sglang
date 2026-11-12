@@ -734,7 +734,7 @@ class TestNativePdDecode(CustomTestCase):
     def bootstrap(room):
         return dict(bootstrap_host="p1", bootstrap_port=35409, bootstrap_room=room)
 
-    async def start_completion(self, room, port=31117):
+    async def start_completion(self, room, port=31117, *, generate=False):
         requests, responses = asyncio.Queue(), asyncio.Queue()
         body = dict(
             model="test-model",
@@ -746,12 +746,22 @@ class TestNativePdDecode(CustomTestCase):
             stop=None,
             **self.bootstrap(room),
         )
+        if generate:
+            body = dict(
+                model="test-model",
+                input_ids=[0],
+                stream=True,
+                sampling_params=dict(max_new_tokens=16, temperature=0, ignore_eos=True),
+                log_metrics=True,
+                return_text_in_logprobs=False,
+                **self.bootstrap(room),
+            )
         await requests.put(dict(type="http.request", body=json.dumps(body).encode()))
         task = asyncio.create_task(
             self.app(
                 {
                     "server": ("127.0.0.1", port),
-                    "path": "/v1/completions",
+                    "path": "/generate" if generate else "/v1/completions",
                     "method": "POST",
                 },
                 requests.get,
@@ -906,8 +916,16 @@ class TestNativePdDecode(CustomTestCase):
             self.assertEqual(len(submitted), 2)
 
     def test_preserves_smg_bootstrap_and_one_sse_through_handoff(self):
+        self.assert_sse_handoff()
+
+    def test_generate_keeps_native_token_prefix_and_room_through_handoff(self):
+        self.assert_sse_handoff(generate=True)
+
+    def assert_sse_handoff(self, *, generate=False):
         async def run():
-            task, requests, responses = await self.start_completion(731)
+            task, requests, responses = await self.start_completion(
+                731, generate=generate
+            )
             try:
                 await self.wait_for_submission()
                 await asyncio.to_thread(self.controller.tick)
@@ -918,9 +936,15 @@ class TestNativePdDecode(CustomTestCase):
                     self.bootstrap(731),
                 )
                 self.assertIsNone(payload["prefill_url"])
+                self.assertEqual(payload["sampling"]["ignore_eos"], generate)
                 self.assertEqual((await self.next_response(responses))["status"], 200)
                 first = json.loads((await self.next_response(responses))["body"][6:])
-                self.assertEqual(first["choices"][0]["text"], "A")
+                if generate:
+                    self.assertEqual(first["text"], "A")
+                    self.assertEqual(first["output_ids"], [1, 2])
+                    self.assertIsNone(first["meta_info"]["finish_reason"])
+                else:
+                    self.assertEqual(first["choices"][0]["text"], "A")
 
                 pending = self.controller.start_named_drain("D0", "D1")
                 self.assertEqual(pending["state"], "CORDONING")
@@ -930,8 +954,15 @@ class TestNativePdDecode(CustomTestCase):
                 for _ in range(12):
                     await asyncio.to_thread(self.controller.tick)
                 result = json.loads((await self.next_response(responses))["body"][6:])
-                self.assertEqual(result["choices"][0]["text"], "中")
-                self.assertEqual(result["id"], first["id"])
+                if generate:
+                    self.assertEqual(result["text"], "A中")
+                    self.assertEqual(result["output_ids"], [1, 2, 3, 4])
+                    self.assertEqual(
+                        result["meta_info"]["id"], first["meta_info"]["id"]
+                    )
+                else:
+                    self.assertEqual(result["choices"][0]["text"], "中")
+                    self.assertEqual(result["id"], first["id"])
                 status = self.controller.drain_status()
                 self.assertEqual(status["state"], "SAFE_TO_STOP")
                 self.assertEqual(status["id"], pending["id"])
@@ -941,7 +972,13 @@ class TestNativePdDecode(CustomTestCase):
                     row.update(finished=True, kv_released=True, finish_type="stop")
                 await asyncio.to_thread(self.controller.tick)
                 final = json.loads((await self.next_response(responses))["body"][6:])
-                self.assertEqual(final["choices"][0]["finish_reason"], "stop")
+                if generate:
+                    self.assertEqual(final["output_ids"], result["output_ids"])
+                    self.assertEqual(
+                        final["meta_info"]["finish_reason"], {"type": "stop"}
+                    )
+                else:
+                    self.assertEqual(final["choices"][0]["finish_reason"], "stop")
                 self.assertEqual(
                     (await self.next_response(responses))["body"], b"data: [DONE]\n\n"
                 )

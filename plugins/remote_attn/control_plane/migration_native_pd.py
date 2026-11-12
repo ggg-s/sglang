@@ -15,7 +15,7 @@ from urllib.parse import urlsplit
 from urllib.request import Request, urlopen
 
 from migration_controller import MigrationController
-from migration_http import CompletionFrames
+from migration_http import CompletionFrames, GenerateFrames
 from p4_dsv_gateway import DrainConflict
 
 MAX_REQUEST_BYTES = 4 * 1024 * 1024
@@ -50,6 +50,26 @@ NEUTRAL_FIELDS = {
     "return_cached_tokens_details": False,
     "return_spec_tokens_details": False,
     "return_token_ids": False,
+}
+GENERATE_FIELDS = {
+    "model",
+    "input_ids",
+    "sampling_params",
+    "stream",
+    "rid",
+    "bootstrap_host",
+    "bootstrap_port",
+    "bootstrap_room",
+}
+GENERATE_NEUTRAL_FIELDS = {
+    "return_logprob": False,
+    "return_text_in_logprobs": False,
+    "log_metrics": True,
+    "return_hidden_states": False,
+    "background": False,
+    "no_logs": False,
+    "return_bytes": False,
+    "return_entropy": False,
 }
 
 
@@ -396,6 +416,45 @@ def parse_completion(body, model, vocab_size):
     return request, dict(bootstrap_host=host, bootstrap_port=port, bootstrap_room=room)
 
 
+def parse_generate(body, model, vocab_size):
+    if not isinstance(body, dict):
+        raise ValueError("expected a generate request object")
+    for field, value in body.items():
+        if field in GENERATE_FIELDS or value is None:
+            continue
+        if (
+            field not in GENERATE_NEUTRAL_FIELDS
+            or value != GENERATE_NEUTRAL_FIELDS[field]
+        ):
+            raise ValueError(f"unsupported generate parameter: {field}")
+    sampling = body.get("sampling_params")
+    if not isinstance(sampling, dict) or "max_new_tokens" not in sampling:
+        raise ValueError("sampling_params must include max_new_tokens")
+    if set(sampling) - {"max_new_tokens", "temperature", "top_p", "ignore_eos"}:
+        raise ValueError("unsupported generate sampling parameter")
+    ignore_eos = sampling.get("ignore_eos", False)
+    if type(ignore_eos) is not bool:
+        raise ValueError("ignore_eos must be a boolean")
+    request, bootstrap = parse_completion(
+        {
+            "model": model if body.get("model") is None else body["model"],
+            "prompt": body.get("input_ids"),
+            "stream": body.get("stream"),
+            "max_tokens": sampling["max_new_tokens"],
+            "temperature": sampling.get("temperature", 1.0),
+            "top_p": sampling.get("top_p", 1.0),
+            **{
+                field: body.get(field)
+                for field in ("bootstrap_host", "bootstrap_port", "bootstrap_room")
+            },
+        },
+        model,
+        vocab_size,
+    )
+    request["sampling_params"]["ignore_eos"] = ignore_eos
+    return request, bootstrap
+
+
 async def _response(send, status, payload):
     await send(
         {
@@ -447,18 +506,22 @@ class NativeDecodeApp:
         path, method = scope["path"], scope["method"]
         if method == "GET":
             return await self._get(worker, path, send)
-        if method != "POST" or path != "/v1/completions":
+        if method != "POST" or path not in {"/v1/completions", "/generate"}:
             return await _error(send, 404, "unknown Decode route")
+        generate = path == "/generate"
         try:
             body = await _read_body(receive)
             if body is None:
                 return
-            request, bootstrap = parse_completion(
+            parser = parse_generate if generate else parse_completion
+            request, bootstrap = parser(
                 json.loads(body), self.model, len(self.controller.tokenizer)
             )
         except (ValueError, UnicodeError) as exc:
             return await _error(send, 400, str(exc))
-        stream = asyncio.create_task(self._completion(worker, request, bootstrap, send))
+        stream = asyncio.create_task(
+            self._completion(worker, request, bootstrap, send, generate=generate)
+        )
         disconnect = asyncio.create_task(_wait_disconnect(receive))
         try:
             done, _ = await asyncio.wait(
@@ -507,7 +570,7 @@ class NativeDecodeApp:
             )
         return await _error(send, 404, "unknown Decode route")
 
-    async def _completion(self, worker, request, bootstrap, send):
+    async def _completion(self, worker, request, bootstrap, send, *, generate=False):
         controller = self.controller
         submit = asyncio.create_task(
             asyncio.to_thread(controller.accept_native, worker, request, bootstrap)
@@ -523,8 +586,11 @@ class NativeDecodeApp:
                 return await _error(send, 400, str(exc))
             except (RuntimeError, OSError):
                 return await _error(send, 503, "Decode worker is unavailable")
-            frames = CompletionFrames(
-                controller.tokenizer.backend_tokenizer, rid, self.model
+            tokenizer = controller.tokenizer.backend_tokenizer
+            frames = (
+                GenerateFrames(tokenizer, rid, len(request["prompt_ids"]))
+                if generate
+                else CompletionFrames(tokenizer, rid, self.model)
             )
             last_write = time.monotonic()
             while not controller.stop.is_set():
