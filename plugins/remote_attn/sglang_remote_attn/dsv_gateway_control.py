@@ -25,11 +25,14 @@ def instance(controller):
 def request_status(controller, req):
     blocker = d2d.migration_blocker(controller.scheduler, req)
     plan_blocker = d2d.planning_blocker(req)
+    reason = getattr(req, "finished_reason", None)
+    to_json = getattr(reason, "to_json", None)
     return dict(
         rid=req.rid,
         output_ids=list(req.output_ids),
         finished=bool(req.finished()),
-        finished_reason=str(getattr(req, "finished_reason", None)),
+        finished_reason=str(reason),
+        finish_type=to_json()["type"] if to_json is not None else None,
         kv_len=int(req.kv.kv_committed_len),
         kv_released=not req.kv.holds_kv,
         frozen=bool(getattr(req, "_handoff_frozen", False)),
@@ -175,6 +178,15 @@ def handle(controller, data):
     if cmd == "d2d_cancel":
         req = tracked.get(rid)
         if req is None:
+            if data.get("cancel_pending_submit") is True:
+                # The scheduler serializes this with submit on every rank.
+                # A lost submit reply must not cause a disconnected stream
+                # to be enqueued later under the same epoch and request ID.
+                cancelled = getattr(controller, "d2d_cancelled_submissions", None)
+                if cancelled is None:
+                    cancelled = controller.d2d_cancelled_submissions = set()
+                cancelled.add((epoch, rid))
+                return dict(cancelled=True, finished=True, kv_released=True)
             raise KeyError("P4 cancel requires a known native request")
         if req.finished():
             return dict(cancelled=True, finished=True, kv_released=not req.kv.holds_kv)
@@ -212,6 +224,9 @@ def handle(controller, data):
         )
     }
     payload["prepare_migration"] = data.get("prepare_migration")
+    payload["external_prefill"] = data.get("external_prefill", False)
+    if (epoch, rid) in getattr(controller, "d2d_cancelled_submissions", ()):
+        raise ValueError("native PD submission was cancelled")
     previous = controller.d2d_submissions.get(epoch)
     if previous is not None:
         if previous != payload:
@@ -236,9 +251,16 @@ def handle(controller, data):
 
         from .handoff_control import _new_req
 
-        url = urlparse(payload["prefill_url"])
-        if url.scheme not in {"http", "https"} or not url.hostname:
-            raise ValueError("native PD prefill requires an HTTP(S) URL")
+        external = payload["external_prefill"]
+        if type(external) is not bool:
+            raise ValueError("external_prefill must be a boolean")
+        if external:
+            if payload["prefill_url"] is not None:
+                raise ValueError("externally dispatched Prefill cannot include a Prefill URL")
+        else:
+            url = urlparse(payload["prefill_url"])
+            if url.scheme not in {"http", "https"} or not url.hostname:
+                raise ValueError("native PD prefill requires an HTTP(S) URL")
         params = SamplingParams(**payload["sampling"])
         params.normalize(scheduler.tokenizer)
         req = _new_req(
@@ -266,7 +288,7 @@ def handle(controller, data):
     req._handoff_pd = True
     try:
         scheduler._add_request_to_queue(req)
-        if controller.rank == 0:
+        if controller.rank == 0 and not payload["external_prefill"]:
             req._d2d_prefill_thread = threading.Thread(
                 target=prefill,
                 args=(req, payload),

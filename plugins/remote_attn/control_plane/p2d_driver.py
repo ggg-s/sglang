@@ -24,7 +24,6 @@ from transformers import AutoTokenizer
 
 CTL = Path(os.environ.get("HANDOFF_CTL_DIR", "/workspace/handoff_ctl"))
 STATE = Path(os.environ.get("HANDOFF_STATE_DIR", "/workspace/handoff_state"))
-STATE.mkdir(parents=True, exist_ok=True)
 MODEL = os.environ.get("HANDOFF_MODEL", "/workspace/models/Qwen3-8B")
 _READY_WAIT_S = 60.0
 _BARE_LEGACY_WAIT_S = 2.0
@@ -46,13 +45,12 @@ def control_dir(role: str) -> Path:
     return Path(explicit) if explicit else CTL / role
 
 
-def _ready(role: str) -> list:
+def _ready(base: Path) -> list:
     """Live rank readiness files written atomically by RemoteHub on each rank.
 
     Reads exact names (no directory scan): ``ready.0.json`` defines tp_size and
     the remaining eager per-rank files are read directly.
     """
-    base = control_dir(role)
     first = base / "ready.0.json"
     try:
         info0 = json.loads(first.read_text(encoding="utf-8"))
@@ -115,20 +113,23 @@ def _send_legacy(d: Path, role: str, payload: dict, timeout: float) -> dict:
 
 
 def send(role: str, payload: dict, timeout: float = 300.0) -> dict:
-    # The file control protocol has a single command slot per role.  The
+    return send_to(control_dir(role), role, payload, timeout)
+
+
+def send_to(directory: Path, role: str, payload: dict, timeout: float = 300.0) -> dict:
+    # The file control protocol has a single command slot per directory.  The
     # Router (b1_proxy) and the Migration Controller (p4_gateway) can both be
     # alive after a failover, so serialize cross-process access with flock.
     advisory = payload["cmd"] == "d2d_worker_status"
-    with _role_lock(role, blocking=not advisory):
-        return _send_unlocked(role, payload, timeout)
+    with _role_lock(directory, blocking=not advisory):
+        return _send_unlocked(directory, role, payload, timeout)
 
 
 @contextlib.contextmanager
-def _role_lock(role: str, *, blocking: bool = True):
+def _role_lock(d: Path, *, blocking: bool = True):
     if fcntl is None:
         yield
         return
-    d = control_dir(role)
     d.mkdir(parents=True, exist_ok=True)
     fh = open(d / ".control.lock", "a+")
     with fh:
@@ -137,18 +138,17 @@ def _role_lock(role: str, *, blocking: bool = True):
         yield
 
 
-def _send_unlocked(role: str, payload: dict, timeout: float = 300.0) -> dict:
-    d = control_dir(role)
+def _send_unlocked(d: Path, role: str, payload: dict, timeout: float) -> dict:
     d.mkdir(parents=True, exist_ok=True)
     advisory = payload["cmd"] == "d2d_worker_status"
-    infos = _ready(role)
+    infos = _ready(d)
     if not infos and not advisory:
         # A new server may still be creating its Hub/ready file, but an old
         # single-rank server never publishes one: cap the wait, then go legacy.
         deadline = time.time() + _BARE_LEGACY_WAIT_S
         while not infos and time.time() < deadline:
             time.sleep(0.1)
-            infos = _ready(role)
+            infos = _ready(d)
     if not infos and str(payload.get("cmd", "")).startswith("d2d_"):
         raise RuntimeError(f"{role}: D2D requires live ready.<rank>.json files in {d}; refusing nonce-free legacy control")
     if not infos:
@@ -162,7 +162,7 @@ def _send_unlocked(role: str, payload: dict, timeout: float = 300.0) -> dict:
         deadline = time.time() + _READY_WAIT_S
         while time.time() < deadline:
             time.sleep(0.1)
-            infos = _ready(role)
+            infos = _ready(d)
             if not infos:
                 continue
             ranks = [int(i.get("rank", 0)) for i in infos]
@@ -310,6 +310,7 @@ def release(role: str, rid: str):
 
 
 def main() -> int:
+    STATE.mkdir(parents=True, exist_ok=True)
     tok = AutoTokenizer.from_pretrained(MODEL)
     base = (
         "The quick brown fox jumps over the lazy dog. "

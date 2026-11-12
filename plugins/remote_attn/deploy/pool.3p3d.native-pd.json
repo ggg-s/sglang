@@ -1,0 +1,37 @@
+{
+  "model_path": "/models/deepseek-ai/DeepSeek-V4-Flash-0731",
+  "served_model_name": "dsv4-flash",
+  "state_dir": "/pool/state/migration-controller-native-pd",
+  "prefill": {
+    "P0": {
+      "url": "http://p0:31016/generate",
+      "bootstrap_host": "p0",
+      "bootstrap_port": 35409
+    },
+    "P1": {
+      "url": "http://p1:31016/generate",
+      "bootstrap_host": "p1",
+      "bootstrap_port": 35409
+    },
+    "P2": {
+      "url": "http://p2:31016/generate",
+      "bootstrap_host": "p2",
+      "bootstrap_port": 35409
+    }
+  },
+  "decode": {
+    "D0": "/pool/ctl/D0",
+    "D1": "/pool/ctl/D1",
+    "D2": "/pool/ctl/D2"
+  },
+  "native_pd": {
+    "decode_urls": {
+      "D0": "http://127.0.0.1:31117",
+      "D1": "http://127.0.0.1:31118",
+      "D2": "http://127.0.0.1:31119"
+    },
+    "smg_admin_urls": [
+      "http://127.0.0.1:32000"
+    ]
+  }
+}

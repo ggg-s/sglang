@@ -168,6 +168,10 @@ class Payloads:
         return value
 
 
+class DrainConflict(RuntimeError):
+    pass
+
+
 class StatusBusy(Exception):
     """Skip advisory polling while a mutation is queued; keep the last facts."""
 
@@ -188,6 +192,7 @@ def latency_histogram(samples):
 
 class DsvGateway:
     protocol = PROTOCOL
+    journal_filename = "dsv_gateway_journal.json"
 
     def __init__(
         self,
@@ -203,13 +208,20 @@ class DsvGateway:
         autostart=True,
         async_handoff=False,
         disable_precopy=False,
+        decode_workers=None,
+        precopy_window_ms=0,
     ):
         self.driver, self.tokenizer = driver, tokenizer
+        self.decode_workers = decode_workers or {}
+        self.control_workers = tuple(self.decode_workers or ("src", "dst"))
+        self.precopy_window_s = precopy_window_ms / 1000
+        if precopy_window_ms < 0:
+            raise ValueError("precopy window must be nonnegative")
         self.prefill_url, self.bootstrap_host = prefill_url, bootstrap_host
         self.bootstrap_port = int(bootstrap_port)
         self.poll_s = max(float(poll_ms) / 1000, 0.003)
         self.out = Path(out) if out else None
-        self.path = Path(state_dir) / "dsv_gateway_journal.json"
+        self.path = Path(state_dir) / self.journal_filename
         self.path.parent.mkdir(parents=True, exist_ok=True)
         self.payloads = Payloads(self.path.parent / "dsv_payloads")
         self.tick_cursor = 0
@@ -225,9 +237,10 @@ class DsvGateway:
         self.cv = threading.Condition(self.lock)
         self.stop = threading.Event()
         self.facts, self.fact_errors = {}, {}
+        self.facts_at = {}
         self.connections = set()
-        self.role_locks = {role: threading.Lock() for role in ("src", "dst")}
-        self.command_waiters = dict(src=0, dst=0)
+        self.role_locks = {role: threading.Lock() for role in self.control_workers}
+        self.command_waiters = dict.fromkeys(self.control_workers, 0)
         self.dst_slot_holder = None
         self.dst_slot_history = deque(maxlen=256)
         self.control_latencies = {}
@@ -302,6 +315,7 @@ class DsvGateway:
                     raise ValueError(
                         "incomplete DSV gateway journal; refusing recovery"
                     )
+            self._validate_worker_bindings()
             migrated = self.journal["version"] == 1
             for rid, entry in list(self.journal["entries"].items()):
                 self.journal["entries"][rid] = self.payloads.pack(entry)
@@ -314,19 +328,37 @@ class DsvGateway:
             raise
         self.thread = None
         if autostart:
-            for role in ("src", "dst"):
+            for role in self.control_workers:
                 poller = threading.Thread(
                     target=self._poll_role,
                     args=(role,),
                     daemon=True,
-                    name="p4-dsv-status-" + role,
+                    name="dsv-worker-status-" + role,
                 )
                 self.status_threads.append(poller)
                 poller.start()
             self.thread = threading.Thread(
-                target=self._loop, daemon=True, name="p4-dsv-reconcile"
+                target=self._loop, daemon=True, name="dsv-reconcile"
             )
             self.thread.start()
+
+    def _validate_worker_bindings(self):
+        configured = {name: str(path) for name, path in self.decode_workers.items()}
+        if self.path.exists():
+            if self.journal.get("decode_workers", {}) != configured:
+                raise ValueError("migration journal Decode registry changed")
+        elif configured:
+            self.journal.update(decode_workers=configured, fenced_workers={})
+
+    @staticmethod
+    def _worker(entry, role):
+        workers = entry.get("workers") if entry is not None else None
+        return role if workers is None else workers[role]
+
+    def _call_for(self, entry, role, cmd, epoch, **payload):
+        if self.decode_workers:
+            payload["expected_instances"] = entry["instances"][role]
+        return self._call(self._worker(entry, role), cmd, epoch, **payload)
 
     def close(self):
         if self.fd < 0:
@@ -575,14 +607,15 @@ class DsvGateway:
                 holder = dict(cmd=cmd, members=commands, started=submitted)
                 with self.lock:
                     self.dst_slot_holder = holder
-            rows = self.rows(
-                self.driver.send(
-                    role,
-                    dict(cmd=cmd, migration_epoch=epoch, **payload),
-                    timeout=2 if status else 30,
+            command = dict(cmd=cmd, migration_epoch=epoch, **payload)
+            timeout = 2 if status else 30
+            if self.decode_workers:
+                response = self.driver.send_to(
+                    self.decode_workers[role], role, command, timeout=timeout
                 )
-            )
-            return rows
+            else:
+                response = self.driver.send(role, command, timeout=timeout)
+            return self.rows(response)
         finally:
             ended = time.monotonic()
             with self.lock:
@@ -724,22 +757,38 @@ class DsvGateway:
                 ),
             )
 
+    @staticmethod
+    def _check_worker(rows):
+        if not rows or any(
+            r.get("protocol") != PROTOCOL
+            or r.get("rank") != rank
+            or r.get("tp_size") != len(rows)
+            or not r.get("instance_id")
+            for rank, r in enumerate(rows)
+        ):
+            raise RuntimeError("DSV worker protocol/TP identity mismatch")
+
     def _refresh_role(self, role):
         with self.lock:
-            if role == "src" and (self.journal["drain"] or {}).get("stopped"):
+            drain = self.journal["drain"]
+            if self.decode_workers:
+                if role in self.journal["fenced_workers"] and (
+                    role != drain["src"] or drain.get("source_released_at")
+                ):
+                    return
+            elif role == "src" and (drain or {}).get("stopped"):
                 return
         try:
             rows = self._call(role, "d2d_worker_status")
-            if any(
-                r.get("protocol") != PROTOCOL
-                or r.get("rank") != rank
-                or r.get("tp_size") != len(rows)
-                or not r.get("instance_id")
-                for rank, r in enumerate(rows)
-            ):
-                raise RuntimeError("DSV worker protocol/TP identity mismatch")
+            self._check_worker(rows)
             with self.cv:
+                drain = self.journal["drain"]
+                if self.decode_workers and drain and not drain.get("source_released_at"):
+                    expected = drain["instances"].get(role)
+                    if expected is not None and [r["instance_id"] for r in rows] != expected:
+                        raise RuntimeError(f"{role} restarted during migration")
                 self.facts[role] = rows
+                self.facts_at[role] = time.monotonic()
                 self.fact_errors.pop(role, None)
                 self.cv.notify_all()
         except (StatusBusy, BlockingIOError, TimeoutError):
@@ -758,14 +807,15 @@ class DsvGateway:
             self.stop.wait(self.poll_s)
 
     def _refresh(self):
-        for role in ("src", "dst"):
+        for role in self.control_workers:
             self._refresh_role(role)
 
     def _bound(self, entry, roles=None):
         for role in roles or entry["instances"]:
-            if role in self.fact_errors or role not in self.facts:
-                raise ConnectionError(f"{role} unavailable; ownership unchanged")
-            actual = [r["instance_id"] for r in self.facts[role]]
+            worker = self._worker(entry, role)
+            if worker in self.fact_errors or worker not in self.facts:
+                raise ConnectionError(f"{worker} unavailable; ownership unchanged")
+            actual = [r["instance_id"] for r in self.facts[worker]]
             if actual != entry["instances"][role]:
                 raise RuntimeError(
                     f"{role} worker restarted; refusing stale epoch recovery"
@@ -773,7 +823,10 @@ class DsvGateway:
 
     def _request(self, entry, role):
         rid = entry["source_rid"] if role == "src" else entry["target_rid"]
-        rows = [r.get("requests", {}).get(rid) for r in self.facts.get(role, [])]
+        rows = [
+            r.get("requests", {}).get(rid)
+            for r in self.facts.get(self._worker(entry, role), ())
+        ]
         if not rows or any(row is None for row in rows):
             return None
         outputs = [r["output_ids"] for r in rows]
@@ -781,11 +834,13 @@ class DsvGateway:
         # publish the common prefix; never mistake lag for different ownership.
         size = min(map(len, outputs))
         prefix = outputs[0][:size]
-        if any(o[:size] != prefix for o in outputs):
+        finished = all(r["finished"] for r in rows)
+        if any(o[:size] != prefix or (finished and len(o) != size) for o in outputs):
             raise RuntimeError("TP output token history diverged")
         return dict(
             output_ids=prefix,
-            finished=all(r["finished"] for r in rows),
+            finished=finished,
+            finish_reason=rows[0].get("finish_type") if finished else None,
             kv_released=all(r["kv_released"] for r in rows),
             plan_ready=all(
                 r.get("plan_ready", r.get("migration_ready", False)) for r in rows
@@ -814,10 +869,27 @@ class DsvGateway:
 
     def _states(self, entry, role):
         return [
-            r.get("migrations", {}).get(entry["epoch"], {}) for r in self.facts[role]
+            r.get("migrations", {}).get(entry["epoch"], {}) for r in self.facts[self._worker(entry, role)]
         ]
 
-    def accept(self, body, role=None):
+    def _admission(self, role):
+        drain = self.journal["drain"]
+        role = role or ("dst" if drain and drain["active"] else "src")
+        if role not in self.facts or role in self.fact_errors:
+            raise RuntimeError(f"{role} worker not ready")
+        return dict(
+            owner=role,
+            initial_owner=role,
+            instances={role: [r["instance_id"] for r in self.facts[role]]},
+            prefill_url=self.prefill_url,
+            bootstrap_host=self.bootstrap_host,
+            bootstrap_port=self.bootstrap_port,
+        )
+
+    def _external_admission(self, role, bootstrap):
+        raise ValueError("this controller does not accept external PD requests")
+
+    def accept(self, body, role=None, *, external_pd=None):
         prompt = body.get("prompt_ids", body.get("input_ids", body.get("prompt")))
         if isinstance(prompt, str):
             prompt = self.tokenizer.encode(prompt)
@@ -827,7 +899,7 @@ class DsvGateway:
             or any(type(x) is not int or x < 0 for x in prompt)
         ):
             raise ValueError("DSV P4 requires nonempty prompt token ids or prompt text")
-        if not self.prefill_url:
+        if not self.prefill_url and not self.decode_workers:
             raise ValueError("DSV P4 requires HANDOFF_PD_PREFILL_URL")
         rid = str(body.get("rid") or uuid.uuid4().hex)
         if re.fullmatch(r"[A-Za-z0-9_-]{1,128}", rid) is None:
@@ -847,10 +919,13 @@ class DsvGateway:
         with self.cv:
             if rid in self.journal["entries"]:
                 raise ValueError("rid already exists; reconnect using /v1/attach")
-            drain = self.journal["drain"]
-            role = role or ("dst" if drain and drain["active"] else "src")
-            if role not in self.facts or role in self.fact_errors:
-                raise RuntimeError(f"{role} worker not ready")
+            if external_pd is None:
+                admission = self._admission(role)
+            else:
+                admission = self._external_admission(role, external_pd)
+            room = admission.pop("bootstrap_room", None)
+            if room is None:
+                room = (uuid.uuid4().int & ((1 << 63) - 1)) or 1
             uid = uuid.uuid4().hex
             entry = dict(
                 rid=rid,
@@ -860,18 +935,13 @@ class DsvGateway:
                 admission_epoch="move-" + uid,
                 epoch=None,
                 phase="SUBMIT",
-                owner=role,
-                initial_owner=role,
                 input_ids=prompt,
                 sampling=sampling,
                 max_new=max_new,
                 cut=int(body.get("cut", max_new)),
                 growth_tokens=int(body.get("growth_tokens", 128)),
-                bootstrap_room=(uuid.uuid4().int & ((1 << 63) - 1)) or 1,
-                bootstrap_host=self.bootstrap_host,
-                bootstrap_port=self.bootstrap_port,
-                prefill_url=self.prefill_url,
-                instances={role: [r["instance_id"] for r in self.facts[role]]},
+                bootstrap_room=room,
+                **admission,
                 attempts=0,
                 cancel_requested=False,
                 cut_attempted=False,
@@ -907,17 +977,29 @@ class DsvGateway:
             cancellation_pending=self._entry(rid)["phase"] not in TERMINAL,
         )
 
-    def _begin(self, entry):
+    def _migration_target(self, entry):
         if "dst" not in self.facts or "dst" in self.fact_errors:
             raise RuntimeError("target unavailable before reservation")
+        return "dst"
+
+    def _begin(self, entry):
+        target = self._migration_target(entry)
+        if target is None:
+            return
         instances = dict(
-            entry["instances"], dst=[r["instance_id"] for r in self.facts["dst"]]
+            entry["instances"], dst=[r["instance_id"] for r in self.facts[target]]
         )
         if len(instances["src"]) != len(instances["dst"]):
             raise RuntimeError("source/target TP size mismatch")
+        binding = (
+            {"workers": {**entry["workers"], "dst": target}}
+            if "workers" in entry
+            else {}
+        )
         self._update(
             entry["rid"],
             phase="PLAN",
+            **binding,
             epoch=entry["admission_plans"][0]["epoch"]
             if entry.get("admission_plans")
             else "move-" + uuid.uuid4().hex,
@@ -952,20 +1034,34 @@ class DsvGateway:
             migration_skip_reason=None,
         )
 
-    @staticmethod
-    def _cut_due(entry, request):
-        return bool(request["output_ids"]) and (
-            entry["migration_requested"] or len(request["output_ids"]) >= entry["cut"]
-        )
+    def _cut_due(self, entry, request):
+        if not request["output_ids"]:
+            return False
+        if len(request["output_ids"]) >= entry["cut"]:
+            return True
+        if not entry["migration_requested"]:
+            return False
+        if not self.precopy_window_s or self.disable_precopy:
+            return True
+        if entry["phase"] in {"SUBMIT", "SOURCE", "PLAN", "RESERVE"}:
+            return False
+        if not all(
+            r.get("precopy_protocol") == "closed-page-precopy-v1"
+            for role in ("src", "dst")
+            for r in self.facts.get(self._worker(entry, role), ())
+        ):
+            return True
+        return entry.get("precopy_until", 0) <= time.time()
 
-    def _async_handoff(self):
-        workers = self.facts.get("dst", ())
+    def _async_handoff(self, entry=None):
+        worker = "dst" if entry is None else self._worker(entry, "dst")
+        workers = self.facts.get(worker, ())
         return self.async_handoff and bool(workers) and all(
             r.get("async_handoff_supported") for r in workers
         )
 
     def _control_waves(self):
-        return self._async_handoff() and all(
+        return not self.decode_workers and self._async_handoff() and all(
             rows and all(row.get("control_wave_supported") for row in rows)
             for rows in (self.facts.get("src"), self.facts.get("dst"))
         )
@@ -1101,7 +1197,7 @@ class DsvGateway:
             if not all(
                 r.get("precopy_protocol") == "closed-page-precopy-v1"
                 for role in ("src", "dst")
-                for r in self.facts.get(role, [])
+                for r in self.facts.get(self._worker(entry, role), ())
             ):
                 return
             # A reservation owns one receiver for all frames. Pin its negotiated
@@ -1113,7 +1209,10 @@ class DsvGateway:
             if capacity is None:
                 max_bytes = upper_pages * max(e[-1] for e in schema["entries"])
                 cap = 16 * 1024 * 1024 if max_bytes > 4 * 1024 * 1024 else 4 * 1024 * 1024
-                facts = [self.facts.get(role, []) for role in ("src", "dst")]
+                facts = [
+                    self.facts.get(self._worker(entry, role), ())
+                    for role in ("src", "dst")
+                ]
                 if all(facts) and all(
                     row.get("precopy_rdma") is True for rows in facts for row in rows
                 ):
@@ -1279,13 +1378,26 @@ class DsvGateway:
         if phase == "SUBMIT":
             role = entry["initial_owner"]
             backend_rid = entry["source_rid"] if role == "src" else entry["target_rid"]
+            external = entry.get("external_prefill", False)
+            if external and entry["cancel_requested"]:
+                if entry.get("submit_started"):
+                    rows = self._call_for(
+                        entry, role, "d2d_cancel", entry["submission_epoch"],
+                        rid=backend_rid, cancel_pending_submit=True,
+                    )
+                    if not all(row.get("kv_released") for row in rows):
+                        return
+                self._update(
+                    rid, phase="CANCELLED", final_output_ids=[], final_finish_reason="abort"
+                )
+                return
             if request is None:
                 prepare = None
                 if (
                     role == "src"
                     and entry["cut"] < entry["max_new"]
                     and all(
-                        r.get("admission_plan_supported") for r in self.facts["src"]
+                        r.get("admission_plan_supported") for r in self.facts[self._worker(entry, "src")]
                     )
                 ):
                     prepare = dict(
@@ -1295,8 +1407,10 @@ class DsvGateway:
                         destination="D1",
                         growth_tokens=max(entry["growth_tokens"], entry["max_new"]),
                     )
-                rows = self._call(
-                    role,
+                if external and not entry.get("submit_started"):
+                    self._update(rid, submit_started=True)
+                rows = self._call_for(
+                    entry, role,
                     "d2d_submit_pd",
                     entry["submission_epoch"],
                     rid=backend_rid,
@@ -1307,6 +1421,7 @@ class DsvGateway:
                     bootstrap_port=entry["bootstrap_port"],
                     prefill_url=entry["prefill_url"],
                     prepare_migration=prepare,
+                    **({"external_prefill": True} if external else {}),
                 )
                 if prepare is not None and all(r.get("plan") for r in rows):
                     self._update(
@@ -1326,6 +1441,16 @@ class DsvGateway:
             )
             return
         if phase in {"SOURCE", "DIRECT"}:
+            if request is None and entry.get("external_prefill") and entry["cancel_requested"]:
+                rows = self._call_for(
+                    entry, entry["owner"], "d2d_cancel", entry["submission_epoch"],
+                    rid=entry["source_rid"], cancel_pending_submit=True,
+                )
+                if all(row.get("kv_released") for row in rows):
+                    self._update(
+                        rid, phase="CANCELLED", final_output_ids=[], final_finish_reason="abort"
+                    )
+                return
             if request is None:
                 confirmed = entry.get("submission_confirmed_at")
                 if (
@@ -1353,14 +1478,16 @@ class DsvGateway:
                 backend_rid = (
                     entry["source_rid"] if role == "src" else entry["target_rid"]
                 )
-                self._call(
-                    role, "d2d_cancel", entry["submission_epoch"], rid=backend_rid
+                self._call_for(
+                    entry, role, "d2d_cancel",
+                    entry["submission_epoch"], rid=backend_rid
                 )
             if request["finished"] and request["kv_released"]:
                 self._update(
                     rid,
                     phase="CANCELLED" if entry["cancel_requested"] else "DONE",
                     final_output_ids=request["output_ids"],
+                    final_finish_reason=request["finish_reason"],
                     migration_outcome=entry.get("migration_outcome")
                     or (
                         "completed_on_source_before_migration"
@@ -1390,15 +1517,18 @@ class DsvGateway:
             self._update(rid, phase="ROLLBACK")
             return
         epoch = entry["epoch"]
+        destination = entry.get("workers", {}).get("dst", "D1")
         common = dict(
-            destination="D1", target_rid=entry["target_rid"], rid=entry["source_rid"]
+            destination=destination,
+            target_rid=entry["target_rid"],
+            rid=entry["source_rid"],
         )
         if phase == "PLAN":
             rows = (
                 [dict(plan=p) for p in entry["admission_plans"]]
                 if entry.get("admission_plans")
-                else self._call(
-                    "src",
+                else self._call_for(
+                    entry, "src",
                     "d2d_plan",
                     epoch,
                     growth_tokens=max(entry["growth_tokens"], entry["max_new"]),
@@ -1450,6 +1580,9 @@ class DsvGateway:
                 rid,
                 reservations=[r["reservation"] for r in rows],
                 phase="WAIT_CUT",
+                precopy_until=(
+                    time.time() + self.precopy_window_s if self.precopy_window_s else 0
+                ),
                 prepare_latency_ms=max(
                     0,
                     (time.time() - entry.get("prepare_started_at", time.time())) * 1000,
@@ -1559,7 +1692,7 @@ class DsvGateway:
                 **self._end_deferral(entry),
             )
         elif phase == "IMPORT":
-            async_handoff = self._async_handoff()
+            async_handoff = self._async_handoff(entry)
             targets = [r.get("target") for r in self._states(entry, "dst")]
             if async_handoff and any(t and t.get("import_pending") for t in targets):
                 return
@@ -1572,7 +1705,7 @@ class DsvGateway:
                 "dst",
                 "d2d_import",
                 epoch,
-                destination="D1",
+                destination=destination,
                 require_reservation=True,
                 async_handoff=async_handoff,
                 defer_bulk=self._control_waves(),
@@ -1632,18 +1765,18 @@ class DsvGateway:
                     error="observed committed source during rollback",
                 )
                 return
-            closes = self._call(
-                "src",
+            closes = self._call_for(
+                entry, "src",
                 "d2d_precopy_close",
                 epoch,
                 pending_chunk=(entry.get("precopy_pending") or {})
                 .get("frame", {})
                 .get("chunk"),
             )
-            rows = self._call("dst", "d2d_abort", epoch, precopy_close=closes)
+            rows = self._call_for(entry, "dst", "d2d_abort", epoch, precopy_close=closes)
             if not all(r.get("aborted") for r in rows):
                 return
-            rows = self._call("src", "d2d_resume", epoch)
+            rows = self._call_for(entry, "src", "d2d_resume", epoch)
             if all(r.get("resumed") for r in rows):
                 drain = self.journal["drain"]
                 retry = bool(
@@ -1665,18 +1798,19 @@ class DsvGateway:
             if request is None:
                 raise RuntimeError("target output history missing")
             if entry["cancel_requested"] and not request["finished"]:
-                self._call("dst", "d2d_cancel", epoch, rid=entry["target_rid"])
+                self._call_for(entry, "dst", "d2d_cancel", epoch, rid=entry["target_rid"])
             if request["finished"] and request["kv_released"]:
                 self._update(
                     rid,
                     phase="CANCELLED" if entry["cancel_requested"] else "DONE",
                     final_output_ids=request["output_ids"],
+                    final_finish_reason=request["finish_reason"],
                 )
         elif phase == "TARGET":
             if request is None:
                 raise RuntimeError("target output history missing")
             if entry["cancel_requested"] and not request["finished"]:
-                self._call("dst", "d2d_cancel", epoch, rid=entry["target_rid"])
+                self._call_for(entry, "dst", "d2d_cancel", epoch, rid=entry["target_rid"])
             sources = [s.get("source") for s in self._states(entry, "src")]
             targets = [s.get("target") for s in self._states(entry, "dst")]
             if any(
@@ -1706,18 +1840,21 @@ class DsvGateway:
                     updates.update(
                         phase="CANCELLED" if entry["cancel_requested"] else "DONE",
                         final_output_ids=request["output_ids"],
+                        final_finish_reason=request["finish_reason"],
                     )
                 else:
                     updates["phase"] = "LOCAL"
             if updates:
                 self._update(rid, **updates)
 
-    def _drive(self, step):
+    def _drive(self, step, entry=None):
         try:
             cmd = next(step)
             while True:
                 try:
-                    rows = self._call(cmd.role, cmd.name, cmd.epoch, **cmd.payload)
+                    rows = self._call_for(
+                        entry, cmd.role, cmd.name, cmd.epoch, **cmd.payload
+                    )
                 except Exception as exc:
                     cmd = step.throw(exc)
                 else:
@@ -1726,7 +1863,7 @@ class DsvGateway:
             pass
 
     def _advance_one(self, entry, started):
-        self._drive(self._step(entry))
+        self._drive(self._step(entry), entry)
         while self.background and time.monotonic() - started < 0.05:
             current = self._entry(entry["rid"])
             continue_frame = (
@@ -1737,12 +1874,12 @@ class DsvGateway:
             start_commit = (
                 entry["phase"] == "IMPORT"
                 and current["phase"] == "COMMIT"
-                and self._async_handoff()
+                and self._async_handoff(current)
             )
             if not (continue_frame or start_commit):
                 break
             entry = current
-            self._drive(self._step(entry))
+            self._drive(self._step(entry), entry)
 
     def _advance_error(self, rid, exc):
         current = self._entry(rid)
@@ -1891,7 +2028,7 @@ class DsvGateway:
                     self._run_wave([e for e in slice_entries if e["phase"] in WAVE_PHASES])
                     for item in slice_entries:
                         if item["phase"] not in WAVE_PHASES:
-                            self._drive(self._step(item))
+                            self._drive(self._step(item), item)
                     served += len(slice_entries)
                 else:
                     self._advance_one(entry, started)
@@ -1923,6 +2060,10 @@ class DsvGateway:
                 req = self._request(entry, entry["owner"])
         ids = list(req["output_ids"]) if req else []
         frozen = entry.get("frozen_output", [])
+        if entry["owner"] == "dst" and frozen:
+            overlap = min(len(ids), len(frozen))
+            if ids[:overlap] != frozen[:overlap]:
+                raise RuntimeError("destination output does not continue the frozen prefix")
         if entry["owner"] == "src" and entry["phase"] not in {
             "SOURCE",
             "SUBMIT",
@@ -1941,7 +2082,7 @@ class DsvGateway:
             dict(
                 seq=i,
                 token_id=int(ids[i]),
-                owner=entry["owner"],
+                owner=self._worker(entry, entry["owner"]),
                 epoch=entry["epoch"] or entry["submission_epoch"],
                 rid=rid,
             )
@@ -1949,6 +2090,17 @@ class DsvGateway:
         ]
         finished = bool(req and req["finished"]) or entry["phase"] in TERMINAL
         return result, finished
+
+    def finish_reason(self, rid, output_count):
+        with self.lock:
+            entry = self._entry(rid)
+            if entry["phase"] in TERMINAL:
+                reason = entry.get("final_finish_reason")
+            else:
+                reason = (self._request(entry, entry["owner"]) or {}).get("finish_reason")
+            if reason is not None:
+                return reason
+            return "length" if output_count == entry["max_new"] else "stop"
 
     def start_drain(self, mode="d2d"):
         if mode not in {"d2d", "natural"}:
@@ -1989,25 +2141,35 @@ class DsvGateway:
             self.cv.notify_all()
             return self.drain_status()
 
+    def _source_idle(self, source):
+        return (
+            source not in self.fact_errors
+            and bool(self.facts.get(source))
+            and all(row.get("idle", False) for row in self.facts[source])
+        )
+
     def drain_status(self):
         with self.lock:
             drain = copy.deepcopy(self.journal["drain"])
             if not drain:
                 return dict(state="READY", active=False)
             entries = [self.journal["entries"][rid] for rid in drain["members"]]
+            source = drain.get("src", "src")
             safe = all(e["phase"] in TERMINAL | {"LOCAL"} for e in entries)
-            safe = (
-                safe
-                and "src" not in self.fact_errors
-                and bool(self.facts.get("src"))
-                and all(row.get("idle", False) for row in self.facts.get("src", []))
-            )
+            safe = safe and self._source_idle(source)
+            if self.decode_workers and drain.get("source_released_at") is not None:
+                safe = True
             if safe and drain.get("source_released_at") is None:
+                previous = self.journal["drain"]
                 drain["source_released_at"] = time.time()
-                self.journal["drain"].update(
-                    source_released_at=drain["source_released_at"]
-                )
-                self._persist()
+                if self.decode_workers:
+                    drain["active"] = False
+                self.journal["drain"] = drain
+                try:
+                    self._persist()
+                except BaseException:
+                    self.journal["drain"] = previous
+                    raise
             blocked = any(
                 e["blocked"] or e["phase"] == "SOURCE" and e["cut_attempted"]
                 for e in entries
@@ -2037,7 +2199,7 @@ class DsvGateway:
                 members_state={
                     e["rid"]: dict(
                         phase=e["phase"],
-                        owner=e["owner"],
+                        owner=self._worker(e, e["owner"]),
                         error=e["error"],
                         migration_deferred=e.get("migration_deferred", False),
                         migration_deferred_reason=e.get("migration_deferred_reason"),
@@ -2046,6 +2208,9 @@ class DsvGateway:
                         migration_outcome=e.get("migration_outcome"),
                         freeze_pending=e.get("freeze_pending", False),
                         source_partial_remote=e.get("source_partial_remote", False),
+                        precopy_bytes=e.get("precopy_bytes", 0),
+                        remaining_copy_bytes=e.get("remaining_copy_bytes"),
+                        handoff_timing=handoff_timing(e),
                     )
                     for e in entries
                 },

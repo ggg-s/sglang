@@ -9,6 +9,8 @@ P4 DSV 模式：[原生 PD、D2D 编排、SSE 接续与重启恢复](P4-DSV-GATE
 
 P 缓存前缀（Qwen3/DSV4.1）：[统一 Remote progressive 与 A/B 对照](PREFIX-REMOTE-PROGRESSIVE-ZH.md)。
 
+3P3D 原生 SMG 接入迁移控制器：[启动与 D2D 验收](MIGRATION-CONTROLLER-NATIVE-PD-ZH.md)。
+
 多 P × 多 D（同机/跨机、原生 SMG）：[网络 journal 与部署说明](MULTI-PD-ZH.md)。
 Remote Q/O/LSE 原生 Mooncake GPU 传输：[启用与完成/回收协议](REMOTE-GPU-TRANSPORT-ZH.md)。
 
