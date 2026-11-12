@@ -79,6 +79,27 @@ curl -fsS http://127.0.0.1:31081/v1/drain/status |
 
 自然排空窗口结束后，控制器每次只为一条仍在生成的请求执行 PLAN 和 RESERVE。目标全部 rank 确认 RESERVE 后才开始单请求 Pre-copy 窗口。窗口到期后收尾已开始的帧，并按现有协议 Freeze。期间请求自然结束时走现有回滚，释放目标端预留。只有上一条请求的源端资源回收完成，才启动下一条。两个窗口的 CLI 默认值都是 `0`，分别关闭对应等待和限时 Pre-copy。上面的 `300/400 ms` 用于首轮验证。
 
+## 撤销迁移和摘流超时
+
+控制器配置 `native_pd.smg_cordon_timeout_s` 默认 **15 秒**，从发出摘流起计。所有配置的 SMG 副本都确认源 Decode 的 `is_healthy: false` 后才开始迁移。超过期限时，控制器自动撤销该轮摘流，健康的源 D 恢复接流。状态为 `ABORTED`，`abort_reason` 为 `cordon_timeout`，`cordon_error` 保留最后观察到的管理查询错误或仍健康的副本。
+
+手动撤销时提交当次操作的 ID。重复提交同一轮的撤销可查询进度，过期的 ID 返回 HTTP 409。
+
+```bash
+admin=http://127.0.0.1:31081
+drain_id=$(curl -fsS "$admin/v1/drain/status" | jq -er '.id')
+jq -n --arg id "$drain_id" '{drain_id: $id}' |
+  curl -fsS "$admin/v1/drain/abort" \
+    -H 'Content-Type: application/json' --data-binary @-
+curl -fsS "$admin/v1/drain/status" |
+  jq '{id, state, abort_reason, cordon_error, members_state}'
+curl -fsS http://127.0.0.1:31118/health
+```
+
+- 摘流确认期间撤销直接进入 `ABORTED`。源 D 的健康探针恢复后，SMG 按原健康检查周期重新将其加入路由。
+- 迁移开始后撤销会停止选择新请求，并恢复健康源 D 的准入。提交前的迁移释放目的端预留，再由源端继续生成。已记录提交意图的迁移继续完成提交和源端回收。
+- `ABORTING` 表示仍有迁移资源在清理。此时可查看成员阶段和错误，清理完成后可重新发起 drain。只有 `SAFE_TO_STOP` 允许停源 D，已完成的 drain 不接受撤销。
+
 ## 长短请求混跑 A/B
 
 在隔离的 3P3D 池上使用同一批引擎、同一个输入 ID 文件和相同的预热。两轮自然排空均为 300 ms。A 直接 Handoff，B 在 RESERVE 后增加 400 ms Pre-copy。对照轮使用独立的控制器状态目录，上一轮 SSE 全部结束后再重启测试控制器和 SMG。测试 SMG 可在上面的命令中加入 `--prefill-policy round_robin --decode-policy round_robin --disable-retries`，并将 `--health-failure-threshold` 设为 `1`，两轮使用相同参数。

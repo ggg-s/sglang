@@ -25,6 +25,7 @@
     "D2": "/pool/ctl/D2"
   },
   "native_pd": {
+    "smg_cordon_timeout_s": 15,
     "decode_urls": {
       "D0": "http://127.0.0.1:31117",
       "D1": "http://127.0.0.1:31118",

@@ -94,6 +94,8 @@ def run(args, prompt):
         )
         drain_id = drain["id"]
         while drain["state"] != "SAFE_TO_STOP":
+            if drain["state"] in {"ABORTING", "ABORTED"}:
+                raise RuntimeError(f"drain aborted during measurement: {drain}")
             if time.monotonic() >= deadline:
                 raise TimeoutError(f"source did not reach SAFE_TO_STOP: {drain}")
             time.sleep(0.02)

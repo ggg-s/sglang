@@ -522,6 +522,30 @@ class TestDsvMigrationController(CustomTestCase):
         self.assertEqual(entry["workers"], {"src": "D0"})
         self.assertFalse(entry["migration_requested"])
 
+    def test_abort_admin_rejects_stale_id_and_is_idempotent_for_current_drain(self):
+        from migration_http import MigrationAdminHandler
+
+        class Admin(MigrationAdminHandler):
+            controller = self.controller
+
+        self.controller.accept({"prompt_ids": [0], "max_new_tokens": 12})
+        port = self.server(Admin)
+        pair = {"src": "D0", "dst": "D1"}
+        first = json.load(self.http(port, "/v1/drain", pair))
+        path = "/v1/drain/abort"
+        self.assertEqual(self.http(port, path, {"drain_id": 0}).status, 400)
+        aborted = self.http(port, path, {"drain_id": first["id"]})
+        self.assertEqual(aborted.status, 202)
+        self.assertEqual(json.load(aborted)["state"], "ABORTED")
+        self.assertEqual(
+            json.load(self.http(port, path, {"drain_id": first["id"]}))["state"],
+            "ABORTED",
+        )
+        second = json.load(self.http(port, "/v1/drain", pair))
+        self.assertNotEqual(second["id"], first["id"])
+        self.assertEqual(self.http(port, path, {"drain_id": first["id"]}).status, 409)
+        self.assertNotIn("D0", self.controller._available_decodes())
+
 
 class NativeWorkerTransport(WorkerTransport):
     def __init__(self):
@@ -553,14 +577,14 @@ class TestNativePdDecode(CustomTestCase):
         from migration_controller import Prefill
         from migration_native_pd import NativeDecodeApp, NativePdController
 
-        root = Path(self.enterContext(tempfile.TemporaryDirectory()))
+        self.root = Path(self.enterContext(tempfile.TemporaryDirectory()))
         self.driver = NativeWorkerTransport()
-        self.controller = NativePdController(
-            self.driver,
-            TextTokenizer(),
-            root,
+        self.controller_type = NativePdController
+        self.config = dict(
             prefills={"p1": Prefill("http://p1:31016/generate", "p1", 35409)},
-            decode_workers={worker: root / worker for worker in self.driver.requests},
+            decode_workers={
+                worker: self.root / worker for worker in self.driver.requests
+            },
             decode_urls={
                 worker: f"http://127.0.0.1:{31117 + index}"
                 for index, worker in enumerate(self.driver.requests)
@@ -568,9 +592,16 @@ class TestNativePdDecode(CustomTestCase):
             smg_admin_urls=["http://smg1:32000", "http://smg2:32000"],
             autostart=False,
         )
-        self.addCleanup(self.controller.close)
-        self.controller.tick()
+        self.controller = self.open_controller()
         self.app = NativeDecodeApp(self.controller, "test-model")
+
+    def open_controller(self, **options):
+        controller = self.controller_type(
+            self.driver, TextTokenizer(), self.root, **(self.config | options)
+        )
+        self.addCleanup(controller.close)
+        controller.tick()
+        return controller
 
     @staticmethod
     def bootstrap(room):
@@ -866,6 +897,192 @@ class TestNativePdDecode(CustomTestCase):
         self.assertEqual(self.controller.entry(late)["workers"], {"src": "D1"})
         self.assertEqual(self.controller.entry(late)["bootstrap_room"], 11)
         self.assertNotIn(late, self.controller.drain_status()["members"])
+
+    def test_cordon_timeout_unfences_source_with_unreachable_replica(self):
+        from io import BytesIO
+
+        pending = self.controller.start_named_drain("D0", "D1")
+        confirm = BytesIO(
+            json.dumps(
+                {
+                    "workers": [
+                        {
+                            "url": self.controller.decode_urls["D0"],
+                            "worker_type": "decode",
+                            "is_healthy": False,
+                        }
+                    ]
+                }
+            ).encode()
+        )
+        with patch(
+            "migration_native_pd.urlopen",
+            side_effect=[confirm, TimeoutError("replica unavailable")],
+        ):
+            self.controller._reconcile_cordon()
+        before = self.controller.drain_status()
+        self.assertEqual(before["state"], "CORDONING")
+        self.assertIn("smg2:32000/workers", before["cordon_error"])
+        self.assertFalse(self.controller.decode_ready("D0"))
+        with patch.object(time, "time", return_value=pending["cordon_deadline_at"]):
+            self.controller._reconcile_cordon()
+        self.controller.close()
+        self.controller = self.open_controller()
+        after = self.controller.drain_status()
+        self.assertEqual(after["id"], pending["id"])
+        self.assertEqual(after["state"], "ABORTED")
+        self.assertEqual(after["abort_reason"], "cordon_timeout")
+        self.assertEqual(after["cordon_error"], before["cordon_error"])
+        self.assertTrue(self.controller.decode_ready("D0"))
+        rid = self.controller.accept_native(
+            "D0", {"prompt_ids": [0], "max_new_tokens": 16}, self.bootstrap(81)
+        )
+        self.assertEqual(self.controller.entry(rid)["workers"], {"src": "D0"})
+        self.assertNotEqual(
+            self.controller.start_named_drain("D0", "D1")["id"], pending["id"]
+        )
+
+    def test_cordon_watchdog_expires_while_ack_is_in_flight(self):
+        controller = self.controller
+        query_started, release_query = threading.Event(), threading.Event()
+        now = time.time()
+
+        def blocked_ack(_):
+            query_started.set()
+            return release_query.wait(3)
+
+        with (
+            patch.object(controller, "_smg_cordoned", side_effect=blocked_ack),
+            patch.object(time, "time", return_value=now) as clock,
+        ):
+            pending = controller.start_named_drain("D0", "D1")
+            routing = threading.Thread(target=controller._reconcile_cordon)
+            watchdog = threading.Thread(target=controller._watch_cordon_timeout)
+            routing.start()
+            watchdog.start()
+            try:
+                self.assertTrue(query_started.wait(2))
+                clock.return_value = pending["cordon_deadline_at"]
+                with controller.cv:
+                    self.assertTrue(
+                        controller.cv.wait_for(
+                            lambda: controller.drain_status()["state"] == "ABORTED",
+                            timeout=2,
+                        )
+                    )
+                self.assertTrue(controller.decode_ready("D0"))
+                next_drain = controller.start_named_drain("D0", "D1")
+                self.assertNotEqual(next_drain["id"], pending["id"])
+            finally:
+                release_query.set()
+                routing.join(timeout=3)
+                controller.stop.set()
+                watchdog.join(timeout=3)
+        self.assertFalse(routing.is_alive())
+        self.assertFalse(watchdog.is_alive())
+        status = controller.drain_status()
+        self.assertEqual(status["id"], next_drain["id"])
+        self.assertEqual(status["state"], "CORDONING")
+        self.assertIsNone(status["cordon_error"])
+        self.assertEqual(
+            controller.abort_named_drain(next_drain["id"])["abort_reason"],
+            "operator_abort",
+        )
+        self.assertTrue(controller.decode_ready("D0"))
+
+    def test_abort_during_import_restores_ingress_and_rolls_back_without_commit(self):
+        controller = self.controller
+        body = {"prompt_ids": [0], "max_new_tokens": 16}
+        members = [
+            controller.accept_native("D0", body, self.bootstrap(room))
+            for room in (90, 89)
+        ]
+        controller.tick()
+        pending = controller.start_named_drain("D0", "D1")
+        with patch.object(controller, "_smg_cordoned", return_value=True):
+            controller._reconcile_cordon()
+        routed = controller.accept_native("D0", body, self.bootstrap(91))
+        self.assertEqual(controller.entry(routed)["workers"], {"src": "D1"})
+        send_to = self.driver.send_to
+        result = {}
+        cleanup_ready = False
+
+        def abort_during_import(directory, worker, payload, timeout):
+            cmd = payload["cmd"]
+            if cmd == "d2d_import" and not result:
+                reply = send_to(directory, worker, payload, timeout)
+                result.update(controller.abort_named_drain(pending["id"]))
+                return reply
+            if cmd == "d2d_precopy_close":
+                return {"closed": True}
+            if cmd == "d2d_abort":
+                return {"aborted": cleanup_ready}
+            if cmd == "d2d_resume":
+                return {"resumed": True}
+            return send_to(directory, worker, payload, timeout)
+
+        with patch.object(self.driver, "send_to", side_effect=abort_during_import):
+            for _ in range(10):
+                controller.tick()
+            self.assertEqual(result["state"], "ABORTING")
+            rid = next(
+                rid
+                for rid in members
+                if result["members_state"][rid]["phase"] == "IMPORT"
+            )
+            waiting = next(other for other in members if other != rid)
+            self.assertEqual(controller.drain_status()["state"], "ABORTING")
+            self.assertEqual(controller.entry(rid)["phase"], "ROLLBACK")
+            self.assertTrue(controller.decode_ready("D0"))
+            fresh = controller.accept_native("D0", body, self.bootstrap(92))
+            self.assertEqual(controller.entry(fresh)["workers"], {"src": "D0"})
+            cleanup_ready = True
+            for _ in range(5):
+                controller.tick()
+        status = controller.drain_status()
+        self.assertEqual(status["state"], "ABORTED")
+        self.assertEqual(
+            status["members_state"][rid]["migration_outcome"], "drain_aborted"
+        )
+        self.assertEqual(controller.entry(rid)["phase"], "SOURCE")
+        self.assertFalse(controller.entry(rid)["cancel_requested"])
+        self.assertFalse(controller.entry(rid)["migration_requested"])
+        self.assertEqual(status["members_state"][waiting]["migration_attempts"], 0)
+        self.assertNotIn("d2d_commit", [cmd for _, cmd, _ in self.driver.commands])
+        retry = controller.start_named_drain("D0", "D1")
+        self.assertNotEqual(retry["id"], pending["id"])
+        with patch.object(controller, "_smg_cordoned", return_value=True):
+            controller._reconcile_cordon()
+        self.assertEqual(controller.entry(rid)["attempts"], 0)
+
+    def test_abort_keeps_durable_commit_and_waits_for_source_retirement(self):
+        controller = self.controller
+        self.driver.auto_release = False
+        rid = controller.accept_native(
+            "D0", {"prompt_ids": [0], "max_new_tokens": 16}, self.bootstrap(93)
+        )
+        controller.tick()
+        pending = controller.start_named_drain("D0", "D1")
+        with patch.object(controller, "_smg_cordoned", return_value=True):
+            controller._reconcile_cordon()
+        for _ in range(6):
+            controller.tick()
+        entry = controller.entry(rid)
+        self.assertEqual(entry["phase"], "COMMIT")
+        self.assertEqual(
+            controller.abort_named_drain(pending["id"])["state"], "ABORTING"
+        )
+        controller.close()
+        self.controller = controller = self.open_controller()
+        self.assertEqual(controller.entry(rid)["phase"], "TARGET")
+        self.assertEqual(controller.drain_status()["state"], "ABORTING")
+        self.assertTrue(controller.decode_ready("D0"))
+        self.driver.release(entry["epoch"])
+        controller.tick()
+        status = controller.drain_status()
+        self.assertEqual(status["state"], "ABORTED")
+        self.assertEqual(status["members_state"][rid]["owner"], "D1")
+        self.assertEqual(status["members_state"][rid]["migration_outcome"], "migrated")
 
 
 if __name__ == "__main__":

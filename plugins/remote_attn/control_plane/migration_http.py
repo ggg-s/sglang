@@ -219,13 +219,23 @@ class MigrationAdminHandler(MigrationWorkerHandler):
     def do_POST(self):
         self.close_connection = True
         path = urlsplit(self.path).path
-        if path != "/v1/drain":
+        if path not in {"/v1/drain", "/v1/drain/abort"}:
             return self.error(404, "unknown admin route")
         try:
             body = self.body()
-            if set(body) != {"src", "dst"}:
-                raise ValueError("expected src and dst instance names")
-            result = self.controller.start_named_drain(body["src"], body["dst"])
+            if path == "/v1/drain/abort":
+                drain_id = body.get("drain_id")
+                if (
+                    set(body) != {"drain_id"}
+                    or not isinstance(drain_id, str)
+                    or not drain_id
+                ):
+                    raise ValueError("expected a nonempty drain_id")
+                result = self.controller.abort_named_drain(drain_id)
+            else:
+                if set(body) != {"src", "dst"}:
+                    raise ValueError("expected src and dst instance names")
+                result = self.controller.start_named_drain(body["src"], body["dst"])
         except ValueError as exc:
             return self.error(400, str(exc))
         except DrainConflict as exc:

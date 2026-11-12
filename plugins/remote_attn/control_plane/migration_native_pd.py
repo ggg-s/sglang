@@ -6,6 +6,7 @@ import asyncio
 import hashlib
 import json
 import socket
+import threading
 import time
 import uuid
 from contextlib import ExitStack
@@ -75,9 +76,14 @@ class NativePdController(MigrationController):
         decode_urls,
         smg_admin_urls,
         smg_admin_token_file=None,
+        smg_cordon_timeout_s=15,
         decode_workers,
+        autostart=True,
         **kwargs,
     ):
+        if type(smg_cordon_timeout_s) is not int or smg_cordon_timeout_s <= 0:
+            raise ValueError("smg_cordon_timeout_s must be a positive integer")
+        self.smg_cordon_timeout_s = smg_cordon_timeout_s
         self.decode_urls = {name: http_base(url) for name, url in decode_urls.items()}
         if not self.decode_urls.keys() <= decode_workers.keys() or not self.decode_urls:
             raise ValueError("native PD Decode listeners must name registered workers")
@@ -100,7 +106,25 @@ class NativePdController(MigrationController):
             Path(smg_admin_token_file) if smg_admin_token_file else None
         )
         self.cordon_error = None
-        super().__init__(*args, decode_workers=decode_workers, **kwargs)
+        self.cordon_watchdog = None
+        super().__init__(
+            *args, decode_workers=decode_workers, autostart=autostart, **kwargs
+        )
+        if autostart:
+            self.cordon_watchdog = threading.Thread(
+                target=self._watch_cordon_timeout,
+                daemon=True,
+                name="smg-cordon-timeout",
+            )
+            self.cordon_watchdog.start()
+
+    def close(self):
+        self.stop.set()
+        if self.cordon_watchdog is not None:
+            self.cordon_watchdog.join(timeout=5)
+            if self.cordon_watchdog.is_alive():
+                raise RuntimeError("SMG cordon watchdog is still active")
+        super().close()
 
     def _validate_worker_bindings(self):
         super()._validate_worker_bindings()
@@ -175,22 +199,56 @@ class NativePdController(MigrationController):
             existing = self._existing_drain(src, dst)
             if existing:
                 return existing
+            instances = self._drain_instances(src, dst)
+            started_at = time.time()
             cordon = dict(
                 id=uuid.uuid4().hex,
                 active=True,
                 src=src,
                 dst=dst,
-                instances=self._drain_instances(src, dst),
-                started_at=time.time(),
+                instances=instances,
+                started_at=started_at,
+                cordon_deadline_at=started_at + self.smg_cordon_timeout_s,
             )
-            self.journal["native_cordon"] = cordon
-            try:
-                self._persist()
-            except BaseException:
-                self.journal["native_cordon"] = None
-                raise
+            self._publish_journal(native_cordon=cordon)
             self.cordon_error = None
             return self.drain_status()
+
+    def _cordon_deadline(self, pending):
+        return pending.get(
+            "cordon_deadline_at", pending["started_at"] + self.smg_cordon_timeout_s
+        )
+
+    def _abort_cordon(self, pending, reason):
+        now = time.time()
+        error = self.cordon_error
+        if error is None and reason == "cordon_timeout":
+            error = "SMG confirmations did not arrive before the deadline"
+        self._publish_journal(
+            native_cordon=None,
+            drain={
+                **pending,
+                "mode": "d2d",
+                "active": False,
+                "members": [],
+                "cordon_deadline_at": self._cordon_deadline(pending),
+                "cordon_error": error,
+                "abort_requested_at": now,
+                "aborted_at": now,
+                "abort_reason": reason,
+            },
+        )
+        self.cordon_error = None
+
+    def abort_named_drain(self, drain_id):
+        with self.cv:
+            pending = self.journal["native_cordon"]
+            if pending is not None:
+                if pending["id"] != drain_id:
+                    raise DrainConflict("drain id does not match the current cordon")
+                self._abort_cordon(pending, "operator_abort")
+                return self.drain_status()
+            return super().abort_named_drain(drain_id)
 
     def drain_status(self):
         with self.cv:
@@ -200,46 +258,89 @@ class NativePdController(MigrationController):
                     **pending,
                     "state": "CORDONING",
                     "members": [],
+                    "cordon_deadline_at": self._cordon_deadline(pending),
                     "cordon_error": self.cordon_error,
                 }
             return super().drain_status()
 
-    def _smg_cordoned(self, worker):
-        url = self.decode_urls[worker]
+    def _smg_cordoned(self, pending):
+        url = self.decode_urls[pending["src"]]
         headers = {}
         if self.smg_admin_token_file is not None:
             headers["Authorization"] = (
                 "Bearer " + self.smg_admin_token_file.read_text().strip()
             )
         for gateway in self.smg_admin_urls:
-            if self.stop.is_set():
+            remaining = self._cordon_deadline(pending) - time.time()
+            if self.stop.is_set() or remaining <= 0:
                 return False
-            with urlopen(
-                Request(gateway + "/workers", headers=headers), timeout=2
-            ) as response:
-                workers = json.load(response)["workers"]
-            matches = [
-                row
-                for row in workers
-                if row["url"].rstrip("/") == url
-                and row["worker_type"].lower() == "decode"
-            ]
+            try:
+                with urlopen(
+                    Request(gateway + "/workers", headers=headers),
+                    timeout=min(2, remaining),
+                ) as response:
+                    workers = json.load(response)["workers"]
+                matches = [
+                    row
+                    for row in workers
+                    if row["url"].rstrip("/") == url
+                    and row["worker_type"].lower() == "decode"
+                ]
+                if any(row["is_healthy"] is not False for row in matches):
+                    raise RuntimeError(f"Decode worker {url} is still healthy")
+            except (
+                OSError,
+                ValueError,
+                KeyError,
+                TypeError,
+                AttributeError,
+                RuntimeError,
+            ) as exc:
+                raise RuntimeError(f"{gateway}/workers: {exc}") from exc
             if not matches:
                 raise RuntimeError(f"{gateway} has no Decode worker {url}")
-            if any(row["is_healthy"] is not False for row in matches):
-                return False
         return True
 
+    def _expire_cordon(self):
+        with self.cv:
+            pending = self.journal["native_cordon"]
+            if pending is None or time.time() < self._cordon_deadline(pending):
+                return
+            try:
+                self._abort_cordon(pending, "cordon_timeout")
+            except OSError as exc:
+                self.cordon_error = f"could not persist cordon timeout: {exc}"
+
+    def _watch_cordon_timeout(self):
+        # A management HTTP call can outlive its per-socket timeout.
+        while not self.stop.is_set():
+            self._expire_cordon()
+            self.stop.wait(0.25)
+
     def _reconcile_cordon(self):
+        self._expire_cordon()
         pending = self.journal["native_cordon"]
         if not pending:
             return
+        error = None
         try:
-            if self._smg_cordoned(pending["src"]) and not self.stop.is_set():
-                self._activate_drain(pending["src"], pending["dst"], cordon=pending)
-            self.cordon_error = None
+            if self._smg_cordoned(pending) and not self.stop.is_set():
+                self._activate_drain(
+                    pending["src"],
+                    pending["dst"],
+                    cordon={
+                        **pending,
+                        "cordon_deadline_at": self._cordon_deadline(pending),
+                    },
+                )
         except (OSError, ValueError, KeyError, TypeError, RuntimeError) as exc:
-            self.cordon_error = str(exc)
+            error = str(exc)
+        with self.cv:
+            if error is not None and (
+                (self.journal["native_cordon"] or {}).get("id") == pending["id"]
+            ):
+                self.cordon_error = error
+        self._expire_cordon()
 
     def _poll_routing(self):
         while not self.stop.is_set():

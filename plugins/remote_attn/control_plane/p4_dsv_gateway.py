@@ -23,6 +23,7 @@ from urllib.parse import parse_qs
 PROTOCOL = "dsv-d2d-v2"
 TERMINAL = {"DONE", "CANCELLED"}
 PRECOMMIT = {"PLAN", "RESERVE", "WAIT_CUT", "FREEZE", "IMPORT"}
+ACTIVE_MIGRATION_PHASES = PRECOMMIT | {"COMMIT", "ROLLBACK", "TARGET"}
 STATUS_VISIBILITY_GRACE_S = 30
 WAVE_SIZE = 8
 WAVE_PHASES = {"RESERVE", "WAIT_CUT", "FREEZE", "IMPORT", "COMMIT"}
@@ -373,13 +374,18 @@ class DsvGateway:
         os.close(self.fd)
         self.fd = -1
 
-    def _persist(self):
+    def _persist(self, journal=None):
         # A failed write must stop the transition before its side effect. The
         # caller updates in-memory state only after the durable file is replaced.
         tmp = self.path.with_suffix(".tmp")
         with tmp.open("w") as stream:
             os.fchmod(stream.fileno(), 0o600)
-            json.dump(self.journal, stream, ensure_ascii=False, separators=(",", ":"))
+            json.dump(
+                self.journal if journal is None else journal,
+                stream,
+                ensure_ascii=False,
+                separators=(",", ":"),
+            )
             stream.flush()
             os.fsync(stream.fileno())
         os.replace(tmp, self.path)
@@ -783,7 +789,13 @@ class DsvGateway:
             self._check_worker(rows)
             with self.cv:
                 drain = self.journal["drain"]
-                if self.decode_workers and drain and not drain.get("source_released_at"):
+                if (
+                    self.decode_workers
+                    and drain
+                    and drain["active"]
+                    and drain.get("abort_requested_at") is None
+                    and not drain.get("source_released_at")
+                ):
                     expected = drain["instances"].get(role)
                     if expected is not None and [r["instance_id"] for r in rows] != expected:
                         raise RuntimeError(f"{role} restarted during migration")
@@ -1344,8 +1356,24 @@ class DsvGateway:
                         max(0, (time.time() - pending["started_at"]) * 1000)
                     )
 
+    def _drain_abort_requested(self, rid):
+        drain = self.journal["drain"]
+        return (
+            drain is not None
+            and drain.get("abort_requested_at") is not None
+            and rid in drain["members"]
+        )
+
     def _advance(self, entry):
         rid, phase = entry["rid"], entry["phase"]
+        if phase in PRECOMMIT and self._drain_abort_requested(rid):
+            self._update(
+                rid,
+                phase="ROLLBACK",
+                migration_requested=False,
+                migration_outcome="drain_aborted",
+            )
+            return
         self._bound(
             entry,
             roles=(
@@ -1476,6 +1504,7 @@ class DsvGateway:
                 and entry.get("admission_plans")
                 and not entry["cut_attempted"]
                 and not entry["cancel_requested"]
+                and not self._drain_abort_requested(rid)
             ):
                 self._begin(entry)
                 return
@@ -1510,7 +1539,7 @@ class DsvGateway:
                 prepare = entry["migration_requested"] or (
                     not entry["cut_attempted"] and entry["cut"] < entry["max_new"]
                 )
-                if prepare:
+                if prepare and not self._drain_abort_requested(rid):
                     if not request["plan_ready"]:
                         self._defer_migration(
                             entry,
@@ -1563,7 +1592,7 @@ class DsvGateway:
                     phase="SOURCE",
                     epoch=None,
                     cut_attempted=False,
-                    migration_requested=True,
+                    migration_requested=not self._drain_abort_requested(rid),
                     attempts=entry["attempts"] - 1,
                     retry_at=time.time() + max(self.poll_s, 0.1),
                 )
@@ -1723,12 +1752,17 @@ class DsvGateway:
                 return
             if not all(r.get("imported") for r in rows):
                 raise RuntimeError("D2D target did not confirm import")
-            # Persist irreversible intent BEFORE the first possible commit RPC.
-            self._update(
-                rid,
-                phase="ROLLBACK" if self._entry(rid)["cancel_requested"] else "COMMIT",
-                import_ready_at=time.time(),
-            )
+            # Serialize irreversible intent with the operator abort, which can
+            # be accepted while the IMPORT RPC is outstanding.
+            with self.cv:
+                aborted = self._drain_abort_requested(rid)
+                cancelled = self.journal["entries"][rid]["cancel_requested"]
+                self._update(
+                    rid,
+                    phase="ROLLBACK" if aborted or cancelled else "COMMIT",
+                    import_ready_at=time.time(),
+                    **({"migration_outcome": "drain_aborted"} if aborted else {}),
+                )
         elif phase == "COMMIT":
             # A timeout, partial TP commit or gateway crash can never send us
             # back to SOURCE. The per-rank backend commit is idempotent.
@@ -1788,6 +1822,7 @@ class DsvGateway:
                 retry = bool(
                     drain
                     and drain["active"]
+                    and drain.get("abort_requested_at") is None
                     and rid in drain["members"]
                     and entry["attempts"] < 3
                 )
@@ -2161,13 +2196,28 @@ class DsvGateway:
                 return dict(state="READY", active=False)
             entries = [self.journal["entries"][rid] for rid in drain["members"]]
             source = drain.get("src", "src")
-            safe = all(e["phase"] in TERMINAL | {"LOCAL"} for e in entries)
-            safe = safe and self._source_idle(source)
-            if self.decode_workers and drain.get("source_released_at") is not None:
+            abort_requested = drain.get("abort_requested_at") is not None
+            aborting = abort_requested and any(
+                e["phase"] in ACTIVE_MIGRATION_PHASES for e in entries
+            )
+            safe = not abort_requested and (
+                all(e["phase"] in TERMINAL | {"LOCAL"} for e in entries)
+                and self._source_idle(source)
+            )
+            if (
+                not abort_requested
+                and self.decode_workers
+                and drain.get("source_released_at") is not None
+            ):
                 safe = True
-            if safe and drain.get("source_released_at") is None:
+            if (
+                safe and drain.get("source_released_at") is None
+                or abort_requested and not aborting and drain.get("aborted_at") is None
+            ):
                 previous = self.journal["drain"]
-                drain["source_released_at"] = time.time()
+                drain["aborted_at" if abort_requested else "source_released_at"] = (
+                    time.time()
+                )
                 if self.decode_workers:
                     drain["active"] = False
                 self.journal["drain"] = drain
@@ -2197,6 +2247,10 @@ class DsvGateway:
                 freeze_pending=sum(bool(e.get("freeze_pending")) for e in entries),
                 state="STOPPED"
                 if drain.get("stopped")
+                else "ABORTING"
+                if aborting
+                else "ABORTED"
+                if abort_requested
                 else "SAFE_TO_STOP"
                 if safe
                 else "BLOCKED"

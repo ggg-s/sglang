@@ -13,9 +13,8 @@ from pathlib import Path
 from urllib.parse import urlsplit, urlunsplit
 from urllib.request import urlopen
 
-from p4_dsv_gateway import PRECOMMIT, TERMINAL, DrainConflict, DsvGateway
+from p4_dsv_gateway import ACTIVE_MIGRATION_PHASES, TERMINAL, DrainConflict, DsvGateway
 
-ACTIVE_MIGRATION_PHASES = PRECOMMIT | {"COMMIT", "ROLLBACK", "TARGET"}
 DECODE_STATUS_MAX_AGE_S = 10
 
 
@@ -181,7 +180,12 @@ class MigrationController(DsvGateway):
 
     def _migration_target(self, entry):
         drain = self.journal["drain"]
-        if not drain or entry["rid"] not in drain["members"]:
+        if (
+            not drain
+            or not drain["active"]
+            or drain.get("abort_requested_at") is not None
+            or entry["rid"] not in drain["members"]
+        ):
             return None
         if time.time() < drain.get("natural_drain_until", 0):
             return None
@@ -198,6 +202,11 @@ class MigrationController(DsvGateway):
             raise RuntimeError("destination identity changed before reservation")
         return target
 
+    def _begin(self, entry):
+        # Serialize acquiring the migration slot with aborting the drain.
+        with self.cv:
+            super()._begin(entry)
+
     def _cut_due(self, entry, request):
         # Named drains decide the cut only after a request has the migration slot.
         return entry["phase"] not in {"SUBMIT", "SOURCE"} and super()._cut_due(
@@ -211,6 +220,10 @@ class MigrationController(DsvGateway):
         drain = self.journal["drain"]
         if drain:
             status = super().drain_status()
+            if status["state"] == "ABORTED":
+                return None
+            if status["state"] == "ABORTING":
+                raise DrainConflict("the previous migration is still cleaning up")
             if (drain["src"], drain["dst"]) == (src, dst):
                 return status
             if status["state"] != "SAFE_TO_STOP":
@@ -249,6 +262,44 @@ class MigrationController(DsvGateway):
         self._validate_drain_pair(src, dst)
         return self._activate_drain(src, dst)
 
+    def _publish_journal(self, **changes):
+        journal = {**self.journal, **changes}
+        self._persist(journal)
+        self.journal = journal
+        self.cv.notify_all()
+
+    def abort_named_drain(self, drain_id):
+        with self.cv:
+            drain = self.journal["drain"]
+            if not drain or drain["id"] != drain_id:
+                raise DrainConflict("drain id does not match the current drain")
+            if drain.get("abort_requested_at") is not None:
+                return self.drain_status()
+            source = drain["src"]
+            fenced = self.journal["fenced_workers"].copy()
+            if not drain["active"] or fenced.get(source) != drain_id:
+                raise DrainConflict("drain is already complete")
+            del fenced[source]
+            entries = self.journal["entries"].copy()
+            for rid in drain["members"]:
+                entries[rid] = {**entries[rid], "migration_requested": False}
+            changes = dict(
+                drain={
+                    **drain,
+                    "abort_requested_at": time.time(),
+                    "abort_reason": "operator_abort",
+                },
+                entries=entries,
+                fenced_workers=fenced,
+            )
+            if "late_routes" in self.journal:
+                routes = self.journal["late_routes"].copy()
+                routes.pop(source, None)
+                changes["late_routes"] = routes
+            # Requests already bound to an engine keep their owner and epoch.
+            self._publish_journal(**changes)
+            return self.drain_status()
+
     def _activate_drain(self, src, dst, *, cordon=None):
         with self.cv:
             existing = self._existing_drain(src, dst)
@@ -263,8 +314,9 @@ class MigrationController(DsvGateway):
             if cordon is not None and (
                 (self.journal.get("native_cordon") or {}).get("id") != cordon["id"]
                 or instances != cordon["instances"]
+                or time.time() >= cordon["cordon_deadline_at"]
             ):
-                raise DrainConflict("SMG cordon or Decode identities changed")
+                raise DrainConflict("SMG cordon expired or Decode identities changed")
             members = {
                 rid: entry
                 for rid, entry in self.journal["entries"].items()
@@ -294,7 +346,13 @@ class MigrationController(DsvGateway):
             previous = self.journal
             entries = dict(previous["entries"])
             for rid, entry in members.items():
-                changes = {"migration_requested": True}
+                changes = {
+                    "migration_requested": True,
+                    "attempts": 0,
+                    "cut_attempted": False,
+                    "retry_at": 0,
+                    "cut_observed_at": None,
+                }
                 if entry["phase"] == "LOCAL":
                     # D1 has the full generated prefix and its native request
                     # row. Preserve both the public rid and the SSE cursor.
@@ -307,33 +365,23 @@ class MigrationController(DsvGateway):
                         source_rid=entry["target_rid"],
                         target_rid="p4d-" + uuid.uuid4().hex,
                         epoch=None,
-                        attempts=0,
-                        cut_attempted=False,
-                        retry_at=0,
-                        cut_observed_at=None,
                         admission_plans_ref=None,
                         migration_outcome=None,
                         frozen_output=[],
                     )
                 entries[rid] = {**entry, **changes}
-            self.journal = {
-                **previous,
+            changes = {
                 "drain": drain,
                 "entries": entries,
                 "fenced_workers": {**previous["fenced_workers"], src: drain["id"]},
             }
             if cordon is not None:
-                self.journal["native_cordon"] = None
-                self.journal["late_routes"] = {
+                changes["native_cordon"] = None
+                changes["late_routes"] = {
                     **previous.get("late_routes", {}),
                     src: dst,
                 }
-            try:
-                self._persist()
-            except BaseException:
-                self.journal = previous
-                raise
-            self.cv.notify_all()
+            self._publish_journal(**changes)
             return self.drain_status()
 
 
