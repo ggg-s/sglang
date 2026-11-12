@@ -24,9 +24,10 @@ PROTOCOL = "dsv-d2d-v2"
 TERMINAL = {"DONE", "CANCELLED"}
 PRECOMMIT = {"PLAN", "RESERVE", "WAIT_CUT", "FREEZE", "IMPORT"}
 ACTIVE_MIGRATION_PHASES = PRECOMMIT | {"COMMIT", "ROLLBACK", "TARGET"}
+CUTOVER_PHASES = {"FREEZE", "IMPORT", "COMMIT"}
 STATUS_VISIBILITY_GRACE_S = 30
 WAVE_SIZE = 8
-WAVE_PHASES = {"RESERVE", "WAIT_CUT", "FREEZE", "IMPORT", "COMMIT"}
+WAVE_PHASES = CUTOVER_PHASES | {"RESERVE", "WAIT_CUT"}
 Command = namedtuple("Command", "role name epoch payload")
 
 
@@ -589,6 +590,9 @@ class DsvGateway:
             else [dict(cmd=cmd, epoch=epoch)]
         )
         with self.lock:
+            drain = self.journal["drain"]
+            destination = (drain or {}).get("dst") if self.decode_workers else "dst"
+            is_destination = role == destination
             if status and self.command_waiters[role]:
                 raise StatusBusy()
             if not status:
@@ -609,8 +613,8 @@ class DsvGateway:
                 raise TimeoutError(f"{role} control busy; command not submitted")
             submitted = time.monotonic()
             submitted_at = time.time()
-            if role == "dst":
-                holder = dict(cmd=cmd, members=commands, started=submitted)
+            if is_destination:
+                holder = dict(worker=role, cmd=cmd, members=commands, started=submitted)
                 with self.lock:
                     self.dst_slot_holder = holder
             command = dict(cmd=cmd, migration_epoch=epoch, **payload)
@@ -625,7 +629,7 @@ class DsvGateway:
         finally:
             ended = time.monotonic()
             with self.lock:
-                if role == "dst" and not status:
+                if is_destination and not status:
                     waited_until = submitted if acquired else ended
                     blockers = []
                     holders = list(self.dst_slot_history)
@@ -637,6 +641,8 @@ class DsvGateway:
                     for previous in reversed(holders):
                         if previous["ended"] <= started:
                             break
+                        if previous["worker"] != role:
+                            continue
                         overlap = min(previous["ended"], waited_until) - max(
                             previous["started"], started
                         )
@@ -654,7 +660,8 @@ class DsvGateway:
                     )
                 if holder is not None:
                     self.dst_slot_history.append(dict(holder, ended=ended))
-                    self.dst_slot_holder = None
+                    if self.dst_slot_holder is holder:
+                        self.dst_slot_holder = None
                 if acquired:
                     self.role_locks[role].release()
                 for trace in list(self.precopy_active.values()):
@@ -1072,10 +1079,21 @@ class DsvGateway:
             r.get("async_handoff_supported") for r in workers
         )
 
-    def _control_waves(self):
-        return not self.decode_workers and self._async_handoff() and all(
+    def _control_waves(self, entry=None):
+        if entry is not None:
+            src, dst = (self._worker(entry, role) for role in ("src", "dst"))
+        elif self.decode_workers:
+            drain = self.journal["drain"]
+            if not drain or not drain["active"]:
+                return False
+            src, dst = drain["src"], drain["dst"]
+        else:
+            src, dst = "src", "dst"
+        return self.async_handoff and all(
             rows and all(row.get("control_wave_supported") for row in rows)
-            for rows in (self.facts.get("src"), self.facts.get("dst"))
+            for rows in (self.facts.get(src), self.facts.get(dst))
+        ) and all(
+            row.get("async_handoff_supported") for row in self.facts.get(dst, ())
         )
 
     @staticmethod
@@ -1100,12 +1118,20 @@ class DsvGateway:
         )
         return None
 
+    def _can_freeze(self, entry):
+        return True
+
+    def _update_after_precopy(self, entry, cut_due, **changes):
+        with self.cv:
+            phase = "FREEZE" if cut_due and self._can_freeze(entry) else "WAIT_CUT"
+            self._update(entry["rid"], phase=phase, **changes)
+
     def _precopy(self, entry, *, cut_due=False):
         rid, epoch = entry["rid"], entry["epoch"]
         pending = entry.get("precopy_pending")
         if pending is None and self.disable_precopy:
             if cut_due:
-                self._update(rid, phase="FREEZE")
+                self._update_after_precopy(entry, cut_due)
             return
         started = time.monotonic()
         frame = pending["frame"] if pending else None
@@ -1204,7 +1230,7 @@ class DsvGateway:
         backend = entry.get("precopy_backend")
         if pending is None:
             if cut_due:
-                self._update(rid, phase="FREEZE")
+                self._update_after_precopy(entry, cut_due)
                 return
             # Named drains bound new frames even before the first output token.
             deadline = entry.get("precopy_until", 0) if self.decode_workers else None
@@ -1341,9 +1367,9 @@ class DsvGateway:
             )
             for receipt, row in zip(receipts, rows):
                 receipt.append(row["receipt"])
-            self._update(
-                rid,
-                phase="FREEZE" if cut_due else "WAIT_CUT",
+            self._update_after_precopy(
+                entry,
+                cut_due,
                 precopy_pending=None,
                 precopy_pages=rows[0]["prefix_pages"],
                 precopy_receipts=receipts,
@@ -1743,7 +1769,7 @@ class DsvGateway:
                 destination=destination,
                 require_reservation=True,
                 async_handoff=async_handoff,
-                defer_bulk=self._control_waves(),
+                defer_bulk=self._control_waves(entry),
                 **payload,
             ))
             if any(r.get("import_pending") for r in rows):
@@ -1959,7 +1985,7 @@ class DsvGateway:
             # and classifies divergence before issuing any mutation.
             rows = [
                 row.get("requests", {}).get(entry["source_rid"])
-                for row in self.facts.get("src", ())
+                for row in self.facts.get(self._worker(entry, "src"), ())
             ]
             if rows and all(
                 row and (row["finished"] or self._cut_due(entry, row))
@@ -1970,23 +1996,20 @@ class DsvGateway:
                 return 3
         return 4
 
-    def _wave_results(self, role, members):
-        expected = members[0][2][role]
-        if any(instances[role] != expected for _, _, instances in members):
-            raise ConnectionError("D2D wave contains different worker instances")
+    def _wave_results(self, worker, expected, members):
         commands = [
             dict(cmd=cmd.name, migration_epoch=cmd.epoch, **cmd.payload)
             for _, cmd, _ in members
         ]
         with self.lock:
-            sizes = self.control_wave_sizes.setdefault(role, {})
+            sizes = self.control_wave_sizes.setdefault(worker, {})
             size = str(len(commands))
             sizes[size] = sizes.get(size, 0) + 1
             for item in commands:
-                key = role + "/" + item["cmd"]
+                key = worker + "/" + item["cmd"]
                 self.control_wave_members[key] = self.control_wave_members.get(key, 0) + 1
         return self._call(
-            role, "d2d_control_wave", commands=commands, expected_instances=expected
+            worker, "d2d_control_wave", commands=commands, expected_instances=list(expected)
         )
 
     def _run_wave(self, entries):
@@ -2005,44 +2028,43 @@ class DsvGateway:
             cmd = next(step, None)
             if cmd is not None:
                 copies += int(cmd.name == "d2d_precopy_copy")
-                steps.append((step, cmd, entry["instances"]))
+                steps.append((step, cmd, entry))
         while steps:
             following = []
             # Keep destination admission ahead of speculative source copying.
             for role in ("dst", "src"):
-                wave = [
-                    (step, cmd, instances)
-                    for step, cmd, instances in steps
-                    if cmd.role == role
-                ]
-                if not wave:
-                    continue
-                try:
-                    rows = self._wave_results(role, wave)
-                    results = [
-                        [row["results"][cmd.epoch] for row in rows]
-                        for _, cmd, _ in wave
-                    ]
-                except Exception as exc:
-                    # A lost envelope can follow successful member mutations.
-                    # Reconcile each same durable phase/epoch, including precopy.
-                    for step, _, _ in wave:
+                groups = {}
+                for step, cmd, entry in steps:
+                    if cmd.role == role:
+                        worker = self._worker(entry, role)
+                        expected = tuple(entry["instances"][role])
+                        groups.setdefault((worker, expected), []).append((step, cmd, entry))
+                for (worker, expected), wave in groups.items():
+                    try:
+                        rows = self._wave_results(worker, expected, wave)
+                        results = [
+                            [row["results"][cmd.epoch] for row in rows]
+                            for _, cmd, _ in wave
+                        ]
+                    except Exception as exc:
+                        # A lost envelope can follow successful member mutations.
+                        for step, _, _ in wave:
+                            try:
+                                step.throw(
+                                    ConnectionError(f"D2D control wave unacknowledged: {exc}")
+                                )
+                            except StopIteration:
+                                pass
+                        continue
+                    for (step, _, entry), replies in zip(wave, results):
                         try:
-                            step.throw(
-                                ConnectionError(f"D2D control wave unacknowledged: {exc}")
+                            error = next((r["error"] for r in replies if "error" in r), None)
+                            cmd = (
+                                step.throw(RuntimeError(error)) if error else step.send(replies)
                             )
+                            following.append((step, cmd, entry))
                         except StopIteration:
                             pass
-                    continue
-                for (step, _, instances), replies in zip(wave, results):
-                    try:
-                        error = next((r["error"] for r in replies if "error" in r), None)
-                        cmd = (
-                            step.throw(RuntimeError(error)) if error else step.send(replies)
-                        )
-                        following.append((step, cmd, instances))
-                    except StopIteration:
-                        pass
             steps = following
 
     def tick(self):
@@ -2055,10 +2077,26 @@ class DsvGateway:
                     for e in self.journal["entries"].values()
                     if e["phase"] not in TERMINAL
                 ]
-            offset = self.tick_cursor % len(entries) if entries else 0
-            entries = entries[offset:] + entries[:offset]
             started, served = time.monotonic(), 0
             waves = self._control_waves()
+            if self.decode_workers and waves:
+                # Gather the drain members independently of unrelated Decode
+                # traffic. Keep cutovers in envelopes separate from KV copying.
+                for phases in (CUTOVER_PHASES, WAVE_PHASES - CUTOVER_PHASES):
+                    members = [
+                        self.payloads.view(e) for e in entries if e["phase"] in phases
+                    ]
+                    for offset in range(0, len(members), WAVE_SIZE):
+                        self._run_wave(members[offset : offset + WAVE_SIZE])
+                for entry in entries:
+                    if entry["phase"] in {"ROLLBACK", "TARGET"}:
+                        self._advance_one(self.payloads.view(entry), started)
+                entries = [
+                    e for e in entries if e["phase"] not in WAVE_PHASES | {"ROLLBACK", "TARGET"}
+                ]
+                waves = False
+            offset = self.tick_cursor % len(entries) if entries else 0
+            entries = entries[offset:] + entries[:offset]
             while served < len(entries):
                 entry = self.payloads.view(entries[served])
                 if waves:

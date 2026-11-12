@@ -13,9 +13,17 @@ from pathlib import Path
 from urllib.parse import urlsplit, urlunsplit
 from urllib.request import urlopen
 
-from p4_dsv_gateway import ACTIVE_MIGRATION_PHASES, TERMINAL, DrainConflict, DsvGateway
+from p4_dsv_gateway import (
+    ACTIVE_MIGRATION_PHASES,
+    CUTOVER_PHASES,
+    TERMINAL,
+    DrainConflict,
+    DsvGateway,
+)
 
 DECODE_STATUS_MAX_AGE_S = 10
+PREPARING_PHASES = {"PLAN", "RESERVE", "WAIT_CUT"}
+MAX_INFLIGHT_MIGRATIONS = 8
 
 
 @dataclass(frozen=True)
@@ -61,11 +69,30 @@ class MigrationController(DsvGateway):
         decode_workers,
         standby=(),
         natural_drain_ms=0,
+        max_concurrent_migrations=1,
+        max_preparing_migrations=None,
+        async_handoff=True,
         autostart=True,
         **kwargs,
     ):
         if natural_drain_ms < 0:
             raise ValueError("natural drain window must be nonnegative")
+        if max_concurrent_migrations not in (1, 2, 4):
+            raise ValueError("max_concurrent_migrations must be 1, 2, or 4")
+        if max_preparing_migrations is None:
+            max_preparing_migrations = max_concurrent_migrations
+        if max_preparing_migrations not in range(1, 5):
+            raise ValueError("max_preparing_migrations must be between 1 and 4")
+        self.max_concurrent_migrations = max_concurrent_migrations
+        self.max_preparing_migrations = max_preparing_migrations
+        self.max_inflight_migrations = (
+            1
+            if max_concurrent_migrations == max_preparing_migrations == 1
+            else min(
+                MAX_INFLIGHT_MIGRATIONS,
+                max_concurrent_migrations + max_preparing_migrations,
+            )
+        )
         self.natural_drain_s = natural_drain_ms / 1000
         self.prefills = dict(prefills)
         self.standby = frozenset(standby)
@@ -87,6 +114,7 @@ class MigrationController(DsvGateway):
             state_dir,
             prefill_url=None,
             decode_workers=dict(decode_workers),
+            async_handoff=async_handoff,
             autostart=autostart,
             **kwargs,
         )
@@ -189,9 +217,12 @@ class MigrationController(DsvGateway):
             return None
         if time.time() < drain.get("natural_drain_until", 0):
             return None
-        if any(
-            record["phase"] in ACTIVE_MIGRATION_PHASES
-            for record in self.journal["entries"].values()
+        phases = [self.journal["entries"][rid]["phase"] for rid in drain["members"]]
+        if (
+            sum(phase in PREPARING_PHASES for phase in phases)
+            >= self.max_preparing_migrations
+            or sum(phase in ACTIVE_MIGRATION_PHASES for phase in phases)
+            >= self.max_inflight_migrations
         ):
             return None
         target = drain["dst"]
@@ -212,6 +243,41 @@ class MigrationController(DsvGateway):
         return entry["phase"] not in {"SUBMIT", "SOURCE"} and super()._cut_due(
             entry, request
         )
+
+    def _can_freeze(self, entry):
+        drain = self.journal["drain"]
+        if (
+            not drain
+            or not drain["active"]
+            or self._drain_abort_requested(entry["rid"])
+        ):
+            return False
+        entries = self.journal["entries"]
+        # A rollback can still hold a frozen source until all ranks resume.
+        cutovers = sum(
+            entries[rid]["phase"] in CUTOVER_PHASES
+            or (
+                entries[rid]["phase"] == "ROLLBACK"
+                and entries[rid].get("freeze_requested_at") is not None
+            )
+            for rid in drain["members"]
+        )
+        return cutovers < self.max_concurrent_migrations
+
+    def drain_status(self):
+        with self.cv:
+            return {
+                **super().drain_status(),
+                "migration_limits": {
+                    "preparing": self.max_preparing_migrations,
+                    "cutover": self.max_concurrent_migrations,
+                    "inflight": self.max_inflight_migrations,
+                },
+                "control_wave_sizes": {
+                    worker: sizes.copy()
+                    for worker, sizes in self.control_wave_sizes.items()
+                },
+            }
 
     def _source_idle(self, source):
         return self._decode_ready(source) and super()._source_idle(source)
@@ -331,6 +397,7 @@ class MigrationController(DsvGateway):
                     "a live request is still bound to a previous source instance"
                 )
 
+            activated_at = time.time()
             drain = dict(
                 id=cordon["id"] if cordon else uuid.uuid4().hex,
                 active=True,
@@ -339,10 +406,11 @@ class MigrationController(DsvGateway):
                 dst=dst,
                 members=list(members),
                 instances=instances,
-                started_at=cordon["started_at"] if cordon else time.time(),
+                started_at=cordon["started_at"] if cordon else activated_at,
+                activated_at=activated_at,
             )
             if self.natural_drain_s:
-                drain["natural_drain_until"] = time.time() + self.natural_drain_s
+                drain["natural_drain_until"] = activated_at + self.natural_drain_s
             previous = self.journal
             entries = dict(previous["entries"])
             for rid, entry in members.items():
@@ -399,6 +467,19 @@ def main():
         help="Let source requests finish for this long after cordon before planning D2D",
     )
     parser.add_argument("--precopy-window-ms", type=int, default=0)
+    parser.add_argument(
+        "--max-concurrent-migrations",
+        type=int,
+        choices=(1, 2, 4),
+        default=1,
+        help="Max simultaneous Freeze-to-admission cutovers",
+    )
+    parser.add_argument(
+        "--max-preparing-migrations",
+        type=int,
+        choices=range(1, 5),
+        help="Max requests in PLAN, RESERVE or Pre-copy (defaults to cutover limit)",
+    )
     parser.add_argument("--out", type=Path, help="Optional per-request handoff JSONL")
     args = parser.parse_args()
     if min(args.natural_drain_ms, args.precopy_window_ms) < 0:
@@ -445,6 +526,8 @@ def main():
         poll_ms=args.poll_ms,
         natural_drain_ms=args.natural_drain_ms,
         precopy_window_ms=args.precopy_window_ms,
+        max_concurrent_migrations=args.max_concurrent_migrations,
+        max_preparing_migrations=args.max_preparing_migrations,
         out=args.out,
         **(native_options or {}),
     )

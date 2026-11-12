@@ -1,4 +1,4 @@
-"""Measure a mixed short/long drain through a native-PD SMG test deployment."""
+"""Measure all-long and mixed drains through a native-PD SMG test deployment."""
 
 import argparse
 import json
@@ -65,13 +65,31 @@ def completion(url, body, first_content, timeout):
         raise
 
 
+def peak_cutovers(moved):
+    events = []
+    for row in moved:
+        timing = row["drain_member"]["handoff_timing"]
+        begin = timing["freeze_requested_at"]
+        end = timing["target_admitted_at"]
+        if begin is not None and end is not None and begin < end:
+            events.extend(((begin, 1), (end, -1)))
+    active = peak = 0
+    for _, change in sorted(events):
+        active += change
+        peak = max(peak, active)
+    return peak
+
+
 def run(args, prompt):
     status_path = "/v1/drain/status"
     if rpc(args.admin, status_path, timeout=5)["state"] != "READY":
         raise RuntimeError("use a fresh controller state directory for each run")
-    with ThreadPoolExecutor(max_workers=2 * args.per_group) as pool:
+    groups = [("long", args.long_tokens)]
+    if args.mode == "mixed":
+        groups.append(("short", args.short_tokens))
+    with ThreadPoolExecutor(max_workers=len(groups) * args.per_group) as pool:
         jobs = []
-        for group, limit in (("long", args.long_tokens), ("short", args.short_tokens)):
+        for group, limit in groups:
             for _ in range(args.per_group):
                 first_content = Future()
                 body = {
@@ -109,6 +127,11 @@ def run(args, prompt):
             member = drain["members_state"].get(row["rid"])
             requests.append(dict(group=group, **row, drain_member=member))
 
+    if args.journal is not None:
+        entries = json.loads(args.journal.read_text())["entries"]
+        for row in requests:
+            row["initial_decode"] = entries[row["rid"]]["workers"]["src"]
+
     members = [row for row in requests if row["drain_member"] is not None]
     moved = [
         row
@@ -124,8 +147,32 @@ def run(args, prompt):
         and row["drain_member"]["phase"] == "DONE"
         and row["drain_member"]["migration_attempts"] == 0
     ]
+    peak = peak_cutovers(moved)
+    waves = drain["control_wave_sizes"]
+    matched = len(members) == len(drain["members"])
+    valid_mixed = (
+        matched and bool(short_natural) and any(row["group"] == "long" for row in moved)
+    )
+    valid_all_long = (
+        matched
+        and len(members) == len(moved) == 4
+        and peak == drain["migration_limits"]["cutover"]
+        and all(waves.get(worker) for worker in (args.src, args.dst))
+        and (
+            args.journal is None
+            or sum(row["initial_decode"] == args.src for row in requests) == 4
+        )
+    )
     return {
+        "mode": args.mode,
         "source_safe_to_stop_ms": safe_ms,
+        "activate_to_safe_to_stop_ms": (
+            drain["source_released_at"] - drain["activated_at"]
+        )
+        * 1000,
+        "peak_cutovers": peak,
+        "migration_limits": drain["migration_limits"],
+        "control_wave_sizes": waves,
         "input_tokens": len(prompt),
         "short_tokens": args.short_tokens,
         "long_tokens": args.long_tokens,
@@ -135,11 +182,8 @@ def run(args, prompt):
         "moved_precopy_bytes": sum(
             row["drain_member"]["precopy_bytes"] for row in moved
         ),
-        "valid_mixed_run": (
-            len(members) == len(drain["members"])
-            and bool(short_natural)
-            and any(row["group"] == "long" for row in moved)
-        ),
+        "valid_run": valid_mixed if args.mode == "mixed" else valid_all_long,
+        "valid_mixed_run": valid_mixed,
         "drain": drain,
         "requests": requests,
     }
@@ -152,10 +196,16 @@ def main():
     parser.add_argument("--model", required=True)
     parser.add_argument("--src", default="D1")
     parser.add_argument("--dst", default="D2")
+    parser.add_argument("--mode", choices=("all-long", "mixed"), default="mixed")
     parser.add_argument("--prompt-ids", required=True, type=Path)
+    parser.add_argument(
+        "--journal",
+        type=Path,
+        help="Controller journal used to label initial Decode workers",
+    )
     parser.add_argument("--short-tokens", type=int, default=192)
     parser.add_argument("--long-tokens", type=int, default=1024)
-    parser.add_argument("--per-group", type=int, default=6)
+    parser.add_argument("--per-group", type=int)
     parser.add_argument("--timeout", type=float, default=180)
     parser.add_argument("--output", required=True, type=Path)
     args = parser.parse_args()
@@ -166,8 +216,12 @@ def main():
         or any(type(token) is not int or token < 0 for token in prompt)
     ):
         parser.error("prompt-ids must be a nonempty JSON token-id list")
-    if not 0 < args.short_tokens < args.long_tokens or args.per_group < 1:
-        parser.error("require 0 < short-tokens < long-tokens and per-group >= 1")
+    if args.per_group is None:
+        args.per_group = 6 if args.mode == "mixed" else 12
+    if args.per_group < 1 or args.long_tokens < 1:
+        parser.error("per-group and long-tokens must be positive")
+    if args.mode == "mixed" and not 0 < args.short_tokens < args.long_tokens:
+        parser.error("mixed mode requires 0 < short-tokens < long-tokens")
     result = run(args, prompt)
     args.output.write_text(json.dumps(result, indent=2) + "\n")
     print(
@@ -175,8 +229,11 @@ def main():
             {
                 key: result[key]
                 for key in (
-                    "valid_mixed_run",
+                    "mode",
+                    "valid_run",
                     "source_safe_to_stop_ms",
+                    "activate_to_safe_to_stop_ms",
+                    "peak_cutovers",
                     "moved",
                     "short_natural",
                     "precopy_bytes",
@@ -184,7 +241,7 @@ def main():
             }
         )
     )
-    raise SystemExit(0 if result["valid_mixed_run"] else 1)
+    raise SystemExit(0 if result["valid_run"] else 1)
 
 
 if __name__ == "__main__":

@@ -38,6 +38,9 @@ class WorkerTransport:
         self.submissions = []
         self.auto_release = True
         self.precopy = False
+        self.waves = []
+        self.wave_supported = False
+        self.import_ready = True
 
     def send_to(self, directory, worker, payload, timeout):
         assert directory.name == worker
@@ -54,7 +57,21 @@ class WorkerTransport:
                 requests=copy.deepcopy(requests),
                 migrations=copy.deepcopy(self.migrations[worker]),
                 precopy_protocol="closed-page-precopy-v1" if self.precopy else None,
+                async_handoff_supported=self.wave_supported,
+                control_wave_supported=self.wave_supported,
             )
+        if cmd == "d2d_control_wave":
+            assert self.wave_supported and payload["expected_instances"] == [worker]
+            commands = payload["commands"]
+            self.waves.append((worker, copy.deepcopy(commands)))
+            return {
+                "results": {
+                    command["migration_epoch"]: self.send_to(
+                        directory, worker, command, timeout
+                    )
+                    for command in commands
+                }
+            }
         if cmd == "d2d_submit_pd":
             requests[payload["rid"]] = self.request([1, 2])
             self.submissions.append((worker, payload["prefill_url"]))
@@ -88,6 +105,8 @@ class WorkerTransport:
             )
             return {"transfer": transfer}
         if cmd == "d2d_import":
+            if payload.get("async_handoff") and not self.import_ready:
+                return {"import_pending": True}
             self.moves[epoch] = payload["transfers"][0]
             return {"imported": True}
         if cmd == "d2d_commit":
@@ -287,6 +306,7 @@ class TestDsvMigrationController(CustomTestCase):
 
     def test_next_request_cannot_start_until_previous_source_retires(self):
         self.driver.auto_release = False
+        self.driver.wave_supported = True
         ids = [
             self.controller.accept({"prompt_ids": [0], "max_new_tokens": 12})
             for _ in range(4)
@@ -307,6 +327,113 @@ class TestDsvMigrationController(CustomTestCase):
             sorted(self.controller.entry(rid)["phase"] for rid in (ids[0], ids[3])),
             ["LOCAL", "TARGET"],
         )
+
+    def test_named_workers_batch_four_async_cutovers(self):
+        self.controller.close()
+        self.driver.wave_supported = True
+        self.controller = self.open_controller(
+            standby=("D0", "D2"), max_concurrent_migrations=4
+        )
+        rids = [
+            self.controller.accept({"prompt_ids": [0], "max_new_tokens": 12})
+            for _ in range(4)
+        ]
+        self.ticks(2)
+        self.controller.start_named_drain("D1", "D2")
+        self.ticks()
+        status = self.controller.drain_status()
+        self.assertEqual(status["state"], "SAFE_TO_STOP")
+        self.assertCountEqual(status["members"], rids)
+        self.assertEqual(
+            status["migration_limits"], {"preparing": 4, "cutover": 4, "inflight": 8}
+        )
+        self.assertTrue(
+            all(
+                member["owner"] == "D2" and member["migration_outcome"] == "migrated"
+                for member in status["members_state"].values()
+            )
+        )
+        for worker, command in (
+            ("D2", "d2d_reserve"),
+            ("D1", "d2d_freeze"),
+            ("D2", "d2d_import"),
+            ("D2", "d2d_commit"),
+        ):
+            wave = next(
+                commands
+                for name, commands in self.driver.waves
+                if name == worker and {item["cmd"] for item in commands} == {command}
+            )
+            self.assertEqual(len(wave), 4)
+            if command == "d2d_import":
+                self.assertTrue(
+                    all(item["async_handoff"] and item["defer_bulk"] for item in wave)
+                )
+
+    def test_prepare_overlaps_cutover_and_waits_for_inflight_retirement(self):
+        self.controller.close()
+        self.driver.wave_supported = True
+        self.driver.precopy = True
+        self.driver.import_ready = False
+        self.driver.auto_release = False
+        self.controller = self.open_controller(
+            standby=("D1", "D2"),
+            max_concurrent_migrations=2,
+            max_preparing_migrations=2,
+            precopy_window_ms=400,
+        )
+        rids = [
+            self.controller.accept({"prompt_ids": [0], "max_new_tokens": 12})
+            for _ in range(5)
+        ]
+        self.ticks(2)
+
+        def entries_in(phase):
+            return [
+                entry
+                for rid in rids
+                if (entry := self.controller.entry(rid))["phase"] == phase
+            ]
+
+        with patch.object(time, "time", return_value=time.time()) as clock:
+            self.controller.start_named_drain("D0", "D1")
+            self.ticks()
+            preparing = entries_in("WAIT_CUT")
+            self.assertEqual(len(preparing), 2)
+            self.assertEqual(len(entries_in("SOURCE")), 3)
+            self.assertTrue(all(entry["precopy_bytes"] == 128 for entry in preparing))
+
+            clock.return_value = preparing[0]["precopy_until"]
+            self.ticks()
+            self.assertEqual(len(entries_in("IMPORT")), 2)
+            queued = entries_in("WAIT_CUT")
+            self.assertEqual(len(queued), 2)
+            self.assertTrue(all(entry["precopy_bytes"] == 128 for entry in queued))
+
+            clock.return_value = queued[0]["precopy_until"]
+            self.driver.waves.clear()
+            self.ticks()
+            self.assertCountEqual(
+                [entry["rid"] for entry in entries_in("WAIT_CUT")],
+                [entry["rid"] for entry in queued],
+            )
+            self.assertTrue(
+                all(
+                    item["cmd"] == "d2d_import"
+                    for _, wave in self.driver.waves
+                    for item in wave
+                )
+            )
+
+            self.driver.import_ready = True
+            self.ticks()
+            targets = entries_in("TARGET")
+            self.assertEqual(len(targets), 4)
+            self.assertEqual(len(entries_in("SOURCE")), 1)
+            self.assertEqual(self.controller.drain_status()["state"], "MIGRATING")
+            self.driver.release(targets[0]["epoch"])
+            self.ticks()
+            self.assertEqual(len(entries_in("WAIT_CUT")), 1)
 
     def test_finish_at_freeze_holds_slot_until_rollback_cleans_destination(self):
         """EOS after the status poll must finish on source before the next move."""
