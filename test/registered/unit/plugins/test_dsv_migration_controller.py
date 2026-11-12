@@ -308,6 +308,73 @@ class TestDsvMigrationController(CustomTestCase):
             ["LOCAL", "TARGET"],
         )
 
+    def test_finish_at_freeze_holds_slot_until_rollback_cleans_destination(self):
+        """EOS after the status poll must finish on source before the next move."""
+        self.controller.close()
+        self.controller = self.open_controller(standby=("D1", "D2"))
+        rids = [
+            self.controller.accept({"prompt_ids": [0], "max_new_tokens": 12})
+            for _ in range(2)
+        ]
+        self.ticks(2)
+        self.controller.start_named_drain("D0", "D1")
+        self.ticks(4)
+        first = next(
+            self.controller.entry(rid)
+            for rid in rids
+            if self.controller.entry(rid)["phase"] == "FREEZE"
+        )
+        second = next(rid for rid in rids if rid != first["rid"])
+        send_to = self.driver.send_to
+        abort_acknowledged = False
+
+        def finish_at_freeze(directory, worker, payload, timeout):
+            if payload["migration_epoch"] == first["epoch"]:
+                cmd = payload["cmd"]
+                if cmd == "d2d_freeze":
+                    self.driver.requests[worker][payload["rid"]] = self.driver.request(
+                        [1, 2, 3], finished=True
+                    )
+                    return {
+                        "deferred": True,
+                        "migration_deferred_reason": "request_finished",
+                        "retryable": False,
+                    }
+                if cmd == "d2d_precopy_close":
+                    return {"closed": True}
+                if cmd == "d2d_abort":
+                    return {"aborted": abort_acknowledged}
+                if cmd == "d2d_resume":
+                    return {"resumed": True}
+            return send_to(directory, worker, payload, timeout)
+
+        with patch.object(self.driver, "send_to", side_effect=finish_at_freeze):
+            self.ticks()
+            status = self.controller.drain_status()
+            self.assertEqual(status["state"], "MIGRATING")
+            self.assertEqual(status["members_state"][first["rid"]]["phase"], "ROLLBACK")
+            self.assertEqual(status["members_state"][second]["phase"], "SOURCE")
+            self.assertEqual(status["members_state"][second]["migration_attempts"], 0)
+            abort_acknowledged = True
+            self.ticks()
+
+        status = self.controller.drain_status()
+        self.assertEqual(status["state"], "SAFE_TO_STOP")
+        members = status["members_state"]
+        completed = members[first["rid"]]
+        self.assertEqual((completed["owner"], completed["phase"]), ("D0", "DONE"))
+        self.assertEqual(
+            completed["migration_outcome"], "window_missed_request_finished"
+        )
+        self.assertEqual(
+            self.controller.entry(first["rid"])["final_output_ids"], [1, 2, 3]
+        )
+        self.assertNotIn(first["epoch"], self.driver.moves)
+        self.assertEqual(
+            (members[second]["owner"], members[second]["phase"]), ("D1", "LOCAL")
+        )
+        self.assertEqual(members[second]["migration_outcome"], "migrated")
+
     def test_mixed_drain_waits_once_and_only_moves_a_surviving_request(self):
         self.controller.close()
         self.driver.precopy = True
