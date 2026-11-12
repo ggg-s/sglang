@@ -61,9 +61,13 @@ class MigrationController(DsvGateway):
         prefills,
         decode_workers,
         standby=(),
+        natural_drain_ms=0,
         autostart=True,
         **kwargs,
     ):
+        if natural_drain_ms < 0:
+            raise ValueError("natural drain window must be nonnegative")
+        self.natural_drain_s = natural_drain_ms / 1000
         self.prefills = dict(prefills)
         self.standby = frozenset(standby)
         if (
@@ -179,6 +183,8 @@ class MigrationController(DsvGateway):
         drain = self.journal["drain"]
         if not drain or entry["rid"] not in drain["members"]:
             return None
+        if time.time() < drain.get("natural_drain_until", 0):
+            return None
         if any(
             record["phase"] in ACTIVE_MIGRATION_PHASES
             for record in self.journal["entries"].values()
@@ -191,6 +197,12 @@ class MigrationController(DsvGateway):
         if instances != drain["instances"][target]:
             raise RuntimeError("destination identity changed before reservation")
         return target
+
+    def _cut_due(self, entry, request):
+        # Named drains decide the cut only after a request has the migration slot.
+        return entry["phase"] not in {"SUBMIT", "SOURCE"} and super()._cut_due(
+            entry, request
+        )
 
     def _source_idle(self, source):
         return self._decode_ready(source) and super()._source_idle(source)
@@ -277,6 +289,8 @@ class MigrationController(DsvGateway):
                 instances=instances,
                 started_at=cordon["started_at"] if cordon else time.time(),
             )
+            if self.natural_drain_s:
+                drain["natural_drain_until"] = time.time() + self.natural_drain_s
             previous = self.journal
             entries = dict(previous["entries"])
             for rid, entry in members.items():
@@ -330,9 +344,17 @@ def main():
     parser.add_argument("--port", type=int, default=31080)
     parser.add_argument("--admin-port", type=int, default=31081)
     parser.add_argument("--poll-ms", type=float, default=10)
+    parser.add_argument(
+        "--natural-drain-ms",
+        type=int,
+        default=0,
+        help="Let source requests finish for this long after cordon before planning D2D",
+    )
     parser.add_argument("--precopy-window-ms", type=int, default=0)
     parser.add_argument("--out", type=Path, help="Optional per-request handoff JSONL")
     args = parser.parse_args()
+    if min(args.natural_drain_ms, args.precopy_window_ms) < 0:
+        parser.error("drain and precopy windows must be nonnegative")
     try:
         config = json.loads(args.config.read_text())
         prefills = {
@@ -373,6 +395,7 @@ def main():
         decode_workers=decode_workers,
         standby=config.get("standby", ()),
         poll_ms=args.poll_ms,
+        natural_drain_ms=args.natural_drain_ms,
         precopy_window_ms=args.precopy_window_ms,
         out=args.out,
         **(native_options or {}),

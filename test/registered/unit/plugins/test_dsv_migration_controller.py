@@ -37,6 +37,7 @@ class WorkerTransport:
         self.commands = []
         self.submissions = []
         self.auto_release = True
+        self.precopy = False
 
     def send_to(self, directory, worker, payload, timeout):
         assert directory.name == worker
@@ -52,6 +53,7 @@ class WorkerTransport:
                 idle=all(row["kv_released"] for row in requests.values()),
                 requests=copy.deepcopy(requests),
                 migrations=copy.deepcopy(self.migrations[worker]),
+                precopy_protocol="closed-page-precopy-v1" if self.precopy else None,
             )
         if cmd == "d2d_submit_pd":
             requests[payload["rid"]] = self.request([1, 2])
@@ -63,10 +65,19 @@ class WorkerTransport:
                     "lower": 4,
                     "upper": 12,
                     "output_ids": requests[payload["rid"]]["output_ids"],
+                    "schema": {"page_size": 4, "entries": [["full", 128]]},
                 }
             }
         if cmd == "d2d_reserve":
             return {"reserved": True, "reservation": {}}
+        if cmd == "d2d_precopy_status":
+            return {"available": [1]}
+        if cmd == "d2d_precopy_prepare":
+            return {"receive": {}}
+        if cmd == "d2d_precopy_copy":
+            return {"proof": {}}
+        if cmd == "d2d_precopy_apply":
+            return {"prefix_pages": [1], "receipt": {"bytes": 128}}
         if cmd == "d2d_freeze":
             transfer = dict(
                 output_ids=list(requests[payload["rid"]]["output_ids"]),
@@ -296,6 +307,117 @@ class TestDsvMigrationController(CustomTestCase):
             sorted(self.controller.entry(rid)["phase"] for rid in (ids[0], ids[3])),
             ["LOCAL", "TARGET"],
         )
+
+    def test_mixed_drain_waits_once_and_only_moves_a_surviving_request(self):
+        self.controller.close()
+        self.driver.precopy = True
+        self.driver.auto_release = False
+        self.controller = self.open_controller(
+            standby=("D1", "D2"), natural_drain_ms=300, precopy_window_ms=400
+        )
+        ids = [
+            self.controller.accept({"prompt_ids": [0], "max_new_tokens": 12})
+            for _ in range(3)
+        ]
+        self.ticks(2)
+        now = time.time()
+        with patch.object(time, "time", return_value=now) as clock:
+            status = self.controller.start_named_drain("D0", "D1")
+            self.assertEqual(status["state"], "NATURAL_DRAINING")
+            self.assertCountEqual(status["members"], ids)
+            self.assertNotIn("D0", self.controller._available_decodes())
+            short = self.controller.entry(ids[0])["source_rid"]
+            self.driver.requests["D0"][short] = self.driver.request(
+                [1, 2], finished=True
+            )
+            self.ticks()
+            self.assertEqual(self.controller.entry(ids[0])["phase"], "DONE")
+            self.assertTrue(
+                all(cmd != "d2d_plan" for _, cmd, _ in self.driver.commands)
+            )
+
+            clock.return_value = status["natural_drain_until"]
+            self.ticks()
+            active = [
+                self.controller.entry(rid)
+                for rid in ids
+                if self.controller.entry(rid)["epoch"]
+            ]
+            self.assertEqual(len(active), 1)
+            move = active[0]
+            self.assertEqual(move["phase"], "WAIT_CUT")
+            self.assertEqual(move["precopy_bytes"], 128)
+            self.assertEqual(move["precopy_until"], clock.return_value + 0.4)
+            commands = [cmd for _, cmd, _ in self.driver.commands]
+            self.assertLess(
+                commands.index("d2d_reserve"), commands.index("d2d_precopy_prepare")
+            )
+            self.assertNotIn("d2d_freeze", commands)
+
+            clock.return_value = move["precopy_until"]
+            self.ticks()
+            self.assertEqual(self.controller.entry(move["rid"])["phase"], "TARGET")
+            survivor = next(rid for rid in ids[1:] if rid != move["rid"])
+            source_rid = self.controller.entry(survivor)["source_rid"]
+            self.driver.requests["D0"][source_rid] = self.driver.request(
+                [1, 2], finished=True
+            )
+            self.ticks()
+            self.assertEqual(self.controller.entry(survivor)["phase"], "DONE")
+            self.assertEqual(self.controller.drain_status()["state"], "MIGRATING")
+            self.driver.release(move["epoch"])
+            self.ticks()
+            self.assertEqual(self.controller.drain_status()["state"], "SAFE_TO_STOP")
+            self.assertEqual(
+                sum(cmd == "d2d_plan" for _, cmd, _ in self.driver.commands), 1
+            )
+
+    def test_natural_window_survives_restart_and_can_finish_early(self):
+        self.controller.close()
+        self.controller = self.open_controller(natural_drain_ms=300)
+        rid = self.controller.accept({"prompt_ids": [0], "max_new_tokens": 12})
+        self.ticks(2)
+        with patch.object(time, "time", return_value=time.time()):
+            drain = self.controller.start_named_drain("D0", "D1")
+            self.controller.close()
+            self.controller = self.open_controller()
+            status = self.controller.start_named_drain("D0", "D1")
+            self.assertEqual(status["id"], drain["id"])
+            self.assertEqual(
+                status["natural_drain_until"], drain["natural_drain_until"]
+            )
+            self.assertEqual(status["state"], "NATURAL_DRAINING")
+            source_rid = self.controller.entry(rid)["source_rid"]
+            self.driver.requests["D0"][source_rid] = self.driver.request(
+                [1, 2], finished=True
+            )
+            self.ticks()
+            self.assertEqual(self.controller.drain_status()["state"], "SAFE_TO_STOP")
+            self.assertIsNone(self.controller.entry(rid)["epoch"])
+
+    def test_expired_precopy_window_does_not_start_a_frame_before_first_token(self):
+        self.controller.close()
+        self.driver.precopy = True
+        self.controller = self.open_controller(precopy_window_ms=400)
+        rid = self.controller.accept({"prompt_ids": [0], "max_new_tokens": 12})
+        self.ticks(2)
+        source = self.driver.requests["D0"][self.controller.entry(rid)["source_rid"]]
+        source["output_ids"] = []
+        with patch.object(time, "time", return_value=time.time()) as clock:
+            self.controller.start_named_drain("D0", "D1")
+            self.ticks(3)
+            entry = self.controller.entry(rid)
+            self.assertEqual(entry["phase"], "WAIT_CUT")
+            clock.return_value = entry["precopy_until"]
+            self.driver.commands.clear()
+            self.ticks(2)
+            self.assertEqual(self.controller.entry(rid)["phase"], "WAIT_CUT")
+            self.assertFalse(
+                any(cmd.startswith("d2d_precopy") for _, cmd, _ in self.driver.commands)
+            )
+            source["output_ids"] = [1, 2]
+            self.ticks()
+            self.assertEqual(self.controller.drain_status()["state"], "SAFE_TO_STOP")
 
     def test_restart_keeps_the_fence_and_physical_target(self):
         from p4_dsv_gateway import DrainConflict
@@ -633,6 +755,7 @@ class TestNativePdDecode(CustomTestCase):
     def test_cordon_waits_for_every_smg_and_preserves_already_paired_requests(self):
         from io import BytesIO
 
+        self.controller.natural_drain_s = 0.3
         pending = self.controller.start_named_drain("D0", "D1")
         body = {"prompt_ids": [0], "max_new_tokens": 16}
         early = self.controller.accept_native("D0", body, self.bootstrap(10))
@@ -658,11 +781,18 @@ class TestNativePdDecode(CustomTestCase):
             self.controller._reconcile_cordon()
         self.assertEqual(self.controller.drain_status()["state"], "CORDONING")
         self.assertEqual(self.controller.entry(early)["workers"], {"src": "D0"})
-        with patch(
-            "migration_native_pd.urlopen", side_effect=[answer(False), answer(False)]
+        confirmed_at = pending["started_at"] + 3
+        with (
+            patch(
+                "migration_native_pd.urlopen",
+                side_effect=[answer(False), answer(False)],
+            ),
+            patch.object(time, "time", return_value=confirmed_at),
         ):
             self.controller._reconcile_cordon()
-        state = self.controller.drain_status()
+            state = self.controller.drain_status()
+        self.assertEqual(state["state"], "NATURAL_DRAINING")
+        self.assertEqual(state["natural_drain_until"], confirmed_at + 0.3)
         self.assertEqual(state["id"], pending["id"])
         self.assertEqual(state["members"], [early])
         late = self.controller.accept_native("D0", body, self.bootstrap(11))

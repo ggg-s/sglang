@@ -1194,6 +1194,10 @@ class DsvGateway:
             if cut_due:
                 self._update(rid, phase="FREEZE")
                 return
+            # Named drains bound new frames even before the first output token.
+            deadline = entry.get("precopy_until", 0) if self.decode_workers else None
+            if deadline is not None and time.time() >= deadline:
+                return
             if not all(
                 r.get("precopy_protocol") == "closed-page-precopy-v1"
                 for role in ("src", "dst")
@@ -1236,6 +1240,8 @@ class DsvGateway:
                     )
             rows = yield from self._precopy_source(entry, "d2d_precopy_status")
             if rows is None:
+                return
+            if deadline is not None and time.time() >= deadline:
                 return
             available = [
                 min(r["available"][i] for r in rows)
@@ -2195,12 +2201,15 @@ class DsvGateway:
                 if safe
                 else "BLOCKED"
                 if blocked
+                else "NATURAL_DRAINING"
+                if time.time() < drain.get("natural_drain_until", 0)
                 else "MIGRATING",
                 members_state={
                     e["rid"]: dict(
                         phase=e["phase"],
                         owner=self._worker(e, e["owner"]),
                         error=e["error"],
+                        migration_attempts=e["attempts"],
                         migration_deferred=e.get("migration_deferred", False),
                         migration_deferred_reason=e.get("migration_deferred_reason"),
                         migration_deferred_count=e.get("migration_deferred_count", 0),
