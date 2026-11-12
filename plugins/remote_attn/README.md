@@ -56,8 +56,8 @@ P5.19 now has an opt-in same-host pre-layerwise PD prototype; see the
 It inherits the model deployment's token chunking and selects layer groups from
 the scheduler's actual batch lengths. No separate chunk-size setting is needed.
 Small tails use native transfer in `layerwise` mode. In `remote` mode, dense MHA
-and FULL+MAMBA PD default to split prefill. After cache matching, P assigns 30%
-of the uncached tokens to D by default (`HANDOFF_HYBRID_SPLIT_PREFILL_CUT_RATIO=0.70`).
+and FULL+MAMBA PD default to split prefill. After cache matching, P assigns 25%
+of the uncached tokens to D by default (`HANDOFF_HYBRID_SPLIT_PREFILL_CUT_RATIO=0.75`).
 The suffix floor scales up to 2,048 tokens. Warm prompts and prompts shorter
 than 32K also cap the suffix by D's advertised chunk cap and 15% of the prompt.
 D uses 4,096-token chunks by default and caps outstanding offers and continuations

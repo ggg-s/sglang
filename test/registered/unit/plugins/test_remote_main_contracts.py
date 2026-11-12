@@ -1359,8 +1359,9 @@ class TestSplitPD(CustomTestCase):
             for length, prefix, expected in (
                 (16384, 0, 13927),
                 (16384, 14745, 15360),
-                (32768, 0, 22938),
+                (32768, 0, 24576),
                 (32768, 13107, 28672),
+                (32768, 19660, 29491),
                 (32768, 26214, 30720),
                 (65536, 26214, 61440),
             ):
@@ -1403,10 +1404,10 @@ class TestSplitPD(CustomTestCase):
         with patch.dict(os.environ, {"HANDOFF_HYBRID_SPLIT_PREFILL": "0"}):
             self.assertFalse(self.controller().split_prefill)
             self.assertFalse(self.controller("decode").split_prefill)
-        with patch.dict(os.environ, {"HANDOFF_HYBRID_SPLIT_PREFILL_CUT_RATIO": "0.75"}):
+        with patch.dict(os.environ, {"HANDOFF_HYBRID_SPLIT_PREFILL_CUT_RATIO": "0.70"}):
             _, _, req, _ = self.bootstrap()
             self.split.init_input(self.match, req, object())
-            self.assertEqual(req._hybrid_split_at, 24576)
+            self.assertEqual(req._hybrid_split_at, 22938)
         with patch.dict(os.environ, {"HANDOFF_SPLIT_CUT_BASIS": "whole"}):
             _, _, req, _ = self.bootstrap(prefix=26214)
             self.split.init_input(self.match, req, object())
@@ -1427,7 +1428,7 @@ class TestSplitPD(CustomTestCase):
         self.assertEqual(len(req.full_untruncated_fill_ids), 32768)
         self.assertFalse(hasattr(req, "_hybrid_split_at"))
         self.split.init_input(self.match, req, cache)
-        self.assertEqual(req._hybrid_split_at, 22938)
+        self.assertEqual(req._hybrid_split_at, 24576)
         req.prefix_len = req.kv.cache_protected_len = 29491
         self.split.init_input(self.match, req, cache)
         self.assertEqual(req._hybrid_split_at, 30720)

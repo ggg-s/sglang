@@ -121,8 +121,8 @@ Remote attention 用于 D2D 迁移。P→D Remote 早接纳作为实验功能，
 `HANDOFF_HYBRID_SPLIT_PREFILL` 默认 `1`，在 P、D 两端设为 `0` 可做原生 PD 对照。
 至少 4096 token 的纯文本请求可参与协商。P 配置切点，D 配置续算批大小。
 
-- P 的 `HANDOFF_HYBRID_SPLIT_PREFILL_CUT_RATIO` 范围为 `[0.5, 1)`，默认 `0.70`。
-  默认按实际未命中量分配，D 接手其中 30%，后缀下限为
+- P 的 `HANDOFF_HYBRID_SPLIT_PREFILL_CUT_RATIO` 范围为 `[0.5, 1)`，默认 `0.75`。
+  默认按实际未命中量分配，D 接手其中 25%，后缀下限为
   `min(2048, max(prompt_tokens // 16, 1))`。有缓存命中或 prompt 短于 32K 时，
   后缀再受 D 声明的 chunk cap 和 prompt 长度的 15% 限制。切点须越过命中前缀，
   满足 D 声明的下界，并留下足够的后缀。没有合法切点时走原生 PD。
@@ -148,7 +148,7 @@ P 发出切点前的 KV 和 Conv／SSM 后完成原生传输。D 在已有预留
 并从完整 prompt 的末尾采样首 token。前缀 KV 在 D 本地读取。每个续算 batch 最多处理
 一个请求，已有 decode batch 会在两个续算 batch 之间获得执行机会。
 验收时用相同的缓存冷热顺序和并发，对比 TTFT、E2E、吞吐和逐请求 ITL。
-增大续算块会减少停顿次数，单次停顿仍可能变长，因此同时记录最大 token 间隔。
+同时记录最大 token 间隔超过 100 ms 的请求占比，以及逐请求最大间隔的分位数。
 P、D 的 `[handoff-split-decision]` 记录协商与回退原因，可按 bootstrap room 对照。
 D 的 `[handoff-split]` 记录切点和总续算量，`[handoff-split-chunk]` 记录每块的起止
 位置和剩余 token 数。D 复用同一份 KV 预留和 Conv／SSM 状态。
