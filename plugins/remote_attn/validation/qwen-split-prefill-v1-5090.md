@@ -54,7 +54,7 @@
 779 ms。32K C8 冷缓存的摘要列出 42 ms，统计分母待用原始数据复核。
 表格沿用各实验臂的实际配置，其中 64K 冷缓存的 11% 来自钉后缀臂。
 
-## V1 默认策略
+## Split V1 策略
 
 P 以 `H = max(prefix_len, cache_protected_len)` 为命中长度，D 默认计算未命中
 token 的 25%（cut 基准比例 0.75）。后缀至少为
@@ -62,7 +62,8 @@ token 的 25%（cut 基准比例 0.75）。后缀至少为
 短于 32K 时，后缀还受 `min(chunk_cap, floor(0.15 × N))` 限制。
 D 默认 chunk 为 4096，以 D 的 `--max-prefill-tokens` 为上限，声明的
 `chunk_cap = max(实际 chunk, 2048)`。切点须越过实际命中前缀并落在双方
-协商的范围内，否则走原生 PD。V3 offer 隔离采用固定后缀下限的旧端。
+协商的范围内，否则走原生 PD。D 在续算块满足调度条件时立即提交。
+`whole` 是整段比例对照臂。V3 wire 是 Split V1 与 Split V2 共用的协商协议。
 
 ## 冷热缓存与并发
 

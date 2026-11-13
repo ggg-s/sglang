@@ -121,13 +121,19 @@ Remote attention 用于 D2D 迁移。P→D Remote 早接纳作为实验功能，
 `HANDOFF_HYBRID_SPLIT_PREFILL` 默认 `1`，在 P、D 两端设为 `0` 可做原生 PD 对照。
 至少 4096 token 的纯文本请求可参与协商。P 配置切点，D 配置续算批大小。
 
+- **Split V1** 用 `miss` 按未命中量选切点。热请求或短于 32K 的请求再加后缀
+  cap，D 在续算块满足调度条件时立即提交。
+- **Split V2** 用平衡切点并优先调度已有 decode，是当前默认策略。
+
+本分支的 Split 策略只有 V1 和 V2。**V3 wire** 是两套策略共用的 P/D bootstrap 协议版本。
+
 - P 默认在 D 声明 decode 优先时使用平衡切点
   `min((N + H + 12185) // 2, N - floor)`。其中 `H` 是实际命中前缀，
   `floor = min(2048, max(N // 16, 1))`。切点须越过命中前缀并满足
   D 声明的下界，否则走原生 PD。12185 按 5090、TP2、128 输出 token 标定。
 - D 的 `HANDOFF_SPLIT_DEFER_TICKS` 默认 `150`。有活跃 decode 时，
   候选后缀每让路一次计一轮。P 命中至少 70% 时，预算上限为 45 轮。
-  每块提交后重新计数。设为 `0` 可恢复 V1 的立即提交和默认未命中比例。
+  每块提交后重新计数。P 保持默认切点配置时，D 设为 `0` 即恢复 Split V1。
 - P 可用 `HANDOFF_SPLIT_CUT_BASIS=miss` 对照 V1 切点。此时
   `HANDOFF_HYBRID_SPLIT_PREFILL_CUT_RATIO` 范围为 `[0.5, 1)`，默认 `0.75`，
   D 接手未命中量的 25%。有缓存命中或 prompt 短于 32K 时，V1 后缀
@@ -148,9 +154,9 @@ Remote attention 用于 D2D 迁移。P→D Remote 早接纳作为实验功能，
 沿用同 TP 的原生 Mooncake、early device allocation 和 page-1 KV 配置。
 D 命中已有前缀、请求输出 logprobs、结构化生成或对端未协商时走原生 PD。
 P 等到 bootstrap 后再为可协商请求启动 Prefill，首次 Forward 前对实际 cut 做
-TP 一致性检查。V3 Bootstrap 传递最小切点、chunk cap 和可选的 decode 优先能力，
-完成 metadata 传递实际切点。旧 V3 D 仍可与新 P 协商 V1 切点。协议版本
-不匹配时走原生 PD。
+TP 一致性检查。V3 wire 的 bootstrap 消息传递最小切点、chunk cap 和可选的
+decode 优先能力，完成 metadata 传递实际切点。未声明 decode 优先能力的
+V3 wire 对端仍可协商 Split V1。协议版本不兼容时走原生 PD。
 
 P 发出切点前的 KV 和 Conv／SSM 后完成原生传输。D 在已有预留中续算剩余 prompt，
 并从完整 prompt 的末尾采样首 token。前缀 KV 在 D 本地读取。每个续算 batch 最多处理

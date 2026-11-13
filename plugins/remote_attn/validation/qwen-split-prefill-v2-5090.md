@@ -6,7 +6,11 @@ Qwen3.8-27B-FP8、P TP2 / D TP2、Mooncake TCP、CUDA Graph 和 overlap。
 入库前的 V1 对照默认 cut 0.75 见 `9733758372`。
 以下延迟均为 ms，吞吐为输出 token/s。
 
-## 策略
+## Split V2 策略
+
+Split V2 使用平衡切点和 decode 优先。Split V1 使用 `miss` 切点，
+对热请求和短请求应用后缀 cap，并在续算块满足调度条件时立即提交。
+两套策略共用 V3 wire 协议。内网的 `RUNID=v3` 是平衡切点验证的实验标签。
 
 P 在匹配缓存后选择 `min((N + H + 12185) // 2, N - floor)`。
 `H` 是实际命中前缀，`floor = min(2048, max(N // 16, 1))`。
@@ -98,8 +102,8 @@ E2E 分别为 39,848 和 39,891。64K 的相对 p90 降幅使用同为 40 条的
 
 ## 对照配置
 
-- 两侧使用默认值可复现 V2 的策略。D 侧用 `HANDOFF_SPLIT_DEFER_TICKS=0`
-  可恢复 V1 的立即提交和默认未命中比例。
+- 两侧使用默认值可复现 Split V2。P 保持默认切点配置、D 侧设置
+  `HANDOFF_SPLIT_DEFER_TICKS=0` 可复现 Split V1。
 - 固定 cut 比较调度时，在 P 设 `HANDOFF_SPLIT_SUFFIX_TOKENS`，
   例如 64K 同切点对照用 26612，在 D 分别设预算 0 和 150。
 - 每臂用唯一标签保存请求记录，同时计算打断率和受影响子集的最大 ITL p90。
