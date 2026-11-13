@@ -16604,6 +16604,47 @@ class TestRemoteAttn(CustomTestCase):
         self.assertIsNone(source.service)
         self.assertFalse(e.freed)
 
+    def test_dsv_d2d_worker_snapshot_publishes_owned_copy_on_background_thread(self):
+        """A slow writer cannot hold the scheduler or observe later tokens."""
+        from sglang_remote_attn import d2d_worker_snapshot
+
+        e = self._d2d_env()
+        directory = Path(e.tmp) / "snapshot"
+        directory.mkdir()
+        scheduler = e.source.scheduler
+        scheduler._pre_layerwise = e.source
+        writing, proceed, written = (
+            threading.Event(), threading.Event(), threading.Event()
+        )
+        write = self.runtime._write_result
+
+        def blocked_write(path, payload):
+            writing.set()
+            if proceed.wait(2):
+                write(path, payload)
+                written.set()
+
+        with (
+            patch.object(d2d_worker_snapshot, "ENABLED", True),
+            patch.object(self.runtime, "_CTL_DIR", str(directory)),
+            patch.object(self.runtime, "_write_result", side_effect=blocked_write),
+        ):
+            try:
+                d2d_worker_snapshot.sample(scheduler)
+                self.assertTrue(writing.wait(2))
+                self.assertTrue(scheduler._d2d_status_publisher.thread.is_alive())
+                e.req.output_ids.append(99)
+                proceed.set()
+                self.assertTrue(written.wait(2))
+            finally:
+                proceed.set()
+                d2d_worker_snapshot.close(scheduler)
+        snapshot = json.loads((directory / "d2d-status.0.json").read_text())
+        self.assertEqual(snapshot["sequence"], 1)
+        status = snapshot["status"]
+        self.assertEqual(status["instance_id"], e.source.d2d_instance_id)
+        self.assertEqual(status["requests"][e.req.rid]["output_ids"], [31, 32, 33])
+
     def test_dsv_d2d_worker_status_recovers_only_released_submission_history(self):
         """The submit replay record can prove EOS after native tracking is gone."""
         from sglang_remote_attn import dsv_d2d as d2d

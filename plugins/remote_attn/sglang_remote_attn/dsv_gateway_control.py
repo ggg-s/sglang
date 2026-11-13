@@ -44,7 +44,7 @@ def request_status(controller, req):
     )
 
 
-def migration_status(controller, epoch, *, include_transfer=True):
+def migration_status(controller, epoch, *, include_transfer=True, diagnostics=True):
     sources, targets = d2d.records(controller)
     source, target = sources.get(epoch), targets.get(epoch)
     return dict(
@@ -90,9 +90,14 @@ def migration_status(controller, epoch, *, include_transfer=True):
             commit_pending=(
                 target.commit_worker is not None and target.commit_worker.is_alive()
             ),
-            import_timing_ns=dict(target.import_timing_ns),
-            setup_reads_ns=dict(target.reader.read_timing_ns) if target.reader else {},
-            bulk_reads_ns=dict(target.bulk_reader.read_timing_ns) if target.bulk_reader else {},
+            import_timing_ns=dict(target.import_timing_ns) if diagnostics else {},
+            setup_reads_ns=(
+                dict(target.reader.read_timing_ns) if diagnostics and target.reader else {}
+            ),
+            bulk_reads_ns=(
+                dict(target.bulk_reader.read_timing_ns)
+                if diagnostics and target.bulk_reader else {}
+            ),
             group_size=target.group_size,
             group_frames=target.group_frames,
             bulk_backend=target.bulk_reader.backend if target.bulk_reader else None,
@@ -136,6 +141,47 @@ def candidates(controller):
     return [r for r in reqs if hasattr(r, "rid")]
 
 
+def worker_status(controller, *, advisory=False):
+    scheduler = controller.scheduler
+    from .d2d_precopy import rdma_available
+    from .mooncake_backend import policy
+
+    sources, targets = d2d.records(controller)
+    _, tickets = reservations.records(controller)
+    epochs = set(sources) | set(targets) | set(tickets)
+    epochs.update(getattr(controller, "d2d_cancelled_epochs", ()))
+    epochs.update(getattr(controller, "d2d_source_cancelled_epochs", ()))
+    reqs = {req.rid: req for req in candidates(controller)}
+    reqs.update((s.req.rid, s.req) for s in sources.values())
+    reqs.update((t.decode_req.req.rid, t.decode_req.req) for t in targets.values())
+    return dict(
+        idle=bool(getattr(scheduler, "is_fully_idle", lambda: False)()),
+        protocol=d2d.VERSION,
+        precopy_protocol="closed-page-precopy-v1",
+        precopy_frame_bytes=d2d.bulk.CAPACITY,
+        precopy_packed_supported=True,
+        precopy_rdma=rdma_available(controller),
+        precopy_tcp=policy() != "rdma",
+        decode_timing={} if advisory else dict(getattr(controller, "decode_timing", {})),
+        sparse_timing={} if advisory else dict(getattr(controller, "sparse_stats", {})),
+        iter_period_ms=getattr(scheduler, "_handoff_iter_period_ms", None),
+        admission_plan_supported=True,
+        terminal_request_lookup_supported=True,
+        async_handoff_supported=True,
+        control_wave_supported=True,
+        instance_id=instance(controller),
+        rank=controller.rank,
+        tp_size=controller.tp_size,
+        requests={rid: request_status(controller, req) for rid, req in reqs.items()},
+        migrations={
+            e: migration_status(
+                controller, e, include_transfer=False, diagnostics=not advisory
+            )
+            for e in sorted(epochs)
+        },
+    )
+
+
 def handle(controller, data):
     scheduler, cmd = controller.scheduler, data["cmd"]
     epoch = data["migration_epoch"]
@@ -153,41 +199,7 @@ def handle(controller, data):
                 return dict(request=request_status(controller, req))
             return dict(request=None)
 
-        from .d2d_precopy import rdma_available
-        from .mooncake_backend import policy
-
-        sources, targets = d2d.records(controller)
-        _, tickets = reservations.records(controller)
-        epochs = set(sources) | set(targets) | set(tickets)
-        epochs.update(getattr(controller, "d2d_cancelled_epochs", ()))
-        epochs.update(getattr(controller, "d2d_source_cancelled_epochs", ()))
-        reqs = candidates(controller)
-        reqs.extend(s.req for s in sources.values())
-        reqs.extend(t.decode_req.req for t in targets.values())
-        return dict(
-            idle=bool(getattr(scheduler, "is_fully_idle", lambda: False)()),
-            protocol=d2d.VERSION,
-            precopy_protocol="closed-page-precopy-v1",
-            precopy_frame_bytes=d2d.bulk.CAPACITY,
-            precopy_packed_supported=True,
-            precopy_rdma=rdma_available(controller),
-            precopy_tcp=policy() != "rdma",
-            decode_timing=dict(getattr(controller, "decode_timing", {})),
-            sparse_timing=dict(getattr(controller, "sparse_stats", {})),
-            iter_period_ms=getattr(scheduler, "_handoff_iter_period_ms", None),
-            admission_plan_supported=True,
-            terminal_request_lookup_supported=True,
-            async_handoff_supported=True,
-            control_wave_supported=True,
-            instance_id=instance(controller),
-            rank=controller.rank,
-            tp_size=controller.tp_size,
-            requests={r.rid: request_status(controller, r) for r in reqs},
-            migrations={
-                e: migration_status(controller, e, include_transfer=False)
-                for e in sorted(epochs)
-            },
-        )
+        return worker_status(controller)
     tracked = d2d.remote.runtime()._tracked(scheduler)
     rid = str(data["rid"])
     if cmd == "d2d_cancel":

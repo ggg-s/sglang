@@ -87,6 +87,38 @@ def _ready(base: Path) -> list:
     return out
 
 
+def read_worker_snapshots(directory, *, max_age_s):
+    """Read advisory status from every live rank in the control directory."""
+    infos = _ready(directory)
+    if not infos or len(infos) != infos[0].get("tp_size"):
+        return None
+    snapshots = []
+    for rank, info in enumerate(infos):
+        try:
+            if info["rank"] != rank or info["tp_size"] != len(infos):
+                return None
+            snapshot = json.loads(
+                (directory / f"d2d-status.{rank}.json").read_text(encoding="utf-8")
+            )
+            if (
+                snapshot["version"] != 1
+                or snapshot["pid"] != info["pid"]
+                or type(snapshot["sequence"]) is not int
+                or snapshot["sequence"] < 1
+                or not isinstance(snapshot["status"], dict)
+                or type(snapshot["sampled_at"]) not in (int, float)
+                or snapshot["sampled_at"] < info["started_at"]
+            ):
+                return None
+        except (OSError, KeyError, TypeError, ValueError):
+            return None
+        snapshots.append(snapshot)
+    now = time.time()
+    if any(not 0 <= now - s["sampled_at"] <= max_age_s for s in snapshots):
+        return None
+    return snapshots
+
+
 def _send_legacy(d: Path, role: str, payload: dict, timeout: float) -> dict:
     """Pre-multi-rank control protocol: shared cmd.json/result.json."""
     res_path = d / "result.json"
@@ -189,6 +221,8 @@ def _send_unlocked(d: Path, role: str, payload: dict, timeout: float) -> dict:
             (d / f"result.{r}.json").unlink()
         except FileNotFoundError:
             pass
+    if payload["cmd"].startswith("d2d_"):
+        payload["_ctl_publish_mono"] = time.monotonic()
     for r in cmd_ranks:
         tmp = d / f"cmd.{r}.tmp"
         tmp.write_text(json.dumps(payload), encoding="utf-8")
@@ -213,6 +247,10 @@ def _send_unlocked(d: Path, role: str, payload: dict, timeout: float) -> dict:
                 except OSError:
                     pass
                 continue
+            if reply_started := res.get("_ctl", {}).get("reply_write_start_mono"):
+                res["_ctl"]["reply_observed_ms"] = max(
+                    0.0, (time.monotonic() - reply_started) * 1000
+                )
             results[r] = res
             pending.discard(r)
         if pending:

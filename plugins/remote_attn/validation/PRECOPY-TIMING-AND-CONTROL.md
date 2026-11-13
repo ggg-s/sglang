@@ -97,3 +97,28 @@ CPU 真实 tensor/控制 socket、显式 fake NIC 的合约测试覆盖：128/51
 - `worker_wait_before_exec_ms` 从 worker claim 计到执行开始，`worker_exec_ms` 是 worker handler 的执行时间。两者取各 TP rank 最大值，可能来自不同 rank，均包含在 `rpc_ms` 内。控制 wave 按 envelope 统计一次。
 
 同时比较 `PLAN→FREEZE`、`FREEZE→首 token`、`activate_to_safe_to_stop_ms` 和未迁请求的最大 chunk 间隔。阶段推进时间和 worker 锁等待分开归因。
+
+## Scheduler 状态快照 A/B
+
+A 组沿用同步状态 RPC。B 组在每个 Decode worker 启动前设置
+`HANDOFF_D2D_STATUS_SNAPSHOT=1`，并给迁移控制器加 `--worker-status-snapshots`。
+两组保持 `--event-driven-reconcile`、并发、Pre-copy 和压测负载一致，都设置
+`--out`。SMG 用同一配置。
+
+每个 TP rank 在 Scheduler 安全边界按 20 ms 节流采样。后台只保留最新待写快照，
+在现有控制目录中原子发布 `d2d-status.<rank>.json`。控制器先用 RPC 建立实例身份，
+然后读取所有 rank 的快照。任一 rank 缺失、超过 250 ms、PID 或实例身份变化时回退
+RPC。同一份快照反复读到也不会续期。按请求找终态和 drain 最终空闲确认继续用同步 RPC。
+
+控制 RPC 的 `d2d_control_slot` 增加以下字段。worker 时间取各 TP rank 的最大值，
+与控制器的 `slot_wait_ms`、`rpc_ms` 和 `phase_wait_ms` 分开对照。
+
+- `worker_publish_to_claim_ms` 从 driver 开始发布命令文件到 rank 0 完成 claim 和解析。
+- `worker_wait_before_exec_ms` 从 claim 到 handler 开始，`worker_exec_ms` 是 handler 耗时。
+- `worker_tp_confirm_ms` 从 handler 返回到 TP 对账完成并开始写回包。
+- `worker_reply_observed_ms` 从开始写回包到 driver 读到该 rank 的结果，含文件写入和 driver 轮询。
+
+先看 `GET /v1/drain/status` 中 `worker_status_reads` 的常规 RPC 和快照读取次数、
+迁移命令的 `slot_wait_ms` 和未迁请求 ITL。状态读取次数按每轮开始和结束的计数差比较。
+再看 `PLAN→FREEZE` 与 `activate_to_safe_to_stop_ms`。如果 RPC 频繁回退，先核对
+控制目录、各 rank 快照的采样时间和实例身份。该旁路依赖控制器和 worker 的墙钟同步。

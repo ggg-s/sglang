@@ -26,6 +26,14 @@ PRECOMMIT = {"PLAN", "RESERVE", "WAIT_CUT", "FREEZE", "IMPORT"}
 ACTIVE_MIGRATION_PHASES = PRECOMMIT | {"COMMIT", "ROLLBACK", "TARGET"}
 CUTOVER_PHASES = {"FREEZE", "IMPORT", "COMMIT"}
 STATUS_VISIBILITY_GRACE_S = 30
+WORKER_SNAPSHOT_MAX_AGE_S = 0.25
+WORKER_TIMINGS = (
+    "publish_to_claim_ms",
+    "wait_before_exec_ms",
+    "exec_ms",
+    "tp_confirm_ms",
+    "reply_observed_ms",
+)
 WAVE_SIZE = 8
 WAVE_PHASES = CUTOVER_PHASES | {"RESERVE", "WAIT_CUT"}
 Command = namedtuple("Command", "role name epoch payload")
@@ -214,6 +222,7 @@ class DsvGateway:
         precopy_window_ms=0,
         packed_precopy=False,
         event_driven_reconcile=False,
+        worker_status_snapshots=False,
     ):
         self.driver, self.tokenizer = driver, tokenizer
         self.decode_workers = decode_workers or {}
@@ -248,6 +257,11 @@ class DsvGateway:
         self.phase_ready = {}
         self.facts, self.fact_errors = {}, {}
         self.facts_at = {}
+        self.worker_status_snapshots = worker_status_snapshots
+        self.worker_snapshot_versions = {}
+        self.worker_status_sampled_at = {}
+        self.worker_status_reads = {}
+        self.source_idle_rpc = None
         self.connections = set()
         self.role_locks = {role: threading.Lock() for role in self.control_workers}
         self.command_waiters = dict.fromkeys(self.control_workers, 0)
@@ -661,7 +675,7 @@ class DsvGateway:
         finally:
             ended = time.monotonic()
             worker_times = {}
-            for field in ("wait_before_exec_ms", "exec_ms"):
+            for field in WORKER_TIMINGS:
                 times = [r.get("_ctl", {}).get(field) for r in rows]
                 worker_times[field] = (
                     max(times) if times and all(t is not None for t in times) else None
@@ -738,8 +752,7 @@ class DsvGateway:
                         members=commands,
                         submitted_at=submitted_at if acquired else None,
                         rpc_ms=(ended - submitted) * 1000 if acquired else None,
-                        worker_wait_before_exec_ms=worker_times["wait_before_exec_ms"],
-                        worker_exec_ms=worker_times["exec_ms"],
+                        **{f"worker_{field}": value for field, value in worker_times.items()},
                         **(
                             slot_trace
                             or dict(
@@ -792,6 +805,8 @@ class DsvGateway:
                 precopy_stage_wait_ms=copy.deepcopy(self.precopy_stage_samples),
                 precopy_enabled=not self.disable_precopy,
                 event_driven_reconcile=self.event_driven_reconcile,
+                worker_status_snapshots=self.worker_status_snapshots,
+                worker_status_reads=copy.deepcopy(self.worker_status_reads),
                 precopy_frame_events=copy.deepcopy(list(self.precopy_events)),
                 precopy_bytes_scope="applied_payload_sum_across_tp_ranks",
                 tick_recent_latency_ms=latency_histogram(self.tick_samples),
@@ -899,6 +914,38 @@ class DsvGateway:
                         self._queue_reconcile(rid, "snapshot")
                         break
 
+    def _read_worker_snapshots(self, role):
+        if not self.worker_status_snapshots:
+            return None
+        read = getattr(self.driver, "read_worker_snapshots", None)
+        if read is None:
+            return None
+        try:
+            directory = (
+                self.decode_workers[role]
+                if self.decode_workers
+                else self.driver.control_dir(role)
+            )
+            snapshots = read(directory, max_age_s=WORKER_SNAPSHOT_MAX_AGE_S)
+        except (OSError, AttributeError, KeyError, TypeError, ValueError):
+            return None
+        if not snapshots:
+            return None
+        rows = [snapshot["status"] for snapshot in snapshots]
+        sampled_at = min(snapshot["sampled_at"] for snapshot in snapshots)
+        versions = tuple(snapshot["sequence"] for snapshot in snapshots)
+        try:
+            self._check_worker(rows)
+        except RuntimeError:
+            return None
+        with self.lock:
+            previous = self.facts.get(role)
+            if not previous or [r["instance_id"] for r in rows] != [
+                r["instance_id"] for r in previous
+            ]:
+                return None  # Establish or change worker identity through a live RPC.
+            return rows, sampled_at, versions
+
     def _refresh_role(self, role):
         with self.lock:
             drain = self.journal["drain"]
@@ -910,9 +957,17 @@ class DsvGateway:
             elif role == "src" and (drain or {}).get("stopped"):
                 return
         try:
-            rows = self._call(role, "d2d_worker_status")
-            self._check_worker(rows)
+            snapshot = self._read_worker_snapshots(role)
+            if snapshot is None:
+                versions = None
+                rows = self._call(role, "d2d_worker_status")
+                sampled_at = time.time()
+                self._check_worker(rows)
+            else:
+                rows, sampled_at, versions = snapshot
             with self.cv:
+                reads = self.worker_status_reads.setdefault(role, {"rpc": 0, "snapshot": 0})
+                reads["rpc" if versions is None else "snapshot"] += 1
                 drain = self.journal["drain"]
                 if (
                     self.decode_workers
@@ -924,9 +979,37 @@ class DsvGateway:
                     expected = drain["instances"].get(role)
                     if expected is not None and [r["instance_id"] for r in rows] != expected:
                         raise RuntimeError(f"{role} restarted during migration")
+                if self.worker_status_snapshots:
+                    previous_versions = self.worker_snapshot_versions.get(role)
+                    if versions is not None and (
+                        sampled_at < self.worker_status_sampled_at.get(role, 0)
+                        or (
+                            previous_versions is not None
+                            and (
+                                versions == previous_versions
+                                or any(
+                                    new < old for new, old in zip(versions, previous_versions)
+                                )
+                            )
+                        )
+                    ):
+                        return  # Rereading a file never renews freshness.
+                    self.worker_status_sampled_at[role] = sampled_at
+                    self.worker_snapshot_versions[role] = versions
                 previous = self.facts.get(role, ()) if role not in self.fact_errors else ()
+                if (
+                    self.source_idle_rpc is not None
+                    and self.source_idle_rpc[0] == role
+                    and (
+                        self.source_idle_rpc[2] != tuple(r["instance_id"] for r in rows)
+                        or not all(r.get("idle") is True for r in rows)
+                    )
+                ):
+                    self.source_idle_rpc = None
                 self.facts[role] = rows
                 self.facts_at[role] = time.monotonic()
+                if versions is not None:
+                    self.facts_at[role] -= max(0, time.time() - sampled_at)
                 self.fact_errors.pop(role, None)
                 self._queue_snapshot_changes(role, previous, rows)
                 self.cv.notify_all()
@@ -940,14 +1023,70 @@ class DsvGateway:
                 self.fact_errors[role] = repr(exc)
                 self.cv.notify_all()
 
+    def _confirm_drained_source(self, worker):
+        # Select the candidate under the journal lock, then issue the RPC
+        # without it. The coordinator never commits SAFE_TO_STOP on file data.
+        with self.lock:
+            drain = self.journal["drain"]
+            if (
+                not drain
+                or not drain["active"]
+                or drain.get("abort_requested_at") is not None
+                or drain.get("source_released_at") is not None
+                or any(
+                    self.journal["entries"][rid]["phase"] not in TERMINAL | {"LOCAL"}
+                    for rid in drain["members"]
+                )
+            ):
+                return
+            source = drain.get("src", "src")
+            if source != worker or not self._source_idle(source):
+                return
+            expected = (drain.get("instances") or {}).get(source)
+            if expected is None:
+                expected = [r["instance_id"] for r in self.facts[source]]
+            drain_id = drain["id"]
+            if self._has_source_idle_confirmation(source, drain_id):
+                return
+        try:
+            rows = self._call(source, "d2d_worker_status", expected_instances=expected)
+            self._check_worker(rows)
+        except (StatusBusy, OSError, RuntimeError):
+            return
+        with self.cv:
+            if (
+                (self.journal["drain"] or {}).get("id") == drain_id
+                and self._source_idle(source)
+                and [r["instance_id"] for r in self.facts[source]] == expected
+                and [r["instance_id"] for r in rows] == expected
+                and all(r.get("idle") is True for r in rows)
+            ):
+                self.source_idle_rpc = (
+                    source, drain_id, tuple(expected), time.monotonic()
+                )
+                self.cv.notify_all()
+
+    def _has_source_idle_confirmation(self, source, drain_id):
+        proof = self.source_idle_rpc
+        return (
+            proof is not None
+            and proof[:3]
+            == (source, drain_id, tuple(row["instance_id"] for row in self.facts[source]))
+            and time.monotonic() - proof[3] <= WORKER_SNAPSHOT_MAX_AGE_S
+        )
+
     def _poll_role(self, role):
         while not self.stop.is_set():
             self._refresh_role(role)
+            if self.worker_status_snapshots:
+                self._confirm_drained_source(role)
             self.stop.wait(self.poll_s)
 
     def _refresh(self):
         for role in self.control_workers:
             self._refresh_role(role)
+            if self.worker_status_snapshots:
+                self._confirm_drained_source(role)
 
     def _bound(self, entry, roles=None):
         for role in roles or entry["instances"]:
@@ -2477,6 +2616,10 @@ class DsvGateway:
             safe = not abort_requested and (
                 all(e["phase"] in TERMINAL | {"LOCAL"} for e in entries)
                 and self._source_idle(source)
+                and (
+                    not self.worker_status_snapshots
+                    or self._has_source_idle_confirmation(source, drain["id"])
+                )
             )
             if (
                 not abort_requested

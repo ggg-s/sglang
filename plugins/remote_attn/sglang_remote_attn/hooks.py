@@ -8,6 +8,7 @@ import time
 
 from . import (
     control_wakeup,
+    d2d_worker_snapshot,
     decode_overlap,
     destination_cache,
     dsv41_layerwise,
@@ -162,6 +163,7 @@ def _event_loop(original, scheduler, *args, **kwargs):
         from .pre_layerwise import shutdown
 
         try:
+            d2d_worker_snapshot.close(scheduler)
             shutdown(scheduler)
         finally:
             try:
@@ -267,6 +269,7 @@ def _process_requests(original, scheduler, recv_reqs):
     from .pre_layerwise import poll
 
     poll(scheduler)
+    d2d_worker_snapshot.sample(scheduler)
     return result
 
 

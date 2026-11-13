@@ -273,6 +273,10 @@ class MigrationController(DsvGateway):
                     "cutover": self.max_concurrent_migrations,
                     "inflight": self.max_inflight_migrations,
                 },
+                "worker_status_reads": {
+                    worker: reads.copy()
+                    for worker, reads in self.worker_status_reads.items()
+                },
                 "control_wave_sizes": {
                     worker: sizes.copy()
                     for worker, sizes in self.control_wave_sizes.items()
@@ -469,6 +473,11 @@ def main():
         help="Advance affected requests on durable transitions and worker snapshots",
     )
     parser.add_argument(
+        "--worker-status-snapshots",
+        action="store_true",
+        help="Read advisory TP status snapshots with status RPC fallback",
+    )
+    parser.add_argument(
         "--natural-drain-ms",
         type=int,
         default=0,
@@ -538,6 +547,7 @@ def main():
         standby=config.get("standby", ()),
         poll_ms=args.poll_ms,
         event_driven_reconcile=args.event_driven_reconcile,
+        worker_status_snapshots=args.worker_status_snapshots,
         natural_drain_ms=args.natural_drain_ms,
         precopy_window_ms=args.precopy_window_ms,
         packed_precopy=args.packed_precopy,

@@ -394,6 +394,11 @@ class TestGatewayControlPaths(CustomTestCase):
                         )
                         latencies.append((time.monotonic() - started) * 1000)
                         self.assertEqual(result["command"], "d2d_worker_status")
+                        for field in (
+                            "publish_to_claim_ms", "wait_before_exec_ms", "exec_ms",
+                            "tp_confirm_ms", "reply_observed_ms",
+                        ):
+                            self.assertGreaterEqual(result["_ctl"][field], 0)
                     self.assertLess(max(latencies), 500, latencies)
                     self.assertEqual(set(executed), {worker.ident})
                     self.assertFalse(failures)

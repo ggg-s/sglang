@@ -5,8 +5,10 @@ import http.client
 import importlib.util
 import io
 import json
+import os
 import tempfile
 import threading
+import time
 import unittest
 from concurrent.futures import ThreadPoolExecutor
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
@@ -76,6 +78,77 @@ class TestDsvGatewayStatus(CustomTestCase):
         req = dict(output_ids=[31, 32], finished=False, kv_released=False)
         self.driver.rows[role]["requests"][native_rid] = req
         return req
+
+    def test_snapshot_refresh_requires_live_fresh_ranks_and_falls_back(self):
+        """Replayed files cannot renew freshness or rebind a restarted rank."""
+        gw = self.gw
+        gw.worker_status_snapshots = True
+        path = ROOT / "plugins/remote_attn/control_plane/p2d_driver.py"
+        spec = importlib.util.spec_from_file_location("d2d_snapshot_driver", path)
+        driver_module = importlib.util.module_from_spec(spec)
+        spec.loader.exec_module(driver_module)
+        directory = gw.path.parent
+        self.driver.control_dir = lambda _: directory
+        self.driver.read_worker_snapshots = driver_module.read_worker_snapshots
+        now = time.time()
+        rows = [
+            dict(self.driver.rows["src"], rank=rank, tp_size=2, instance_id=f"tp{rank}")
+            for rank in range(2)
+        ]
+        for rank in range(2):
+            (directory / f"ready.{rank}.json").write_text(
+                json.dumps(dict(rank=rank, tp_size=2, pid=os.getpid(), started_at=now - 1))
+            )
+
+        def write(rank, **changes):
+            snapshot = dict(
+                version=1, pid=os.getpid(), sequence=1,
+                sampled_at=now, status=rows[rank],
+            )
+            (directory / f"d2d-status.{rank}.json").write_text(
+                json.dumps({**snapshot, **changes})
+            )
+
+        gw.facts["src"] = rows
+        write(0)
+        with patch.object(
+            self.driver, "send", return_value=dict(tp_rank_results=rows)
+        ) as rpc, patch.object(time, "time", return_value=now):
+            gw._refresh_role("src")
+            self.assertEqual(rpc.call_count, 1)  # incomplete TP snapshot
+            write(1)
+            gw._refresh_role("src")
+            self.assertEqual(rpc.call_count, 1)
+            self.assertEqual(gw.worker_snapshot_versions["src"], (1, 1))
+            accepted_at = gw.facts_at["src"]
+            gw._refresh_role("src")
+            self.assertEqual(gw.facts_at["src"], accepted_at)
+
+            write(1, sampled_at=now - 0.5)
+            gw._refresh_role("src")
+            self.assertEqual(rpc.call_count, 2)
+            write(1, status=dict(rows[1], instance_id="restarted"))
+            gw._refresh_role("src")
+            self.assertEqual(rpc.call_count, 3)
+            self.assertEqual(gw.facts["src"][1]["instance_id"], "tp1")
+            write(1, pid=os.getpid() + 1)
+            gw._refresh_role("src")
+            self.assertEqual(rpc.call_count, 4)
+
+    def test_snapshot_idle_requires_live_confirmation_before_safe_to_stop(self):
+        """A source can be busy at TP even when its last file reported idle."""
+        gw = self.gw
+        gw.worker_status_snapshots = True
+        gw.facts["src"][0]["idle"] = True
+        started = gw.start_drain()
+        self.assertNotEqual(started["state"], "SAFE_TO_STOP")
+        self.driver.rows["src"]["idle"] = False
+        gw._confirm_drained_source("src")
+        self.assertNotEqual(gw.drain_status()["state"], "SAFE_TO_STOP")
+
+        self.driver.rows["src"]["idle"] = True
+        gw._confirm_drained_source("src")
+        self.assertEqual(gw.drain_status()["state"], "SAFE_TO_STOP")
 
     def test_background_reconcile_wakes_for_phase_reply_and_relevant_snapshot(self):
         """A reply and an async-ready snapshot can advance with the timer parked."""

@@ -5157,6 +5157,7 @@ def execute_handoff_control(scheduler, data):
         }
     t_done = time.monotonic()
     claim = data.get("_ctl_claim_mono")
+    published = data.get("_ctl_publish_mono")
     result["_ctl"] = {
         "cmd": data.get("cmd"),
         "rank": _tp_rank(scheduler),
@@ -5165,6 +5166,11 @@ def execute_handoff_control(scheduler, data):
         "claim_mono": claim,
         "exec_start_mono": t_exec,
         "exec_end_mono": t_done,
+        "publish_to_claim_ms": (
+            round((claim - published) * 1000, 3)
+            if isinstance(published, (int, float)) and claim is not None and claim >= published
+            else None
+        ),
         "wait_before_exec_ms": (
             None if claim is None else round((t_exec - claim) * 1000.0, 3)
         ),
@@ -5182,6 +5188,9 @@ def execute_handoff_control(scheduler, data):
         world_size=parallel.tp_size,
     )
     fatal = fatal or bool(result.get("fatal"))
+    reply_started = time.monotonic()
+    result["_ctl"]["tp_confirm_ms"] = (reply_started - t_done) * 1000
+    result["_ctl"]["reply_write_start_mono"] = reply_started
     _write_result(result_path, result)
     if resume_claim:
         # Retire the durable claim only after the command actually ran.
