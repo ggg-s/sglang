@@ -505,10 +505,12 @@ def bootstrap(original, receiver, *, bootstrap_info, message, operation):
         and operation == "send_metadata"
         and not bootstrap_info["is_dummy"]
     ):
-        from .qwen_split_prefill import WIRE
+        from .qwen_split_prefill import DECODE_PRIORITY, WIRE
 
         min_cut, chunk_cap = limits
         message = [*message, WIRE + f"{min_cut}:{chunk_cap}".encode("ascii")]
+        if getattr(receiver, "_hybrid_split_decode_priority", False):
+            message.append(DECODE_PRIORITY)
     return original(
         receiver, bootstrap_info=bootstrap_info, message=message, operation=operation
     )
@@ -517,7 +519,7 @@ def bootstrap(original, receiver, *, bootstrap_info, message, operation):
 def parse_transfer(original, *args, **kwargs):
     value = original(*args, **kwargs)
     message = kwargs.get("msg", args[-1] if args else None)
-    from .qwen_split_prefill import WIRE
+    from .qwen_split_prefill import DECODE_PRIORITY, WIRE
 
     extensions = message[10:]
     split_offer = next(
@@ -526,6 +528,7 @@ def parse_transfer(original, *args, **kwargs):
     min_cut, _, chunk_cap = split_offer.partition(b":")
     if all(0 < len(field) <= 10 and field.isdigit() for field in (min_cut, chunk_cap)):
         value._hybrid_split_limits = int(min_cut), int(chunk_cap)
+        value._hybrid_split_decode_priority = DECODE_PRIORITY in extensions
     journal = next((frame for frame in extensions if frame.startswith(MAGIC)), None)
     if journal is not None:
         try:

@@ -1319,7 +1319,9 @@ class TestSplitPD(CustomTestCase):
         self.split.advertise(NS(scheduler=d.scheduler), dr, 0)
         return dr
 
-    def bootstrap(self, *, prefix=0, length=32768, hybrid=False, decode_budget=16384):
+    def bootstrap(
+        self, *, prefix=0, length=32768, hybrid=False, decode_budget=16384, legacy=False
+    ):
         p = self.controller(hybrid=hybrid)
         d = self.controller("decode", hybrid=hybrid, max_prefill_tokens=decode_budget)
         req = self.request(prefix=prefix, length=length)
@@ -1333,6 +1335,8 @@ class TestSplitPD(CustomTestCase):
             message=[b""] * 10,
             operation="send_metadata",
         )
+        if legacy:
+            frames.remove(self.split.DECODE_PRIORITY)
         peer = self.mesh.parse_transfer(lambda **_: NS(), msg=frames)
         peer.is_dummy = False
         peer.mooncake_session_id = "decode"
@@ -1354,16 +1358,17 @@ class TestSplitPD(CustomTestCase):
     def match(req, *_):
         req.full_untruncated_fill_ids = list(req.origin_input_ids)
 
-    def test_default_cut_uses_misses_and_caps_short_or_warm_suffixes(self):
+    def test_default_cut_balances_stages_when_decode_advertises_priority(self):
         for hybrid in (False, True):
             for length, prefix, expected in (
-                (16384, 0, 13927),
+                (16384, 0, 14284),
                 (16384, 14745, 15360),
-                (32768, 0, 24576),
-                (32768, 13107, 28672),
-                (32768, 19660, 29491),
+                (32768, 0, 22476),
+                (32768, 13107, 29030),
+                (32768, 19660, 30720),
                 (32768, 26214, 30720),
-                (65536, 26214, 61440),
+                (65408, 0, 38796),
+                (65536, 39321, 58521),
             ):
                 with self.subTest(hybrid=hybrid, length=length, prefix=prefix):
                     p, d, req, dr = self.bootstrap(
@@ -1385,10 +1390,16 @@ class TestSplitPD(CustomTestCase):
                     )
 
     def test_prefill_cap_uses_the_decode_budget_from_bootstrap(self):
-        _, d, req, _ = self.bootstrap(prefix=13107, decode_budget=1024)
-        self.assertEqual(d.split_prefill_chunk_size, 1024)
+        with patch.dict(os.environ, {"HANDOFF_SPLIT_DEFER_TICKS": "0"}):
+            _, d, req, _ = self.bootstrap(prefix=13107, decode_budget=1024)
+            self.assertEqual(d.split_prefill_chunk_size, 1024)
+            self.split.init_input(self.match, req, object())
+            self.assertEqual(req._hybrid_split_at, 30720)
+
+    def test_legacy_v3_offer_keeps_the_warm_suffix_cap(self):
+        _, _, req, _ = self.bootstrap(length=65536, prefix=39321, legacy=True)
         self.split.init_input(self.match, req, object())
-        self.assertEqual(req._hybrid_split_at, 30720)
+        self.assertEqual(req._hybrid_split_at, 61440)
 
     def test_small_suffix_and_tp_cut_disagreement_use_full_native_input(self):
         for prefix, disagreement in ((30720, False), (32000, False), (0, True)):
@@ -1428,7 +1439,7 @@ class TestSplitPD(CustomTestCase):
         self.assertEqual(len(req.full_untruncated_fill_ids), 32768)
         self.assertFalse(hasattr(req, "_hybrid_split_at"))
         self.split.init_input(self.match, req, cache)
-        self.assertEqual(req._hybrid_split_at, 24576)
+        self.assertEqual(req._hybrid_split_at, 22476)
         req.prefix_len = req.kv.cache_protected_len = 29491
         self.split.init_input(self.match, req, cache)
         self.assertEqual(req._hybrid_split_at, 30720)
@@ -1569,6 +1580,73 @@ class TestSplitPD(CustomTestCase):
                 self.assertEqual(dr.req.prefix_len, 15360)
                 self.assertIsNone(dr.kv_receiver)
                 self.assertEqual(d.split_prefill_outstanding, 1)
+
+    def test_decode_priority_expires_per_chunk_and_uses_transferred_hits(self):
+        for hits, budget, early_idle in (
+            (19660, 150, False),
+            (26214, 45, False),
+            (19660, 150, True),
+        ):
+            with self.subTest(hits=hits, early_idle=early_idle):
+                d, queue, dr = self.commit_fixture(24576)
+                queue.metadata_buffers.cached_tokens[0, 0] = hits
+                self.assertTrue(self.split.commit(queue, dr, keep_receiver=False))
+                req = dr.req
+                req.extend_batch_idx = 0
+                req.refresh_fill_ids = lambda: None
+                req.time_stats.set_forward_entry_time = lambda: None
+                req.finished = lambda: False
+                req.inflight_steps = 0
+                scheduler = d.scheduler
+                scheduler.last_batch = scheduler.chunked_req = None
+                scheduler.process_pending_chunked_abort = lambda: None
+                scheduler.token_to_kv_pool_allocator = scheduler.tree_cache = None
+                scheduler.model_config = scheduler.spec_algorithm = None
+                scheduler.enable_overlap = True
+
+                class WaitingQueue(list):
+                    def leave(self, reqs):
+                        self.remove(reqs[0])
+
+                    def prepend(self, reqs):
+                        self[:0] = reqs
+
+                scheduler.waiting_queue = waiting = WaitingQueue([req])
+                running = NS(batch_size=lambda: 1)
+                batch = NS(prepare_for_extend=lambda **_: None)
+                native_decode = lambda *_: running
+                modules = {
+                    "sglang.srt.managers.schedule_batch": NS(
+                        ScheduleBatch=NS(init_new=lambda *_, **__: batch),
+                        NextBatchPlan=NS,
+                    ),
+                    "sglang.srt.observability.req_time_stats": NS(
+                        set_schedule_time_batch=lambda _: None
+                    ),
+                }
+                with patch.dict(sys.modules, modules):
+                    for _ in range(2 if early_idle else budget):
+                        self.assertIs(
+                            self.split.next_batch(native_decode, scheduler, running),
+                            running,
+                        )
+                    self.assertEqual(waiting, [req])
+                    if early_idle:
+                        running.batch_size = lambda: 0
+                    req.extend_len = 4096
+                    plan = self.split.next_batch(native_decode, scheduler, running)
+                    self.assertIs(plan.batch_to_run, batch)
+                    self.assertEqual(req.extend_end, 28672)
+                    self.assertEqual(req._hybrid_split_defer_ticks, 0)
+                    self.assertEqual(waiting, [])
+                    self.assertIs(scheduler.chunked_req, req)
+                    req.kv.truncate_committed(28672)
+                    running.batch_size = lambda: 1
+                    self.assertIs(
+                        self.split.next_batch(native_decode, scheduler, running),
+                        running,
+                    )
+                    self.assertEqual(req._hybrid_split_defer_ticks, 1)
 
     def test_invalid_transfer_or_tp_cut_mismatch_aborts_before_continuation(self):
         for length, cut, room, mismatch, missing_state in (

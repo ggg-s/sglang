@@ -694,6 +694,7 @@ class Controller:
                 getattr(self, "split_prefill_cut_basis", None),
                 getattr(self, "split_prefill_suffix_tokens", None),
                 getattr(self, "split_prefill_max_outstanding", None),
+                getattr(self, "split_prefill_defer_ticks", 0),
             ),
             ("destination-cache-v1", "prefix-range-v1", prefix_enabled()),
             (
