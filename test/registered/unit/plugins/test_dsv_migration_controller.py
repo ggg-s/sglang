@@ -32,6 +32,7 @@ CONTROL = Path(__file__).resolve().parents[4] / "plugins/remote_attn/control_pla
 class WorkerTransport:
     def __init__(self):
         self.requests = {worker: {} for worker in ("D0", "D1", "D2")}
+        self.retired = {}
         self.moves = {}
         self.migrations = {worker: {} for worker in self.requests}
         self.commands = []
@@ -48,6 +49,9 @@ class WorkerTransport:
         requests = self.requests[worker]
         self.commands.append((worker, cmd, epoch))
         if cmd == "d2d_worker_status":
+            if "request_rid" in payload:
+                assert payload["expected_instances"] == [worker]
+                return dict(request=self.retired.get((worker, epoch, payload["request_rid"])))
             return dict(
                 protocol="dsv-d2d-v2",
                 rank=0,
@@ -56,6 +60,7 @@ class WorkerTransport:
                 idle=all(row["kv_released"] for row in requests.values()),
                 requests=copy.deepcopy(requests),
                 migrations=copy.deepcopy(self.migrations[worker]),
+                terminal_request_lookup_supported=True,
                 precopy_protocol="closed-page-precopy-v1" if self.precopy else None,
                 async_handoff_supported=self.wave_supported,
                 control_wave_supported=self.wave_supported,
@@ -434,6 +439,66 @@ class TestDsvMigrationController(CustomTestCase):
             self.driver.release(targets[0]["epoch"])
             self.ticks()
             self.assertEqual(len(entries_in("WAIT_CUT")), 1)
+
+    def test_retired_source_rolls_back_reservation_before_publishing_terminal(self):
+        """EOS between polls leaves a destination reservation to clean up."""
+        self.controller.close()
+        self.controller = self.open_controller(standby=("D1", "D2"))
+        controller = self.controller
+        rid = controller.accept({"prompt_ids": [0], "max_new_tokens": 12})
+        self.ticks(2)
+        controller.start_named_drain("D0", "D1")
+        self.ticks(3)
+        entry = controller.entry(rid)
+        self.assertEqual(entry["phase"], "WAIT_CUT")
+        move_epoch = entry["epoch"]
+        source_rid = entry["source_rid"]
+        self.driver.requests["D0"].pop(source_rid)
+        self.driver.retired["D0", entry["submission_epoch"], source_rid] = (
+            self.driver.request([1, 2, 3, 4], finished=True)
+        )
+        send_to = self.driver.send_to
+        abort_acknowledged = False
+        reserved = True
+        cleanup = []
+
+        def send(directory, worker, payload, timeout):
+            nonlocal reserved
+            if payload["migration_epoch"] == move_epoch:
+                cmd = payload["cmd"]
+                if cmd == "d2d_precopy_close":
+                    self.assertEqual(worker, "D0")
+                    return {"closed": True}
+                if cmd == "d2d_abort":
+                    self.assertEqual(worker, "D1")
+                    self.assertEqual(payload["precopy_close"], [{"closed": True}])
+                    if abort_acknowledged:
+                        reserved = False
+                        cleanup.append(cmd)
+                    return {"aborted": abort_acknowledged}
+                if cmd == "d2d_resume":
+                    self.assertEqual(worker, "D0")
+                    self.assertFalse(reserved)
+                    cleanup.append(cmd)
+                    return {"resumed": True}
+            return send_to(directory, worker, payload, timeout)
+
+        with patch.object(self.driver, "send_to", side_effect=send):
+            self.ticks(3)
+            self.assertTrue(reserved)
+            self.assertEqual(controller.entry(rid)["phase"], "ROLLBACK")
+            self.assertNotEqual(controller.drain_status()["state"], "SAFE_TO_STOP")
+            abort_acknowledged = True
+            self.ticks(3)
+
+        self.assertEqual(cleanup, ["d2d_abort", "d2d_resume"])
+        self.assertFalse(reserved)
+        self.assertEqual(controller.drain_status()["state"], "SAFE_TO_STOP")
+        self.assertEqual(controller.entry(rid)["final_output_ids"], [1, 2, 3, 4])
+        events, finished = controller.events(rid, after=1)
+        self.assertTrue(finished)
+        self.assertEqual([event["token_id"] for event in events], [3, 4])
+        self.assertEqual(controller.finish_reason(rid, 4), "stop")
 
     def test_finish_at_freeze_holds_slot_until_rollback_cleans_destination(self):
         """EOS after the status poll must finish on source before the next move."""
@@ -1061,6 +1126,45 @@ class TestNativePdDecode(CustomTestCase):
         self.assertEqual(self.controller.entry(late)["workers"], {"src": "D1"})
         self.assertEqual(self.controller.entry(late)["bootstrap_room"], 11)
         self.assertNotIn(late, self.controller.drain_status()["members"])
+
+    def test_submit_bound_before_cordon_stays_in_drain_until_it_finishes(self):
+        """A lost submit reply leaves a SUBMIT entry already owned by the source."""
+        controller = self.controller
+        body = {"prompt_ids": [0], "max_new_tokens": 16}
+        pending = controller.accept_native("D0", body, self.bootstrap(12))
+        send_to = self.driver.send_to
+
+        def lose_submit_reply(directory, worker, payload, timeout):
+            result = send_to(directory, worker, payload, timeout)
+            if payload["cmd"] == "d2d_submit_pd":
+                raise TimeoutError("lost submit acknowledgement")
+            return result
+
+        with patch.object(self.driver, "send_to", side_effect=lose_submit_reply):
+            controller.tick()
+        self.assertEqual(controller.entry(pending)["phase"], "SUBMIT")
+        self.assertTrue(controller.entry(pending)["submit_started"])
+
+        # EOS and native removal happen before the next status poll.
+        entry = controller.entry(pending)
+        source_rid = entry["source_rid"]
+        self.driver.requests["D0"].pop(source_rid)
+        self.driver.retired["D0", entry["submission_epoch"], source_rid] = (
+            self.driver.request([1, 2, 3], finished=True)
+        )
+        controller.start_named_drain("D0", "D1")
+        with patch.object(controller, "_smg_cordoned", return_value=True):
+            controller._reconcile_cordon()
+        status = controller.drain_status()
+        self.assertEqual(status["members"], [pending])
+        self.assertNotEqual(status["state"], "SAFE_TO_STOP")
+
+        controller.tick()
+        controller.tick()
+        self.assertEqual(len(self.driver.bootstrap_submissions), 1)
+        self.assertEqual(controller.entry(pending)["phase"], "DONE")
+        self.assertEqual(controller.entry(pending)["final_output_ids"], [1, 2, 3])
+        self.assertEqual(controller.drain_status()["state"], "SAFE_TO_STOP")
 
     def test_cordon_timeout_unfences_source_with_unreachable_replica(self):
         from io import BytesIO

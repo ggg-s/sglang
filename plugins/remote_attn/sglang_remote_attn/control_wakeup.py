@@ -11,6 +11,7 @@ from pathlib import Path
 import zmq
 
 POLL_SECONDS = 0.005
+MAX_IDLE_MS = 10
 
 
 class WakePoller:
@@ -48,6 +49,11 @@ class WakePoller:
             self.stop.wait(POLL_SECONDS)
 
     def poll(self, timeout=None, *args, **kwargs):
+        # Rank 0 can claim the file before a peer's watcher sees it. Bound
+        # the idle wait so that peer can still reach the TP broadcast promptly.
+        timeout = (
+            MAX_IDLE_MS if timeout is None or timeout < 0 else min(timeout, MAX_IDLE_MS)
+        )
         events = self.poller.poll(timeout, *args, **kwargs)
         with self.lock:
             if not self.closed:
@@ -80,10 +86,10 @@ def sleep(original, scheduler):
             if not isinstance(sleeper.poller, WakePoller):
                 sleeper.poller = WakePoller(sleeper.poller, _CTL_DIR)
                 scheduler._remote_attn_control_wakeup = sleeper.poller
-        elif hasattr(sleeper, "timeout_ms"):
+        if hasattr(sleeper, "timeout_ms"):
             # The Rust ingress parks on its own request ring, not a zmq Poller.
             # Keep its native path, with a bounded interval for file controls.
-            sleeper.timeout_ms = min(sleeper.timeout_ms, 10)
+            sleeper.timeout_ms = min(sleeper.timeout_ms, MAX_IDLE_MS)
     return original(scheduler)
 
 

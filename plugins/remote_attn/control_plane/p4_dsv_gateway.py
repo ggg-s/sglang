@@ -848,6 +848,10 @@ class DsvGateway:
             r.get("requests", {}).get(rid)
             for r in self.facts.get(self._worker(entry, role), ())
         ]
+        return self._request_from_ranks(rows)
+
+    @staticmethod
+    def _request_from_ranks(rows):
         if not rows or any(row is None for row in rows):
             return None
         outputs = [r["output_ids"] for r in rows]
@@ -887,6 +891,26 @@ class DsvGateway:
             ),
             error=next((r.get("error") for r in rows if r.get("error")), None),
         )
+
+    def _retired_request(self, entry):
+        role = entry["owner"]
+        facts = self.facts.get(self._worker(entry, role), ())
+        if not facts or not all(r.get("terminal_request_lookup_supported") for r in facts):
+            return None
+        native_rid = entry["source_rid"] if role == "src" else entry["target_rid"]
+        rows = self._call(
+            self._worker(entry, role),
+            "d2d_worker_status",
+            entry["submission_epoch"],
+            request_rid=native_rid,
+            expected_instances=entry["instances"][role],
+        )
+        if len(rows) != len(entry["instances"][role]):
+            raise RuntimeError("terminal lookup returned an incomplete TP response")
+        result = self._request_from_ranks([row.get("request") for row in rows])
+        if result and result["finished"] and result["kv_released"] and not result["error"]:
+            return result
+        return None
 
     def _states(self, entry, role):
         return [
@@ -1470,6 +1494,21 @@ class DsvGateway:
             and phase in {"SUBMIT", "SOURCE", "DIRECT"}
         ):
             raise RuntimeError(request["error"])
+        if request is None and (
+            phase == "SUBMIT" and entry.get("submit_started")
+            or phase in {"SOURCE", "DIRECT"}
+            and (
+                entry.get("request_seen")
+                or entry.get("awaiting_visibility")
+                or entry["cancel_requested"]
+            )
+        ):
+            try:
+                request = self._retired_request(entry)
+            except (StatusBusy, BlockingIOError, TimeoutError):
+                # A contended advisory lookup does not prove that a submitted
+                # request is missing. Leave the current intent for another tick.
+                return
         if phase == "SUBMIT":
             role = entry["initial_owner"]
             backend_rid = entry["source_rid"] if role == "src" else entry["target_rid"]
@@ -1562,6 +1601,7 @@ class DsvGateway:
                 self._update(rid, request_seen=True, awaiting_visibility=False)
             if (
                 phase == "SOURCE"
+                and not request["finished"]
                 and entry.get("admission_plans")
                 and not entry["cut_attempted"]
                 and not entry["cancel_requested"]
@@ -1609,9 +1649,14 @@ class DsvGateway:
                     elif time.time() >= entry.get("retry_at", 0):
                         self._begin(entry)
             return
-        if entry["cancel_requested"] and phase in PRECOMMIT:
-            self._update(rid, phase="ROLLBACK")
-            return
+        if phase in PRECOMMIT:
+            if entry["cancel_requested"]:
+                self._update(rid, phase="ROLLBACK")
+                return
+            if request is None:
+                # A missing request cannot prove completion. Cancel this
+                # reversible epoch before reconciling the source's output.
+                raise RuntimeError("prepared source request missing")
         epoch = entry["epoch"]
         destination = entry.get("workers", {}).get("dst", "D1")
         common = dict(
@@ -1685,8 +1730,6 @@ class DsvGateway:
                 ),
             )
         elif phase == "WAIT_CUT":
-            if request is None:
-                raise RuntimeError("prepared source request missing")
             cut_due = self._cut_due(entry, request)
             if request["finished"]:
                 if entry.get("precopy_pending") is not None:

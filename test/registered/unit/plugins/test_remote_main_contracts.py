@@ -292,7 +292,7 @@ class TestGatewayControlPaths(CustomTestCase):
         import time
         import uuid
 
-        names = {"control_dir", "_ready", "_role_lock", "_send_unlocked", "send"}
+        names = {"control_dir", "_ready", "_role_lock", "_send_unlocked", "send", "send_to"}
         ns = dict(
             CTL=root / "legacy",
             Path=Path,
@@ -412,6 +412,29 @@ class TestGatewayControlPaths(CustomTestCase):
                 lambda s: calls.append(s.idle_sleeper.timeout_ms), scheduler
             )
             self.assertEqual(calls, [10])
+
+    def test_idle_peer_reaches_tp_control_without_pending_file(self):
+        """A peer must leave its idle wait after rank zero claims the command."""
+        import tempfile
+
+        from sglang_remote_attn import control_wakeup, handoff_control as runtime
+
+        poller = Mock()
+        poller.poll.return_value = []
+        with (
+            tempfile.TemporaryDirectory() as directory,
+            patch.object(runtime, "_CTL_DIR", directory),
+        ):
+            sleeper = NS(poller=poller, timeout_ms=250)
+            scheduler = NS(idle_sleeper=sleeper)
+            try:
+                control_wakeup.sleep(
+                    lambda s: s.idle_sleeper.poller.poll(250), scheduler
+                )
+                poller.poll.assert_called_once_with(10)
+                self.assertEqual(sleeper.timeout_ms, 10)
+            finally:
+                control_wakeup.close(scheduler)
 
     def test_heartbeat_and_qwen_dsv_commands_share_selected_directories(self):
         import json

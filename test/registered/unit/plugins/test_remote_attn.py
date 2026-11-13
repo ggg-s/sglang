@@ -16604,6 +16604,28 @@ class TestRemoteAttn(CustomTestCase):
         self.assertIsNone(source.service)
         self.assertFalse(e.freed)
 
+    def test_dsv_d2d_worker_status_recovers_only_released_submission_history(self):
+        """The submit replay record can prove EOS after native tracking is gone."""
+        from sglang_remote_attn import dsv_d2d as d2d
+
+        e = self._d2d_env()
+        e.source.scheduler.handoff_tracked_reqs.clear()
+        e.source.scheduler.running_batch.reqs.clear()
+        e.source.d2d_submission_requests = {"submitted": e.req}
+        lookup = dict(
+            cmd="d2d_worker_status", migration_epoch="submitted", request_rid=e.req.rid
+        )
+        self.assertIsNone(d2d.handle(e.source, lookup)["request"])
+        e.req.finished = lambda: True
+        self.assertIsNone(d2d.handle(e.source, lookup)["request"])
+        e.req.kv.holds_kv = False
+        self.assertIsNone(
+            d2d.handle(e.source, dict(lookup, request_rid="other"))["request"]
+        )
+        terminal = d2d.handle(e.source, lookup)["request"]
+        self.assertTrue(terminal["finished"] and terminal["kv_released"])
+        self.assertEqual(terminal["output_ids"], [31, 32, 33])
+
     def test_layerwise_d2d_control_publishes_unsupported_result(self):
         from sglang.srt.runtime_context import get_parallel
 

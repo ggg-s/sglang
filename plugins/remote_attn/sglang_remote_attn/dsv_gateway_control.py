@@ -140,6 +140,19 @@ def handle(controller, data):
     scheduler, cmd = controller.scheduler, data["cmd"]
     epoch = data["migration_epoch"]
     if cmd == "d2d_worker_status":
+        if "request_rid" in data:
+            # The idempotent submission record outlives native queue/tracking
+            # membership, including when EOS falls between two status polls.
+            req = getattr(controller, "d2d_submission_requests", {}).get(epoch)
+            if (
+                req is not None
+                and req.rid == data["request_rid"]
+                and req.finished()
+                and not req.kv.holds_kv
+            ):
+                return dict(request=request_status(controller, req))
+            return dict(request=None)
+
         from .d2d_precopy import rdma_available
         from .mooncake_backend import policy
 
@@ -163,6 +176,7 @@ def handle(controller, data):
             sparse_timing=dict(getattr(controller, "sparse_stats", {})),
             iter_period_ms=getattr(scheduler, "_handoff_iter_period_ms", None),
             admission_plan_supported=True,
+            terminal_request_lookup_supported=True,
             async_handoff_supported=True,
             control_wave_supported=True,
             instance_id=instance(controller),
