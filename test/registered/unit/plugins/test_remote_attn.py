@@ -19406,7 +19406,12 @@ class TestRemoteAttn(CustomTestCase):
         f = self._p4_dsv_env(accept=False)
         f.gw.close()
         f.gw = f.support.gateway(
-            f.driver, ROOT, f.folder, autostart=True, async_handoff=True
+            f.driver,
+            ROOT,
+            f.folder,
+            autostart=True,
+            async_handoff=True,
+            event_driven_reconcile=True,
         )
         self.addCleanup(f.gw.close)
         deadline = time.monotonic() + 5

@@ -332,6 +332,9 @@ class MigrationController(DsvGateway):
         journal = {**self.journal, **changes}
         self._persist(journal)
         self.journal = journal
+        if "drain" in changes and changes["drain"]:
+            for rid in changes["drain"].get("members", ()):
+                self._queue_reconcile(rid, "drain")
         self.cv.notify_all()
 
     def abort_named_drain(self, drain_id):
@@ -461,6 +464,11 @@ def main():
     parser.add_argument("--admin-port", type=int, default=31081)
     parser.add_argument("--poll-ms", type=float, default=10)
     parser.add_argument(
+        "--event-driven-reconcile",
+        action="store_true",
+        help="Advance affected requests on durable transitions and worker snapshots",
+    )
+    parser.add_argument(
         "--natural-drain-ms",
         type=int,
         default=0,
@@ -529,6 +537,7 @@ def main():
         decode_workers=decode_workers,
         standby=config.get("standby", ()),
         poll_ms=args.poll_ms,
+        event_driven_reconcile=args.event_driven_reconcile,
         natural_drain_ms=args.natural_drain_ms,
         precopy_window_ms=args.precopy_window_ms,
         packed_precopy=args.packed_precopy,

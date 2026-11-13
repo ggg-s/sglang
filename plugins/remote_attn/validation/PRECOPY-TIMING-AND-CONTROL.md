@@ -74,8 +74,8 @@ CPU 真实 tensor/控制 socket、显式 fake NIC 的合约测试覆盖：128/51
 和 bulk materialization，不含协议头、对齐、重传或远程 attention 流量。
 缺少字节计算所需 descriptor 字段时为 null。
 
-`type=d2d_control_slot` 对每个 dst 非 status RPC（以及 src 的 FREEZE RPC）
-记一次 envelope，成员用 cmd/epoch 关联请求。每个 `holders` 项给出等槽期间
+`type=d2d_control_slot` 对每个非 status RPC 记一次 envelope，成员用 cmd/epoch
+关联请求。每个 `holders` 项给出等槽期间
 重叠的 dst 持槽命令、wave 成员及 `overlap_ms`。status 也可出现在持槽者列表。
 未提交的超时尝试 `submitted_at` 和 `rpc_ms` 为 null。记录使用有限的近期持槽
 历史，未归因的等待包含线程调度与记账边界。precopy 阶段的 `dst_slot_waits`
@@ -84,3 +84,16 @@ CPU 真实 tensor/控制 socket、显式 fake NIC 的合约测试覆盖：128/51
 跑 m128/m512、c=8、cut32 的热缓存 ON/OFF 对照时，按完整请求对比上述阶段、
 剩余字节、D1 首 token 和 safe-to-stop。按 epoch 关联 PREPARE 的持槽记录，
 再分辨它在等 precopy、IMPORT/COMMIT 或 status。
+
+
+## 控制器阶段推进 A/B
+
+在 H20 使用相同构建、负载、`--poll-ms`、迁移并发和 Pre-copy 配置。A 组沿用周期扫描，B 组给迁移控制器加 `--event-driven-reconcile`。两组都设置 `--out`，各轮用独立 state 目录。B 组的快照和已持久化阶段变化只唤醒相关请求，周期扫描仍会检查重试和等待期限。
+
+按 `epoch` 对齐以下 JSONL 记录。
+
+- `type=d2d_reconcile` 的 `phase_wait_ms` 从 journal 完成阶段写入计到该阶段开始推进。恢复后没有进程内时间戳时为 null。B 组的 `event_wait_ms.snapshot` 单独记录相关快照发布到推进的等待。
+- `type=d2d_control_slot` 的 `slot_wait_ms` 和 `rpc_ms` 分别记录控制器等 worker 锁、以及拿到锁到 RPC 返回的耗时。目标端的 `holders` 可定位占锁命令。
+- `worker_wait_before_exec_ms` 从 worker claim 计到执行开始，`worker_exec_ms` 是 worker handler 的执行时间。两者取各 TP rank 最大值，可能来自不同 rank，均包含在 `rpc_ms` 内。控制 wave 按 envelope 统计一次。
+
+同时比较 `PLAN→FREEZE`、`FREEZE→首 token`、`activate_to_safe_to_stop_ms` 和未迁请求的最大 chunk 间隔。阶段推进时间和 worker 锁等待分开归因。

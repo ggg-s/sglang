@@ -77,6 +77,141 @@ class TestDsvGatewayStatus(CustomTestCase):
         self.driver.rows[role]["requests"][native_rid] = req
         return req
 
+    def test_background_reconcile_wakes_for_phase_reply_and_relevant_snapshot(self):
+        """A reply and an async-ready snapshot can advance with the timer parked."""
+        gw = self.gw
+        gw.event_driven_reconcile = True
+        gw.out = gw.path.with_name("handoff.jsonl")
+        gw.poll_s = 60
+        rid = gw.accept(dict(rid="moving", prompt_ids=[1], max_new_tokens=8))
+        unrelated = gw.accept(dict(rid="unrelated", prompt_ids=[1]), role="dst")
+        gw._update(unrelated, phase="DIRECT")
+        self.driver.rows["dst"]["requests"][gw.entry(unrelated)["target_rid"]] = dict(
+            output_ids=[19], finished=False, kv_released=False
+        )
+        entry = gw.entry(rid)
+        source_rid = entry["source_rid"]
+        request = dict(output_ids=[31], finished=False, kv_released=False)
+        self.driver.rows["src"]["requests"][source_rid] = request
+        gw._refresh()
+        with gw.cv:
+            gw._update(
+                rid,
+                phase="FREEZE",
+                epoch="move",
+                plans=[{}],
+                reservations=[{}],
+                instances={role: [role + "-instance"] for role in ("src", "dst")},
+            )
+        first_import = threading.Event()
+        periodic = threading.Event()
+        coordinator_idle = threading.Event()
+        import_calls = []
+        send = self.driver.send
+        timings = dict(wait_before_exec_ms=11.0, exec_ms=7.0)
+
+        def rpc(role, payload, timeout):
+            cmd = payload["cmd"]
+            if cmd == "d2d_freeze":
+                return dict(transfer=dict(output_ids=[31], kv_len=4), _ctl=timings)
+            if cmd == "d2d_import":
+                import_calls.append(payload)
+                first_import.set()
+                if len(import_calls) == 1:
+                    return dict(import_pending=True, _ctl=timings)
+                return dict(imported=True, _ctl=timings)
+            if cmd == "d2d_commit":
+                return dict(commit_pending=True, _ctl=timings)
+            return send(role, payload, timeout)
+
+        tick = gw.tick
+        wait = gw.reconcile_wakeup.wait
+
+        def wait_for_reconcile(timeout):
+            coordinator_idle.set()
+            return wait(timeout)
+
+        def reconcile(*, pending_only=False):
+            if not pending_only:
+                periodic.set()
+            tick(pending_only=pending_only)
+
+        with (
+            patch.object(self.driver, "send", side_effect=rpc),
+            patch.object(gw, "tick", side_effect=reconcile),
+            patch.object(gw.reconcile_wakeup, "wait", side_effect=wait_for_reconcile),
+        ):
+            gw.background = True
+            gw.thread = threading.Thread(target=gw._loop, daemon=True)
+            gw.thread.start()
+            try:
+                self.assertTrue(periodic.wait(2))
+                self.assertTrue(first_import.wait(2))
+                self.assertEqual(gw.entry(rid)["phase"], "IMPORT")
+                self.assertTrue(coordinator_idle.wait(2))
+                first_import.clear()
+
+                # Publish import completion through status, with the periodic
+                # deadline far away. The unrelated request must not be queued.
+                self.driver.rows["dst"]["migrations"] = {
+                    "move": {"target": {"prepared": True, "import_pending": False}}
+                }
+                with gw.lock:
+                    gw._refresh_role("dst")
+                    self.assertEqual(set(gw.reconcile_pending), {rid})
+                self.assertTrue(first_import.wait(2))
+                with gw.cv:
+                    self.assertTrue(
+                        gw.cv.wait_for(
+                            lambda: gw.journal["entries"][rid]["phase"] == "COMMIT",
+                            timeout=2,
+                        )
+                    )
+                self.assertEqual(len(import_calls), 2)
+                self.assertEqual(gw.entry(unrelated)["phase"], "DIRECT")
+                self.assertEqual(
+                    [
+                        call.kwargs["pending_only"] for call in gw.tick.call_args_list
+                    ].count(False),
+                    1,
+                )
+            finally:
+                gw.close()
+
+        traces = [json.loads(line) for line in gw.out.read_text().splitlines()]
+        phases = [
+            t
+            for t in traces
+            if t.get("type") == "d2d_reconcile" and t["epoch"] == "move"
+        ]
+        self.assertTrue(
+            any(
+                t["phase"] == "IMPORT" and t["previous_phase"] == "FREEZE"
+                for t in phases
+            )
+        )
+        self.assertTrue(
+            any(
+                t["phase"] == "IMPORT" and "snapshot" in t["event_wait_ms"]
+                for t in phases
+            )
+        )
+        freeze = next(
+            t
+            for t in traces
+            if t.get("type") == "d2d_control_slot" and t["cmd"] == "d2d_freeze"
+        )
+        self.assertGreaterEqual(freeze["slot_wait_ms"], 0)
+        self.assertGreaterEqual(freeze["rpc_ms"], 0)
+        self.assertEqual(freeze["worker_wait_before_exec_ms"], 11.0)
+        self.assertEqual(freeze["worker_exec_ms"], 7.0)
+        self.assertEqual(
+            gw.latency_metrics()["control_breakdown_ms"]["src/d2d_freeze"]["exec_ms"][
+                "count"
+            ],
+            1,
+        )
+
     def test_submit_waits_for_first_visible_status_without_resubmitting(self):
         """A confirmed submit may precede many snapshots, even for one-token output."""
         for role in ("src", "dst"):

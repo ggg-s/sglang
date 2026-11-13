@@ -213,6 +213,7 @@ class DsvGateway:
         decode_workers=None,
         precopy_window_ms=0,
         packed_precopy=False,
+        event_driven_reconcile=False,
     ):
         self.driver, self.tokenizer = driver, tokenizer
         self.decode_workers = decode_workers or {}
@@ -240,6 +241,11 @@ class DsvGateway:
         self.work_lock = threading.Lock()
         self.cv = threading.Condition(self.lock)
         self.stop = threading.Event()
+        self.event_driven_reconcile = event_driven_reconcile
+        self.reconcile_wakeup = threading.Event()
+        self.reconcile_pending = {}
+        self.active_rids = {}  # Ordered live journal IDs, updated after persist.
+        self.phase_ready = {}
         self.facts, self.fact_errors = {}, {}
         self.facts_at = {}
         self.connections = set()
@@ -324,6 +330,8 @@ class DsvGateway:
             for rid, entry in list(self.journal["entries"].items()):
                 self.journal["entries"][rid] = self.payloads.pack(entry)
                 self.payloads.view(self.journal["entries"][rid])
+                if self.event_driven_reconcile and entry["phase"] not in TERMINAL:
+                    self.active_rids[rid] = None
             self.journal["version"] = 2
             if migrated:
                 self._persist()
@@ -368,6 +376,7 @@ class DsvGateway:
         if self.fd < 0:
             return
         self.stop.set()
+        self.reconcile_wakeup.set()
         if self.thread is not None:
             self.thread.join(timeout=5)
             if self.thread.is_alive():
@@ -430,12 +439,32 @@ class DsvGateway:
             ):
                 return
             previous = copy.deepcopy(self.journal)
+            old = previous["entries"][rid]
             self.journal["entries"][rid].update(changes, updated_at=time.time())
             try:
                 self._persist()
             except BaseException:
                 self.journal = previous
                 raise
+            entry = self.journal["entries"][rid]
+            phase = entry["phase"]
+            if phase in TERMINAL:
+                self.active_rids.pop(rid, None)
+                self.reconcile_pending.pop(rid, None)
+                self.phase_ready.pop(rid, None)
+            else:
+                if self.event_driven_reconcile:
+                    self.active_rids[rid] = None
+                if phase != old["phase"]:
+                    if self.out is not None and entry.get("epoch"):
+                        self.phase_ready[rid] = (old["phase"], time.monotonic())
+                    self._queue_reconcile(rid, "phase")
+                elif (
+                    changes.get("cancel_requested") and not old["cancel_requested"]
+                    or changes.get("precopy_pending")
+                    and changes["precopy_pending"] != old.get("precopy_pending")
+                ):
+                    self._queue_reconcile(rid, "intent")
             self.cv.notify_all()
             if (
                 self.out is not None
@@ -627,9 +656,16 @@ class DsvGateway:
                 )
             else:
                 response = self.driver.send(role, command, timeout=timeout)
-            return self.rows(response)
+            rows = self.rows(response)
+            return rows
         finally:
             ended = time.monotonic()
+            worker_times = {}
+            for field in ("wait_before_exec_ms", "exec_ms"):
+                times = [r.get("_ctl", {}).get(field) for r in rows]
+                worker_times[field] = (
+                    max(times) if times and all(t is not None for t in times) else None
+                )
             with self.lock:
                 if is_destination and not status:
                     waited_until = submitted if acquired else ended
@@ -689,13 +725,11 @@ class DsvGateway:
                     )
                     breakdown = self.control_breakdown.setdefault(key, {})
                     self._observe(breakdown, "gateway_slot_wait", (submitted - started) * 1000)
-                    for field in ("wait_before_exec_ms", "exec_ms"):
-                        times = [r.get("_ctl", {}).get(field) for r in rows]
-                        if times and all(t is not None for t in times):
-                            self._observe(breakdown, field, max(times))
-            if slot_trace is not None or any(
-                c["cmd"] == "d2d_freeze" for c in commands
-            ):
+                    self._observe(breakdown, "rpc_ms", (ended - submitted) * 1000)
+                    for field, value in worker_times.items():
+                        if value is not None:
+                            self._observe(breakdown, field, value)
+            if not status and self.out is not None:
                 self._log_trace(
                     dict(
                         type="d2d_control_slot",
@@ -704,6 +738,8 @@ class DsvGateway:
                         members=commands,
                         submitted_at=submitted_at if acquired else None,
                         rpc_ms=(ended - submitted) * 1000 if acquired else None,
+                        worker_wait_before_exec_ms=worker_times["wait_before_exec_ms"],
+                        worker_exec_ms=worker_times["exec_ms"],
                         **(
                             slot_trace
                             or dict(
@@ -755,6 +791,7 @@ class DsvGateway:
                 control_wave_members=dict(self.control_wave_members),
                 precopy_stage_wait_ms=copy.deepcopy(self.precopy_stage_samples),
                 precopy_enabled=not self.disable_precopy,
+                event_driven_reconcile=self.event_driven_reconcile,
                 precopy_frame_events=copy.deepcopy(list(self.precopy_events)),
                 precopy_bytes_scope="applied_payload_sum_across_tp_ranks",
                 tick_recent_latency_ms=latency_histogram(self.tick_samples),
@@ -783,6 +820,85 @@ class DsvGateway:
         ):
             raise RuntimeError("DSV worker protocol/TP identity mismatch")
 
+    def _queue_reconcile(self, rid, reason):
+        # Called with the journal lock held. Keep the oldest outstanding event
+        # of each kind and let the coordinator consume the latest state.
+        if self.event_driven_reconcile and rid in self.active_rids:
+            self.reconcile_pending.setdefault(rid, {}).setdefault(
+                reason, time.monotonic()
+            )
+            self.reconcile_wakeup.set()
+
+    @staticmethod
+    def _snapshot_progress(request, migration, cut):
+        # SSE consumes live token updates directly. The coordinator needs the
+        # first token, a crossed cut, and readiness/ownership transitions.
+        request_progress = (
+            (
+                bool(request.get("output_ids")),
+                len(request.get("output_ids", ())) >= cut,
+                request.get("finished"),
+                request.get("kv_released"),
+                request.get("plan_ready", request.get("migration_ready")),
+                request.get("migration_ready"),
+                request.get("error"),
+            )
+            if request is not None
+            else None
+        )
+        migration = migration or {}
+        source = migration.get("source") or {}
+        target = migration.get("target") or {}
+        return (
+            request_progress,
+            source.get("prepared"),
+            source.get("committed"),
+            source.get("released"),
+            source.get("kv_released"),
+            source.get("error"),
+            target.get("prepared"),
+            target.get("import_pending"),
+            target.get("commit_pending"),
+            target.get("admitted"),
+            target.get("copied"),
+            target.get("local"),
+            target.get("error"),
+        )
+
+    def _queue_snapshot_changes(self, worker, previous, rows):
+        if not self.event_driven_reconcile:
+            return
+        for rid in self.active_rids:
+            entry = self.journal["entries"][rid]
+            for role in entry["instances"]:
+                if self._worker(entry, role) != worker:
+                    continue
+                native_rid = entry["source_rid"] if role == "src" else entry["target_rid"]
+                epoch = entry.get("epoch")
+                cut = entry["cut"]
+                if (
+                    role == entry["owner"] == "dst"
+                    and entry.get("dst_first_token_observed_at") is None
+                ):
+                    cut = len(entry.get("frozen_output", ())) + 1
+                if len(previous) != len(rows):
+                    self._queue_reconcile(rid, "snapshot")
+                    continue
+                for old, new in zip(previous, rows):
+                    before = self._snapshot_progress(
+                        old.get("requests", {}).get(native_rid),
+                        old.get("migrations", {}).get(epoch),
+                        cut,
+                    )
+                    after = self._snapshot_progress(
+                        new.get("requests", {}).get(native_rid),
+                        new.get("migrations", {}).get(epoch),
+                        cut,
+                    )
+                    if before != after:
+                        self._queue_reconcile(rid, "snapshot")
+                        break
+
     def _refresh_role(self, role):
         with self.lock:
             drain = self.journal["drain"]
@@ -808,9 +924,11 @@ class DsvGateway:
                     expected = drain["instances"].get(role)
                     if expected is not None and [r["instance_id"] for r in rows] != expected:
                         raise RuntimeError(f"{role} restarted during migration")
+                previous = self.facts.get(role, ()) if role not in self.fact_errors else ()
                 self.facts[role] = rows
                 self.facts_at[role] = time.monotonic()
                 self.fact_errors.pop(role, None)
+                self._queue_snapshot_changes(role, previous, rows)
                 self.cv.notify_all()
         except (StatusBusy, BlockingIOError, TimeoutError):
             # Advisory status may miss its short deadline while a control wave
@@ -1011,6 +1129,9 @@ class DsvGateway:
             except BaseException:
                 self.journal["entries"].pop(rid)
                 raise
+            if self.event_driven_reconcile:
+                self.active_rids[rid] = None
+                self._queue_reconcile(rid, "admission")
             self.cv.notify_all()
         return rid
 
@@ -2046,6 +2167,24 @@ class DsvGateway:
 
     def _step(self, entry):
         rid = entry["rid"]
+        with self.lock:
+            events = self.reconcile_pending.pop(rid, {})
+            transition = self.phase_ready.pop(rid, None)
+        if self.out is not None and entry.get("epoch") and (transition or events):
+            now = time.monotonic()
+            self._log_trace(
+                dict(
+                    type="d2d_reconcile",
+                    rid=rid,
+                    epoch=entry.get("epoch"),
+                    phase=entry["phase"],
+                    previous_phase=transition[0] if transition else None,
+                    phase_wait_ms=(now - transition[1]) * 1000 if transition else None,
+                    event_wait_ms={
+                        reason: (now - at) * 1000 for reason, at in events.items()
+                    },
+                )
+            )
         try:
             yield from self._advance(entry)
             current = self._entry(rid)
@@ -2145,15 +2284,20 @@ class DsvGateway:
                             pass
             steps = following
 
-    def tick(self):
+    def tick(self, *, pending_only=False):
         with self.work_lock:
             if not self.background:
                 self._refresh()
             with self.lock:
+                journal_entries = self.journal["entries"]
+                if pending_only:
+                    candidates = (journal_entries[rid] for rid in self.reconcile_pending)
+                elif self.event_driven_reconcile:
+                    candidates = (journal_entries[rid] for rid in self.active_rids)
+                else:
+                    candidates = journal_entries.values()
                 entries = [
-                    copy.deepcopy(e)
-                    for e in self.journal["entries"].values()
-                    if e["phase"] not in TERMINAL
+                    copy.deepcopy(e) for e in candidates if e["phase"] not in TERMINAL
                 ]
             started, served = time.monotonic(), 0
             waves = self._control_waves()
@@ -2173,7 +2317,7 @@ class DsvGateway:
                     e for e in entries if e["phase"] not in WAVE_PHASES | {"ROLLBACK", "TARGET"}
                 ]
                 waves = False
-            offset = self.tick_cursor % len(entries) if entries else 0
+            offset = self.tick_cursor % len(entries) if entries and not pending_only else 0
             entries = entries[offset:] + entries[:offset]
             while served < len(entries):
                 entry = self.payloads.view(entries[served])
@@ -2192,20 +2336,34 @@ class DsvGateway:
                     served += 1
                 if self.background and time.monotonic() - started >= 0.05:
                     break
-            if entries:
+            if entries and not pending_only:
                 self.tick_cursor = (offset + served) % len(entries)
             with self.lock:
                 self.tick_samples.append((time.monotonic() - started) * 1000)
 
     def _loop(self):
+        periodic_at = time.monotonic()
         while not self.stop.is_set():
+            now = time.monotonic()
+            pending_only = self.event_driven_reconcile and now < periodic_at
+            if pending_only:
+                with self.lock:
+                    pending = bool(self.reconcile_pending)
+                    if not pending:
+                        self.reconcile_wakeup.clear()
+                if not pending:
+                    self.reconcile_wakeup.wait(periodic_at - now)
+                    continue
             try:
-                self.tick()
+                self.tick(pending_only=pending_only)
             except Exception:
                 # Disk errors are fail-closed: no subsequent side effects from
                 # the failed transition. A later tick may retry its durable intent.
-                pass
-            self.stop.wait(self.poll_s)
+                self.stop.wait(self.poll_s)
+            if not pending_only:
+                periodic_at = time.monotonic() + self.poll_s
+                if not self.event_driven_reconcile:
+                    self.stop.wait(self.poll_s)
 
     def events(self, rid, after=-1):
         entry = self._entry(rid)
