@@ -219,10 +219,13 @@ jq -c 'select(.type == "d2d_control_slot" or .type == "d2d_reconcile")' \
 - `setup_reads_ns_by_rank.slot_setup` 观测接收槽创建和注册。该对象里的
   `count`、`bytes`、`max_frame_bytes` 分别是次数和字节数，其余时间字段为 ns。
   尚未发生读操作时计数为 0。
-- `commit_timing_ns_by_rank` 中 `readiness_agree`、`capacity_agree` 是该
-  epoch 的累计 TP 投票时间，`source_confirm_rpc` 是成功确认的 RPC 耗时。
-  `wave_validity_agree`、`wave_native_admit` 和 `wave_admit_agree` 是共享
-  wave 耗时，一个 wave 只记一次。用 `phase_wait_ms` 与 `worker_*_ms`
+- `commit_timing_ns_by_rank.wave_prepare_agree` 是 Commit wave 共享的
+  TP 有效性、确认进度和容量投票耗时，取最终准入的那次 wave。
+  `source_confirm_rpc` 是每个请求成功确认的 RPC 耗时。
+  `wave_native_admit` 和 `wave_admit_agree` 也是共享 wave 耗时。
+  旧引擎单独记录 `wave_validity_agree`、`readiness_agree` 和 `capacity_agree`，
+  跨版本总耗时用 `d2d_control_slot` 对比，一个 wave 只记一次。
+  用 `phase_wait_ms` 与 `worker_*_ms`
   区分阶段等待、发布到认领、认领到执行、执行、TP 对账和回包。
 - `*_by_rank` 按目标 TP rank 顺序记录，慢 rank 用最大值看，跨 rank 不求和。
   老 worker 的回包可能没有计时。状态输出仍可通过 `d2d_status` 查单个 epoch

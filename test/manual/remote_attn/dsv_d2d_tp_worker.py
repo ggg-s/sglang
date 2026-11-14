@@ -423,7 +423,26 @@ def main():
             )["results"]
 
         target.reader.call = partial_commit
-        reply = commit()
+        # Rank 1 has no background slot. Rank 0 must wait instead of issuing
+        # its source confirmation on an epoch that its peer cannot start.
+        if args.rank == 1:
+            e.target.d2d_targets.update(
+                {
+                    f"busy-{i}": NS(
+                        setup_worker=NS(is_alive=lambda: True), commit_worker=None
+                    )
+                    for i in range(d2d.ASYNC_HANDOFF_LIMIT)
+                }
+            )
+        assert commit()[e.epoch]["commit_pending"]
+        assert target.commit_worker is None and not target.commit_started
+        if args.rank == 1:
+            for i in range(d2d.ASYNC_HANDOFF_LIMIT):
+                del e.target.d2d_targets[f"busy-{i}"]
+
+        with patch.object(e.target, "agree", wraps=e.target.agree) as agree:
+            reply = commit()
+            assert agree.call_count == 1  # One prepare collective for the wave.
         assert reply[e.epoch]["commit_pending"]
         assert reply["absent-epoch"]["rejected"]
         target.commit_worker.join(5)

@@ -1536,39 +1536,86 @@ def commit_wave(controller, epochs, targets):
             errors.append(repr(exc))
         else:
             errors.append(None)
+    # Snapshot every epoch in command order. Readers can finish while we vote
+    # but only this scheduler thread can start new workers.
     votes = []
     for epoch, error in zip(epochs, errors):
-        admitted = error is None and targets[epoch].admitted
-        votes.extend((int(error is None), int(admitted), int(not admitted)))
+        target = targets.get(epoch)
+        if error is not None:
+            votes.extend((0, 0, 0, 0, 0, 0, 0, 0))
+            continue
+        worker = target.commit_worker
+        settled = worker is None or not worker.is_alive()
+        confirmed = target.source_confirmed
+        votes.extend(
+            (
+                1,
+                int(target.admitted),
+                int(not target.admitted),
+                int(target.async_handoff),
+                int(not target.async_handoff),
+                int(settled),
+                int(target.admitted or confirmed),
+                int(worker is None or confirmed),
+            )
+        )
     started = time.perf_counter_ns()
-    agreed = controller.agree(votes)
-    validity_ns = time.perf_counter_ns() - started
+    agreed = controller.agree([handoff_headroom(targets), *votes])
+    headroom = agreed[0]
+    prepare_agree_ns = time.perf_counter_ns() - started
     results, confirmed = {}, []
     for i, (epoch, error) in enumerate(zip(epochs, errors)):
-        valid, admitted, pending = agreed[3 * i : 3 * i + 3]
-        if not valid or not (admitted or pending):
+        valid, admitted, pending, async_handoff, sync_handoff, settled, ack, healthy = (
+            agreed[1 + 8 * i : 1 + 8 * (i + 1)]
+        )
+        if (
+            not valid
+            or not (admitted or pending)
+            or not (async_handoff or sync_handoff)
+        ):
             results[epoch] = dict(
                 rejected=True,
                 error=f"TP D2D commit rejected: {error or 'peer rejected'}",
             )
             continue
         target = targets[epoch]
-        try:
-            if target.async_handoff:
-                if not poll_commit(controller, target, targets):
-                    results[epoch] = dict(commit_pending=True)
-                    continue
-            else:
-                if not target.admitted and not target.source_confirmed:
+        timings = target.commit_timing_ns
+        if not admitted:
+            timings["wave_prepare_agree"] = prepare_agree_ns
+        if async_handoff:
+            if settled and not ack and not healthy:
+                target.commit_worker = None
+                results[epoch] = dict(
+                    error=f"TP D2D commit confirmation pending: {target.commit_error or 'peer failed'}"
+                )
+                continue
+            if not (settled and ack):
+                if settled and headroom:
+                    # Charge the whole TP wave for each launched epoch, even
+                    # if a previously confirmed rank needs no local worker.
+                    headroom -= 1
                     target.commit_started = True
-                    confirm_source(target)
-                if not controller.agree([int(target.admitted or target.source_confirmed)])[0]:
-                    raise TransportFailure(
-                        f"TP D2D commit confirmation pending: {target.commit_error or 'peer pending'}"
-                    )
-        except TransportFailure as exc:
-            results[epoch] = dict(error=str(exc))
-            continue
+                    if not target.source_confirmed:
+                        target.commit_worker = threading.Thread(
+                            target=confirm_source,
+                            args=(target,),
+                            name="dsv-d2d-commit",
+                            daemon=True,
+                        )
+                        target.commit_worker.start()
+                results[epoch] = dict(commit_pending=True)
+                continue
+        else:
+            if not target.admitted and not target.source_confirmed:
+                target.commit_started = True
+                confirm_source(target)
+            if not controller.agree([int(target.admitted or target.source_confirmed)])[
+                0
+            ]:
+                results[epoch] = dict(
+                    error=f"TP D2D commit confirmation pending: {target.commit_error or 'peer pending'}"
+                )
+                continue
         confirmed.append((epoch, target))
 
     # Only shards with a collective confirmation may join native Decode.
@@ -1607,7 +1654,6 @@ def commit_wave(controller, epochs, targets):
         else:
             for target in new:
                 target.commit_timing_ns.update(
-                    wave_validity_agree=validity_ns,
                     wave_native_admit=local_admit_ns,
                     wave_admit_agree=admit_agree_ns,
                 )
@@ -1654,13 +1700,13 @@ def allocation_preflight(controller, req, required=None):
         raise ValueError("D2D target native KV/state/request-row budget unavailable")
 
 
-def handoff_capacity(controller, targets):
+def handoff_headroom(targets):
     active = sum(
         thread is not None and thread.is_alive()
         for target in targets.values()
         for thread in (target.setup_worker, target.commit_worker)
     )
-    return controller.agree([int(active < ASYNC_HANDOFF_LIMIT)])[0]
+    return max(0, ASYNC_HANDOFF_LIMIT - active)
 
 
 def confirm_source(target):
@@ -1673,43 +1719,6 @@ def confirm_source(target):
         target.commit_timing_ns["source_confirm_rpc"] = time.perf_counter_ns() - started
         target.source_confirmed = True
         target.commit_error = None
-
-
-def poll_commit(controller, target, targets):
-    # All ranks must finish the same attempt before retrying a failed shard.
-    started = time.perf_counter_ns()
-    settled, confirmed, healthy = controller.agree(
-        [
-            int(target.commit_worker is None or not target.commit_worker.is_alive()),
-            int(target.admitted or target.source_confirmed),
-            int(target.commit_worker is None or target.source_confirmed),
-        ]
-    )
-    elapsed = time.perf_counter_ns() - started
-    timings = target.commit_timing_ns
-    timings["readiness_agree"] = timings.get("readiness_agree", 0) + elapsed
-    if not settled:
-        return False
-    if confirmed:
-        return True
-    if not healthy:
-        target.commit_worker = None
-        raise TransportFailure(
-            f"TP D2D commit confirmation pending: {target.commit_error or 'peer failed'}"
-        )
-    started = time.perf_counter_ns()
-    has_capacity = handoff_capacity(controller, targets)
-    elapsed = time.perf_counter_ns() - started
-    timings["capacity_agree"] = timings.get("capacity_agree", 0) + elapsed
-    if not has_capacity:
-        return False
-    target.commit_started = True
-    if not target.source_confirmed:
-        target.commit_worker = threading.Thread(
-            target=confirm_source, args=(target,), name="dsv-d2d-commit", daemon=True
-        )
-        target.commit_worker.start()
-    return False
 
 
 def prepare_import_io(target, transfer, session, jobs):
@@ -1874,7 +1883,7 @@ def import_request(controller, data):
             setup_reads_ns=dict(target.reader.read_timing_ns),
         )
     async_handoff = data.get("async_handoff") is True
-    if async_handoff and not handoff_capacity(controller, targets):
+    if async_handoff and not controller.agree([handoff_headroom(targets)])[0]:
         return dict(import_pending=True)
     transfer = _select_transfer(data, controller.rank, controller.tp_size)
     if (

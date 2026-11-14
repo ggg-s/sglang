@@ -1258,18 +1258,25 @@ class Controller:
         from .transport_failure import TransportFailure, quarantine
 
         sources = list(self.sources)
-        ready = [
-            int(
-                not src.responded
-                and self.config.mode == "remote"
-                and read_json(src.path / "ready.json") is not None
+        if self.scheduler.disaggregation_mode.value == "decode":
+            # Decode sources only serve D2D; there is no P HTTP response.
+            # Use the TP-wide worker role, which is invariant across ranks.
+            ready = [0] * len(sources)
+        else:
+            ready = self.agree(
+                [
+                    int(
+                        not src.responded
+                        and self.config.mode == "remote"
+                        and read_json(src.path / "ready.json") is not None
+                    )
+                    for src in sources
+                ]
             )
-            for src in sources
-        ]
         retired = []
         failed = []
         prefix_error = False
-        for src, respond in zip(sources, self.agree(ready)):
+        for src, respond in zip(sources, ready):
             if respond:
                 snapshot = copy.copy(src.req)
                 snapshot.finished_reason = FINISH_LENGTH(length=0)

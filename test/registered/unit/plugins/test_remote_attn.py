@@ -11612,13 +11612,20 @@ class TestRemoteAttn(CustomTestCase):
                 self.assertFalse(source.poll())
                 # A request flag alone cannot bypass native state completion.
                 f.req.kv.is_kv_released = True
-                with patch.dict(
-                    sys.modules,
-                    {
-                        "sglang.srt.managers.schedule_batch": SimpleNamespace(
-                            FINISH_LENGTH=object
-                        )
-                    },
+                with (
+                    patch.object(
+                        f.scheduler,
+                        "disaggregation_mode",
+                        SimpleNamespace(value="prefill"),
+                    ),
+                    patch.dict(
+                        sys.modules,
+                        {
+                            "sglang.srt.managers.schedule_batch": SimpleNamespace(
+                                FINISH_LENGTH=object
+                            )
+                        },
+                    ),
                 ):
                     f.controller.poll_sources()
                 self.assertEqual(freed, [])
