@@ -86,6 +86,9 @@ def handoff_timing(entry):
     )
     timing.update(entry.get("source_setup_timing") or {})
     timing["rdma_sender_prewarmed_ranks"] = entry.get("rdma_sender_prewarmed_ranks")
+    for name in ("import_timing_ns_by_rank", "setup_reads_ns_by_rank", "commit_timing_ns_by_rank"):
+        if any(entry.get(name) or ()):
+            timing[name] = entry[name]
     admitted = timing["target_admitted_at"]
     for marker in (
         "dst_copy_observed_at", "dst_local_observed_at", "src_release_observed_at"
@@ -1393,6 +1396,9 @@ class DsvGateway:
             freeze_requested_at=None,
             freeze_descriptor_ready_at=None,
             source_setup_timing=None,
+            import_timing_ns_by_rank=None,
+            setup_reads_ns_by_rank=None,
+            commit_timing_ns_by_rank=None,
             rdma_sender_prewarmed_ranks=None,
             import_ready_at=None,
             target_admitted_at=None,
@@ -2219,7 +2225,11 @@ class DsvGateway:
                 freeze_descriptor_ready_at=time.time(),
                 source_setup_timing={
                     name: max(t[name] for t in transfers)
-                    for name in ("source_transport_setup_ms", "source_route_publish_ms")
+                    for name in (
+                        "source_event_record_ms",
+                        "source_transport_setup_ms",
+                        "source_route_publish_ms",
+                    )
                     if all(name in t for t in transfers)
                 },
                 remaining_copy_bytes=remaining_copy_bytes(transfers),
@@ -2274,6 +2284,8 @@ class DsvGateway:
                     rid,
                     phase="ROLLBACK" if aborted or cancelled else "COMMIT",
                     import_ready_at=time.time(),
+                    import_timing_ns_by_rank=[row.get("import_timing_ns") for row in rows],
+                    setup_reads_ns_by_rank=[row.get("setup_reads_ns") for row in rows],
                     **({"migration_outcome": "drain_aborted"} if aborted else {}),
                 )
         elif phase == "COMMIT":
@@ -2302,6 +2314,7 @@ class DsvGateway:
                 owner="dst",
                 phase="TARGET",
                 target_admitted_at=time.time(),
+                commit_timing_ns_by_rank=[row.get("commit_timing_ns") for row in rows],
                 error=None,
                 blocked=False,
                 migration_outcome="migrated",

@@ -19492,6 +19492,20 @@ class TestRemoteAttn(CustomTestCase):
                 self.assertEqual(len(e.resumed), 1)
                 self.assertEqual(len(e.resumed[0][1]), 2)
                 self.assertEqual(len(e.target.d2d_targets), 2)
+                for rid in rids:
+                    timing = gw.entry(rid)
+                    self.assertGreaterEqual(
+                        timing["source_setup_timing"]["source_event_record_ms"], 0
+                    )
+                    (imported,) = timing["import_timing_ns_by_rank"]
+                    (committed,) = timing["commit_timing_ns_by_rank"]
+                    self.assertEqual(
+                        imported["setup_gpu_fence"],
+                        imported["setup_event_record"] + imported["setup_event_wait"],
+                    )
+                    self.assertGreater(imported["manifest"], 0)
+                    self.assertGreater(committed["source_confirm_rpc"], 0)
+                    self.assertGreaterEqual(committed["wave_native_admit"], 0)
                 self.assertFalse(any(p["cmd"] == "d2d_resume" for _, p in driver.calls))
             finally:
                 for gate in gates.values():

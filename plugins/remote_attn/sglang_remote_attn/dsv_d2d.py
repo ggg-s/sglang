@@ -443,6 +443,7 @@ class Source:
                 buffers(self.owner.pool, manager(self.owner)), self.schema["entries"]
             )
         ]
+        started = time.perf_counter()
         self.final_event = dp.event(self.pages.device)
         transport_started = time.perf_counter()
         catalog = bulk_catalog(self.owner, self.pages.device)
@@ -466,6 +467,7 @@ class Source:
         route_started = time.perf_counter()
         remote.register(self)
         self.meta = dict(
+            source_event_record_ms=(transport_started - started) * 1000,
             source_transport_setup_ms=(route_started - transport_started) * 1000,
             source_route_publish_ms=(time.perf_counter() - route_started) * 1000,
             version=VERSION,
@@ -975,6 +977,7 @@ class Target(NativeTarget):
     grouped_entries: int = 0
     rdma_frame_capacity: int | None = None
     import_timing_ns: dict = field(default_factory=dict)
+    commit_timing_ns: dict = field(default_factory=dict)
 
     def refresh(self):
         if (
@@ -1537,7 +1540,9 @@ def commit_wave(controller, epochs, targets):
     for epoch, error in zip(epochs, errors):
         admitted = error is None and targets[epoch].admitted
         votes.extend((int(error is None), int(admitted), int(not admitted)))
+    started = time.perf_counter_ns()
     agreed = controller.agree(votes)
+    validity_ns = time.perf_counter_ns() - started
     results, confirmed = {}, []
     for i, (epoch, error) in enumerate(zip(epochs, errors)):
         valid, admitted, pending = agreed[3 * i : 3 * i + 3]
@@ -1573,6 +1578,7 @@ def commit_wave(controller, epochs, targets):
         from .handoff_control import _flush_decode_resume
 
         error = None
+        started = time.perf_counter_ns()
         try:
             _flush_decode_resume(
                 controller.scheduler, [target.decode_req.req for target in new]
@@ -1582,7 +1588,11 @@ def commit_wave(controller, epochs, targets):
                     start_bulk(target)
         except BaseException as exc:
             error = repr(exc)
-        if not controller.agree([int(error is None)])[0]:
+        local_admit_ns = time.perf_counter_ns() - started
+        started = time.perf_counter_ns()
+        admitted = controller.agree([int(error is None)])[0]
+        admit_agree_ns = time.perf_counter_ns() - started
+        if not admitted:
             from .transport_failure import quarantine, request_of
 
             for target in new:
@@ -1596,11 +1606,21 @@ def commit_wave(controller, epochs, targets):
                         protocol.registered.pop(index)
         else:
             for target in new:
+                target.commit_timing_ns.update(
+                    wave_validity_agree=validity_ns,
+                    wave_native_admit=local_admit_ns,
+                    wave_admit_agree=admit_agree_ns,
+                )
                 target.admitted = True
 
     for epoch, target in confirmed:
         results[epoch] = (
-            dict(admitted=True, source_confirmed=True, rid=target.decode_req.req.rid)
+            dict(
+                admitted=True,
+                source_confirmed=True,
+                rid=target.decode_req.req.rid,
+                commit_timing_ns=dict(target.commit_timing_ns),
+            )
             if target.admitted
             else dict(error=target.error)
         )
@@ -1644,16 +1664,20 @@ def handoff_capacity(controller, targets):
 
 
 def confirm_source(target):
+    started = time.perf_counter_ns()
     try:
         target.reader.call("commit")
-        target.source_confirmed = True
-        target.commit_error = None
     except Exception as exc:
         target.commit_error = repr(exc)
+    else:
+        target.commit_timing_ns["source_confirm_rpc"] = time.perf_counter_ns() - started
+        target.source_confirmed = True
+        target.commit_error = None
 
 
 def poll_commit(controller, target, targets):
     # All ranks must finish the same attempt before retrying a failed shard.
+    started = time.perf_counter_ns()
     settled, confirmed, healthy = controller.agree(
         [
             int(target.commit_worker is None or not target.commit_worker.is_alive()),
@@ -1661,6 +1685,9 @@ def poll_commit(controller, target, targets):
             int(target.commit_worker is None or target.source_confirmed),
         ]
     )
+    elapsed = time.perf_counter_ns() - started
+    timings = target.commit_timing_ns
+    timings["readiness_agree"] = timings.get("readiness_agree", 0) + elapsed
     if not settled:
         return False
     if confirmed:
@@ -1670,7 +1697,11 @@ def poll_commit(controller, target, targets):
         raise TransportFailure(
             f"TP D2D commit confirmation pending: {target.commit_error or 'peer failed'}"
         )
-    if not handoff_capacity(controller, targets):
+    started = time.perf_counter_ns()
+    has_capacity = handoff_capacity(controller, targets)
+    elapsed = time.perf_counter_ns() - started
+    timings["capacity_agree"] = timings.get("capacity_agree", 0) + elapsed
+    if not has_capacity:
         return False
     target.commit_started = True
     if not target.source_confirmed:
@@ -1728,8 +1759,14 @@ def prepare_import_io(target, transfer, session, jobs):
             queued = time.perf_counter_ns()
             target.import_timing_ns["state_index_copy"] = queued - manifest_at
             target.decode_req.ready = dp.event(device)
+            recorded = time.perf_counter_ns()
             target.decode_req.ready.synchronize()
-            target.import_timing_ns["setup_gpu_fence"] = time.perf_counter_ns() - queued
+            finished = time.perf_counter_ns()
+            target.import_timing_ns.update(
+                setup_event_record=recorded - queued,
+                setup_event_wait=finished - recorded,
+                setup_gpu_fence=finished - queued,
+            )
     except BaseException as exc:
         target.error = repr(exc)
         dp.io_for(req).poison()
@@ -1797,7 +1834,12 @@ def finish_import(controller, target):
         if not target.defer_bulk and target.worker is None:
             start_bulk(target)
         return dict(
-            rid=req.rid, imported=True, kv_len=kv_len, output_len=len(req.output_ids)
+            rid=req.rid,
+            imported=True,
+            kv_len=kv_len,
+            output_len=len(req.output_ids),
+            import_timing_ns=dict(target.import_timing_ns),
+            setup_reads_ns=dict(target.reader.read_timing_ns),
         )
     except BaseException as exc:
         target.error = repr(exc)
@@ -1824,7 +1866,13 @@ def import_request(controller, data):
             return finish_import(controller, target)
         if target.error or target.cancelled:
             raise ValueError("D2D import has failed/aborted; cannot retry allocation")
-        return dict(rid=target.decode_req.req.rid, imported=True, duplicate=True)
+        return dict(
+            rid=target.decode_req.req.rid,
+            imported=True,
+            duplicate=True,
+            import_timing_ns=dict(target.import_timing_ns),
+            setup_reads_ns=dict(target.reader.read_timing_ns),
+        )
     async_handoff = data.get("async_handoff") is True
     if async_handoff and not handoff_capacity(controller, targets):
         return dict(import_pending=True)
@@ -1963,11 +2011,17 @@ def import_request(controller, data):
                 )
         target.import_timing_ns["native_prepare"] = time.perf_counter_ns() - started
         if async_handoff:
+            stream_started = time.perf_counter_ns()
             setup_stream = new_stream(device)
+            stream_created = time.perf_counter_ns()
             # Fence writes issued on the scheduler stream even if launching the
             # worker fails or abort arrives before the worker begins.
             setup_stream.wait_event(dp.event(device))
             target.setup_stream = setup_stream
+            target.import_timing_ns.update(
+                setup_stream_create=stream_created - stream_started,
+                setup_stream_dependency=time.perf_counter_ns() - stream_created,
+            )
             target.setup_worker = threading.Thread(
                 target=prepare_import_io,
                 args=(target, transfer, session, jobs),
