@@ -405,80 +405,6 @@ class TestDsvMigrationController(CustomTestCase):
                     all(item["async_handoff"] and item["defer_bulk"] for item in wave)
                 )
 
-    def test_prepare_overlaps_cutover_and_waits_for_inflight_retirement(self):
-        self.controller.close()
-        self.driver.wave_supported = True
-        self.driver.precopy = True
-        self.driver.import_ready = False
-        self.driver.auto_release = False
-        self.controller = self.open_controller(
-            standby=("D1", "D2"),
-            max_concurrent_migrations=2,
-            max_preparing_migrations=4,
-            chain_drain=True,
-            precopy_window_ms=400,
-        )
-        rids = [
-            self.controller.accept({"prompt_ids": [0], "max_new_tokens": 12})
-            for _ in range(7)
-        ]
-        self.ticks(2)
-
-        def entries_in(phase):
-            return [
-                entry
-                for rid in rids
-                if (entry := self.controller.entry(rid))["phase"] == phase
-            ]
-
-        now = time.monotonic()
-        with (
-            patch.object(time, "time", return_value=time.time()) as clock,
-            patch.object(time, "monotonic", return_value=now) as monotonic,
-        ):
-            self.controller.start_named_drain("D0", "D1")
-            self.ticks()
-            preparing = entries_in("WAIT_CUT")
-            self.assertEqual(len(preparing), 4)
-            self.assertEqual(len(entries_in("SOURCE")), 3)
-            self.assertTrue(all(entry["precopy_bytes"] == 128 for entry in preparing))
-
-            clock.return_value = preparing[0]["precopy_until"]
-            self.ticks()
-            self.assertEqual(len(entries_in("IMPORT")), 2)
-            queued = entries_in("WAIT_CUT")
-            self.assertEqual(len(queued), 4)
-            self.assertTrue(all(entry["precopy_bytes"] == 128 for entry in queued))
-
-            clock.return_value = queued[0]["precopy_until"]
-            self.driver.waves.clear()
-            self.ticks()
-            self.assertCountEqual(
-                [entry["rid"] for entry in entries_in("WAIT_CUT")],
-                [entry["rid"] for entry in queued],
-            )
-            self.assertFalse(
-                any(
-                    item["cmd"] == "d2d_import"
-                    for _, wave in self.driver.waves
-                    for item in wave
-                )
-            )
-
-            self.driver.import_ready = True
-            # No new readiness facts from this worker: periodic recovery retries.
-            for _ in range(8):
-                monotonic.return_value += 0.30
-                clock.return_value += 0.30
-                self.ticks()
-            targets = entries_in("TARGET")
-            self.assertEqual(len(targets), 6)
-            self.assertEqual(len(entries_in("SOURCE")), 1)
-            self.assertEqual(self.controller.drain_status()["state"], "MIGRATING")
-            self.driver.release(targets[0]["epoch"])
-            self.ticks()
-            self.assertEqual(len(entries_in("WAIT_CUT")), 1)
-
     def test_retired_source_rolls_back_reservation_before_publishing_terminal(self):
         """EOS between polls leaves a destination reservation to clean up."""
         self.controller.close()
@@ -1243,6 +1169,112 @@ class TestNativePdDecode(CustomTestCase):
         self.assertEqual(self.controller.entry(late)["workers"], {"src": "D1"})
         self.assertEqual(self.controller.entry(late)["bootstrap_room"], 11)
         self.assertNotIn(late, self.controller.drain_status()["members"])
+
+    def test_native_pd_prepare_overlaps_cutover_and_waits_for_retirement(self):
+        self.controller.close()
+        self.driver.wave_supported = True
+        self.driver.precopy = True
+        self.driver.import_ready = False
+        self.driver.auto_release = False
+        self.controller = self.open_controller(
+            max_concurrent_migrations=2,
+            max_preparing_migrations=4,
+            chain_drain=True,
+            precopy_window_ms=400,
+        )
+        controller = self.controller
+        rids = [
+            controller.accept_native(
+                "D0", {"prompt_ids": [0], "max_new_tokens": 12}, self.bootstrap(i)
+            )
+            for i in range(7)
+        ]
+
+        def ticks(count=12):
+            for _ in range(count):
+                controller.tick()
+                self.assertLessEqual(controller.drain_status().get("active_cutovers", 0), 2)
+
+        ticks(2)
+
+        def entries_in(phase):
+            return [
+                entry
+                for rid in rids
+                if (entry := self.controller.entry(rid))["phase"] == phase
+            ]
+
+        now = time.monotonic()
+        with (
+            patch.object(time, "time", return_value=time.time()) as clock,
+            patch.object(time, "monotonic", return_value=now) as monotonic,
+        ):
+            pending = controller.start_named_drain("D0", "D1")
+            self.assertEqual(pending["state"], "CORDONING")
+            self.assertTrue(controller.cordon_wakeup.is_set())
+            with patch.object(controller, "_smg_cordoned", return_value=True):
+                controller._reconcile_cordon()
+            ticks()
+            preparing = entries_in("WAIT_CUT")
+            self.assertEqual(len(preparing), 4)
+            self.assertEqual(len(entries_in("SOURCE")), 3)
+            self.assertTrue(all(entry["precopy_bytes"] == 128 for entry in preparing))
+
+            clock.return_value = preparing[0]["precopy_until"]
+            ticks()
+            self.assertEqual(len(entries_in("IMPORT")), 2)
+            status = controller.drain_status()
+            self.assertEqual(status["active_cutovers"], 2)
+            self.assertTrue(status["controller_features"]["chain_drain"])
+            # A concurrent all-request poll can arrive between two wave
+            # envelopes. It must yield even while the role lock is free.
+            run_waves = controller._run_drain_waves
+
+            def poll_between_envelopes(members):
+                before = self.driver.commands.count(("D1", "d2d_worker_status", "worker"))
+                controller._refresh_role("D1")
+                after = self.driver.commands.count(("D1", "d2d_worker_status", "worker"))
+                self.assertEqual(before, after)
+                return run_waves(members)
+
+            with (
+                patch.object(controller, "background", True),
+                patch.object(controller, "_run_drain_waves", poll_between_envelopes),
+            ):
+                controller._advance_drain_waves(entries_in("IMPORT"))
+            self.assertFalse(controller.drain_wave_workers)
+            queued = entries_in("WAIT_CUT")
+            self.assertEqual(len(queued), 4)
+            self.assertTrue(all(entry["precopy_bytes"] == 128 for entry in queued))
+
+            clock.return_value = queued[0]["precopy_until"]
+            self.driver.waves.clear()
+            ticks()
+            self.assertCountEqual(
+                [entry["rid"] for entry in entries_in("WAIT_CUT")],
+                [entry["rid"] for entry in queued],
+            )
+            self.assertFalse(
+                any(
+                    item["cmd"] == "d2d_import"
+                    for _, wave in self.driver.waves
+                    for item in wave
+                )
+            )
+
+            self.driver.import_ready = True
+            # No new readiness facts from this worker: periodic recovery retries.
+            for _ in range(8):
+                monotonic.return_value += 0.30
+                clock.return_value += 0.30
+                ticks()
+            targets = entries_in("TARGET")
+            self.assertEqual(len(targets), 6)
+            self.assertEqual(len(entries_in("SOURCE")), 1)
+            self.assertEqual(self.controller.drain_status()["state"], "MIGRATING")
+            self.driver.release(targets[0]["epoch"])
+            ticks()
+            self.assertEqual(len(entries_in("WAIT_CUT")), 1)
 
     def test_submit_bound_before_cordon_stays_in_drain_until_it_finishes(self):
         """A lost submit reply leaves a SUBMIT entry already owned by the source."""

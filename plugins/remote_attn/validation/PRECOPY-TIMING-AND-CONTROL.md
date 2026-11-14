@@ -143,7 +143,8 @@ RPC。同一份快照反复读到也不会续期。按请求找终态和 drain �
 ```bash
 export D2D_PROFILE=optimized
 launch=plugins/remote_attn/deploy/run_native_pd_d2d.sh
-# 在各 Decode 的原启动命令前加 "$launch" decode。
+# 在内网脚本的每条 Decode 启动行，保留原有参数及日志重定向。
+# "$launch" decode bash start_pd.sh <现有 Decode 参数>
 "$launch" controller --config "$POOL_CONFIG" \
   --max-preparing-migrations 4 --max-concurrent-migrations 2 \
   --natural-drain-ms "$NATURAL_MS" --precopy-window-ms "$PRECOPY_MS" \
@@ -161,10 +162,18 @@ curl -fsS "$ADMIN/v1/drain" -H 'Content-Type: application/json' \
 curl -fsS "$ADMIN/v1/drain/status" | jq '{
   id, state, source_release_ms,
   cordon_ms: (if .activated_at then 1000 * (.activated_at - .started_at) else null end),
-  members_state, migration_limits, control_wave_sizes
+  members_state, migration_limits, active_cutovers, controller_features,
+  control_wave_sizes
 }'
 ```
 
+- 发压前确认 `controller_features`。两组的 `event_driven_reconcile` 和
+  `worker_status_snapshots` 都应为 true，B 的 `chain_drain` 应为 true。
+  迁移时确认 `migration_limits.preparing=4`、`migration_limits.cutover=2`，
+  `active_cutovers` 包含尚未恢复的冻结回滚，峰值应 ≤2。
+- `cordon_ms` 仍包含 SMG 的探针等待。控制器持久化请求后立刻开始查，
+  每个 SMG 副本均须确认摘流。sglang-router 0.3.2 的
+  `--health-check-interval-secs` 接受整数，沿用 1 秒。
 - 主指标用 `source_release_ms`（POST 接受至 SAFE_TO_STOP），另比较
   `1000 * (source_released_at - activated_at)` 和摘流耗时。至少做 3 轮配对，
   同时记每轮源端成员数、实际迁移数、源端自然完成数和回滚数。
@@ -182,4 +191,6 @@ curl -fsS "$ADMIN/v1/drain/status" | jq '{
   仍依赖每次迁移。两组均在 Import 成功后先写 journal，再执行 COMMIT。
 - `worker_snapshot_sample_ms` 记录控制器接收到的每份快照的 TP 最大采样耗时。
   快照丢失时对 drain 两端的全量状态回退 RPC 按最近成功状态节流到约 100 ms，
-  首次建立身份、终态查证和 idle 正证仍用 RPC。
+  优化组的整条控制 wave 期间全量状态 RPC 也会让路，命令结束后补读。
+  已经提交的状态 RPC 会等回包交还角色锁。首次建立身份、终态查证和
+  idle 正证仍用 RPC。

@@ -275,6 +275,7 @@ class DsvGateway:
         self.connections = set()
         self.role_locks = {role: threading.Lock() for role in self.control_workers}
         self.command_waiters = dict.fromkeys(self.control_workers, 0)
+        self.drain_wave_workers = set()
         self.dst_slot_holder = None
         self.dst_slot_history = deque(maxlen=256)
         self.control_latencies = {}
@@ -643,6 +644,7 @@ class DsvGateway:
 
     def _call(self, role, cmd, epoch="worker", **payload):
         status = cmd == "d2d_worker_status"
+        advisory = status and "request_rid" not in payload and not payload.get("idle_only")
         started = time.monotonic()
         acquired = False
         sent = False
@@ -660,7 +662,9 @@ class DsvGateway:
             drain = self.journal["drain"]
             destination = (drain or {}).get("dst") if self.decode_workers else "dst"
             is_destination = role == destination
-            if status and self.command_waiters[role]:
+            if status and (
+                self.command_waiters[role] or advisory and role in self.drain_wave_workers
+            ):
                 raise StatusBusy()
             if not status:
                 self.command_waiters[role] += 1
@@ -682,7 +686,9 @@ class DsvGateway:
             submitted_at = time.time()
             if status:
                 with self.lock:
-                    if self.command_waiters[role]:
+                    if self.command_waiters[role] or (
+                        advisory and role in self.drain_wave_workers
+                    ):
                         raise StatusBusy()
             if is_destination:
                 holder = dict(worker=role, cmd=cmd, members=commands, started=submitted)
@@ -2130,7 +2136,18 @@ class DsvGateway:
                 yield from self._precopy(entry, cut_due=cut_due)
         elif phase == "FREEZE":
             if entry.get("freeze_requested_at") is None:
-                self._update(rid, freeze_requested_at=time.time())
+                # Serialize first dispatch authorization with operator abort.
+                # Retries keep the original durable intent and cutover slot.
+                with self.cv:
+                    if self._drain_abort_requested(rid):
+                        self._update(
+                            rid,
+                            phase="ROLLBACK",
+                            migration_requested=False,
+                            migration_outcome="drain_aborted",
+                        )
+                        return
+                    self._update(rid, freeze_requested_at=time.time())
             rows = (yield self._command(
                 "src",
                 "d2d_freeze",
@@ -2564,6 +2581,30 @@ class DsvGateway:
             steps = following
 
     def _advance_drain_waves(self, members):
+        if not members:
+            return
+        if not self.background or not self.chain_drain:
+            self._run_drain_waves(members)
+            return
+        # Individual RPCs already take the per-worker command slot. Reserve
+        # priority across the gaps in this bounded chain so advisory RPCs
+        # cannot enter between mutations. File snapshots still flow.
+        workers = {
+            self._worker(entry, role)
+            for entry in members
+            for role in ("src", "dst")
+        }
+        with self.lock:
+            self.drain_wave_workers.update(workers)
+        try:
+            self._run_drain_waves(members)
+        finally:
+            with self.lock:
+                self.drain_wave_workers.difference_update(workers)
+                for worker in workers:
+                    self.status_wakeups[worker].set()
+
+    def _run_drain_waves(self, members):
         """Run adjacent durable stages, yielding on pending I/O and cut limits."""
         for _ in range(8 if self.chain_drain else 1):
             if not members:

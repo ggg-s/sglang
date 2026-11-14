@@ -244,17 +244,10 @@ class MigrationController(DsvGateway):
             entry, request
         )
 
-    def _can_freeze(self, entry):
-        drain = self.journal["drain"]
-        if (
-            not drain
-            or not drain["active"]
-            or self._drain_abort_requested(entry["rid"])
-        ):
-            return False
+    def _active_cutovers(self, drain):
         entries = self.journal["entries"]
-        # A rollback can still hold a frozen source until all ranks resume.
-        cutovers = sum(
+        # Rollback can still hold a frozen source until all ranks resume.
+        return sum(
             entries[rid]["phase"] in CUTOVER_PHASES
             or (
                 entries[rid]["phase"] == "ROLLBACK"
@@ -262,12 +255,29 @@ class MigrationController(DsvGateway):
             )
             for rid in drain["members"]
         )
-        return cutovers < self.max_concurrent_migrations
+
+    def _can_freeze(self, entry):
+        drain = self.journal["drain"]
+        return bool(
+            drain
+            and drain["active"]
+            and drain.get("abort_requested_at") is None
+            and entry["rid"] in drain["members"]
+            and self._active_cutovers(drain) < self.max_concurrent_migrations
+        )
 
     def drain_status(self):
         with self.cv:
+            status = super().drain_status()
+            drain = self.journal["drain"]
             return {
-                **super().drain_status(),
+                **status,
+                "active_cutovers": self._active_cutovers(drain) if drain else 0,
+                "controller_features": {
+                    "event_driven_reconcile": self.event_driven_reconcile,
+                    "worker_status_snapshots": self.worker_status_snapshots,
+                    "chain_drain": self.chain_drain,
+                },
                 "migration_limits": {
                     "preparing": self.max_preparing_migrations,
                     "cutover": self.max_concurrent_migrations,

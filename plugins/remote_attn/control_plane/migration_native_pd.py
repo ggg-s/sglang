@@ -126,6 +126,7 @@ class NativePdController(MigrationController):
             Path(smg_admin_token_file) if smg_admin_token_file else None
         )
         self.cordon_error = None
+        self.cordon_wakeup = threading.Event()
         self.cordon_watchdog = None
         super().__init__(
             *args, decode_workers=decode_workers, autostart=autostart, **kwargs
@@ -140,6 +141,7 @@ class NativePdController(MigrationController):
 
     def close(self):
         self.stop.set()
+        self.cordon_wakeup.set()
         if self.cordon_watchdog is not None:
             self.cordon_watchdog.join(timeout=5)
             if self.cordon_watchdog.is_alive():
@@ -232,6 +234,7 @@ class NativePdController(MigrationController):
             )
             self._publish_journal(native_cordon=cordon)
             self.cordon_error = None
+            self.cordon_wakeup.set()
             return self.drain_status()
 
     def _cordon_deadline(self, pending):
@@ -364,8 +367,11 @@ class NativePdController(MigrationController):
 
     def _poll_routing(self):
         while not self.stop.is_set():
+            self.cordon_wakeup.clear()
+            if self.stop.is_set():
+                return
             self._reconcile_cordon()
-            self.stop.wait(0.05 if self.journal.get("native_cordon") else 0.25)
+            self.cordon_wakeup.wait(0.05 if self.journal.get("native_cordon") else 0.25)
 
 
 def parse_completion(body, model, vocab_size):
