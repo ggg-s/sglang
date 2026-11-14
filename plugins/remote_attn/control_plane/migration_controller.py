@@ -277,6 +277,10 @@ class MigrationController(DsvGateway):
                     worker: reads.copy()
                     for worker, reads in self.worker_status_reads.items()
                 },
+                "worker_snapshot_sample_ms": {
+                    worker: sample.copy()
+                    for worker, sample in self.worker_snapshot_sample_ms.items()
+                },
                 "control_wave_sizes": {
                     worker: sizes.copy()
                     for worker, sizes in self.control_wave_sizes.items()

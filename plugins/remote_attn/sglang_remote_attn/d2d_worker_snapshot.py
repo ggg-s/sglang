@@ -70,6 +70,7 @@ def sample(scheduler):
         sampled_at = time.time()
         # The writer never touches request objects, allocators or TP groups.
         status = dsv_gateway_control.worker_status(controller, advisory=True)
+        status["sample_ms"] = (time.monotonic() - now) * 1000
         publisher = getattr(scheduler, "_d2d_status_publisher", None)
         if publisher is None:
             publisher = scheduler._d2d_status_publisher = Publisher(

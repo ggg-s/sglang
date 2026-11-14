@@ -459,6 +459,7 @@ class Source:
             catalog=catalog,
             capacity=capacity,
             rdma_capacity=rdma_capacity,
+            gpu_send_pool=getattr(self.owner, "_d2d_gpu_send_pool", None),
         )
         hub = remote.runtime().get_remote_hub(s)
         isolated = hub.prepare_d2d_bulk()

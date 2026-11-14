@@ -1407,14 +1407,25 @@ def initialize(scheduler):
             getattr(controller, "dsv41_remote", False)
             and os.environ.get("HANDOFF_D2D_WARM_TRANSPORT") == "1"
         ):
+            from .d2d_bulk import GpuSendPool
             from .dsv_d2d import bulk_catalog, on_device, pool_device
+            from .mooncake_backend import GPU
 
             # All D ranks can become a source. Initialize reusable transport
             # resources before requests can reach a freeze boundary.
             device = pool_device(controller)
             with on_device(device):
-                controller._d2d_bulk_catalog = bulk_catalog(controller, device)
+                catalog = controller._d2d_bulk_catalog = bulk_catalog(controller, device)
                 hub.prepare_d2d_bulk()
+                slots = int(os.environ.get("HANDOFF_D2D_WARM_RDMA_SLOTS", "2"))
+                if not 0 <= slots <= 4:
+                    raise ValueError("HANDOFF_D2D_WARM_RDMA_SLOTS must be between 0 and 4")
+                if slots and GPU in catalog.engines:
+                    pool = controller._d2d_gpu_send_pool = GpuSendPool()
+                    try:
+                        pool.prewarm(catalog.engines[GPU], device, slots)
+                    except RuntimeError:
+                        logger.warning("Could not prewarm all D2D RDMA slots", exc_info=True)
 
 
 def run_batch(original, scheduler, batch, *args, **kwargs):
@@ -1650,6 +1661,9 @@ def shutdown(scheduler):
         from .dsv_d2d import drain_sources
 
         drain_sources(controller)
+    pool = getattr(controller, "_d2d_gpu_send_pool", None)
+    if pool is not None:
+        pool.close()
     for source in controller.sources:
         if source.thread is not None:
             source.thread.join(timeout=controller.config.drain_timeout)

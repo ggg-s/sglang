@@ -124,7 +124,9 @@ curl -fsS http://127.0.0.1:31118/health
 
 在隔离的 3P3D 池上使用同一批引擎、输入 ID 文件和预热。每轮使用独立的控制器状态目录，上一轮 SSE 全部结束后再重启测试控制器和 SMG。测试 SMG 在上面的命令中加入 `--prefill-policy round_robin --decode-policy round_robin --disable-retries`，并将 `--health-failure-threshold` 设为 `1`。测量批次从三个 Decode 均健康开始，期间只发送本轮基准请求。
 
-先跑四条长请求全迁，设置 `natural_ms=0`、`precopy_ms=0`，分别跑 `k=1/2/4`。再跑长短混跑，设置 `natural_ms=300`，对选定的 `k` 分别跑 `precopy_ms=0/400`。每轮在终端一启动控制器，记下打印的状态目录。
+先跑四条长请求全迁，设置 `natural_ms=0`、`precopy_ms=0`，分别跑 `k=1/2/4`。再跑长短混跑，设置 `natural_ms=300`，对选定的 `k` 分别跑 `precopy_ms=0/400`。每轮在终端一启动控制器，记下打印的状态目录。用
+`plugins/remote_attn/deploy/run_native_pd_d2d.sh decode` 包装各 Decode 的原启动命令，
+与控制器使用同一个 `D2D_PROFILE`。默认 `optimized`，A/B 对照设置 `baseline`。
 
 ```bash
 mode=all-long
@@ -137,7 +139,7 @@ state_dir=$(mktemp -d "/pool/state/native-pd-${variant}.XXXXXX")
 echo "$state_dir"
 jq --arg state_dir "$state_dir" '.state_dir = $state_dir' \
   /pool/pool-native-pd.json > "$state_dir/config.json"
-python plugins/remote_attn/control_plane/migration_controller.py \
+plugins/remote_attn/deploy/run_native_pd_d2d.sh controller \
   --config "$state_dir/config.json" \
   --host 127.0.0.1 --admin-port 31081 \
   --max-concurrent-migrations "$k" --max-preparing-migrations "$k" \

@@ -145,6 +145,60 @@ class Registered:
         pass
 
 
+class GpuSendBuffer(Registered):
+    """An RDMA staging allocation that never exposes its address to peers."""
+
+    def __init__(self, engine, device, capacity):
+        from types import SimpleNamespace
+
+        super().__init__(engine, SimpleNamespace())
+        self.stream = None
+        try:
+            self.tensor = torch.empty(
+                capacity + FOOTER, dtype=torch.uint8, device=device
+            )
+            dp.event(device).synchronize()
+            self.stream = torch.cuda.Stream(device=device)
+            self.register()
+        except BaseException:
+            if not self.registered:
+                self.close()
+            raise
+
+    def drain(self):
+        if self.stream is not None:
+            self.stream.synchronize()
+
+
+class GpuSendPool:
+    def __init__(self):
+        self.lock = threading.Lock()
+        self.available = []
+        self.closed = False
+
+    def prewarm(self, engine, device, count):
+        for _ in range(count):
+            self.available.append(GpuSendBuffer(engine, device, RDMA_CAPACITY))
+
+    def acquire(self):
+        with self.lock:
+            return self.available.pop() if self.available else None
+
+    def release(self, buffer):
+        with self.lock:
+            if not self.closed:
+                self.available.append(buffer)
+                return
+        buffer.close()
+
+    def close(self):
+        with self.lock:
+            self.closed = True
+            buffers, self.available = self.available, []
+        for buffer in buffers:
+            buffer.close()
+
+
 class Sender(Registered):
     def __init__(
         self,
@@ -154,7 +208,8 @@ class Sender(Registered):
         catalog=None,
         *,
         capacity=CAPACITY,
-        rdma_capacity=None
+        rdma_capacity=None,
+        gpu_send_pool=None,
     ):
         self.capacity = frame_capacity(capacity)
         self.rdma_capacity = (
@@ -164,6 +219,9 @@ class Sender(Registered):
         )
         super().__init__(engine, req)
         self.catalog = catalog
+        self.gpu_send_pool = gpu_send_pool
+        self.gpu_buffer = None
+        self.prewarmed = False
         self.device = torch.device(device)
         self.backend = None
         self.stream = None
@@ -191,6 +249,13 @@ class Sender(Registered):
         self.backend = backend
         try:
             if backend == transport.GPU:
+                if self.gpu_send_pool is not None:
+                    self.gpu_buffer = self.gpu_send_pool.acquire()
+                if self.gpu_buffer is not None:
+                    self.tensor = self.gpu_buffer.tensor
+                    self.stream = self.gpu_buffer.stream
+                    self.prewarmed = True
+                    return
                 self.tensor = torch.empty(
                     self.rdma_capacity + FOOTER, dtype=torch.uint8, device=self.device
                 )
@@ -290,6 +355,11 @@ class Sender(Registered):
                 raise
         return size
 
+    def poison(self):
+        if self.gpu_buffer is not None:
+            self.gpu_buffer.unsafe = True
+        super().poison()
+
     def drain(self):
         if self.stream is not None:
             self.stream.synchronize()
@@ -297,6 +367,12 @@ class Sender(Registered):
             self.slot.stream.synchronize()
 
     def dispose(self):
+        if self.gpu_buffer is not None:
+            # Registered.close already fenced the copy stream. A failed or
+            # ambiguous write poisons this Sender, so it never returns the slot.
+            self.gpu_send_pool.release(self.gpu_buffer)
+            self.gpu_buffer = None
+            self.stream = None
         if self.slot is not None:
             self.slot.close()
             self.slot = None

@@ -136,7 +136,23 @@ RPC。同一份快照反复读到也不会续期。按请求找终态和 drain �
 | A | `--event-driven-reconcile --worker-status-snapshots` | `HANDOFF_D2D_STATUS_SNAPSHOT=1 HANDOFF_D2D_WARM_TRANSPORT=0` |
 | B | 与 A 相同，加 `--chain-drain` | `HANDOFF_D2D_STATUS_SNAPSHOT=1 HANDOFF_D2D_WARM_TRANSPORT=1` |
 
-两组都用 `--out`。需要定位收益时，再单跑 B 关闭预热，与 A、B 分别比较。
+仓库启动入口默认是 `optimized`。把现有 Decode 启动命令完整放在 `decode`
+之后，把现有控制器参数放在 `controller` 之后。A/B 分别设置
+`D2D_PROFILE=baseline` / `optimized`。
+
+```bash
+export D2D_PROFILE=optimized
+launch=plugins/remote_attn/deploy/run_native_pd_d2d.sh
+# 在各 Decode 的原启动命令前加 "$launch" decode。
+"$launch" controller --config "$POOL_CONFIG" \
+  --max-preparing-migrations 4 --max-concurrent-migrations 2 \
+  --natural-drain-ms "$NATURAL_MS" --precopy-window-ms "$PRECOPY_MS" \
+  --out "$RUN_DIR/handoff.jsonl"
+```
+
+`optimized` 默认每 rank 预注册 2 个 64 MiB RDMA 源端发送槽。
+`HANDOFF_D2D_WARM_RDMA_SLOTS=0` 保留 catalog 和 worker 预热，关闭发送槽预注册。
+两组都用 `--out`。
 都用同一个 admin 请求触发迁移。
 
 ```bash
@@ -161,6 +177,9 @@ curl -fsS "$ADMIN/v1/drain/status" | jq '{
 - 按 epoch 对照 `d2d_reconcile.phase_wait_ms` 和
   `d2d_control_slot.{slot_wait_ms,worker_publish_to_claim_ms,worker_exec_ms,worker_tp_confirm_ms}`。
   发给同一 worker 的 wave envelope 只计一次。
-- 预热覆盖 rank 级传输能力及可复用的 bulk worker/stream。请求级缓冲区注册、
-  路由 attach 和实际数据传输仍在原路径。原始 A/B 两组均在 Import 成功后先写
-  journal，再执行 COMMIT。
+- `rdma_sender_prewarmed_ranks` 记录实际命中预热发送槽的源端 rank 数。
+  预注册槽耗尽时沿用按需分配。目的端接收槽注册、路由 attach 和实际 peer 写入
+  仍依赖每次迁移。两组均在 Import 成功后先写 journal，再执行 COMMIT。
+- `worker_snapshot_sample_ms` 记录控制器接收到的每份快照的 TP 最大采样耗时。
+  快照丢失时对 drain 两端的全量状态回退 RPC 按最近成功状态节流到约 100 ms，
+  首次建立身份、终态查证和 idle 正证仍用 RPC。

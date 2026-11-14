@@ -15646,6 +15646,55 @@ class TestRemoteAttn(CustomTestCase):
             self.assertNotEqual(old, b.config.directory)
             self.assertTrue((directory / "control/P0/instance.lock").exists())
 
+    def test_dsv_d2d_reuses_only_drained_prewarmed_send_buffers(self):
+        from contextlib import nullcontext
+        from unittest.mock import Mock
+
+        from sglang_remote_attn import d2d_bulk as bulk
+        from sglang_remote_attn import dsv_d2d as d2d
+        from sglang_remote_attn import mooncake_backend as transport
+
+        engine = d2d.manager(self._d2d_env().source).engine
+        pool = bulk.GpuSendPool()
+        self.addCleanup(pool.close)
+        catalog = SimpleNamespace(engines={transport.GPU: engine})
+        stream = Mock()
+        with (
+            patch.object(torch.cuda, "Stream", return_value=stream),
+            patch.object(torch.cuda, "stream", return_value=nullcontext()),
+        ):
+            pool.prewarm(engine, "cpu", 1)
+            sender = bulk.Sender(
+                engine, SimpleNamespace(), "cpu", catalog=catalog, gpu_send_pool=pool
+            )
+            sender.configure(transport.GPU)
+            buffer = sender.gpu_buffer
+            self.assertIsNotNone(buffer)
+            sender.close()
+            stream.synchronize.assert_called_once()
+
+            failed_req = SimpleNamespace()
+            sender = bulk.Sender(
+                engine, failed_req, "cpu", catalog=catalog, gpu_send_pool=pool
+            )
+            sender.configure(transport.GPU)
+            self.assertIs(sender.gpu_buffer, buffer)
+            receiver = bulk.Receiver(
+                engine, SimpleNamespace(), "cpu", capacity=bulk.LEGACY_CAPACITY
+            )
+            self.addCleanup(receiver.close)
+            region = dict(receiver.prepare(), protocol=transport.GPU)
+            with patch.object(transport.handle(engine), "batch_transfer_sync", return_value=-1):
+                with self.assertRaisesRegex(RuntimeError, "completion is unknown"):
+                    sender.write(torch.zeros(1, dtype=torch.uint8), sender.stream, region, 1)
+            self.assertTrue(failed_req._d2d_bulk_unsafe)
+            with self.assertRaisesRegex(RuntimeError, "closed/quarantined"):
+                sender.close()
+
+        self.assertIsNone(pool.acquire())
+        self.assertTrue(buffer.registered)
+        self.assertTrue(buffer.unsafe)
+
     def test_dsv_d2d_bulk_uses_registered_mooncake_bytes_without_tcp_payload(self):
         from sglang_remote_attn import dsv_d2d as d2d
 

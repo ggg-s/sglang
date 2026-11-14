@@ -27,6 +27,8 @@ ACTIVE_MIGRATION_PHASES = PRECOMMIT | {"COMMIT", "ROLLBACK", "TARGET"}
 CUTOVER_PHASES = {"FREEZE", "IMPORT", "COMMIT"}
 STATUS_VISIBILITY_GRACE_S = 30
 DRAIN_FIRST_TOKEN_GRACE_S = 5
+HANDOFF_PENDING_RETRY_S = 0.25
+DRAIN_STATUS_FALLBACK_S = 0.10
 WORKER_SNAPSHOT_MAX_AGE_S = 0.25
 WORKER_TIMINGS = (
     "publish_to_claim_ms",
@@ -83,6 +85,7 @@ def handoff_timing(entry):
         (b - a) * 1000 if a is not None and b is not None and b >= a else None
     )
     timing.update(entry.get("source_setup_timing") or {})
+    timing["rdma_sender_prewarmed_ranks"] = entry.get("rdma_sender_prewarmed_ranks")
     admitted = timing["target_admitted_at"]
     for marker in (
         "dst_copy_observed_at", "dst_local_observed_at", "src_release_observed_at"
@@ -259,13 +262,16 @@ class DsvGateway:
         self.reconcile_pending = {}
         self.active_rids = {}  # Ordered live journal IDs, updated after persist.
         self.phase_ready = {}
+        self.pending_handoff_retries = {}
         self.facts, self.fact_errors = {}, {}
         self.facts_at = {}
         self.worker_status_snapshots = worker_status_snapshots
         self.worker_snapshot_versions = {}
         self.worker_status_sampled_at = {}
         self.worker_status_reads = {}
+        self.worker_snapshot_sample_ms = {}
         self.source_idle_rpc = None
+        self.status_wakeups = {role: threading.Event() for role in self.control_workers}
         self.connections = set()
         self.role_locks = {role: threading.Lock() for role in self.control_workers}
         self.command_waiters = dict.fromkeys(self.control_workers, 0)
@@ -395,6 +401,8 @@ class DsvGateway:
             return
         self.stop.set()
         self.reconcile_wakeup.set()
+        for wakeup in self.status_wakeups.values():
+            wakeup.set()
         if self.thread is not None:
             self.thread.join(timeout=5)
             if self.thread.is_alive():
@@ -466,6 +474,15 @@ class DsvGateway:
                 raise
             entry = self.journal["entries"][rid]
             phase = entry["phase"]
+            if phase != old["phase"]:
+                self.pending_handoff_retries.pop(rid, None)
+                drain = self.journal["drain"]
+                if (
+                    self.worker_status_snapshots
+                    and phase in TERMINAL | {"LOCAL"}
+                    and drain and drain["active"] and rid in drain["members"]
+                ):
+                    self.status_wakeups[drain.get("src", "src")].set()
             if phase in TERMINAL:
                 self.active_rids.pop(rid, None)
                 self.reconcile_pending.pop(rid, None)
@@ -894,7 +911,9 @@ class DsvGateway:
         if not self.event_driven_reconcile:
             return
         for rid in self.active_rids:
-            entry = self.journal["entries"][rid]
+            entry = self.journal["entries"].get(rid)
+            if entry is None:
+                continue
             for role in entry["instances"]:
                 if self._worker(entry, role) != worker:
                     continue
@@ -969,6 +988,17 @@ class DsvGateway:
         try:
             snapshot = self._read_worker_snapshots(role)
             if snapshot is None:
+                with self.lock:
+                    drain = self.journal["drain"] or {}
+                    if (
+                        self.worker_status_snapshots
+                        and drain.get("active")
+                        and role in (drain.get("src"), drain.get("dst"))
+                        and role not in self.fact_errors
+                        and time.monotonic() - self.facts_at.get(role, float("-inf"))
+                        < DRAIN_STATUS_FALLBACK_S
+                    ):
+                        return
                 versions = None
                 rows = self._call(role, "d2d_worker_status")
                 sampled_at = time.time()
@@ -990,6 +1020,18 @@ class DsvGateway:
                     if expected is not None and [r["instance_id"] for r in rows] != expected:
                         raise RuntimeError(f"{role} restarted during migration")
                 if self.worker_status_snapshots:
+                    # The fallback RPC is also a live idle proof. It can be
+                    # reused once the last journal member finishes reconciling.
+                    if (
+                        versions is None
+                        and drain and drain["active"]
+                        and role == drain.get("src", "src")
+                        and all(row.get("idle") is True for row in rows)
+                    ):
+                        self.source_idle_rpc = (
+                            role, drain["id"], tuple(r["instance_id"] for r in rows),
+                            time.monotonic(),
+                        )
                     previous_versions = self.worker_snapshot_versions.get(role)
                     if versions is not None and (
                         sampled_at < self.worker_status_sampled_at.get(role, 0)
@@ -1006,6 +1048,12 @@ class DsvGateway:
                         return  # Rereading a file never renews freshness.
                     self.worker_status_sampled_at[role] = sampled_at
                     self.worker_snapshot_versions[role] = versions
+                    if all(r.get("sample_ms") is not None for r in rows):
+                        self._observe(
+                            self.worker_snapshot_sample_ms,
+                            role,
+                            max(r["sample_ms"] for r in rows),
+                        )
                 previous = self.facts.get(role, ()) if role not in self.fact_errors else ()
                 if (
                     self.source_idle_rpc is not None
@@ -1059,7 +1107,9 @@ class DsvGateway:
             if self._has_source_idle_confirmation(source, drain_id):
                 return
         try:
-            rows = self._call(source, "d2d_worker_status", expected_instances=expected)
+            rows = self._call(
+                source, "d2d_worker_status", expected_instances=expected, idle_only=True
+            )
             self._check_worker(rows)
         except (StatusBusy, OSError, RuntimeError):
             return
@@ -1086,11 +1136,15 @@ class DsvGateway:
         )
 
     def _poll_role(self, role):
+        wakeup = self.status_wakeups[role]
         while not self.stop.is_set():
+            wakeup.clear()
+            if self.worker_status_snapshots:
+                self._confirm_drained_source(role)
             self._refresh_role(role)
             if self.worker_status_snapshots:
                 self._confirm_drained_source(role)
-            self.stop.wait(self.poll_s)
+            wakeup.wait(self.poll_s)
 
     def _refresh(self):
         for role in self.control_workers:
@@ -1159,7 +1213,7 @@ class DsvGateway:
             error=next((r.get("error") for r in rows if r.get("error")), None),
         )
 
-    def _retired_request(self, entry):
+    def _lookup_request(self, entry, *, include_live=False):
         role = entry["owner"]
         facts = self.facts.get(self._worker(entry, role), ())
         if not facts or not all(r.get("terminal_request_lookup_supported") for r in facts):
@@ -1171,11 +1225,14 @@ class DsvGateway:
             entry["submission_epoch"],
             request_rid=native_rid,
             expected_instances=entry["instances"][role],
+            **({"include_live": True} if include_live else {}),
         )
         if len(rows) != len(entry["instances"][role]):
             raise RuntimeError("terminal lookup returned an incomplete TP response")
         result = self._request_from_ranks([row.get("request") for row in rows])
-        if result and result["finished"] and result["kv_released"] and not result["error"]:
+        if result and not result["error"] and (
+            include_live or result["finished"] and result["kv_released"]
+        ):
             return result
         return None
 
@@ -1326,9 +1383,11 @@ class DsvGateway:
             freeze_pending=False,
             source_partial_remote=False,
             prepare_started_at=time.time(),
+            wait_cut_started_at=None,
             freeze_requested_at=None,
             freeze_descriptor_ready_at=None,
             source_setup_timing=None,
+            rdma_sender_prewarmed_ranks=None,
             import_ready_at=None,
             target_admitted_at=None,
             dst_first_token_observed_at=None,
@@ -1720,6 +1779,25 @@ class DsvGateway:
             and rid in drain["members"]
         )
 
+    def _handoff_pending(self, entry, targets, sampled_at, key):
+        now = time.monotonic()
+        if now - sampled_at < HANDOFF_PENDING_RETRY_S and any(
+            target and target.get(key) for target in targets
+        ):
+            return True
+        retry = self.pending_handoff_retries.get(entry["rid"])
+        if retry is None or now >= retry[0]:
+            return False
+        return not (
+            sampled_at > retry[1]
+            and targets
+            and all(
+                target and target.get(key) is False
+                and (key != "commit_pending" or target.get("commit_started"))
+                for target in targets
+            )
+        )
+
     def _advance(self, entry):
         rid, phase = entry["rid"], entry["phase"]
         if phase in PRECOMMIT and self._drain_abort_requested(rid):
@@ -1770,7 +1848,8 @@ class DsvGateway:
         ):
             raise RuntimeError(request["error"])
         if request is None and (
-            phase == "SUBMIT" and entry.get("submit_started")
+            phase == "WAIT_CUT"
+            or phase == "SUBMIT" and entry.get("submit_started")
             or phase in {"SOURCE", "DIRECT"}
             and (
                 entry.get("request_seen")
@@ -1779,7 +1858,7 @@ class DsvGateway:
             )
         ):
             try:
-                request = self._retired_request(entry)
+                request = self._lookup_request(entry, include_live=phase == "WAIT_CUT")
             except (StatusBusy, BlockingIOError, TimeoutError):
                 # A contended advisory lookup does not prove that a submitted
                 # request is missing. Leave the current intent for another tick.
@@ -2137,14 +2216,19 @@ class DsvGateway:
             )
         elif phase == "IMPORT":
             async_handoff = self._async_handoff(entry)
-            targets = [r.get("target") for r in self._states(entry, "dst")]
-            if async_handoff and any(t and t.get("import_pending") for t in targets):
+            with self.lock:
+                targets = [r.get("target") for r in self._states(entry, "dst")]
+                sampled_at = self.facts_at.get(self._worker(entry, "dst"), 0)
+            if async_handoff and self._handoff_pending(
+                entry, targets, sampled_at, "import_pending"
+            ):
                 return
             payload = (
                 {}
                 if async_handoff and targets and all(targets)
                 else {"transfers": entry["transfers"]}
             )
+            submitted_after = time.monotonic()
             rows = (yield self._command(
                 "dst",
                 "d2d_import",
@@ -2158,6 +2242,9 @@ class DsvGateway:
             if any(r.get("import_pending") for r in rows):
                 if not all(r.get("import_pending") for r in rows):
                     raise RuntimeError("TP import readiness disagreed")
+                self.pending_handoff_retries[rid] = (
+                    time.monotonic() + HANDOFF_PENDING_RETRY_S, submitted_after
+                )
                 return
             if not all(r.get("imported") for r in rows):
                 raise RuntimeError("D2D target did not confirm import")
@@ -2175,13 +2262,17 @@ class DsvGateway:
         elif phase == "COMMIT":
             # A timeout, partial TP commit or gateway crash can never send us
             # back to SOURCE. The per-rank backend commit is idempotent.
-            if self.background and any(
-                (r.get("target") or {}).get("commit_pending")
-                for r in self._states(entry, "dst")
-            ):
+            with self.lock:
+                targets = [r.get("target") for r in self._states(entry, "dst")]
+                sampled_at = self.facts_at.get(self._worker(entry, "dst"), 0)
+            if self._handoff_pending(entry, targets, sampled_at, "commit_pending"):
                 return
+            submitted_after = time.monotonic()
             rows = (yield self._command("dst", "d2d_commit", epoch))
             if all(r.get("commit_pending") for r in rows):
+                self.pending_handoff_retries[rid] = (
+                    time.monotonic() + HANDOFF_PENDING_RETRY_S, submitted_after
+                )
                 return
             if not all(r.get("admitted") and r.get("source_confirmed") for r in rows):
                 raise RuntimeError("TP commit not yet confirmed; keeping commit intent")
@@ -2285,6 +2376,10 @@ class DsvGateway:
                 )
                 if seen and entry.get(marker) is None
             }
+            if released and all("rdma_sender_prewarmed" in s for s in sources):
+                count = sum(s["rdma_sender_prewarmed"] for s in sources)
+                if entry.get("rdma_sender_prewarmed_ranks") != count:
+                    updates["rdma_sender_prewarmed_ranks"] = count
             if local and released:
                 if request["finished"] and request["kv_released"]:
                     updates.update(

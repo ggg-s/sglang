@@ -51,7 +51,11 @@ class WorkerTransport:
         if cmd == "d2d_worker_status":
             if "request_rid" in payload:
                 assert payload["expected_instances"] == [worker]
-                return dict(request=self.retired.get((worker, epoch, payload["request_rid"])))
+                rid = payload["request_rid"]
+                return dict(
+                    request=self.retired.get((worker, epoch, rid))
+                    or (requests.get(rid) if payload.get("include_live") else None)
+                )
             return dict(
                 protocol="dsv-d2d-v2",
                 rank=0,
@@ -410,12 +414,13 @@ class TestDsvMigrationController(CustomTestCase):
         self.controller = self.open_controller(
             standby=("D1", "D2"),
             max_concurrent_migrations=2,
-            max_preparing_migrations=2,
+            max_preparing_migrations=4,
+            chain_drain=True,
             precopy_window_ms=400,
         )
         rids = [
             self.controller.accept({"prompt_ids": [0], "max_new_tokens": 12})
-            for _ in range(5)
+            for _ in range(7)
         ]
         self.ticks(2)
 
@@ -426,11 +431,15 @@ class TestDsvMigrationController(CustomTestCase):
                 if (entry := self.controller.entry(rid))["phase"] == phase
             ]
 
-        with patch.object(time, "time", return_value=time.time()) as clock:
+        now = time.monotonic()
+        with (
+            patch.object(time, "time", return_value=time.time()) as clock,
+            patch.object(time, "monotonic", return_value=now) as monotonic,
+        ):
             self.controller.start_named_drain("D0", "D1")
             self.ticks()
             preparing = entries_in("WAIT_CUT")
-            self.assertEqual(len(preparing), 2)
+            self.assertEqual(len(preparing), 4)
             self.assertEqual(len(entries_in("SOURCE")), 3)
             self.assertTrue(all(entry["precopy_bytes"] == 128 for entry in preparing))
 
@@ -438,7 +447,7 @@ class TestDsvMigrationController(CustomTestCase):
             self.ticks()
             self.assertEqual(len(entries_in("IMPORT")), 2)
             queued = entries_in("WAIT_CUT")
-            self.assertEqual(len(queued), 2)
+            self.assertEqual(len(queued), 4)
             self.assertTrue(all(entry["precopy_bytes"] == 128 for entry in queued))
 
             clock.return_value = queued[0]["precopy_until"]
@@ -448,8 +457,8 @@ class TestDsvMigrationController(CustomTestCase):
                 [entry["rid"] for entry in entries_in("WAIT_CUT")],
                 [entry["rid"] for entry in queued],
             )
-            self.assertTrue(
-                all(
+            self.assertFalse(
+                any(
                     item["cmd"] == "d2d_import"
                     for _, wave in self.driver.waves
                     for item in wave
@@ -457,9 +466,13 @@ class TestDsvMigrationController(CustomTestCase):
             )
 
             self.driver.import_ready = True
-            self.ticks()
+            # No new readiness facts from this worker: periodic recovery retries.
+            for _ in range(8):
+                monotonic.return_value += 0.30
+                clock.return_value += 0.30
+                self.ticks()
             targets = entries_in("TARGET")
-            self.assertEqual(len(targets), 4)
+            self.assertEqual(len(targets), 6)
             self.assertEqual(len(entries_in("SOURCE")), 1)
             self.assertEqual(self.controller.drain_status()["state"], "MIGRATING")
             self.driver.release(targets[0]["epoch"])
@@ -479,6 +492,20 @@ class TestDsvMigrationController(CustomTestCase):
         self.assertEqual(entry["phase"], "WAIT_CUT")
         move_epoch = entry["epoch"]
         source_rid = entry["source_rid"]
+        # An advisory status omission must not discard a live reservation.
+        request = self.driver.requests["D0"][source_rid]
+        request["output_ids"] = []
+        send_to = self.driver.send_to
+
+        def omitted_from_status(directory, worker, payload, timeout):
+            reply = send_to(directory, worker, payload, timeout)
+            if worker == "D0" and "requests" in reply:
+                reply["requests"].pop(source_rid, None)
+            return reply
+
+        with patch.object(self.driver, "send_to", side_effect=omitted_from_status):
+            self.ticks(1)
+        self.assertEqual(controller.entry(rid)["phase"], "WAIT_CUT")
         self.driver.requests["D0"].pop(source_rid)
         self.driver.retired["D0", entry["submission_epoch"], source_rid] = (
             self.driver.request([1, 2, 3, 4], finished=True)

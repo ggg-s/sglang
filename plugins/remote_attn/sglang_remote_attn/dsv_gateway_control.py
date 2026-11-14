@@ -48,7 +48,7 @@ def migration_status(controller, epoch, *, include_transfer=True, diagnostics=Tr
     sources, targets = d2d.records(controller)
     source, target = sources.get(epoch), targets.get(epoch)
     return dict(
-        reservation=reservations.status(controller, epoch),
+        reservation=reservations.status(controller, epoch) if diagnostics else None,
         precopy_unsafe=bool(getattr(controller, "d2d_precopy_unsafe", False)),
         source_cancelled=epoch
         in getattr(controller, "d2d_source_cancelled_epochs", ()),
@@ -68,6 +68,9 @@ def migration_status(controller, epoch, *, include_transfer=True, diagnostics=Tr
                 else max(0, (source.released_at - source.frozen_at) * 1000)
             ),
             postfreeze_bytes=source.postfreeze_bytes,
+            rdma_sender_prewarmed=getattr(
+                getattr(source, "bulk_sender", None), "prewarmed", False
+            ),
             resumed=source.released and not source.committed,
             error=source.error,
             kv_released=not source.req.kv.holds_kv,
@@ -87,6 +90,7 @@ def migration_status(controller, epoch, *, include_transfer=True, diagnostics=Tr
             import_pending=(
                 target.setup_worker is not None and target.setup_worker.is_alive()
             ),
+            commit_started=target.commit_started,
             commit_pending=(
                 target.commit_worker is not None and target.commit_worker.is_alive()
             ),
@@ -148,9 +152,14 @@ def worker_status(controller, *, advisory=False):
 
     sources, targets = d2d.records(controller)
     _, tickets = reservations.records(controller)
-    epochs = set(sources) | set(targets) | set(tickets)
-    epochs.update(getattr(controller, "d2d_cancelled_epochs", ()))
-    epochs.update(getattr(controller, "d2d_source_cancelled_epochs", ()))
+    if advisory:
+        # Controller reconciliation only consumes source/target progress.
+        # Reservation history and tombstones remain available through live RPC.
+        epochs = sources.keys() | targets.keys()
+    else:
+        epochs = sources.keys() | targets.keys() | tickets.keys()
+        epochs.update(getattr(controller, "d2d_cancelled_epochs", ()))
+        epochs.update(getattr(controller, "d2d_source_cancelled_epochs", ()))
     reqs = {req.rid: req for req in candidates(controller)}
     reqs.update((s.req.rid, s.req) for s in sources.values())
     reqs.update((t.decode_req.req.rid, t.decode_req.req) for t in targets.values())
@@ -186,13 +195,28 @@ def handle(controller, data):
     scheduler, cmd = controller.scheduler, data["cmd"]
     epoch = data["migration_epoch"]
     if cmd == "d2d_worker_status":
+        if data.get("idle_only") is True:
+            return dict(
+                idle=bool(scheduler.is_fully_idle()),
+                protocol=d2d.VERSION,
+                instance_id=instance(controller),
+                rank=controller.rank,
+                tp_size=controller.tp_size,
+            )
         if "request_rid" in data:
-            # The idempotent submission record outlives native queue/tracking
-            # membership, including when EOS falls between two status polls.
+            # Idempotent submissions outlive the native scheduler queues.
+            rid = data["request_rid"]
             req = getattr(controller, "d2d_submission_requests", {}).get(epoch)
-            if (
+            if data.get("include_live") is True:
+                if req is None or req.rid != rid:
+                    # A prior migration may have rebound a LOCAL request to
+                    # this worker without going through native PD submission.
+                    req = next((r for r in candidates(controller) if r.rid == rid), None)
+                if req is not None:
+                    return dict(request=request_status(controller, req))
+            elif (
                 req is not None
-                and req.rid == data["request_rid"]
+                and req.rid == rid
                 and req.finished()
                 and not req.kv.holds_kv
             ):
