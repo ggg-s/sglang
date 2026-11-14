@@ -122,3 +122,45 @@ RPC。同一份快照反复读到也不会续期。按请求找终态和 drain �
 迁移命令的 `slot_wait_ms` 和未迁请求 ITL。状态读取次数按每轮开始和结束的计数差比较。
 再看 `PLAN→FREEZE` 与 `activate_to_safe_to_stop_ms`。如果 RPC 频繁回退，先核对
 控制目录、各 rank 快照的采样时间和实例身份。该旁路依赖控制器和 worker 的墙钟同步。
+
+## H20 满载迁移 A/B
+
+两组用同一提交和同一套 SMG。保持 H20 拓扑、模型和 Mooncake 后端、SWE 24 条会话、
+8 用户、max_new=1024、打流 4 分钟后 D1→D2、压测种子和迁移配置一致。
+准备上限 4、切换上限 2，固定自然排空和 Pre-copy 窗口沿用现场参数。
+每轮用新的控制器 state 目录和日志，恢复 D1、D2 后再回放。两组均重启 Decode，
+避免对照组继承已初始化的传输资源。
+
+| | 控制器 | 每个 Decode 的进程环境 |
+|---|---|---|
+| A | `--event-driven-reconcile --worker-status-snapshots` | `HANDOFF_D2D_STATUS_SNAPSHOT=1 HANDOFF_D2D_WARM_TRANSPORT=0` |
+| B | 与 A 相同，加 `--chain-drain` | `HANDOFF_D2D_STATUS_SNAPSHOT=1 HANDOFF_D2D_WARM_TRANSPORT=1` |
+
+两组都用 `--out`。需要定位收益时，再单跑 B 关闭预热，与 A、B 分别比较。
+都用同一个 admin 请求触发迁移。
+
+```bash
+curl -fsS "$ADMIN/v1/drain" -H 'Content-Type: application/json' \
+  -d '{"src":"D1","dst":"D2"}'
+curl -fsS "$ADMIN/v1/drain/status" | jq '{
+  id, state, source_release_ms,
+  cordon_ms: (if .activated_at then 1000 * (.activated_at - .started_at) else null end),
+  members_state, migration_limits, control_wave_sizes
+}'
+```
+
+- 主指标用 `source_release_ms`（POST 接受至 SAFE_TO_STOP），另比较
+  `1000 * (source_released_at - activated_at)` 和摘流耗时。至少做 3 轮配对，
+  同时记每轮源端成员数、实际迁移数、源端自然完成数和回滚数。
+- SSE 记录请求成功率、完整终止、token 前缀连续性及客户端 ITL。
+  对已迁与未迁请求各报 p50/p95/p99、最大间隔和大于 300 ms 的次数。
+- `handoff_timing` 记录 `freeze_request_to_descriptor_ms`、
+  `descriptor_to_import_ms`、`import_to_target_ms`、`target_to_first_token_ms`。
+  `source_transport_setup_ms` 从传输能力选择计到批量传输 worker/stream 就绪，
+  `source_route_publish_ms` 记录请求路由注册，用各 TP rank 最大值。
+- 按 epoch 对照 `d2d_reconcile.phase_wait_ms` 和
+  `d2d_control_slot.{slot_wait_ms,worker_publish_to_claim_ms,worker_exec_ms,worker_tp_confirm_ms}`。
+  发给同一 worker 的 wave envelope 只计一次。
+- 预热覆盖 rank 级传输能力及可复用的 bulk worker/stream。请求级缓冲区注册、
+  路由 attach 和实际数据传输仍在原路径。原始 A/B 两组均在 Import 成功后先写
+  journal，再执行 COMMIT。

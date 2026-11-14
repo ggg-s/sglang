@@ -333,6 +333,32 @@ class TestDsvMigrationController(CustomTestCase):
             ["LOCAL", "TARGET"],
         )
 
+    def test_chained_drain_keeps_prefill_member_without_holding_a_slot(self):
+        self.controller.close()
+        self.driver.wave_supported = True
+        self.controller = self.open_controller(standby=("D1", "D2"), chain_drain=True)
+        controller = self.controller
+        prefill, decoding = [
+            controller.accept({"prompt_ids": [0], "max_new_tokens": 12})
+            for _ in range(2)
+        ]
+        self.ticks(2)
+        request = controller.entry(prefill)["source_rid"]
+        self.driver.requests["D0"][request] = self.driver.request([])
+        controller.start_named_drain("D0", "D1")
+        with patch("p4_dsv_gateway.time.monotonic", return_value=time.monotonic()):
+            controller.tick()
+        self.assertEqual(controller.entry(prefill)["phase"], "SOURCE")
+        self.assertIsNone(controller.entry(prefill)["epoch"])
+        self.assertEqual(controller.entry(decoding)["phase"], "TARGET")
+        self.assertCountEqual(controller.drain_status()["members"], [prefill, decoding])
+        self.assertNotEqual(controller.drain_status()["state"], "SAFE_TO_STOP")
+
+        self.driver.requests["D0"][request] = self.driver.request([1], finished=True)
+        self.ticks(2)
+        self.assertEqual(controller.drain_status()["state"], "SAFE_TO_STOP")
+        self.assertEqual(controller.entry(prefill)["final_output_ids"], [1])
+
     def test_named_workers_batch_four_async_cutovers(self):
         self.controller.close()
         self.driver.wave_supported = True
@@ -499,6 +525,50 @@ class TestDsvMigrationController(CustomTestCase):
         self.assertTrue(finished)
         self.assertEqual([event["token_id"] for event in events], [3, 4])
         self.assertEqual(controller.finish_reason(rid, 4), "stop")
+
+    def test_wait_cut_without_first_token_rolls_back_and_frees_slot(self):
+        self.controller.close()
+        self.controller = self.open_controller(standby=("D1", "D2"))
+        controller = self.controller
+        rid, other = [
+            controller.accept({"prompt_ids": [0], "max_new_tokens": 12})
+            for _ in range(2)
+        ]
+        self.ticks(2)
+        controller.start_named_drain("D0", "D1")
+        self.ticks(3)
+        # Simulate a persisted WAIT_CUT from the older prefill admission path.
+        entry, other = next(
+            (controller.entry(candidate), alternate)
+            for candidate, alternate in ((rid, other), (other, rid))
+            if controller.entry(candidate)["phase"] == "WAIT_CUT"
+        )
+        self.driver.requests["D0"][entry["source_rid"]] = self.driver.request([])
+        controller._update(entry["rid"], wait_cut_started_at=time.time() - 6)
+        send_to = self.driver.send_to
+        cleanup = []
+
+        def send(directory, worker, payload, timeout):
+            cmd = payload["cmd"]
+            if payload["migration_epoch"] == entry["epoch"] and cmd in {
+                "d2d_precopy_close",
+                "d2d_abort",
+                "d2d_resume",
+            }:
+                cleanup.append(cmd)
+                return {
+                    "d2d_precopy_close": {"closed": True},
+                    "d2d_abort": {"aborted": True},
+                    "d2d_resume": {"resumed": True},
+                }[cmd]
+            return send_to(directory, worker, payload, timeout)
+
+        with patch.object(self.driver, "send_to", side_effect=send):
+            self.ticks(12)
+        self.assertEqual(cleanup, ["d2d_precopy_close", "d2d_abort", "d2d_resume"])
+        self.assertEqual(controller.entry(entry["rid"])["phase"], "SOURCE")
+        self.assertEqual(controller.entry(other)["migration_outcome"], "migrated")
+        self.assertNotEqual(controller.drain_status()["state"], "SAFE_TO_STOP")
 
     def test_finish_at_freeze_holds_slot_until_rollback_cleans_destination(self):
         """EOS after the status poll must finish on source before the next move."""
@@ -1016,8 +1086,28 @@ class TestNativePdDecode(CustomTestCase):
                 self.assertFalse(self.controller.decode_ready("D0"))
                 with patch.object(self.controller, "_smg_cordoned", return_value=True):
                     self.controller._reconcile_cordon()
-                for _ in range(12):
-                    await asyncio.to_thread(self.controller.tick)
+                send_to = self.driver.send_to
+
+                def lagging_commit(directory, worker, payload, timeout):
+                    reply = send_to(directory, worker, payload, timeout)
+                    if payload["cmd"] == "d2d_commit":
+                        move = self.driver.moves[payload["migration_epoch"]]
+                        self.driver.requests[worker][move["target_rid"]] = (
+                            self.driver.request([1], finished=True)
+                        )
+                    return reply
+
+                with patch.object(self.driver, "send_to", side_effect=lagging_commit):
+                    for _ in range(12):
+                        await asyncio.to_thread(self.controller.tick)
+                rid = next(iter(self.controller.drain_status()["members"]))
+                events, finished, reason = self.controller.stream_events(rid, after=1)
+                self.assertEqual((events, finished, reason), ([], False, None))
+                for rid_on_dst in self.driver.requests["D1"]:
+                    self.driver.requests["D1"][rid_on_dst] = self.driver.request(
+                        [1, 2, 3, 4]
+                    )
+                await asyncio.to_thread(self.controller.tick)
                 result = json.loads((await self.next_response(responses))["body"][6:])
                 if generate:
                     self.assertEqual(result["text"], "A中")

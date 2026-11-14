@@ -365,7 +365,7 @@ class NativePdController(MigrationController):
     def _poll_routing(self):
         while not self.stop.is_set():
             self._reconcile_cordon()
-            self.stop.wait(0.25)
+            self.stop.wait(0.05 if self.journal.get("native_cordon") else 0.25)
 
 
 def parse_completion(body, model, vocab_size):
@@ -595,11 +595,11 @@ class NativeDecodeApp:
             last_write = time.monotonic()
             while not controller.stop.is_set():
                 try:
-                    events, finished = await asyncio.to_thread(
-                        controller.events, rid, frames.cursor
+                    events, finished, reason = await asyncio.to_thread(
+                        controller.stream_events, rid, frames.cursor
                     )
                 except ConnectionError:
-                    events, finished = [], False
+                    events, finished, reason = [], False, None
                 if not started and not events and not finished:
                     entry = await asyncio.to_thread(
                         controller.entry, rid, copy_payloads=False
@@ -608,9 +608,6 @@ class NativeDecodeApp:
                         return await _error(send, 503, "Decode submission failed")
                 output = list(frames.tokens(events))
                 if finished:
-                    reason = await asyncio.to_thread(
-                        controller.finish_reason, rid, frames.cursor + 1
-                    )
                     if reason == "abort" and not started:
                         completed = True
                         return await _error(send, 503, "Decode generation aborted")

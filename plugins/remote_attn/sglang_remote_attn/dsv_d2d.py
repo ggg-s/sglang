@@ -202,6 +202,15 @@ def manager(controller):
     return controller.scheduler.disagg_decode_prealloc_queue.kv_manager
 
 
+def bulk_catalog(controller, device=None):
+    catalog = getattr(controller, "_d2d_bulk_catalog", None)
+    if catalog is None:
+        if device is None:
+            device = pool_device(controller)
+        return transport.Catalog(manager(controller).engine, device)
+    return catalog
+
+
 def validate(controller):
     s = controller.scheduler
     if not controller.dsv41_remote or s.disaggregation_mode.value != "decode":
@@ -435,7 +444,8 @@ class Source:
             )
         ]
         self.final_event = dp.event(self.pages.device)
-        catalog = transport.Catalog(manager(self.owner).engine, self.pages.device)
+        transport_started = time.perf_counter()
+        catalog = bulk_catalog(self.owner, self.pages.device)
         capacity = self.bulk_capacity()
         rdma_capacity = (
             self.bulk_capacity(rdma=True)
@@ -452,8 +462,11 @@ class Source:
         )
         hub = remote.runtime().get_remote_hub(s)
         isolated = hub.prepare_d2d_bulk()
+        route_started = time.perf_counter()
         remote.register(self)
         self.meta = dict(
+            source_transport_setup_ms=(route_started - transport_started) * 1000,
+            source_route_publish_ms=(time.perf_counter() - route_started) * 1000,
             version=VERSION,
             bulk_transport=bulk.PROTOCOL,
             bulk_frame_bytes=capacity,
@@ -777,8 +790,7 @@ class Reader:
 
     def select_backend(self):
         if self.catalog is None:
-            device = pool_device(self.owner)
-            self.catalog = transport.Catalog(manager(self.owner).engine, device)
+            self.catalog = bulk_catalog(self.owner)
             self.backend = self.catalog.select(self.offer)
             if self.backend == transport.GPU and self.rdma_capacity is not None:
                 self.capacity = bulk.frame_capacity(self.rdma_capacity, rdma=True)
@@ -1827,9 +1839,7 @@ def import_request(controller, data):
     if "bulk_rdma_frame_bytes" in transfer:
         bulk.frame_capacity(transfer["bulk_rdma_frame_bytes"], rdma=True)
     transport.validate(transfer.get("bulk_capabilities"))
-    transport.Catalog(manager(controller).engine, pool_device(controller)).select(
-        transfer["bulk_capabilities"]
-    )
+    bulk_catalog(controller).select(transfer["bulk_capabilities"])
     ranges.check_history(
         transfer["origin_input_ids"], transfer["output_ids"], transfer["kv_len"]
     )

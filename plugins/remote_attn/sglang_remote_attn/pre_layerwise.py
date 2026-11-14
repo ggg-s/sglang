@@ -1402,7 +1402,19 @@ def initialize(scheduler):
     if scheduler.disaggregation_mode.value == "decode":
         # Publish rank readiness before the first native P->D request. D may
         # never become a remote source during an ordinary serving run.
-        _runtime().get_remote_hub(scheduler)
+        hub = _runtime().get_remote_hub(scheduler)
+        if (
+            getattr(controller, "dsv41_remote", False)
+            and os.environ.get("HANDOFF_D2D_WARM_TRANSPORT") == "1"
+        ):
+            from .dsv_d2d import bulk_catalog, on_device, pool_device
+
+            # All D ranks can become a source. Initialize reusable transport
+            # resources before requests can reach a freeze boundary.
+            device = pool_device(controller)
+            with on_device(device):
+                controller._d2d_bulk_catalog = bulk_catalog(controller, device)
+                hub.prepare_d2d_bulk()
 
 
 def run_batch(original, scheduler, batch, *args, **kwargs):

@@ -26,6 +26,7 @@ PRECOMMIT = {"PLAN", "RESERVE", "WAIT_CUT", "FREEZE", "IMPORT"}
 ACTIVE_MIGRATION_PHASES = PRECOMMIT | {"COMMIT", "ROLLBACK", "TARGET"}
 CUTOVER_PHASES = {"FREEZE", "IMPORT", "COMMIT"}
 STATUS_VISIBILITY_GRACE_S = 30
+DRAIN_FIRST_TOKEN_GRACE_S = 5
 WORKER_SNAPSHOT_MAX_AGE_S = 0.25
 WORKER_TIMINGS = (
     "publish_to_claim_ms",
@@ -81,6 +82,7 @@ def handoff_timing(entry):
     timing["cut_to_first_token_ms"] = (
         (b - a) * 1000 if a is not None and b is not None and b >= a else None
     )
+    timing.update(entry.get("source_setup_timing") or {})
     admitted = timing["target_admitted_at"]
     for marker in (
         "dst_copy_observed_at", "dst_local_observed_at", "src_release_observed_at"
@@ -223,6 +225,7 @@ class DsvGateway:
         packed_precopy=False,
         event_driven_reconcile=False,
         worker_status_snapshots=False,
+        chain_drain=False,
     ):
         self.driver, self.tokenizer = driver, tokenizer
         self.decode_workers = decode_workers or {}
@@ -251,6 +254,7 @@ class DsvGateway:
         self.cv = threading.Condition(self.lock)
         self.stop = threading.Event()
         self.event_driven_reconcile = event_driven_reconcile
+        self.chain_drain = chain_drain
         self.reconcile_wakeup = threading.Event()
         self.reconcile_pending = {}
         self.active_rids = {}  # Ordered live journal IDs, updated after persist.
@@ -624,6 +628,7 @@ class DsvGateway:
         status = cmd == "d2d_worker_status"
         started = time.monotonic()
         acquired = False
+        sent = False
         rows = ()
         slot_trace = holder = None
         commands = (
@@ -658,12 +663,17 @@ class DsvGateway:
                 raise TimeoutError(f"{role} control busy; command not submitted")
             submitted = time.monotonic()
             submitted_at = time.time()
+            if status:
+                with self.lock:
+                    if self.command_waiters[role]:
+                        raise StatusBusy()
             if is_destination:
                 holder = dict(worker=role, cmd=cmd, members=commands, started=submitted)
                 with self.lock:
                     self.dst_slot_holder = holder
             command = dict(cmd=cmd, migration_epoch=epoch, **payload)
             timeout = 2 if status else 30
+            sent = True
             if self.decode_workers:
                 response = self.driver.send_to(
                     self.decode_workers[role], role, command, timeout=timeout
@@ -732,7 +742,7 @@ class DsvGateway:
                             trace["wave_envelope"] = True
                 if not status:
                     self.command_waiters[role] -= 1
-                if acquired:
+                if sent:
                     key = role + "/" + cmd
                     self._observe(
                         self.control_latencies, key, (time.monotonic() - started) * 1000
@@ -1318,6 +1328,7 @@ class DsvGateway:
             prepare_started_at=time.time(),
             freeze_requested_at=None,
             freeze_descriptor_ready_at=None,
+            source_setup_timing=None,
             import_ready_at=None,
             target_admitted_at=None,
             dst_first_token_observed_at=None,
@@ -1737,15 +1748,19 @@ class DsvGateway:
             and self._cut_due(entry, request)
         ):
             self._update(rid, cut_observed_at=time.time())
-        if (
-            phase in {"TARGET", "LOCAL"}
-            and entry.get("target_admitted_at") is not None
-            and entry.get("dst_first_token_observed_at") is None
-            and request is not None
-        ):
+        if phase in {"TARGET", "LOCAL"} and request is not None:
             frozen = entry["frozen_output"]
             ids = request["output_ids"]
-            if len(ids) > len(frozen) and ids[: len(frozen)] == frozen:
+            overlap = min(len(ids), len(frozen))
+            if ids[:overlap] != frozen[:overlap]:
+                raise RuntimeError("destination output does not continue the frozen prefix")
+            if len(ids) < len(frozen):
+                return  # A stale snapshot cannot decide completion or release.
+            if (
+                entry.get("target_admitted_at") is not None
+                and entry.get("dst_first_token_observed_at") is None
+                and len(ids) > len(frozen)
+            ):
                 self._update(rid, dst_first_token_observed_at=time.time())
         if (
             request
@@ -1859,9 +1874,15 @@ class DsvGateway:
                 raise RuntimeError("native request missing; refusing resubmission")
             if not entry.get("request_seen", False) or entry.get("awaiting_visibility"):
                 self._update(rid, request_seen=True, awaiting_visibility=False)
+            waiting_for_first_token = (
+                self.decode_workers
+                and entry["migration_requested"]
+                and not request["output_ids"]
+            )
             if (
                 phase == "SOURCE"
                 and not request["finished"]
+                and not waiting_for_first_token
                 and entry.get("admission_plans")
                 and not entry["cut_attempted"]
                 and not entry["cancel_requested"]
@@ -1901,7 +1922,9 @@ class DsvGateway:
                     not entry["cut_attempted"] and entry["cut"] < entry["max_new"]
                 )
                 if prepare and not self._drain_abort_requested(rid):
-                    if not request["plan_ready"]:
+                    if waiting_for_first_token:
+                        self._defer_migration(entry, "sampled_output_pending")
+                    elif not request["plan_ready"]:
                         self._defer_migration(
                             entry,
                             request["plan_deferred_reason"] or "sampled_output_pending",
@@ -1977,16 +2000,17 @@ class DsvGateway:
             rows = (yield self._command("dst", "d2d_reserve", epoch, plans=entry["plans"]))
             if not all(r.get("reserved") for r in rows):
                 raise RuntimeError("target did not reserve on every rank")
+            reserved_at = time.time()
             self._update(
                 rid,
                 reservations=[r["reservation"] for r in rows],
                 phase="WAIT_CUT",
+                wait_cut_started_at=reserved_at,
                 precopy_until=(
-                    time.time() + self.precopy_window_s if self.precopy_window_s else 0
+                    reserved_at + self.precopy_window_s if self.precopy_window_s else 0
                 ),
                 prepare_latency_ms=max(
-                    0,
-                    (time.time() - entry.get("prepare_started_at", time.time())) * 1000,
+                    0, (reserved_at - entry.get("prepare_started_at", reserved_at)) * 1000
                 ),
             )
         elif phase == "WAIT_CUT":
@@ -2005,6 +2029,22 @@ class DsvGateway:
                     migration_outcome=outcome,
                     error=None,
                 )
+            elif (
+                self.decode_workers
+                and entry["migration_requested"]
+                and not request["output_ids"]
+            ):
+                # Older journal entries may already hold a target reservation
+                # while waiting for their first sampled token.
+                since = (
+                    entry.get("wait_cut_started_at")
+                    or entry.get("prepare_started_at")
+                    or entry["created_at"]
+                )
+                if time.time() >= since + DRAIN_FIRST_TOKEN_GRACE_S:
+                    self._update(
+                        rid, phase="ROLLBACK", migration_skip_reason="sampled_output_pending"
+                    )
             else:
                 # At the cut, finish only an already durable frame. Its APPLY
                 # receipt must be sealed by FREEZE, including after a restart.
@@ -2081,6 +2121,11 @@ class DsvGateway:
                 rid,
                 transfers=transfers,
                 freeze_descriptor_ready_at=time.time(),
+                source_setup_timing={
+                    name: max(t[name] for t in transfers)
+                    for name in ("source_transport_setup_ms", "source_route_publish_ms")
+                    if all(name in t for t in transfers)
+                },
                 remaining_copy_bytes=remaining_copy_bytes(transfers),
                 frozen_output=transfers[0]["output_ids"],
                 phase="IMPORT",
@@ -2423,6 +2468,27 @@ class DsvGateway:
                             pass
             steps = following
 
+    def _advance_drain_waves(self, members):
+        """Run adjacent durable stages, yielding on pending I/O and cut limits."""
+        for _ in range(8 if self.chain_drain else 1):
+            if not members:
+                return
+            following = []
+            for phases in (CUTOVER_PHASES, WAVE_PHASES - CUTOVER_PHASES):
+                wave = [entry for entry in members if entry["phase"] in phases]
+                for offset in range(0, len(wave), WAVE_SIZE):
+                    batch = wave[offset : offset + WAVE_SIZE]
+                    self._run_wave(batch)
+                    if self.chain_drain:
+                        for entry in batch:
+                            current = self._entry(entry["rid"])
+                            if (
+                                current["phase"] in WAVE_PHASES
+                                and current["phase"] != entry["phase"]
+                            ):
+                                following.append(current)
+            members = following
+
     def tick(self, *, pending_only=False):
         with self.work_lock:
             if not self.background:
@@ -2443,18 +2509,37 @@ class DsvGateway:
             if self.decode_workers and waves:
                 # Gather the drain members independently of unrelated Decode
                 # traffic. Keep cutovers in envelopes separate from KV copying.
-                for phases in (CUTOVER_PHASES, WAVE_PHASES - CUTOVER_PHASES):
-                    members = [
-                        self.payloads.view(e) for e in entries if e["phase"] in phases
-                    ]
-                    for offset in range(0, len(members), WAVE_SIZE):
-                        self._run_wave(members[offset : offset + WAVE_SIZE])
+                self._advance_drain_waves(
+                    [self.payloads.view(e) for e in entries if e["phase"] in WAVE_PHASES]
+                )
                 for entry in entries:
                     if entry["phase"] in {"ROLLBACK", "TARGET"}:
                         self._advance_one(self.payloads.view(entry), started)
                 entries = [
                     e for e in entries if e["phase"] not in WAVE_PHASES | {"ROLLBACK", "TARGET"}
                 ]
+                if self.chain_drain and time.monotonic() - started < 0.05:
+                    drain = self.journal["drain"]
+                    ready = []
+                    handled = set()
+                    for raw in entries:
+                        rid = raw["rid"]
+                        if rid not in drain["members"] or raw["phase"] not in {"SOURCE", "PLAN"}:
+                            continue
+                        entry = self.payloads.view(raw)
+                        if entry["phase"] == "SOURCE":
+                            self._drive(self._step(entry), entry)
+                            entry = self._entry(rid)
+                        if entry["phase"] == "PLAN":
+                            self._drive(self._step(entry), entry)
+                            entry = self._entry(rid)
+                        if entry["phase"] == "RESERVE":
+                            ready.append(entry)
+                        handled.add(rid)
+                        if time.monotonic() - started >= 0.05:
+                            break
+                    self._advance_drain_waves(ready)
+                    entries = [e for e in entries if e["rid"] not in handled]
                 waves = False
             offset = self.tick_cursor % len(entries) if entries and not pending_only else 0
             entries = entries[offset:] + entries[:offset]
@@ -2495,9 +2580,11 @@ class DsvGateway:
                     continue
             try:
                 self.tick(pending_only=pending_only)
-            except Exception:
+            except Exception as exc:
                 # Disk errors are fail-closed: no subsequent side effects from
                 # the failed transition. A later tick may retry its durable intent.
+                if self.out is not None:
+                    self._log_trace(dict(type="d2d_reconcile_error", error=repr(exc)))
                 self.stop.wait(self.poll_s)
             if not pending_only:
                 periodic_at = time.monotonic() + self.poll_s
@@ -2505,10 +2592,18 @@ class DsvGateway:
                     self.stop.wait(self.poll_s)
 
     def events(self, rid, after=-1):
-        entry = self._entry(rid)
+        events, finished, _ = self.stream_events(rid, after)
+        return events, finished
+
+    def stream_events(self, rid, after=-1):
+        # The journal owner and the TP facts must come from the same view.
         with self.lock:
+            entry = self._entry(rid)
             if entry["phase"] in TERMINAL and "final_output_ids" in entry:
-                req = dict(output_ids=entry["final_output_ids"], finished=True)
+                req = dict(
+                    output_ids=entry["final_output_ids"], finished=True,
+                    finish_reason=entry.get("final_finish_reason"),
+                )
             else:
                 self._bound(entry, roles=[entry["owner"]])
                 req = self._request(entry, entry["owner"])
@@ -2518,6 +2613,9 @@ class DsvGateway:
             overlap = min(len(ids), len(frozen))
             if ids[:overlap] != frozen[:overlap]:
                 raise RuntimeError("destination output does not continue the frozen prefix")
+            if len(ids) < len(frozen):
+                req = None
+                ids = frozen
         if entry["owner"] == "src" and entry["phase"] not in {
             "SOURCE",
             "SUBMIT",
@@ -2529,6 +2627,7 @@ class DsvGateway:
             ):
                 raise RuntimeError("frozen source output history changed")
             if len(frozen) > len(ids):
+                req = None
                 ids = frozen
         if after < -1 or after >= entry["max_new"]:
             raise ValueError("SSE cursor outside request token budget")
@@ -2543,7 +2642,10 @@ class DsvGateway:
             for i in range(after + 1, len(ids))
         ]
         finished = bool(req and req["finished"]) or entry["phase"] in TERMINAL
-        return result, finished
+        reason = (req or {}).get("finish_reason")
+        if finished and reason is None:
+            reason = "length" if len(ids) == entry["max_new"] else "stop"
+        return result, finished, reason
 
     def finish_reason(self, rid, output_count):
         with self.lock:

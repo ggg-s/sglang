@@ -483,6 +483,11 @@ def main():
         default=0,
         help="Let source requests finish for this long after cordon before planning D2D",
     )
+    parser.add_argument(
+        "--chain-drain",
+        action="store_true",
+        help="Advance adjacent D2D drain stages in the same reconcile pass",
+    )
     parser.add_argument("--precopy-window-ms", type=int, default=0)
     parser.add_argument(
         "--packed-precopy",
@@ -548,6 +553,7 @@ def main():
         poll_ms=args.poll_ms,
         event_driven_reconcile=args.event_driven_reconcile,
         worker_status_snapshots=args.worker_status_snapshots,
+        chain_drain=args.chain_drain,
         natural_drain_ms=args.natural_drain_ms,
         precopy_window_ms=args.precopy_window_ms,
         packed_precopy=args.packed_precopy,

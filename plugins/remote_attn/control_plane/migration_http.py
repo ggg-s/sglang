@@ -224,14 +224,15 @@ class MigrationWorkerHandler(BaseHTTPRequestHandler):
             self.end_headers()
             while not self.controller.stop.is_set():
                 try:
-                    events, finished = self.controller.events(rid, frames.cursor)
+                    events, finished, reason = self.controller.stream_events(
+                        rid, frames.cursor
+                    )
                 except ConnectionError:
-                    events, finished = [], False
+                    events, finished, reason = [], False, None
                 for frame in frames.tokens(events):
                     send(frame)
                     last_write = time.monotonic()
                 if finished:
-                    reason = self.controller.finish_reason(rid, frames.cursor + 1)
                     for frame in frames.finish(reason):
                         send(frame)
                     completed = True

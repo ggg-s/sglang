@@ -17542,6 +17542,8 @@ class TestRemoteAttn(CustomTestCase):
         from sglang_remote_attn import dsv_d2d as d2d
 
         e = self._d2d_env()
+        for controller in (e.source, e.target):
+            controller._d2d_bulk_catalog = d2d.bulk_catalog(controller)
         p = self._precopy_support()
         common, plan = p.reserve(e)
         available, receipts = p.copy_available(e, "precopy", retry=False)
@@ -17563,6 +17565,8 @@ class TestRemoteAttn(CustomTestCase):
                 **common,
             )["transfer"]
         self.assertEqual(meta["precopy"]["prefix_pages"], available)
+        self.assertGreaterEqual(meta["source_transport_setup_ms"], 0)
+        self.assertGreaterEqual(meta["source_route_publish_ms"], 0)
         target = None
         reads = []
         actual = d2d.Reader.call
@@ -17581,6 +17585,7 @@ class TestRemoteAttn(CustomTestCase):
         self.assertTrue(reads)
         self.assertTrue(all(lo >= 4 for _, lo, _ in reads), reads)
         self.assertTrue(target.closed)
+        self.assertIs(target.bulk_reader.catalog, e.target._d2d_bulk_catalog)
         self.assertFalse(
             any(not s.closed for s in pc.bulk.owners(d2d.manager(e.source).engine))
         )
