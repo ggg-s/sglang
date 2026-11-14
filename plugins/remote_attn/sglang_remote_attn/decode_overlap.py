@@ -188,20 +188,22 @@ def before_retract(original, *, req, **kwargs):
     return original(req=req, **kwargs)
 
 
-def after_result(original, scheduler, *args, **kwargs):
-    p_overlap = getattr(
-        getattr(scheduler, "_pre_layerwise", None), "prefill_overlap", None
-    )
+def after_result(original, scheduler, batch, result):
+    controller = getattr(scheduler, "_pre_layerwise", None)
+    p_overlap = getattr(controller, "prefill_overlap", None)
     if p_overlap is not None:
         from .prefill_overlap import after_result as process_result
 
-        return process_result(original, scheduler, *args, **kwargs)
-    result = original(scheduler, *args, **kwargs)
-    controller = getattr(scheduler, "_pre_layerwise", None)
+        return process_result(original, scheduler, batch, result)
+    value = original(scheduler, batch, result)
+    if getattr(controller, "split_prefill_auto_cap", 0):
+        from .qwen_split_prefill import record_completed_suffix
+
+        record_completed_suffix(controller, result)
     overlap = getattr(controller, "decode_overlap", None)
     if overlap is not None:
         # Remote's native serial gate has consumed the previous result before
         # the next launch. Empty/idle iterations reach the sample hook as well.
         overlap.retirement.observe()
         overlap.retirement.finalize()
-    return result
+    return value

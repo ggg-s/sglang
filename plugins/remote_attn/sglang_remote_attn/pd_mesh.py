@@ -505,10 +505,13 @@ def bootstrap(original, receiver, *, bootstrap_info, message, operation):
         and operation == "send_metadata"
         and not bootstrap_info["is_dummy"]
     ):
-        from .qwen_split_prefill import DECODE_PRIORITY, WIRE
+        from .qwen_split_prefill import DECODE_PRIORITY, SUFFIX_CAP_WIRE, WIRE
 
         min_cut, chunk_cap = limits
         message = [*message, WIRE + f"{min_cut}:{chunk_cap}".encode("ascii")]
+        suffix_cap = getattr(receiver, "_hybrid_split_suffix_cap", 0)
+        if suffix_cap:
+            message.append(SUFFIX_CAP_WIRE + str(suffix_cap).encode("ascii"))
         if getattr(receiver, "_hybrid_split_decode_priority", False):
             message.append(DECODE_PRIORITY)
     return original(
@@ -519,7 +522,12 @@ def bootstrap(original, receiver, *, bootstrap_info, message, operation):
 def parse_transfer(original, *args, **kwargs):
     value = original(*args, **kwargs)
     message = kwargs.get("msg", args[-1] if args else None)
-    from .qwen_split_prefill import DECODE_PRIORITY, WIRE
+    from .qwen_split_prefill import (
+        AUTO_SUFFIX_CAP_MAX,
+        DECODE_PRIORITY,
+        SUFFIX_CAP_WIRE,
+        WIRE,
+    )
 
     extensions = message[10:]
     split_offer = next(
@@ -529,6 +537,23 @@ def parse_transfer(original, *args, **kwargs):
     if all(0 < len(field) <= 10 and field.isdigit() for field in (min_cut, chunk_cap)):
         value._hybrid_split_limits = int(min_cut), int(chunk_cap)
         value._hybrid_split_decode_priority = DECODE_PRIORITY in extensions
+        suffix_cap = next(
+            (
+                frame[len(SUFFIX_CAP_WIRE) :]
+                for frame in extensions
+                if frame.startswith(SUFFIX_CAP_WIRE)
+            ),
+            None,
+        )
+        if suffix_cap is not None:
+            if (
+                0 < len(suffix_cap) <= len(str(AUTO_SUFFIX_CAP_MAX))
+                and suffix_cap.isdigit()
+                and 0 < int(suffix_cap) <= AUTO_SUFFIX_CAP_MAX
+            ):
+                value._hybrid_split_suffix_cap = int(suffix_cap)
+            else:
+                del value._hybrid_split_limits
     journal = next((frame for frame in extensions if frame.startswith(MAGIC)), None)
     if journal is not None:
         try:

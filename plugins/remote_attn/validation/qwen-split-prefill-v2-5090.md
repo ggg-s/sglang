@@ -105,6 +105,7 @@ E2E 分别为 39,848 和 39,891。64K 的相对 p90 降幅使用同为 40 条的
 - 本文入库前的默认策略见 `2dead5629b`。在该版本两侧使用默认值为 Split V2，
   P 保持默认切点配置、D 设置 `HANDOFF_SPLIT_DEFER_TICKS=0` 为 Split V1。
   当前版本默认使用容量限制下的 miss 切点，并增加 15 轮等待早退。
+  新默认的标定和对照见 [RTX 5090 2P1D SWE-bench 实测](qwen-split-prefill-2p1d-5090.md)。
 - 固定 cut 比较调度时，在 P 设 `HANDOFF_SPLIT_SUFFIX_TOKENS`，
   例如 64K 同切点对照用 26612，在 D 分别设预算 0 和 150。
 - 每臂用唯一标签保存请求记录，同时计算打断率和受影响子集的最大 ITL p90。

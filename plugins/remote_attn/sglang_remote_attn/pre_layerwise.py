@@ -697,6 +697,8 @@ class Controller:
                 getattr(self, "split_prefill_min_queue_tokens", 0),
                 getattr(self, "split_prefill_max_outstanding", None),
                 getattr(self, "split_prefill_defer_ticks", 0),
+                getattr(self, "split_prefill_patience_ticks", None),
+                getattr(self, "split_prefill_suffix_budget_s", None),
             ),
             ("destination-cache-v1", "prefix-range-v1", prefix_enabled()),
             (

@@ -158,13 +158,37 @@ Remote attention 用于 D2D 迁移。P→D Remote 早接纳作为实验功能，
 输出吞吐从 72.62 增到 78.98 token/s，ITL 均值增加 26%，TPOT 增加 36%。
 C1 的 TTFT p90 下降 14.3%，ITL 均值增加 0.5%。更换模型、硬件或负载后，
 应重新测量 D 的后缀处理速率和延迟，再标定后缀上限。
+完整三臂数据、固定后缀对照与低并发结果见
+[RTX 5090 2P1D SWE-bench 实测](validation/qwen-split-prefill-2p1d-5090.md)。
+[H100 1P1D 自适应 cap 实验](validation/qwen-split-prefill-adaptive-h100.md)
+另记录了并发扫描和 ITL 代价。
+
+#### 自适应后缀上限（实验）
+
+| 对照 | P 侧 | D 侧 |
+| --- | --- | --- |
+| 静态（默认） | `HANDOFF_SPLIT_SUFFIX_CAP_TOKENS=4096`，也可用其他整数 | `HANDOFF_SPLIT_CAP_AUTO=0` |
+| 自适应 | `HANDOFF_SPLIT_SUFFIX_CAP_TOKENS=auto` | `HANDOFF_SPLIT_CAP_AUTO=1` |
+
+D 默认用 `HANDOFF_SPLIT_SUFFIX_BUDGET_S=2.0` 将实测续算速度换算为整段
+后缀上限，范围 2048–32768 token，向下对齐到 512 token。首个有效样本
+之前使用按同样规则处理的本地 chunk 大小。CUDA event 在续算执行流上记录，
+原生结果处理完成后读取并更新 EMA。D 在原有 TP 准入投票中取各 rank 的最小值，
+通过独立 bootstrap 扩展发布整段上限，V3 的 chunk 字段保留单块口径。
+每条请求实际可用的上限还受 D 声明的切点下界约束。
+
+P 的 `auto` 模式在 D 未提供该扩展时使用 4096。P 若配置整数 cap，
+`miss` 路径取该值和 D 宣告上限的较小值。D 的协商下界对所有切点生效。
+分块仍由 `HANDOFF_HYBRID_SPLIT_PREFILL_CHUNK_SIZE` 控制。
+D 可用 `HANDOFF_SPLIT_DEFER_PATIENCE_TICKS` 调整提前结束等待的阈值，
+默认 15，设为 0 仅关闭早退。
 
 沿用同 TP 的原生 Mooncake、early device allocation 和 page-1 KV 配置。
 D 命中已有前缀、请求输出 logprobs、结构化生成或对端未协商时走原生 PD。
 P 等到 bootstrap 后再为可协商请求启动 Prefill，首次 Forward 前对实际 cut 做
 TP 一致性检查。V3 wire 的 bootstrap 消息传递最小切点、chunk cap 和可选的
-decode 优先能力，完成 metadata 传递实际切点。未声明 decode 优先能力的
-V3 wire 对端仍可协商 Split V1。协议版本不兼容时走原生 PD。
+decode 优先能力，完成 metadata 传递实际切点。当前 P 的切点策略独立于该
+标记。协议版本不兼容时走原生 PD。
 
 P 发出切点前的 KV 和 Conv／SSM 后完成原生传输。D 在已有预留中续算剩余 prompt，
 并从完整 prompt 的末尾采样首 token。前缀 KV 在 D 本地读取。每个续算 batch 最多处理

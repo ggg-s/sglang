@@ -659,6 +659,7 @@ HOOKS.update(
         "sglang.srt.disaggregation.common.staging_handler.init_staging_allocator": pre_layerwise.init_staging_allocator,
         "sglang.srt.disaggregation.common.staging_handler.init_staging_buffers": pre_layerwise.init_staging_buffers,
         "sglang.srt.managers.scheduler.Scheduler.run_batch": pre_layerwise.run_batch,
+        "sglang.srt.managers.tp_worker.TpModelWorker.forward_batch_generation": qwen_split_prefill.time_suffix_forward,
         "sglang.srt.managers.scheduler.Scheduler.get_new_batch_prefill": qwen_hybrid_pd.snapshot_prefill_admission,
         "sglang.srt.managers.scheduler.Scheduler.process_batch_result": decode_overlap.after_result,
         "sglang.srt.managers.scheduler.Scheduler.launch_batch_sample_if_needed": prefill_overlap.after_sample,

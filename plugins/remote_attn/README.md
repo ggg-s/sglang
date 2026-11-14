@@ -72,6 +72,11 @@ of D's defer setting. `HANDOFF_SPLIT_DEFER_TICKS=0` on D disables deferral.
 Set `HANDOFF_HYBRID_SPLIT_PREFILL=0` on both roles for native PD.
 Requests without a valid split also use native PD. See the
 [Qwen RTX 5090 measurements and settings](QWEN38-HYBRID-D2D-ZH.md#分段-prefill).
+For the opt-in adaptive suffix cap, set `HANDOFF_SPLIT_CAP_AUTO=1` on D and
+`HANDOFF_SPLIT_SUFFIX_CAP_TOKENS=auto` on P. D measures completed suffix
+forwards with CUDA events and advertises the TP-agreed suffix limit separately
+from the chunk cap. See the
+[H100 SWE-bench experiment](validation/qwen-split-prefill-adaptive-h100.md).
 Remote attention serves D2D migrations. Experimental P-to-D Remote attention
 requires `HANDOFF_EXPERIMENTAL_PD_REMOTE=1` on both roles. To compare it with
 split, also set `HANDOFF_HYBRID_SPLIT_PREFILL=0`. The **V3 wire** advertises a
