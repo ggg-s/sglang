@@ -100,10 +100,11 @@ E2E 分别为 39,848 和 39,891。64K 的相对 p90 降幅使用同为 40 条的
 64K 热缓存只测过 V1。V2 的 72K、C8、变长输出和其他模型也待验证。
 原有长上下文缓存对照见 [V1 实测](qwen-split-prefill-v1-5090.md)。
 
-## 对照配置
+## 历史对照配置
 
-- 两侧使用默认值可复现 Split V2。P 保持默认切点配置、D 侧设置
-  `HANDOFF_SPLIT_DEFER_TICKS=0` 可复现 Split V1。
+- 本文入库前的默认策略见 `2dead5629b`。在该版本两侧使用默认值为 Split V2，
+  P 保持默认切点配置、D 设置 `HANDOFF_SPLIT_DEFER_TICKS=0` 为 Split V1。
+  当前版本默认使用容量限制下的 miss 切点，并增加 15 轮等待早退。
 - 固定 cut 比较调度时，在 P 设 `HANDOFF_SPLIT_SUFFIX_TOKENS`，
   例如 64K 同切点对照用 26612，在 D 分别设预算 0 和 150。
 - 每臂用唯一标签保存请求记录，同时计算打断率和受影响子集的最大 ITL p90。

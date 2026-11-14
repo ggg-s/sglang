@@ -121,28 +121,27 @@ Remote attention 用于 D2D 迁移。P→D Remote 早接纳作为实验功能，
 `HANDOFF_HYBRID_SPLIT_PREFILL` 默认 `1`，在 P、D 两端设为 `0` 可做原生 PD 对照。
 至少 4096 token 的纯文本请求可参与协商。P 配置切点，D 配置续算批大小。
 
-- **Split V1** 用 `miss` 按未命中量选切点。热请求或短于 32K 的请求再加后缀
-  cap，D 在续算块满足调度条件时立即提交。
-- **Split V2** 用平衡切点并优先调度已有 decode，是当前默认策略。
-
-本分支的 Split 策略只有 V1 和 V2。**V3 wire** 是两套策略共用的 P/D bootstrap 协议版本。
-
-- P 默认在 D 声明 decode 优先时使用平衡切点
-  `min((N + H + 12185) // 2, N - floor)`。其中 `H` 是实际命中前缀，
-  `floor = min(2048, max(N // 16, 1))`。切点须越过命中前缀并满足
-  D 声明的下界，否则走原生 PD。12185 按 5090、TP2、128 输出 token 标定。
+- 选中的 D 先做准入，选中的 P 按本机实际命中前缀 `H` 计算 cut。
+  默认 `HANDOFF_SPLIT_CUT_BASIS=miss`。未命中量为 `N - H`，D 接手其中
+  25%，受后缀下限 `min(2048, max(N // 16, 1))` 和
+  `HANDOFF_SPLIT_SUFFIX_CAP_TOKENS` 限制。后者默认 4096，按 5090 2P1D
+  SWE-bench 标定。只有未命中量已能装入一个协商 chunk 时，才再应用 chunk cap
+  和 prompt 长度的 15% 限制。没有合法切点时在原 pair 上走原生 PD。
 - D 的 `HANDOFF_SPLIT_DEFER_TICKS` 默认 `150`。有活跃 decode 时，
   候选后缀每让路一次计一轮。P 命中至少 70% 时，预算上限为 45 轮。
-  每块提交后重新计数。P 保持默认切点配置时，D 设为 `0` 即恢复 Split V1。
-- P 可用 `HANDOFF_SPLIT_CUT_BASIS=miss` 对照 V1 切点。此时
-  `HANDOFF_HYBRID_SPLIT_PREFILL_CUT_RATIO` 范围为 `[0.5, 1)`，默认 `0.75`，
-  D 接手未命中量的 25%。有缓存命中或 prompt 短于 32K 时，V1 后缀
-  还受 D 声明的 chunk cap 和 prompt 长度的 15% 限制。只设置切点比例时，
-  P 仍使用 `miss` 口径。显式选择 `balanced` 时由 D 的能力决定是否使用平衡公式。
+  若让路 15 轮后运行批次仍未小于开始等待时的大小，就提前提交。
+  每块提交后重新计数。设为 `0` 关闭等待，切点仍按 P 的配置计算。
+- `HANDOFF_HYBRID_SPLIT_PREFILL_CUT_RATIO` 范围为 `[0.5, 1)`，默认 `0.75`。
+  P 可用 `HANDOFF_SPLIT_CUT_BASIS=balanced` 选择旧 V2 的平衡切点
+  `min((N + H + 12185) // 2, N - floor)`。12185 按 5090、TP2、128 输出 token 标定。
 - P 可用 `HANDOFF_SPLIT_CUT_BASIS=whole` 对照整段比例。该臂的切点取
   整段比例切点与命中前缀后 1024 token 的较大值。`HANDOFF_SPLIT_SUFFIX_TOKENS`
-  默认 `0`，设为正整数可钉住后缀长度，用于标定。两个对照都检查切点边界。
-- D 的 `HANDOFF_HYBRID_SPLIT_PREFILL_MAX_OUTSTANDING` 默认 `4`。每次发出 offer
+  默认 `0`，设为正整数可钉住后缀长度，用于标定。固定后缀、`balanced`
+  和 `whole` 都按协商边界检查切点，并绕过 `HANDOFF_SPLIT_SUFFIX_CAP_TOKENS`。
+- P 的 `HANDOFF_SPLIT_MIN_P_QUEUE_TOKENS` 可要求最低积压量，默认 `0`（关闭）。
+  2P1D 实测中，入队瞬间的积压信号会漏掉大多数可获益请求。
+- D 的 `HANDOFF_HYBRID_SPLIT_PREFILL_MAX_OUTSTANDING` 默认为该 D 的
+  `--max-running-requests`。每次发出 offer
   预留一个名额，涵盖等待 P 传输和 D 续算的请求。D 达到该上限或 decode 批次已满时，
   新请求走原生 PD。续算完成、原生 PD 完成或请求终止清理时归还名额。
   默认上限是压测起点，可按在途 decode 的 token 间隔调整。
@@ -150,6 +149,15 @@ Remote attention 用于 D2D 迁移。P→D Remote 早接纳作为实验功能，
   `--max-prefill-tokens` 为上限。D 声明最多承接半个 prompt，分块完成续算，
   并向 P 声明 `max(实际续算块上限, 2048)` 作为 chunk cap。
   这个设置独立于原生 `--chunked-prefill-size`。
+
+历史 Split V1 指 miss + cap 与立即提交，V2 指平衡切点与 decode 优先。
+**V3 wire** 是 P/D bootstrap 协议版本。
+
+4096 的标定来自移交的 RTX 5090、Qwen3.8-27B-FP8、2P1D TP2、SWE-bench
+600 秒实验。C6 下，对比原生 PD 的 TTFT p90 从 26,772 降到 21,891 ms，
+输出吞吐从 72.62 增到 78.98 token/s，ITL 均值增加 26%，TPOT 增加 36%。
+C1 的 TTFT p90 下降 14.3%，ITL 均值增加 0.5%。更换模型、硬件或负载后，
+应重新测量 D 的后缀处理速率和延迟，再标定后缀上限。
 
 沿用同 TP 的原生 Mooncake、early device allocation 和 page-1 KV 配置。
 D 命中已有前缀、请求输出 logprobs、结构化生成或对端未协商时走原生 PD。

@@ -1358,17 +1358,17 @@ class TestSplitPD(CustomTestCase):
     def match(req, *_):
         req.full_untruncated_fill_ids = list(req.origin_input_ids)
 
-    def test_default_cut_balances_stages_when_decode_advertises_priority(self):
+    def test_default_cut_caps_misses_by_suffix_capacity(self):
         for hybrid in (False, True):
             for length, prefix, expected in (
-                (16384, 0, 14284),
+                (16384, 0, 12288),
                 (16384, 14745, 15360),
-                (32768, 0, 22476),
-                (32768, 13107, 29030),
-                (32768, 19660, 30720),
+                (32768, 0, 28672),
+                (32768, 13107, 28672),
+                (32768, 19660, 29491),
                 (32768, 26214, 30720),
-                (65408, 0, 38796),
-                (65536, 39321, 58521),
+                (65408, 0, 61312),
+                (65536, 39321, 61440),
             ):
                 with self.subTest(hybrid=hybrid, length=length, prefix=prefix):
                     p, d, req, dr = self.bootstrap(
@@ -1389,17 +1389,28 @@ class TestSplitPD(CustomTestCase):
                         expected, dr.kv_receiver._hybrid_split_limits[0]
                     )
 
-    def test_prefill_cap_uses_the_decode_budget_from_bootstrap(self):
-        with patch.dict(os.environ, {"HANDOFF_SPLIT_DEFER_TICKS": "0"}):
+    def test_suffix_can_span_multiple_decode_chunks(self):
+        with patch.dict(os.environ, {"HANDOFF_SPLIT_SUFFIX_CAP_TOKENS": "8192"}):
             _, d, req, _ = self.bootstrap(prefix=13107, decode_budget=1024)
             self.assertEqual(d.split_prefill_chunk_size, 1024)
             self.split.init_input(self.match, req, object())
-            self.assertEqual(req._hybrid_split_at, 30720)
+            self.assertEqual(req._hybrid_split_at, 27853)
 
-    def test_legacy_v3_offer_keeps_the_warm_suffix_cap(self):
-        _, _, req, _ = self.bootstrap(length=65536, prefix=39321, legacy=True)
-        self.split.init_input(self.match, req, object())
-        self.assertEqual(req._hybrid_split_at, 61440)
+    def test_balanced_cut_does_not_depend_on_decode_deferral(self):
+        for defer, legacy in (("150", False), ("0", False), ("150", True)):
+            with (
+                self.subTest(defer=defer, legacy=legacy),
+                patch.dict(
+                    os.environ,
+                    {
+                        "HANDOFF_SPLIT_CUT_BASIS": "balanced",
+                        "HANDOFF_SPLIT_DEFER_TICKS": defer,
+                    },
+                ),
+            ):
+                _, _, req, _ = self.bootstrap(legacy=legacy)
+                self.split.init_input(self.match, req, object())
+                self.assertEqual(req._hybrid_split_at, 22476)
 
     def test_small_suffix_and_tp_cut_disagreement_use_full_native_input(self):
         for prefix, disagreement in ((30720, False), (32000, False), (0, True)):
@@ -1415,7 +1426,13 @@ class TestSplitPD(CustomTestCase):
         with patch.dict(os.environ, {"HANDOFF_HYBRID_SPLIT_PREFILL": "0"}):
             self.assertFalse(self.controller().split_prefill)
             self.assertFalse(self.controller("decode").split_prefill)
-        with patch.dict(os.environ, {"HANDOFF_HYBRID_SPLIT_PREFILL_CUT_RATIO": "0.70"}):
+        with patch.dict(
+            os.environ,
+            {
+                "HANDOFF_HYBRID_SPLIT_PREFILL_CUT_RATIO": "0.70",
+                "HANDOFF_SPLIT_SUFFIX_CAP_TOKENS": "16384",
+            },
+        ):
             _, _, req, _ = self.bootstrap()
             self.split.init_input(self.match, req, object())
             self.assertEqual(req._hybrid_split_at, 22938)
@@ -1439,7 +1456,7 @@ class TestSplitPD(CustomTestCase):
         self.assertEqual(len(req.full_untruncated_fill_ids), 32768)
         self.assertFalse(hasattr(req, "_hybrid_split_at"))
         self.split.init_input(self.match, req, cache)
-        self.assertEqual(req._hybrid_split_at, 22476)
+        self.assertEqual(req._hybrid_split_at, 28672)
         req.prefix_len = req.kv.cache_protected_len = 29491
         self.split.init_input(self.match, req, cache)
         self.assertEqual(req._hybrid_split_at, 30720)
@@ -1448,12 +1465,28 @@ class TestSplitPD(CustomTestCase):
         self.split.init_input(self.match, req, cache)
         self.assertEqual(req._hybrid_split_at, 30720)
 
+    def test_opt_in_backlog_gate_counts_other_prefill_work(self):
+        with patch.dict(os.environ, {"HANDOFF_SPLIT_MIN_P_QUEUE_TOKENS": "4096"}):
+            p, _, req, _ = self.bootstrap()
+        p.scheduler.waiting_queue = [req]
+        p.scheduler.chunked_req = None
+        self.split.init_input(self.match, req, object())
+        self.assertEqual(req._hybrid_split_at, 0)
+        self.assertEqual(req._hybrid_split_match_reason, "p_backlog_below_threshold")
+
+        active = self.request(length=16384)
+        active.extend_end = 8192
+        p.scheduler.chunked_req = active
+        self.split.init_input(self.match, req, object())
+        self.assertEqual(req._hybrid_split_at, 28672)
+
     def test_decode_offers_reserve_capacity_before_transfer(self):
         d = self.controller("decode")
-        active = [self.offer(d) for _ in range(4)]
+        limit = d.scheduler.max_running_requests
+        active = [self.offer(d) for _ in range(limit)]
         self.split.advertise(NS(scheduler=d.scheduler), active[0], 0)
         self.assertTrue(all(dr.kv_receiver._hybrid_split_limits for dr in active))
-        self.assertEqual(d.split_prefill_outstanding, 4)
+        self.assertEqual(d.split_prefill_outstanding, limit)
         self.assertFalse(hasattr(self.offer(d).kv_receiver, "_hybrid_split_limits"))
         req = active[0].req
         req.kv.req_pool_idx = 0
@@ -1466,7 +1499,7 @@ class TestSplitPD(CustomTestCase):
         ):
             hooks._release_kv(lambda *_, **__: None, req, None, checkpoint=False)
         self.split.release_reservation(req)
-        self.assertEqual(d.split_prefill_outstanding, 3)
+        self.assertEqual(d.split_prefill_outstanding, limit - 1)
         self.assertTrue(self.offer(d).kv_receiver._hybrid_split_limits)
 
     def test_decode_capacity_and_tp_rejection_do_not_create_reservations(self):
@@ -1582,12 +1615,13 @@ class TestSplitPD(CustomTestCase):
                 self.assertEqual(d.split_prefill_outstanding, 1)
 
     def test_decode_priority_expires_per_chunk_and_uses_transferred_hits(self):
-        for hits, budget, early_idle in (
-            (19660, 150, False),
-            (26214, 45, False),
-            (19660, 150, True),
+        for hits, budget, end_bs in (
+            (19660, 150, 1),
+            (26214, 45, 1),
+            (19660, 2, 0),
+            (19660, 15, 2),
         ):
-            with self.subTest(hits=hits, early_idle=early_idle):
+            with self.subTest(hits=hits, budget=budget, end_bs=end_bs):
                 d, queue, dr = self.commit_fixture(24576)
                 queue.metadata_buffers.cached_tokens[0, 0] = hits
                 self.assertTrue(self.split.commit(queue, dr, keep_receiver=False))
@@ -1612,12 +1646,13 @@ class TestSplitPD(CustomTestCase):
                         self[:0] = reqs
 
                 scheduler.waiting_queue = waiting = WaitingQueue([req])
-                running = NS(batch_size=lambda: 1)
+                running = Mock()
+                running.batch_size.return_value = 2
                 batch = NS(prepare_for_extend=lambda **_: None)
-                native_decode = lambda *_: running
+                native_decode = Mock(return_value=running)
                 modules = {
                     "sglang.srt.managers.schedule_batch": NS(
-                        ScheduleBatch=NS(init_new=lambda *_, **__: batch),
+                        ScheduleBatch=NS(init_new=Mock(return_value=batch)),
                         NextBatchPlan=NS,
                     ),
                     "sglang.srt.observability.req_time_stats": NS(
@@ -1625,14 +1660,15 @@ class TestSplitPD(CustomTestCase):
                     ),
                 }
                 with patch.dict(sys.modules, modules):
-                    for _ in range(2 if early_idle else budget):
+                    for tick in range(budget):
+                        if tick == 1 and end_bs:
+                            running.batch_size.return_value = end_bs
                         self.assertIs(
                             self.split.next_batch(native_decode, scheduler, running),
                             running,
                         )
                     self.assertEqual(waiting, [req])
-                    if early_idle:
-                        running.batch_size = lambda: 0
+                    running.batch_size.return_value = end_bs
                     req.extend_len = 4096
                     plan = self.split.next_batch(native_decode, scheduler, running)
                     self.assertIs(plan.batch_to_run, batch)
@@ -1641,7 +1677,7 @@ class TestSplitPD(CustomTestCase):
                     self.assertEqual(waiting, [])
                     self.assertIs(scheduler.chunked_req, req)
                     req.kv.truncate_committed(28672)
-                    running.batch_size = lambda: 1
+                    running.batch_size.return_value = 1
                     self.assertIs(
                         self.split.next_batch(native_decode, scheduler, running),
                         running,

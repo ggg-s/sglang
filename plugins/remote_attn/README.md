@@ -58,23 +58,26 @@ the scheduler's actual batch lengths. No separate chunk-size setting is needed.
 Small tails use native transfer in `layerwise` mode. In `remote` mode, dense MHA
 and FULL+MAMBA PD default to split prefill.
 
-- **Split V1** uses a cache-miss-based cut and caps the suffix for warm prompts
-  or prompts shorter than 32K. D submits suffix chunks as soon as they are eligible.
-- **Split V2**, the default when D advertises decode priority, uses the balanced
-  cut `(prompt + matched_prefix + 12185) // 2` with the negotiated cut bounds.
-  D uses 4,096-token chunks by default and gives active decodes up to 150 scheduling
-  decisions per chunk, capped at 45 when at least 70% of the prompt hit P's cache.
+- P defaults to a suffix of 25% of the cache miss, subject to the negotiated
+  cut bounds and `HANDOFF_SPLIT_SUFFIX_CAP_TOKENS` (default 4096, calibrated on
+  2P1D). D's chunk size controls one execution step. It can be smaller than
+  the suffix.
+- D defaults its outstanding split limit to its own `--max-running-requests`.
+  With active decodes, D defers each eligible chunk for up to 150 scheduling
+  decisions (45 at 70% or higher P cache hit), with early submission after
+  15 decisions if the running batch is still at or above its starting size.
 
-With default cut settings on P, set `HANDOFF_SPLIT_DEFER_TICKS=0` on D to run
-Split V1. Set `HANDOFF_HYBRID_SPLIT_PREFILL=0` on both roles for native PD.
-Requests without a valid split also use native PD.
-See the [V2 RTX 5090 measurements and calibration](validation/qwen-split-prefill-v2-5090.md).
+`HANDOFF_SPLIT_CUT_BASIS=balanced` on P selects the legacy V2 cut independently
+of D's defer setting. `HANDOFF_SPLIT_DEFER_TICKS=0` on D disables deferral.
+Set `HANDOFF_HYBRID_SPLIT_PREFILL=0` on both roles for native PD.
+Requests without a valid split also use native PD. See the
+[Qwen RTX 5090 measurements and settings](QWEN38-HYBRID-D2D-ZH.md#分段-prefill).
 Remote attention serves D2D migrations. Experimental P-to-D Remote attention
 requires `HANDOFF_EXPERIMENTAL_PD_REMOTE=1` on both roles. To compare it with
-split, also set `HANDOFF_HYBRID_SPLIT_PREFILL=0`. **V3 wire** is the bootstrap
-protocol shared by both strategies. It advertises a minimum cut, D's chunk cap,
-and an optional decode-priority capability. Completion metadata carries the
-actual cut. Peers with incompatible wire versions use native PD.
+split, also set `HANDOFF_HYBRID_SPLIT_PREFILL=0`. The **V3 wire** advertises a
+minimum cut, D's chunk cap, and an optional decode-priority marker for older
+peers. Completion metadata carries the actual cut. Peers without a compatible
+offer use native PD.
 With `MC_FORCE_TCP=1`, pre-layerwise groups stage source bytes through a private
 nonblocking CUDA stream and registered pinned host storage before native TE sends.
 This preserves native batching and the send lock; ordinary PD is also staged when `SGLANG_MOONCAKE_HOST_STAGING_ALL=1`.

@@ -693,6 +693,8 @@ class Controller:
                 getattr(self, "split_prefill_cut_ratio", None),
                 getattr(self, "split_prefill_cut_basis", None),
                 getattr(self, "split_prefill_suffix_tokens", None),
+                getattr(self, "split_prefill_suffix_cap", None),
+                getattr(self, "split_prefill_min_queue_tokens", 0),
                 getattr(self, "split_prefill_max_outstanding", None),
                 getattr(self, "split_prefill_defer_ticks", 0),
             ),
