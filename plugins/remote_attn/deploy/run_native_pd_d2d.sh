@@ -26,6 +26,7 @@ case "${1:-}" in
     fi
     export HANDOFF_D2D_STATUS_SNAPSHOT=1
     export HANDOFF_D2D_WARM_TRANSPORT=0
+    export HANDOFF_D2D_WARM_RDMA_RECV_SLOTS=${HANDOFF_D2D_WARM_RDMA_RECV_SLOTS:-0}
     if [[ "$profile" == optimized ]]; then
       export HANDOFF_D2D_WARM_TRANSPORT=1
       export HANDOFF_D2D_WARM_RDMA_SLOTS=${HANDOFF_D2D_WARM_RDMA_SLOTS:-2}

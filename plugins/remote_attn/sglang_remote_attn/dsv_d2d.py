@@ -783,6 +783,7 @@ class Reader:
             bytes=0,
             max_frame_bytes=0,
             slot_setup=0,
+            prewarmed=False,
             slot_wait=0,
             rpc=0,
             source_queue=0,
@@ -828,7 +829,9 @@ class Reader:
                 pool_device(self.owner),
                 backend=self.backend,
                 capacity=self.capacity,
+                gpu_receive_pool=getattr(self.owner, "_d2d_gpu_receive_pool", None),
             )
+            self.read_timing_ns["prewarmed"] = self.bulk.gpu_buffer is not None
         setup_at = time.perf_counter_ns()
         with self.bulk.lock:
             try:
@@ -863,6 +866,8 @@ class Reader:
                 timings["max_frame"] = max(timings["max_frame"], done - started)
                 return header, data
             except bulk.ReadRejected:
+                # The authenticated source explicitly rejected before writing.
+                self.bulk.pending = False
                 raise
             except BaseException:
                 # Even an RPC timeout after a successful send is uncertain to
@@ -1200,6 +1205,10 @@ class Target(NativeTarget):
                     self.copied = True
         except BaseException as exc:
             self.error = repr(exc)
+            if self.bulk_reader is not None and self.bulk_reader.bulk is not None:
+                receiver = self.bulk_reader.bulk
+                if receiver.gpu_buffer is not None and not receiver.unsafe:
+                    receiver.poison()
             dp.io_for(req).poison()
         finally:
             if self.bulk_reader is not None:
@@ -1776,8 +1785,16 @@ def prepare_import_io(target, transfer, session, jobs):
                 setup_event_wait=finished - recorded,
                 setup_gpu_fence=finished - queued,
             )
+            if reader.bulk is not None and reader.bulk.gpu_buffer is not None:
+                # Setup no longer reads this slot. The Reader and its source
+                # lease remain attached for Commit and retirement.
+                reader.bulk.close()
     except BaseException as exc:
         target.error = repr(exc)
+        if target.reader is not None and target.reader.bulk is not None:
+            receiver = target.reader.bulk
+            if receiver.gpu_buffer is not None and not receiver.unsafe:
+                receiver.poison()
         dp.io_for(req).poison()
         if not target.async_handoff:
             raise

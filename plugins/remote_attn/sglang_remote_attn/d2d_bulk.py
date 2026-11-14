@@ -8,6 +8,7 @@ Slots are private to a migration, independent of Remote Attention Q/O lanes.
 import secrets
 import threading
 import time
+from types import SimpleNamespace
 
 import torch
 
@@ -149,8 +150,6 @@ class GpuSendBuffer(Registered):
     """An RDMA staging allocation that never exposes its address to peers."""
 
     def __init__(self, engine, device, capacity):
-        from types import SimpleNamespace
-
         super().__init__(engine, SimpleNamespace())
         self.stream = None
         try:
@@ -170,7 +169,29 @@ class GpuSendBuffer(Registered):
             self.stream.synchronize()
 
 
-class GpuSendPool:
+class GpuReceiveBuffer(Registered):
+    """Registered backing shared across separately fenced receive leases."""
+
+    def __init__(self, engine, device, capacity):
+        super().__init__(engine, SimpleNamespace())
+        try:
+            self.tensor = torch.empty(
+                capacity + FOOTER, dtype=torch.uint8, device=device
+            )
+            self.visibility = dp.Visibility(device, protocol="rdma")
+            dp.event(device).synchronize()
+            self.register()
+        except BaseException:
+            if not self.registered:
+                self.close()
+            raise
+
+    def drain(self):
+        # The receiver lease fences its own consumers before returning backing.
+        pass
+
+
+class _GpuBufferPool:
     def __init__(self):
         self.lock = threading.Lock()
         self.available = []
@@ -178,7 +199,7 @@ class GpuSendPool:
 
     def prewarm(self, engine, device, count):
         for _ in range(count):
-            self.available.append(GpuSendBuffer(engine, device, RDMA_CAPACITY))
+            self.available.append(self.buffer_type(engine, device, RDMA_CAPACITY))
 
     def acquire(self):
         with self.lock:
@@ -197,6 +218,14 @@ class GpuSendPool:
             buffers, self.available = self.available, []
         for buffer in buffers:
             buffer.close()
+
+
+class GpuSendPool(_GpuBufferPool):
+    buffer_type = GpuSendBuffer
+
+
+class GpuReceivePool(_GpuBufferPool):
+    buffer_type = GpuReceiveBuffer
 
 
 class Sender(Registered):
@@ -380,7 +409,14 @@ class Sender(Registered):
 
 class Receiver(Registered):
     def __init__(
-        self, engine, req, device, backend=transport.TCP, *, capacity=CAPACITY
+        self,
+        engine,
+        req,
+        device,
+        backend=transport.TCP,
+        *,
+        capacity=CAPACITY,
+        gpu_receive_pool=None,
     ):
         self.capacity = frame_capacity(capacity, rdma=backend == transport.GPU)
         super().__init__(engine, req)
@@ -392,7 +428,16 @@ class Receiver(Registered):
         self.sequence = 0
         self.consumed = None
         self.nonce = secrets.token_hex(16)
+        self.gpu_receive_pool = gpu_receive_pool
+        self.gpu_buffer = None
+        self.pending = False
         try:
+            if gpu_receive_pool is not None and backend == transport.GPU:
+                self.gpu_buffer = gpu_receive_pool.acquire()
+            if self.gpu_buffer is not None:
+                self.tensor = self.gpu_buffer.tensor
+                self.visibility = self.gpu_buffer.visibility
+                return
             self.tensor = torch.empty(
                 self.capacity + FOOTER,
                 dtype=torch.uint8,
@@ -409,8 +454,11 @@ class Receiver(Registered):
 
     def prepare(self):
         self.check()
+        if self.gpu_buffer is not None and self.pending:
+            raise RuntimeError("D2D receive slot still has an outstanding write")
         self.drain()
         self.sequence += 1
+        self.pending = True
         return dict(
             protocol=self.protocol,
             base=self.tensor.data_ptr(),
@@ -423,6 +471,7 @@ class Receiver(Registered):
         self.check()
         if (
             type(size) is not int
+            or (self.gpu_buffer is not None and not self.pending)
             or header.get("bulk_protocol") != self.protocol
             or header.get("bulk_nonce") != self.nonce
             or header.get("bulk_sequence") != self.sequence
@@ -451,11 +500,25 @@ class Receiver(Registered):
                 raise ValueError("direct D2D consumption requires a GPU slot")
             apply(self.tensor[:size])
             self.consumed = dp.event(self.device)
+            self.pending = False
             return None
         # Return independent GPU backing; slot reuse waits for this copy event.
         data = self.tensor[:size].to(self.device, non_blocking=True, copy=True)
         self.consumed = dp.event(self.device)
+        self.pending = False
         return data
+
+    def poison(self):
+        if self.gpu_buffer is not None:
+            self.gpu_buffer.unsafe = True
+        super().poison()
+
+    def dispose(self):
+        if self.gpu_buffer is not None:
+            if self.pending:
+                raise RuntimeError("D2D receive write completion is unknown")
+            self.gpu_receive_pool.release(self.gpu_buffer)
+            self.gpu_buffer = None
 
     def drain(self):
         if self.consumed is not None:

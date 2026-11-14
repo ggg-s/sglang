@@ -187,8 +187,7 @@ curl -fsS "$ADMIN/v1/drain/status" | jq '{
   `d2d_control_slot.{slot_wait_ms,worker_publish_to_claim_ms,worker_exec_ms,worker_tp_confirm_ms}`。
   发给同一 worker 的 wave envelope 只计一次。
 - `rdma_sender_prewarmed_ranks` 记录实际命中预热发送槽的源端 rank 数。
-  预注册槽耗尽时沿用按需分配。目的端接收槽注册、路由 attach 和实际 peer 写入
-  仍依赖每次迁移。两组均在 Import 成功后先写 journal，再执行 COMMIT。
+  预注册发送槽耗尽时沿用按需分配。两组均在 Import 成功后先写 journal，再执行 COMMIT。
 - `worker_snapshot_sample_ms` 记录控制器接收到的每份快照的 TP 最大采样耗时。
   快照丢失时对 drain 两端的全量状态回退 RPC 按最近成功状态节流到约 100 ms，
   优化组的整条控制 wave 期间全量状态 RPC 也会让路，命令结束后补读。
@@ -217,8 +216,8 @@ jq -c 'select(.type == "d2d_control_slot" or .type == "d2d_reconcile")' \
   `setup_event_record` 和 `setup_event_wait`。原 `setup_gpu_fence` 是记录加等待，
   分析时只算一次。异步 Import 的事件等待发生在后台线程。
 - `setup_reads_ns_by_rank.slot_setup` 观测接收槽创建和注册。该对象里的
-  `count`、`bytes`、`max_frame_bytes` 分别是次数和字节数，其余时间字段为 ns。
-  尚未发生读操作时计数为 0。
+  `count`、`bytes`、`max_frame_bytes` 分别是次数和字节数，`prewarmed` 表示
+  命中预热槽，其余时间字段为 ns。尚未发生读操作时计数为 0。
 - `commit_timing_ns_by_rank.wave_prepare_agree` 是 Commit wave 共享的
   TP 有效性、确认进度和容量投票耗时，取最终准入的那次 wave。
   `source_confirm_rpc` 是每个请求成功确认的 RPC 耗时。
@@ -230,3 +229,26 @@ jq -c 'select(.type == "d2d_control_slot" or .type == "d2d_reconcile")' \
 - `*_by_rank` 按目标 TP rank 顺序记录，慢 rank 用最大值看，跨 rank 不求和。
   老 worker 的回包可能没有计时。状态输出仍可通过 `d2d_status` 查单个 epoch
   的引擎状态。
+
+
+### 目标端 RDMA 接收槽池 A/B
+
+使用同一提交，两组都设置 `D2D_PROFILE=optimized`，保持发送槽、PREP=4、K=2
+和 Pre-copy 窗口一致。重启 Decode 后分别设置以下环境变量再起原 Decode 命令。
+
+```bash
+# A: HANDOFF_D2D_WARM_RDMA_RECV_SLOTS=0
+# B: HANDOFF_D2D_WARM_RDMA_RECV_SLOTS=2
+D2D_PROFILE=optimized HANDOFF_D2D_WARM_RDMA_RECV_SLOTS=2 \
+  "$launch" decode bash start_pd.sh "${decode_args[@]}"
+```
+
+每个接收槽额外占用约 64 MiB/rank，允许配置 0 到 4。接收槽用于 Import 和后续
+bulk 拷贝，Import 完成 GPU fence 后先归还，源端 lease 继续用于 Commit。
+池耗尽时按需创建，TCP 和 live Pre-copy 沿用各自的接收槽。Manifest 继续在目标端
+通过源端 lease 校验。每次借用生成新 nonce；DMA 或消费证明不明确时隔离原 MR。
+
+先用四条长请求全迁验证，查看 `setup_reads_ns_by_rank[].prewarmed` 和
+`slot_setup`。再比较 `descriptor_to_import_ms`、`source_release_ms`、
+SSE token 连续性和已迁/未迁请求 ITL。背景 bulk 的命中可以从目标端
+`d2d_status` 的 `target.bulk_reads_ns.prewarmed` 查看。

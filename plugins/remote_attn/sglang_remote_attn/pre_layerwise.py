@@ -1414,7 +1414,7 @@ def initialize(scheduler):
             getattr(controller, "dsv41_remote", False)
             and os.environ.get("HANDOFF_D2D_WARM_TRANSPORT") == "1"
         ):
-            from .d2d_bulk import GpuSendPool
+            from .d2d_bulk import GpuReceivePool, GpuSendPool
             from .dsv_d2d import bulk_catalog, on_device, pool_device
             from .mooncake_backend import GPU
 
@@ -1424,15 +1424,26 @@ def initialize(scheduler):
             with on_device(device):
                 catalog = controller._d2d_bulk_catalog = bulk_catalog(controller, device)
                 hub.prepare_d2d_bulk()
-                slots = int(os.environ.get("HANDOFF_D2D_WARM_RDMA_SLOTS", "2"))
-                if not 0 <= slots <= 4:
-                    raise ValueError("HANDOFF_D2D_WARM_RDMA_SLOTS must be between 0 and 4")
-                if slots and GPU in catalog.engines:
-                    pool = controller._d2d_gpu_send_pool = GpuSendPool()
-                    try:
-                        pool.prewarm(catalog.engines[GPU], device, slots)
-                    except RuntimeError:
-                        logger.warning("Could not prewarm all D2D RDMA slots", exc_info=True)
+                pools = (
+                    ("HANDOFF_D2D_WARM_RDMA_SLOTS", "2", "_d2d_gpu_send_pool", GpuSendPool),
+                    (
+                        "HANDOFF_D2D_WARM_RDMA_RECV_SLOTS",
+                        "0",
+                        "_d2d_gpu_receive_pool",
+                        GpuReceivePool,
+                    ),
+                )
+                for variable, default, attribute, pool_type in pools:
+                    slots = int(os.environ.get(variable, default))
+                    if not 0 <= slots <= 4:
+                        raise ValueError(f"{variable} must be between 0 and 4")
+                    if slots and GPU in catalog.engines:
+                        pool = pool_type()
+                        setattr(controller, attribute, pool)
+                        try:
+                            pool.prewarm(catalog.engines[GPU], device, slots)
+                        except RuntimeError:
+                            logger.warning("Could not prewarm %s", variable, exc_info=True)
 
 
 def run_batch(original, scheduler, batch, *args, **kwargs):
@@ -1668,9 +1679,10 @@ def shutdown(scheduler):
         from .dsv_d2d import drain_sources
 
         drain_sources(controller)
-    pool = getattr(controller, "_d2d_gpu_send_pool", None)
-    if pool is not None:
-        pool.close()
+    for attribute in ("_d2d_gpu_send_pool", "_d2d_gpu_receive_pool"):
+        pool = getattr(controller, attribute, None)
+        if pool is not None:
+            pool.close()
     for source in controller.sources:
         if source.thread is not None:
             source.thread.join(timeout=controller.config.drain_timeout)

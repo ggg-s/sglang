@@ -15702,6 +15702,84 @@ class TestRemoteAttn(CustomTestCase):
         self.assertTrue(buffer.registered)
         self.assertTrue(buffer.unsafe)
 
+    def test_dsv_d2d_receive_pool_fences_reuse_and_quarantines_unacked_writes(self):
+        """Pool backing may only return after the current receive lease is fenced."""
+        from sglang_remote_attn import d2d_bulk as bulk
+        from sglang_remote_attn import dsv_d2d as d2d
+        from sglang_remote_attn import mooncake_backend as transport
+
+        engine = transport.handle(d2d.manager(self._d2d_env().target).engine)
+        pool = bulk.GpuReceivePool()
+        self.addCleanup(pool.close)
+        pool.prewarm(engine, "cpu", 1)
+
+        def receive():
+            return bulk.Receiver(
+                engine,
+                SimpleNamespace(),
+                "cpu",
+                backend=transport.GPU,
+                capacity=bulk.LEGACY_CAPACITY,
+                gpu_receive_pool=pool,
+            )
+
+        first = receive()
+        region = first.prepare()
+        backing = first.gpu_buffer
+        self.assertIsNotNone(backing)
+        self.assertEqual(region["size"], bulk.LEGACY_CAPACITY + bulk.FOOTER)
+
+        fallback = receive()
+        self.assertIsNone(fallback.gpu_buffer)
+        self.assertNotEqual(fallback.tensor.data_ptr(), region["base"])
+        fallback.close()
+
+        def complete():
+            # The backing must still be out of the pool when the fence runs.
+            self.assertFalse(pool.available)
+
+        with patch.object(
+            bulk.dp, "event", return_value=SimpleNamespace(synchronize=complete)
+        ):
+            first.consume(
+                dict(
+                    bulk_protocol=first.protocol,
+                    bulk_nonce=region["nonce"],
+                    bulk_sequence=first.sequence,
+                    bytes=1,
+                ),
+                1,
+                timeout=0,
+                apply=lambda _: None,
+            )
+        first.close()
+        self.assertIn(
+            region["base"], engine.native.regions
+        )  # Returning a lease keeps the MR registered.
+
+        second = receive()
+        fresh = second.prepare()
+        self.assertEqual(fresh["base"], region["base"])
+        self.assertNotEqual(fresh["nonce"], region["nonce"])
+        self.assertEqual(second.sequence, 1)
+        with self.assertRaisesRegex(ValueError, "completion does not match"):
+            second.consume(
+                dict(
+                    bulk_protocol=second.protocol,
+                    bulk_nonce=region["nonce"],
+                    bulk_sequence=1,
+                    bytes=1,
+                ),
+                1,
+                timeout=0,
+            )
+        with self.assertRaisesRegex(RuntimeError, "write completion is unknown"):
+            second.close()
+        pool.close()
+        self.assertTrue(second.req._d2d_bulk_unsafe and backing.unsafe)
+        self.assertFalse(pool.available)
+        self.assertIn(fresh["base"], engine.native.regions)
+
     def test_dsv_d2d_bulk_uses_registered_mooncake_bytes_without_tcp_payload(self):
         from sglang_remote_attn import dsv_d2d as d2d
 
@@ -15768,9 +15846,21 @@ class TestRemoteAttn(CustomTestCase):
         self.assertTrue(target.decode_req.req.kv.holds_kv)
 
     def test_dsv_d2d_bulk_lost_ack_retains_receiver_even_after_successful_write(self):
+        from contextlib import nullcontext
+
         from sglang_remote_attn import dsv_d2d as d2d
+        from sglang_remote_attn import mooncake_backend as transport
 
         e = self._d2d_env()
+        self.enterContext(patch.dict(os.environ, {"HANDOFF_D2D_BACKEND": "rdma"}))
+        self.enterContext(patch.object(transport, "gpu_capability", return_value=True))
+        stream = SimpleNamespace(wait_event=lambda _: None, synchronize=lambda: None)
+        self.enterContext(patch.object(torch.cuda, "Stream", return_value=stream))
+        self.enterContext(patch.object(torch.cuda, "stream", return_value=nullcontext()))
+        engine = d2d.manager(e.target).engine
+        pool = e.target._d2d_gpu_receive_pool = d2d.bulk.GpuReceivePool()
+        self.addCleanup(pool.close)
+        pool.prewarm(transport.handle(engine), "cpu", 1)
         e.import_(e.freeze())
         self.assertTrue(e.blocked.wait(3))
         target = e.target.d2d_targets[e.epoch]
@@ -15778,7 +15868,7 @@ class TestRemoteAttn(CustomTestCase):
 
         def lost_ack(header, *args, **kwargs):
             result = call(header, *args, **kwargs)
-            if header.get("dsv_d2d") in {"read", "read_group"}:
+            if header.get("dsv_d2d") in {"read", "read_group", "read_pack"}:
                 raise TimeoutError("lost successful bulk ACK")
             return result
 
@@ -15789,7 +15879,10 @@ class TestRemoteAttn(CustomTestCase):
         slot = target.bulk_reader.bulk
         self.assertTrue(slot.unsafe)
         self.assertFalse(slot.closed)
-        self.assertIn(slot, d2d.manager(e.target).engine._d2d_bulk_owners)
+        self.assertTrue(target.bulk_reader.read_timing_ns["prewarmed"])
+        self.assertTrue(slot.gpu_buffer.unsafe)
+        self.assertIn(slot.tensor.data_ptr(), engine.regions)
+        self.assertIsNone(pool.acquire())
         with self.assertRaises(d2d.TransportFailure):
             e.command(e.target, "d2d_abort")
         self.assertEqual(e.freed, [])
@@ -17726,16 +17819,30 @@ class TestRemoteAttn(CustomTestCase):
             dst = pc.page_ids(e.target, ticket.req, 0, count)
             self.assertTrue(torch.equal(source_tables[i][src], target_tables[i][dst]))
 
-        transfer = p.command(
-            e.source,
-            "precopy",
-            "freeze",
-            reservation=plan,
-            precopy_receipts=[[applied["receipt"]]],
-            **common,
-        )["transfer"]
-        self.assertEqual(transfer["precopy"]["prefix_pages"], coverage)
-        self.assertTrue(p.finish(e, "precopy", transfer).closed)
+        pool = d2d.bulk.GpuReceivePool()
+        self.addCleanup(pool.close)
+        pool.prewarm(transport.handle(d2d.manager(e.target).engine), "cpu", 1)
+        e.target._d2d_gpu_receive_pool = pool
+        with (
+            patch.dict(os.environ, {"HANDOFF_D2D_BACKEND": "rdma"}),
+            patch.object(transport, "gpu_capability", return_value=True),
+            patch.object(torch.cuda, "Stream", return_value=stream),
+            patch.object(torch.cuda, "stream", return_value=nullcontext()),
+        ):
+            transfer = p.command(
+                e.source,
+                "precopy",
+                "freeze",
+                reservation=plan,
+                precopy_receipts=[[applied["receipt"]]],
+                **common,
+            )["transfer"]
+            self.assertEqual(transfer["precopy"]["prefix_pages"], coverage)
+            target = p.finish(e, "precopy", transfer)
+        self.assertTrue(target.closed)
+        self.assertTrue(target.reader.read_timing_ns["prewarmed"])
+        self.assertTrue(target.bulk_reader.read_timing_ns["prewarmed"])
+        self.assertEqual(len(pool.available), 1)
 
     def test_dsv_d2d_precopy_replay_reports_zero_new_payload_bytes(self):
         """Retrying an acknowledged chunk must not count another physical payload."""
