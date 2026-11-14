@@ -22,7 +22,8 @@ from urllib.parse import parse_qs
 
 PROTOCOL = "dsv-d2d-v2"
 TERMINAL = {"DONE", "CANCELLED"}
-PRECOMMIT = {"PLAN", "RESERVE", "WAIT_CUT", "FREEZE", "IMPORT"}
+BEFORE_FREEZE = {"PLAN", "RESERVE", "WAIT_CUT"}
+PRECOMMIT = BEFORE_FREEZE | {"FREEZE", "IMPORT"}
 ACTIVE_MIGRATION_PHASES = PRECOMMIT | {"COMMIT", "ROLLBACK", "TARGET"}
 CUTOVER_PHASES = {"FREEZE", "IMPORT", "COMMIT"}
 STATUS_VISIBILITY_GRACE_S = 30
@@ -266,6 +267,7 @@ class DsvGateway:
         self.active_rids = {}  # Ordered live journal IDs, updated after persist.
         self.phase_ready = {}
         self.pending_handoff_retries = {}
+        self.unsent_reserves = set()
         self.facts, self.fact_errors = {}, {}
         self.facts_at = {}
         self.worker_status_snapshots = worker_status_snapshots
@@ -480,6 +482,10 @@ class DsvGateway:
             phase = entry["phase"]
             if phase != old["phase"]:
                 self.pending_handoff_retries.pop(rid, None)
+                if old["phase"] == "RESERVE":
+                    self.unsent_reserves.discard(rid)
+                if old["phase"] == "PLAN" and phase == "RESERVE":
+                    self.unsent_reserves.add(rid)
                 drain = self.journal["drain"]
                 if (
                     self.worker_status_snapshots
@@ -1810,6 +1816,53 @@ class DsvGateway:
             )
         )
 
+    def _finish_before_freeze(self, entry, request, needs_target_cleanup):
+        rid = entry["rid"]
+        if needs_target_cleanup:
+            if entry.get("precopy_pending") is not None:
+                outcome = "migration_cancelled_by_finish"
+            elif self._cut_due(entry, request):
+                outcome = "window_missed_request_finished"
+            else:
+                outcome = "completed_on_source_before_cut"
+            self._update(
+                rid,
+                phase="ROLLBACK",
+                migration_skip_reason="request_finished",
+                migration_outcome=outcome,
+                error=None,
+            )
+            return
+
+        # PLAN may have installed a source plan even if its RPC reply was
+        # lost. The idempotent resume command closes that epoch and tombstones it.
+        rows = self._call_for(entry, "src", "d2d_resume", entry["epoch"])
+        if not all(row.get("resumed") for row in rows):
+            return
+        finished = (
+            dict(
+                phase="DONE",
+                final_output_ids=request["output_ids"],
+                final_finish_reason=request["finish_reason"],
+            )
+            if request["kv_released"]
+            else dict(phase="SOURCE", cut_attempted=False)
+        )
+        with self.cv:
+            if request["kv_released"] and self.journal["entries"][rid]["cancel_requested"]:
+                finished["phase"] = "CANCELLED"
+            self._update(
+                rid,
+                **finished,
+                migration_requested=False,
+                admission_plans=None,
+                migration_skip_reason="request_finished",
+                migration_outcome="completed_on_source_before_migration",
+                error=None,
+                blocked=False,
+                **self._end_deferral(entry),
+            )
+
     def _advance(self, entry):
         rid, phase = entry["rid"], entry["phase"]
         if phase in PRECOMMIT and self._drain_abort_requested(rid):
@@ -1820,14 +1873,16 @@ class DsvGateway:
                 migration_outcome="drain_aborted",
             )
             return
-        self._bound(
-            entry,
-            roles=(
-                [entry["owner"]]
-                if phase in {"SUBMIT", "SOURCE", "DIRECT", "LOCAL"}
-                else None
-            ),
+        # A recovered RESERVE intent may have reached the target. Only this
+        # process can prove that a newly journaled intent was never dispatched.
+        needs_target_cleanup = phase == "WAIT_CUT" or (
+            phase == "RESERVE" and rid not in self.unsent_reserves
         )
+        source_only = (
+            phase in {"SUBMIT", "SOURCE", "DIRECT", "LOCAL"}
+            or phase in BEFORE_FREEZE and not needs_target_cleanup
+        )
+        self._bound(entry, roles=(entry["owner"],) if source_only else None)
         request = self._request(entry, entry["owner"])
         if (
             phase in {"SOURCE", "PLAN", "RESERVE", "WAIT_CUT", "FREEZE"}
@@ -1860,7 +1915,7 @@ class DsvGateway:
         ):
             raise RuntimeError(request["error"])
         if request is None and (
-            phase == "WAIT_CUT"
+            phase in BEFORE_FREEZE
             or phase == "SUBMIT" and entry.get("submit_started")
             or phase in {"SOURCE", "DIRECT"}
             and (
@@ -1870,7 +1925,7 @@ class DsvGateway:
             )
         ):
             try:
-                request = self._lookup_request(entry, include_live=phase == "WAIT_CUT")
+                request = self._lookup_request(entry, include_live=phase in BEFORE_FREEZE)
             except (StatusBusy, BlockingIOError, TimeoutError):
                 # A contended advisory lookup does not prove that a submitted
                 # request is missing. Leave the current intent for another tick.
@@ -2031,6 +2086,12 @@ class DsvGateway:
                 # A missing request cannot prove completion. Cancel this
                 # reversible epoch before reconciling the source's output.
                 raise RuntimeError("prepared source request missing")
+        if phase in BEFORE_FREEZE:
+            if request["finished"]:
+                self._finish_before_freeze(entry, request, needs_target_cleanup)
+                return
+            if source_only:
+                self._bound(entry, roles=("dst",))
         epoch = entry["epoch"]
         destination = entry.get("workers", {}).get("dst", "D1")
         common = dict(
@@ -2088,6 +2149,8 @@ class DsvGateway:
                 **self._end_deferral(entry),
             )
         elif phase == "RESERVE":
+            # From here, a failed call cannot prove no target reservation.
+            self.unsent_reserves.discard(rid)
             rows = (yield self._command("dst", "d2d_reserve", epoch, plans=entry["plans"]))
             if not all(r.get("reserved") for r in rows):
                 raise RuntimeError("target did not reserve on every rank")
@@ -2106,21 +2169,7 @@ class DsvGateway:
             )
         elif phase == "WAIT_CUT":
             cut_due = self._cut_due(entry, request)
-            if request["finished"]:
-                if entry.get("precopy_pending") is not None:
-                    outcome = "migration_cancelled_by_finish"
-                elif cut_due:
-                    outcome = "window_missed_request_finished"
-                else:
-                    outcome = "completed_on_source_before_cut"
-                self._update(
-                    rid,
-                    phase="ROLLBACK",
-                    migration_skip_reason="request_finished",
-                    migration_outcome=outcome,
-                    error=None,
-                )
-            elif (
+            if (
                 self.decode_workers
                 and entry["migration_requested"]
                 and not request["output_ids"]

@@ -405,6 +405,120 @@ class TestDsvMigrationController(CustomTestCase):
                     all(item["async_handoff"] and item["defer_bulk"] for item in wave)
                 )
 
+    def test_natural_finish_before_reserve_never_contacts_destination(self):
+        """Completion in PLAN or before first RESERVE needs only source cleanup."""
+        for phase in ("PLAN", "RESERVE"):
+            with self.subTest(phase=phase), tempfile.TemporaryDirectory() as root:
+                controller = self.controller_type(
+                    self.driver,
+                    TextTokenizer(),
+                    Path(root),
+                    **(self.config | dict(standby=("D1", "D2"))),
+                )
+                self.addCleanup(controller.close)
+                self.driver.requests["D0"].clear()
+                controller.tick()
+                controller.prefill_facts.update(
+                    dict.fromkeys(controller.prefills, time.monotonic())
+                )
+                rid = controller.accept({"prompt_ids": [0], "max_new_tokens": 12})
+                controller.tick()
+                controller.tick()
+                controller.start_named_drain("D0", "D1")
+                controller.tick()
+                if phase == "RESERVE":
+                    controller.tick()
+                entry = controller.entry(rid)
+                self.assertEqual(entry["phase"], phase)
+                finished = self.driver.request([1, 2, 3], finished=True)
+                if phase == "PLAN":
+                    finished["kv_released"] = False
+                self.driver.requests["D0"][entry["source_rid"]] = finished
+                send_to = self.driver.send_to
+
+                def resume(directory, worker, payload, timeout):
+                    if payload["cmd"] == "d2d_resume":
+                        self.assertEqual(worker, "D0")
+                        self.driver.commands.append(
+                            (worker, payload["cmd"], payload["migration_epoch"])
+                        )
+                        return {"resumed": True}
+                    return send_to(directory, worker, payload, timeout)
+
+                with patch.object(self.driver, "send_to", side_effect=resume):
+                    controller.tick()
+                    if phase == "PLAN":
+                        self.assertEqual(controller.entry(rid)["phase"], "SOURCE")
+                        self.assertNotEqual(controller.drain_status()["state"], "SAFE_TO_STOP")
+                        finished["kv_released"] = True
+                    controller.tick()
+                self.assertEqual(controller.entry(rid)["phase"], "DONE")
+                self.assertEqual(controller.entry(rid)["final_output_ids"], [1, 2, 3])
+                self.assertEqual(
+                    [
+                        cmd for worker, cmd, epoch in self.driver.commands
+                        if worker == "D1" and epoch == entry["epoch"]
+                    ],
+                    [],
+                )
+                self.assertIn(("D0", "d2d_resume", entry["epoch"]), self.driver.commands)
+                self.assertEqual(controller.drain_status()["state"], "SAFE_TO_STOP")
+                controller.close()
+
+    def test_natural_finish_after_lost_reserve_reply_waits_for_cleanup(self):
+        """A recovered RESERVE may still own a destination row after source EOS."""
+        self.controller.close()
+        self.controller = self.open_controller(standby=("D1", "D2"))
+        controller = self.controller
+        rid = controller.accept({"prompt_ids": [0], "max_new_tokens": 12})
+        self.ticks(2)
+        controller.start_named_drain("D0", "D1")
+        self.ticks(2)
+        entry = controller.entry(rid)
+        self.assertEqual(entry["phase"], "RESERVE")
+        epoch = entry["epoch"]
+        reserved = False
+        allow_abort = False
+        send_to = self.driver.send_to
+
+        def drop_reserve_reply(directory, worker, payload, timeout):
+            nonlocal reserved
+            cmd = payload["cmd"]
+            if payload["migration_epoch"] == epoch:
+                if cmd == "d2d_reserve":
+                    self.assertFalse(reserved, "finished request retried RESERVE")
+                    reserved = True
+                    raise TimeoutError("lost RESERVE reply")
+                if cmd == "d2d_precopy_close":
+                    return {"closed": True}
+                if cmd == "d2d_abort":
+                    if allow_abort:
+                        reserved = False
+                    return {"aborted": allow_abort}
+                if cmd == "d2d_resume":
+                    self.assertFalse(reserved)
+                    return {"resumed": True}
+            return send_to(directory, worker, payload, timeout)
+
+        with patch.object(self.driver, "send_to", side_effect=drop_reserve_reply):
+            self.ticks(1)
+            self.assertTrue(reserved)
+            self.assertEqual(controller.entry(rid)["phase"], "RESERVE")
+            self.driver.requests["D0"][entry["source_rid"]] = self.driver.request(
+                [1, 2, 3], finished=True
+            )
+            controller.close()
+            self.controller = self.open_controller(standby=("D1", "D2"))
+            self.ticks(2)
+            self.assertTrue(reserved)
+            self.assertEqual(self.controller.entry(rid)["phase"], "ROLLBACK")
+            self.assertNotEqual(self.controller.drain_status()["state"], "SAFE_TO_STOP")
+            allow_abort = True
+            self.ticks(2)
+        self.assertFalse(reserved)
+        self.assertEqual(self.controller.entry(rid)["final_output_ids"], [1, 2, 3])
+        self.assertEqual(self.controller.drain_status()["state"], "SAFE_TO_STOP")
+
     def test_retired_source_rolls_back_reservation_before_publishing_terminal(self):
         """EOS between polls leaves a destination reservation to clean up."""
         self.controller.close()
