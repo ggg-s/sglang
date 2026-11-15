@@ -505,6 +505,7 @@ def bootstrap(original, receiver, *, bootstrap_info, message, operation):
         and operation == "send_metadata"
         and not bootstrap_info["is_dummy"]
     ):
+        from . import dsv4_split_prefill
         from .qwen_split_prefill import (
             DECODE_PRIORITY,
             SUFFIX_CAP_WIRE,
@@ -513,7 +514,12 @@ def bootstrap(original, receiver, *, bootstrap_info, message, operation):
         )
 
         min_cut, chunk_cap = limits
-        message = [*message, WIRE + f"{min_cut}:{chunk_cap}".encode("ascii")]
+        offer = (
+            dsv4_split_prefill.encode_offer(receiver)
+            if getattr(receiver, "_dsv4_split_window", None) is not None
+            else WIRE + f"{min_cut}:{chunk_cap}".encode("ascii")
+        )
+        message = [*message, offer]
         suffix_cap = getattr(receiver, "_hybrid_split_suffix_cap", 0)
         if suffix_cap:
             message.append(SUFFIX_CAP_WIRE + str(suffix_cap).encode("ascii"))
@@ -530,6 +536,7 @@ def bootstrap(original, receiver, *, bootstrap_info, message, operation):
 def parse_transfer(original, *args, **kwargs):
     value = original(*args, **kwargs)
     message = kwargs.get("msg", args[-1] if args else None)
+    from . import dsv4_split_prefill
     from .qwen_split_prefill import (
         AUTO_SUFFIX_CAP_MAX,
         DECODE_PRIORITY,
@@ -544,8 +551,16 @@ def parse_transfer(original, *args, **kwargs):
         (frame[len(WIRE) :] for frame in extensions if frame.startswith(WIRE)), b""
     )
     min_cut, _, chunk_cap = split_offer.partition(b":")
-    if all(0 < len(field) <= 10 and field.isdigit() for field in (min_cut, chunk_cap)):
+    dsv4_offers = [
+        frame for frame in extensions if frame.startswith(dsv4_split_prefill.WIRE)
+    ]
+    if len(dsv4_offers) == 1 and not split_offer:
+        dsv4_split_prefill.parse_offer(value, dsv4_offers[0])
+    elif not dsv4_offers and all(
+        0 < len(field) <= 10 and field.isdigit() for field in (min_cut, chunk_cap)
+    ):
         value._hybrid_split_limits = int(min_cut), int(chunk_cap)
+    if hasattr(value, "_hybrid_split_limits"):
         value._hybrid_split_decode_priority = DECODE_PRIORITY in extensions
         for tag, attr, maximum in (
             (SUFFIX_CAP_WIRE, "_hybrid_split_suffix_cap", AUTO_SUFFIX_CAP_MAX),

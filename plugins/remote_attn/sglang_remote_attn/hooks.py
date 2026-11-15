@@ -10,6 +10,7 @@ from . import (
     control_wakeup,
     decode_overlap,
     destination_cache,
+    dsv4_split_prefill,
     dsv41_layerwise,
     dsv41_progressive,
     dsv41_receive,
@@ -615,6 +616,7 @@ HOOKS = {
     "sglang.srt.disaggregation.prefill.maybe_release_metadata_buffer": source_resources.release_metadata,
     "sglang.srt.disaggregation.prefill.SchedulerDisaggregationPrefillMixin.maybe_send_cached_prefix_chunk": prefix_stream.cached_prefix,
     "sglang.srt.disaggregation.decode.DecodePreallocQueue._match_prefix_and_lock": destination_cache.match_prefix,
+    "sglang.srt.disaggregation.decode.DecodePreallocQueue._select_swa_prealloc_start": dsv4_split_prefill.select_swa_prealloc_start,
     "sglang.srt.disaggregation.decode.DecodePreallocQueue._send_kv_metadata": destination_cache.send_metadata,
     "sglang.srt.disaggregation.decode.DecodeTransferQueue._commit_transfer_to_req": dsv41_remote.commit,
     "sglang.srt.disaggregation.common.staging_handler.StagingManagerMixin._handle_staging_req": dsv41_receive.allocate,
@@ -642,6 +644,7 @@ HOOKS = {
     "sglang.srt.disaggregation.mooncake.conn.MooncakeKVManager.__init__": _mooncake_init,
     "sglang.srt.disaggregation.mooncake.conn.MooncakeKVManager._transfer_data": _transfer,
     "sglang.srt.disaggregation.mooncake.conn.MooncakeKVManager.send_kvcache": dsv41_layerwise.send_selected,
+    "sglang.srt.disaggregation.mooncake.conn.MooncakeKVManager.maybe_send_extra": dsv4_split_prefill.send_states,
     "sglang.srt.disaggregation.mooncake.conn.MooncakeKVManager.send_aux": dsv41_progressive.send_aux,
     "sglang.srt.disaggregation.mooncake.conn.MooncakeKVManager.add_transfer_request": prefix_stream.track,
     "sglang.srt.models.deepseek_v4_replay_tail.DecoderReplayTail.plan": prefill_overlap.tail_plan,
@@ -676,6 +679,7 @@ HOOKS.update(
         "sglang.srt.disaggregation.prefill.PrefillBootstrapQueue.can_prefill_before_bootstrap": qwen_split_prefill.can_prefill_before_bootstrap,
         "sglang.srt.disaggregation.prefill.PrefillBootstrapQueue.finalize_bootstrap": qwen_split_prefill.finalize_bootstrap,
         "sglang.srt.disaggregation.utils.MetadataBuffers.set_buf": qwen_split_prefill.set_metadata,
+        "sglang.srt.disaggregation.utils.MetadataBuffers.clear_slot": qwen_split_prefill.clear_metadata,
         "sglang.srt.managers.schedule_batch.Req.init_next_round_input": qwen_split_prefill.init_input,
     }
 )

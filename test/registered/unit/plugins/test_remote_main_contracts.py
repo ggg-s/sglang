@@ -6,6 +6,7 @@ import os
 import sys
 import unittest
 from contextlib import ExitStack
+from dataclasses import dataclass
 from pathlib import Path
 from types import SimpleNamespace as NS
 from unittest.mock import Mock, patch
@@ -1256,6 +1257,7 @@ class TestSplitPD(CustomTestCase):
                             disaggregation_decode_allocation_policy="early",
                             disaggregation_decode_host_receive_threshold=1,
                             disaggregation_decode_enable_offload_kvcache=False,
+                            disaggregation_transfer_backend="mooncake",
                         )
                     ),
                 },
@@ -1263,7 +1265,9 @@ class TestSplitPD(CustomTestCase):
         )
         self.stack.enter_context(patch.dict(os.environ, {}, clear=True))
 
-    def controller(self, role="prefill", *, hybrid=False, max_prefill_tokens=16384):
+    def controller(
+        self, role="prefill", *, hybrid=False, dsv4=False, max_prefill_tokens=16384
+    ):
         scheduler = NS(
             disaggregation_mode=NS(value=role),
             max_prefill_tokens=max_prefill_tokens,
@@ -1277,12 +1281,238 @@ class TestSplitPD(CustomTestCase):
             rank=0,
             tp_size=1,
             hybrid_gdn=hybrid,
+            dsv41_layerwise=dsv4,
+            dsv4_split_schema="a" * 64 if dsv4 else None,
+            pd_remote=False,
+            pool=NS(page_size=256),
             agree=lambda flags: flags,
             pd_visibility=NS(receive=lambda: None),
         )
         scheduler._pre_layerwise = controller
         self.split.configure(controller)
         return controller
+
+    def test_dsv4_split_negotiates_swa_capacity_and_commits_page_aligned_cut(self):
+        self.assertFalse(self.controller(dsv4=True).split_prefill)
+        with patch.dict(os.environ, {"HANDOFF_HYBRID_SPLIT_PREFILL": "1"}):
+            self._check_dsv4_split(adaptive=False)
+
+    def test_dsv4_split_freezes_page_aligned_adaptive_offer(self):
+        with patch.dict(
+            os.environ,
+            {"HANDOFF_HYBRID_SPLIT_PREFILL": "1", "HANDOFF_SPLIT_ADAPTIVE": "1"},
+        ):
+            self._check_dsv4_split(adaptive=True)
+
+    def _check_dsv4_split(self, *, adaptive):
+        from sglang_remote_attn import dsv4_split_prefill as flash
+
+        with patch.object(
+            sys, "path", [str(ROOT / "test/manual/remote_attn"), *sys.path]
+        ):
+            from dsv41_remote_probe_support import definitions
+
+        state_type = definitions(
+            ROOT, "python/sglang/srt/disaggregation/base/conn.py", owner="StateType"
+        )
+        component_type = definitions(
+            ROOT,
+            "python/sglang/srt/mem_cache/unified_cache/component_type.py",
+            owner="ComponentType",
+        )
+        storage_module = "sglang.srt.mem_cache.static_kv_storage"
+        storage = NS()
+        self.stack.enter_context(
+            patch.dict(
+                sys.modules,
+                {
+                    "sglang.srt.disaggregation.base.conn": NS(StateType=state_type),
+                    "sglang.srt.mem_cache.unified_cache.component_type": NS(
+                        ComponentType=component_type
+                    ),
+                    storage_module: storage,
+                },
+            )
+        )
+
+        @dataclass
+        class Peer:
+            dst_state_indices: list
+
+        length = 8192 + 19
+        page, window = 256, 128
+        p = self.controller(dsv4=True)
+        d = self.controller("decode", dsv4=True, max_prefill_tokens=4200)
+        if adaptive:
+            p.split_prefill_prefix_rate = 6000
+            budget = d.split_prefill_decode_budget
+            for _ in range(8 * 8):
+                budget.observe(2560, 200, suffix=True, rank=1)
+            self.assertEqual(budget.cap, 2560)
+            self.assertLess(budget.coverage, 1)
+            d.agree = lambda vote: (
+                [vote[0], int(budget.cap), 2700, 4500, -20_000, vote[-1]]
+                if len(vote) == 6
+                else vote
+            )
+        manager = NS(
+            kv_shard_size=1,
+            kv_args=NS(state_types=[state_type.SWA, state_type.DSV4_REQUEST_STATE]),
+        )
+        for controller in (p, d):
+            controller.scheduler.sliding_window_size = window
+            controller.pool.swa_page_size = page
+            controller.pool.request_window = None
+            controller.hf_config = NS(model_type="deepseek_v4")
+            controller.schema_signature = {"ratios": [0, 4, 128]}
+            controller.dsv4_split_schema = flash.schema_id(
+                controller,
+                manager,
+                NS(
+                    attn_backend=NS(),
+                    prefill_attention_backend_str="dsv4",
+                    decode_attention_backend_str="dsv4",
+                ),
+            )
+            self.assertIsNotNone(controller.dsv4_split_schema)
+        req = self.request(length=length)
+        receiver = self.receiver_type()
+        receiver.require_staging = False
+        receiver.clear = lambda: None
+        dr = NS(
+            req=req, kv_receiver=receiver, is_rebootstrap=False, metadata_buffer_index=0
+        )
+        d.scheduler.disagg_decode_prealloc_queue = prealloc = NS(
+            scheduler=d.scheduler,
+            token_to_kv_pool_allocator=NS(
+                swa_available_size=lambda: 4608 if adaptive else 2304
+            ),
+            _swa_tail_len=lambda _: length - 7936,
+        )
+
+        def reserve(extra):
+            return flash.select_swa_prealloc_start(
+                lambda *_a, **_kw: None,
+                prealloc,
+                dr,
+                prefix_len=0,
+                fill_len=length,
+                swa_tail_len=length - 7936,
+                extra_swa_budget=extra,
+            )
+
+        self.assertIsNone(reserve(0))
+        self.assertEqual(d.split_prefill_outstanding, 0)
+        start = reserve(3072 if adaptive else 2048)
+        self.assertEqual(start, 5632 if adaptive else 6144)
+        self.assertEqual(receiver._dsv4_split_offer[0], 5888 if adaptive else 6400)
+        req.kv.req_pool_idx = 0
+        req.kv.set_row_len(length)
+        req.kv.set_evicted_seqlen(component_type.SWA, start)
+        req.time_stats = NS(set_wait_queue_entry_time=lambda: None)
+        rows = torch.arange(length).reshape(1, -1)
+        prealloc.req_to_token_pool = NS(req_to_token=rows)
+        mapped = (
+            list(range(93, 82, -1))
+            if adaptive
+            else [81, 44, 38, 92, 71, 15, 30, 48, 91]
+        )
+        storage.kv_storage_of = lambda *_: NS(
+            window_ids=lambda _, tokens: torch.tensor(mapped) * page
+        )
+        self.split.advertise(prealloc, dr, 0)
+        self.assertEqual(d.split_prefill_chunk_size, 4096)
+        if adaptive:
+            self.assertEqual(
+                receiver._hybrid_split_schedule, (2560, 100, 10, 4500, 20_000)
+            )
+            self.assertEqual(receiver._hybrid_split_suffix_cap, 2323)
+
+        receiver.kv_mgr = NS()
+        frames = self.mesh.bootstrap(
+            lambda _, **kw: kw["message"],
+            receiver,
+            bootstrap_info={"is_dummy": False},
+            message=[b""] * 10,
+            operation="send_metadata",
+        )
+        peer = self.mesh.parse_transfer(lambda **_: Peer([[48, 91], [7]]), msg=frames)
+        peer.is_dummy = False
+        peer.mooncake_session_id = "decode"
+        peer.dst_kv_indices = list(range(33))
+        self.assertFalse(
+            self.mesh.parse_transfer(
+                lambda **_: NS(),
+                msg=[b""] * 10 + [flash.WIRE + b"[]"],
+            ).__dict__
+        )
+        sender = self.sender_type()
+        sender.kv_mgr = NS(
+            transfer_infos={7: {"decode": peer}},
+            decode_kv_args_table={
+                "decode": NS(requires_dcp_relayout=False, dst_attn_tp_size=1)
+            },
+        )
+        sender.curr_idx = 11  # pages, not tokens
+        source = self.request(length=length, prefix=4096 if adaptive else 6656)
+        source.disagg_kv_sender = sender
+        self.split.create_sender(lambda *_: True, NS(scheduler=p.scheduler), source, 1)
+        self.split.finalize_bootstrap(lambda *_: True, None, source)
+        if adaptive:
+            self.assertEqual(source._hybrid_split_rates, [4500, 6000])
+        self.split.init_input(self.match, source, object())
+        cut = source._hybrid_split_at
+        self.assertEqual(cut, 6144 if adaptive else 7680)
+        self.assertEqual(len(source.full_untruncated_fill_ids), cut)
+        source.extend_end = cut
+        self.split.seal(source, cut)
+        self.assertEqual(sender.num_kv_indices, 24 if adaptive else 30)
+        sent = flash.send_states(
+            lambda _, target, indices, *_args: (target.dst_state_indices, indices),
+            manager,
+            peer,
+            [[25], [3]],
+            None,
+        )
+        self.assertEqual(sent, ([[92 if adaptive else 15], [7]], [[25], None]))
+        self.assertEqual(peer.dst_state_indices, [[48, 91], [7]])
+
+        freed = []
+        prealloc.token_to_kv_pool_allocator.free_swa_segment = (
+            lambda tokens, *, start_pos: freed.append((start_pos, tokens.tolist()))
+        )
+        queue = NS(
+            scheduler=d.scheduler,
+            metadata_buffers=NS(
+                output_ids=torch.tensor([[99, cut]]),
+                bootstrap_room=torch.tensor([[7]]),
+                cached_tokens=torch.zeros((1, 2), dtype=torch.int32),
+            ),
+        )
+        self.assertTrue(self.split.commit(queue, dr, keep_receiver=False))
+        self.assertEqual(freed, [(start, list(range(start, cut - page)))])
+        self.assertEqual(req.kv.get_evicted_seqlen(component_type.SWA), cut - page)
+        self.assertEqual(
+            (req.kv.kv_committed_len, req.kv.kv_allocated_len), (cut, length)
+        )
+        self.assertTrue(req.kv.reserved_prefill_suffix)
+        if adaptive:
+            self.assertEqual(req._hybrid_split_schedule, (2560, 100, 10, 4500, 20_000))
+        self.assertEqual(req.output_ids, [])
+        self.split.release_reservation(req)
+        self.assertEqual(d.split_prefill_outstanding, 0)
+
+        # A peer that only speaks native PD can still consume the normal
+        # tail rows. It must not inherit a cut from the previous metadata owner.
+        req.kv.set_row_len(length)
+        req.kv.set_evicted_seqlen(component_type.SWA, start)
+        req._hybrid_split_reservation = d
+        d.split_prefill_outstanding = 1
+        dr.kv_receiver = receiver
+        self.split.clear_metadata(lambda *_: None, queue.metadata_buffers, 0)
+        self.assertFalse(self.split.commit(queue, dr, keep_receiver=False))
+        self.assertEqual(req.kv.get_evicted_seqlen(component_type.SWA), 7936)
+        self.assertEqual(d.split_prefill_outstanding, 0)
 
     def request(self, *, prefix=0, length=32768):
         return NS(

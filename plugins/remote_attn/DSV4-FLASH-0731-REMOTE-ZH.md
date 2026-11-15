@@ -42,6 +42,42 @@ GPU payload 通道仍由 HANDOFF_REMOTE_GPU_TRANSFER 独立选择。
 native completion、Remote GPU reader 和 TP，D 等待 scatter/forward/IO/TP；allocator
 部分失败后拒绝重复释放。正常路径缓存 checkpoint 回放与 pin 回收继续执行。
 
+## Split Prefill（实验）
+
+P、D 两端显式设置 `HANDOFF_HYBRID_SPLIT_PREFILL=1` 和
+`HANDOFF_PRE_LAYERWISE=remote`，使用原生 Mooncake、同 TP、early allocation，
+保持 `HANDOFF_EXPERIMENTAL_PD_REMOTE=0`，并关闭 DSpark。两端再设
+`HANDOFF_SPLIT_ADAPTIVE=1` 可启用 decode 时间预算闭环，缺省使用静态策略。
+
+D 先按可用 SWA 页和后缀预算协商最早切点。P 匹配缓存后选择页对齐切点，
+传输已有压缩 KV、C4 indexer 及切点处的 SWA 窗口和 C4 压缩状态。
+切点落在完整的 C128 块边界，由 D 续算后缀并采样首 token。中间块也按页对齐，
+末块使用实际剩余长度。自适应时，D 按 TP 协商后的速率和步时派生每块等待量。
+控制器 cap 地板包含尾页对齐余量，P 仍要求实际后缀至少为 2,048 token。
+
+D 已有前缀命中、SWA 预算不足、无合法切点或对端无法协商时使用原生 PD。
+本地 CPU 契约覆盖静态和自适应 Bootstrap、状态页重映射、原生回退及页回收。
+
+2026-11-15 在 Ubuntu RTX 4060 Laptop 上运行 CUDA 探针，输入 9,215 token，
+KV 页大小 256。每种策略分别跑 C128 online 和 offline。两组均验证 Mooncake TCP
+搬运、C4 attention 和 indexer 压缩、C128 后缀及首步 decode。回收时逐页核对
+释放的页 ID、已退休映射清零和活跃映射保留。
+
+| 策略 | 切点 | D 后缀各块（token） | 每例回收 SWA 页 | 续算最大绝对误差 | 首步 decode 最大绝对误差 |
+| --- | ---: | --- | ---: | ---: | ---: |
+| 静态 | 7,936 | 1,024 + 255 | 17 | 0 | 0 |
+| 自适应 | 6,656 | 1,536 + 1,023 | 14 | 0 | 0 |
+
+自适应探针用 CUDA event 采样 suffix 和 decode，使用协商后的切点及块大小。
+验证范围是单卡上的合成张量及压缩状态交接。整模输出一致性、多 TP GPU 和性能仍待实测。
+
+```bash
+for adaptive in 0 1; do
+  HANDOFF_SPLIT_ADAPTIVE="$adaptive" PYTHONPATH=python:plugins/remote_attn \
+    python test/manual/remote_attn/flash0731_split_prefill_cuda_probe.py
+done
+```
+
 ## 验证
 
 2026-11-04：全部 TestRemoteAttn **272 项通过**（含真实 TP2 Gloo），新增 5 项覆盖

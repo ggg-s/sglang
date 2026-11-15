@@ -674,6 +674,18 @@ class DecodePreallocQueue(DecodeHiCachePreallocMixin):
             return allocated_kv_len, self._swa_tail_len(allocated_kv_len)
         return allocated_kv_len, allocated_kv_len
 
+    def _select_swa_prealloc_start(
+        self,
+        decode_req: DecodeRequest,
+        *,
+        prefix_len: int,
+        fill_len: int,
+        swa_tail_len: int,
+        extra_swa_budget: int,
+    ) -> Optional[int]:
+        """Allow a continuation adapter to reserve an earlier SWA window."""
+        return None
+
     def _prealloc_required_tokens(self, req: Req) -> Tuple[int, int]:
         full_len, swa_len = self._prealloc_kv_lens(req)
         page_size = self.token_to_kv_pool_allocator.page_size
@@ -1726,11 +1738,21 @@ class DecodePreallocQueue(DecodeHiCachePreallocMixin):
                 if prefill_info is not None and prefill_info.stores_to_linker
                 else 0
             )
+            swa_tail_start = None
+            if uses_swa_tail_prealloc and swa_allocatable_tokens is not None:
+                swa_tail_start = self._select_swa_prealloc_start(
+                    decode_req,
+                    prefix_len=total_prefix_len,
+                    fill_len=fill_len,
+                    swa_tail_len=swa_len,
+                    extra_swa_budget=swa_allocatable_tokens - swa_required_for_admission,
+                )
             dst_kv_indices = self._pre_alloc(
                 decode_req.req,
                 prefix_indices,
                 prefix_len,
                 total_prefix_len,
+                swa_tail_start=swa_tail_start,
             )
             decode_req.prefix_match = prefix_match
             hisparse_req_budget -= 1

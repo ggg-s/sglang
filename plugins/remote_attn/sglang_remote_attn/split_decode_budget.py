@@ -37,6 +37,7 @@ class DecodeBudget:
     patience_ms: float
     pinned_chunk: bool
     cap: float
+    min_cap: int = MIN_SUFFIX_TOKENS
     coverage: float = 1.0
     suffix_rate: float | None = None
     decode_ms: float | None = None
@@ -67,14 +68,12 @@ class DecodeBudget:
         if self.target == 0:
             return
         factor = min(1.30, max(0.75, 1 + 0.25 * (self.target - delta) / self.target))
-        if self.cap <= MIN_SUFFIX_TOKENS and (self.coverage < 1 or delta > self.target):
+        if self.cap <= self.min_cap and (self.coverage < 1 or delta > self.target):
             # Delta already reflects the current admission rate. Scale that
             # rate, retaining a probe share when the target is nonzero.
             self.coverage = min(1.0, max(0.05, self.coverage * factor))
         else:
-            self.cap = min(
-                AUTO_SUFFIX_CAP_MAX, max(MIN_SUFFIX_TOKENS, self.cap * factor)
-            )
+            self.cap = min(AUTO_SUFFIX_CAP_MAX, max(self.min_cap, self.cap * factor))
         self.windows += 1
         if rank == 0 and self.windows % 3 == 0:
             logger.info(

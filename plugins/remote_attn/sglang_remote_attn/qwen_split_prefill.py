@@ -5,6 +5,7 @@ import math
 import os
 import time
 from http import HTTPStatus
+from typing import NamedTuple
 
 from .split_decode_budget import (
     AUTO_SUFFIX_CAP_MAX,
@@ -38,6 +39,12 @@ AUTO_SUFFIX_CAP_GRANULARITY = 512
 AUTO_SUFFIX_RATE_EMA = 0.7
 
 
+class DecodeOffer(NamedTuple):
+    suffix_cap: int
+    chunk: int
+    schedule: tuple[int, int, int, int, int] | None
+
+
 def min_suffix_tokens(length):
     return min(MIN_SUFFIX_TOKENS, max(length // 16, 1))
 
@@ -54,16 +61,20 @@ def configure(controller):
     value = os.environ.get("HANDOFF_HYBRID_SPLIT_PREFILL", "1")
     if value not in ("0", "1"):
         raise ValueError("HANDOFF_HYBRID_SPLIT_PREFILL must be 0 or 1")
-    # Dense MHA and native FULL+MAMBA have a continuation adapter. Compressed
-    # DSV KV/state layouts retain native PD until their adapter supports cuts.
+    dsv4 = getattr(controller, "dsv4_split_schema", None)
+    # The paged DSV4 adapter is enabled explicitly while full-model parity
+    # and performance are being validated.
+    dsv4_enabled = dsv4 and os.environ.get("HANDOFF_HYBRID_SPLIT_PREFILL") == "1"
     controller.split_prefill = (
         value == "1"
         and controller.config.mode == "remote"
         and (
             getattr(controller, "hybrid_gdn", False)
             or not getattr(controller, "dsv41_layerwise", False)
+            or bool(dsv4_enabled)
         )
     )
+    controller.split_prefill_page_size = controller.pool.page_size if dsv4 else 1
     if controller.split_prefill:
         from sglang.srt.runtime_context import get_disagg
 
@@ -184,12 +195,26 @@ def configure(controller):
         controller.split_prefill_chunk_size = min(
             chunk_size or 4096, controller.split_prefill_budget
         )
+        page = controller.split_prefill_page_size
+        controller.split_prefill_chunk_size -= (
+            controller.split_prefill_chunk_size % page
+        )
+        if not controller.split_prefill_chunk_size:
+            raise ValueError(
+                "split prefill needs a decode chunk of at least one KV page"
+            )
         auto_env = "HANDOFF_SPLIT_CAP_AUTO"
         auto = os.environ.get(auto_env, "0")
         if auto not in ("0", "1"):
             raise ValueError(f"{auto_env} must be 0 or 1")
         if controller.split_prefill_adaptive:
             g = read_budget("HANDOFF_SPLIT_DECODE_BUDGET_G", 1.0, allow_zero=True)
+            # A paged cut can need up to one extra partial page of suffix.
+            # Round the floor up to a cap quantum so unaligned prompts remain
+            # eligible for coverage probes at the bottom of the feedback loop.
+            min_cap = quantize_suffix_cap(
+                MIN_SUFFIX_TOKENS + page - 1 + AUTO_SUFFIX_CAP_GRANULARITY - 1
+            )
             controller.split_prefill_decode_budget = DecodeBudget(
                 target=g / (1 + g),
                 stall_ms=read_budget("HANDOFF_SPLIT_STALL_MS", 600),
@@ -198,7 +223,10 @@ def configure(controller):
                     "HANDOFF_SPLIT_DEFER_PATIENCE_MS", 200, allow_zero=True
                 ),
                 pinned_chunk=bool(chunk_size),
-                cap=quantize_suffix_cap(controller.split_prefill_chunk_size),
+                cap=max(
+                    min_cap, quantize_suffix_cap(controller.split_prefill_chunk_size)
+                ),
+                min_cap=min_cap,
             )
             budget = controller.split_prefill_decode_budget
             if not budget.defer_ms:
@@ -315,11 +343,65 @@ def can_prefill_before_bootstrap(original, queue, req):
     return original(queue, req)
 
 
+def negotiate_decode_offer(controller, req, reason):
+    length = len(req.origin_input_ids)
+    if length < MIN_PROMPT_TOKENS:
+        return None, reason or "decode_suffix_too_short"
+    chunk = controller.split_prefill_chunk_size
+    budget = controller.split_prefill_decode_budget
+    if budget is None:
+        allowed, suffix_cap = controller.agree(
+            [int(reason is None), controller.split_prefill_auto_cap]
+        )
+        schedule = None
+    else:
+        allowed, suffix_cap, chunk, rate, neg_step_us, coverage = controller.agree(
+            [int(reason is None), *budget.offer(chunk, controller.split_prefill_budget)]
+        )
+        chunk -= chunk % controller.split_prefill_page_size
+        if allowed and length < 2 * chunk:
+            return None, "decode_split_short_for_chunk"
+        if allowed and req.bootstrap_room % 1000 >= coverage:
+            return None, "decode_split_budget"
+        step_us = -neg_step_us
+        defer, patience = budget.defer_steps(
+            step_us,
+            (
+                controller.split_prefill_defer_ticks,
+                controller.split_prefill_patience_ticks,
+            ),
+        )
+        schedule = chunk, defer, patience, rate, step_us
+    if not allowed:
+        return None, reason or "decode_peer_rejected"
+    return DecodeOffer(suffix_cap, chunk, schedule), None
+
+
+def publish_decode_offer(controller, receiver, length, min_cut, offer):
+    chunk = offer.chunk
+    suffix_cap = length - min_cut if offer.suffix_cap else 0
+    receiver._hybrid_split_limits = (
+        min_cut,
+        chunk if suffix_cap else max(chunk, MIN_SUFFIX_TOKENS),
+    )
+    receiver._hybrid_split_suffix_cap = suffix_cap
+    defer = controller.split_prefill_defer_ticks
+    if offer.schedule is not None:
+        receiver._hybrid_split_schedule = offer.schedule
+        _, defer, _, rate, _ = offer.schedule
+        receiver._hybrid_split_suffix_rate = rate
+    receiver._hybrid_split_decode_priority = defer > 0
+
+
 def advertise(queue, dr, decode_prefix_len):
     scheduler = queue.scheduler
     controller = getattr(scheduler, "_pre_layerwise", None)
     if not getattr(controller, "split_prefill", False):
         return
+    if getattr(controller, "dsv4_split_schema", None):
+        from . import dsv4_split_prefill
+
+        return dsv4_split_prefill.advertise(queue, dr)
     from sglang.srt.disaggregation.mooncake.conn import MooncakeKVReceiver
 
     receiver, req = dr.kv_receiver, dr.req
@@ -344,63 +426,22 @@ def advertise(queue, dr, decode_prefix_len):
         reason = "decode_busy"
     # One vote publishes the offer, including a rank-consistent schedule for
     # the admitted request. Keep rank-local timing estimates out of next_batch.
-    allowed = suffix_cap = rate = 0
-    chunk = controller.split_prefill_chunk_size
-    schedule = None
-    budget = controller.split_prefill_decode_budget
-    if length >= MIN_PROMPT_TOKENS:
-        if budget is None:
-            allowed, suffix_cap = controller.agree(
-                [int(reason is None), controller.split_prefill_auto_cap]
-            )
-        else:
-            allowed, suffix_cap, chunk, rate, neg_step_us, coverage = controller.agree(
-                [
-                    int(reason is None),
-                    *budget.offer(chunk, controller.split_prefill_budget),
-                ]
-            )
-            if allowed and length < 2 * chunk:
-                allowed, reason = 0, "decode_split_short_for_chunk"
-            elif allowed and req.bootstrap_room % 1000 >= coverage:
-                allowed, reason = 0, "decode_split_budget"
-            defer, patience = budget.defer_steps(
-                -neg_step_us,
-                (
-                    controller.split_prefill_defer_ticks,
-                    controller.split_prefill_patience_ticks,
-                ),
-            )
-            schedule = chunk, defer, patience, rate, -neg_step_us
-    if allowed:
-        if suffix_cap:
-            suffix_cap = min(suffix_cap, length - min_cut)
-            # Enforce the limit for older P workers that only read V3.
-            min_cut = length - suffix_cap
+    offer, reason = negotiate_decode_offer(controller, req, reason)
+    if offer is not None:
+        if offer.suffix_cap:
+            min_cut = max(min_cut, length - offer.suffix_cap)
         controller.split_prefill_outstanding += 1
         req._hybrid_split_reservation = controller
-        receiver._hybrid_split_limits = (
-            min_cut,
-            chunk if suffix_cap else max(chunk, MIN_SUFFIX_TOKENS),
-        )
-        receiver._hybrid_split_suffix_cap = suffix_cap
-        if schedule is not None:
-            receiver._hybrid_split_schedule = schedule
-            receiver._hybrid_split_suffix_rate = rate
-        receiver._hybrid_split_decode_priority = (
-            schedule[1]
-            if schedule is not None
-            else controller.split_prefill_defer_ticks
-        ) > 0
+        publish_decode_offer(controller, receiver, length, min_cut, offer)
     log_decision(
         controller,
         req,
         "decode_offer",
-        "offered" if allowed else reason or "decode_peer_rejected",
-        min_cut=min_cut if allowed else 0,
+        reason or "offered",
+        min_cut=min_cut if offer else 0,
         outstanding=controller.split_prefill_outstanding,
-        chunk_size=chunk,
-        suffix_cap=suffix_cap,
+        chunk_size=offer.chunk if offer else controller.split_prefill_chunk_size,
+        suffix_cap=getattr(receiver, "_hybrid_split_suffix_cap", 0),
     )
 
 
@@ -411,7 +452,7 @@ def release_reservation(req):
         controller.split_prefill_outstanding -= 1
 
 
-def offered_limits(req, tp_size):
+def offered_limits(req, controller):
     from sglang.srt.disaggregation.mooncake.conn import MooncakeKVSender
 
     reason = request_blocker(req)
@@ -439,13 +480,19 @@ def offered_limits(req, tp_size):
         or (suffix_cap and suffix_cap != length - cut)
     ):
         return None, "invalid_decode_split_limits"
-    if len(peer.dst_kv_indices) != length:
+    page = controller.split_prefill_page_size
+    if len(peer.dst_kv_indices) != (length + page - 1) // page:
         return None, "destination_kv_length_mismatch"
+    if page > 1 or getattr(peer, "_dsv4_split_window", None) is not None:
+        from . import dsv4_split_prefill
+
+        if not dsv4_split_prefill.compatible_offer(controller, peer, length, cut):
+            return None, "incompatible_destination_split_layout"
     registration = manager.decode_kv_args_table.get(peer.mooncake_session_id)
     if (
         registration is None
         or registration.requires_dcp_relayout
-        or registration.dst_attn_tp_size != tp_size
+        or registration.dst_attn_tp_size != controller.tp_size
     ):
         return None, "incompatible_destination_registration"
     # The legacy decode-priority marker still describes D's configured defer
@@ -460,7 +507,7 @@ def finalize_bootstrap(original, queue, req):
     controller = getattr(req, "_hybrid_prefill_controller", None)
     if not result or not getattr(controller, "split_prefill", False):
         return result
-    limits, reason = offered_limits(req, controller.tp_size)
+    limits, reason = offered_limits(req, controller)
     min_cut, chunk_cap, suffix_cap, remote_rate = limits or (0, 0, 0, 0)
     vote = [min_cut, -min_cut, chunk_cap, -chunk_cap, suffix_cap, -suffix_cap]
     if controller.split_prefill_adaptive:
@@ -539,7 +586,23 @@ def select_cut(controller, length, prefix, limits, rates=None):
                 return 0, "split_too_small"
             floor = MIN_SUFFIX_TOKENS
         cut = length - min(max(suffix, floor), suffix_cap)
-    if prefix < cut and max(min_cut, length - suffix_cap) <= cut <= length - floor:
+    earliest = max(prefix + 1, min_cut, length - suffix_cap)
+    latest = length - floor
+    page = controller.split_prefill_page_size
+    if page > 1:
+        earliest = (earliest + page - 1) // page * page
+        latest = latest // page * page
+        if (
+            earliest > latest
+            and controller.split_prefill_adaptive
+            and not pinned_suffix
+            and controller.split_prefill_cut_basis == "miss"
+        ):
+            return 0, "split_too_small"
+        cut = min((cut + page - 1) // page * page, latest)
+        if not pinned_suffix:
+            cut = max(cut, earliest)
+    if earliest <= cut <= latest:
         return cut, "selected"
     return 0, "no_legal_cut"
 
@@ -581,11 +644,23 @@ def seal(req, end_idx):
     cut = getattr(req, "_hybrid_split_at", 0)
     if cut:
         sender = req.disagg_kv_sender
-        if req.extend_end != cut or end_idx not in (None, cut) or sender.curr_idx > cut:
+        controller = req._hybrid_prefill_controller
+        page = controller.split_prefill_page_size
+        count = cut // page
+        if (
+            req.extend_end != cut
+            or end_idx not in (None, cut)
+            or cut % page
+            or sender.curr_idx > count
+        ):
             raise RuntimeError("hybrid split prefill frontier changed before send")
         # Native sender derives its final envelope from curr_idx == total.
         # D registered the entire row; native Mooncake writes the prefix slice.
-        sender.num_kv_indices = cut
+        sender.num_kv_indices = count
+        if page > 1:
+            from . import dsv4_split_prefill
+
+            dsv4_split_prefill.seal(controller, req, cut)
 
 
 def set_metadata(original, buffers, req):
@@ -595,6 +670,11 @@ def set_metadata(original, buffers, req):
     if getattr(buffers, "_hybrid_split_used", False):
         buffers.output_ids[req.metadata_buffer_index, CUT_SLOT] = cut
     return original(buffers, req)
+
+
+def clear_metadata(original, buffers, idx):
+    buffers.output_ids[idx, CUT_SLOT] = 0
+    return original(buffers, idx)
 
 
 def commit(queue, dr, *, keep_receiver):
@@ -611,11 +691,17 @@ def commit(queue, dr, *, keep_receiver):
     controller = queue.scheduler._pre_layerwise
     length = len(req.origin_input_ids)
     min_cut, _ = limits
-    valid_cut = min_cut <= cut <= length - min_suffix_tokens(length)
+    page = controller.split_prefill_page_size
+    paged = getattr(receiver, "_dsv4_split_window", None) is not None
+    valid_cut = min_cut <= cut <= length - min_suffix_tokens(length) and cut % page == 0
     split, ordinary, agreed, negative_max = controller.agree(
         [int(valid_cut), int(cut == 0), cut, -cut]
     )
     if ordinary:
+        if paged:
+            from .dsv4_split_prefill import trim_swa
+
+            trim_swa(controller, req, 0)
         release_reservation(req)
         return False
     room = int(queue.metadata_buffers.bootstrap_room[idx, 0].item())
@@ -644,6 +730,10 @@ def commit(queue, dr, *, keep_receiver):
         )
         return True
     controller.pd_visibility.receive()
+    if paged:
+        from .dsv4_split_prefill import trim_swa
+
+        trim_swa(controller, req, cut)
     req.kv.truncate_committed(cut)
     req.kv.reserved_prefill_suffix = True
     req.kv.mamba_needs_clear = False
@@ -832,6 +922,10 @@ def next_batch(original, scheduler, running_batch):
 
     scheduler.waiting_queue.leave([req])
     req.refresh_fill_ids()
+    if getattr(controller, "dsv4_split_schema", None):
+        from .dsv4_split_prefill import trim_swa
+
+        trim_swa(controller, req, req.prefix_len)
     req.extend_end = req.prefix_len + min(chunk_size, remaining)
     middle = req.extend_end < prompt_len
     scheduler.chunked_req = req if middle else None

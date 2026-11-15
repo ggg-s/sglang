@@ -420,6 +420,9 @@ class DSV41Controller(Controller):
         self.schema_signature = self._schema(
             manager
         )  # TP ownership ABI, without pointers
+        from .dsv4_split_prefill import schema_id
+
+        self.dsv4_split_schema = schema_id(self, manager, runner)
         if self.dsv41_remote:
             dsv41_remote.validate(self, runner, role)
 
