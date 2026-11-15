@@ -6,15 +6,24 @@ import os
 import time
 from http import HTTPStatus
 
+from .split_decode_budget import (
+    AUTO_SUFFIX_CAP_MAX,
+    MIN_SUFFIX_TOKENS,
+    RATE_LIMIT,
+    DecodeBudget,
+    ema,
+    read_budget,
+)
+
 logger = logging.getLogger(__name__)
 # V3 advertises the cut bound and D's chunk cap. V2 assumes a fixed suffix floor.
 WIRE = b"REMOTE_ATTN_HYBRID_SPLIT_V3:"
 DECODE_PRIORITY = b"REMOTE_ATTN_SPLIT_DECODE_PRIORITY"
 SUFFIX_CAP_WIRE = b"REMOTE_ATTN_SPLIT_SUFFIX_CAP:"
+SUFFIX_RATE_WIRE = b"REMOTE_ATTN_SPLIT_RATE:"
 # output_ids rows are already transferred in full; native uses only slot 0.
 CUT_SLOT = 1
 MIN_PROMPT_TOKENS = 4096
-MIN_SUFFIX_TOKENS = 2048
 BALANCED_CUT_RATIO = 0.75
 PREFIX_GROWTH_TOKENS = 1024
 # 2P1D SWE-bench calibration on RTX 5090 TP2 / Qwen3.8-27B-FP8.
@@ -25,7 +34,6 @@ DEFAULT_SUFFIX_CAP_TOKENS = 4096
 COLLISION_BUDGET_TOKENS = 128 * 14 * 6800 // 1000
 HOT_DEFER_TICKS = 45
 DEFER_PATIENCE_TICKS = 15
-AUTO_SUFFIX_CAP_MAX = 32768
 AUTO_SUFFIX_CAP_GRANULARITY = 512
 AUTO_SUFFIX_RATE_EMA = 0.7
 
@@ -68,6 +76,14 @@ def configure(controller):
             raise ValueError("split prefill requires early device KV allocation")
     scheduler = controller.scheduler
     role = scheduler.disaggregation_mode.value
+    adaptive = os.environ.get("HANDOFF_SPLIT_ADAPTIVE", "0")
+    if adaptive not in ("0", "1"):
+        raise ValueError("HANDOFF_SPLIT_ADAPTIVE must be 0 or 1")
+    controller.split_prefill_adaptive = (
+        controller.split_prefill and role in ("prefill", "decode") and adaptive == "1"
+    )
+    controller.split_prefill_decode_budget = None
+    controller.split_prefill_prefix_rate = None
     controller.split_prefill_budget = None
     controller.split_prefill_chunk_size = None
     controller.split_prefill_cut_ratio = None
@@ -101,7 +117,12 @@ def configure(controller):
         if suffix_tokens < 0:
             raise ValueError(f"{suffix_env} must be a nonnegative integer")
         cap_env = "HANDOFF_SPLIT_SUFFIX_CAP_TOKENS"
-        raw_cap = os.environ.get(cap_env, str(DEFAULT_SUFFIX_CAP_TOKENS))
+        default_cap = (
+            "auto"
+            if controller.split_prefill_adaptive
+            else str(DEFAULT_SUFFIX_CAP_TOKENS)
+        )
+        raw_cap = os.environ.get(cap_env, default_cap)
         suffix_cap = None
         if raw_cap != "auto":
             try:
@@ -142,12 +163,14 @@ def configure(controller):
             raise ValueError(f"{patience_env} must be a nonnegative integer")
         controller.split_prefill_patience_ticks = patience
         chunk_env = "HANDOFF_HYBRID_SPLIT_PREFILL_CHUNK_SIZE"
+        minimum_chunk = 0 if controller.split_prefill_adaptive else 1
+        default_chunk = "0" if controller.split_prefill_adaptive else "4096"
         try:
-            chunk_size = int(os.environ.get(chunk_env, "4096"))
+            chunk_size = int(os.environ.get(chunk_env, default_chunk))
         except ValueError as exc:
-            raise ValueError(f"{chunk_env} must be a positive integer") from exc
-        if chunk_size <= 0:
-            raise ValueError(f"{chunk_env} must be a positive integer")
+            raise ValueError(f"{chunk_env} must be an integer") from exc
+        if chunk_size < minimum_chunk:
+            raise ValueError(f"{chunk_env} must be >= {minimum_chunk}")
         limit_env = "HANDOFF_HYBRID_SPLIT_PREFILL_MAX_OUTSTANDING"
         try:
             limit = int(os.environ.get(limit_env, str(scheduler.max_running_requests)))
@@ -159,13 +182,30 @@ def configure(controller):
         controller.split_prefill_outstanding = 0
         controller.split_prefill_budget = scheduler.max_prefill_tokens
         controller.split_prefill_chunk_size = min(
-            chunk_size, controller.split_prefill_budget
+            chunk_size or 4096, controller.split_prefill_budget
         )
         auto_env = "HANDOFF_SPLIT_CAP_AUTO"
         auto = os.environ.get(auto_env, "0")
         if auto not in ("0", "1"):
             raise ValueError(f"{auto_env} must be 0 or 1")
-        if auto == "1":
+        if controller.split_prefill_adaptive:
+            g = read_budget("HANDOFF_SPLIT_DECODE_BUDGET_G", 1.0, allow_zero=True)
+            controller.split_prefill_decode_budget = DecodeBudget(
+                target=g / (1 + g),
+                stall_ms=read_budget("HANDOFF_SPLIT_STALL_MS", 600),
+                defer_ms=read_budget("HANDOFF_SPLIT_DEFER_MS", 2000, allow_zero=True),
+                patience_ms=read_budget(
+                    "HANDOFF_SPLIT_DEFER_PATIENCE_MS", 200, allow_zero=True
+                ),
+                pinned_chunk=bool(chunk_size),
+                cap=quantize_suffix_cap(controller.split_prefill_chunk_size),
+            )
+            budget = controller.split_prefill_decode_budget
+            if not budget.defer_ms:
+                controller.split_prefill_defer_ticks = 0
+            if not budget.patience_ms:
+                controller.split_prefill_patience_ticks = 0
+        elif auto == "1":
             budget_env = "HANDOFF_SPLIT_SUFFIX_BUDGET_S"
             try:
                 budget = float(os.environ.get(budget_env, "2.0"))
@@ -190,7 +230,7 @@ def configure(controller):
             "[handoff-split-config] role=%s enabled=%s max_prefill_tokens=%s "
             "chunk_size=%s cut_ratio=%s cut_basis=%s suffix_tokens=%s suffix_cap=%s "
             "max_outstanding=%s defer_ticks=%s min_p_queue_tokens=%s "
-            "auto_cap=%s suffix_budget_s=%s patience_ticks=%s",
+            "auto_cap=%s suffix_budget_s=%s patience_ticks=%s adaptive=%s decode_budget=%s",
             role,
             controller.split_prefill,
             controller.split_prefill_budget,
@@ -205,6 +245,8 @@ def configure(controller):
             controller.split_prefill_auto_cap,
             controller.split_prefill_suffix_budget_s,
             controller.split_prefill_patience_ticks,
+            controller.split_prefill_adaptive,
+            controller.split_prefill_decode_budget,
         )
 
 
@@ -300,13 +342,37 @@ def advertise(queue, dr, decode_prefix_len):
         or scheduler.running_batch.batch_size() >= scheduler.max_running_requests
     ):
         reason = "decode_busy"
-    # D commits metadata collectively, so every TP rank must publish the same
-    # admission decision even if its local capacity check differs.
-    allowed, suffix_cap = (
-        controller.agree([int(reason is None), controller.split_prefill_auto_cap])
-        if length >= MIN_PROMPT_TOKENS
-        else (0, 0)
-    )
+    # One vote publishes the offer, including a rank-consistent schedule for
+    # the admitted request. Keep rank-local timing estimates out of next_batch.
+    allowed = suffix_cap = rate = 0
+    chunk = controller.split_prefill_chunk_size
+    schedule = None
+    budget = controller.split_prefill_decode_budget
+    if length >= MIN_PROMPT_TOKENS:
+        if budget is None:
+            allowed, suffix_cap = controller.agree(
+                [int(reason is None), controller.split_prefill_auto_cap]
+            )
+        else:
+            allowed, suffix_cap, chunk, rate, neg_step_us, coverage = controller.agree(
+                [
+                    int(reason is None),
+                    *budget.offer(chunk, controller.split_prefill_budget),
+                ]
+            )
+            if allowed and length < 2 * chunk:
+                allowed, reason = 0, "decode_split_short_for_chunk"
+            elif allowed and req.bootstrap_room % 1000 >= coverage:
+                allowed, reason = 0, "decode_split_budget"
+            defer, patience, hot = budget.defer_steps(
+                -neg_step_us,
+                (
+                    controller.split_prefill_defer_ticks,
+                    controller.split_prefill_patience_ticks,
+                    HOT_DEFER_TICKS,
+                ),
+            )
+            schedule = chunk, defer, patience, hot
     if allowed:
         if suffix_cap:
             suffix_cap = min(suffix_cap, length - min_cut)
@@ -316,14 +382,17 @@ def advertise(queue, dr, decode_prefix_len):
         req._hybrid_split_reservation = controller
         receiver._hybrid_split_limits = (
             min_cut,
-            controller.split_prefill_chunk_size
-            if suffix_cap
-            else max(controller.split_prefill_chunk_size, MIN_SUFFIX_TOKENS),
+            chunk if suffix_cap else max(chunk, MIN_SUFFIX_TOKENS),
         )
         receiver._hybrid_split_suffix_cap = suffix_cap
+        if schedule is not None:
+            receiver._hybrid_split_schedule = schedule
+            receiver._hybrid_split_suffix_rate = rate
         receiver._hybrid_split_decode_priority = (
-            controller.split_prefill_defer_ticks > 0
-        )
+            schedule[1]
+            if schedule is not None
+            else controller.split_prefill_defer_ticks
+        ) > 0
     log_decision(
         controller,
         req,
@@ -331,7 +400,7 @@ def advertise(queue, dr, decode_prefix_len):
         "offered" if allowed else reason or "decode_peer_rejected",
         min_cut=min_cut if allowed else 0,
         outstanding=controller.split_prefill_outstanding,
-        chunk_size=controller.split_prefill_chunk_size,
+        chunk_size=chunk,
         suffix_cap=suffix_cap,
     )
 
@@ -383,7 +452,8 @@ def offered_limits(req, tp_size):
     # The legacy decode-priority marker still describes D's configured defer
     # behavior to older peers. Cut selection on this P uses its own basis.
     # Caps above the prompt length are equivalent for the TP vote.
-    return (cut, min(chunk_cap, length), suffix_cap), None
+    rate = getattr(peer, "_hybrid_split_suffix_rate", 0)
+    return (cut, min(chunk_cap, length), suffix_cap, rate), None
 
 
 def finalize_bootstrap(original, queue, req):
@@ -392,11 +462,12 @@ def finalize_bootstrap(original, queue, req):
     if not result or not getattr(controller, "split_prefill", False):
         return result
     limits, reason = offered_limits(req, controller.tp_size)
-    min_cut, chunk_cap, suffix_cap = limits or (0, 0, 0)
-    cut, negative_cut, chunk, negative_chunk, suffix, negative_suffix = (
-        controller.agree(
-            [min_cut, -min_cut, chunk_cap, -chunk_cap, suffix_cap, -suffix_cap]
-        )
+    min_cut, chunk_cap, suffix_cap, remote_rate = limits or (0, 0, 0, 0)
+    vote = [min_cut, -min_cut, chunk_cap, -chunk_cap, suffix_cap, -suffix_cap]
+    if controller.split_prefill_adaptive:
+        vote.extend([remote_rate, int(controller.split_prefill_prefix_rate or 0)])
+    cut, negative_cut, chunk, negative_chunk, suffix, negative_suffix, *rates = (
+        controller.agree(vote)
     )
     if (
         cut > 0
@@ -406,6 +477,7 @@ def finalize_bootstrap(original, queue, req):
         and suffix == -negative_suffix
     ):
         req._hybrid_split_limits = cut, chunk, suffix
+        req._hybrid_split_rates = rates if rates and all(rates) else None
     else:
         log_decision(
             controller,
@@ -435,7 +507,7 @@ def prefill_backlog_tokens(scheduler, exclude):
     )
 
 
-def select_cut(controller, length, prefix, limits):
+def select_cut(controller, length, prefix, limits, rates=None):
     min_cut, chunk_cap, offered_suffix_cap = limits
     floor = min_suffix_tokens(length)
     ratio = controller.split_prefill_cut_ratio
@@ -449,7 +521,15 @@ def select_cut(controller, length, prefix, limits):
         cut = min((length + prefix + COLLISION_BUDGET_TOKENS) // 2, length - floor)
     else:
         miss = max(length - prefix, 0)
-        suffix = max(int(miss * (1 - ratio)), floor)
+        if rates is not None:
+            remote_rate, local_rate = rates
+            suffix = miss * remote_rate // (remote_rate + local_rate)
+        elif controller.split_prefill_adaptive:
+            suffix = int(miss * (1 - ratio))
+        else:
+            suffix = max(int(miss * (1 - ratio)), floor)
+        if controller.split_prefill_adaptive:
+            floor = MIN_SUFFIX_TOKENS
         suffix_cap = controller.split_prefill_suffix_cap
         if suffix_cap is None:
             suffix_cap = offered_suffix_cap or DEFAULT_SUFFIX_CAP_TOKENS
@@ -482,7 +562,10 @@ def init_input(original, req, tree_cache=None, cow_mamba=None):
         prefix = max(req.prefix_len, req.kv.cache_protected_len)
         gate = controller.split_prefill_min_queue_tokens
         below_gate = gate and prefill_backlog_tokens(controller.scheduler, req) < gate
-        selected = 0 if below_gate else select_cut(controller, length, prefix, limits)
+        rates = getattr(req, "_hybrid_split_rates", None)
+        selected = (
+            0 if below_gate else select_cut(controller, length, prefix, limits, rates)
+        )
         agreed, negative_max = controller.agree([selected, -selected])
         accepted = agreed > 0 and agreed == -negative_max
         cut = req._hybrid_split_at = agreed if accepted else 0
@@ -576,17 +659,28 @@ def commit(queue, dr, *, keep_receiver):
     req.cached_tokens_device = int(queue.metadata_buffers.cached_tokens[idx, 1].item())
     req._hybrid_split_defer_ticks = 0
     req._hybrid_split_ready_at = None
+    req._hybrid_split_schedule = getattr(receiver, "_hybrid_split_schedule", None)
     req.time_stats.set_wait_queue_entry_time()
     return True
 
 
 def time_suffix_forward(original, worker, batch, *args, **kwargs):
     controller = getattr(worker.model_runner, "_pre_layerwise", None)
-    if (
-        not getattr(controller, "split_prefill_auto_cap", 0)
-        or not getattr(batch, "_hybrid_split_extend", False)
-        or not batch.forward_mode.is_extend()
+    adaptive = getattr(controller, "split_prefill_adaptive", False)
+    if batch is None or not (
+        adaptive or getattr(controller, "split_prefill_auto_cap", 0)
     ):
+        return original(worker, batch, *args, **kwargs)
+    phase = None
+    if getattr(batch, "_hybrid_split_extend", False) and batch.forward_mode.is_extend():
+        phase = "suffix"
+    elif adaptive:
+        budget = controller.split_prefill_decode_budget
+        if budget is None and batch.forward_mode.is_extend():
+            phase = "prefix"
+        elif budget is not None and budget.target and batch.forward_mode.is_decode():
+            phase = "decode"
+    if phase is None:
         return original(worker, batch, *args, **kwargs)
 
     import torch
@@ -594,14 +688,14 @@ def time_suffix_forward(original, worker, batch, *args, **kwargs):
     # The scheduler has already entered the forward stream in overlap mode.
     # Keep the events with this result, even when another forward launches
     # before the scheduler processes it.
-    tokens = batch.extend_num_tokens
+    tokens = batch.batch_size() if phase == "decode" else batch.extend_num_tokens
     start = torch.cuda.Event(enable_timing=True)
     end = torch.cuda.Event(enable_timing=True)
     stream = torch.cuda.current_stream()
     start.record(stream)
     result = original(worker, batch, *args, **kwargs)
     end.record(stream)
-    result._split_suffix_timing = (tokens, start, end)
+    result._split_suffix_timing = (tokens, start, end, phase)
     return result
 
 
@@ -610,7 +704,7 @@ def record_completed_suffix(controller, result):
     if timing is None:
         return
     del result._split_suffix_timing
-    tokens, start, end = timing
+    tokens, start, end, phase = timing
     # The native result path has consumed the forward and its output copy.
     # Skip any incomplete sample without adding a CUDA synchronization.
     if tokens <= 0 or not end.query():
@@ -619,6 +713,16 @@ def record_completed_suffix(controller, result):
     if not math.isfinite(elapsed_ms) or elapsed_ms <= 0:
         return
     rate = tokens * 1000 / elapsed_ms
+    if controller.split_prefill_adaptive:
+        if phase == "prefix":
+            controller.split_prefill_prefix_rate = ema(
+                controller.split_prefill_prefix_rate, min(rate, RATE_LIMIT)
+            )
+        else:
+            controller.split_prefill_decode_budget.observe(
+                tokens, elapsed_ms, suffix=phase == "suffix", rank=controller.rank
+            )
+        return
     previous = controller.split_prefill_suffix_rate
     if previous is not None:
         rate = AUTO_SUFFIX_RATE_EMA * previous + (1 - AUTO_SUFFIX_RATE_EMA) * rate
@@ -686,15 +790,22 @@ def next_batch(original, scheduler, running_batch):
         return original(scheduler, running_batch)
 
     prompt_len = len(req.origin_input_ids)
-    defer_budget = controller.split_prefill_defer_ticks
+    schedule = getattr(req, "_hybrid_split_schedule", None)
+    if schedule is None:
+        schedule = (
+            controller.split_prefill_chunk_size,
+            controller.split_prefill_defer_ticks,
+            controller.split_prefill_patience_ticks,
+            HOT_DEFER_TICKS,
+        )
+    chunk_size, defer_budget, patience, hot_defer = schedule
     if req.cached_tokens * 10 >= prompt_len * 7:
-        defer_budget = min(defer_budget, HOT_DEFER_TICKS)
+        defer_budget = min(defer_budget, hot_defer)
     ticks = req._hybrid_split_defer_ticks
     if ticks == 0:
         req._hybrid_split_defer_start_bs = running_bs
     # A stable or growing decode batch is unlikely to leave an empty slot
     # before the full budget expires. Use rank-consistent scheduler state.
-    patience = controller.split_prefill_patience_ticks
     stalled = (
         patience > 0
         and ticks >= patience
@@ -722,7 +833,6 @@ def next_batch(original, scheduler, running_batch):
 
     scheduler.waiting_queue.leave([req])
     req.refresh_fill_ids()
-    chunk_size = controller.split_prefill_chunk_size
     req.extend_end = min(req.prefix_len + chunk_size, prompt_len)
     middle = req.extend_end < prompt_len
     scheduler.chunked_req = req if middle else None

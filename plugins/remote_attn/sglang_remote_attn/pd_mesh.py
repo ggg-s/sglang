@@ -505,13 +505,21 @@ def bootstrap(original, receiver, *, bootstrap_info, message, operation):
         and operation == "send_metadata"
         and not bootstrap_info["is_dummy"]
     ):
-        from .qwen_split_prefill import DECODE_PRIORITY, SUFFIX_CAP_WIRE, WIRE
+        from .qwen_split_prefill import (
+            DECODE_PRIORITY,
+            SUFFIX_CAP_WIRE,
+            SUFFIX_RATE_WIRE,
+            WIRE,
+        )
 
         min_cut, chunk_cap = limits
         message = [*message, WIRE + f"{min_cut}:{chunk_cap}".encode("ascii")]
         suffix_cap = getattr(receiver, "_hybrid_split_suffix_cap", 0)
         if suffix_cap:
             message.append(SUFFIX_CAP_WIRE + str(suffix_cap).encode("ascii"))
+        rate = getattr(receiver, "_hybrid_split_suffix_rate", 0)
+        if rate:
+            message.append(SUFFIX_RATE_WIRE + str(rate).encode("ascii"))
         if getattr(receiver, "_hybrid_split_decode_priority", False):
             message.append(DECODE_PRIORITY)
     return original(
@@ -526,8 +534,10 @@ def parse_transfer(original, *args, **kwargs):
         AUTO_SUFFIX_CAP_MAX,
         DECODE_PRIORITY,
         SUFFIX_CAP_WIRE,
+        SUFFIX_RATE_WIRE,
         WIRE,
     )
+    from .split_decode_budget import RATE_LIMIT
 
     extensions = message[10:]
     split_offer = next(
@@ -537,23 +547,25 @@ def parse_transfer(original, *args, **kwargs):
     if all(0 < len(field) <= 10 and field.isdigit() for field in (min_cut, chunk_cap)):
         value._hybrid_split_limits = int(min_cut), int(chunk_cap)
         value._hybrid_split_decode_priority = DECODE_PRIORITY in extensions
-        suffix_cap = next(
-            (
-                frame[len(SUFFIX_CAP_WIRE) :]
-                for frame in extensions
-                if frame.startswith(SUFFIX_CAP_WIRE)
-            ),
-            None,
-        )
-        if suffix_cap is not None:
-            if (
-                0 < len(suffix_cap) <= len(str(AUTO_SUFFIX_CAP_MAX))
-                and suffix_cap.isdigit()
-                and 0 < int(suffix_cap) <= AUTO_SUFFIX_CAP_MAX
+        for tag, attr, maximum in (
+            (SUFFIX_CAP_WIRE, "_hybrid_split_suffix_cap", AUTO_SUFFIX_CAP_MAX),
+            (SUFFIX_RATE_WIRE, "_hybrid_split_suffix_rate", RATE_LIMIT),
+        ):
+            fields = [
+                frame[len(tag) :] for frame in extensions if frame.startswith(tag)
+            ]
+            if not fields:
+                continue
+            field = fields[0]
+            if not (
+                len(fields) == 1
+                and 0 < len(field) <= len(str(maximum))
+                and field.isdigit()
+                and 0 < int(field) <= maximum
             ):
-                value._hybrid_split_suffix_cap = int(suffix_cap)
-            else:
                 del value._hybrid_split_limits
+                break
+            setattr(value, attr, int(field))
     journal = next((frame for frame in extensions if frame.startswith(MAGIC)), None)
     if journal is not None:
         try:

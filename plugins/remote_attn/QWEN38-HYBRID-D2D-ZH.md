@@ -183,6 +183,30 @@ P 的 `auto` 模式在 D 未提供该扩展时使用 4096。P 若配置整数 ca
 D 可用 `HANDOFF_SPLIT_DEFER_PATIENCE_TICKS` 调整提前结束等待的阈值，
 默认 15，设为 0 仅关闭早退。
 
+#### Decode 时间预算闭环（实验）
+
+两端设置 `HANDOFF_SPLIT_ADAPTIVE=1` 启用。D 在原生结果处理后采集
+suffix 和 decode 的 CUDA event 时间，用后缀占有效 forward 时间的比例
+反馈给 cap。默认 `HANDOFF_SPLIT_DECODE_BUDGET_G=1.0`，对应目标占比
+`g / (1 + g)`。如果 cap 已到 2048 且仍超目标，就逐窗减少准入比例，
+并保留至少 5% 探测。g=0 时 D 拒绝实验 split。
+
+P 使用这次选中的 D 的速率计算约等耗时的后缀
+`miss × μ_D / (μ_P + μ_D)`，再应用协商上限。缺样本时用原 miss 比例，
+默认 25%。实验 miss 路径的结果不足 2048 或没有合法 cut 时走原生 PD。
+D 的 `N ≥ 2 × chunk` 是短 prompt 的准入启发式。
+
+D 用 `HANDOFF_SPLIT_STALL_MS`（默认 600）估算单块大小，显式设置
+`HANDOFF_HYBRID_SPLIT_PREFILL_CHUNK_SIZE` 则固定块大小。D 用
+`HANDOFF_SPLIT_DEFER_MS`（默认 2000）及 `HANDOFF_SPLIT_DEFER_PATIENCE_MS`
+（默认 200）按实测 decode 步时估算等待轮数。D 在原准入投票中统一单块
+大小和等待轮数，分配后的请求使用这份配置直到后缀完成。目标占比、单块
+耗时和等待时长均用于调节策略，实际 TPOT 与 ITL 仍需实测。
+
+闭环会给普通 decode forward 也记录 CUDA event，开销需单独验证。
+`HANDOFF_SPLIT_ADAPTIVE=0` 可继续使用原有静态或按速率估算的 cap 对照。
+内网原型数据见 [RTX 5090 闭环实验](validation/qwen-split-prefill-closed-loop-5090.md)。
+
 沿用同 TP 的原生 Mooncake、early device allocation 和 page-1 KV 配置。
 D 命中已有前缀、请求输出 logprobs、结构化生成或对端未协商时走原生 PD。
 P 等到 bootstrap 后再为可协商请求启动 Prefill，首次 Forward 前对实际 cut 做

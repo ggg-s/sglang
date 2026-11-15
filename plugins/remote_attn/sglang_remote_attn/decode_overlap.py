@@ -194,9 +194,12 @@ def after_result(original, scheduler, batch, result):
     if p_overlap is not None:
         from .prefill_overlap import after_result as process_result
 
-        return process_result(original, scheduler, batch, result)
-    value = original(scheduler, batch, result)
-    if getattr(controller, "split_prefill_auto_cap", 0):
+        value = process_result(original, scheduler, batch, result)
+    else:
+        value = original(scheduler, batch, result)
+    if getattr(controller, "split_prefill_auto_cap", 0) or getattr(
+        controller, "split_prefill_adaptive", False
+    ):
         from .qwen_split_prefill import record_completed_suffix
 
         record_completed_suffix(controller, result)

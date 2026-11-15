@@ -1,0 +1,109 @@
+"""Per-rank estimates for the experimental split prefill feedback loop."""
+
+import logging
+import math
+import os
+from dataclasses import dataclass
+
+logger = logging.getLogger(__name__)
+
+MIN_SUFFIX_TOKENS = 2048
+AUTO_SUFFIX_CAP_MAX = 32768
+RATE_LIMIT = 10_000_000
+
+
+def read_budget(name, default, *, allow_zero=False):
+    message = (
+        f"{name} must be a finite {'nonnegative' if allow_zero else 'positive'} number"
+    )
+    try:
+        value = float(os.environ.get(name, str(default)))
+    except ValueError as exc:
+        raise ValueError(message) from exc
+    if not math.isfinite(value) or value < 0 or (not allow_zero and value == 0):
+        raise ValueError(message)
+    return value
+
+
+def ema(previous, sample):
+    return sample if previous is None else 0.7 * previous + 0.3 * sample
+
+
+@dataclass
+class DecodeBudget:
+    target: float
+    stall_ms: float
+    defer_ms: float
+    patience_ms: float
+    pinned_chunk: bool
+    cap: float
+    coverage: float = 1.0
+    suffix_rate: float | None = None
+    decode_ms: float | None = None
+    forward_ms: float = 0.0
+    suffix_ms: float = 0.0
+    suffix_samples: int = 0
+    windows: int = 0
+
+    def observe(self, tokens, elapsed_ms, *, suffix, rank):
+        if suffix:
+            self.suffix_rate = ema(self.suffix_rate, tokens * 1000 / elapsed_ms)
+            self.suffix_ms += elapsed_ms
+            self.suffix_samples += 1
+        else:
+            self.decode_ms = ema(self.decode_ms, elapsed_ms)
+        self.forward_ms += elapsed_ms
+        if self.forward_ms < 1500:
+            return
+        if not self.suffix_samples:
+            self.forward_ms = 0.0
+            return
+        if self.suffix_samples < 8:
+            return
+
+        delta = self.suffix_ms / self.forward_ms
+        self.forward_ms = self.suffix_ms = 0.0
+        self.suffix_samples = 0
+        if self.target == 0:
+            return
+        factor = min(1.30, max(0.75, 1 + 0.25 * (self.target - delta) / self.target))
+        if self.cap <= MIN_SUFFIX_TOKENS and (self.coverage < 1 or delta > self.target):
+            # Delta already reflects the current admission rate. Scale that
+            # rate, retaining a probe share when the target is nonzero.
+            self.coverage = min(1.0, max(0.05, self.coverage * factor))
+        else:
+            self.cap = min(
+                AUTO_SUFFIX_CAP_MAX, max(MIN_SUFFIX_TOKENS, self.cap * factor)
+            )
+        self.windows += 1
+        if rank == 0 and self.windows % 3 == 0:
+            logger.info(
+                "[handoff-split-budget] delta=%.3f target=%.3f cap=%d coverage=%.2f",
+                delta,
+                self.target,
+                self.cap,
+                self.coverage,
+            )
+
+    def offer(self, chunk, max_prefill_tokens):
+        # Round published estimates only. Rounding the controller state would
+        # prevent small upward adjustments from ever accumulating.
+        cap = int(self.cap) // 512 * 512
+        rate = min(RATE_LIMIT, int(self.suffix_rate or 0))
+        if rate and not self.pinned_chunk:
+            chunk = max(1, int(min(max_prefill_tokens, self.stall_ms / 1000 * rate)))
+        # MIN reduction over a negated duration selects the slowest TP rank.
+        step_us = math.ceil(min(2**31 - 1, (self.decode_ms or 0) * 1000))
+        coverage = int(self.coverage * 1000) if self.target else 0
+        return cap, chunk, rate, -step_us, coverage
+
+    def defer_steps(self, step_us, defaults):
+        if step_us <= 0:
+            return defaults
+        # Scheduler ticks approximate decode steps in this path.
+        step_ms = step_us / 1000
+        defer = int(min(2**31 - 1, self.defer_ms / step_ms))
+        patience = int(min(2**31 - 1, self.patience_ms / step_ms))
+        if self.patience_ms:
+            patience = max(1, patience)
+        return defer, patience, int(defer * 0.3)
