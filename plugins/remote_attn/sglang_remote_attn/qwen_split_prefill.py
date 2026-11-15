@@ -37,6 +37,7 @@ HOT_DEFER_TICKS = 45
 DEFER_PATIENCE_TICKS = 15
 AUTO_SUFFIX_CAP_GRANULARITY = 512
 AUTO_SUFFIX_RATE_EMA = 0.7
+TP_MIN_IDENTITY = 2**31 - 1
 
 
 class DecodeOffer(NamedTuple):
@@ -350,13 +351,26 @@ def negotiate_decode_offer(controller, req, reason):
     chunk = controller.split_prefill_chunk_size
     budget = controller.split_prefill_decode_budget
     if budget is None:
-        allowed, suffix_cap = controller.agree(
-            [int(reason is None), controller.split_prefill_auto_cap]
-        )
+        suffix_cap = controller.split_prefill_auto_cap
+        if suffix_cap and controller.rank != 0:
+            suffix_cap = TP_MIN_IDENTITY
+        allowed, suffix_cap = controller.agree([int(reason is None), suffix_cap])
         schedule = None
     else:
+        if controller.rank == 0:
+            parameters = budget.offer(chunk, controller.split_prefill_budget)
+        else:
+            # Publish rank 0's estimates through MIN while keeping this rank's
+            # prefill limit and request veto in the same vote.
+            parameters = (
+                TP_MIN_IDENTITY,
+                controller.split_prefill_budget,
+                TP_MIN_IDENTITY,
+                TP_MIN_IDENTITY,
+                TP_MIN_IDENTITY,
+            )
         allowed, suffix_cap, chunk, rate, neg_step_us, coverage = controller.agree(
-            [int(reason is None), *budget.offer(chunk, controller.split_prefill_budget)]
+            [int(reason is None), *parameters]
         )
         chunk -= chunk % controller.split_prefill_page_size
         if allowed and length < 2 * chunk:
@@ -765,7 +779,7 @@ def time_suffix_forward(original, worker, batch, *args, **kwargs):
             phase = "prefix"
         elif budget is not None and budget.target and batch.forward_mode.is_decode():
             phase = "decode"
-    if phase is None:
+    if phase is None or (phase != "prefix" and controller.rank != 0):
         return original(worker, batch, *args, **kwargs)
 
     import torch

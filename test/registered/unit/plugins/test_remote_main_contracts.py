@@ -1698,6 +1698,68 @@ class TestSplitPD(CustomTestCase):
         self.assertEqual(first._hybrid_split_at, 27502)
         self.assertEqual(second._hybrid_split_at, 28672)
 
+    def test_decode_timing_offer_publishes_rank_zero_estimates_and_preserves_veto(self):
+        def reduce_min(vote, peer_vote):
+            return [
+                min(local, peer) for local, peer in zip(vote, peer_vote, strict=True)
+            ]
+
+        for adaptive in ("0", "1"):
+            with (
+                self.subTest(adaptive=adaptive),
+                patch.dict(
+                    os.environ,
+                    {
+                        "HANDOFF_SPLIT_CAP_AUTO": "1",
+                        "HANDOFF_SPLIT_ADAPTIVE": adaptive,
+                    },
+                ),
+            ):
+                leader = self.controller("decode")
+                follower = self.controller(
+                    "decode", max_prefill_tokens=2048 if adaptive == "1" else 16384
+                )
+                leader.tp_size = follower.tp_size = 2
+                follower.rank = 1
+                if adaptive == "1":
+                    budget = leader.split_prefill_decode_budget
+                    budget.cap = 8192
+                    budget.suffix_rate = 5000
+                    budget.decode_ms = 20
+                    expected_schedule = (2048, 100, 10, 5000, 20_000)
+                else:
+                    leader.split_prefill_auto_cap = 8192
+                    expected_schedule = None
+
+                leader.agree = Mock(side_effect=lambda vote: vote)
+                self.split.negotiate_decode_offer(leader, self.request(), None)
+                leader_vote = leader.agree.call_args.args[0]
+                follower.agree = Mock(
+                    side_effect=lambda vote: reduce_min(vote, leader_vote)
+                )
+                follower_receiver = self.offer(follower).kv_receiver
+
+                follower_vote = follower.agree.call_args.args[0]
+                leader.agree.side_effect = lambda vote: reduce_min(vote, follower_vote)
+                leader_receiver = self.offer(leader).kv_receiver
+                for receiver in (leader_receiver, follower_receiver):
+                    self.assertEqual(receiver._hybrid_split_suffix_cap, 8192)
+                    self.assertEqual(
+                        getattr(receiver, "_hybrid_split_schedule", None),
+                        expected_schedule,
+                    )
+
+                follower.scheduler.running_batch.batch_size = lambda: 16
+                self.assertFalse(
+                    hasattr(self.offer(follower).kv_receiver, "_hybrid_split_limits")
+                )
+                follower_vote = follower.agree.call_args.args[0]
+                self.assertFalse(
+                    hasattr(self.offer(leader).kv_receiver, "_hybrid_split_limits")
+                )
+                self.assertEqual(leader.split_prefill_outstanding, 1)
+                self.assertEqual(follower.split_prefill_outstanding, 1)
+
     def test_feedback_suffix_floor_preserves_splits_after_large_cache_hits(self):
         with patch.dict(os.environ, {"HANDOFF_SPLIT_ADAPTIVE": "1"}):
             for length, prefix, rate, cut, reason in (
@@ -1761,17 +1823,33 @@ class TestSplitPD(CustomTestCase):
     def test_feedback_observes_prefill_overlap_and_decode_only_when_enabled(self):
         from sglang_remote_attn import decode_overlap
 
-        decode = NS(forward_mode=NS(is_decode=lambda: True), batch_size=lambda: 4)
+        decode = NS(
+            forward_mode=NS(is_decode=lambda: True, is_extend=lambda: False),
+            batch_size=lambda: 4,
+        )
         prefix = NS(forward_mode=NS(is_extend=lambda: True), extend_num_tokens=6000)
+        suffix = NS(
+            _hybrid_split_extend=True,
+            forward_mode=NS(is_extend=lambda: True),
+            extend_num_tokens=4096,
+        )
         with patch.dict(os.environ, {"HANDOFF_SPLIT_ADAPTIVE": "1"}):
             p = self.controller()
             d = self.controller("decode")
+            follower = self.controller("decode")
+        with patch.dict(os.environ, {"HANDOFF_SPLIT_CAP_AUTO": "1"}):
+            rate_only_follower = self.controller("decode")
+        p.rank = follower.rank = rate_only_follower.rank = 1
         p.prefill_overlap = NS()
         static = self.controller("decode")
-        for controller, batch, ms in (
-            (static, decode, 10),
-            (p, prefix, 1000),
-            (d, decode, 20),
+        for controller, batch, ms, phase in (
+            (static, decode, 10, None),
+            (p, prefix, 1000, "prefix"),
+            (d, decode, 20, "decode"),
+            (d, suffix, 500, "suffix"),
+            (follower, decode, 20, None),
+            (follower, suffix, 500, None),
+            (rate_only_follower, suffix, 500, None),
         ):
             worker = NS(model_runner=NS(_pre_layerwise=controller))
             start = Mock()
@@ -1780,16 +1858,21 @@ class TestSplitPD(CustomTestCase):
             end.query.return_value = True
             with (
                 patch.object(torch.cuda, "current_stream", return_value=object()),
-                patch.object(torch.cuda, "Event", side_effect=[start, end]),
+                patch.object(torch.cuda, "Event", side_effect=[start, end]) as event,
             ):
                 result = self.split.time_suffix_forward(lambda *_: NS(), worker, batch)
-                if controller is static:
-                    self.assertFalse(hasattr(result, "_split_suffix_timing"))
+                timing = getattr(result, "_split_suffix_timing", None)
+                self.assertEqual(timing[-1] if timing else None, phase)
+                self.assertEqual(event.call_count, 2 if phase else 0)
                 decode_overlap.after_result(
                     lambda *_: None, controller.scheduler, batch, result
                 )
         self.assertEqual(p.split_prefill_prefix_rate, 6000)
         self.assertEqual(d.split_prefill_decode_budget.decode_ms, 20)
+        self.assertEqual(d.split_prefill_decode_budget.suffix_rate, 8192)
+        self.assertIsNone(follower.split_prefill_decode_budget.decode_ms)
+        self.assertIsNone(follower.split_prefill_decode_budget.suffix_rate)
+        self.assertEqual(rate_only_follower.split_prefill_rate_samples, 0)
 
     def test_suffix_events_follow_native_results_not_scheduler_iterations(self):
         from sglang_remote_attn import decode_overlap

@@ -1,4 +1,4 @@
-"""Per-rank estimates for the experimental split prefill feedback loop."""
+"""Estimates for the experimental split prefill feedback loop."""
 
 import logging
 import math
@@ -96,7 +96,7 @@ class DecodeBudget:
                     max(MIN_SUFFIX_TOKENS // 2, self.stall_ms / 1000 * rate),
                 )
             )
-        # MIN reduction over a negated duration selects the slowest TP rank.
+        # The TP MIN vote encodes the decode step as a negated duration.
         step_us = math.ceil(min(2**31 - 1, (self.decode_ms or 0) * 1000))
         coverage = int(self.coverage * 1000) if self.target else 0
         return cap, chunk, rate, -step_us, coverage
