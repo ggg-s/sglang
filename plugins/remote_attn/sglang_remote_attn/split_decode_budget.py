@@ -91,7 +91,12 @@ class DecodeBudget:
         cap = int(self.cap) // 512 * 512
         rate = min(RATE_LIMIT, int(self.suffix_rate or 0))
         if rate and not self.pinned_chunk:
-            chunk = max(1, int(min(max_prefill_tokens, self.stall_ms / 1000 * rate)))
+            chunk = int(
+                min(
+                    max_prefill_tokens,
+                    max(MIN_SUFFIX_TOKENS // 2, self.stall_ms / 1000 * rate),
+                )
+            )
         # MIN reduction over a negated duration selects the slowest TP rank.
         step_us = math.ceil(min(2**31 - 1, (self.decode_ms or 0) * 1000))
         coverage = int(self.coverage * 1000) if self.target else 0
@@ -106,4 +111,4 @@ class DecodeBudget:
         patience = int(min(2**31 - 1, self.patience_ms / step_ms))
         if self.patience_ms:
             patience = max(1, patience)
-        return defer, patience, int(defer * 0.3)
+        return defer, patience

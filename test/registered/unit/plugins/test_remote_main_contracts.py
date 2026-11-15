@@ -1460,11 +1460,56 @@ class TestSplitPD(CustomTestCase):
         _, _, first, dr = self.bootstrap(prefill=p, decode=d, prefix=20480)
         _, _, second, _ = self.bootstrap(prefill=p, decode=other, prefix=20480)
         self.assertEqual(dr.kv_receiver._hybrid_split_limits, (24576, 3072))
-        self.assertEqual(dr.kv_receiver._hybrid_split_schedule, (3072, 100, 10, 30))
+        self.assertEqual(
+            dr.kv_receiver._hybrid_split_schedule, (3072, 100, 10, 4500, 20_000)
+        )
         self.split.init_input(self.match, first, object())
         self.split.init_input(self.match, second, object())
         self.assertEqual(first._hybrid_split_at, 27502)
         self.assertEqual(second._hybrid_split_at, 28672)
+
+    def test_feedback_suffix_floor_preserves_splits_after_large_cache_hits(self):
+        with patch.dict(os.environ, {"HANDOFF_SPLIT_ADAPTIVE": "1"}):
+            for length, prefix, rate, cut, reason in (
+                (36000, 32400, 0, 33952, "selected"),
+                (36000, 32400, 6000, 33952, "selected"),
+                (36000, 33952, 6000, 0, "split_too_small"),
+                (8192, 5200, 6000, 0, "split_too_small"),
+            ):
+                with self.subTest(length=length, prefix=prefix, rate=rate):
+                    p = self.controller()
+                    d = self.controller("decode")
+                    p.split_prefill_prefix_rate = 6000
+                    d.split_prefill_decode_budget.suffix_rate = rate
+                    _, _, req, _ = self.bootstrap(
+                        prefix=prefix, length=length, prefill=p, decode=d
+                    )
+                    self.split.init_input(self.match, req, object())
+                    self.assertEqual(req._hybrid_split_at, cut)
+                    self.assertEqual(req._hybrid_split_match_reason, reason)
+
+    def test_feedback_chunk_floor_respects_scheduler_limit_and_explicit_pin(self):
+        for max_tokens, pin, expected in (
+            (16384, "0", 1024),
+            (768, "0", 768),
+            (16384, "512", 512),
+        ):
+            with (
+                self.subTest(max_tokens=max_tokens, pin=pin),
+                patch.dict(
+                    os.environ,
+                    {
+                        "HANDOFF_SPLIT_ADAPTIVE": "1",
+                        "HANDOFF_HYBRID_SPLIT_PREFILL_CHUNK_SIZE": pin,
+                    },
+                ),
+            ):
+                d = self.controller("decode", max_prefill_tokens=max_tokens)
+                budget = d.split_prefill_decode_budget
+                budget.suffix_rate = 1000
+                budget.cap = 4096
+                receiver = self.offer(d).kv_receiver
+                self.assertEqual(receiver._hybrid_split_limits[1], expected)
 
     def test_feedback_coverage_recovers_after_reaching_cap_floor(self):
         with patch.dict(
@@ -1772,8 +1817,8 @@ class TestSplitPD(CustomTestCase):
         )
         self.assertFalse(hasattr(peer, "_hybrid_split_limits"))
 
-    def commit_fixture(self, cut, *, hybrid=False, room=7, length=32768):
-        _, d, _, dr = self.bootstrap(hybrid=hybrid, length=length)
+    def commit_fixture(self, cut, *, hybrid=False, room=7, length=32768, decode=None):
+        _, d, _, dr = self.bootstrap(hybrid=hybrid, length=length, decode=decode)
         dr.metadata_buffer_index = 0
         dr.req.kv.req_pool_idx = 0
         dr.req.kv.set_row_len(length)
@@ -1800,15 +1845,41 @@ class TestSplitPD(CustomTestCase):
                 self.assertIsNone(dr.kv_receiver)
                 self.assertEqual(d.split_prefill_outstanding, 1)
 
-    def test_decode_priority_expires_per_chunk_and_uses_transferred_hits(self):
-        for hits, budget, end_bs in (
-            (19660, 150, 1),
-            (26214, 45, 1),
-            (19660, 2, 0),
-            (19660, 15, 2),
+    def test_decode_priority_expires_per_chunk(self):
+        for adaptive, hits, budget, end_bs in (
+            (False, 19660, 150, 1),
+            (False, 26214, 45, 1),
+            (False, 19660, 2, 0),
+            (False, 19660, 15, 2),
+            (True, 19660, 80, 1),
+            (True, 26214, 80, 1),
         ):
-            with self.subTest(hits=hits, budget=budget, end_bs=end_bs):
-                d, queue, dr = self.commit_fixture(24576)
+            with self.subTest(
+                adaptive=adaptive, hits=hits, budget=budget, end_bs=end_bs
+            ):
+                decode = None
+                cut = 24576
+                if adaptive:
+                    with patch.dict(
+                        os.environ,
+                        {
+                            "HANDOFF_SPLIT_ADAPTIVE": "1",
+                            "HANDOFF_SPLIT_DEFER_PATIENCE_MS": "0",
+                        },
+                    ):
+                        decode = self.controller("decode")
+                    # The local estimate differs from the vote. Only the
+                    # selected 2560 tok/s and 20 ms step may steer either rank.
+                    feedback = decode.split_prefill_decode_budget
+                    feedback.suffix_rate = 20_000
+                    feedback.decode_ms = 10
+                    decode.agree = lambda vote: (
+                        [vote[0], 8192, 4096, 2560, -20_000, 1000]
+                        if len(vote) == 6
+                        else vote
+                    )
+                    cut = 26624
+                d, queue, dr = self.commit_fixture(cut, decode=decode)
                 queue.metadata_buffers.cached_tokens[0, 0] = hits
                 self.assertTrue(self.split.commit(queue, dr, keep_receiver=False))
                 req = dr.req
@@ -1834,7 +1905,11 @@ class TestSplitPD(CustomTestCase):
                 scheduler.waiting_queue = waiting = WaitingQueue([req])
                 running = Mock()
                 running.batch_size.return_value = 2
-                batch = NS(prepare_for_extend=lambda **_: None)
+
+                def prepare_for_extend(**_):
+                    req.extend_len = req.extend_end - req.prefix_len
+
+                batch = NS(prepare_for_extend=prepare_for_extend)
                 native_decode = Mock(return_value=running)
                 modules = {
                     "sglang.srt.managers.schedule_batch": NS(
@@ -1855,20 +1930,26 @@ class TestSplitPD(CustomTestCase):
                         )
                     self.assertEqual(waiting, [req])
                     running.batch_size.return_value = end_bs
-                    req.extend_len = 4096
                     plan = self.split.next_batch(native_decode, scheduler, running)
                     self.assertIs(plan.batch_to_run, batch)
-                    self.assertEqual(req.extend_end, 28672)
+                    self.assertEqual(req.extend_end, cut + 4096)
                     self.assertEqual(req._hybrid_split_defer_ticks, 0)
                     self.assertEqual(waiting, [])
                     self.assertIs(scheduler.chunked_req, req)
-                    req.kv.truncate_committed(28672)
+                    req.kv.commit_prealloc(req.extend_end)
                     running.batch_size.return_value = 1
-                    self.assertIs(
-                        self.split.next_batch(native_decode, scheduler, running),
-                        running,
-                    )
-                    self.assertEqual(req._hybrid_split_defer_ticks, 1)
+                    final_wait = 40 if adaptive else 1
+                    for _ in range(final_wait):
+                        self.assertIs(
+                            self.split.next_batch(native_decode, scheduler, running),
+                            running,
+                        )
+                    self.assertEqual(req._hybrid_split_defer_ticks, final_wait)
+                    if adaptive:
+                        plan = self.split.next_batch(native_decode, scheduler, running)
+                        self.assertIs(plan.batch_to_run, batch)
+                        self.assertEqual(req.extend_end, 32768)
+                        self.assertIsNone(scheduler.chunked_req)
 
     def test_invalid_transfer_or_tp_cut_mismatch_aborts_before_continuation(self):
         for length, cut, room, mismatch, missing_state in (

@@ -364,15 +364,14 @@ def advertise(queue, dr, decode_prefix_len):
                 allowed, reason = 0, "decode_split_short_for_chunk"
             elif allowed and req.bootstrap_room % 1000 >= coverage:
                 allowed, reason = 0, "decode_split_budget"
-            defer, patience, hot = budget.defer_steps(
+            defer, patience = budget.defer_steps(
                 -neg_step_us,
                 (
                     controller.split_prefill_defer_ticks,
                     controller.split_prefill_patience_ticks,
-                    HOT_DEFER_TICKS,
                 ),
             )
-            schedule = chunk, defer, patience, hot
+            schedule = chunk, defer, patience, rate, -neg_step_us
     if allowed:
         if suffix_cap:
             suffix_cap = min(suffix_cap, length - min_cut)
@@ -524,12 +523,8 @@ def select_cut(controller, length, prefix, limits, rates=None):
         if rates is not None:
             remote_rate, local_rate = rates
             suffix = miss * remote_rate // (remote_rate + local_rate)
-        elif controller.split_prefill_adaptive:
-            suffix = int(miss * (1 - ratio))
         else:
-            suffix = max(int(miss * (1 - ratio)), floor)
-        if controller.split_prefill_adaptive:
-            floor = MIN_SUFFIX_TOKENS
+            suffix = int(miss * (1 - ratio))
         suffix_cap = controller.split_prefill_suffix_cap
         if suffix_cap is None:
             suffix_cap = offered_suffix_cap or DEFAULT_SUFFIX_CAP_TOKENS
@@ -537,10 +532,16 @@ def select_cut(controller, length, prefix, limits, rates=None):
             suffix_cap = min(suffix_cap, offered_suffix_cap)
         if miss <= chunk_cap:
             suffix_cap = min(suffix_cap, chunk_cap, length * 15 // 100)
-        cut = length - min(suffix, suffix_cap)
+        if controller.split_prefill_adaptive:
+            # Leave at least one uncached token for P and honor D's offer.
+            suffix_cap = min(suffix_cap, length - min_cut, miss - 1)
+            if suffix_cap < MIN_SUFFIX_TOKENS:
+                return 0, "split_too_small"
+            floor = MIN_SUFFIX_TOKENS
+        cut = length - min(max(suffix, floor), suffix_cap)
     if prefix < cut and max(min_cut, length - suffix_cap) <= cut <= length - floor:
-        return cut
-    return 0
+        return cut, "selected"
+    return 0, "no_legal_cut"
 
 
 def init_input(original, req, tree_cache=None, cow_mamba=None):
@@ -561,22 +562,16 @@ def init_input(original, req, tree_cache=None, cow_mamba=None):
         length = len(req.origin_input_ids)
         prefix = max(req.prefix_len, req.kv.cache_protected_len)
         gate = controller.split_prefill_min_queue_tokens
-        below_gate = gate and prefill_backlog_tokens(controller.scheduler, req) < gate
-        rates = getattr(req, "_hybrid_split_rates", None)
-        selected = (
-            0 if below_gate else select_cut(controller, length, prefix, limits, rates)
-        )
+        if gate and prefill_backlog_tokens(controller.scheduler, req) < gate:
+            selected, reason = 0, "p_backlog_below_threshold"
+        else:
+            rates = getattr(req, "_hybrid_split_rates", None)
+            selected, reason = select_cut(controller, length, prefix, limits, rates)
         agreed, negative_max = controller.agree([selected, -selected])
         accepted = agreed > 0 and agreed == -negative_max
         cut = req._hybrid_split_at = agreed if accepted else 0
-        if accepted:
-            reason = "selected"
-        elif selected:
+        if not accepted and selected:
             reason = "tp_cut_disagreement"
-        elif below_gate:
-            reason = "p_backlog_below_threshold"
-        else:
-            reason = "no_legal_cut"
         req._hybrid_split_match_reason = reason
     if cut:
         req.full_untruncated_fill_ids = req.full_untruncated_fill_ids[:cut]
@@ -790,17 +785,21 @@ def next_batch(original, scheduler, running_batch):
         return original(scheduler, running_batch)
 
     prompt_len = len(req.origin_input_ids)
+    remaining = prompt_len - req.prefix_len
     schedule = getattr(req, "_hybrid_split_schedule", None)
     if schedule is None:
-        schedule = (
-            controller.split_prefill_chunk_size,
-            controller.split_prefill_defer_ticks,
-            controller.split_prefill_patience_ticks,
-            HOT_DEFER_TICKS,
-        )
-    chunk_size, defer_budget, patience, hot_defer = schedule
-    if req.cached_tokens * 10 >= prompt_len * 7:
-        defer_budget = min(defer_budget, hot_defer)
+        chunk_size = controller.split_prefill_chunk_size
+        defer_budget = controller.split_prefill_defer_ticks
+        patience = controller.split_prefill_patience_ticks
+        if req.cached_tokens * 10 >= prompt_len * 7:
+            defer_budget = min(defer_budget, HOT_DEFER_TICKS)
+    else:
+        chunk_size, defer_budget, patience, rate, step_us = schedule
+        if rate and step_us:
+            # Limit the wait to the estimated forward time of the next chunk.
+            # Both inputs are frozen by the TP vote at admission.
+            chunk_steps = min(chunk_size, remaining) * 1_000_000 // (rate * step_us)
+            defer_budget = min(defer_budget, chunk_steps)
     ticks = req._hybrid_split_defer_ticks
     if ticks == 0:
         req._hybrid_split_defer_start_bs = running_bs
@@ -833,7 +832,7 @@ def next_batch(original, scheduler, running_batch):
 
     scheduler.waiting_queue.leave([req])
     req.refresh_fill_ids()
-    req.extend_end = min(req.prefix_len + chunk_size, prompt_len)
+    req.extend_end = req.prefix_len + min(chunk_size, remaining)
     middle = req.extend_end < prompt_len
     scheduler.chunked_req = req if middle else None
     req.time_stats.set_forward_entry_time()

@@ -193,15 +193,19 @@ suffix 和 decode 的 CUDA event 时间，用后缀占有效 forward 时间的�
 
 P 使用这次选中的 D 的速率计算约等耗时的后缀
 `miss × μ_D / (μ_P + μ_D)`，再应用协商上限。缺样本时用原 miss 比例，
-默认 25%。实验 miss 路径的结果不足 2048 或没有合法 cut 时走原生 PD。
+默认 25%。实验 miss 路径将后缀至少抬到 2048 token，同时给 P 保留至少一个
+未命中 token。未命中长度或协商上限容不下 2048 时回退原生 PD，并记录
+`split_too_small`。
 D 的 `N ≥ 2 × chunk` 是短 prompt 的准入启发式。
 
-D 用 `HANDOFF_SPLIT_STALL_MS`（默认 600）估算单块大小，显式设置
+D 用 `HANDOFF_SPLIT_STALL_MS`（默认 600）估算单块大小，动态块下限为
+1024 token，仍受调度器的 prefill token 上限约束。显式设置
 `HANDOFF_HYBRID_SPLIT_PREFILL_CHUNK_SIZE` 则固定块大小。D 用
 `HANDOFF_SPLIT_DEFER_MS`（默认 2000）及 `HANDOFF_SPLIT_DEFER_PATIENCE_MS`
-（默认 200）按实测 decode 步时估算等待轮数。D 在原准入投票中统一单块
-大小和等待轮数，分配后的请求使用这份配置直到后缀完成。目标占比、单块
-耗时和等待时长均用于调节策略，实际 TPOT 与 ITL 仍需实测。
+（默认 200）按实测 decode 步时估算等待轮数。D 在准入时通过 TP 投票统一
+单块大小、后缀速率和 decode 步时，并随请求保存。每块的等待预算取配置预算
+和该块预计耗时折算的 decode 轮数中较小者，末块按实际 token 数估算。
+缺少速率或步时样本时沿用该请求的配置预算。实际 TPOT 与 ITL 仍需实测。
 
 闭环会给普通 decode forward 也记录 CUDA event，开销需单独验证。
 `HANDOFF_SPLIT_ADAPTIVE=0` 可继续使用原有静态或按速率估算的 cap 对照。
