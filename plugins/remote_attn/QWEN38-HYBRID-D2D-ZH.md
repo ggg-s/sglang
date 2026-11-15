@@ -160,8 +160,8 @@ C1 的 TTFT p90 下降 14.3%，ITL 均值增加 0.5%。更换模型、硬件或�
 应重新测量 D 的后缀处理速率和延迟，再标定后缀上限。
 完整三臂数据、固定后缀对照与低并发结果见
 [RTX 5090 2P1D SWE-bench 实测](validation/qwen-split-prefill-2p1d-5090.md)。
-[H100 1P1D 自适应 cap 实验](validation/qwen-split-prefill-adaptive-h100.md)
-另记录了并发扫描和 ITL 代价。
+[H100 1P1D 自适应 cap 复测](validation/qwen-split-prefill-adaptive-h100.md)
+记录了 `4e360aa4f2` 在 C=8 的等并发对照、C=7→14 的达标边界和 ITL 代价。
 
 #### 自适应后缀上限（实验）
 
