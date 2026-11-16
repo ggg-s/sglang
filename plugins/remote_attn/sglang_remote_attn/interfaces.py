@@ -14,6 +14,7 @@ STAGING = DISAGG + "common.staging_handler."
 # Explicit optional parameters are required: **kwargs can silently discard them.
 # Values pin the native, feature-disabled defaults as well as keyword support.
 CORE_CALLS = {
+    DISAGG + "utils.get_dsv41_spec_layout": {"include_flash": False},
     "sglang.srt.managers.scheduler.Scheduler.request_lists": {},
     "sglang.srt.mem_cache.memory_pool.HybridLinearKVPool.get_state_buf_infos": {},
     "sglang.srt.mem_cache.memory_pool.MambaPool._iter_transfer_state_entries": {},

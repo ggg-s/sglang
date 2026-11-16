@@ -12,6 +12,26 @@ WIRE = b"REMOTE_ATTN_DSV4_SPLIT_V1:"
 logger = logging.getLogger(__name__)
 
 
+def dspark_requested():
+    from sglang.srt.runtime_context import get_disagg, get_spec
+
+    disagg = get_disagg()
+    return (
+        get_spec().speculative_algorithm == "DSPARK"
+        and os.environ.get("HANDOFF_HYBRID_SPLIT_PREFILL") == "1"
+        and os.environ.get("HANDOFF_PRE_LAYERWISE") == "remote"
+        and os.environ.get("HANDOFF_EXPERIMENTAL_PD_REMOTE", "0") == "0"
+        and disagg.disaggregation_mode in ("prefill", "decode")
+        and disagg.disaggregation_transfer_backend == "mooncake"
+    )
+
+
+def native_spec_layout(original, kv_args, *, include_flash=False):
+    # CommonKVManager publishes this descriptor even for requests that never
+    # split. A draft-less peer must fail bootstrap, including native PD fallback.
+    return original(kv_args, include_flash=include_flash or dspark_requested())
+
+
 def schema_id(controller, manager, runner):
     from sglang.srt.runtime_context import get_disagg
 
@@ -29,6 +49,14 @@ def schema_id(controller, manager, runner):
     pool = controller.pool
     backend = runner.attn_backend
     ratios = set(controller.schema_signature["ratios"])
+    dspark = getattr(controller, "dsv4_split_dspark", False)
+    state_types = manager.kv_args.state_types
+    compatible_states = (
+        bool(manager.dsv41_spec_layout)
+        if dspark
+        else len(state_types) == 2
+        and set(state_types) == {StateType.SWA, StateType.DSV4_REQUEST_STATE}
+    )
     if (
         not {4, 128} <= ratios <= {0, 4, 128}
         or pool.request_window is not None
@@ -41,9 +69,7 @@ def schema_id(controller, manager, runner):
         or runner.decode_attention_backend_str != "dsv4"
         or getattr(backend, "trtllm_attn", False)
         or getattr(backend, "mega_attn", False)
-        or set(manager.kv_args.state_types)
-        != {StateType.SWA, StateType.DSV4_REQUEST_STATE}
-        or len(manager.kv_args.state_types) != 2
+        or not compatible_states
     ):
         return None
     schema = (
@@ -255,15 +281,27 @@ def send_states(
     from sglang.srt.disaggregation.base.conn import StateType
 
     types = manager.kv_args.state_types
-    swa, c128 = types.index(StateType.SWA), types.index(StateType.DSV4_REQUEST_STATE)
     src, dst = list(prefill_state_indices), list(req.dst_state_indices)
-    if src[swa] is None or len(src[swa]) != len(pages) or any(p <= 0 for p in src[swa]):
-        logger.error("DSV4 split prefill SWA pages do not cover the cut")
+    if len(src) != len(types) or len(dst) != len(types):
+        logger.error("DSV4 split prefill transfer has incompatible state indices")
         return -1
-    dst[swa] = pages
+    for i, kind in enumerate(types):
+        if kind == StateType.SWA:
+            # Native paged DSpark uses the target's index mapping for both
+            # SWA components. Both destinations must move to the cut window.
+            if (
+                src[i] is None
+                or len(src[i]) != len(pages)
+                or any(p <= 0 for p in src[i])
+            ):
+                logger.error(
+                    "DSV4 split prefill SWA component %s does not cover the cut", i
+                )
+                return -1
+            dst[i] = pages
     # The cut ends on a full C128 block. Native PD's C128 indices describe
     # the full prompt's pending block, which the suffix forward will produce.
-    src[c128] = None
+    src[types.index(StateType.DSV4_REQUEST_STATE)] = None
     return original(
         manager,
         replace(req, dst_state_indices=dst),

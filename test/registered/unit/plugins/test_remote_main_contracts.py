@@ -1313,7 +1313,13 @@ class TestSplitPD(CustomTestCase):
         ):
             self._check_dsv4_split(adaptive=True, invalid_hints=True)
 
-    def _check_dsv4_split(self, *, adaptive, invalid_hints=False):
+    def test_dsv4_dspark_split_remaps_both_swa_components_and_keeps_native_fallback(
+        self,
+    ):
+        with patch.dict(os.environ, {"HANDOFF_HYBRID_SPLIT_PREFILL": "1"}):
+            self._check_dsv4_split(adaptive=False, dspark=True)
+
+    def _check_dsv4_split(self, *, adaptive, invalid_hints=False, dspark=False):
         from sglang_remote_attn import dsv4_split_prefill as flash
 
         with patch.object(
@@ -1365,15 +1371,24 @@ class TestSplitPD(CustomTestCase):
                 if len(vote) == 6
                 else vote
             )
+        state_types = [state_type.SWA, state_type.DSV4_REQUEST_STATE]
+        dst_state_indices = [[48, 91], [7]]
+        src_state_indices = [[25], [3]]
+        if dspark:
+            state_types += [state_type.SWA, state_type.REQUEST_ROW]
+            dst_state_indices += [[48, 91], [9]]
+            src_state_indices += [[25], [4]]
         manager = NS(
             kv_shard_size=1,
-            kv_args=NS(state_types=[state_type.SWA, state_type.DSV4_REQUEST_STATE]),
+            kv_args=NS(state_types=state_types),
+            dsv41_spec_layout={"state_types": state_types} if dspark else None,
         )
         for controller in (p, d):
             controller.scheduler.sliding_window_size = window
             controller.pool.swa_page_size = page
             controller.pool.request_window = None
             controller.hf_config = NS(model_type="deepseek_v4")
+            controller.dsv4_split_dspark = dspark
             controller.schema_signature = {"ratios": [0, 4, 128]}
             controller.dsv4_split_schema = flash.schema_id(
                 controller,
@@ -1458,7 +1473,7 @@ class TestSplitPD(CustomTestCase):
                     self.split.SUFFIX_RATE_WIRE + b"invalid",
                 )
             )
-        peer = self.mesh.parse_transfer(lambda **_: Peer([[48, 91], [7]]), msg=frames)
+        peer = self.mesh.parse_transfer(lambda **_: Peer(dst_state_indices), msg=frames)
         peer.is_dummy = False
         peer.mooncake_session_id = "decode"
         peer.dst_kv_indices = list(range(33))
@@ -1497,11 +1512,39 @@ class TestSplitPD(CustomTestCase):
             lambda _, target, indices, *_args: (target.dst_state_indices, indices),
             manager,
             peer,
-            [[25], [3]],
+            src_state_indices,
             None,
         )
-        self.assertEqual(sent, ([[92 if adaptive else 15], [7]], [[25], None]))
-        self.assertEqual(peer.dst_state_indices, [[48, 91], [7]])
+        cut_pages = [92 if adaptive else 15]
+        expected_dst, expected_src = [cut_pages, [7]], [[25], None]
+        if dspark:
+            expected_dst += [cut_pages, [9]]
+            expected_src += [[25], [4]]
+            self.assertEqual(
+                flash.send_states(
+                    lambda *_: self.fail("draft SWA must be present at the cut"),
+                    manager,
+                    peer,
+                    [[25], [3], None, [4]],
+                    None,
+                ),
+                -1,
+            )
+            self.assertEqual(
+                flash.send_states(
+                    lambda _, target, indices, *_args: (
+                        target.dst_state_indices,
+                        indices,
+                    ),
+                    manager,
+                    Peer(dst_state_indices),
+                    src_state_indices,
+                    None,
+                ),
+                (dst_state_indices, src_state_indices),
+            )
+        self.assertEqual(sent, (expected_dst, expected_src))
+        self.assertEqual(peer.dst_state_indices, dst_state_indices)
 
         freed = []
         prealloc.token_to_kv_pool_allocator.free_swa_segment = (
@@ -1528,8 +1571,7 @@ class TestSplitPD(CustomTestCase):
         self.split.release_reservation(req)
         self.assertEqual(d.split_prefill_outstanding, 0)
 
-        # A peer that only speaks native PD can still consume the normal
-        # tail rows. It must not inherit a cut from the previous metadata owner.
+        # The native PD completion keeps the full-prompt SWA tail.
         req.kv.set_row_len(length)
         req.kv.set_evicted_seqlen(component_type.SWA, start)
         req._hybrid_split_reservation = d
@@ -1539,6 +1581,118 @@ class TestSplitPD(CustomTestCase):
         self.assertFalse(self.split.commit(queue, dr, keep_receiver=False))
         self.assertEqual(req.kv.get_evicted_seqlen(component_type.SWA), 7936)
         self.assertEqual(d.split_prefill_outstanding, 0)
+
+    def test_flash_dspark_reuses_native_bootstrap_layout_check_for_fallback(self):
+        import logging
+        from enum import StrEnum
+
+        from sglang_remote_attn import dsv4_split_prefill as flash
+
+        with patch.object(
+            sys, "path", [str(ROOT / "test/manual/remote_attn"), *sys.path]
+        ):
+            from dsv41_remote_probe_support import definitions
+
+        state_type = definitions(
+            ROOT, "python/sglang/srt/disaggregation/base/conn.py", owner="StateType"
+        )
+        state_type = StrEnum(
+            "StateType",
+            {key: value for key, value in vars(state_type).items() if key.isupper()},
+        )
+        spec = NS(speculative_algorithm="DSPARK", speculative_num_draft_tokens=8)
+        self.stack.enter_context(
+            patch.dict(
+                sys.modules,
+                {
+                    "sglang.srt.disaggregation.base.conn": NS(StateType=state_type),
+                    "sglang.srt.runtime_context": NS(
+                        get_spec=lambda: spec,
+                        get_disagg=lambda: NS(
+                            disaggregation_mode="decode",
+                            disaggregation_transfer_backend="mooncake",
+                        ),
+                    ),
+                },
+            )
+        )
+        layout_for = definitions(
+            ROOT,
+            "python/sglang/srt/disaggregation/utils.py",
+            owner="get_dsv41_spec_layout",
+        )
+        layout_for.__globals__["get_spec"] = lambda: spec
+        kv_args = NS(
+            page_size=256,
+            mla_compression_ratios=[0, 4, 128],
+            kv_layer_ids=[0, 1, 2],
+            kv_item_lens=[128, 256, 512],
+            state_types=[
+                state_type.SWA,
+                state_type.DSV4_REQUEST_STATE,
+                state_type.SWA,
+                state_type.REQUEST_ROW,
+            ],
+            state_item_lens=[[4096], [128], [4096], [8]],
+        )
+        self.assertIsNone(layout_for(kv_args))
+        with patch.dict(
+            os.environ,
+            {"HANDOFF_HYBRID_SPLIT_PREFILL": "1", "HANDOFF_PRE_LAYERWISE": "remote"},
+        ):
+            layout = flash.native_spec_layout(layout_for, kv_args)
+            self.assertEqual(
+                layout["state_types"], [kind.value for kind in kv_args.state_types]
+            )
+            spec.speculative_algorithm = None
+            self.assertIsNone(flash.native_spec_layout(layout_for, kv_args))
+            spec.speculative_algorithm = "DSPARK"
+            kv_args.state_types.pop()
+            with self.assertRaisesRegex(RuntimeError, "Flash DSpark PD requires"):
+                flash.native_spec_layout(layout_for, kv_args)
+            kv_args.state_types.append(state_type.REQUEST_ROW)
+
+        conn = "python/sglang/srt/disaggregation/common/conn.py"
+        ensure = definitions(
+            ROOT, conn, owner="CommonKVManager", members={"try_ensure_parallel_info"}
+        ).try_ensure_parallel_info
+        ensure.__globals__.update(
+            PrefillServerInfo=NS,
+            StateType=state_type,
+            logger=logging.getLogger(__name__),
+        )
+        d = NS(
+            prefill_info_table={},
+            kv_args=kv_args,
+            kv_cache_dtype_str="fp8",
+            kv_layout="v4",
+            dsv41_spec_layout=layout,
+            attn_cp_size=1,
+            attn_tp_size=2,
+            is_mla_backend=True,
+            is_hybrid_mla_backend=False,
+            dcp_size=1,
+            _resolve_rank_mapping=lambda _: None,
+        )
+        info = dict(
+            page_size=256,
+            kv_cache_dtype="fp8",
+            kv_layout="v4",
+            attn_tp_size=2,
+            attn_cp_size=1,
+        )
+        for remote_layout in (None, dict(layout, num_draft_tokens=4), layout):
+            info["dsv41_spec_layout"] = remote_layout
+            ensure.__globals__["requests"] = NS(
+                get=lambda *_args, **_kwargs: NS(status_code=200, json=lambda: info)
+            )
+            if remote_layout != layout:
+                with self.assertRaisesRegex(RuntimeError, "DSpark PD layout mismatch"):
+                    ensure(d, "P")
+                self.assertEqual(d.prefill_info_table, {})
+            else:
+                self.assertTrue(ensure(d, "P"))
+                self.assertEqual(d.prefill_info_table["P"].dsv41_spec_layout, layout)
 
     def request(self, *, prefix=0, length=32768):
         return NS(
@@ -1943,6 +2097,40 @@ class TestSplitPD(CustomTestCase):
         self.assertIsNone(follower.split_prefill_decode_budget.decode_ms)
         self.assertIsNone(follower.split_prefill_decode_budget.suffix_rate)
         self.assertEqual(rate_only_follower.split_prefill_rate_samples, 0)
+
+    def test_flash_dspark_times_the_outer_worker_once(self):
+        from sglang_remote_attn import decode_overlap
+
+        with patch.dict(os.environ, {"HANDOFF_SPLIT_ADAPTIVE": "1"}):
+            d = self.controller("decode")
+        d.dsv4_split_dspark = True
+        target = NS(model_runner=NS(_pre_layerwise=d))
+        worker = NS(target_worker=target)
+        batch = NS(
+            forward_mode=NS(is_extend=lambda: True),
+            _hybrid_split_extend=True,
+            extend_num_tokens=4096,
+        )
+        trace = []
+        start, end = Mock(), Mock()
+        start.record.side_effect = lambda _: trace.append("start")
+        end.record.side_effect = lambda _: trace.append("end")
+        end.query.return_value = True
+        start.elapsed_time.return_value = 500
+
+        def forward(_worker, batch):
+            output = self.split.time_suffix_forward(lambda *_: NS(), target, batch)
+            trace.append("draft KV written")
+            return output
+
+        with (
+            patch.object(torch.cuda, "current_stream", return_value=object()),
+            patch.object(torch.cuda, "Event", side_effect=[start, end]),
+        ):
+            result = self.split.time_dspark_forward(forward, worker, batch)
+        self.assertEqual(trace, ["start", "draft KV written", "end"])
+        decode_overlap.after_result(lambda *_: None, d.scheduler, batch, result)
+        self.assertEqual(d.split_prefill_decode_budget.suffix_rate, 8192)
 
     def test_suffix_events_follow_native_results_not_scheduler_iterations(self):
         from sglang_remote_attn import decode_overlap

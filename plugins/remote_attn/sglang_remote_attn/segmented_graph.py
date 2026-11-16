@@ -497,13 +497,14 @@ def install_attention(model_runner, *, hybrid=False):
 def resolve_backend(original, runner):
     from sglang.srt.runtime_context import get_disagg, get_exec, get_parallel
 
-    from . import dsv41_graph, dsv41_remote, qwen_hybrid
+    from . import dsv4_split_prefill, dsv41_graph, dsv41_remote, qwen_hybrid
 
     dsv41 = dsv41_graph.is_model(runner)
     flash = (
         getattr(runner.model_runner.model_config.hf_config, "model_type", None)
         == "deepseek_v4"
     )
+    native_dspark = flash and dsv4_split_prefill.dspark_requested()
     parallel = get_parallel()
     option = os.environ.get("HANDOFF_REMOTE_SEGMENTED_GRAPH", "1")
     settings = (
@@ -524,7 +525,11 @@ def resolve_backend(original, runner):
         or controller is not None
         and (controller.targets or controller.sources)
     )
-    abi = dsv41_graph.capture_signature(mr, runner) if dsv41 else None
+    abi = (
+        dsv41_graph.capture_signature(mr, runner)
+        if dsv41 and not native_dspark
+        else None
+    )
     dsv41_remote_decode = dsv41 and settings[:2] == ("decode", "remote")
     # Exchange the actual pool layout, not the requested env setting. Join the
     # TP vote before rejecting so another rank cannot enter capture alone.
@@ -555,6 +560,7 @@ def resolve_backend(original, runner):
         live,
         cuda_python if settings == ("decode", "remote", "1") else True,
         kv_layout,
+        native_dspark,
     )
     # This vote precedes all extra capture barriers. Even a disabled rank joins,
     # so asymmetric plugin settings cannot hang a peer in segmented capture.
@@ -565,6 +571,8 @@ def resolve_backend(original, runner):
     )
     if option not in ("0", "1"):
         raise ValueError("HANDOFF_REMOTE_SEGMENTED_GRAPH must be 0 or 1")
+    if native_dspark:
+        return original(runner)
     if dsv41_remote_decode or flash and settings[:2] == ("decode", "remote"):
         # Scheduler/controller validation happens after runner initialization.
         # Reject before even constructing the native backend: it may capture

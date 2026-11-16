@@ -315,6 +315,42 @@ def run(transport, online, adaptive):
     )
     assert torch.all(d_swa_rows[d_pages[cut // PAGE]] == -1)
 
+    # The paged DSpark draft uses its own KV buffer at the same SWA page IDs.
+    # Exercise that second component and its positional request-row transfer.
+    draft_peer = Peer([*peer.dst_state_indices, peer.dst_state_indices[0], [1]])
+    draft_peer._dsv4_split_swa_destination = peer._dsv4_split_swa_destination
+    draft_manager = NS(
+        kv_args=NS(
+            state_types=[
+                *manager.kv_args.state_types,
+                StateType.SWA,
+                StateType.REQUEST_ROW,
+            ]
+        )
+    )
+    p_draft = p_swa_rows + 1
+    d_draft = torch.full_like(d_swa_rows, -1)
+    p_valid_from = torch.tensor([7, 0], dtype=torch.int64, device="cuda")
+    d_valid_from = torch.full_like(p_valid_from, -1)
+
+    def send_draft_states(manager, target, states, *_args):
+        send_states(manager, Peer(target.dst_state_indices[:2]), states[:2])
+        assert states[2:] == [[source_page], [0]]
+        assert target.dst_state_indices[2:] == [[dest_page], [1]]
+        transport.copy(p_draft[states[2][0]], d_draft[target.dst_state_indices[2][0]])
+        transport.copy(p_valid_from[0:1], d_valid_from[1:2])
+
+    dsv4_split_prefill.send_states(
+        send_draft_states,
+        draft_manager,
+        draft_peer,
+        [[source_page], [0], [source_page], [0]],
+        None,
+    )
+    torch.testing.assert_close(d_draft[dest_page], p_draft[source_page])
+    assert torch.all(d_draft[d_pages[cut // PAGE]] == -1)
+    assert d_valid_from.tolist() == [-1, 7]
+
     # Exercise the same CUDA mapping release used by D between suffix chunks.
     # All compressors share this FULL->SWA map.
     released = []
@@ -380,6 +416,7 @@ def run(transport, online, adaptive):
         "max_compressor_error": max(errors),
         "max_first_decode_error": max(decode_errors),
         "retired_swa_pages": len(released),
+        "draft_swa_and_request_row": "pass",
     }
 
 

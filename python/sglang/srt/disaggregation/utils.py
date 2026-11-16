@@ -1615,14 +1615,28 @@ def _token_kv_view(token_to_kv_pool):
     return token_to_kv_pool.layer_router.wrapped_view() or token_to_kv_pool
 
 
-def get_dsv41_spec_layout(kv_args: KVArgs) -> Optional[dict]:
+def get_dsv41_spec_layout(
+    kv_args: KVArgs, *, include_flash: bool = False
+) -> Optional[dict]:
     """Describe the positional transfer layout without pool capacities or pointers."""
     ratios = getattr(kv_args, "mla_compression_ratios", None) or []
-    if 2 not in ratios or str(get_spec().speculative_algorithm).upper() != "DSPARK":
+    flash = include_flash and {4, 128} <= set(ratios) <= {0, 4, 128}
+    if (2 not in ratios and not flash) or str(
+        get_spec().speculative_algorithm
+    ).upper() != "DSPARK":
         return None
 
     from sglang.srt.disaggregation.base.conn import StateType
 
+    if flash and list(kv_args.state_types) != [
+        StateType.SWA,
+        StateType.DSV4_REQUEST_STATE,
+        StateType.SWA,
+        StateType.REQUEST_ROW,
+    ]:
+        raise RuntimeError(
+            "Flash DSpark PD requires paged target and draft SWA and request state"
+        )
     if kv_args.state_types.count(StateType.SWA) != 2:
         raise RuntimeError(
             "DeepSeek-V4.1 DSpark PD requires target and draft SWA state"

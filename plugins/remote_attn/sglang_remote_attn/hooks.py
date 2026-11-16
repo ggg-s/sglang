@@ -53,6 +53,13 @@ def _scheduler_init(original, scheduler, *args, **kwargs):
     runner = scheduler.tp_worker.model_runner
     from . import qwen_hybrid
 
+    if (
+        dsv4_split_prefill.dspark_requested()
+        and runner.model_config.hf_config.model_type != "deepseek_v4"
+    ):
+        raise RuntimeError(
+            "remote_attn DSpark requires DeepSeek-V4 Flash paged split prefill"
+        )
     if qwen_hybrid.matches(runner):
         pre_layerwise.initialize(scheduler)
         return
@@ -141,7 +148,10 @@ def validate_config():
         not in ("layerwise", "remote")
     ):
         raise RuntimeError("remote_attn requires --page-size 1 without mixed chunks")
-    if get_spec().speculative_algorithm is not None:
+    if (
+        get_spec().speculative_algorithm is not None
+        and not dsv4_split_prefill.dspark_requested()
+    ):
         raise RuntimeError("remote_attn does not yet support speculative decoding")
     if get_disagg().enable_pd_role_switch:
         raise RuntimeError("remote_attn does not yet support live PD role switching")
@@ -657,12 +667,14 @@ HOOKS = {
 HOOKS.update(
     {
         "sglang.srt.disaggregation.common.conn.CommonKVReceiver._send_bootstrap_message": pd_mesh.bootstrap,
+        "sglang.srt.disaggregation.utils.get_dsv41_spec_layout": dsv4_split_prefill.native_spec_layout,
         "sglang.srt.disaggregation.mooncake.conn.TransferInfo.from_zmq": pd_mesh.parse_transfer,
         "sglang.srt.disaggregation.common.conn.CommonKVManager.resolve_kv_replica_factor": pd_mesh.resolve_peers,
         "sglang.srt.disaggregation.common.staging_handler.init_staging_allocator": pre_layerwise.init_staging_allocator,
         "sglang.srt.disaggregation.common.staging_handler.init_staging_buffers": pre_layerwise.init_staging_buffers,
         "sglang.srt.managers.scheduler.Scheduler.run_batch": pre_layerwise.run_batch,
         "sglang.srt.managers.tp_worker.TpModelWorker.forward_batch_generation": qwen_split_prefill.time_suffix_forward,
+        "sglang.srt.speculative.dspark_components.dspark_worker_v2.DSparkWorkerV2.forward_batch_generation": qwen_split_prefill.time_dspark_forward,
         "sglang.srt.managers.scheduler.Scheduler.get_new_batch_prefill": qwen_hybrid_pd.snapshot_prefill_admission,
         "sglang.srt.managers.scheduler.Scheduler.process_batch_result": decode_overlap.after_result,
         "sglang.srt.managers.scheduler.Scheduler.launch_batch_sample_if_needed": prefill_overlap.after_sample,

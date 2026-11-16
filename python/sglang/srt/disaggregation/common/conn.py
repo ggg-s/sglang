@@ -1428,7 +1428,7 @@ class CommonKVManager(BaseKVManager):
                     != (info.dsv41_spec_layout or {}).get(key)
                 )
                 raise RuntimeError(
-                    "DeepSeek-V4.1 DSpark PD layout mismatch "
+                    "DeepSeek-V4 family DSpark PD layout mismatch "
                     f"({', '.join(mismatched_fields)}): both servers must "
                     "enable DSpark with the same block size and target/draft KV "
                     "layout. Upgrade both servers together."
@@ -1445,7 +1445,7 @@ class CommonKVManager(BaseKVManager):
                 and not decode_tp_size_aligns_prefill_world_size
             ):
                 raise RuntimeError(
-                    "DeepSeek-V4.1 DSpark PD requires the same TP size on both "
+                    "DeepSeek-V4 family DSpark PD requires the same TP size on both "
                     "servers (including prefill CP ranks for MLA)"
                 )
 

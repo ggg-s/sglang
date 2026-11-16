@@ -46,7 +46,7 @@ native completion、Remote GPU reader 和 TP，D 等待 scatter/forward/IO/TP；
 
 P、D 两端显式设置 `HANDOFF_HYBRID_SPLIT_PREFILL=1` 和
 `HANDOFF_PRE_LAYERWISE=remote`，使用原生 Mooncake、同 TP、early allocation，
-保持 `HANDOFF_EXPERIMENTAL_PD_REMOTE=0`，并关闭 DSpark。两端再设
+保持 `HANDOFF_EXPERIMENTAL_PD_REMOTE=0`。两端再设
 `HANDOFF_SPLIT_ADAPTIVE=1` 可启用 decode 时间预算闭环，缺省使用静态策略。
 
 D 先按可用 SWA 页和后缀预算协商最早切点。P 匹配缓存后选择页对齐切点，
@@ -57,6 +57,40 @@ D 先按可用 SWA 页和后缀预算协商最早切点。P 匹配缓存后选�
 
 D 已有前缀命中、SWA 预算不足、无合法切点或对端无法协商时使用原生 PD。
 本地 CPU 契约覆盖静态和自适应 Bootstrap、状态页重映射、原生回退及页回收。
+
+### 双端 DSpark（实验）
+
+P、D 使用同一分支、相同的 draft 模型与 DSpark 配置，并同时设置
+`--speculative-algorithm DSPARK`。仅接入原生 paged FlashMLA 的 SWA-only
+draft 布局。Mooncake 在 bootstrap 校验两端的 target/draft 布局。
+
+P 使用原生 DSpark prefill 写入 draft SWA。发生 split 时，target 和 draft
+的 SWA 都搬到切点窗口，draft 请求状态沿用原生传输。D 使用原生 DSpark prefill
+续算后缀，保留原生 CUDA graph，并用末块结果直接进入 DSpark decode。
+未选中切点时，P 传输完整 prefill 的状态，D 使用原生 PD 的 DSpark 接力。
+自适应计时覆盖整个 DSpark forward，包括 draft KV 写入或提议与验证。
+
+#### 双端 DSpark 状态交接复测（RTX 4060 Laptop）
+
+基线为 `b6ee6c8520`，叠加本次改动。输入 9,215 token，KV 页大小 256，
+使用真实 CUDA 和经 host staging 的 Mooncake TCP。静态和自适应分别跑了
+C128 online 与 offline，各策略 22 次传输，四组均通过。
+
+| 策略 | C128 模式 | 切点 | D 后缀各块（token） | target/draft SWA 与 draft 请求状态 | 续算 / 首步 decode 最大绝对误差 |
+| --- | --- | ---: | --- | --- | --- |
+| 静态 | online、offline | 7,936 | 1,024 + 255 | 通过 | 0 / 0 |
+| 自适应 | online、offline | 6,656 | 1,536 + 1,023 | 通过 | 0 / 0 |
+
+逐组验证 target 和 draft SWA 都写入切点对应的目标页，切点后的下一页保留
+原值，draft 的 `swa_valid_from` 写入正确的请求槽位。C4/C128 压缩续算
+及探针首步 decode 与本地参考一致。日志位于
+`ubuntu:/tmp/sglang-flash-dspark-probe.Hm7Vh4/probe-{0,1}.json`。
+
+40 项相关 CPU 契约通过，覆盖双 SWA 重映射、缺失 draft 状态时拒绝 bootstrap，
+以及原生 PD 回退。4060 探针使用合成的 draft SWA 和请求状态张量，整模 DSpark
+输出一致性、多 TP GPU 和性能仍待验证。
+
+### 原有 Flash CUDA 探针
 
 2026-11-15 在 Ubuntu RTX 4060 Laptop 上运行 CUDA 探针，输入 9,215 token，
 KV 页大小 256。每种策略分别跑 C128 online 和 offline。两组均验证 Mooncake TCP

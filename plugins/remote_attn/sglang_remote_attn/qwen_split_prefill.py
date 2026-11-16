@@ -765,6 +765,21 @@ def commit(queue, dr, *, keep_receiver):
 
 def time_suffix_forward(original, worker, batch, *args, **kwargs):
     controller = getattr(worker.model_runner, "_pre_layerwise", None)
+    if getattr(controller, "dsv4_split_dspark", False):
+        return original(worker, batch, *args, **kwargs)
+    return _time_split_forward(controller, original, worker, batch, *args, **kwargs)
+
+
+def time_dspark_forward(original, worker, batch, *args, **kwargs):
+    controller = getattr(worker.target_worker.model_runner, "_pre_layerwise", None)
+    if not getattr(controller, "dsv4_split_dspark", False):
+        return original(worker, batch, *args, **kwargs)
+    # Time the outer worker so suffix samples include draft KV injection and
+    # decode samples cover draft proposal and target verification.
+    return _time_split_forward(controller, original, worker, batch, *args, **kwargs)
+
+
+def _time_split_forward(controller, original, worker, batch, *args, **kwargs):
     adaptive = getattr(controller, "split_prefill_adaptive", False)
     if batch is None or not (
         adaptive or getattr(controller, "split_prefill_auto_cap", 0)
