@@ -8,7 +8,6 @@ from dataclasses import dataclass
 logger = logging.getLogger(__name__)
 
 MIN_SUFFIX_TOKENS = 2048
-AUTO_SUFFIX_CAP_MAX = 32768
 RATE_LIMIT = 10_000_000
 
 
@@ -37,6 +36,7 @@ class DecodeBudget:
     patience_ms: float
     pinned_chunk: bool
     cap: float
+    max_cap: int
     min_cap: int = MIN_SUFFIX_TOKENS
     coverage: float = 1.0
     suffix_rate: float | None = None
@@ -73,7 +73,7 @@ class DecodeBudget:
             # rate, retaining a probe share when the target is nonzero.
             self.coverage = min(1.0, max(0.05, self.coverage * factor))
         else:
-            self.cap = min(AUTO_SUFFIX_CAP_MAX, max(self.min_cap, self.cap * factor))
+            self.cap = min(self.max_cap, max(self.min_cap, self.cap * factor))
         self.windows += 1
         if rank == 0 and self.windows % 3 == 0:
             logger.info(

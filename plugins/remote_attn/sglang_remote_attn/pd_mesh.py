@@ -538,10 +538,10 @@ def parse_transfer(original, *args, **kwargs):
     message = kwargs.get("msg", args[-1] if args else None)
     from . import dsv4_split_prefill
     from .qwen_split_prefill import (
-        AUTO_SUFFIX_CAP_MAX,
         DECODE_PRIORITY,
         SUFFIX_CAP_WIRE,
         SUFFIX_RATE_WIRE,
+        TP_MIN_IDENTITY,
         WIRE,
     )
     from .split_decode_budget import RATE_LIMIT
@@ -563,7 +563,7 @@ def parse_transfer(original, *args, **kwargs):
     if hasattr(value, "_hybrid_split_limits"):
         value._hybrid_split_decode_priority = DECODE_PRIORITY in extensions
         for tag, attr, maximum in (
-            (SUFFIX_CAP_WIRE, "_hybrid_split_suffix_cap", AUTO_SUFFIX_CAP_MAX),
+            (SUFFIX_CAP_WIRE, "_hybrid_split_suffix_cap", TP_MIN_IDENTITY),
             (SUFFIX_RATE_WIRE, "_hybrid_split_suffix_rate", RATE_LIMIT),
         ):
             fields = [

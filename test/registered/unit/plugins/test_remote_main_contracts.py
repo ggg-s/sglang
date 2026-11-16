@@ -1270,6 +1270,7 @@ class TestSplitPD(CustomTestCase):
     ):
         scheduler = NS(
             disaggregation_mode=NS(value=role),
+            max_req_input_len=131072,
             max_prefill_tokens=max_prefill_tokens,
             max_running_requests=16,
             running_batch=NS(batch_size=lambda: 0),
@@ -1662,6 +1663,49 @@ class TestSplitPD(CustomTestCase):
                 _, _, req, _ = self.bootstrap(length=65536, decode=d)
                 self.split.init_input(self.match, req, object())
                 self.assertEqual(req._hybrid_split_at, 61440)
+
+    def test_dynamic_suffix_cap_is_clamped_per_prompt_and_round_trips(self):
+        for mode in ("HANDOFF_SPLIT_ADAPTIVE", "HANDOFF_SPLIT_CAP_AUTO"):
+            with (
+                self.subTest(mode=mode),
+                patch.dict(
+                    os.environ,
+                    {
+                        mode: "1",
+                        "HANDOFF_HYBRID_SPLIT_PREFILL_CHUNK_SIZE": "4096",
+                        "HANDOFF_SPLIT_SUFFIX_CAP_TOKENS": "auto",
+                    },
+                ),
+            ):
+                d = self.controller("decode")
+                budget = d.split_prefill_decode_budget
+                if budget is None:
+                    d.split_prefill_auto_cap = 60_000
+                    expected_cap = 60_000
+                else:
+                    budget.cap = 60_000
+                    for _ in range(7):
+                        budget.observe(1024, 25, suffix=True, rank=0)
+                    budget.observe(1, 1400, suffix=False, rank=0)
+                    budget.observe(1024, 25, suffix=True, rank=0)
+                    expected_cap = d.scheduler.max_req_input_len // 2
+                    self.assertEqual(budget.cap, expected_cap)
+
+                short = self.offer(d, length=8193).kv_receiver
+                self.assertEqual(short._hybrid_split_suffix_cap, 4096)
+                _, _, req, long = self.bootstrap(length=98305, decode=d)
+                self.assertEqual(long.kv_receiver._hybrid_split_suffix_cap, 49152)
+                self.assertEqual(req._hybrid_split_limits, (49153, 4096, 49152))
+                self.assertEqual(
+                    budget.cap if budget else d.split_prefill_auto_cap, expected_cap
+                )
+
+                d.split_prefill_page_size = 256
+                offer, reason = self.split.negotiate_decode_offer(
+                    d, self.request(length=98305), None, min_cut=64020
+                )
+                self.assertIsNone(reason)
+                self.assertEqual(offer.suffix_cap, 98305 - 64256)
 
     def test_auto_prefill_falls_back_to_static_cap_without_extension(self):
         with patch.dict(os.environ, {"HANDOFF_SPLIT_SUFFIX_CAP_TOKENS": "auto"}):
@@ -2125,7 +2169,7 @@ class TestSplitPD(CustomTestCase):
             msg=[b""] * 10
             + [
                 self.split.WIRE + b"16384:4096",
-                self.split.SUFFIX_CAP_WIRE + b"32769",
+                self.split.SUFFIX_CAP_WIRE + b"2147483648",
             ],
         )
         self.assertFalse(hasattr(peer, "_hybrid_split_limits"))

@@ -171,12 +171,14 @@ C1 的 TTFT p90 下降 14.3%，ITL 均值增加 0.5%。更换模型、硬件或�
 | 自适应 | `HANDOFF_SPLIT_SUFFIX_CAP_TOKENS=auto` | `HANDOFF_SPLIT_CAP_AUTO=1` |
 
 D 默认用 `HANDOFF_SPLIT_SUFFIX_BUDGET_S=2.0` 将实测续算速度换算为整段
-后缀上限，范围 2048–32768 token，向下对齐到 512 token。首个有效样本
-之前使用按同样规则处理的本地 chunk 大小。D 仅在每个 TP 组的 rank 0
+后缀预算，先按 512 token 向下对齐并保留 2048 token 的估算下限。
+首个有效样本之前使用按同样规则处理的本地 chunk 大小。D 仅在每个 TP 组的 rank 0
 记录 CUDA event，原生结果处理完成后读取并更新 EMA。各 rank 继续在
 原有 MIN 投票中提交本地准入判断，并在同一次投票中接收 rank 0 的上限。
 D 通过独立 bootstrap 扩展发布整段上限，V3 的 chunk 字段保留单块口径。
-每条请求实际可用的上限还受 D 声明的切点下界约束。
+每条请求的报价取估算预算与该请求可交接后缀长度的较小值。Dense 和
+FULL+MAMBA 的请求上限是 prompt 长度的一半（向下取整）。DSV4 还要按
+SWA 可用容量及 KV 页对齐后的最早切点缩小上限。
 
 P 的 `auto` 模式在 D 未提供该扩展时使用 4096。P 若配置整数 cap，
 `miss` 路径取该值和 D 宣告上限的较小值。D 的协商下界对所有切点生效。
@@ -188,7 +190,9 @@ D 可用 `HANDOFF_SPLIT_DEFER_PATIENCE_TICKS` 调整提前结束等待的阈值�
 
 两端设置 `HANDOFF_SPLIT_ADAPTIVE=1` 启用。D 的 TP rank 0 在原生结果
 处理后读取 suffix 和 decode 的 CUDA event 时间，用后缀占有效 forward 时间的比例
-反馈给 cap。默认 `HANDOFF_SPLIT_DECODE_BUDGET_G=1.0`，对应目标占比
+反馈给 cap。控制器状态的上界由 D 可接收的最长 prompt 派生，实际报价
+再应用每条请求自己的上限。默认 `HANDOFF_SPLIT_DECODE_BUDGET_G=1.0`，
+对应目标占比
 `g / (1 + g)`。如果 cap 已到 2048 且仍超目标，就逐窗减少准入比例，
 并保留至少 5% 探测。g=0 时 D 拒绝实验 split。
 

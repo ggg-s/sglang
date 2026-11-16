@@ -8,7 +8,6 @@ from http import HTTPStatus
 from typing import NamedTuple
 
 from .split_decode_budget import (
-    AUTO_SUFFIX_CAP_MAX,
     MIN_SUFFIX_TOKENS,
     RATE_LIMIT,
     DecodeBudget,
@@ -51,7 +50,7 @@ def min_suffix_tokens(length):
 
 
 def quantize_suffix_cap(tokens):
-    tokens = int(min(tokens, AUTO_SUFFIX_CAP_MAX))
+    tokens = int(min(tokens, TP_MIN_IDENTITY))
     return max(
         MIN_SUFFIX_TOKENS,
         tokens // AUTO_SUFFIX_CAP_GRANULARITY * AUTO_SUFFIX_CAP_GRANULARITY,
@@ -210,12 +209,19 @@ def configure(controller):
             raise ValueError(f"{auto_env} must be 0 or 1")
         if controller.split_prefill_adaptive:
             g = read_budget("HANDOFF_SPLIT_DECODE_BUDGET_G", 1.0, allow_zero=True)
+            # Bound the feedback state by the longest admissible prompt.
+            # A shorter request only clamps its own quote.
+            max_cap = min(scheduler.max_req_input_len // 2, TP_MIN_IDENTITY)
+            max_cap -= max_cap % AUTO_SUFFIX_CAP_GRANULARITY
             # A paged cut can need up to one extra partial page of suffix.
-            # Round the floor up to a cap quantum so unaligned prompts remain
-            # eligible for coverage probes at the bottom of the feedback loop.
-            min_cap = quantize_suffix_cap(
-                MIN_SUFFIX_TOKENS + page - 1 + AUTO_SUFFIX_CAP_GRANULARITY - 1
+            # Round the floor up to preserve unaligned coverage probes.
+            min_cap = min(
+                max_cap,
+                quantize_suffix_cap(
+                    MIN_SUFFIX_TOKENS + page - 1 + AUTO_SUFFIX_CAP_GRANULARITY - 1
+                ),
             )
+            initial_cap = quantize_suffix_cap(controller.split_prefill_chunk_size)
             controller.split_prefill_decode_budget = DecodeBudget(
                 target=g / (1 + g),
                 stall_ms=read_budget("HANDOFF_SPLIT_STALL_MS", 600),
@@ -224,9 +230,8 @@ def configure(controller):
                     "HANDOFF_SPLIT_DEFER_PATIENCE_MS", 200, allow_zero=True
                 ),
                 pinned_chunk=bool(chunk_size),
-                cap=max(
-                    min_cap, quantize_suffix_cap(controller.split_prefill_chunk_size)
-                ),
+                cap=min(max_cap, max(min_cap, initial_cap)),
+                max_cap=max_cap,
                 min_cap=min_cap,
             )
             budget = controller.split_prefill_decode_budget
@@ -344,10 +349,17 @@ def can_prefill_before_bootstrap(original, queue, req):
     return original(queue, req)
 
 
-def negotiate_decode_offer(controller, req, reason):
+def negotiate_decode_offer(controller, req, reason, *, min_cut=0):
     length = len(req.origin_input_ids)
     if length < MIN_PROMPT_TOKENS:
         return None, reason or "decode_suffix_too_short"
+    page = controller.split_prefill_page_size
+    first_cut = max((length + 1) // 2, min_cut)
+    first_cut = (first_cut + page - 1) // page * page
+    prompt_cap = length - first_cut
+    if prompt_cap < min_suffix_tokens(length):
+        return None, reason or "decode_suffix_too_short"
+
     chunk = controller.split_prefill_chunk_size
     budget = controller.split_prefill_decode_budget
     if budget is None:
@@ -372,7 +384,7 @@ def negotiate_decode_offer(controller, req, reason):
         allowed, suffix_cap, chunk, rate, neg_step_us, coverage = controller.agree(
             [int(reason is None), *parameters]
         )
-        chunk -= chunk % controller.split_prefill_page_size
+        chunk -= chunk % page
         if allowed and length < 2 * chunk:
             return None, "decode_split_short_for_chunk"
         if allowed and req.bootstrap_room % 1000 >= coverage:
@@ -388,7 +400,9 @@ def negotiate_decode_offer(controller, req, reason):
         schedule = chunk, defer, patience, rate, step_us
     if not allowed:
         return None, reason or "decode_peer_rejected"
-    return DecodeOffer(suffix_cap, chunk, schedule), None
+    if budget is not None and not suffix_cap:
+        return None, "decode_suffix_too_short"
+    return DecodeOffer(min(suffix_cap, prompt_cap), chunk, schedule), None
 
 
 def publish_decode_offer(controller, receiver, length, min_cut, offer):

@@ -103,12 +103,14 @@ def select_swa_prealloc_start(
     )
     if not allowed:
         return None
-    offer, reason = split.negotiate_decode_offer(controller, req, None)
+    earliest_start = max(0, normal_start - extra // page * page)
+    first_cut = max((fill_len + 1) // 2, earliest_start + window)
+    offer, reason = split.negotiate_decode_offer(
+        controller, req, None, min_cut=first_cut
+    )
     if offer is None:
         split.log_decision(controller, req, "decode_offer", reason)
         return None
-    earliest_start = max(0, normal_start - extra // page * page)
-    first_cut = max((fill_len + 1) // 2, earliest_start + window)
     if offer.suffix_cap:
         first_cut = max(first_cut, fill_len - offer.suffix_cap)
     min_cut = (first_cut + page - 1) // page * page
