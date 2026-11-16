@@ -123,9 +123,9 @@ Remote attention 用于 D2D 迁移。P→D Remote 早接纳作为实验功能，
 
 - 选中的 D 先做准入，选中的 P 按本机实际命中前缀 `H` 计算 cut。
   默认 `HANDOFF_SPLIT_CUT_BASIS=miss`。未命中量为 `N - H`，D 接手其中
-  25%，受后缀下限 `min(2048, max(N // 16, 1))` 和
-  `HANDOFF_SPLIT_SUFFIX_CAP_TOKENS` 限制。后者默认 4096，按 5090 2P1D
-  SWE-bench 标定。只有未命中量已能装入一个协商 chunk 时，才再应用 chunk cap
+  25%，受后缀下限 `min(2048, max(N // 16, 1))` 和 D 的协商上限约束。
+  `HANDOFF_SPLIT_SUFFIX_CAP_TOKENS` 默认 `auto`，显式设置整数可以增加
+  P 侧上限。只有未命中量已能装入一个协商 chunk 时，才再应用 chunk cap
   和 prompt 长度的 15% 限制。没有合法切点时在原 pair 上走原生 PD。
 - D 的 `HANDOFF_SPLIT_DEFER_TICKS` 默认 `150`。有活跃 decode 时，
   候选后缀每让路一次计一轮。P 命中至少 70% 时，预算上限为 45 轮。
@@ -153,7 +153,7 @@ Remote attention 用于 D2D 迁移。P→D Remote 早接纳作为实验功能，
 历史 Split V1 指 miss + cap 与立即提交，V2 指平衡切点与 decode 优先。
 **V3 wire** 是 P/D bootstrap 协议版本。
 
-4096 的标定来自移交的 RTX 5090、Qwen3.8-27B-FP8、2P1D TP2、SWE-bench
+固定 cap 4096 的对照来自 RTX 5090、Qwen3.8-27B-FP8、2P1D TP2、SWE-bench
 600 秒实验。C6 下，对比原生 PD 的 TTFT p90 从 26,772 降到 21,891 ms，
 输出吞吐从 72.62 增到 78.98 token/s，ITL 均值增加 26%，TPOT 增加 36%。
 C1 的 TTFT p90 下降 14.3%，ITL 均值增加 0.5%。更换模型、硬件或负载后，
@@ -167,7 +167,7 @@ C1 的 TTFT p90 下降 14.3%，ITL 均值增加 0.5%。更换模型、硬件或�
 
 | 对照 | P 侧 | D 侧 |
 | --- | --- | --- |
-| 静态（默认） | `HANDOFF_SPLIT_SUFFIX_CAP_TOKENS=4096`，也可用其他整数 | `HANDOFF_SPLIT_CAP_AUTO=0` |
+| 请求切点约束（默认） | `HANDOFF_SPLIT_SUFFIX_CAP_TOKENS=auto`，也可设整数上限 | `HANDOFF_SPLIT_CAP_AUTO=0` |
 | 自适应 | `HANDOFF_SPLIT_SUFFIX_CAP_TOKENS=auto` | `HANDOFF_SPLIT_CAP_AUTO=1` |
 
 D 默认用 `HANDOFF_SPLIT_SUFFIX_BUDGET_S=2.0` 将实测续算速度换算为整段
@@ -180,8 +180,8 @@ D 通过独立 bootstrap 扩展发布整段上限，V3 的 chunk 字段保留单
 FULL+MAMBA 的请求上限是 prompt 长度的一半（向下取整）。DSV4 还要按
 SWA 可用容量及 KV 页对齐后的最早切点缩小上限。
 
-P 的 `auto` 模式在 D 未提供该扩展时使用 4096。P 若配置整数 cap，
-`miss` 路径取该值和 D 宣告上限的较小值。D 的协商下界对所有切点生效。
+P 的 `auto` 模式在缺少 cap 扩展时从 D 的最早切点推导后缀上限。
+P 若配置整数 cap，`miss` 路径仍取该值和 D 宣告上限的较小值。
 分块仍由 `HANDOFF_HYBRID_SPLIT_PREFILL_CHUNK_SIZE` 控制。
 D 可用 `HANDOFF_SPLIT_DEFER_PATIENCE_TICKS` 调整提前结束等待的阈值，
 默认 15，设为 0 仅关闭早退。
@@ -197,7 +197,7 @@ D 可用 `HANDOFF_SPLIT_DEFER_PATIENCE_TICKS` 调整提前结束等待的阈值�
 并保留至少 5% 探测。g=0 时 D 拒绝实验 split。
 
 P 使用这次选中的 D 的速率计算约等耗时的后缀
-`miss × μ_D / (μ_P + μ_D)`，再应用协商上限。缺样本时用原 miss 比例，
+`miss × μ_D / (μ_P + μ_D)`，再应用协商上限。缺样本或可选速率扩展无效时用原 miss 比例，
 默认 25%。实验 miss 路径将后缀至少抬到 2048 token，同时给 P 保留至少一个
 未命中 token。未命中长度或协商上限容不下 2048 时回退原生 PD，并记录
 `split_too_small`。

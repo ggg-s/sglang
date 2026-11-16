@@ -26,10 +26,6 @@ CUT_SLOT = 1
 MIN_PROMPT_TOKENS = 4096
 BALANCED_CUT_RATIO = 0.75
 PREFIX_GROWTH_TOKENS = 1024
-# 2P1D SWE-bench calibration on RTX 5090 TP2 / Qwen3.8-27B-FP8.
-# For a target suffix time fraction f, size the average suffix at most
-# f * suffix_prefill_rate / admitted_split_rps. Recalibrate for other loads.
-DEFAULT_SUFFIX_CAP_TOKENS = 4096
 # Legacy balanced basis: 128 decode steps at 14 ms, 6800 prefill tok/s.
 COLLISION_BUDGET_TOKENS = 128 * 14 * 6800 // 1000
 HOT_DEFER_TICKS = 45
@@ -128,12 +124,7 @@ def configure(controller):
         if suffix_tokens < 0:
             raise ValueError(f"{suffix_env} must be a nonnegative integer")
         cap_env = "HANDOFF_SPLIT_SUFFIX_CAP_TOKENS"
-        default_cap = (
-            "auto"
-            if controller.split_prefill_adaptive
-            else str(DEFAULT_SUFFIX_CAP_TOKENS)
-        )
-        raw_cap = os.environ.get(cap_env, default_cap)
+        raw_cap = os.environ.get(cap_env, "auto")
         suffix_cap = None
         if raw_cap != "auto":
             try:
@@ -498,13 +489,13 @@ def offered_limits(req, controller):
     peer = peers[0]
     limits = getattr(peer, "_hybrid_split_limits", None)
     if limits is None:
-        return None, "decode_did_not_offer"
+        return None, getattr(peer, "_hybrid_split_offer_error", "decode_did_not_offer")
     cut, chunk_cap = limits
     length = len(req.origin_input_ids)
     suffix_cap = getattr(peer, "_hybrid_split_suffix_cap", 0)
     if (
         not (length + 1) // 2 <= cut <= length - min_suffix_tokens(length)
-        or chunk_cap < (1 if suffix_cap else MIN_SUFFIX_TOKENS)
+        or chunk_cap < 1
         or (suffix_cap and suffix_cap != length - cut)
     ):
         return None, "invalid_decode_split_limits"
@@ -600,11 +591,12 @@ def select_cut(controller, length, prefix, limits, rates=None):
             suffix = miss * remote_rate // (remote_rate + local_rate)
         else:
             suffix = int(miss * (1 - ratio))
-        suffix_cap = controller.split_prefill_suffix_cap
-        if suffix_cap is None:
-            suffix_cap = offered_suffix_cap or DEFAULT_SUFFIX_CAP_TOKENS
-        elif offered_suffix_cap:
-            suffix_cap = min(suffix_cap, offered_suffix_cap)
+        # The required cut already carries D's maximum suffix length,
+        # including its page and SWA constraints.
+        suffix_cap = offered_suffix_cap or length - min_cut
+        configured_cap = controller.split_prefill_suffix_cap
+        if configured_cap is not None:
+            suffix_cap = min(suffix_cap, configured_cap)
         if miss <= chunk_cap:
             suffix_cap = min(suffix_cap, chunk_cap, length * 15 // 100)
         if controller.split_prefill_adaptive:

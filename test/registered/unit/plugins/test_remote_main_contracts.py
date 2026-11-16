@@ -1305,7 +1305,15 @@ class TestSplitPD(CustomTestCase):
         ):
             self._check_dsv4_split(adaptive=True)
 
-    def _check_dsv4_split(self, *, adaptive):
+    def test_dsv4_adaptive_keeps_offer_with_invalid_optional_hints(self):
+        """Bad cap/rate hints previously erased a valid paged cut on P."""
+        with patch.dict(
+            os.environ,
+            {"HANDOFF_HYBRID_SPLIT_PREFILL": "1", "HANDOFF_SPLIT_ADAPTIVE": "1"},
+        ):
+            self._check_dsv4_split(adaptive=True, invalid_hints=True)
+
+    def _check_dsv4_split(self, *, adaptive, invalid_hints=False):
         from sglang_remote_attn import dsv4_split_prefill as flash
 
         with patch.object(
@@ -1344,6 +1352,7 @@ class TestSplitPD(CustomTestCase):
         page, window = 256, 128
         p = self.controller(dsv4=True)
         d = self.controller("decode", dsv4=True, max_prefill_tokens=4200)
+        chunk = 1280 if invalid_hints else 2560
         if adaptive:
             p.split_prefill_prefix_rate = 6000
             budget = d.split_prefill_decode_budget
@@ -1352,7 +1361,7 @@ class TestSplitPD(CustomTestCase):
             self.assertEqual(budget.cap, 2560)
             self.assertLess(budget.coverage, 1)
             d.agree = lambda vote: (
-                [vote[0], int(budget.cap), 2700, 4500, -20_000, vote[-1]]
+                [vote[0], int(budget.cap), chunk + 140, 4500, -20_000, vote[-1]]
                 if len(vote) == 6
                 else vote
             )
@@ -1425,7 +1434,7 @@ class TestSplitPD(CustomTestCase):
         self.assertEqual(d.split_prefill_chunk_size, 4096)
         if adaptive:
             self.assertEqual(
-                receiver._hybrid_split_schedule, (2560, 100, 10, 4500, 20_000)
+                receiver._hybrid_split_schedule, (chunk, 100, 10, 4500, 20_000)
             )
             self.assertEqual(receiver._hybrid_split_suffix_cap, 2323)
 
@@ -1437,15 +1446,29 @@ class TestSplitPD(CustomTestCase):
             message=[b""] * 10,
             operation="send_metadata",
         )
+        if invalid_hints:
+            frames = [
+                frame
+                for frame in frames
+                if not frame.startswith(self.split.SUFFIX_RATE_WIRE)
+            ]
+            frames.extend(
+                (
+                    self.split.SUFFIX_CAP_WIRE + b"2147483648",
+                    self.split.SUFFIX_RATE_WIRE + b"invalid",
+                )
+            )
         peer = self.mesh.parse_transfer(lambda **_: Peer([[48, 91], [7]]), msg=frames)
         peer.is_dummy = False
         peer.mooncake_session_id = "decode"
         peer.dst_kv_indices = list(range(33))
-        self.assertFalse(
-            self.mesh.parse_transfer(
-                lambda **_: NS(),
-                msg=[b""] * 10 + [flash.WIRE + b"[]"],
-            ).__dict__
+        malformed = self.mesh.parse_transfer(
+            lambda **_: NS(),
+            msg=[b""] * 10 + [flash.WIRE + b"[]"],
+        )
+        self.assertFalse(hasattr(malformed, "_hybrid_split_limits"))
+        self.assertEqual(
+            malformed._hybrid_split_offer_error, "invalid_decode_split_offer"
         )
         sender = self.sender_type()
         sender.kv_mgr = NS(
@@ -1460,7 +1483,9 @@ class TestSplitPD(CustomTestCase):
         self.split.create_sender(lambda *_: True, NS(scheduler=p.scheduler), source, 1)
         self.split.finalize_bootstrap(lambda *_: True, None, source)
         if adaptive:
-            self.assertEqual(source._hybrid_split_rates, [4500, 6000])
+            self.assertEqual(
+                source._hybrid_split_rates, None if invalid_hints else [4500, 6000]
+            )
         self.split.init_input(self.match, source, object())
         cut = source._hybrid_split_at
         self.assertEqual(cut, 6144 if adaptive else 7680)
@@ -1498,7 +1523,7 @@ class TestSplitPD(CustomTestCase):
         )
         self.assertTrue(req.kv.reserved_prefill_suffix)
         if adaptive:
-            self.assertEqual(req._hybrid_split_schedule, (2560, 100, 10, 4500, 20_000))
+            self.assertEqual(req._hybrid_split_schedule, (chunk, 100, 10, 4500, 20_000))
         self.assertEqual(req.output_ids, [])
         self.split.release_reservation(req)
         self.assertEqual(d.split_prefill_outstanding, 0)
@@ -1599,17 +1624,18 @@ class TestSplitPD(CustomTestCase):
     def match(req, *_):
         req.full_untruncated_fill_ids = list(req.origin_input_ids)
 
-    def test_default_cut_caps_misses_by_suffix_capacity(self):
+    def test_default_cut_uses_prompt_bound_without_a_fixed_cap(self):
         for hybrid in (False, True):
             for length, prefix, expected in (
                 (16384, 0, 12288),
                 (16384, 14745, 15360),
-                (32768, 0, 28672),
-                (32768, 13107, 28672),
+                (32768, 0, 24576),
+                (32768, 13107, 27853),
                 (32768, 19660, 29491),
                 (32768, 26214, 30720),
-                (65408, 0, 61312),
-                (65536, 39321, 61440),
+                (65408, 0, 49056),
+                (65536, 39321, 58983),
+                (131072, 0, 98304),
             ):
                 with self.subTest(hybrid=hybrid, length=length, prefix=prefix):
                     p, d, req, dr = self.bootstrap(
@@ -1707,13 +1733,13 @@ class TestSplitPD(CustomTestCase):
                 self.assertIsNone(reason)
                 self.assertEqual(offer.suffix_cap, 98305 - 64256)
 
-    def test_auto_prefill_falls_back_to_static_cap_without_extension(self):
+    def test_auto_prefill_falls_back_to_the_negotiated_bound(self):
         with patch.dict(os.environ, {"HANDOFF_SPLIT_SUFFIX_CAP_TOKENS": "auto"}):
             _, d, req, dr = self.bootstrap()
         self.assertEqual(d.split_prefill_auto_cap, 0)
         self.assertEqual(dr.kv_receiver._hybrid_split_suffix_cap, 0)
         self.split.init_input(self.match, req, object())
-        self.assertEqual(req._hybrid_split_at, 28672)
+        self.assertEqual(req._hybrid_split_at, 24576)
 
     def test_feedback_offer_agrees_admission_and_freezes_selected_peer_rates(self):
         with patch.dict(os.environ, {"HANDOFF_SPLIT_ADAPTIVE": "1"}):
@@ -2035,7 +2061,7 @@ class TestSplitPD(CustomTestCase):
         self.assertEqual(len(req.full_untruncated_fill_ids), 32768)
         self.assertFalse(hasattr(req, "_hybrid_split_at"))
         self.split.init_input(self.match, req, cache)
-        self.assertEqual(req._hybrid_split_at, 28672)
+        self.assertEqual(req._hybrid_split_at, 24576)
         req.prefix_len = req.kv.cache_protected_len = 29491
         self.split.init_input(self.match, req, cache)
         self.assertEqual(req._hybrid_split_at, 30720)
@@ -2057,7 +2083,7 @@ class TestSplitPD(CustomTestCase):
         active.extend_end = 8192
         p.scheduler.chunked_req = active
         self.split.init_input(self.match, req, object())
-        self.assertEqual(req._hybrid_split_at, 28672)
+        self.assertEqual(req._hybrid_split_at, 24576)
 
     def test_decode_offers_reserve_capacity_before_transfer(self):
         d = self.controller("decode")
@@ -2172,7 +2198,8 @@ class TestSplitPD(CustomTestCase):
                 self.split.SUFFIX_CAP_WIRE + b"2147483648",
             ],
         )
-        self.assertFalse(hasattr(peer, "_hybrid_split_limits"))
+        self.assertEqual(peer._hybrid_split_limits, (16384, 4096))
+        self.assertFalse(hasattr(peer, "_hybrid_split_suffix_cap"))
 
     def commit_fixture(self, cut, *, hybrid=False, room=7, length=32768, decode=None):
         _, d, _, dr = self.bootstrap(hybrid=hybrid, length=length, decode=decode)

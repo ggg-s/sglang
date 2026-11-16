@@ -59,9 +59,9 @@ Small tails use native transfer in `layerwise` mode. In `remote` mode, dense MHA
 and FULL+MAMBA PD default to split prefill.
 
 - P defaults to a suffix of 25% of the cache miss, subject to the negotiated
-  cut bounds and `HANDOFF_SPLIT_SUFFIX_CAP_TOKENS` (default 4096, calibrated on
-  2P1D). D's chunk size controls one execution step. It can be smaller than
-  the suffix.
+  cut bounds. `HANDOFF_SPLIT_SUFFIX_CAP_TOKENS=auto` uses D's per-request
+  suffix bound. An explicit integer adds a P-side ceiling. D's chunk size
+  controls one execution step and can be smaller than the suffix.
 - D defaults its outstanding split limit to its own `--max-running-requests`.
   With active decodes, D defers each eligible chunk for up to 150 scheduling
   decisions (45 at 70% or higher P cache hit), with early submission after

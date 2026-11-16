@@ -6,6 +6,7 @@ Each instance keeps its own files; the wire grants access to one room/attempt.
 
 import dataclasses
 import json
+import logging
 import os
 import re
 import secrets
@@ -14,6 +15,8 @@ import struct
 import threading
 import time
 from pathlib import Path
+
+logger = logging.getLogger(__name__)
 
 MAGIC = b"REMOTE_ATTN_PD_V1:"
 LIMIT = 2 * 1024 * 1024
@@ -500,11 +503,12 @@ def bootstrap(original, receiver, *, bootstrap_info, message, operation):
         if room is not None:
             message = [*message, MAGIC + json.dumps(room.descriptor).encode()]
     limits = getattr(receiver, "_hybrid_split_limits", None)
-    if (
+    send_split_offer = (
         limits is not None
         and operation == "send_metadata"
         and not bootstrap_info["is_dummy"]
-    ):
+    )
+    if send_split_offer:
         from . import dsv4_split_prefill
         from .qwen_split_prefill import (
             DECODE_PRIORITY,
@@ -528,9 +532,16 @@ def bootstrap(original, receiver, *, bootstrap_info, message, operation):
             message.append(SUFFIX_RATE_WIRE + str(rate).encode("ascii"))
         if getattr(receiver, "_hybrid_split_decode_priority", False):
             message.append(DECODE_PRIORITY)
-    return original(
+    sent = original(
         receiver, bootstrap_info=bootstrap_info, message=message, operation=operation
     )
+    if send_split_offer and sent:
+        logger.debug(
+            "[handoff-split-wire] room=%s sent_min_cut=%s sent_chunk_cap=%s",
+            getattr(receiver, "bootstrap_room", None),
+            *limits,
+        )
+    return sent
 
 
 def parse_transfer(original, *args, **kwargs):
@@ -547,19 +558,25 @@ def parse_transfer(original, *args, **kwargs):
     from .split_decode_budget import RATE_LIMIT
 
     extensions = message[10:]
-    split_offer = next(
-        (frame[len(WIRE) :] for frame in extensions if frame.startswith(WIRE)), b""
-    )
-    min_cut, _, chunk_cap = split_offer.partition(b":")
+    split_offers = [
+        frame[len(WIRE) :] for frame in extensions if frame.startswith(WIRE)
+    ]
     dsv4_offers = [
         frame for frame in extensions if frame.startswith(dsv4_split_prefill.WIRE)
     ]
-    if len(dsv4_offers) == 1 and not split_offer:
+    if len(dsv4_offers) == 1 and not split_offers:
         dsv4_split_prefill.parse_offer(value, dsv4_offers[0])
-    elif not dsv4_offers and all(
-        0 < len(field) <= 10 and field.isdigit() for field in (min_cut, chunk_cap)
-    ):
-        value._hybrid_split_limits = int(min_cut), int(chunk_cap)
+    elif len(split_offers) == 1 and not dsv4_offers:
+        min_cut, _, chunk_cap = split_offers[0].partition(b":")
+        if all(
+            0 < len(field) <= 10
+            and field.isdigit()
+            and 0 < int(field) <= TP_MIN_IDENTITY
+            for field in (min_cut, chunk_cap)
+        ):
+            value._hybrid_split_limits = int(min_cut), int(chunk_cap)
+    if (split_offers or dsv4_offers) and not hasattr(value, "_hybrid_split_limits"):
+        value._hybrid_split_offer_error = "invalid_decode_split_offer"
     if hasattr(value, "_hybrid_split_limits"):
         value._hybrid_split_decode_priority = DECODE_PRIORITY in extensions
         for tag, attr, maximum in (
@@ -578,8 +595,15 @@ def parse_transfer(original, *args, **kwargs):
                 and field.isdigit()
                 and 0 < int(field) <= maximum
             ):
-                del value._hybrid_split_limits
-                break
+                # Optional hints can be lost independently of the cut.
+                # P can recover the suffix bound from the required cut and
+                # select by the miss ratio when a rate is unavailable.
+                logger.warning(
+                    "[handoff-split-wire] room=%s ignored_hint=%s",
+                    getattr(value, "room", None),
+                    tag.decode("ascii").rstrip(":"),
+                )
+                continue
             setattr(value, attr, int(field))
     journal = next((frame for frame in extensions if frame.startswith(MAGIC)), None)
     if journal is not None:
