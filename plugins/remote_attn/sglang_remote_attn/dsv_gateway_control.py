@@ -6,7 +6,9 @@ forced KV free, token replay, or HTTP stream from the source is used here.
 
 import http.client
 import json
+import os
 import threading
+import time
 import uuid
 from urllib.parse import urlparse
 
@@ -145,6 +147,35 @@ def candidates(controller):
     return [r for r in reqs if hasattr(r, "rid")]
 
 
+def snapshot_requests(controller, reqs):
+    ttl = getattr(controller, "_d2d_finished_snapshot_ttl", None)
+    if ttl is None:
+        try:
+            ttl = float(os.environ.get("HANDOFF_SNAPSHOT_FINISHED_TTL_S", "60"))
+        except ValueError:
+            ttl = 60.0
+        controller._d2d_finished_snapshot_ttl = ttl
+        controller._d2d_finished_seen = {}
+    if ttl < 0:
+        return reqs
+
+    now = time.monotonic()
+    seen = controller._d2d_finished_seen
+    visible = {}
+    for rid, req in reqs.items():
+        if req.finished() and not req.kv.holds_kv:
+            if now - seen.setdefault(rid, now) > ttl:
+                continue
+        else:
+            seen.pop(rid, None)
+        visible[rid] = req
+    # Keep expiry marks for requests still in the history, otherwise they
+    # would reappear on the next sample. Forget marks for removed requests.
+    for rid in seen.keys() - reqs.keys():
+        del seen[rid]
+    return visible
+
+
 def worker_status(controller, *, advisory=False):
     scheduler = controller.scheduler
     from .d2d_precopy import rdma_available
@@ -163,6 +194,8 @@ def worker_status(controller, *, advisory=False):
     reqs = {req.rid: req for req in candidates(controller)}
     reqs.update((s.req.rid, s.req) for s in sources.values())
     reqs.update((t.decode_req.req.rid, t.decode_req.req) for t in targets.values())
+    if advisory:
+        reqs = snapshot_requests(controller, reqs)
     return dict(
         idle=bool(getattr(scheduler, "is_fully_idle", lambda: False)()),
         protocol=d2d.VERSION,
@@ -207,18 +240,23 @@ def handle(controller, data):
             # Idempotent submissions outlive the native scheduler queues.
             rid = data["request_rid"]
             req = getattr(controller, "d2d_submission_requests", {}).get(epoch)
-            if data.get("include_live") is True:
-                if req is None or req.rid != rid:
-                    # A prior migration may have rebound a LOCAL request to
-                    # this worker without going through native PD submission.
+            if req is None or req.rid != rid:
+                # A migrated request is indexed by its native rid rather than
+                # the original submission epoch on this worker.
+                req = d2d.remote.runtime()._tracked(scheduler).get(rid)
+                if req is None:
+                    sources, targets = d2d.records(controller)
+                    req = next((s.req for s in sources.values() if s.req.rid == rid), None)
+                    if req is None:
+                        req = next(
+                            (t.decode_req.req for t in targets.values() if t.decode_req.req.rid == rid),
+                            None,
+                        )
+                if req is None and data.get("include_live") is True:
                     req = next((r for r in candidates(controller) if r.rid == rid), None)
-                if req is not None:
-                    return dict(request=request_status(controller, req))
-            elif (
-                req is not None
-                and req.rid == rid
-                and req.finished()
-                and not req.kv.holds_kv
+            if req is not None and (
+                data.get("include_live") is True
+                or req.finished() and not req.kv.holds_kv
             ):
                 return dict(request=request_status(controller, req))
             return dict(request=None)

@@ -71,6 +71,8 @@ class MigrationController(DsvGateway):
         natural_drain_ms=0,
         max_concurrent_migrations=1,
         max_preparing_migrations=None,
+        order_by_remaining=False,
+        min_remaining_tokens=0,
         async_handoff=True,
         autostart=True,
         **kwargs,
@@ -83,6 +85,10 @@ class MigrationController(DsvGateway):
             max_preparing_migrations = max_concurrent_migrations
         if max_preparing_migrations not in range(1, 5):
             raise ValueError("max_preparing_migrations must be between 1 and 4")
+        if min_remaining_tokens < 0:
+            raise ValueError("migration minimum remaining tokens must be nonnegative")
+        self.order_by_remaining = order_by_remaining
+        self.min_remaining_tokens = min_remaining_tokens
         self.max_concurrent_migrations = max_concurrent_migrations
         self.max_preparing_migrations = max_preparing_migrations
         self.max_inflight_migrations = (
@@ -244,6 +250,28 @@ class MigrationController(DsvGateway):
             entry, request
         )
 
+    def _worth_preparing(self, entry, request):
+        return (
+            not entry["migration_requested"]
+            or self.min_remaining_tokens == 0
+            or entry["max_new"] - len(request["output_ids"]) > self.min_remaining_tokens
+        )
+
+    def _order_drain_wave(self, wave):
+        if not self.order_by_remaining:
+            return wave
+
+        def remaining(entry):
+            rows = self.facts.get(self._worker(entry, "src"), ())
+            requests = [
+                row.get("requests", {}).get(entry["source_rid"]) for row in rows
+            ]
+            if not requests or any(request is None for request in requests):
+                return float("inf")  # No length estimate for this request.
+            return min(len(request["output_ids"]) for request in requests) - entry["max_new"]
+
+        return sorted(wave, key=remaining)
+
     def _active_cutovers(self, drain):
         entries = self.journal["entries"]
         # Rollback can still hold a frozen source until all ranks resume.
@@ -352,6 +380,11 @@ class MigrationController(DsvGateway):
         self.journal = journal
         if "drain" in changes and changes["drain"]:
             for rid in changes["drain"].get("members", ()):
+                if (
+                    self.event_driven_reconcile
+                    and journal["entries"][rid]["phase"] not in TERMINAL
+                ):
+                    self.active_rids[rid] = None
                 self._queue_reconcile(rid, "drain")
         self.cv.notify_all()
 
@@ -387,6 +420,33 @@ class MigrationController(DsvGateway):
             self._publish_journal(**changes)
             return self.drain_status()
 
+    def _finished_before_drain(self, entry):
+        if entry["phase"] not in {"SOURCE", "DIRECT", "LOCAL"}:
+            return None
+        try:
+            request = self._request(entry, entry["owner"])
+        except RuntimeError:
+            return None  # Normal reconciliation reports TP history disagreement.
+        if (
+            not request or not request["finished"]
+            or not request["kv_released"] or request["error"]
+        ):
+            return None
+        frozen = entry.get("frozen_output", [])
+        if request["output_ids"][: len(frozen)] != frozen:
+            return None
+        return {
+            **entry,
+            "phase": "CANCELLED" if entry["cancel_requested"] else "DONE",
+            "final_output_ids": request["output_ids"],
+            "final_finish_reason": request["finish_reason"],
+            "migration_requested": False,
+            "blocked": False,
+            "error": None,
+            "updated_at": time.time(),
+            **self._end_deferral(entry),
+        }
+
     def _activate_drain(self, src, dst, *, cordon=None):
         with self.cv:
             existing = self._existing_drain(src, dst)
@@ -418,6 +478,15 @@ class MigrationController(DsvGateway):
                     "a live request is still bound to a previous source instance"
                 )
 
+            previous = self.journal
+            entries = dict(previous["entries"])
+            retired = []
+            for rid, entry in list(members.items()):
+                if (finished := self._finished_before_drain(entry)) is not None:
+                    entries[rid] = finished
+                    del members[rid]
+                    retired.append(rid)
+
             activated_at = time.time()
             drain = dict(
                 id=cordon["id"] if cordon else uuid.uuid4().hex,
@@ -432,8 +501,6 @@ class MigrationController(DsvGateway):
             )
             if self.natural_drain_s:
                 drain["natural_drain_until"] = activated_at + self.natural_drain_s
-            previous = self.journal
-            entries = dict(previous["entries"])
             for rid, entry in members.items():
                 changes = {
                     "migration_requested": True,
@@ -471,6 +538,10 @@ class MigrationController(DsvGateway):
                     src: dst,
                 }
             self._publish_journal(**changes)
+            for rid in retired:
+                self.active_rids.pop(rid, None)
+                self.reconcile_pending.pop(rid, None)
+                self.phase_ready.pop(rid, None)
             return self.drain_status()
 
 
@@ -521,10 +592,21 @@ def main():
         choices=range(1, 5),
         help="Max requests in PLAN, RESERVE or Pre-copy (defaults to cutover limit)",
     )
+    parser.add_argument(
+        "--order-by-remaining",
+        action="store_true",
+        help="Prioritize larger remaining token budgets within a drain wave",
+    )
+    parser.add_argument(
+        "--min-remaining-tokens",
+        type=int,
+        default=0,
+        help="Leave requests with this much token budget or less to finish on source",
+    )
     parser.add_argument("--out", type=Path, help="Optional per-request handoff JSONL")
     args = parser.parse_args()
-    if min(args.natural_drain_ms, args.precopy_window_ms) < 0:
-        parser.error("drain and precopy windows must be nonnegative")
+    if min(args.natural_drain_ms, args.precopy_window_ms, args.min_remaining_tokens) < 0:
+        parser.error("windows and minimum remaining tokens must be nonnegative")
     try:
         config = json.loads(args.config.read_text())
         prefills = {
@@ -573,6 +655,8 @@ def main():
         packed_precopy=args.packed_precopy,
         max_concurrent_migrations=args.max_concurrent_migrations,
         max_preparing_migrations=args.max_preparing_migrations,
+        order_by_remaining=args.order_by_remaining,
+        min_remaining_tokens=args.min_remaining_tokens,
         out=args.out,
         **(native_options or {}),
     )

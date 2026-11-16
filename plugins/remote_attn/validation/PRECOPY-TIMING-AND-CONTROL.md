@@ -151,7 +151,7 @@ launch=plugins/remote_attn/deploy/run_native_pd_d2d.sh
   --out "$RUN_DIR/handoff.jsonl"
 ```
 
-`optimized` 默认每 rank 预注册 2 个 64 MiB RDMA 源端发送槽。
+`optimized` 默认每 rank 预注册 2 个 64 MiB RDMA 发送槽和 2 个接收槽。
 `HANDOFF_D2D_WARM_RDMA_SLOTS=0` 保留 catalog 和 worker 预热，关闭发送槽预注册。
 两组都用 `--out`。
 都用同一个 admin 请求触发迁移。
@@ -243,6 +243,7 @@ D2D_PROFILE=optimized HANDOFF_D2D_WARM_RDMA_RECV_SLOTS=2 \
   "$launch" decode bash start_pd.sh "${decode_args[@]}"
 ```
 
+直接启动引擎时接收槽默认 0，`optimized` 启动入口默认 2。
 每个接收槽额外占用约 64 MiB/rank，允许配置 0 到 4。接收槽用于 Import 和后续
 bulk 拷贝，Import 完成 GPU fence 后先归还，源端 lease 继续用于 Commit。
 池耗尽时按需创建，TCP 和 live Pre-copy 沿用各自的接收槽。Manifest 继续在目标端
@@ -252,3 +253,17 @@ bulk 拷贝，Import 完成 GPU fence 后先归还，源端 lease 继续用于 C
 `slot_setup`。再比较 `descriptor_to_import_ms`、`source_release_ms`、
 SSE token 连续性和已迁/未迁请求 ITL。背景 bulk 的命中可以从目标端
 `d2d_status` 的 `target.bulk_reads_ns.prewarmed` 查看。
+
+
+## 长跑快照与排水对照
+
+设置 `HANDOFF_SNAPSHOT_FINISHED_TTL_S=60` 保留 60 秒已结束且已释放 KV 的快照，
+`-1` 为完整历史对照。两组都开启状态快照。独立比较快照文件字节数、请求条数、
+`worker_snapshot_sample_ms` 和 Decode 吞吐。裁剪仅用于状态文件，按请求的
+TP 查询继续保留最终 token 及结束原因。
+
+摘流时使用当前 TP 快照批量收尾已确认结束且 KV 已释放的请求。
+对已裁掉的记录，正常协调流程会按请求查证。成员快照仍包含已绑定到源 D 的
+`SUBMIT`。H20 使用真实 EOS 流量时保持候选开关默认值。
+受控 burst 可显式加 `--order-by-remaining --min-remaining-tokens 64` 比较
+迁移波次顺序与短剩余跳过。排序只作用于 wave，剩余量来自输出 token 预算。

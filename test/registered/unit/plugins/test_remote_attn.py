@@ -16816,6 +16816,34 @@ class TestRemoteAttn(CustomTestCase):
         self.assertTrue(terminal["finished"] and terminal["kv_released"])
         self.assertEqual(terminal["output_ids"], [31, 32, 33])
 
+    def test_dsv_d2d_snapshot_expires_terminal_history_without_losing_tokens(self):
+        from sglang_remote_attn import dsv_d2d as d2d
+        from sglang_remote_attn import dsv_gateway_control as control
+
+        e = self._d2d_env()
+        e.req.finished = lambda: True
+        e.source.d2d_submission_requests = {"submitted": e.req}
+        lookup = dict(
+            cmd="d2d_worker_status", migration_epoch="submitted", request_rid=e.req.rid
+        )
+        with (
+            patch.dict(os.environ, {"HANDOFF_SNAPSHOT_FINISHED_TTL_S": "60"}),
+            patch.object(control.time, "monotonic", return_value=100) as clock,
+        ):
+            self.assertIn(e.req.rid, control.worker_status(e.source, advisory=True)["requests"])
+            clock.return_value = 161
+            self.assertIn(e.req.rid, control.worker_status(e.source, advisory=True)["requests"])
+            e.req.kv.holds_kv = False
+            self.assertIn(e.req.rid, control.worker_status(e.source, advisory=True)["requests"])
+            clock.return_value = 222
+            for _ in range(2):
+                self.assertNotIn(
+                    e.req.rid, control.worker_status(e.source, advisory=True)["requests"]
+                )
+        terminal = d2d.handle(e.source, lookup)["request"]
+        self.assertTrue(terminal["finished"] and terminal["kv_released"])
+        self.assertEqual(terminal["output_ids"], [31, 32, 33])
+
     def test_layerwise_d2d_control_publishes_unsupported_result(self):
         from sglang.srt.runtime_context import get_parallel
 

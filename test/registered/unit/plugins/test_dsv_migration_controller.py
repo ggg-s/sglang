@@ -405,6 +405,28 @@ class TestDsvMigrationController(CustomTestCase):
                     all(item["async_handoff"] and item["defer_bulk"] for item in wave)
                 )
 
+    def test_drain_excludes_only_proven_finished_requests(self):
+        self.controller.close()
+        controller = self.controller = self.open_controller(
+            standby=("D1", "D2"), event_driven_reconcile=True
+        )
+        body = {"prompt_ids": [0], "max_new_tokens": 12}
+        finished, missing = (controller.accept(body) for _ in range(2))
+        self.ticks(2)
+        self.driver.requests["D0"][controller.entry(finished)["source_rid"]] = (
+            self.driver.request([1, 2, 3], finished=True)
+        )
+        self.driver.requests["D0"].pop(controller.entry(missing)["source_rid"])
+        controller._refresh()
+        pending = controller.accept(body)  # SUBMIT still belongs to D0.
+        status = controller.start_named_drain("D0", "D1")
+        self.assertCountEqual(status["members"], [missing, pending])
+        self.assertEqual(controller.entry(finished)["final_output_ids"], [1, 2, 3])
+        self.assertEqual(controller.entry(finished)["phase"], "DONE")
+        self.assertNotIn(finished, controller.active_rids)
+        self.assertIn(pending, controller.reconcile_pending)
+        self.assertNotEqual(status["state"], "SAFE_TO_STOP")
+
     def test_natural_finish_before_reserve_never_contacts_destination(self):
         """Completion in PLAN or before first RESERVE needs only source cleanup."""
         for phase in ("PLAN", "RESERVE"):

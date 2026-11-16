@@ -1893,20 +1893,6 @@ class DsvGateway:
             and self._cut_due(entry, request)
         ):
             self._update(rid, cut_observed_at=time.time())
-        if phase in {"TARGET", "LOCAL"} and request is not None:
-            frozen = entry["frozen_output"]
-            ids = request["output_ids"]
-            overlap = min(len(ids), len(frozen))
-            if ids[:overlap] != frozen[:overlap]:
-                raise RuntimeError("destination output does not continue the frozen prefix")
-            if len(ids) < len(frozen):
-                return  # A stale snapshot cannot decide completion or release.
-            if (
-                entry.get("target_admitted_at") is not None
-                and entry.get("dst_first_token_observed_at") is None
-                and len(ids) > len(frozen)
-            ):
-                self._update(rid, dst_first_token_observed_at=time.time())
         if (
             request
             and request["error"]
@@ -1915,7 +1901,7 @@ class DsvGateway:
         ):
             raise RuntimeError(request["error"])
         if request is None and (
-            phase in BEFORE_FREEZE
+            phase in BEFORE_FREEZE | {"TARGET", "LOCAL"}
             or phase == "SUBMIT" and entry.get("submit_started")
             or phase in {"SOURCE", "DIRECT"}
             and (
@@ -1930,6 +1916,20 @@ class DsvGateway:
                 # A contended advisory lookup does not prove that a submitted
                 # request is missing. Leave the current intent for another tick.
                 return
+        if phase in {"TARGET", "LOCAL"} and request is not None:
+            frozen = entry["frozen_output"]
+            ids = request["output_ids"]
+            overlap = min(len(ids), len(frozen))
+            if ids[:overlap] != frozen[:overlap]:
+                raise RuntimeError("destination output does not continue the frozen prefix")
+            if len(ids) < len(frozen):
+                return  # A stale snapshot cannot decide completion or release.
+            if (
+                entry.get("target_admitted_at") is not None
+                and entry.get("dst_first_token_observed_at") is None
+                and len(ids) > len(frozen)
+            ):
+                self._update(rid, dst_first_token_observed_at=time.time())
         if phase == "SUBMIT":
             role = entry["initial_owner"]
             backend_rid = entry["source_rid"] if role == "src" else entry["target_rid"]
@@ -2033,6 +2033,7 @@ class DsvGateway:
                 and not entry["cut_attempted"]
                 and not entry["cancel_requested"]
                 and not self._drain_abort_requested(rid)
+                and self._worth_preparing(entry, request)
             ):
                 self._begin(entry)
                 return
@@ -2067,7 +2068,10 @@ class DsvGateway:
                 prepare = entry["migration_requested"] or (
                     not entry["cut_attempted"] and entry["cut"] < entry["max_new"]
                 )
-                if prepare and not self._drain_abort_requested(rid):
+                if (
+                    prepare and not self._drain_abort_requested(rid)
+                    and self._worth_preparing(entry, request)
+                ):
                     if waiting_for_first_token:
                         self._defer_migration(entry, "sampled_output_pending")
                     elif not request["plan_ready"]:
@@ -2666,6 +2670,12 @@ class DsvGateway:
                 for worker in workers:
                     self.status_wakeups[worker].set()
 
+    def _worth_preparing(self, entry, request):
+        return True
+
+    def _order_drain_wave(self, wave):
+        return wave
+
     def _run_drain_waves(self, members):
         """Run adjacent durable stages, yielding on pending I/O and cut limits."""
         for _ in range(8 if self.chain_drain else 1):
@@ -2673,7 +2683,9 @@ class DsvGateway:
                 return
             following = []
             for phases in (CUTOVER_PHASES, WAVE_PHASES - CUTOVER_PHASES):
-                wave = [entry for entry in members if entry["phase"] in phases]
+                wave = self._order_drain_wave(
+                    [entry for entry in members if entry["phase"] in phases]
+                )
                 for offset in range(0, len(wave), WAVE_SIZE):
                     batch = wave[offset : offset + WAVE_SIZE]
                     self._run_wave(batch)
