@@ -820,12 +820,13 @@ class TestDsvMigrationController(CustomTestCase):
         rid = self.controller.accept({"prompt_ids": [0], "max_new_tokens": 12})
         self.ticks(2)
         source = self.driver.requests["D0"][self.controller.entry(rid)["source_rid"]]
-        source["output_ids"] = []
         with patch.object(time, "time", return_value=time.time()) as clock:
             self.controller.start_named_drain("D0", "D1")
             self.ticks(3)
             entry = self.controller.entry(rid)
             self.assertEqual(entry["phase"], "WAIT_CUT")
+            # Simulate a legacy reservation obtained before the first sample.
+            source["output_ids"] = []
             clock.return_value = entry["precopy_until"]
             self.driver.commands.clear()
             self.ticks(2)
@@ -1305,6 +1306,124 @@ class TestNativePdDecode(CustomTestCase):
         self.assertEqual(self.controller.entry(late)["workers"], {"src": "D1"})
         self.assertEqual(self.controller.entry(late)["bootstrap_room"], 11)
         self.assertNotIn(late, self.controller.drain_status()["members"])
+
+    def test_native_pd_shared_precopy_window_with_sixteen_preparing(self):
+        """Only fully applied closed pages permit early cutover, capped at K=2."""
+        self.controller.close()
+        self.driver.wave_supported = self.driver.precopy = True
+        self.driver.import_ready = False
+        controller = self.controller = self.open_controller(
+            max_preparing_migrations=16,
+            max_concurrent_migrations=2,
+            chain_drain=True,
+            precopy_window_ms=10_000,
+            shared_precopy_window=True,
+        )
+        rids = [
+            controller.accept_native(
+                "D0", {"prompt_ids": [0], "max_new_tokens": 12}, self.bootstrap(i)
+            )
+            for i in range(16)
+        ]
+        for _ in range(3):
+            controller.tick()
+        for i, rid in enumerate(rids):
+            request = self.driver.requests["D0"][controller.entry(rid)["source_rid"]]
+            request["kv_len"] = 7 if i < 3 else 8  # One versus two closed pages.
+
+        now = time.time()
+        with (
+            patch.object(time, "time", return_value=now) as clock,
+            patch.object(time, "monotonic", return_value=time.monotonic()),
+        ):
+            pending = controller.start_named_drain("D0", "D1")
+            self.assertEqual(pending["state"], "CORDONING")
+            clock.return_value = now + 1
+            with patch.object(controller, "_smg_cordoned", return_value=True):
+                controller._reconcile_cordon()
+            deadline = now + 11
+
+            controller.tick()
+            self.assertTrue(
+                all(controller.entry(rid)["phase"] == "WAIT_CUT" for rid in rids)
+            )
+            self.assertTrue(
+                all(controller.entry(rid)["precopy_until"] == deadline for rid in rids)
+            )
+            for _ in range(20):
+                controller.tick()
+            status = controller.drain_status()
+            self.assertEqual(status["precopy_deadline_at"], deadline)
+            self.assertEqual(status["active_cutovers"], 2)
+            migrating = [
+                rid for rid in rids if controller.entry(rid)["phase"] == "IMPORT"
+            ]
+            self.assertEqual(migrating, rids[:2])
+            for rid in migrating:
+                self.assertEqual(
+                    controller.entry(rid)["precopy_cut_reason"], "full_pages_applied"
+                )
+            self.assertEqual(controller.entry(rids[2])["phase"], "WAIT_CUT")
+            self.assertEqual(controller.entry(rids[3])["precopy_pages"], [1])
+            self.assertIsNone(controller.entry(rids[3])["precopy_cut_reason"])
+
+    def test_native_pd_shared_precopy_late_reserve_uses_original_deadline(self):
+        """A request admitted after the deadline gets no additional Pre-copy time."""
+        self.controller.close()
+        self.driver.wave_supported = self.driver.precopy = True
+        self.driver.import_ready = False
+        options = dict(
+            max_preparing_migrations=4,
+            max_concurrent_migrations=2,
+            chain_drain=True,
+            precopy_window_ms=10_000,
+            shared_precopy_window=True,
+        )
+        controller = self.controller = self.open_controller(**options)
+        rids = [
+            controller.accept_native(
+                "D0", {"prompt_ids": [0], "max_new_tokens": 12}, self.bootstrap(i)
+            )
+            for i in range(5)
+        ]
+        for _ in range(3):
+            controller.tick()
+
+        now = time.time()
+        with (
+            patch.object(time, "time", return_value=now) as clock,
+            patch.object(time, "monotonic", return_value=time.monotonic()),
+            patch.object(controller, "_smg_cordoned", return_value=True),
+        ):
+            controller.start_named_drain("D0", "D1")
+            controller._reconcile_cordon()
+            controller.tick()
+            last = rids[-1]
+            first = controller.entry(rids[0])
+            self.assertEqual(first["precopy_pending"]["stage"], "COPY")
+            self.assertEqual(controller.entry(last)["phase"], "SOURCE")
+            self.assertEqual(controller.drain_status()["precopy_deadline_at"], now + 10)
+            controller.close()
+            self.driver.commands.clear()
+            clock.return_value = now + 11
+            controller = self.controller = self.open_controller(**options)
+            for _ in range(10):
+                controller.tick()
+            entry = controller.entry(last)
+            self.assertEqual(entry["phase"], "WAIT_CUT")
+            self.assertEqual(entry["precopy_until"], now + 10)
+            self.assertEqual(entry["precopy_cut_reason"], "deadline")
+            self.assertFalse(
+                any(
+                    cmd.startswith("d2d_precopy_") and epoch == entry["epoch"]
+                    for _, cmd, epoch in self.driver.commands
+                )
+            )
+            self.assertIn(("D1", "d2d_precopy_apply", first["epoch"]), self.driver.commands)
+            self.assertFalse(
+                any(cmd == "d2d_precopy_prepare" for _, cmd, _ in self.driver.commands)
+            )
+            self.assertEqual(controller.drain_status()["active_cutovers"], 2)
 
     def test_native_pd_prepare_overlaps_cutover_and_waits_for_retirement(self):
         self.controller.close()

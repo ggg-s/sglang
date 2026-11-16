@@ -267,3 +267,43 @@ TP 查询继续保留最终 token 及结束原因。
 `SUBMIT`。H20 使用真实 EOS 流量时保持候选开关默认值。
 受控 burst 可显式加 `--order-by-remaining --min-remaining-tokens 64` 比较
 迁移波次顺序与短剩余跳过。排序只作用于 wave，剩余量来自输出 token 预算。
+
+## 16 条在飞的共享 Pre-copy A/B
+
+两组都用同一提交、`K=2`、共享 10 秒窗口及 `optimized`。每轮设
+`PREP=4` 或 `PREP=16`，使用独立控制器状态目录并恢复源 D 的接流状态。
+P、D、SMG、RDMA 配置及回放输入保持一致。
+
+```bash
+# 每轮从仓库根目录执行。A 组 PREP=4，B 组 PREP=16。
+export D2D_PROFILE=optimized
+export PREP=4
+export RUN_DIR=$(mktemp -d "/pool/state/shared-prep${PREP}.XXXXXX")
+jq --arg dir "$RUN_DIR" '.state_dir = $dir' "$POOL_CONFIG" > "$RUN_DIR/pool.json"
+plugins/remote_attn/deploy/run_native_pd_d2d.sh controller \
+  --config "$RUN_DIR/pool.json" \
+  --max-preparing-migrations "$PREP" --max-concurrent-migrations 2 \
+  --natural-drain-ms 0 --shared-precopy-window --precopy-window-ms 10000 \
+  --packed-precopy --out "$RUN_DIR/handoff.jsonl"
+```
+
+沿用 H20 的回放脚本。确认 D1 有 16 条未完成请求后下发迁移。
+`RUN_DIR` 和 `ADMIN` 指向本轮控制器的状态目录和管理地址。
+
+```bash
+curl -fsS "$ADMIN/v1/drain" -H 'Content-Type: application/json' \
+  -d '{"src":"D1","dst":"D2"}' | tee "$RUN_DIR/drain-start.json"
+# 到 SAFE_TO_STOP 后保存最终结果。
+curl -fsS "$ADMIN/v1/drain/status" | tee "$RUN_DIR/drain-final.json" | jq '{
+  state, members: (.members | length), source_release_ms, precopy_deadline_at,
+  migration_limits, cut_reasons: ([.members_state[].precopy_cut_reason] | group_by(.) |
+    map({reason: .[0], count: length})),
+  precopy_bytes: ([.members_state[].precopy_bytes] | add // 0)
+}'
+```
+
+确认两组摘流激活时源端成员数可比。统计自然完成数、真正于 deadline 前
+发起 Freeze 的请求数及剩余字节，并按迁移结果分组记录客户端 ITL。
+`precopy_cut_reason` 记录首次满足切换条件的原因，实际 Freeze 时刻看
+`handoff_timing.freeze_requested_at`。延迟获得 RESERVE 的成员使用同一个
+`precopy_deadline_at`。窗口到期后收完已开始的帧，再按 K=2 排队切换。

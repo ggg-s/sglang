@@ -506,7 +506,7 @@ class DsvGateway:
                     self._queue_reconcile(rid, "phase")
                 elif (
                     changes.get("cancel_requested") and not old["cancel_requested"]
-                    or changes.get("precopy_pending")
+                    or "precopy_pending" in changes
                     and changes["precopy_pending"] != old.get("precopy_pending")
                 ):
                     self._queue_reconcile(rid, "intent")
@@ -1198,8 +1198,12 @@ class DsvGateway:
         finished = all(r["finished"] for r in rows)
         if any(o[:size] != prefix or (finished and len(o) != size) for o in outputs):
             raise RuntimeError("TP output token history diverged")
+        lengths = [row.get("kv_len") for row in rows]
         return dict(
             output_ids=prefix,
+            kv_len=max(lengths)
+            if all(type(length) is int and length >= 0 for length in lengths)
+            else None,
             finished=finished,
             finish_reason=rows[0].get("finish_type") if finished else None,
             kv_released=all(r["kv_released"] for r in rows),
@@ -1416,6 +1420,7 @@ class DsvGateway:
             freeze_ack_latency_ms=None,
             plan_before_first_token=False,
             precopy_pending=None,
+            precopy_cut_reason=None,
             precopy_capacity=None,
             precopy_backend=None,
             precopy_packed=False,
@@ -1428,6 +1433,27 @@ class DsvGateway:
             migration_skip_reason=None,
         )
 
+    def _shared_precopy_deadline(self, entry):
+        drain = self.journal["drain"] or {}
+        if self.decode_workers and entry["rid"] in drain.get("members", ()):
+            return drain.get("precopy_deadline_at")
+        return None
+
+    @staticmethod
+    def _full_pages_applied(entry, request):
+        # The source's available prefix can be short while native PD is
+        # still receiving. Compare APPLY coverage to committed KV instead.
+        ends = entry.get("precopy_pages")
+        length = request.get("kv_len")
+        if entry.get("precopy_pending") or not ends or type(length) is not int:
+            return False
+        schema = entry["plans"][0]["schema"]
+        pages = length // schema["page_size"]
+        return (
+            pages > 0 and len(ends) == len(schema["entries"])
+            and all(end >= pages for end in ends)
+        )
+
     def _cut_due(self, entry, request):
         if not request["output_ids"]:
             return False
@@ -1435,7 +1461,8 @@ class DsvGateway:
             return True
         if not entry["migration_requested"]:
             return False
-        if not self.precopy_window_s or self.disable_precopy:
+        shared_deadline = self._shared_precopy_deadline(entry)
+        if self.disable_precopy or (not self.precopy_window_s and shared_deadline is None):
             return True
         if entry["phase"] in {"SUBMIT", "SOURCE", "PLAN", "RESERVE"}:
             return False
@@ -1445,6 +1472,8 @@ class DsvGateway:
             for r in self.facts.get(self._worker(entry, role), ())
         ):
             return True
+        if shared_deadline is not None:
+            return time.time() >= shared_deadline or self._full_pages_applied(entry, request)
         return entry.get("precopy_until", 0) <= time.time()
 
     def _async_handoff(self, entry=None):
@@ -1615,7 +1644,9 @@ class DsvGateway:
                 self._update_after_precopy(entry, cut_due)
                 return
             # Named drains bound new frames even before the first output token.
-            deadline = entry.get("precopy_until", 0) if self.decode_workers else None
+            deadline = self._shared_precopy_deadline(entry)
+            if deadline is None and self.decode_workers:
+                deadline = entry.get("precopy_until", 0)
             if deadline is not None and time.time() >= deadline:
                 return
             if not all(
@@ -1892,7 +1923,20 @@ class DsvGateway:
             and (entry["cut"] < entry["max_new"] or entry["migration_requested"])
             and self._cut_due(entry, request)
         ):
-            self._update(rid, cut_observed_at=time.time())
+            now = time.time()
+            changes = dict(cut_observed_at=now)
+            shared_deadline = self._shared_precopy_deadline(entry)
+            if phase == "WAIT_CUT" and shared_deadline is not None:
+                if len(request["output_ids"]) >= entry["cut"]:
+                    reason = "token_cut"
+                elif now >= shared_deadline:
+                    reason = "deadline"
+                elif self._full_pages_applied(entry, request):
+                    reason = "full_pages_applied"
+                else:
+                    reason = "precopy_unavailable"
+                changes["precopy_cut_reason"] = reason
+            self._update(rid, **changes)
         if (
             request
             and request["error"]
@@ -2159,14 +2203,15 @@ class DsvGateway:
             if not all(r.get("reserved") for r in rows):
                 raise RuntimeError("target did not reserve on every rank")
             reserved_at = time.time()
+            deadline = self._shared_precopy_deadline(entry)
+            if deadline is None:
+                deadline = reserved_at + self.precopy_window_s if self.precopy_window_s else 0
             self._update(
                 rid,
                 reservations=[r["reservation"] for r in rows],
                 phase="WAIT_CUT",
                 wait_cut_started_at=reserved_at,
-                precopy_until=(
-                    reserved_at + self.precopy_window_s if self.precopy_window_s else 0
-                ),
+                precopy_until=deadline,
                 prepare_latency_ms=max(
                     0, (reserved_at - entry.get("prepare_started_at", reserved_at)) * 1000
                 ),
@@ -3001,6 +3046,8 @@ class DsvGateway:
                         freeze_pending=e.get("freeze_pending", False),
                         source_partial_remote=e.get("source_partial_remote", False),
                         precopy_bytes=e.get("precopy_bytes", 0),
+                        precopy_until=e.get("precopy_until"),
+                        precopy_cut_reason=e.get("precopy_cut_reason"),
                         remaining_copy_bytes=e.get("remaining_copy_bytes"),
                         handoff_timing=handoff_timing(e),
                     )

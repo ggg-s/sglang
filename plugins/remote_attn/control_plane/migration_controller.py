@@ -23,7 +23,7 @@ from p4_dsv_gateway import (
 
 DECODE_STATUS_MAX_AGE_S = 10
 PREPARING_PHASES = {"PLAN", "RESERVE", "WAIT_CUT"}
-MAX_INFLIGHT_MIGRATIONS = 8
+MAX_PREPARING_MIGRATIONS = 16
 
 
 @dataclass(frozen=True)
@@ -73,6 +73,7 @@ class MigrationController(DsvGateway):
         max_preparing_migrations=None,
         order_by_remaining=False,
         min_remaining_tokens=0,
+        shared_precopy_window=False,
         async_handoff=True,
         autostart=True,
         **kwargs,
@@ -83,10 +84,13 @@ class MigrationController(DsvGateway):
             raise ValueError("max_concurrent_migrations must be 1, 2, or 4")
         if max_preparing_migrations is None:
             max_preparing_migrations = max_concurrent_migrations
-        if max_preparing_migrations not in range(1, 5):
-            raise ValueError("max_preparing_migrations must be between 1 and 4")
+        if max_preparing_migrations not in range(1, MAX_PREPARING_MIGRATIONS + 1):
+            raise ValueError(
+                f"max_preparing_migrations must be between 1 and {MAX_PREPARING_MIGRATIONS}"
+            )
         if min_remaining_tokens < 0:
             raise ValueError("migration minimum remaining tokens must be nonnegative")
+        self.shared_precopy_window = shared_precopy_window
         self.order_by_remaining = order_by_remaining
         self.min_remaining_tokens = min_remaining_tokens
         self.max_concurrent_migrations = max_concurrent_migrations
@@ -94,10 +98,7 @@ class MigrationController(DsvGateway):
         self.max_inflight_migrations = (
             1
             if max_concurrent_migrations == max_preparing_migrations == 1
-            else min(
-                MAX_INFLIGHT_MIGRATIONS,
-                max_concurrent_migrations + max_preparing_migrations,
-            )
+            else max_concurrent_migrations + max_preparing_migrations
         )
         self.natural_drain_s = natural_drain_ms / 1000
         self.prefills = dict(prefills)
@@ -499,6 +500,8 @@ class MigrationController(DsvGateway):
                 started_at=cordon["started_at"] if cordon else activated_at,
                 activated_at=activated_at,
             )
+            if self.shared_precopy_window and self.precopy_window_s:
+                drain["precopy_deadline_at"] = activated_at + self.precopy_window_s
             if self.natural_drain_s:
                 drain["natural_drain_until"] = activated_at + self.natural_drain_s
             for rid, entry in members.items():
@@ -575,6 +578,11 @@ def main():
     )
     parser.add_argument("--precopy-window-ms", type=int, default=0)
     parser.add_argument(
+        "--shared-precopy-window",
+        action="store_true",
+        help="Share the Pre-copy deadline from drain activation and cut early after APPLY",
+    )
+    parser.add_argument(
         "--packed-precopy",
         action="store_true",
         help="Pack closed KV ranges into one RDMA frame when all ranks support it",
@@ -589,7 +597,7 @@ def main():
     parser.add_argument(
         "--max-preparing-migrations",
         type=int,
-        choices=range(1, 5),
+        choices=range(1, MAX_PREPARING_MIGRATIONS + 1),
         help="Max requests in PLAN, RESERVE or Pre-copy (defaults to cutover limit)",
     )
     parser.add_argument(
@@ -607,6 +615,8 @@ def main():
     args = parser.parse_args()
     if min(args.natural_drain_ms, args.precopy_window_ms, args.min_remaining_tokens) < 0:
         parser.error("windows and minimum remaining tokens must be nonnegative")
+    if args.shared_precopy_window and not args.precopy_window_ms:
+        parser.error("--shared-precopy-window requires a positive --precopy-window-ms")
     try:
         config = json.loads(args.config.read_text())
         prefills = {
@@ -652,6 +662,7 @@ def main():
         chain_drain=args.chain_drain,
         natural_drain_ms=args.natural_drain_ms,
         precopy_window_ms=args.precopy_window_ms,
+        shared_precopy_window=args.shared_precopy_window,
         packed_precopy=args.packed_precopy,
         max_concurrent_migrations=args.max_concurrent_migrations,
         max_preparing_migrations=args.max_preparing_migrations,
