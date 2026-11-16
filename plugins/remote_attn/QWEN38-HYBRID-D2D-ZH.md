@@ -205,13 +205,13 @@ D 的 `N ≥ 2 × chunk` 是短 prompt 的准入启发式。
 
 D 用 `HANDOFF_SPLIT_STALL_MS`（默认 600）估算单块大小，动态块下限为
 1024 token，仍受调度器的 prefill token 上限约束。显式设置
-`HANDOFF_HYBRID_SPLIT_PREFILL_CHUNK_SIZE` 则固定块大小。D 用
-`HANDOFF_SPLIT_DEFER_MS`（默认 2000）及 `HANDOFF_SPLIT_DEFER_PATIENCE_MS`
-（默认 200）按实测 decode 步时估算等待轮数。D 在准入时通过原有 TP MIN
-投票发布 rank 0 的估计，保留各 rank 的准入否决和单块 token 上限，并随
-请求保存投票结果。每块的等待预算取配置预算
-和该块预计耗时折算的 decode 轮数中较小者，末块按实际 token 数估算。
-缺少速率或步时样本时沿用该请求的配置预算。实际 TPOT 与 ITL 仍需实测。
+`HANDOFF_HYBRID_SPLIT_PREFILL_CHUNK_SIZE` 则固定块大小。D 在准入时通过
+原有 TP MIN 投票发布 rank 0 的估计，保留各 rank 的准入否决和单块 token 上限，
+并随请求保存投票结果。每块按预计耗时除以实测 decode 步时确定让路轮数，
+末块按实际 token 数估算。缺少速率或步时样本时使用
+`HANDOFF_SPLIT_DEFER_TICKS`，设为 `0` 可关闭让路。
+`HANDOFF_SPLIT_DEFER_PATIENCE_MS`（默认 200）仍控制批次大小没有下降时的提前提交。
+实际 TPOT 与 ITL 仍需实测。
 
 闭环也会在 D 的 TP rank 0 给普通 decode forward 记录 CUDA event。
 `HANDOFF_SPLIT_ADAPTIVE=0` 可继续使用原有静态或按速率估算的 cap 对照。

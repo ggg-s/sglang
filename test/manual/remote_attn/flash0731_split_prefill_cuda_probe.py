@@ -165,10 +165,10 @@ def negotiate(adaptive, schedule, p_table, p_swa, d_pages):
         DecodeBudget(
             target=0.5,
             stall_ms=600,
-            defer_ms=2000,
             patience_ms=200,
             pinned_chunk=False,
             cap=2560,
+            max_cap=LENGTH // 2,
             min_cap=2560,
         )
         if adaptive

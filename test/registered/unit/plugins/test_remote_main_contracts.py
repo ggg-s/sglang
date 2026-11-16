@@ -1434,7 +1434,7 @@ class TestSplitPD(CustomTestCase):
         self.assertEqual(d.split_prefill_chunk_size, 4096)
         if adaptive:
             self.assertEqual(
-                receiver._hybrid_split_schedule, (chunk, 100, 10, 4500, 20_000)
+                receiver._hybrid_split_schedule, (chunk, 150, 10, 4500, 20_000)
             )
             self.assertEqual(receiver._hybrid_split_suffix_cap, 2323)
 
@@ -1523,7 +1523,7 @@ class TestSplitPD(CustomTestCase):
         )
         self.assertTrue(req.kv.reserved_prefill_suffix)
         if adaptive:
-            self.assertEqual(req._hybrid_split_schedule, (chunk, 100, 10, 4500, 20_000))
+            self.assertEqual(req._hybrid_split_schedule, (chunk, 150, 10, 4500, 20_000))
         self.assertEqual(req.output_ids, [])
         self.split.release_reservation(req)
         self.assertEqual(d.split_prefill_outstanding, 0)
@@ -1761,7 +1761,7 @@ class TestSplitPD(CustomTestCase):
         _, _, second, _ = self.bootstrap(prefill=p, decode=other, prefix=20480)
         self.assertEqual(dr.kv_receiver._hybrid_split_limits, (24576, 3072))
         self.assertEqual(
-            dr.kv_receiver._hybrid_split_schedule, (3072, 100, 10, 4500, 20_000)
+            dr.kv_receiver._hybrid_split_schedule, (3072, 150, 10, 4500, 20_000)
         )
         self.split.init_input(self.match, first, object())
         self.split.init_input(self.match, second, object())
@@ -1796,7 +1796,7 @@ class TestSplitPD(CustomTestCase):
                     budget.cap = 8192
                     budget.suffix_rate = 5000
                     budget.decode_ms = 20
-                    expected_schedule = (2048, 100, 10, 5000, 20_000)
+                    expected_schedule = (2048, 150, 10, 5000, 20_000)
                 else:
                     leader.split_prefill_auto_cap = 8192
                     expected_schedule = None
@@ -2230,17 +2230,19 @@ class TestSplitPD(CustomTestCase):
                 self.assertEqual(d.split_prefill_outstanding, 1)
 
     def test_decode_priority_expires_per_chunk(self):
-        for adaptive, hits, budget, end_bs in (
-            (False, 19660, 150, 1),
-            (False, 26214, 45, 1),
-            (False, 19660, 2, 0),
-            (False, 19660, 15, 2),
-            (True, 19660, 80, 1),
-            (True, 26214, 80, 1),
+        for rate, hits, budget, end_bs, defer_ticks in (
+            (None, 19660, 150, 1, 150),
+            (None, 26214, 45, 1, 150),
+            (None, 19660, 2, 0, 150),
+            (None, 19660, 15, 2, 150),
+            (2560, 19660, 80, 1, 150),
+            (2560, 26214, 80, 1, 150),
+            (1280, 19660, 160, 1, 150),
+            (2560, 19660, 0, 1, 0),
+            (0, 19660, 17, 1, 17),
         ):
-            with self.subTest(
-                adaptive=adaptive, hits=hits, budget=budget, end_bs=end_bs
-            ):
+            adaptive = rate is not None
+            with self.subTest(rate=rate, hits=hits, budget=budget, end_bs=end_bs):
                 decode = None
                 cut = 24576
                 if adaptive:
@@ -2248,17 +2250,18 @@ class TestSplitPD(CustomTestCase):
                         os.environ,
                         {
                             "HANDOFF_SPLIT_ADAPTIVE": "1",
+                            "HANDOFF_SPLIT_DEFER_TICKS": str(defer_ticks),
                             "HANDOFF_SPLIT_DEFER_PATIENCE_MS": "0",
                         },
                     ):
                         decode = self.controller("decode")
-                    # The local estimate differs from the vote. Only the
-                    # selected 2560 tok/s and 20 ms step may steer either rank.
+                    # The TP-voted rate and step time steer both ranks even
+                    # when the local estimates differ.
                     feedback = decode.split_prefill_decode_budget
                     feedback.suffix_rate = 20_000
                     feedback.decode_ms = 10
                     decode.agree = lambda vote: (
-                        [vote[0], 8192, 4096, 2560, -20_000, 1000]
+                        [vote[0], 8192, 4096, rate, -20_000, 1000]
                         if len(vote) == 6
                         else vote
                     )
@@ -2322,7 +2325,10 @@ class TestSplitPD(CustomTestCase):
                     self.assertIs(scheduler.chunked_req, req)
                     req.kv.commit_prealloc(req.extend_end)
                     running.batch_size.return_value = 1
-                    final_wait = 40 if adaptive else 1
+                    if adaptive:
+                        final_wait = budget // 2 if rate else defer_ticks
+                    else:
+                        final_wait = 1
                     for _ in range(final_wait):
                         self.assertIs(
                             self.split.next_batch(native_decode, scheduler, running),

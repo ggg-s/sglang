@@ -216,7 +216,6 @@ def configure(controller):
             controller.split_prefill_decode_budget = DecodeBudget(
                 target=g / (1 + g),
                 stall_ms=read_budget("HANDOFF_SPLIT_STALL_MS", 600),
-                defer_ms=read_budget("HANDOFF_SPLIT_DEFER_MS", 2000, allow_zero=True),
                 patience_ms=read_budget(
                     "HANDOFF_SPLIT_DEFER_PATIENCE_MS", 200, allow_zero=True
                 ),
@@ -226,8 +225,6 @@ def configure(controller):
                 min_cap=min_cap,
             )
             budget = controller.split_prefill_decode_budget
-            if not budget.defer_ms:
-                controller.split_prefill_defer_ticks = 0
             if not budget.patience_ms:
                 controller.split_prefill_patience_ticks = 0
         elif auto == "1":
@@ -381,12 +378,9 @@ def negotiate_decode_offer(controller, req, reason, *, min_cut=0):
         if allowed and req.bootstrap_room % 1000 >= coverage:
             return None, "decode_split_budget"
         step_us = -neg_step_us
-        defer, patience = budget.defer_steps(
-            step_us,
-            (
-                controller.split_prefill_defer_ticks,
-                controller.split_prefill_patience_ticks,
-            ),
+        defer = controller.split_prefill_defer_ticks
+        patience = budget.patience_steps(
+            step_us, controller.split_prefill_patience_ticks
         )
         schedule = chunk, defer, patience, rate, step_us
     if not allowed:
@@ -905,11 +899,10 @@ def next_batch(original, scheduler, running_batch):
             defer_budget = min(defer_budget, HOT_DEFER_TICKS)
     else:
         chunk_size, defer_budget, patience, rate, step_us = schedule
-        if rate and step_us:
-            # Limit the wait to the estimated forward time of the next chunk.
-            # Both inputs are frozen by the TP vote at admission.
-            chunk_steps = min(chunk_size, remaining) * 1_000_000 // (rate * step_us)
-            defer_budget = min(defer_budget, chunk_steps)
+        if defer_budget and rate and step_us:
+            # Use the next chunk's estimated forward time. A zero tick
+            # setting disables deferral, and all inputs agree across TP.
+            defer_budget = min(chunk_size, remaining) * 1_000_000 // (rate * step_us)
     ticks = req._hybrid_split_defer_ticks
     if ticks == 0:
         req._hybrid_split_defer_start_bs = running_bs

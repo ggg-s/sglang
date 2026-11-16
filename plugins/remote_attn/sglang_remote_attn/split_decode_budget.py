@@ -32,7 +32,6 @@ def ema(previous, sample):
 class DecodeBudget:
     target: float
     stall_ms: float
-    defer_ms: float
     patience_ms: float
     pinned_chunk: bool
     cap: float
@@ -101,13 +100,10 @@ class DecodeBudget:
         coverage = int(self.coverage * 1000) if self.target else 0
         return cap, chunk, rate, -step_us, coverage
 
-    def defer_steps(self, step_us, defaults):
+    def patience_steps(self, step_us, fallback_ticks):
         if step_us <= 0:
-            return defaults
+            return fallback_ticks
         # Scheduler ticks approximate decode steps in this path.
         step_ms = step_us / 1000
-        defer = int(min(2**31 - 1, self.defer_ms / step_ms))
         patience = int(min(2**31 - 1, self.patience_ms / step_ms))
-        if self.patience_ms:
-            patience = max(1, patience)
-        return defer, patience
+        return max(1, patience) if self.patience_ms else 0
