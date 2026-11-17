@@ -1373,8 +1373,16 @@ class TestSplitPD(CustomTestCase):
                 with self.subTest(dpa=dpa):
                     self._check_dsv4_split(adaptive=False, dspark=True, dpa=dpa)
 
+    def test_dsv4_pcp_followers_use_cp_zero_split_offer(self):
+        """A dummy CP sender has no D metadata and must still stop at the cut."""
+        with patch.dict(
+            os.environ,
+            {"HANDOFF_HYBRID_SPLIT_PREFILL": "1", "HANDOFF_SPLIT_ADAPTIVE": "1"},
+        ):
+            self._check_dsv4_split(adaptive=True, dspark=True, dpa=True, pcp=True)
+
     def _check_dsv4_split(
-        self, *, adaptive, invalid_hints=False, dspark=False, dpa=False
+        self, *, adaptive, invalid_hints=False, dspark=False, dpa=False, pcp=False
     ):
         from sglang_remote_attn import dsv4_split_prefill as flash
 
@@ -1386,6 +1394,34 @@ class TestSplitPD(CustomTestCase):
         state_type = definitions(
             ROOT, "python/sglang/srt/disaggregation/base/conn.py", owner="StateType"
         )
+        if pcp:
+            manager_type = definitions(
+                ROOT,
+                "python/sglang/srt/disaggregation/common/conn.py",
+                owner="CommonKVManager",
+                members={"_resolve_rank_mapping"},
+            )
+            decoder = NS(
+                attn_tp_size=1,
+                attn_cp_size=1,
+                is_mla_backend=True,
+                kv_args=NS(engine_rank=3),
+                enable_all_cp_ranks_for_transfer=False,
+                pp_size=1,
+                pp_rank=0,
+            )
+            prefill = NS(
+                attn_tp_size=1,
+                attn_cp_size=4,
+                enable_kv_cache_sharding=False,
+                enable_dsa_cache_layer_split=False,
+                pp_size=1,
+            )
+            manager_type._resolve_rank_mapping(decoder, prefill)
+            self.assertEqual(
+                (prefill.target_cp_ranks, prefill.target_tp_ranks), ([0], [0])
+            )
+            self.assertEqual(prefill.required_prefill_response_num, 1)
         component_type = definitions(
             ROOT,
             "python/sglang/srt/mem_cache/unified_cache/component_type.py",
@@ -1440,7 +1476,13 @@ class TestSplitPD(CustomTestCase):
             dsv41_spec_layout={"state_types": state_types} if dspark else None,
         )
         for controller in (p, d):
-            if dpa:
+            if pcp and controller is p:
+                p.tp_size = 4
+                p.attn_tp_rank = 0
+                p.attn_tp_size = 1
+                p.split_pcp = True
+                p.agree = Mock(side_effect=lambda vote: vote)
+            elif dpa:
                 controller.rank = 3
                 controller.tp_size = 4
                 controller.attn_tp_rank = 0
@@ -1559,6 +1601,8 @@ class TestSplitPD(CustomTestCase):
         source.disagg_kv_sender = sender
         self.split.create_sender(lambda *_: True, NS(scheduler=p.scheduler), source, 1)
         self.split.finalize_bootstrap(lambda *_: True, None, source)
+        if pcp:
+            leader_offer_vote = p.agree.call_args.args[0]
         if adaptive:
             self.assertEqual(
                 source._hybrid_split_rates, None if invalid_hints else [4500, 6000]
@@ -1570,6 +1614,41 @@ class TestSplitPD(CustomTestCase):
         source.extend_end = cut
         self.split.seal(source, cut)
         self.assertEqual(sender.num_kv_indices, 24 if adaptive else 30)
+        if pcp:
+            # Native transports bootstrap on CP0 only. Exercise the other
+            # three ranks with no peer or decoded SWA mapping at all.
+            for rank in range(1, 4):
+                follower = NS(**vars(p))
+                follower.rank = rank
+                follower.agree = Mock(
+                    side_effect=lambda vote: [
+                        min(local, leader)
+                        for local, leader in zip(vote, leader_offer_vote, strict=True)
+                    ]
+                )
+                dummy = self.request(length=length, prefix=4096)
+                dummy.disagg_kv_sender = dummy_sender = self.sender_type()
+                dummy_sender.kv_mgr = NS(is_dummy_cp_rank=True, transfer_infos={})
+                dummy_sender.curr_idx = 11
+                self.split.create_sender(
+                    lambda *_: True, NS(scheduler=NS(_pre_layerwise=follower)), dummy, 1
+                )
+                self.split.finalize_bootstrap(lambda *_: True, None, dummy)
+                follower.agree.assert_called_once_with([self.split.TP_MIN_IDENTITY] * 8)
+                self.assertEqual(
+                    dummy._hybrid_split_limits, source._hybrid_split_limits
+                )
+                self.assertEqual(dummy._hybrid_split_rates, source._hybrid_split_rates)
+                follower.agree.side_effect = lambda vote: [
+                    min(vote[0], cut),
+                    min(vote[1], -cut),
+                ]
+                self.split.init_input(self.match, dummy, object())
+                self.assertEqual(dummy._hybrid_split_at, cut)
+                self.assertEqual(len(dummy.full_untruncated_fill_ids), cut)
+                dummy.extend_end = cut
+                self.split.seal(dummy, cut)
+                self.assertEqual(dummy_sender.num_kv_indices, sender.num_kv_indices)
         sent = flash.send_states(
             lambda _, target, indices, *_args: (target.dst_state_indices, indices),
             manager,
@@ -1897,6 +1976,73 @@ class TestSplitPD(CustomTestCase):
                 hooks.validate_config()
                 os.environ["HANDOFF_EXPERIMENTAL_PD_REMOTE"] = "1"
                 with self.assertRaisesRegex(RuntimeError, "native Mooncake PD"):
+                    hooks.validate_config()
+
+    def test_split_pcp_requires_native_replicated_prefill_topology(self):
+        from sglang_remote_attn import hooks
+
+        parallel = NS(
+            pp_size=1,
+            tp_size=4,
+            dp_size=1,
+            dcp_enabled=False,
+            attn_cp_size=4,
+            attn_dp_size=1,
+            attn_dp_enabled=False,
+            enable_prefill_cp=True,
+            cp_strategy="interleave",
+            cp_kv_layout=None,
+            enable_kv_cache_sharding=False,
+            enable_dsa_cache_layer_split=False,
+            enable_cp_tp_group_sharing=False,
+        )
+        disagg = NS(
+            disaggregation_mode="prefill",
+            disaggregation_transfer_backend="mooncake",
+            enable_pd_role_switch=False,
+        )
+        runtime = NS(
+            get_device=lambda: NS(device="cuda"),
+            get_parallel=lambda: parallel,
+            get_disagg=lambda: disagg,
+            get_exec=lambda: NS(overlap=NS(enable_two_batch_overlap=False)),
+            get_memory=lambda: NS(
+                disable_radix_cache=True,
+                enable_unified_memory=False,
+                enable_hierarchical_cache=False,
+            ),
+            get_schedule=lambda: NS(
+                disable_overlap_schedule=False, enable_mixed_chunk=False, page_size=256
+            ),
+            get_spec=lambda: NS(speculative_algorithm="DSPARK"),
+        )
+        with (
+            patch.dict(
+                sys.modules,
+                {
+                    "sglang.srt.runtime_context": runtime,
+                    "mooncake.engine": NS(TransferEngine=NS(send_probe=lambda: None)),
+                },
+            ),
+            patch.dict(
+                os.environ,
+                {
+                    "HANDOFF_HYBRID_SPLIT_PREFILL": "1",
+                    "HANDOFF_PRE_LAYERWISE": "remote",
+                },
+            ),
+        ):
+            hooks.validate_config()
+            for config, name, value in (
+                (disagg, "disaggregation_mode", "decode"),
+                (parallel, "attn_cp_size", 2),
+                (parallel, "enable_kv_cache_sharding", True),
+            ):
+                with (
+                    self.subTest(name=name),
+                    patch.object(config, name, value),
+                    self.assertRaisesRegex(RuntimeError, "TP=CP=4"),
+                ):
                     hooks.validate_config()
 
     def test_dpa_split_negotiates_inside_the_request_attention_group(self):

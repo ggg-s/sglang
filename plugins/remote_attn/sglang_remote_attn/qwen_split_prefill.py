@@ -303,6 +303,8 @@ def request_blocker(req):
 
 
 def split_tp_rank(controller):
+    if getattr(controller, "split_pcp", False):
+        return controller.rank
     return getattr(controller, "attn_tp_rank", controller.rank)
 
 
@@ -522,14 +524,26 @@ def finalize_bootstrap(original, queue, req):
     controller = getattr(req, "_hybrid_prefill_controller", None)
     if not result or not getattr(controller, "split_prefill", False):
         return result
-    limits, reason = offered_limits(req, controller)
+    dummy_cp = getattr(controller, "split_pcp", False) and getattr(
+        req.disagg_kv_sender.kv_mgr, "is_dummy_cp_rank", False
+    )
+    limits, reason = (None, None) if dummy_cp else offered_limits(req, controller)
     min_cut, chunk_cap, suffix_cap, remote_rate = limits or (0, 0, 0, 0)
-    vote = [min_cut, -min_cut, chunk_cap, -chunk_cap, suffix_cap, -suffix_cap]
+    # Native PCP may send only from CP0. Dummy senders still prefill the same
+    # prefix, so they contribute the MIN identity and receive CP0's offer.
+    vote = (
+        [TP_MIN_IDENTITY] * 6
+        if dummy_cp
+        else [min_cut, -min_cut, chunk_cap, -chunk_cap, suffix_cap, -suffix_cap]
+    )
     if controller.split_prefill_adaptive:
         prefix_rate = int(controller.split_prefill_prefix_rate or 0)
-        if getattr(controller, "split_dpa", False) and split_tp_rank(controller) != 0:
+        if (
+            getattr(controller, "split_dpa", False)
+            or getattr(controller, "split_pcp", False)
+        ) and split_tp_rank(controller) != 0:
             prefix_rate = TP_MIN_IDENTITY
-        vote.extend([remote_rate, prefix_rate])
+        vote.extend([TP_MIN_IDENTITY if dummy_cp else remote_rate, prefix_rate])
     cut, negative_cut, chunk, negative_chunk, suffix, negative_suffix, *rates = (
         controller.agree(vote)
     )
@@ -676,7 +690,7 @@ def seal(req, end_idx):
         # Native sender derives its final envelope from curr_idx == total.
         # D registered the entire row; native Mooncake writes the prefix slice.
         sender.num_kv_indices = count
-        if page > 1:
+        if page > 1 and not getattr(sender.kv_mgr, "is_dummy_cp_rank", False):
             from . import dsv4_split_prefill
 
             dsv4_split_prefill.seal(controller, req, cut)
@@ -820,7 +834,11 @@ def _time_split_forward(controller, original, worker, batch, *args, **kwargs):
             phase = "decode"
     if phase is None or (
         split_tp_rank(controller) != 0
-        and (phase != "prefix" or getattr(controller, "split_dpa", False))
+        and (
+            phase != "prefix"
+            or getattr(controller, "split_dpa", False)
+            or getattr(controller, "split_pcp", False)
+        )
     ):
         return original(worker, batch, *args, **kwargs)
 

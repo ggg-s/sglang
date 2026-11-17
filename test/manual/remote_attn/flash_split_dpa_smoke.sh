@@ -13,6 +13,7 @@ D_PORT=${D_PORT:-31117}
 BOOTSTRAP_PORT=${BOOTSTRAP_PORT:-31997}
 SMG=${SMG:-0}
 SMG_PORT=${SMG_PORT:-31100}
+P_PCP=${P_PCP:-0}
 RUN_DIR=$(mktemp -d "${TMPDIR:-/tmp}/flash-split-dpa.XXXXXX")
 echo "Logs: $RUN_DIR"
 
@@ -22,7 +23,7 @@ export SGLANG_ENABLE_DP_SPEC_PREFILL_COORDINATION=1 SGLANG_RAGGED_VERIFY_MODE=st
 export SGLANG_SCHEDULER_SKIP_ALL_GATHER=0 SGLANG_DSV4_UNIFIED_KV_FP8=0
 export HANDOFF_PRE_LAYERWISE=remote HANDOFF_PD_DIR="$RUN_DIR/pd"
 export HANDOFF_CTL_DIR="$RUN_DIR/control"
-export HANDOFF_HYBRID_SPLIT_PREFILL=1 HANDOFF_SPLIT_DPA=1
+export HANDOFF_HYBRID_SPLIT_PREFILL=1
 export HANDOFF_EXPERIMENTAL_PD_REMOTE=0 HANDOFF_PD_NETWORK=0 HANDOFF_REMOTE_GPU_TRANSFER=0
 export HANDOFF_SPLIT_ADAPTIVE=0 HANDOFF_SPLIT_CAP_AUTO=0
 export HANDOFF_SPLIT_DEFER_TICKS=0 HANDOFF_HYBRID_SPLIT_PREFILL_CHUNK_SIZE=1024
@@ -31,7 +32,7 @@ mkdir -p "$HANDOFF_PD_DIR" "$HANDOFF_CTL_DIR"
 
 common=(
   --model-path "$MODEL" --trust-remote-code --language-model-only
-  --tp "$TP" --attn-dp-size "$TP" --enable-dp-lm-head --moe-a2a-backend none
+  --tp "$TP" --moe-a2a-backend none
   --speculative-algorithm DSPARK --dsv4-attn-backend flashmla --page-size 256
   --disaggregation-transfer-backend mooncake
   --disaggregation-bootstrap-port "$BOOTSTRAP_PORT"
@@ -43,7 +44,17 @@ if [[ -n ${DRAFT:-} ]]; then
   common+=(--speculative-draft-model-path "$DRAFT")
 fi
 
+p_groups=$TP
+p_split_dpa=1
 prefill_args=(--disaggregation-mode prefill --port "$P_PORT")
+if [[ "$P_PCP" == 1 ]]; then
+  p_groups=1
+  p_split_dpa=0
+  prefill_args+=(--enable-prefill-cp --cp-strategy interleave)
+else
+  prefill_args+=(--enable-dp-lm-head)
+fi
+prefill_args+=(--attn-dp-size "$p_groups")
 if [[ "$SMG" == 1 ]]; then
   # SMG selects a P group independently of the random bootstrap room.
   export SGLANG_DISAGGREGATION_FORCE_QUERY_PREFILL_DP_RANK=1
@@ -52,11 +63,13 @@ else
 fi
 
 "$PYTHON" -m sglang_remote_attn.check
-CUDA_VISIBLE_DEVICES="$P_GPUS" "$PYTHON" -m sglang.launch_server "${common[@]}" \
+HANDOFF_SPLIT_DPA="$p_split_dpa" SGLANG_ENABLE_DP_SPEC_PREFILL_COORDINATION="$p_split_dpa" \
+  CUDA_VISIBLE_DEVICES="$P_GPUS" "$PYTHON" -m sglang.launch_server "${common[@]}" \
   "${prefill_args[@]}" >"$RUN_DIR/p.log" 2>&1 &
 p_pid=$!
-SGLANG_LOG_DECODE_GRAPH_KEY=1 CUDA_VISIBLE_DEVICES="$D_GPUS" \
+HANDOFF_SPLIT_DPA=1 SGLANG_LOG_DECODE_GRAPH_KEY=1 CUDA_VISIBLE_DEVICES="$D_GPUS" \
   "$PYTHON" -m sglang.launch_server "${common[@]}" \
+  --attn-dp-size "$TP" --enable-dp-lm-head \
   --disaggregation-mode decode --port "$D_PORT" --disable-radix-cache \
   >"$RUN_DIR/d.log" 2>&1 &
 d_pid=$!
@@ -68,7 +81,7 @@ trap cleanup EXIT
 trap 'exit 130' INT
 trap 'exit 143' TERM
 
-"$PYTHON" - "$TP" "$P_PORT" "$D_PORT" "$BOOTSTRAP_PORT" "$RUN_DIR" \
+"$PYTHON" - "$p_groups" "$TP" "$P_PORT" "$D_PORT" "$BOOTSTRAP_PORT" "$RUN_DIR" \
   "$p_pid" "$d_pid" "$SMG" "$SMG_PORT" <<'PY'
 import concurrent.futures
 import json
@@ -82,10 +95,10 @@ from pathlib import Path
 
 import requests
 
-groups, prefill_port, decode_port, bootstrap_port = map(int, sys.argv[1:5])
-log_dir = Path(sys.argv[5])
-pids = list(map(int, sys.argv[6:8]))
-smg, smg_port = map(int, sys.argv[8:10])
+p_groups, groups, prefill_port, decode_port, bootstrap_port = map(int, sys.argv[1:6])
+log_dir = Path(sys.argv[6])
+pids = list(map(int, sys.argv[7:9]))
+smg, smg_port = map(int, sys.argv[9:11])
 prefill, decode = (f"http://127.0.0.1:{port}" for port in (prefill_port, decode_port))
 deadline = time.monotonic() + 1200
 for url in (prefill, decode):
@@ -126,7 +139,7 @@ def smoke_smg():
                         listing = response.json()
                         stats = listing["stats"]
                         counts = stats["prefill_count"], stats["decode_count"]
-                        if counts == (groups, groups) and all(
+                        if counts == (p_groups, groups) and all(
                             worker["is_healthy"] for worker in listing["workers"]
                         ):
                             break
@@ -135,7 +148,7 @@ def smoke_smg():
                 time.sleep(1)
             else:
                 raise RuntimeError(
-                    f"Expected {groups} healthy groups per role, got counts={counts}. "
+                    f"Expected {p_groups} P and {groups} D groups, got counts={counts}. "
                     f"Check SMG attention-DP discovery in {log.name}"
                 )
             print(f"SMG registered P={counts[0]} and D={counts[1]} groups", flush=True)
@@ -185,18 +198,22 @@ stop = threading.Event()
 
 
 def send_pair(rid, room_index, rank, prompt, output, *, keep=False):
+    prefill_rank = rank % p_groups
     payload = {
         "rid": rid,
         "input_ids": [1234] * prompt,
         "sampling_params": {"temperature": 0, "max_new_tokens": output, "ignore_eos": True},
         "routed_dp_rank": rank,
-        "disagg_prefill_dp_rank": rank,
+        "disagg_prefill_dp_rank": prefill_rank,
         "bootstrap_host": "127.0.0.1",
         "bootstrap_port": bootstrap_port,
         "bootstrap_room": room_index * groups + rank,
     }
     with concurrent.futures.ThreadPoolExecutor(max_workers=1) as executor:
-        p = executor.submit(requests.post, f"{prefill}/generate", json=payload, timeout=300)
+        p = executor.submit(
+            requests.post, f"{prefill}/generate",
+            json=dict(payload, routed_dp_rank=prefill_rank), timeout=300,
+        )
         with requests.post(
             f"{decode}/generate",
             json=dict(payload, stream=keep),

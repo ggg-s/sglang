@@ -101,25 +101,21 @@ def validate_config():
     if get_device().device != "cuda":
         raise RuntimeError("remote_attn requires CUDA")
     dpa = dsv4_split_prefill.dpa_requested()
+    pcp = parallel.attn_cp_size > 1
     if (
         parallel.pp_size != 1
         or parallel.dp_size != 1
-        or parallel.attn_cp_size != 1
         or parallel.dcp_enabled
         or (parallel.attn_dp_enabled and not dpa)
     ):
         raise RuntimeError(
             "remote_attn requires plain TP or HANDOFF_SPLIT_DPA=1 for Flash split; "
-            "PP, replica DP, CP and DCP are unsupported"
+            "PP, replica DP and DCP are unsupported"
         )
-    if dpa:
-        from sglang.srt.environ import envs
-
+    if dpa or pcp:
         disagg = get_disagg()
         if (
-            not parallel.attn_dp_enabled
-            or parallel.attn_dp_size <= 1
-            or disagg.disaggregation_mode not in ("prefill", "decode")
+            disagg.disaggregation_mode not in ("prefill", "decode")
             or disagg.disaggregation_transfer_backend != "mooncake"
             or os.environ.get("HANDOFF_PRE_LAYERWISE") != "remote"
             or os.environ.get("HANDOFF_HYBRID_SPLIT_PREFILL") != "1"
@@ -127,9 +123,30 @@ def validate_config():
             or pd_mesh.enabled()
         ):
             raise RuntimeError(
-                "HANDOFF_SPLIT_DPA requires attention DP and Flash split with "
-                "native Mooncake PD"
+                "Flash split DPA and prefill CP require native Mooncake PD"
             )
+        if pcp and (
+            dpa
+            or disagg.disaggregation_mode != "prefill"
+            or parallel.tp_size != 4
+            or parallel.attn_cp_size != 4
+            or parallel.attn_dp_size != 1
+            or not parallel.enable_prefill_cp
+            or parallel.cp_strategy != "interleave"
+            or parallel.cp_kv_layout is not None
+            or parallel.enable_kv_cache_sharding
+            or parallel.enable_dsa_cache_layer_split
+            or parallel.enable_cp_tp_group_sharing
+        ):
+            raise RuntimeError(
+                "Flash split prefill CP requires P with TP=CP=4, attention DP=1, "
+                "interleave and replicated KV"
+            )
+    if dpa:
+        from sglang.srt.environ import envs
+
+        if not parallel.attn_dp_enabled or parallel.attn_dp_size <= 1:
+            raise RuntimeError("HANDOFF_SPLIT_DPA requires attention DP")
         if envs.SGLANG_SCHEDULER_SKIP_ALL_GATHER.get():
             raise RuntimeError("Flash split DPA needs the native scheduler gather")
         if (

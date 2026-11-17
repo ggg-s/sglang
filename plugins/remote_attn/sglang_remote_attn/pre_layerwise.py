@@ -639,11 +639,22 @@ class Controller:
         from .dsv4_split_prefill import dpa_requested
 
         self.split_dpa = dpa_requested()
+        cp_size = getattr(getattr(scheduler, "attn_cp_group", None), "world_size", 1)
+        self.split_pcp = cp_size > 1
+        split_attention = self.split_dpa or self.split_pcp
         self.attn_tp_rank = (
-            scheduler.attn_tp_group.rank_in_group if self.split_dpa else self.rank
+            scheduler.attn_tp_group.rank_in_group if split_attention else self.rank
         )
         self.attn_tp_size = (
-            scheduler.attn_tp_group.world_size if self.split_dpa else self.tp_size
+            scheduler.attn_tp_group.world_size if split_attention else self.tp_size
+        )
+        # PCP4 uses one attention shard. All CP peers run the same request,
+        # while each DPA shard agrees independently within its attention TP.
+        self.split_vote_size = cp_size if self.split_pcp else self.attn_tp_size
+        self.split_vote_group = (
+            scheduler.attn_cp_cpu_group
+            if self.split_pcp
+            else getattr(scheduler, "attn_tp_cpu_group", None)
         )
         self.layers = scheduler.tp_worker.model_runner.model_config.num_hidden_layers
         self.sources = []
@@ -719,12 +730,12 @@ class Controller:
             ),
         )
         clean = not _runtime().has_target_states()
-        if self.attn_tp_size > 1:
+        if self.split_vote_size > 1:
             import torch.distributed as dist
 
-            reports = [None] * self.attn_tp_size
+            reports = [None] * self.split_vote_size
             dist.all_gather_object(
-                reports, (signature, clean), group=self.scheduler.attn_tp_cpu_group
+                reports, (signature, clean), group=self.split_vote_group
             )
             if any(item[0] != reports[0][0] for item in reports):
                 raise RuntimeError(
@@ -773,12 +784,10 @@ class Controller:
         import torch
         import torch.distributed as dist
 
-        if not flags or self.attn_tp_size == 1:
+        if not flags or self.split_vote_size == 1:
             return flags
         values = torch.tensor(flags, dtype=torch.int32)
-        dist.all_reduce(
-            values, op=dist.ReduceOp.MIN, group=self.scheduler.attn_tp_cpu_group
-        )
+        dist.all_reduce(values, op=dist.ReduceOp.MIN, group=self.split_vote_group)
         return values.tolist()
 
     def offer(self, queue, dr):
@@ -1364,6 +1373,11 @@ def initialize(scheduler):
         else Controller
     )
     controller = cls(scheduler, config)
+    if (
+        controller.split_pcp
+        and runner.model_config.hf_config.model_type != "deepseek_v4"
+    ):
+        raise RuntimeError("remote_attn prefill CP requires DeepSeek-V4 Flash split")
     controller.validate()
     from . import qwen_split_prefill
 

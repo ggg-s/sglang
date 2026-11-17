@@ -99,6 +99,13 @@ attention TP 为 1，例如两端各用 `--tp 4 --attn-dp-size 4 --enable-dp-lm-
 D 设置 `SGLANG_ENABLE_DP_SPEC_PREFILL_COORDINATION=1`。沿用上面的原生 Mooncake
 和 FlashMLA 布局。P 开 radix cache，D 保持 `--disable-radix-cache`。
 
+也可让 P 使用 `--tp 4 --attn-dp-size 1 --enable-prefill-cp --cp-strategy interleave`，
+保留复制的 KV 布局，P 设 `HANDOFF_SPLIT_DPA=0`。D 仍用 DPA4 和
+`HANDOFF_SPLIT_DPA=1`。P 的四个 CP rank 对同一 offer 和切点达成一致，
+默认由 CP0 发送 KV 和 DSpark 状态。直连时，D 可选择任意 attention DP rank，
+P 的 DP rank 固定为 0。冒烟脚本可用 `P_PCP=1` 覆盖此拓扑，并检查 D 的 draft
+和 target verify 回放。
+
 采用能从 `/server_info` 读取 `attn_dp_size` 的 SMG。一个 P 和一个 D 各开
 DPA4 时，`/workers` 应各显示 4 个 worker。SMG 按 P 的 DP 组匹配前缀，
 独立选 D，并把选中的 P 组号传给 D。P 默认按 `bootstrap_room` 分组选路，
