@@ -106,6 +106,12 @@ D 设置 `SGLANG_ENABLE_DP_SPEC_PREFILL_COORDINATION=1`。沿用上面的原生 
 P 的 DP rank 固定为 0。冒烟脚本可用 `P_PCP=1` 覆盖此拓扑，并检查 D 的 draft
 和 target verify 回放。
 
+P 使用 PCP4 时，D 也可用纯 TP4（`--tp 4 --attn-dp-size 1`，两端均设
+`HANDOFF_SPLIT_DPA=0`）。P 收齐四个 D rank 的 offer 后，取最晚的最早切点和
+最小的 chunk 上限。Mooncake 按各 rank 的页表写入 target 和 draft SWA。
+任何一个 rank 的 offer 缺失或不兼容，请求就走原生 PD。
+用 `P_PCP=1 D_DPA=0` 跑冒烟脚本可检查这组拓扑。
+
 采用能从 `/server_info` 读取 `attn_dp_size` 的 SMG。一个 P 和一个 D 各开
 DPA4 时，`/workers` 应各显示 4 个 worker。SMG 按 P 的 DP 组匹配前缀，
 独立选 D，并把选中的 P 组号传给 D。P 默认按 `bootstrap_room` 分组选路，

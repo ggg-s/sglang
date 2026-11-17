@@ -481,14 +481,52 @@ def offered_limits(req, controller):
         return None, "prefill_already_started"
     manager = sender.kv_mgr
     peers = tuple(manager.transfer_infos.get(req.bootstrap_room, {}).values())
-    if len(peers) != 1 or peers[0].is_dummy:
+    attn_tp_size = getattr(controller, "attn_tp_size", controller.tp_size)
+    fanout = (
+        getattr(controller, "split_pcp", False)
+        and getattr(controller, "dsv4_split_schema", None)
+        and attn_tp_size == 1
+        and len(peers) == controller.tp_size
+    )
+    if (len(peers) != 1 and not fanout) or any(peer.is_dummy for peer in peers):
         return None, "unexpected_destination_peers"
-    peer = peers[0]
+
+    # Replicated DSV4 KV can fan out from one P shard to the whole D TP
+    # group. Choose a cut and chunk that fit every destination's reservation.
+    length = len(req.origin_input_ids)
+    offers = []
+    dst_ranks = set()
+    dst_tp_size = len(peers) if fanout else attn_tp_size
+    for peer in peers:
+        limits, reason = _peer_limits(controller, peer, length)
+        if limits is None:
+            return None, reason
+        registration = manager.decode_kv_args_table.get(peer.mooncake_session_id)
+        if (
+            registration is None
+            or registration.requires_dcp_relayout
+            or registration.dst_attn_tp_size != dst_tp_size
+        ):
+            return None, "incompatible_destination_registration"
+        if fanout:
+            if peer.required_dst_info_num != dst_tp_size:
+                return None, "unexpected_destination_peers"
+            dst_ranks.add(registration.dst_tp_rank)
+        offers.append(limits)
+    if fanout and dst_ranks != set(range(dst_tp_size)):
+        return None, "incompatible_destination_registration"
+
+    cuts, chunks, caps, rates = zip(*offers)
+    min_cut = max(cuts)
+    suffix_cap = length - min_cut if any(caps) else 0
+    return (min_cut, min(length, *chunks), suffix_cap, min(rates)), None
+
+
+def _peer_limits(controller, peer, length):
     limits = getattr(peer, "_hybrid_split_limits", None)
     if limits is None:
         return None, getattr(peer, "_hybrid_split_offer_error", "decode_did_not_offer")
     cut, chunk_cap = limits
-    length = len(req.origin_input_ids)
     suffix_cap = getattr(peer, "_hybrid_split_suffix_cap", 0)
     if (
         not (length + 1) // 2 <= cut <= length - min_suffix_tokens(length)
@@ -504,19 +542,8 @@ def offered_limits(req, controller):
 
         if not dsv4_split_prefill.compatible_offer(controller, peer, length, cut):
             return None, "incompatible_destination_split_layout"
-    registration = manager.decode_kv_args_table.get(peer.mooncake_session_id)
-    attn_tp_size = getattr(controller, "attn_tp_size", controller.tp_size)
-    if (
-        registration is None
-        or registration.requires_dcp_relayout
-        or registration.dst_attn_tp_size != attn_tp_size
-    ):
-        return None, "incompatible_destination_registration"
-    # The legacy decode-priority marker still describes D's configured defer
-    # behavior to older peers. Cut selection on this P uses its own basis.
-    # Caps above the prompt length are equivalent for the TP vote.
     rate = getattr(peer, "_hybrid_split_suffix_rate", 0)
-    return (cut, min(chunk_cap, length), suffix_cap, rate), None
+    return (cut, chunk_cap, suffix_cap, rate), None
 
 
 def finalize_bootstrap(original, queue, req):

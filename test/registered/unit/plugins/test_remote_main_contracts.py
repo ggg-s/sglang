@@ -1381,8 +1381,23 @@ class TestSplitPD(CustomTestCase):
         ):
             self._check_dsv4_split(adaptive=True, dspark=True, dpa=True, pcp=True)
 
+    def test_dsv4_pcp_split_covers_all_decode_tp_destinations(self):
+        """CP0 must accept four compatible offers and use each D rank's pages."""
+        with patch.dict(
+            os.environ,
+            {"HANDOFF_HYBRID_SPLIT_PREFILL": "1", "HANDOFF_SPLIT_ADAPTIVE": "1"},
+        ):
+            self._check_dsv4_split(adaptive=True, dspark=True, pcp=True, fanout=True)
+
     def _check_dsv4_split(
-        self, *, adaptive, invalid_hints=False, dspark=False, dpa=False, pcp=False
+        self,
+        *,
+        adaptive,
+        invalid_hints=False,
+        dspark=False,
+        dpa=False,
+        pcp=False,
+        fanout=False,
     ):
         from sglang_remote_attn import dsv4_split_prefill as flash
 
@@ -1402,7 +1417,7 @@ class TestSplitPD(CustomTestCase):
                 members={"_resolve_rank_mapping"},
             )
             decoder = NS(
-                attn_tp_size=1,
+                attn_tp_size=4 if fanout else 1,
                 attn_cp_size=1,
                 is_mla_backend=True,
                 kv_args=NS(engine_rank=3),
@@ -1422,6 +1437,7 @@ class TestSplitPD(CustomTestCase):
                 (prefill.target_cp_ranks, prefill.target_tp_ranks), ([0], [0])
             )
             self.assertEqual(prefill.required_prefill_response_num, 1)
+            self.assertEqual(prefill.required_dst_info_num, 4 if fanout else 1)
         component_type = definitions(
             ROOT,
             "python/sglang/srt/mem_cache/unified_cache/component_type.py",
@@ -1596,16 +1612,70 @@ class TestSplitPD(CustomTestCase):
                 "decode": NS(requires_dcp_relayout=False, dst_attn_tp_size=1)
             },
         )
+        if fanout:
+            peers = sender.kv_mgr.transfer_infos[7]
+            registrations = sender.kv_mgr.decode_kv_args_table
+            for rank in range(4):
+                session = f"decode-{rank}"
+                destination = self.mesh.parse_transfer(
+                    lambda **_: Peer(
+                        [
+                            [index + 100 * rank for index in row]
+                            for row in dst_state_indices
+                        ]
+                    ),
+                    msg=frames,
+                )
+                destination.is_dummy = False
+                destination.required_dst_info_num = 4
+                destination.mooncake_session_id = session
+                destination.dst_kv_indices = list(range(33))
+                schema, start_page, pages = destination._dsv4_split_window
+                destination._dsv4_split_window = (
+                    schema,
+                    start_page,
+                    [index + 100 * rank for index in pages],
+                )
+                if rank == 3:
+                    destination._hybrid_split_limits = (6144, 2048)
+                    destination._hybrid_split_suffix_cap = length - 6144
+                    destination._hybrid_split_suffix_rate = 4200
+                peers[session] = destination
+                registrations[session] = NS(
+                    requires_dcp_relayout=False, dst_attn_tp_size=4, dst_tp_rank=rank
+                )
+            del peers["decode"], registrations["decode"]
+            peer = peers["decode-0"]
         sender.curr_idx = 11  # pages, not tokens
         source = self.request(length=length, prefix=4096 if adaptive else 6656)
         source.disagg_kv_sender = sender
         self.split.create_sender(lambda *_: True, NS(scheduler=p.scheduler), source, 1)
+        if fanout:
+            self.assertEqual(
+                self.split.offered_limits(source, p),
+                ((6144, 2048, length - 6144, 4200), None),
+            )
+            with patch.object(peers["decode-3"], "_hybrid_split_limits", None):
+                self.assertEqual(
+                    self.split.offered_limits(source, p), (None, "decode_did_not_offer")
+                )
+            with patch.object(registrations["decode-3"], "dst_tp_rank", 0):
+                self.assertEqual(
+                    self.split.offered_limits(source, p),
+                    (None, "incompatible_destination_registration"),
+                )
+            with patch.object(peer, "_dsv4_split_window", ("b" * 64, start, mapped)):
+                self.assertEqual(
+                    self.split.offered_limits(source, p),
+                    (None, "incompatible_destination_split_layout"),
+                )
         self.split.finalize_bootstrap(lambda *_: True, None, source)
         if pcp:
             leader_offer_vote = p.agree.call_args.args[0]
         if adaptive:
             self.assertEqual(
-                source._hybrid_split_rates, None if invalid_hints else [4500, 6000]
+                source._hybrid_split_rates,
+                None if invalid_hints else [4200 if fanout else 4500, 6000],
             )
         self.split.init_input(self.match, source, object())
         cut = source._hybrid_split_at
@@ -1686,6 +1756,27 @@ class TestSplitPD(CustomTestCase):
             )
         self.assertEqual(sent, (expected_dst, expected_src))
         self.assertEqual(peer.dst_state_indices, dst_state_indices)
+        if fanout:
+            for rank, destination in enumerate(peers.values()):
+                pages = [92 + 100 * rank]
+                sent = flash.send_states(
+                    lambda _, target, indices, *_args: (
+                        target.dst_state_indices,
+                        indices,
+                    ),
+                    manager,
+                    destination,
+                    src_state_indices,
+                    None,
+                )
+                offset = 100 * rank
+                self.assertEqual(
+                    sent, ([pages, [7 + offset], pages, [9 + offset]], expected_src)
+                )
+                self.assertEqual(
+                    destination.dst_state_indices,
+                    [[index + offset for index in row] for row in dst_state_indices],
+                )
 
         freed = []
         prealloc.token_to_kv_pool_allocator.free_swa_segment = (

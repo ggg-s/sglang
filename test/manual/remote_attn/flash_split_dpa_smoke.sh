@@ -14,12 +14,13 @@ BOOTSTRAP_PORT=${BOOTSTRAP_PORT:-31997}
 SMG=${SMG:-0}
 SMG_PORT=${SMG_PORT:-31100}
 P_PCP=${P_PCP:-0}
+D_DPA=${D_DPA:-1}
 RUN_DIR=$(mktemp -d "${TMPDIR:-/tmp}/flash-split-dpa.XXXXXX")
 echo "Logs: $RUN_DIR"
 
 export PYTHONPATH="$PWD/python:$PWD/plugins/remote_attn${PYTHONPATH:+:$PYTHONPATH}"
 export SGLANG_PLUGINS=remote_attn
-export SGLANG_ENABLE_DP_SPEC_PREFILL_COORDINATION=1 SGLANG_RAGGED_VERIFY_MODE=static
+export SGLANG_RAGGED_VERIFY_MODE=static
 export SGLANG_SCHEDULER_SKIP_ALL_GATHER=0 SGLANG_DSV4_UNIFIED_KV_FP8=0
 export HANDOFF_PRE_LAYERWISE=remote HANDOFF_PD_DIR="$RUN_DIR/pd"
 export HANDOFF_CTL_DIR="$RUN_DIR/control"
@@ -55,6 +56,13 @@ else
   prefill_args+=(--enable-dp-lm-head)
 fi
 prefill_args+=(--attn-dp-size "$p_groups")
+d_groups=1
+decode_args=(--disaggregation-mode decode --port "$D_PORT" --disable-radix-cache)
+if [[ "$D_DPA" == 1 ]]; then
+  d_groups=$TP
+  decode_args+=(--enable-dp-lm-head)
+fi
+decode_args+=(--attn-dp-size "$d_groups")
 if [[ "$SMG" == 1 ]]; then
   # SMG selects a P group independently of the random bootstrap room.
   export SGLANG_DISAGGREGATION_FORCE_QUERY_PREFILL_DP_RANK=1
@@ -67,10 +75,10 @@ HANDOFF_SPLIT_DPA="$p_split_dpa" SGLANG_ENABLE_DP_SPEC_PREFILL_COORDINATION="$p_
   CUDA_VISIBLE_DEVICES="$P_GPUS" "$PYTHON" -m sglang.launch_server "${common[@]}" \
   "${prefill_args[@]}" >"$RUN_DIR/p.log" 2>&1 &
 p_pid=$!
-HANDOFF_SPLIT_DPA=1 SGLANG_LOG_DECODE_GRAPH_KEY=1 CUDA_VISIBLE_DEVICES="$D_GPUS" \
+HANDOFF_SPLIT_DPA="$D_DPA" SGLANG_ENABLE_DP_SPEC_PREFILL_COORDINATION="$D_DPA" \
+  SGLANG_LOG_DECODE_GRAPH_KEY=1 CUDA_VISIBLE_DEVICES="$D_GPUS" \
   "$PYTHON" -m sglang.launch_server "${common[@]}" \
-  --attn-dp-size "$TP" --enable-dp-lm-head \
-  --disaggregation-mode decode --port "$D_PORT" --disable-radix-cache \
+  "${decode_args[@]}" \
   >"$RUN_DIR/d.log" 2>&1 &
 d_pid=$!
 cleanup() {
@@ -81,7 +89,7 @@ trap cleanup EXIT
 trap 'exit 130' INT
 trap 'exit 143' TERM
 
-"$PYTHON" - "$p_groups" "$TP" "$P_PORT" "$D_PORT" "$BOOTSTRAP_PORT" "$RUN_DIR" \
+"$PYTHON" - "$p_groups" "$d_groups" "$P_PORT" "$D_PORT" "$BOOTSTRAP_PORT" "$RUN_DIR" \
   "$p_pid" "$d_pid" "$SMG" "$SMG_PORT" <<'PY'
 import concurrent.futures
 import json
@@ -253,32 +261,36 @@ def has_step(rid, peer_mode, coordinated):
 d_log = log_dir / "d.log"
 before = len(d_log.read_text())
 send_pair("flash-smoke-idle", 10, 0, 16384, 64)
-assert has_step("flash-smoke-idle", "idle", False), "Expected suffix + idle"
 isolated_log = d_log.read_text()[before:]
+assert "[handoff-split] hybrid PD rid=flash-smoke-idle " in isolated_log, isolated_log
+if groups > 1:
+    assert has_step("flash-smoke-idle", "idle", False), "Expected suffix + idle"
 for worker in ("draft", "target"):
     assert re.search(
         rf"Decode graph replay: worker={worker} .*mode=TARGET_VERIFY raw_bs=[1-9]",
         isolated_log,
     ), f"Expected active {worker} CUDA graph replay after the split"
 
-# Wait until group 1 is generating tokens before asking group 0 to split.
-with concurrent.futures.ThreadPoolExecutor(max_workers=1) as executor:
-    decoding = executor.submit(send_pair, "flash-smoke-peer", 11, 1, 1024, 16384, keep=True)
-    try:
-        assert ready.wait(120), "Peer did not start DSpark decode"
-        send_pair("flash-smoke-mixed", 12, 0, 16384, 64)
-        assert has_step("flash-smoke-mixed", "verify", True), "Expected coordinated suffix + verify"
-    finally:
-        stop.set()
-    decoding.result()
+if groups > 1:
+    # Wait until group 1 is generating tokens before asking group 0 to split.
+    with concurrent.futures.ThreadPoolExecutor(max_workers=1) as executor:
+        decoding = executor.submit(send_pair, "flash-smoke-peer", 11, 1, 1024, 16384, keep=True)
+        try:
+            assert ready.wait(120), "Peer did not start DSpark decode"
+            send_pair("flash-smoke-mixed", 12, 0, 16384, 64)
+            assert has_step("flash-smoke-mixed", "verify", True), "Expected coordinated suffix + verify"
+        finally:
+            stop.set()
+        decoding.result()
 
 # A pinned 4096-token suffix on a 6144-token prompt would leave P 2048
 # tokens, below the earliest cut 3072. D offers; P sends the full prompt.
 send_pair("flash-smoke-fallback", 13, 0, 6144, 64)
 logs = (log_dir / "d.log").read_text()
-assert "stage=decode_commit reason=native_pd rid=flash-smoke-fallback" in logs, (
-    "Expected native PD commit after declining a split offer"
-)
+if groups > 1:
+    assert "stage=decode_commit reason=native_pd rid=flash-smoke-fallback" in logs, (
+        "Expected native PD commit after declining a split offer"
+    )
 assert "[handoff-split] hybrid PD rid=flash-smoke-fallback " not in logs
-print("PASS: split with draft/verify graph replay, suffix + DSpark verify, native PD fallback")
+print("PASS: split with draft/verify graph replay and native PD fallback")
 PY

@@ -260,15 +260,18 @@ def seal(controller, req, cut):
     peers = sender.kv_mgr.transfer_infos.get(req.bootstrap_room)
     if not peers:
         return  # Native cancellation may already have removed the room.
-    (peer,) = peers.values()
-    _, start, pages = peer._dsv4_split_window
     page = controller.split_prefill_page_size
     first = window_start(cut, controller.scheduler.sliding_window_size, page)
-    if first < start or cut % page or cut > start + len(pages) * page:
-        raise RuntimeError("DSV4 split prefill cut exceeds its reserved SWA window")
-    peer._dsv4_split_swa_destination = pages[
-        (first - start) // page : (cut - start) // page
-    ]
+    destinations = []
+    for peer in peers.values():
+        _, start, pages = peer._dsv4_split_window
+        if first < start or cut % page or cut > start + len(pages) * page:
+            raise RuntimeError("DSV4 split prefill cut exceeds its reserved SWA window")
+        destinations.append(
+            (peer, pages[(first - start) // page : (cut - start) // page])
+        )
+    for peer, pages in destinations:
+        peer._dsv4_split_swa_destination = pages
 
 
 def send_states(
