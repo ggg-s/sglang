@@ -695,6 +695,8 @@ class ForwardFlags:
         "moe_output_buffer": None,
         # A live prefill can request eager dispatch without changing graph config.
         "force_eager_prefill": False,
+        # One speculative decode step can veto graph dispatch for both runners.
+        "force_eager_decode": False,
         # Attention-TP input-scattering (set per forward by
         # AttnTpContext.maybe_input_scattered / set_attn_inputs).
         "attn_input_scattered": False,

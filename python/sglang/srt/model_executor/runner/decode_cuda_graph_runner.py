@@ -126,7 +126,13 @@ from sglang.srt.model_executor.runner_utils.pool import (
 )
 from sglang.srt.model_executor.runner_utils.shared_read_event import make_external_event
 from sglang.srt.models.unlimited_ocr_v2_support.decode_graph_io import UOCRDecodeGraphIO
-from sglang.srt.runtime_context import get_exec, get_flags, get_parallel, get_spec
+from sglang.srt.runtime_context import (
+    get_exec,
+    get_flags,
+    get_forward,
+    get_parallel,
+    get_spec,
+)
 from sglang.srt.utils import empty_context, get_available_gpu_memory
 from sglang.srt.utils.device_timer import device_timer_ctx
 
@@ -1927,7 +1933,7 @@ class DecodeCudaGraphRunner(BaseCudaGraphRunner):
         """After the draft launch, stage the verify inputs and glue replay on a side
         stream waiting on ``after``; False when this batch cannot be staged."""
         early = self._early_verify_metadata
-        if early is None:
+        if early is None or get_forward().force_eager_decode:
             return False
         bs = seq_lens.shape[0]
         num_tokens = bs * self.captured_req_width
