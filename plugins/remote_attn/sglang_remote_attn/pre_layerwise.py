@@ -636,6 +636,15 @@ class Controller:
         self.pd_remote = config.mode != "remote" or pd_remote == "1"
         self.rank = _runtime()._tp_rank(scheduler)
         self.tp_size = _runtime()._tp_size(scheduler)
+        from .dsv4_split_prefill import dpa_requested
+
+        self.split_dpa = dpa_requested()
+        self.attn_tp_rank = (
+            scheduler.attn_tp_group.rank_in_group if self.split_dpa else self.rank
+        )
+        self.attn_tp_size = (
+            scheduler.attn_tp_group.world_size if self.split_dpa else self.tp_size
+        )
         self.layers = scheduler.tp_worker.model_runner.model_config.num_hidden_layers
         self.sources = []
         self.targets = []
@@ -710,10 +719,10 @@ class Controller:
             ),
         )
         clean = not _runtime().has_target_states()
-        if self.tp_size > 1:
+        if self.attn_tp_size > 1:
             import torch.distributed as dist
 
-            reports = [None] * self.tp_size
+            reports = [None] * self.attn_tp_size
             dist.all_gather_object(
                 reports, (signature, clean), group=self.scheduler.attn_tp_cpu_group
             )
@@ -764,7 +773,7 @@ class Controller:
         import torch
         import torch.distributed as dist
 
-        if not flags or self.tp_size == 1:
+        if not flags or self.attn_tp_size == 1:
             return flags
         values = torch.tensor(flags, dtype=torch.int32)
         dist.all_reduce(

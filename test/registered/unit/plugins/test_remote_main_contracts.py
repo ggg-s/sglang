@@ -1317,9 +1317,13 @@ class TestSplitPD(CustomTestCase):
         self,
     ):
         with patch.dict(os.environ, {"HANDOFF_HYBRID_SPLIT_PREFILL": "1"}):
-            self._check_dsv4_split(adaptive=False, dspark=True)
+            for dpa in (False, True):
+                with self.subTest(dpa=dpa):
+                    self._check_dsv4_split(adaptive=False, dspark=True, dpa=dpa)
 
-    def _check_dsv4_split(self, *, adaptive, invalid_hints=False, dspark=False):
+    def _check_dsv4_split(
+        self, *, adaptive, invalid_hints=False, dspark=False, dpa=False
+    ):
         from sglang_remote_attn import dsv4_split_prefill as flash
 
         with patch.object(
@@ -1384,6 +1388,12 @@ class TestSplitPD(CustomTestCase):
             dsv41_spec_layout={"state_types": state_types} if dspark else None,
         )
         for controller in (p, d):
+            if dpa:
+                controller.rank = 3
+                controller.tp_size = 4
+                controller.attn_tp_rank = 0
+                controller.attn_tp_size = 1
+                controller.split_dpa = True
             controller.scheduler.sliding_window_size = window
             controller.pool.swa_page_size = page
             controller.pool.request_window = None
@@ -1777,6 +1787,192 @@ class TestSplitPD(CustomTestCase):
     @staticmethod
     def match(req, *_):
         req.full_untruncated_fill_ids = list(req.origin_input_ids)
+
+    def test_dpa_split_requires_opt_in_and_native_dspark_coordination(self):
+        from sglang.srt.environ import envs
+        from sglang_remote_attn import hooks
+
+        runtime = NS(
+            get_device=lambda: NS(device="cuda"),
+            get_parallel=lambda: NS(
+                pp_size=1,
+                dp_size=1,
+                attn_cp_size=1,
+                dcp_enabled=False,
+                attn_dp_enabled=True,
+                attn_dp_size=2,
+            ),
+            get_disagg=lambda: NS(
+                disaggregation_mode="decode",
+                disaggregation_transfer_backend="mooncake",
+                enable_pd_role_switch=False,
+            ),
+            get_exec=lambda: NS(overlap=NS(enable_two_batch_overlap=False)),
+            get_memory=lambda: NS(
+                disable_radix_cache=True,
+                enable_unified_memory=False,
+                enable_hierarchical_cache=False,
+            ),
+            get_schedule=lambda: NS(
+                disable_overlap_schedule=False, enable_mixed_chunk=False, page_size=256
+            ),
+            get_spec=lambda: NS(speculative_algorithm="DSPARK"),
+        )
+        with (
+            patch.dict(
+                sys.modules,
+                {
+                    "sglang.srt.runtime_context": runtime,
+                    "mooncake.engine": NS(TransferEngine=NS(send_probe=lambda: None)),
+                },
+            ),
+            patch.dict(
+                os.environ,
+                {
+                    "HANDOFF_HYBRID_SPLIT_PREFILL": "1",
+                    "HANDOFF_PRE_LAYERWISE": "remote",
+                },
+            ),
+        ):
+            with self.assertRaisesRegex(RuntimeError, "HANDOFF_SPLIT_DPA=1"):
+                hooks.validate_config()
+            os.environ["HANDOFF_SPLIT_DPA"] = "1"
+            with self.assertRaisesRegex(
+                RuntimeError, "SGLANG_ENABLE_DP_SPEC_PREFILL_COORDINATION=1"
+            ):
+                hooks.validate_config()
+            with envs.SGLANG_ENABLE_DP_SPEC_PREFILL_COORDINATION.override(True):
+                hooks.validate_config()
+                os.environ["HANDOFF_EXPERIMENTAL_PD_REMOTE"] = "1"
+                with self.assertRaisesRegex(RuntimeError, "native Mooncake PD"):
+                    hooks.validate_config()
+
+    def test_dpa_split_negotiates_inside_the_request_attention_group(self):
+        with patch.dict(os.environ, {"HANDOFF_SPLIT_ADAPTIVE": "1"}):
+            p, d = self.controller(), self.controller("decode")
+        for controller in (p, d):
+            controller.rank = 3
+            controller.tp_size = 4
+            controller.attn_tp_rank = 0
+            controller.attn_tp_size = 1
+            controller.split_dpa = True
+        p.split_prefill_prefix_rate = 6000
+        d.split_prefill_decode_budget.cap = 8192
+        d.split_prefill_decode_budget.suffix_rate = 4500
+        _, _, req, dr = self.bootstrap(prefill=p, decode=d)
+        self.assertEqual(req._hybrid_split_rates, [4500, 6000])
+        self.assertEqual(dr.kv_receiver._hybrid_split_schedule[3], 4500)
+        self.split.init_input(self.match, req, object())
+        self.assertEqual(req._hybrid_split_at, 24576)
+
+    def test_dpa_prefill_samples_only_the_attention_group_leader(self):
+        with patch.dict(os.environ, {"HANDOFF_SPLIT_ADAPTIVE": "1"}):
+            p = self.controller()
+        p.split_dpa = p.dsv4_split_dspark = True
+        p.rank = 2
+        worker = NS(target_worker=NS(model_runner=NS(_pre_layerwise=p)))
+        batch = NS(
+            forward_mode=NS(is_extend=lambda: True),
+            extend_num_tokens=4096,
+        )
+        start, end = Mock(), Mock()
+        end.query.return_value = True
+        start.elapsed_time.return_value = 500
+        with (
+            patch.object(torch.cuda, "current_stream", return_value=object()),
+            patch.object(torch.cuda, "Event", side_effect=[start, end]) as event,
+        ):
+            p.attn_tp_rank = 0
+            result = self.split.time_dspark_forward(lambda *_: NS(), worker, batch)
+            self.split.record_completed_suffix(p, result)
+            self.assertEqual(p.split_prefill_prefix_rate, 8192)
+            p.attn_tp_rank = 1
+            result = self.split.time_dspark_forward(lambda *_: NS(), worker, batch)
+            self.assertFalse(hasattr(result, "_split_suffix_timing"))
+        self.assertEqual(event.call_count, 2)
+
+    def test_dpa_suffix_and_native_steps_share_one_batch_sync(self):
+        from sglang.srt.model_executor.forward_mode import ForwardMode
+        from sglang_remote_attn import decode_overlap
+
+        d = self.controller("decode")
+        d.split_dpa = d.dsv4_split_dspark = True
+        s = d.scheduler
+        s.last_batch = s.chunked_req = None
+        s.token_to_kv_pool_allocator = s.tree_cache = s.model_config = None
+        s.enable_overlap = True
+        s.spec_algorithm = "DSPARK"
+        req = self.request(length=8192, prefix=6144)
+        req.kv.reserved_prefill_suffix = True
+        req.refresh_fill_ids = Mock()
+        req.time_stats = Mock()
+        req.extend_len = 2048
+        req.extend_batch_idx = req.cached_tokens = req._hybrid_split_defer_ticks = 0
+        req._hybrid_split_ready_at = None
+
+        class WaitingQueue(list):
+            def leave(self, reqs):
+                for req in reqs:
+                    self.remove(req)
+
+        s.waiting_queue = WaitingQueue([req])
+        suffix = NS(
+            forward_mode=ForwardMode.EXTEND, prepare_for_extend=Mock(), extend_len=2048
+        )
+        s.dp_attn_adapter = NS()
+
+        def sync_batch(batch):
+            if batch is None:
+                batch = NS(forward_mode=ForwardMode.IDLE)
+            batch.is_extend_in_batch = True
+            return batch
+
+        sync = s.dp_attn_adapter.maybe_prepare_mlp_sync_batch = Mock(
+            side_effect=sync_batch
+        )
+
+        def native(scheduler, running):
+            batch = None if running.is_empty() else running
+            return NS(
+                batch_to_run=scheduler.dp_attn_adapter.maybe_prepare_mlp_sync_batch(
+                    batch
+                ),
+                running_batch=running,
+            )
+
+        native = Mock(side_effect=native)
+        idle = NS(is_empty=lambda: True, batch_size=lambda: 0)
+        with patch.dict(
+            sys.modules,
+            {
+                "sglang.srt.managers.schedule_batch": NS(
+                    NextBatchPlan=NS,
+                    ScheduleBatch=NS(init_new=lambda *args, **kwargs: suffix),
+                ),
+                "sglang.srt.observability.req_time_stats": NS(
+                    set_schedule_time_batch=lambda _: None
+                ),
+            },
+        ):
+            result = self.split.next_batch(native, s, idle)
+        self.assertIs(result.batch_to_run, suffix)
+        self.assertTrue(suffix._hybrid_split_extend)
+        sync.assert_called_once_with(suffix)
+        native.assert_not_called()
+
+        running = NS(forward_mode=ForwardMode.DECODE, is_empty=lambda: False)
+        for active in (running, idle):
+            result = self.split.next_batch(native, s, active)
+            self.assertTrue(result.batch_to_run.is_extend_in_batch)
+            self.assertTrue(
+                decode_overlap.process_last_batch_early(
+                    lambda *_: False, s, result.batch_to_run
+                )
+            )
+        self.assertEqual(
+            [call.args[0] for call in sync.call_args_list], [suffix, running, None]
+        )
+        self.assertEqual(native.call_count, 2)
 
     def test_default_cut_uses_prompt_bound_without_a_fixed_cap(self):
         for hybrid in (False, True):

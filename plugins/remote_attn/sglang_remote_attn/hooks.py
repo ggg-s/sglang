@@ -54,12 +54,10 @@ def _scheduler_init(original, scheduler, *args, **kwargs):
     from . import qwen_hybrid
 
     if (
-        dsv4_split_prefill.dspark_requested()
+        (dsv4_split_prefill.dspark_requested() or dsv4_split_prefill.dpa_requested())
         and runner.model_config.hf_config.model_type != "deepseek_v4"
     ):
-        raise RuntimeError(
-            "remote_attn DSpark requires DeepSeek-V4 Flash paged split prefill"
-        )
+        raise RuntimeError("remote_attn DSpark/DPA requires DeepSeek-V4 Flash split")
     if qwen_hybrid.matches(runner):
         pre_layerwise.initialize(scheduler)
         return
@@ -102,14 +100,47 @@ def validate_config():
     schedule = get_schedule()
     if get_device().device != "cuda":
         raise RuntimeError("remote_attn requires CUDA")
+    dpa = dsv4_split_prefill.dpa_requested()
     if (
         parallel.pp_size != 1
         or parallel.dp_size != 1
         or parallel.attn_cp_size != 1
         or parallel.dcp_enabled
-        or parallel.attn_dp_enabled
+        or (parallel.attn_dp_enabled and not dpa)
     ):
-        raise RuntimeError("remote_attn supports plain TP, without PP/DP/CP/DCP")
+        raise RuntimeError(
+            "remote_attn requires plain TP or HANDOFF_SPLIT_DPA=1 for Flash split; "
+            "PP, replica DP, CP and DCP are unsupported"
+        )
+    if dpa:
+        from sglang.srt.environ import envs
+
+        disagg = get_disagg()
+        if (
+            not parallel.attn_dp_enabled
+            or parallel.attn_dp_size <= 1
+            or disagg.disaggregation_mode not in ("prefill", "decode")
+            or disagg.disaggregation_transfer_backend != "mooncake"
+            or os.environ.get("HANDOFF_PRE_LAYERWISE") != "remote"
+            or os.environ.get("HANDOFF_HYBRID_SPLIT_PREFILL") != "1"
+            or os.environ.get("HANDOFF_EXPERIMENTAL_PD_REMOTE", "0") != "0"
+            or pd_mesh.enabled()
+        ):
+            raise RuntimeError(
+                "HANDOFF_SPLIT_DPA requires attention DP and Flash split with "
+                "native Mooncake PD"
+            )
+        if envs.SGLANG_SCHEDULER_SKIP_ALL_GATHER.get():
+            raise RuntimeError("Flash split DPA needs the native scheduler gather")
+        if (
+            disagg.disaggregation_mode == "decode"
+            and dsv4_split_prefill.dspark_requested()
+            and not envs.SGLANG_ENABLE_DP_SPEC_PREFILL_COORDINATION.get()
+        ):
+            raise RuntimeError(
+                "Flash split DPA with DSpark requires "
+                "SGLANG_ENABLE_DP_SPEC_PREFILL_COORDINATION=1 on D"
+            )
     if get_exec().overlap.enable_two_batch_overlap:
         raise RuntimeError("remote_attn does not support two-batch overlap")
     if not schedule.disable_overlap_schedule and (

@@ -352,7 +352,9 @@ class DSV41Controller(Controller):
 
         s = self.scheduler
         self.dsv4_split_dspark = dspark_requested()
-        self.dsv41_remote = self.config.mode == "remote" and not self.dsv4_split_dspark
+        self.dsv41_remote = self.config.mode == "remote" and not (
+            self.dsv4_split_dspark or self.split_dpa
+        )
         if not hasattr(self, "remote_targets"):
             self.remote_targets = {}
         if self.config.mode not in ("layerwise", "remote"):
@@ -424,9 +426,9 @@ class DSV41Controller(Controller):
             manager
         )  # TP ownership ABI, without pointers
         self.dsv4_split_schema = schema_id(self, manager, runner)
-        if self.dsv4_split_dspark and self.dsv4_split_schema is None:
+        if (self.dsv4_split_dspark or self.split_dpa) and self.dsv4_split_schema is None:
             raise ValueError(
-                "Flash DSpark requires the native paged split-prefill layout"
+                "Flash DSpark/DPA requires the native paged split-prefill layout"
             )
         if self.dsv41_remote:
             dsv41_remote.validate(self, runner, role)
@@ -449,7 +451,7 @@ class DSV41Controller(Controller):
             layers = runner.model.model.layers
             if len(layers) != self.layers:
                 raise ValueError("DSV4.1 layerwise requires a complete PP=1 model")
-            if not (self.dsv41_remote or self.dsv4_split_dspark):
+            if not (self.dsv41_remote or self.dsv4_split_dspark or self.split_dpa):
                 for index, layer in enumerate(layers):
                     self._layer_handles.append(
                         layer.register_forward_hook(

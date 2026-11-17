@@ -247,7 +247,7 @@ def configure(controller):
             controller.pd_visibility = Visibility(
                 scheduler.req_to_token_pool.req_to_token.device
             )
-    if controller.rank == 0:
+    if split_tp_rank(controller) == 0:
         logger.info(
             "[handoff-split-config] role=%s enabled=%s max_prefill_tokens=%s "
             "chunk_size=%s cut_ratio=%s cut_basis=%s suffix_tokens=%s suffix_cap=%s "
@@ -305,8 +305,12 @@ def request_blocker(req):
     return None
 
 
+def split_tp_rank(controller):
+    return getattr(controller, "attn_tp_rank", controller.rank)
+
+
 def log_decision(controller, req, stage, reason, **details):
-    if controller.rank == 0:
+    if split_tp_rank(controller) == 0:
         logger.info(
             "[handoff-split-decision] stage=%s reason=%s rid=%s room=%s prompt=%s %s",
             stage,
@@ -352,12 +356,12 @@ def negotiate_decode_offer(controller, req, reason, *, min_cut=0):
     budget = controller.split_prefill_decode_budget
     if budget is None:
         suffix_cap = controller.split_prefill_auto_cap
-        if suffix_cap and controller.rank != 0:
+        if suffix_cap and split_tp_rank(controller) != 0:
             suffix_cap = TP_MIN_IDENTITY
         allowed, suffix_cap = controller.agree([int(reason is None), suffix_cap])
         schedule = None
     else:
-        if controller.rank == 0:
+        if split_tp_rank(controller) == 0:
             parameters = budget.offer(chunk, controller.split_prefill_budget)
         else:
             # Publish rank 0's estimates through MIN while keeping this rank's
@@ -502,10 +506,11 @@ def offered_limits(req, controller):
         if not dsv4_split_prefill.compatible_offer(controller, peer, length, cut):
             return None, "incompatible_destination_split_layout"
     registration = manager.decode_kv_args_table.get(peer.mooncake_session_id)
+    attn_tp_size = getattr(controller, "attn_tp_size", controller.tp_size)
     if (
         registration is None
         or registration.requires_dcp_relayout
-        or registration.dst_attn_tp_size != controller.tp_size
+        or registration.dst_attn_tp_size != attn_tp_size
     ):
         return None, "incompatible_destination_registration"
     # The legacy decode-priority marker still describes D's configured defer
@@ -524,7 +529,10 @@ def finalize_bootstrap(original, queue, req):
     min_cut, chunk_cap, suffix_cap, remote_rate = limits or (0, 0, 0, 0)
     vote = [min_cut, -min_cut, chunk_cap, -chunk_cap, suffix_cap, -suffix_cap]
     if controller.split_prefill_adaptive:
-        vote.extend([remote_rate, int(controller.split_prefill_prefix_rate or 0)])
+        prefix_rate = int(controller.split_prefill_prefix_rate or 0)
+        if getattr(controller, "split_dpa", False) and split_tp_rank(controller) != 0:
+            prefix_rate = TP_MIN_IDENTITY
+        vote.extend([remote_rate, prefix_rate])
     cut, negative_cut, chunk, negative_chunk, suffix, negative_suffix, *rates = (
         controller.agree(vote)
     )
@@ -717,6 +725,8 @@ def commit(queue, dr, *, keep_receiver):
 
             trim_swa(controller, req, 0)
         release_reservation(req)
+        if getattr(controller, "split_dpa", False):
+            log_decision(controller, req, "decode_commit", "native_pd")
         return False
     room = int(queue.metadata_buffers.bootstrap_room[idx, 0].item())
     valid = (
@@ -776,7 +786,24 @@ def time_dspark_forward(original, worker, batch, *args, **kwargs):
         return original(worker, batch, *args, **kwargs)
     # Time the outer worker so suffix samples include draft KV injection and
     # decode samples cover draft proposal and target verification.
-    return _time_split_forward(controller, original, worker, batch, *args, **kwargs)
+    result = _time_split_forward(controller, original, worker, batch, *args, **kwargs)
+    if (
+        getattr(controller, "split_dpa", False)
+        and getattr(batch, "_hybrid_split_extend", False)
+        and split_tp_rank(controller) == 0
+    ):
+        counts, _, prefills = batch.dp_spec_prefill_coordination_metadata
+        modes = ",".join(
+            "idle" if not count else "extend" if prefill else "verify"
+            for count, prefill in zip(counts, prefills.tolist())
+        )
+        logger.info(
+            "[handoff-split-dpa] rid=%s modes=%s coordinated=%s",
+            batch.reqs[0].rid,
+            modes,
+            batch.dp_spec_prefill_coordination_applied,
+        )
+    return result
 
 
 def _time_split_forward(controller, original, worker, batch, *args, **kwargs):
@@ -794,7 +821,10 @@ def _time_split_forward(controller, original, worker, batch, *args, **kwargs):
             phase = "prefix"
         elif budget is not None and budget.target and batch.forward_mode.is_decode():
             phase = "decode"
-    if phase is None or (phase != "prefix" and controller.rank != 0):
+    if phase is None or (
+        split_tp_rank(controller) != 0
+        and (phase != "prefix" or getattr(controller, "split_dpa", False))
+    ):
         return original(worker, batch, *args, **kwargs)
 
     import torch
@@ -834,7 +864,10 @@ def record_completed_suffix(controller, result):
             )
         else:
             controller.split_prefill_decode_budget.observe(
-                tokens, elapsed_ms, suffix=phase == "suffix", rank=controller.rank
+                tokens,
+                elapsed_ms,
+                suffix=phase == "suffix",
+                rank=split_tp_rank(controller),
             )
         return
     previous = controller.split_prefill_suffix_rate
@@ -844,7 +877,10 @@ def record_completed_suffix(controller, result):
     budget = controller.split_prefill_suffix_budget_s
     controller.split_prefill_auto_cap = quantize_suffix_cap(budget * rate)
     controller.split_prefill_rate_samples += 1
-    if controller.rank == 0 and controller.split_prefill_rate_samples % 50 == 0:
+    if (
+        split_tp_rank(controller) == 0
+        and controller.split_prefill_rate_samples % 50 == 0
+    ):
         logger.info(
             "[handoff-split-auto] samples=%s rate=%.0f tok/s budget=%.2fs local_cap=%s",
             controller.split_prefill_rate_samples,
@@ -931,7 +967,7 @@ def next_batch(original, scheduler, running_batch):
     if running_bs and ticks < defer_budget and not stalled:
         # All TP ranks schedule the same requests. Count decisions and use
         # rank-local time only for logging.
-        if controller.rank == 0 and ticks == 0:
+        if split_tp_rank(controller) == 0 and ticks == 0:
             req._hybrid_split_ready_at = time.monotonic()
             logger.info(
                 "[handoff-split-defer] rid=%s running_bs=%s budget=%s",
@@ -974,6 +1010,13 @@ def next_batch(original, scheduler, running_batch):
     first_chunk = req.extend_batch_idx == 0
     batch.prepare_for_extend(reuse_preallocated_kv=True)
     batch._hybrid_split_extend = True
+    if getattr(controller, "split_dpa", False):
+        # Native decode and idle reach this same gather via original(). A
+        # suffix must enter it once as EXTEND, before any worker runs.
+        batch = scheduler.dp_attn_adapter.maybe_prepare_mlp_sync_batch(batch)
+        if not controller.dsv4_split_dspark:
+            # The PD decode scheduler does not convert decode to graph extend.
+            batch.can_run_dp_prefill_cuda_graph = False
     set_schedule_time_batch(batch)
     if first_chunk:
         logger.info(
@@ -982,7 +1025,7 @@ def next_batch(original, scheduler, running_batch):
             req.prefix_len,
             prompt_len - req.prefix_len,
         )
-    if controller.rank == 0:
+    if split_tp_rank(controller) == 0:
         logger.info(
             "[handoff-split-chunk] hybrid PD rid=%s prefix=%s suffix_chunk=%s end=%s "
             "remaining=%s running_bs=%s defer_ticks=%s waited_ms=%.0f",

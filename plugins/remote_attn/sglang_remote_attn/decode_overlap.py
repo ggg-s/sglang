@@ -140,6 +140,13 @@ def install(controller, *, force=False):
 
 
 def process_last_batch_early(original, scheduler, last_batch):
+    controller = getattr(scheduler, "_pre_layerwise", None)
+    if getattr(controller, "split_dpa", False):
+        # A peer may have run the suffix. Consume the result before the next
+        # scheduler gather on every group that participated in the step.
+        return (
+            last_batch is not None and last_batch.is_extend_in_batch
+        ) or original(scheduler, last_batch)
     if (
         getattr(last_batch, "_hybrid_split_extend", False)
         and last_batch.forward_mode.is_extend()
@@ -147,7 +154,6 @@ def process_last_batch_early(original, scheduler, last_batch):
     ):
         return True
     native = original(scheduler, last_batch)
-    controller = getattr(scheduler, "_pre_layerwise", None)
     overlap = getattr(controller, "decode_overlap", None)
     if overlap is None:
         return native

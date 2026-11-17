@@ -12,6 +12,13 @@ WIRE = b"REMOTE_ATTN_DSV4_SPLIT_V1:"
 logger = logging.getLogger(__name__)
 
 
+def dpa_requested():
+    value = os.environ.get("HANDOFF_SPLIT_DPA", "0")
+    if value not in ("0", "1"):
+        raise ValueError("HANDOFF_SPLIT_DPA must be 0 or 1")
+    return value == "1"
+
+
 def dspark_requested():
     from sglang.srt.runtime_context import get_disagg, get_spec
 
