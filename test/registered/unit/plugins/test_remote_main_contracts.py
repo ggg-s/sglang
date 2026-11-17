@@ -457,6 +457,7 @@ class TestGatewayControlPaths(CustomTestCase):
         import tempfile
         import threading
         import time
+        from collections import deque
 
         with tempfile.TemporaryDirectory() as folder:
             root = Path(folder)
@@ -510,7 +511,7 @@ class TestGatewayControlPaths(CustomTestCase):
                 )
                 dsv = self.functions(
                     "plugins/remote_attn/control_plane/p4_dsv_gateway.py",
-                    {"_call", "rows"},
+                    {"_call", "_log_trace", "_observe", "rows"},
                     ns,
                     "DsvGateway",
                 )
@@ -519,11 +520,20 @@ class TestGatewayControlPaths(CustomTestCase):
                     rows=dsv.rows,
                     lock=threading.RLock(),
                     command_waiters=dict(src=0, dst=0),
+                    dst_slot_holder=None,
+                    dst_slot_history=deque(maxlen=256),
+                    precopy_active={},
                     control_latencies={},
+                    control_breakdown={},
+                    _observe=dsv._observe,
+                    out=None,
                     role_locks={r: threading.Lock() for r in ("src", "dst")},
                     facts={
                         r: [dict(instance_id=r + "-instance")] for r in ("src", "dst")
                     },
+                )
+                coordinator._log_trace = lambda trace: dsv._log_trace(
+                    coordinator, trace
                 )
                 with self.assertRaises(TimeoutError):
                     dsv._call(coordinator, "dst", "d2d_abort", "migration-1")
