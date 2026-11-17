@@ -90,6 +90,39 @@ C128 online 与 offline，各策略 22 次传输，四组均通过。
 以及原生 PD 回退。4060 探针使用合成的 draft SWA 和请求状态张量，整模 DSpark
 输出一致性、多 TP GPU 和性能仍待验证。
 
+### DPA 与 SMG 的前缀路由（实验）
+
+P、D 两端启用 `HANDOFF_SPLIT_DPA=1`。双端 DSpark 的 CUDA 部署每组
+attention TP 为 1，例如两端各用 `--tp 4 --attn-dp-size 4 --enable-dp-lm-head`。
+D 设置 `SGLANG_ENABLE_DP_SPEC_PREFILL_COORDINATION=1`。沿用上面的原生 Mooncake
+和 FlashMLA 布局。P 开 radix cache，D 保持 `--disable-radix-cache`。
+
+采用能从 `/server_info` 读取 `attn_dp_size` 的 SMG。一个 P 和一个 D 各开
+DPA4 时，`/workers` 应各显示 4 个 worker。SMG 按 P 的 DP 组匹配前缀，
+独立选 D，并把选中的 P 组号传给 D。P 默认按 `bootstrap_room` 分组选路，
+SMG 发的随机 room 可能与选中的 P 组不一致。启动 P、D 前需设置
+`SGLANG_DISAGGREGATION_FORCE_QUERY_PREFILL_DP_RANK=1`，允许 P 注册实际组号；
+D 收到 SMG 显式传来的组号时直接使用。
+
+```bash
+python -m sglang_router.launch_router --pd-disaggregation --dp-aware \
+  --prefill http://127.0.0.1:31116 31997 --decode http://127.0.0.1:31117 \
+  --prefill-policy cache_aware --decode-policy power_of_two --port 31100
+```
+
+同机多卡冒烟会自行启动 P、D 和 SMG。两条不同尾部的共享前缀请求由 SMG
+选组。第二条需要报告实际 KV 命中，两条都需要在 D 日志中确认 split 且返回
+`spec_verify_ct > 0`。
+
+```bash
+SMG=1 MODEL=/path/to/DeepSeek-V4-Flash \
+  P_GPUS=0,1,2,3 D_GPUS=4,5,6,7 \
+  bash test/manual/remote_attn/flash_split_dpa_smoke.sh
+```
+
+冒烟沿用 32K context 和固定 4,096-token 后缀。长上下文压测应按最长输入、
+输出预算和每个 DP 组的实际 KV 容量配置。
+
 ### 原有 Flash CUDA 探针
 
 2026-11-15 在 Ubuntu RTX 4060 Laptop 上运行 CUDA 探针，输入 9,215 token，

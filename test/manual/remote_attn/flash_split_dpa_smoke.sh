@@ -11,6 +11,8 @@ D_GPUS=${D_GPUS:-4,5,6,7}
 P_PORT=${P_PORT:-31116}
 D_PORT=${D_PORT:-31117}
 BOOTSTRAP_PORT=${BOOTSTRAP_PORT:-31997}
+SMG=${SMG:-0}
+SMG_PORT=${SMG_PORT:-31100}
 RUN_DIR=$(mktemp -d "${TMPDIR:-/tmp}/flash-split-dpa.XXXXXX")
 echo "Logs: $RUN_DIR"
 
@@ -33,7 +35,7 @@ common=(
   --speculative-algorithm DSPARK --dsv4-attn-backend flashmla --page-size 256
   --disaggregation-transfer-backend mooncake
   --disaggregation-bootstrap-port "$BOOTSTRAP_PORT"
-  --host 127.0.0.1 --context-length 32768 --disable-radix-cache
+  --host 127.0.0.1 --context-length 32768
   --chunked-prefill-size 4096 --max-running-requests 32
   --cuda-graph-backend-prefill disabled --skip-server-warmup
 )
@@ -41,12 +43,21 @@ if [[ -n ${DRAFT:-} ]]; then
   common+=(--speculative-draft-model-path "$DRAFT")
 fi
 
+prefill_args=(--disaggregation-mode prefill --port "$P_PORT")
+if [[ "$SMG" == 1 ]]; then
+  # SMG selects a P group independently of the random bootstrap room.
+  export SGLANG_DISAGGREGATION_FORCE_QUERY_PREFILL_DP_RANK=1
+else
+  prefill_args+=(--disable-radix-cache)
+fi
+
 "$PYTHON" -m sglang_remote_attn.check
 CUDA_VISIBLE_DEVICES="$P_GPUS" "$PYTHON" -m sglang.launch_server "${common[@]}" \
-  --disaggregation-mode prefill --port "$P_PORT" >"$RUN_DIR/p.log" 2>&1 &
+  "${prefill_args[@]}" >"$RUN_DIR/p.log" 2>&1 &
 p_pid=$!
 CUDA_VISIBLE_DEVICES="$D_GPUS" "$PYTHON" -m sglang.launch_server "${common[@]}" \
-  --disaggregation-mode decode --port "$D_PORT" >"$RUN_DIR/d.log" 2>&1 &
+  --disaggregation-mode decode --port "$D_PORT" --disable-radix-cache \
+  >"$RUN_DIR/d.log" 2>&1 &
 d_pid=$!
 cleanup() {
   kill "$p_pid" "$d_pid" 2>/dev/null || true
@@ -56,11 +67,13 @@ trap cleanup EXIT
 trap 'exit 130' INT
 trap 'exit 143' TERM
 
-"$PYTHON" - "$TP" "$P_PORT" "$D_PORT" "$BOOTSTRAP_PORT" "$RUN_DIR" "$p_pid" "$d_pid" <<'PY'
+"$PYTHON" - "$TP" "$P_PORT" "$D_PORT" "$BOOTSTRAP_PORT" "$RUN_DIR" \
+  "$p_pid" "$d_pid" "$SMG" "$SMG_PORT" <<'PY'
 import concurrent.futures
 import json
 import os
 import re
+import subprocess
 import sys
 import threading
 import time
@@ -70,7 +83,8 @@ import requests
 
 groups, prefill_port, decode_port, bootstrap_port = map(int, sys.argv[1:5])
 log_dir = Path(sys.argv[5])
-pids = list(map(int, sys.argv[6:]))
+pids = list(map(int, sys.argv[6:8]))
+smg, smg_port = map(int, sys.argv[8:10])
 prefill, decode = (f"http://127.0.0.1:{port}" for port in (prefill_port, decode_port))
 deadline = time.monotonic() + 1200
 for url in (prefill, decode):
@@ -85,6 +99,85 @@ for url in (prefill, decode):
         time.sleep(2)
     else:
         raise TimeoutError(f"Server did not start: {url}")
+
+def smoke_smg():
+    router_url = f"http://127.0.0.1:{smg_port}"
+    with (log_dir / "smg.log").open("w") as log:
+        router = subprocess.Popen(
+            [
+                sys.executable, "-m", "sglang_router.launch_router",
+                "--host", "127.0.0.1", "--port", str(smg_port),
+                "--pd-disaggregation", "--dp-aware",
+                "--prefill", prefill, str(bootstrap_port), "--decode", decode,
+                "--prefill-policy", "cache_aware", "--decode-policy", "power_of_two",
+            ],
+            stdout=log, stderr=subprocess.STDOUT,
+        )
+        try:
+            deadline = time.monotonic() + 120
+            counts = None
+            while time.monotonic() < deadline:
+                if router.poll() is not None:
+                    raise RuntimeError(f"SMG exited. See {log.name}")
+                try:
+                    response = requests.get(f"{router_url}/workers", timeout=2)
+                    if response.ok:
+                        listing = response.json()
+                        stats = listing["stats"]
+                        counts = stats["prefill_count"], stats["decode_count"]
+                        if counts == (groups, groups) and all(
+                            worker["is_healthy"] for worker in listing["workers"]
+                        ):
+                            break
+                except requests.RequestException:
+                    pass
+                time.sleep(1)
+            else:
+                raise RuntimeError(
+                    f"Expected {groups} healthy groups per role, got counts={counts}. "
+                    f"Check SMG attention-DP discovery in {log.name}"
+                )
+            print(f"SMG registered P={counts[0]} and D={counts[1]} groups", flush=True)
+
+            # The HTTP cache_aware policy matches the request text. Leave ranks
+            # and bootstrap fields unset so SMG selects both groups itself.
+            prefix = " cache" * 8192
+            cached = []
+            for tail in (" cold", " warm"):
+                response = requests.post(
+                    f"{router_url}/generate",
+                    json={
+                        "text": prefix + tail * 6144,
+                        "sampling_params": {
+                            "temperature": 0, "max_new_tokens": 64, "ignore_eos": True
+                        },
+                    },
+                    timeout=300,
+                )
+                response.raise_for_status()
+                meta = response.json()["meta_info"]
+                assert meta["completion_tokens"] == 64, meta
+                assert meta.get("spec_verify_ct", 0) > 0, meta
+                rid = meta["id"]
+                decode_log = (log_dir / "d.log").read_text()
+                assert f"[handoff-split] hybrid PD rid={rid} " in decode_log, meta
+                cached.append(meta["cached_tokens"])
+                print(f"{rid}: cached={cached[-1]}, verify={meta['spec_verify_ct']}", flush=True)
+            assert cached[0] == 0 and cached[1] >= 256, cached
+            print("PASS: SMG DP-aware routing, Flash split + DSpark, and warm P radix hit")
+        finally:
+            if router.poll() is None:
+                router.terminate()
+                try:
+                    router.wait(timeout=10)
+                except subprocess.TimeoutExpired:
+                    router.kill()
+                    router.wait()
+
+
+if smg:
+    smoke_smg()
+    sys.exit(0)
 
 ready = threading.Event()
 stop = threading.Event()
