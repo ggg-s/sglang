@@ -55,7 +55,8 @@ fi
 CUDA_VISIBLE_DEVICES="$P_GPUS" "$PYTHON" -m sglang.launch_server "${common[@]}" \
   "${prefill_args[@]}" >"$RUN_DIR/p.log" 2>&1 &
 p_pid=$!
-CUDA_VISIBLE_DEVICES="$D_GPUS" "$PYTHON" -m sglang.launch_server "${common[@]}" \
+SGLANG_LOG_DECODE_GRAPH_KEY=1 CUDA_VISIBLE_DEVICES="$D_GPUS" \
+  "$PYTHON" -m sglang.launch_server "${common[@]}" \
   --disaggregation-mode decode --port "$D_PORT" --disable-radix-cache \
   >"$RUN_DIR/d.log" 2>&1 &
 d_pid=$!
@@ -232,8 +233,16 @@ def has_step(rid, peer_mode, coordinated):
 
 
 # No peer request during the first suffix.
+d_log = log_dir / "d.log"
+before = len(d_log.read_text())
 send_pair("flash-smoke-idle", 10, 0, 16384, 64)
 assert has_step("flash-smoke-idle", "idle", False), "Expected suffix + idle"
+isolated_log = d_log.read_text()[before:]
+for worker in ("draft", "target"):
+    assert re.search(
+        rf"Decode graph replay: worker={worker} .*mode=TARGET_VERIFY raw_bs=[1-9]",
+        isolated_log,
+    ), f"Expected active {worker} CUDA graph replay after the split"
 
 # Wait until group 1 is generating tokens before asking group 0 to split.
 with concurrent.futures.ThreadPoolExecutor(max_workers=1) as executor:
@@ -254,5 +263,5 @@ assert "stage=decode_commit reason=native_pd rid=flash-smoke-fallback" in logs, 
     "Expected native PD commit after declining a split offer"
 )
 assert "[handoff-split] hybrid PD rid=flash-smoke-fallback " not in logs
-print("PASS: suffix + idle, suffix + DSpark verify, native PD + DSpark fallback")
+print("PASS: split with draft/verify graph replay, suffix + DSpark verify, native PD fallback")
 PY

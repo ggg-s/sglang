@@ -60,77 +60,46 @@ class TestRemoteMainContracts(CustomTestCase):
                     )
                 self.assertFalse(get_forward().force_eager_prefill)
 
-    def test_dspark_split_decode_veto_covers_draft_verify_and_dp_peers(self):
-        """A split decode step must keep all its participating ranks off graphs."""
+    def test_split_dpa_uses_native_graph_admission_without_global_tp_vote(self):
+        """A draft graph probe on one DP group must not wait for idle groups."""
         from sglang.srt.model_executor.forward_mode import ForwardMode
         from sglang.srt.runtime_context import get_parallel
-        from sglang_remote_attn import qwen_split_prefill
+        from sglang_remote_attn import tp
 
-        d = NS(
-            scheduler=NS(disaggregation_mode=NS(value="decode")),
-            dsv4_split_dspark=True,
-            graph_fast_path=True,
-            targets={},
+        draft = NS(model_runner=NS())
+        target = NS(
+            model_runner=NS(_pre_layerwise=NS(graph_fast_path=False, split_dpa=True))
         )
-        model_runner = NS(_pre_layerwise=d)
-        worker = NS(target_worker=NS(model_runner=model_runner))
-        draft, target = NS(model_runner=model_runner), NS(model_runner=model_runner)
-        split_req, native_req = NS(_dspark_split_handoff=True), NS()
-        split_batch = NS(
-            reqs=[native_req, split_req],
-            forward_mode=ForwardMode.DECODE,
-            can_run_decode_cuda_graph=True,
+        verify = NS(
+            forward_mode=ForwardMode.TARGET_VERIFY, can_run_decode_cuda_graph=True
         )
+        idle = NS(forward_mode=ForwardMode.IDLE, can_run_decode_cuda_graph=True)
+        native = Mock(return_value=True)
+        with (
+            patch.dict(os.environ, {"HANDOFF_SPLIT_DPA": "1"}),
+            get_parallel().override(tp_size=4, tp_rank=0, tp_group=NS(cpu_group=None)),
+            patch.object(
+                hooks, "_runtime", return_value=NS(has_remote_work=lambda: False)
+            ),
+            patch.object(
+                tp, "agree_graph", side_effect=AssertionError("global TP vote")
+            ),
+        ):
+            self.assertTrue(hooks._decode_graph(native, draft, verify))
+            self.assertTrue(hooks._decode_graph(native, target, verify))
+            self.assertTrue(hooks._decode_graph(native, target, idle))
+            self.assertTrue(hooks._prefill_graph(native, target, verify))
 
-        def forward(_worker, batch):
-            verify = NS(forward_mode=ForwardMode.TARGET_VERIFY)
-            peer = NS(forward_mode=batch.forward_mode)
-            return (
-                hooks._decode_graph(lambda *_: True, draft, verify),
-                hooks._decode_graph(lambda *_: True, target, peer),
-                hooks._prefill_graph(lambda *_: True, target, verify),
-            )
+            verify.can_run_decode_cuda_graph = False
+            self.assertFalse(hooks._decode_graph(native, draft, verify))
+            self.assertFalse(hooks._decode_graph(native, target, verify))
+            self.assertEqual(native.call_count, 4)
 
-        with get_parallel().override(tp_size=4, tp_rank=0):
-            # A plain TP deployment can detect the split request on every rank.
+            verify.can_run_decode_cuda_graph = True
+            native.return_value = False
+            self.assertFalse(hooks._decode_graph(native, target, verify))
             self.assertEqual(
-                qwen_split_prefill.time_dspark_forward(forward, worker, split_batch),
-                (False, False, False),
-            )
-            native_batch = NS(
-                reqs=[native_req],
-                forward_mode=ForwardMode.DECODE,
-                can_run_decode_cuda_graph=True,
-            )
-            idle_batch = NS(
-                reqs=[], forward_mode=ForwardMode.IDLE, can_run_decode_cuda_graph=True
-            )
-            batches = (split_batch, native_batch, idle_batch)
-            dp_vote = hooks.HOOKS[
-                "sglang.srt.managers.scheduler_components.dp_attn._local_decode_cuda_graph_vote"
-            ]
-            votes = [
-                dp_vote(
-                    lambda *, local_batch, disable_cuda_graph: not disable_cuda_graph,
-                    local_batch=batch,
-                    disable_cuda_graph=False,
-                )
-                for batch in batches
-            ]
-            self.assertEqual(votes, [False, True, True])
-            d.split_dpa = True
-            for batch in batches:
-                batch.can_run_decode_cuda_graph = all(votes)
-                self.assertEqual(
-                    qwen_split_prefill.time_dspark_forward(forward, worker, batch),
-                    (False, False, False),
-                )
-
-            # Native requests can use graphs again on the next eligible step.
-            native_batch.can_run_decode_cuda_graph = True
-            self.assertEqual(
-                qwen_split_prefill.time_dspark_forward(forward, worker, native_batch),
-                (True, True, True),
+                verify._remote_attn_graph_fallback, "native_graph_ineligible"
             )
 
     def test_every_native_decode_backend_access_is_implemented(self):
@@ -1658,7 +1627,6 @@ class TestSplitPD(CustomTestCase):
             (req.kv.kv_committed_len, req.kv.kv_allocated_len), (cut, length)
         )
         self.assertTrue(req.kv.reserved_prefill_suffix)
-        self.assertEqual(getattr(req, "_dspark_split_handoff", False), dspark)
         if adaptive:
             self.assertEqual(req._hybrid_split_schedule, (chunk, 150, 10, 4500, 20_000))
         self.assertEqual(req.output_ids, [])
@@ -1673,7 +1641,6 @@ class TestSplitPD(CustomTestCase):
         dr.kv_receiver = receiver
         self.split.clear_metadata(lambda *_: None, queue.metadata_buffers, 0)
         self.assertFalse(self.split.commit(queue, dr, keep_receiver=False))
-        self.assertFalse(getattr(req, "_dspark_split_handoff", False))
         self.assertEqual(req.kv.get_evicted_seqlen(component_type.SWA), 7936)
         self.assertEqual(d.split_prefill_outstanding, 0)
 
@@ -2389,7 +2356,6 @@ class TestSplitPD(CustomTestCase):
         self.assertEqual(rate_only_follower.split_prefill_rate_samples, 0)
 
     def test_flash_dspark_times_the_outer_worker_once(self):
-        from sglang.srt.model_executor.forward_mode import ForwardMode
         from sglang_remote_attn import decode_overlap
 
         with patch.dict(os.environ, {"HANDOFF_SPLIT_ADAPTIVE": "1"}):
@@ -2398,7 +2364,7 @@ class TestSplitPD(CustomTestCase):
         target = NS(model_runner=NS(_pre_layerwise=d))
         worker = NS(target_worker=target)
         batch = NS(
-            forward_mode=ForwardMode.EXTEND,
+            forward_mode=NS(is_extend=lambda: True),
             _hybrid_split_extend=True,
             extend_num_tokens=4096,
         )

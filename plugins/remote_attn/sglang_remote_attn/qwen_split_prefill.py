@@ -4,7 +4,6 @@ import logging
 import math
 import os
 import time
-from contextlib import nullcontext
 from http import HTTPStatus
 from typing import NamedTuple
 
@@ -722,8 +721,6 @@ def commit(queue, dr, *, keep_receiver):
             from .dsv4_split_prefill import trim_swa
 
             trim_swa(controller, req, 0)
-            if getattr(controller, "dsv4_split_dspark", False):
-                req._dspark_split_handoff = False
         release_reservation(req)
         if getattr(controller, "split_dpa", False):
             log_decision(controller, req, "decode_commit", "native_pd")
@@ -758,10 +755,6 @@ def commit(queue, dr, *, keep_receiver):
         from .dsv4_split_prefill import trim_swa
 
         trim_swa(controller, req, cut)
-        if getattr(controller, "dsv4_split_dspark", False):
-            # The suffix marker is cleared on promotion to the running
-            # batch. Keep the provenance on the request across decode steps.
-            req._dspark_split_handoff = True
     req.kv.truncate_committed(cut)
     req.kv.reserved_prefill_suffix = True
     req.kv.mamba_needs_clear = False
@@ -784,45 +777,13 @@ def time_suffix_forward(original, worker, batch, *args, **kwargs):
     return _time_split_forward(controller, original, worker, batch, *args, **kwargs)
 
 
-def _has_dspark_split_decode(batch):
-    return (
-        batch is not None
-        and batch.forward_mode.is_decode()
-        and any(getattr(req, "_dspark_split_handoff", False) for req in batch.reqs)
-    )
-
-
-def dspark_decode_graph_vote(original, *, local_batch, disable_cuda_graph):
-    # The scheduler MIN vote also reaches DP peers with native or idle batches.
-    return original(
-        local_batch=local_batch,
-        disable_cuda_graph=disable_cuda_graph or _has_dspark_split_decode(local_batch),
-    )
-
-
 def time_dspark_forward(original, worker, batch, *args, **kwargs):
     controller = getattr(worker.target_worker.model_runner, "_pre_layerwise", None)
     if not getattr(controller, "dsv4_split_dspark", False):
         return original(worker, batch, *args, **kwargs)
-    graph_scope = nullcontext()
-    if (
-        batch is not None
-        and controller.scheduler.disaggregation_mode.value == "decode"
-        and (
-            not batch.can_run_decode_cuda_graph
-            if getattr(controller, "split_dpa", False)
-            else _has_dspark_split_decode(batch)
-        )
-    ):
-        from sglang.srt.runtime_context import get_forward
-
-        graph_scope = get_forward().scoped(force_eager_decode=True)
-    # The draft and target build separate ForwardBatches in the same step.
-    # Keep the graph decision and timing scoped around both forwards.
-    with graph_scope:
-        result = _time_split_forward(
-            controller, original, worker, batch, *args, **kwargs
-        )
+    # Time the outer worker so suffix samples include draft KV injection and
+    # decode samples cover draft proposal and target verification.
+    result = _time_split_forward(controller, original, worker, batch, *args, **kwargs)
     if (
         getattr(controller, "split_dpa", False)
         and getattr(batch, "_hybrid_split_extend", False)

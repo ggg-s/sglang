@@ -439,33 +439,13 @@ def _stream_output(original, streamer, reqs, *args, **kwargs):
 
 
 def _decode_graph(original, runner, forward_batch):
-    from sglang.srt.runtime_context import get_forward, get_parallel
-
-    if get_forward().force_eager_decode:
-        reason = "dspark_decode_veto"
-        forward_batch._remote_attn_graph_fallback = reason
-        # This choice is agreed before forwarding. Do not enter a TP vote
-        # here: active and idle DSpark ranks can query replay differently.
-        verdict = (False, None)
-        if getattr(runner, "_remote_attn_graph_verdict", None) != verdict:
-            runner._remote_attn_graph_verdict = verdict
-            logger.info(
-                "[remote-attn-graph] kind=decode rank=%s tp=%s path=eager reason=%s",
-                get_parallel().tp_rank,
-                get_parallel().tp_size,
-                reason,
-            )
-        return False
     return _graph_decision(original, runner, forward_batch, "decode")
 
 
 def _prefill_graph(original, runner, forward_batch):
     from sglang.srt.runtime_context import get_forward
 
-    forward = get_forward()
-    if forward.force_eager_decode and forward_batch.forward_mode.is_target_verify():
-        return False
-    if forward.force_eager_prefill:
+    if get_forward().force_eager_prefill:
         forward_batch._remote_attn_graph_fallback = "hybrid_split_prefill"
         return False
     return _graph_decision(original, runner, forward_batch, "prefill")
@@ -507,7 +487,18 @@ def _graph_decision(original, runner, forward_batch, kind):
             forward_batch._remote_attn_graph_fallback = "compatibility_window"
         return False  # Compatibility windows have no TP progressive graph lease.
     reason = None
-    if controller is not None and controller.graph_fast_path:
+    if dsv4_split_prefill.dpa_requested():
+        # Flash split DPA uses native Mooncake KV only. Draft runners may
+        # have no controller and may override the current TP topology.
+        # The scheduler has already synchronized graph eligibility across
+        # DP ranks, which need not all reach this per-runner probe.
+        all_local = True
+        can_replay = (
+            kind != "decode" or forward_batch.can_run_decode_cuda_graph
+        ) and bool(original(runner, forward_batch))
+        if not can_replay:
+            reason = "native_graph_ineligible"
+    elif controller is not None and controller.graph_fast_path:
         # early_targets admits/removes leases only after TP agreement. Keep
         # even a locally complete lease eager until its slowest peer retires.
         # The empty set is a shared Local certificate, not a rank-local guess.
@@ -724,7 +715,6 @@ HOOKS.update(
         "sglang.srt.disaggregation.common.staging_handler.init_staging_allocator": pre_layerwise.init_staging_allocator,
         "sglang.srt.disaggregation.common.staging_handler.init_staging_buffers": pre_layerwise.init_staging_buffers,
         "sglang.srt.managers.scheduler.Scheduler.run_batch": pre_layerwise.run_batch,
-        "sglang.srt.managers.scheduler_components.dp_attn._local_decode_cuda_graph_vote": qwen_split_prefill.dspark_decode_graph_vote,
         "sglang.srt.managers.tp_worker.TpModelWorker.forward_batch_generation": qwen_split_prefill.time_suffix_forward,
         "sglang.srt.speculative.dspark_components.dspark_worker_v2.DSparkWorkerV2.forward_batch_generation": qwen_split_prefill.time_dspark_forward,
         "sglang.srt.managers.scheduler.Scheduler.get_new_batch_prefill": qwen_hybrid_pd.snapshot_prefill_admission,

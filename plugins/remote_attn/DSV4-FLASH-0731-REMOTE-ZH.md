@@ -66,10 +66,10 @@ draft 布局。Mooncake 在 bootstrap 校验两端的 target/draft 布局。
 
 P 使用原生 DSpark prefill 写入 draft SWA。发生 split 时，target 和 draft
 的 SWA 都搬到切点窗口，draft 请求状态沿用原生传输。D 使用原生 DSpark prefill
-续算后缀，并用末块结果直接进入 DSpark decode。含 split 交接请求的 decode
-步在 draft 和 target verify 中使用 eager。DPA 通过原有调度投票同步这一决定，
-同一步的其他 decode 或 idle rank 一起回退。原生 PD 请求在单独调度且符合
-原有条件时仍可回放 CUDA graph。回退时 D 侧记录 `path=eager reason=dspark_decode_veto`。
+续算后缀，并用末块结果直接进入 DSpark decode。draft 和 target verify
+按原生 graph 准入条件回放。DPA 使用调度器已同步的准入结果，碰到不满足
+原生条件的 batch 时走 eager。在 D 设置 `SGLANG_LOG_DECODE_GRAPH_KEY=1`，
+可在日志中分别确认 `worker=draft` 和 `worker=target` 的实际回放。
 自适应计时覆盖整个 DSpark forward，包括 draft KV 写入或提议与验证。
 
 #### 双端 DSpark 状态交接复测（RTX 4060 Laptop）
