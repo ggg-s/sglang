@@ -10,6 +10,7 @@ from typing import NamedTuple
 from .split_decode_budget import (
     MIN_SUFFIX_TOKENS,
     RATE_LIMIT,
+    SUFFIX_CAP_GRANULARITY,
     DecodeBudget,
     ema,
     read_budget,
@@ -30,7 +31,6 @@ PREFIX_GROWTH_TOKENS = 1024
 COLLISION_BUDGET_TOKENS = 128 * 14 * 6800 // 1000
 HOT_DEFER_TICKS = 45
 DEFER_PATIENCE_TICKS = 15
-AUTO_SUFFIX_CAP_GRANULARITY = 512
 AUTO_SUFFIX_RATE_EMA = 0.7
 TP_MIN_IDENTITY = 2**31 - 1
 
@@ -49,7 +49,7 @@ def quantize_suffix_cap(tokens):
     tokens = int(min(tokens, TP_MIN_IDENTITY))
     return max(
         MIN_SUFFIX_TOKENS,
-        tokens // AUTO_SUFFIX_CAP_GRANULARITY * AUTO_SUFFIX_CAP_GRANULARITY,
+        tokens // SUFFIX_CAP_GRANULARITY * SUFFIX_CAP_GRANULARITY,
     )
 
 
@@ -200,19 +200,17 @@ def configure(controller):
             raise ValueError(f"{auto_env} must be 0 or 1")
         if controller.split_prefill_adaptive:
             g = read_budget("HANDOFF_SPLIT_DECODE_BUDGET_G", 1.0, allow_zero=True)
-            # Bound the feedback state by the longest admissible prompt.
-            # A shorter request only clamps its own quote.
+            # Keep the offered token cap within the scheduler's prompt limit.
             max_cap = min(scheduler.max_req_input_len // 2, TP_MIN_IDENTITY)
-            max_cap -= max_cap % AUTO_SUFFIX_CAP_GRANULARITY
+            max_cap -= max_cap % SUFFIX_CAP_GRANULARITY
             # A paged cut can need up to one extra partial page of suffix.
             # Round the floor up to preserve unaligned coverage probes.
             min_cap = min(
                 max_cap,
                 quantize_suffix_cap(
-                    MIN_SUFFIX_TOKENS + page - 1 + AUTO_SUFFIX_CAP_GRANULARITY - 1
+                    MIN_SUFFIX_TOKENS + page - 1 + SUFFIX_CAP_GRANULARITY - 1
                 ),
             )
-            initial_cap = quantize_suffix_cap(controller.split_prefill_chunk_size)
             controller.split_prefill_decode_budget = DecodeBudget(
                 target=g / (1 + g),
                 stall_ms=read_budget("HANDOFF_SPLIT_STALL_MS", 600),
@@ -220,7 +218,6 @@ def configure(controller):
                     "HANDOFF_SPLIT_DEFER_PATIENCE_MS", 200, allow_zero=True
                 ),
                 pinned_chunk=bool(chunk_size),
-                cap=min(max_cap, max(min_cap, initial_cap)),
                 max_cap=max_cap,
                 min_cap=min_cap,
             )
@@ -362,7 +359,7 @@ def negotiate_decode_offer(controller, req, reason, *, min_cut=0):
         schedule = None
     else:
         if split_tp_rank(controller) == 0:
-            parameters = budget.offer(chunk, controller.split_prefill_budget)
+            parameters = budget.offer(chunk, controller.split_prefill_budget, length)
         else:
             # Publish rank 0's estimates through MIN while keeping this rank's
             # prefill limit and request veto in the same vote.

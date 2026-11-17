@@ -1376,12 +1376,12 @@ class TestSplitPD(CustomTestCase):
         if adaptive:
             p.split_prefill_prefix_rate = 6000
             budget = d.split_prefill_decode_budget
-            for _ in range(8 * 8):
+            budget.share = 0.05
+            for _ in range(8):
                 budget.observe(2560, 200, suffix=True, rank=1)
-            self.assertEqual(budget.cap, 2560)
             self.assertLess(budget.coverage, 1)
             d.agree = lambda vote: (
-                [vote[0], int(budget.cap), chunk + 140, 4500, -20_000, vote[-1]]
+                [*vote[:2], chunk + 140, 4500, -20_000, vote[-1]]
                 if len(vote) == 6
                 else vote
             )
@@ -1867,7 +1867,6 @@ class TestSplitPD(CustomTestCase):
             controller.attn_tp_size = 1
             controller.split_dpa = True
         p.split_prefill_prefix_rate = 6000
-        d.split_prefill_decode_budget.cap = 8192
         d.split_prefill_decode_budget.suffix_rate = 4500
         _, _, req, dr = self.bootstrap(prefill=p, decode=d)
         self.assertEqual(req._hybrid_split_rates, [4500, 6000])
@@ -2067,24 +2066,33 @@ class TestSplitPD(CustomTestCase):
                 budget = d.split_prefill_decode_budget
                 if budget is None:
                     d.split_prefill_auto_cap = 60_000
-                    expected_cap = 60_000
                 else:
-                    budget.cap = 60_000
+                    self.assertEqual(budget.share, 0.25)
+                    for length, cap in ((8193, 2048), (98305, 24576)):
+                        receiver = self.offer(d, length=length).kv_receiver
+                        self.assertEqual(receiver._hybrid_split_suffix_cap, cap)
+
                     for _ in range(7):
                         budget.observe(1024, 25, suffix=True, rank=0)
                     budget.observe(1, 1400, suffix=False, rank=0)
+                    self.assertEqual(budget.share, 0.25)
                     budget.observe(1024, 25, suffix=True, rank=0)
-                    expected_cap = d.scheduler.max_req_input_len // 2
-                    self.assertEqual(budget.cap, expected_cap)
+                    self.assertAlmostEqual(budget.share, 0.275)
+                    for _ in range(8):
+                        budget.observe(1, 1400, suffix=False, rank=0)
+                        for _ in range(8):
+                            budget.observe(1024, 25, suffix=True, rank=0)
+                    self.assertEqual(budget.share, 0.5)
 
                 short = self.offer(d, length=8193).kv_receiver
                 self.assertEqual(short._hybrid_split_suffix_cap, 4096)
                 _, _, req, long = self.bootstrap(length=98305, decode=d)
                 self.assertEqual(long.kv_receiver._hybrid_split_suffix_cap, 49152)
                 self.assertEqual(req._hybrid_split_limits, (49153, 4096, 49152))
-                self.assertEqual(
-                    budget.cap if budget else d.split_prefill_auto_cap, expected_cap
-                )
+                if budget is None:
+                    self.assertEqual(d.split_prefill_auto_cap, 60_000)
+                else:
+                    self.assertEqual(budget.share, 0.5)
 
                 d.split_prefill_page_size = 256
                 offer, reason = self.split.negotiate_decode_offer(
@@ -2113,7 +2121,6 @@ class TestSplitPD(CustomTestCase):
 
         p.split_prefill_prefix_rate = 6000
         for worker, rate in ((d, 6000), (other, 3000)):
-            worker.split_prefill_decode_budget.cap = 8192
             worker.split_prefill_decode_budget.suffix_rate = rate
             worker.split_prefill_decode_budget.decode_ms = 10
         d.agree = lambda vote: [vote[0], 8192, 3072, 4500, -20_000, 1000]
@@ -2153,7 +2160,6 @@ class TestSplitPD(CustomTestCase):
                 follower.rank = 1
                 if adaptive == "1":
                     budget = leader.split_prefill_decode_budget
-                    budget.cap = 8192
                     budget.suffix_rate = 5000
                     budget.decode_ms = 20
                     expected_schedule = (2048, 150, 10, 5000, 20_000)
@@ -2229,26 +2235,29 @@ class TestSplitPD(CustomTestCase):
                 d = self.controller("decode", max_prefill_tokens=max_tokens)
                 budget = d.split_prefill_decode_budget
                 budget.suffix_rate = 1000
-                budget.cap = 4096
                 receiver = self.offer(d).kv_receiver
                 self.assertEqual(receiver._hybrid_split_limits[1], expected)
 
-    def test_feedback_coverage_recovers_after_reaching_cap_floor(self):
+    def test_feedback_coverage_recovers_after_reaching_share_floor(self):
         with patch.dict(
             os.environ,
             {"HANDOFF_SPLIT_ADAPTIVE": "1", "HANDOFF_SPLIT_DECODE_BUDGET_G": "0.2"},
         ):
             d = self.controller("decode")
         budget = d.split_prefill_decode_budget
-        for _ in range(30 * 8):
+        for _ in range(8):
             budget.observe(2048, 200, suffix=True, rank=1)
-        self.assertEqual(budget.cap, 2048)
+        self.assertAlmostEqual(budget.share, 0.225)
+        self.assertEqual(budget.coverage, 1)
+        for _ in range(49 * 8):
+            budget.observe(2048, 200, suffix=True, rank=1)
+        self.assertEqual(budget.share, 0.05)
         self.assertAlmostEqual(budget.coverage, 0.05)
-        for _ in range(32 * 8):
+        for _ in range(35 * 8):
             budget.observe(1, 200, suffix=False, rank=1)
             budget.observe(2048, 10, suffix=True, rank=1)
         self.assertEqual(budget.coverage, 1)
-        self.assertGreater(budget.cap, 2048)
+        self.assertGreater(budget.share, 0.05)
 
     def test_feedback_observes_prefill_overlap_and_decode_only_when_enabled(self):
         from sglang_remote_attn import decode_overlap

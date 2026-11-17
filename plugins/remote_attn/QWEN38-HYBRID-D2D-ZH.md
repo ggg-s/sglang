@@ -190,11 +190,12 @@ D 可用 `HANDOFF_SPLIT_DEFER_PATIENCE_TICKS` 调整提前结束等待的阈值�
 
 两端设置 `HANDOFF_SPLIT_ADAPTIVE=1` 启用。D 的 TP rank 0 在原生结果
 处理后读取 suffix 和 decode 的 CUDA event 时间，用后缀占有效 forward 时间的比例
-反馈给 cap。控制器状态的上界由 D 可接收的最长 prompt 派生，实际报价
-再应用每条请求自己的上限。默认 `HANDOFF_SPLIT_DECODE_BUDGET_G=1.0`，
-对应目标占比
-`g / (1 + g)`。如果 cap 已到 2048 且仍超目标，就逐窗减少准入比例，
-并保留至少 5% 探测。g=0 时 D 拒绝实验 split。
+调整后缀份额 `share`。初始份额为 25%，范围为 5% 到 50%，每个反馈窗口最多
+相对调整 10%。D 将 `share × prompt 长度` 按 512 token 向下对齐，应用后缀
+地板和 D 的最长 prompt 限制，再以该请求可交接的后缀长度为上限。
+默认 `HANDOFF_SPLIT_DECODE_BUDGET_G=1.0`，对应目标占比 `g / (1 + g)`。
+如果份额已到 5% 且仍超目标，就逐窗减少准入比例，并保留至少 5% 探测。
+g=0 时 D 拒绝实验 split。
 
 P 使用这次选中的 D 的速率计算约等耗时的后缀
 `miss × μ_D / (μ_P + μ_D)`，再应用协商上限。缺样本或可选速率扩展无效时用原 miss 比例，

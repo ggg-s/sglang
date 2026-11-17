@@ -9,6 +9,9 @@ logger = logging.getLogger(__name__)
 
 MIN_SUFFIX_TOKENS = 2048
 RATE_LIMIT = 10_000_000
+SUFFIX_CAP_GRANULARITY = 512
+MIN_CAP_SHARE = 0.05
+MAX_CAP_SHARE = 0.50
 
 
 def read_budget(name, default, *, allow_zero=False):
@@ -34,8 +37,8 @@ class DecodeBudget:
     stall_ms: float
     patience_ms: float
     pinned_chunk: bool
-    cap: float
     max_cap: int
+    share: float = 0.25
     min_cap: int = MIN_SUFFIX_TOKENS
     coverage: float = 1.0
     suffix_rate: float | None = None
@@ -66,27 +69,27 @@ class DecodeBudget:
         self.suffix_samples = 0
         if self.target == 0:
             return
-        factor = min(1.30, max(0.75, 1 + 0.25 * (self.target - delta) / self.target))
-        if self.cap <= self.min_cap and (self.coverage < 1 or delta > self.target):
+        factor = min(1.10, max(0.90, 1 + 0.25 * (self.target - delta) / self.target))
+        if self.share <= MIN_CAP_SHARE and (self.coverage < 1 or delta > self.target):
             # Delta already reflects the current admission rate. Scale that
             # rate, retaining a probe share when the target is nonzero.
             self.coverage = min(1.0, max(0.05, self.coverage * factor))
         else:
-            self.cap = min(self.max_cap, max(self.min_cap, self.cap * factor))
+            self.share = min(MAX_CAP_SHARE, max(MIN_CAP_SHARE, self.share * factor))
         self.windows += 1
         if rank == 0 and self.windows % 3 == 0:
             logger.info(
-                "[handoff-split-budget] delta=%.3f target=%.3f cap=%d coverage=%.2f",
+                "[handoff-split-budget] delta=%.3f target=%.3f share=%.3f coverage=%.2f",
                 delta,
                 self.target,
-                self.cap,
+                self.share,
                 self.coverage,
             )
 
-    def offer(self, chunk, max_prefill_tokens):
-        # Round published estimates only. Rounding the controller state would
-        # prevent small upward adjustments from ever accumulating.
-        cap = int(self.cap) // 512 * 512
+    def offer(self, chunk, max_prefill_tokens, length):
+        cap = int(self.share * length)
+        cap -= cap % SUFFIX_CAP_GRANULARITY
+        cap = min(self.max_cap, max(self.min_cap, cap))
         rate = min(RATE_LIMIT, int(self.suffix_rate or 0))
         if rate and not self.pinned_chunk:
             chunk = int(
