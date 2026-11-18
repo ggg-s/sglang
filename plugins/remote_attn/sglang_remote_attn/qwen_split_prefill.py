@@ -908,7 +908,9 @@ def commit(queue, dr, *, keep_receiver):
 
             trim_swa(controller, req, 0)
         release_reservation(req)
-        if getattr(controller, "split_dpa", False):
+        if getattr(controller, "split_dpa", False) or getattr(
+            controller, "split_pcp", False
+        ):
             log_decision(controller, req, "decode_commit", "native_pd")
         return False
     valid = (

@@ -94,6 +94,60 @@ C128 online 与 offline，各策略 22 次传输，四组均通过。
 以及原生 PD 回退。4060 探针使用合成的 draft SWA 和请求状态张量，整模 DSpark
 输出一致性、多 TP GPU 和性能仍待验证。
 
+### D 侧后缀 PCP4（实验）
+
+P、D 各用 4 张 GPU，D 启用 `HANDOFF_SPLIT_DECODE_PCP=1`、
+`--enable-prefill-cp --cp-strategy interleave --enable-cp-decode-attn-tp`。
+后缀 `EXTEND` 走原生 CP，普通 decode 和 DSpark verify 由原生路径切分
+attention 权重。Mooncake 仍按 TP4 注册四份接收页表。接收完成和预分配
+使用同一个四 rank CPU 组。无切点的请求使用原生 PD 收发和 DSpark。
+该模式要求 interleave、复制的 GPU KV、attention DP=1 和原生 Mooncake。
+
+两台各四卡的机器可用直连冒烟。两端使用同一个 checkpoint、同一份代码和相同的
+DSpark draft 配置。如果 draft 是独立 checkpoint，两端都设置 `DRAFT`。
+
+```bash
+# P 机器
+MODEL=/path/to/DeepSeek-V4-Flash P_ONLY=1 P_PCP=1 D_DPA=0 \
+  P_GPUS=0,1,2,3 bash test/manual/remote_attn/flash_split_dpa_smoke.sh
+
+# D 机器。P_HOST 填 P 的内网 IPv4 地址
+MODEL=/path/to/DeepSeek-V4-Flash P_HOST=10.0.0.10 P_PCP=1 D_DPA=0 D_PCP=1 \
+  D_GPUS=0,1,2,3 bash test/manual/remote_attn/flash_split_dpa_smoke.sh
+```
+
+同机 8 卡时省略 `P_ONLY`、`P_HOST`，在 D 命令上指定
+`P_GPUS=0,1,2,3 D_GPUS=4,5,6,7`。冒烟检查长请求续算、draft 和 target
+verify 图回放，以及短请求拒绝切分后仍完成 DSpark。用下面的设备探针在
+四张 D 卡上逐卡对比切点处 target/draft SWA 和 draft 请求槽的内容。
+探针使用合成页和本地 Mooncake 拷贝，整模跨节点接收由上面的冒烟覆盖。
+
+```bash
+for gpu in 0 1 2 3; do
+  CUDA_VISIBLE_DEVICES=$gpu PYTHONPATH=python:plugins/remote_attn \
+    python test/manual/remote_attn/flash0731_split_prefill_cuda_probe.py || exit
+done
+```
+
+#### 2026-11-18 验证
+
+基于 `c9eee64c81` 叠加 D 侧 PCP4 opt-in，在 Ubuntu RTX 4060 Laptop 上用
+PyTorch 2.13.0+cu130 复测。源码预检覆盖 66 个 hook 和 147 个核心接口。
+主契约 69 项通过，含 156 个通过的子测试，decode 预算契约 22 项通过。
+另在本机用四进程 Gloo 验证
+原生接收同步，单个 rank 未就绪时四个 rank 都等待，收到全部 KV 后共同放行，
+单 rank 失败也同步给全组。
+
+| 4060 CUDA 探针 | C128 模式 | Mooncake TCP 传输次数 | 切点 | D 后缀各块（token） | target/draft SWA 与 draft 请求槽 | 续算 / 首步 decode 最大绝对误差 |
+| --- | --- | ---: | ---: | --- | --- | --- |
+| 静态 | online、offline | 22 | 7,936 | 1,024 + 255 | 通过 | 0 / 0 |
+| 自适应 | online、offline | 22 | 6,656 | 1,536 + 1,023 | 通过 | 0 / 0 |
+
+日志位于 `ubuntu:/tmp/sglang-flash-pcp-publish.Jt4iNN/` 下的
+`test_remote_main_contracts.log`、`test_remote_split_budget.log`、
+`probe-0.json` 和 `probe-1.json`。4060 验证的是
+单卡合成页，整模四卡 PCP4、DSpark verify 图回放与原生 PD 回退待内网冒烟。
+
 ### DPA 与 SMG 的前缀路由（实验）
 
 P、D 两端启用 `HANDOFF_SPLIT_DPA=1`。双端 DSpark 的 CUDA 部署每组

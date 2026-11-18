@@ -96,12 +96,23 @@ def validate_config():
     )
 
     parallel = get_parallel()
+    disagg = get_disagg()
     memory = get_memory()
     schedule = get_schedule()
     if get_device().device != "cuda":
         raise RuntimeError("remote_attn requires CUDA")
     dpa = dsv4_split_prefill.dpa_requested()
     pcp = parallel.attn_cp_size > 1
+    decode_pcp = dsv4_split_prefill.decode_pcp_requested()
+    if decode_pcp and (
+        disagg.disaggregation_mode != "decode"
+        or not pcp
+        or not parallel.enable_cp_decode_attn_tp
+    ):
+        raise RuntimeError(
+            "HANDOFF_SPLIT_DECODE_PCP requires D with --enable-prefill-cp "
+            "and --enable-cp-decode-attn-tp"
+        )
     if (
         parallel.pp_size != 1
         or parallel.dp_size != 1
@@ -113,7 +124,6 @@ def validate_config():
             "PP, replica DP and DCP are unsupported"
         )
     if dpa or pcp:
-        disagg = get_disagg()
         if (
             disagg.disaggregation_mode not in ("prefill", "decode")
             or disagg.disaggregation_transfer_backend != "mooncake"
@@ -127,7 +137,7 @@ def validate_config():
             )
         if pcp and (
             dpa
-            or disagg.disaggregation_mode != "prefill"
+            or (disagg.disaggregation_mode != "prefill" and not decode_pcp)
             or parallel.tp_size != 4
             or parallel.attn_cp_size != 4
             or parallel.attn_dp_size != 1
@@ -139,9 +149,11 @@ def validate_config():
             or parallel.enable_cp_tp_group_sharing
         ):
             raise RuntimeError(
-                "Flash split prefill CP requires P with TP=CP=4, attention DP=1, "
-                "interleave and replicated KV"
+                "Flash split prefill CP requires TP=CP=4, attention DP=1, "
+                "interleave and replicated KV. D requires HANDOFF_SPLIT_DECODE_PCP=1."
             )
+        if decode_pcp and disagg.disaggregation_decode_host_receive_threshold < 1:
+            raise RuntimeError("Flash split decode PCP requires GPU KV receive")
     if dpa:
         from sglang.srt.environ import envs
 
@@ -685,6 +697,8 @@ def _publish_peer_now(original, manager, mooncake_session_id, decode_kv_args):
 HOOKS = {
     "sglang.srt.disaggregation.prefill.maybe_release_metadata_buffer": source_resources.release_metadata,
     "sglang.srt.disaggregation.prefill.SchedulerDisaggregationPrefillMixin.maybe_send_cached_prefix_chunk": prefix_stream.cached_prefix,
+    "sglang.srt.disaggregation.decode.DecodePreallocQueue.__init__": dsv4_split_prefill.init_decode_queue,
+    "sglang.srt.disaggregation.decode.DecodeTransferQueue.__init__": dsv4_split_prefill.init_decode_queue,
     "sglang.srt.disaggregation.decode.DecodePreallocQueue._match_prefix_and_lock": destination_cache.match_prefix,
     "sglang.srt.disaggregation.decode.DecodePreallocQueue._select_swa_prealloc_start": dsv4_split_prefill.select_swa_prealloc_start,
     "sglang.srt.disaggregation.decode.DecodePreallocQueue._send_kv_metadata": destination_cache.send_metadata,

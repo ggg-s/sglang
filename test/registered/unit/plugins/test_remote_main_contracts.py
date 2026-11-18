@@ -102,6 +102,81 @@ class TestRemoteMainContracts(CustomTestCase):
                 verify._remote_attn_graph_fallback, "native_graph_ineligible"
             )
 
+    def test_flash_decode_pcp_uses_four_native_receive_ranks(self):
+        """A width-one PD view collapses all four D destinations into rank zero."""
+        from sglang.srt.runtime_context import get_parallel
+
+        with patch.object(
+            sys, "path", [str(ROOT / "test/manual/remote_attn"), *sys.path]
+        ):
+            from dsv41_remote_probe_support import definitions
+
+        manager = definitions(
+            ROOT,
+            "python/sglang/srt/disaggregation/common/conn.py",
+            owner="CommonKVManager",
+            members={"_resolve_rank_mapping"},
+        )
+        parallel = get_parallel()
+        full_group = NS(world_size=4, cpu_group=object())
+        singleton = NS(world_size=1, cpu_group=object())
+        prefix = "sglang.srt.disaggregation.decode."
+        transfer_init = hooks.HOOKS[prefix + "DecodeTransferQueue.__init__"]
+        prealloc_init = hooks.HOOKS[prefix + "DecodePreallocQueue.__init__"]
+
+        def init_transfer(queue):
+            queue.group = parallel.attn_tp_group.cpu_group
+
+        def init_prealloc(queue):
+            queue.group = parallel.attn_tp_group.cpu_group
+            queue.args = NS(
+                engine_rank=parallel.tp_rank % parallel.attn_tp_size,
+            )
+            queue.manager = NS(
+                attn_cp_size=parallel.attn_cp_size,
+                attn_tp_size=parallel.attn_tp_size,
+                is_mla_backend=True,
+                kv_args=queue.args,
+                enable_all_cp_ranks_for_transfer=False,
+                pp_size=1,
+                pp_rank=0,
+            )
+
+        registered = []
+        with patch.dict(os.environ, {"HANDOFF_SPLIT_DECODE_PCP": "1"}):
+            for rank in range(4):
+                with parallel.override(
+                    tp_size=4,
+                    tp_rank=rank,
+                    tp_group=full_group,
+                    attn_tp_size=1,
+                    attn_tp_rank=0,
+                    attn_tp_group=singleton,
+                    attn_cp_size=4,
+                    attn_cp_rank=rank,
+                    attn_cp_group=full_group,
+                    attn_dp_size=1,
+                    attn_dp_rank=0,
+                ):
+                    transfer, prealloc = NS(), NS()
+                    transfer_init(init_transfer, transfer)
+                    prealloc_init(init_prealloc, prealloc)
+                    self.assertIs(transfer.group, full_group.cpu_group)
+                    self.assertIs(prealloc.group, full_group.cpu_group)
+                    self.assertEqual(parallel.attn_cp_size, 4)
+                    self.assertIs(parallel.attn_tp_group, singleton)
+                    prefill = NS(
+                        attn_tp_size=1,
+                        attn_cp_size=4,
+                        enable_kv_cache_sharding=False,
+                        enable_dsa_cache_layer_split=False,
+                        pp_size=1,
+                    )
+                    manager._resolve_rank_mapping(prealloc.manager, prefill)
+                    self.assertEqual(prefill.required_dst_info_num, 4)
+                    registered.append(prealloc.args.engine_rank)
+        self.assertEqual(registered, [0, 1, 2, 3])
+
     def test_every_native_decode_backend_access_is_implemented(self):
         source = (
             ROOT / "python/sglang/srt/model_executor/runner/decode_cuda_graph_runner.py"
@@ -2169,7 +2244,7 @@ class TestSplitPD(CustomTestCase):
                 with self.assertRaisesRegex(RuntimeError, "native Mooncake PD"):
                     hooks.validate_config()
 
-    def test_split_pcp_requires_native_replicated_prefill_topology(self):
+    def test_split_pcp_requires_native_replicated_topology(self):
         from sglang_remote_attn import hooks
 
         parallel = NS(
@@ -2181,6 +2256,7 @@ class TestSplitPD(CustomTestCase):
             attn_dp_size=1,
             attn_dp_enabled=False,
             enable_prefill_cp=True,
+            enable_cp_decode_attn_tp=False,
             cp_strategy="interleave",
             cp_kv_layout=None,
             enable_kv_cache_sharding=False,
@@ -2191,6 +2267,7 @@ class TestSplitPD(CustomTestCase):
             disaggregation_mode="prefill",
             disaggregation_transfer_backend="mooncake",
             enable_pd_role_switch=False,
+            disaggregation_decode_host_receive_threshold=1,
         )
         runtime = NS(
             get_device=lambda: NS(device="cuda"),
@@ -2235,6 +2312,16 @@ class TestSplitPD(CustomTestCase):
                     self.assertRaisesRegex(RuntimeError, "TP=CP=4"),
                 ):
                     hooks.validate_config()
+
+            disagg.disaggregation_mode = "decode"
+            os.environ["HANDOFF_SPLIT_DECODE_PCP"] = "1"
+            with self.assertRaisesRegex(RuntimeError, "--enable-cp-decode-attn-tp"):
+                hooks.validate_config()
+            parallel.enable_cp_decode_attn_tp = True
+            hooks.validate_config()
+            disagg.disaggregation_decode_host_receive_threshold = 0
+            with self.assertRaisesRegex(RuntimeError, "requires GPU KV receive"):
+                hooks.validate_config()
 
     def test_dpa_split_negotiates_inside_the_request_attention_group(self):
         with patch.dict(os.environ, {"HANDOFF_SPLIT_ADAPTIVE": "1"}):

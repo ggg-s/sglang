@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# Same-node CUDA smoke test. Use a separate GPU set for each native PD role.
+# CUDA smoke test. Use a separate GPU set for each native PD role.
 set -euo pipefail
 
 cd "$(dirname "${BASH_SOURCE[0]}")/../../.."
@@ -15,6 +15,13 @@ SMG=${SMG:-0}
 SMG_PORT=${SMG_PORT:-31100}
 P_PCP=${P_PCP:-0}
 D_DPA=${D_DPA:-1}
+D_PCP=${D_PCP:-0}
+P_ONLY=${P_ONLY:-0}
+P_HOST=${P_HOST:-127.0.0.1}
+if [[ "$D_PCP" == 1 && ( "$TP" != 4 || "$P_PCP" != 1 || "$D_DPA" != 0 || "$SMG" != 0 ) ]]; then
+  echo "D_PCP=1 requires TP=4 P_PCP=1 D_DPA=0 SMG=0" >&2
+  exit 2
+fi
 RUN_DIR=$(mktemp -d "${TMPDIR:-/tmp}/flash-split-dpa.XXXXXX")
 echo "Logs: $RUN_DIR"
 
@@ -61,6 +68,8 @@ decode_args=(--disaggregation-mode decode --port "$D_PORT" --disable-radix-cache
 if [[ "$D_DPA" == 1 ]]; then
   d_groups=$TP
   decode_args+=(--enable-dp-lm-head)
+elif [[ "$D_PCP" == 1 ]]; then
+  decode_args+=(--enable-prefill-cp --cp-strategy interleave --enable-cp-decode-attn-tp)
 fi
 decode_args+=(--attn-dp-size "$d_groups")
 if [[ "$SMG" == 1 ]]; then
@@ -71,26 +80,36 @@ else
 fi
 
 "$PYTHON" -m sglang_remote_attn.check
-HANDOFF_SPLIT_DPA="$p_split_dpa" SGLANG_ENABLE_DP_SPEC_PREFILL_COORDINATION="$p_split_dpa" \
-  CUDA_VISIBLE_DEVICES="$P_GPUS" "$PYTHON" -m sglang.launch_server "${common[@]}" \
-  "${prefill_args[@]}" >"$RUN_DIR/p.log" 2>&1 &
-p_pid=$!
-HANDOFF_SPLIT_DPA="$D_DPA" SGLANG_ENABLE_DP_SPEC_PREFILL_COORDINATION="$D_DPA" \
+launch_prefill() {
+  HANDOFF_SPLIT_DECODE_PCP=0 HANDOFF_SPLIT_DPA="$p_split_dpa" \
+    SGLANG_ENABLE_DP_SPEC_PREFILL_COORDINATION="$p_split_dpa" CUDA_VISIBLE_DEVICES="$P_GPUS" \
+    exec "$PYTHON" -m sglang.launch_server "${common[@]}" "${prefill_args[@]}" "$@"
+}
+if [[ "$P_ONLY" == 1 ]]; then
+  launch_prefill --host 0.0.0.0
+fi
+p_pid=
+if [[ "$P_HOST" == 127.0.0.1 ]]; then
+  launch_prefill >"$RUN_DIR/p.log" 2>&1 &
+  p_pid=$!
+fi
+HANDOFF_SPLIT_DECODE_PCP="$D_PCP" HANDOFF_SPLIT_DPA="$D_DPA" \
+  SGLANG_ENABLE_DP_SPEC_PREFILL_COORDINATION="$D_DPA" \
   SGLANG_LOG_DECODE_GRAPH_KEY=1 CUDA_VISIBLE_DEVICES="$D_GPUS" \
   "$PYTHON" -m sglang.launch_server "${common[@]}" \
   "${decode_args[@]}" \
   >"$RUN_DIR/d.log" 2>&1 &
 d_pid=$!
 cleanup() {
-  kill "$p_pid" "$d_pid" 2>/dev/null || true
-  wait "$p_pid" "$d_pid" 2>/dev/null || true
+  kill ${p_pid:+"$p_pid"} "$d_pid" 2>/dev/null || true
+  wait ${p_pid:+"$p_pid"} "$d_pid" 2>/dev/null || true
 }
 trap cleanup EXIT
 trap 'exit 130' INT
 trap 'exit 143' TERM
 
 "$PYTHON" - "$p_groups" "$d_groups" "$P_PORT" "$D_PORT" "$BOOTSTRAP_PORT" "$RUN_DIR" \
-  "$p_pid" "$d_pid" "$SMG" "$SMG_PORT" <<'PY'
+  "${p_pid:-0}" "$d_pid" "$SMG" "$SMG_PORT" "$P_HOST" "$D_PCP" <<'PY'
 import concurrent.futures
 import json
 import os
@@ -105,9 +124,12 @@ import requests
 
 p_groups, groups, prefill_port, decode_port, bootstrap_port = map(int, sys.argv[1:6])
 log_dir = Path(sys.argv[6])
-pids = list(map(int, sys.argv[7:9]))
+pids = [pid for pid in map(int, sys.argv[7:9]) if pid]
 smg, smg_port = map(int, sys.argv[9:11])
-prefill, decode = (f"http://127.0.0.1:{port}" for port in (prefill_port, decode_port))
+prefill_host = sys.argv[11]
+decode_pcp = sys.argv[12] == "1"
+prefill = f"http://{prefill_host}:{prefill_port}"
+decode = f"http://127.0.0.1:{decode_port}"
 deadline = time.monotonic() + 1200
 for url in (prefill, decode):
     while time.monotonic() < deadline:
@@ -213,7 +235,7 @@ def send_pair(rid, room_index, rank, prompt, output, *, keep=False):
         "sampling_params": {"temperature": 0, "max_new_tokens": output, "ignore_eos": True},
         "routed_dp_rank": rank,
         "disagg_prefill_dp_rank": prefill_rank,
-        "bootstrap_host": "127.0.0.1",
+        "bootstrap_host": prefill_host,
         "bootstrap_port": bootstrap_port,
         "bootstrap_room": room_index * groups + rank,
     }
@@ -287,7 +309,7 @@ if groups > 1:
 # tokens, below the earliest cut 3072. D offers; P sends the full prompt.
 send_pair("flash-smoke-fallback", 13, 0, 6144, 64)
 logs = (log_dir / "d.log").read_text()
-if groups > 1:
+if groups > 1 or decode_pcp:
     assert "stage=decode_commit reason=native_pd rid=flash-smoke-fallback" in logs, (
         "Expected native PD commit after declining a split offer"
     )

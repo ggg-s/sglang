@@ -19,6 +19,34 @@ def dpa_requested():
     return value == "1"
 
 
+def decode_pcp_requested():
+    value = os.environ.get("HANDOFF_SPLIT_DECODE_PCP", "0")
+    if value not in ("0", "1"):
+        raise ValueError("HANDOFF_SPLIT_DECODE_PCP must be 0 or 1")
+    return value == "1"
+
+
+def init_decode_queue(original, queue, *args, **kwargs):
+    if not decode_pcp_requested():
+        return original(queue, *args, **kwargs)
+
+    from sglang.srt.runtime_context import get_parallel
+
+    parallel = get_parallel()
+    # Only these native PD constructors see a TP wire topology. They retain
+    # the rank-local KV pools and use the four-rank CPU group for preallocation
+    # and receive polling. The model and draft runners keep their CP topology.
+    with parallel.override(
+        attn_tp_size=parallel.tp_size,
+        attn_tp_rank=parallel.tp_rank,
+        attn_tp_group=parallel.tp_group,
+        attn_cp_size=1,
+        attn_cp_rank=0,
+        attn_cp_group=parallel.attn_tp_group,
+    ):
+        return original(queue, *args, **kwargs)
+
+
 def dspark_requested():
     from sglang.srt.runtime_context import get_disagg, get_spec
 
