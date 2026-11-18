@@ -32,6 +32,7 @@ class TestRemoteMainContracts(CustomTestCase):
         from sglang.srt import runtime_context
         from sglang_remote_attn import pd_mesh, pre_layerwise, source_cache
         from sglang_remote_attn.split_decode_budget import DecodeBudget
+        from sglang_remote_attn.split_inflight_budget import InflightSuffixBudget
 
         @dataclass
         class GraphConfig:
@@ -60,6 +61,8 @@ class TestRemoteMainContracts(CustomTestCase):
             split_vote_size=2,
             split_vote_group=object(),
             split_prefill_decode_budget=budget,
+            split_prefill_max_inflight_ms=800,
+            split_prefill_inflight=InflightSuffixBudget(800, store=budget.ledger),
         )
         execution = NS(graph=NS(cuda_graph_config=GraphConfig()))
         reports = []
@@ -85,6 +88,10 @@ class TestRemoteMainContracts(CustomTestCase):
             budget.suffix_rate = 6000
             pre_layerwise.Controller.validate_graphs(control)
             self.assertEqual(reports[0], reports[1])
+            control.split_prefill_max_inflight_ms = 900
+            with self.assertRaisesRegex(RuntimeError, "config or captures differ"):
+                pre_layerwise.Controller.validate_graphs(control)
+            control.split_prefill_max_inflight_ms = 800
             control.split_prefill_decode_budget = replace(budget, stall_ms=500)
             with self.assertRaisesRegex(RuntimeError, "config or captures differ"):
                 pre_layerwise.Controller.validate_graphs(control)
@@ -3053,6 +3060,87 @@ class TestSplitPD(CustomTestCase):
         self.split.release_reservation(req)
         self.assertEqual(d.split_prefill_outstanding, limit - 1)
         self.assertTrue(self.offer(d).kv_receiver._hybrid_split_limits)
+
+    def test_inflight_limit_charges_offers_and_refunds_committed_work(self):
+        """Two offers for one D must share the same estimated suffix time."""
+        with patch.dict(
+            os.environ,
+            {"HANDOFF_SPLIT_ADAPTIVE": "1", "HANDOFF_SPLIT_MAX_INFLIGHT_MS": "800"},
+        ):
+            d = self.controller("decode")
+        d.split_prefill_decode_budget.suffix_rate = 10_000
+
+        _, queue, first = self.commit_fixture(28672, decode=d)
+        self.assertEqual(first.kv_receiver._hybrid_split_suffix_cap, 8192)
+        # The first request keeps its full share even when larger than the limit.
+        with self.assertLogs(self.split.logger, level="INFO") as logs:
+            rejected = self.offer(d)
+        self.assertFalse(hasattr(rejected.kv_receiver, "_hybrid_split_limits"))
+        self.assertIn("decode_inflight_budget", "".join(logs.output))
+
+        self.assertTrue(self.split.commit(queue, first, keep_receiver=False))
+        second = self.offer(d)
+        self.assertEqual(second.kv_receiver._hybrid_split_suffix_cap, 3904)
+
+        req = first.req
+        req.kv.commit_prealloc(30720)
+        req.finished = lambda: False
+        req.inflight_steps = 1
+        scheduler = d.scheduler
+        scheduler.chunked_req = req
+        scheduler.last_batch = NS(_hybrid_split_extend=True)
+        scheduler.process_pending_chunked_abort = lambda: None
+        scheduler.waiting_queue = NS(prepend=lambda _: None)
+        running = NS(is_empty=lambda: False)
+
+        def native(_, batch):
+            return batch
+
+        self.assertIs(self.split.next_batch(native, scheduler, running), running)
+        self.assertFalse(hasattr(self.offer(d).kv_receiver, "_hybrid_split_limits"))
+        req.inflight_steps = 0
+        self.assertIs(self.split.next_batch(native, scheduler, running), running)
+        third = self.offer(d)
+        self.assertEqual(third.kv_receiver._hybrid_split_suffix_cap, 2048)
+
+        second.metadata_buffer_index = 0
+        queue.metadata_buffers.output_ids[0, self.split.CUT_SLOT] = 0
+        self.assertFalse(self.split.commit(queue, second, keep_receiver=False))
+        self.split.release_reservation(first.req)
+        self.split.release_reservation(first.req)
+        self.split.release_reservation(third.req)
+        self.assertEqual(d.split_prefill_inflight.used_us, 0)
+        self.assertEqual(d.split_prefill_outstanding, 0)
+
+        d.agree = lambda vote: [0, *vote[1:]]
+        self.assertFalse(hasattr(self.offer(d).kv_receiver, "_hybrid_split_limits"))
+        self.assertEqual(d.split_prefill_inflight.used_us, 0)
+
+    def test_dpa_inflight_equal_debits_cannot_both_win_store_vote(self):
+        """A failed CAS returning a peer's value must never double-admit."""
+        from sglang_remote_attn.split_inflight_budget import InflightSuffixBudget
+
+        store = torch.distributed.HashStore()
+        peer = InflightSuffixBudget(800, store=store, rank=1)
+        competing = []
+
+        def reserve(budget):
+            return budget.reserve(8192, length=32769, page=256, rate=10_000)
+
+        def compare_set(key, expected, desired):
+            if key == "used_us" and expected:
+                competing.append(reserve(peer))
+            return store.compare_set(key, expected, desired)
+
+        leader = InflightSuffixBudget(
+            800, store=NS(compare_set=compare_set, get=store.get), rank=0
+        )
+        self.assertIsNone(reserve(leader))
+        self.assertEqual(len(competing), 1)
+        reservation = competing.pop()
+        self.assertEqual(reservation.tokens, 7937)
+        reservation.shrink(0)
+        self.assertEqual(reserve(peer).tokens, 7937)
 
     def test_decode_capacity_and_tp_rejection_do_not_create_reservations(self):
         d = self.controller("decode")

@@ -181,6 +181,7 @@ def select_swa_prealloc_start(
         else split.min_suffix_tokens(fill_len)
     )
     if min_cut > fill_len - floor:
+        split.release_reservation(req)
         split.log_decision(controller, req, "decode_offer", "dsv4_suffix_too_short")
         return None
 

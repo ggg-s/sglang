@@ -721,6 +721,7 @@ class Controller:
                 getattr(self, "split_prefill_patience_ticks", None),
                 getattr(self, "split_prefill_suffix_budget_s", None),
                 getattr(self, "split_prefill_adaptive", False),
+                getattr(self, "split_prefill_max_inflight_ms", 0),
                 budget.startup_signature() if budget is not None else None,
             ),
             ("destination-cache-v1", "prefix-range-v1", prefix_enabled()),

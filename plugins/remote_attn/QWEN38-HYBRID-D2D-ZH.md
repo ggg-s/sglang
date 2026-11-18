@@ -218,6 +218,14 @@ D 用 `HANDOFF_SPLIT_STALL_MS`（默认 600）估算单块大小，动态块下�
 `HANDOFF_SPLIT_ADAPTIVE=0` 可继续使用原有静态或按速率估算的 cap 对照。
 内网原型数据见 [RTX 5090 闭环实验](validation/qwen-split-prefill-closed-loop-5090.md)。
 
+在 D 设置 `HANDOFF_SPLIT_MAX_INFLIGHT_MS` 可为 share 环加在途续算时间上限。
+默认为 `0`，启用需要 `HANDOFF_SPLIT_ADAPTIVE=1`。同一个 D 收到的所有 P
+请求共用预算，包含已发出的 offer 和已确认但尚未完成的 suffix。无在途任务时
+第一笔按原 share 上限发出。有在途任务时用剩余时间裁剪后续 offer，容不下
+一个合法后缀时记录 `decode_inflight_budget` 并走原生 PD。D 用确认切点和
+已完成的块退回额度，原生回退或取消时释放余额。`HANDOFF_SPLIT_STALL_MS`
+仍用于估计单块大小，并为速率尚未测出的启动期提供估算。
+
 沿用同 TP 的原生 Mooncake、early device allocation 和 page-1 KV 配置。
 D 命中已有前缀、请求输出 logprobs、结构化生成或对端未协商时走原生 PD。
 P 等到 bootstrap 后再为可协商请求启动 Prefill，首次 Forward 前对实际 cut 做

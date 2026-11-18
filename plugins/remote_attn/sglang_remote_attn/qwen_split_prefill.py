@@ -15,6 +15,7 @@ from .split_decode_budget import (
     ema,
     read_budget,
 )
+from .split_inflight_budget import InflightSuffixBudget
 
 logger = logging.getLogger(__name__)
 # V3 advertises the cut bound and D's chunk cap. V2 assumes a fixed suffix floor.
@@ -90,6 +91,8 @@ def configure(controller):
         controller.split_prefill and role in ("prefill", "decode") and adaptive == "1"
     )
     controller.split_prefill_decode_budget = None
+    controller.split_prefill_max_inflight_ms = 0
+    controller.split_prefill_inflight = None
     controller.split_prefill_prefix_rate = None
     controller.split_prefill_budget = None
     controller.split_prefill_chunk_size = None
@@ -200,6 +203,25 @@ def configure(controller):
             raise ValueError(f"{auto_env} must be 0 or 1")
         if controller.split_prefill_adaptive:
             g = read_budget("HANDOFF_SPLIT_DECODE_BUDGET_G", 1.0, allow_zero=True)
+            inflight_ms = read_budget(
+                "HANDOFF_SPLIT_MAX_INFLIGHT_MS", 0, allow_zero=True
+            )
+            controller.split_prefill_max_inflight_ms = inflight_ms
+            if inflight_ms and split_tp_rank(controller) == 0:
+                store = None
+                if getattr(controller, "split_dpa", False):
+                    from torch.distributed import PrefixStore
+                    from torch.distributed.distributed_c10d import (
+                        _get_process_group_store,
+                    )
+
+                    store = PrefixStore(
+                        "remote-attn-split-inflight/",
+                        _get_process_group_store(scheduler.tp_cpu_group),
+                    )
+                controller.split_prefill_inflight = InflightSuffixBudget(
+                    inflight_ms, store=store, rank=controller.rank
+                )
             # Keep the offered token cap within the scheduler's prompt limit.
             max_cap = min(scheduler.max_req_input_len // 2, TP_MIN_IDENTITY)
             max_cap -= max_cap % SUFFIX_CAP_GRANULARITY
@@ -249,7 +271,8 @@ def configure(controller):
             "[handoff-split-config] role=%s enabled=%s max_prefill_tokens=%s "
             "chunk_size=%s cut_ratio=%s cut_basis=%s suffix_tokens=%s suffix_cap=%s "
             "max_outstanding=%s defer_ticks=%s min_p_queue_tokens=%s "
-            "auto_cap=%s suffix_budget_s=%s patience_ticks=%s adaptive=%s decode_budget=%s",
+            "auto_cap=%s suffix_budget_s=%s patience_ticks=%s adaptive=%s "
+            "max_inflight_ms=%s decode_budget=%s",
             role,
             controller.split_prefill,
             controller.split_prefill_budget,
@@ -265,6 +288,7 @@ def configure(controller):
             controller.split_prefill_suffix_budget_s,
             controller.split_prefill_patience_ticks,
             controller.split_prefill_adaptive,
+            controller.split_prefill_max_inflight_ms,
             controller.split_prefill_decode_budget,
         )
 
@@ -362,6 +386,34 @@ def negotiate_decode_offer(controller, req, reason, *, min_cut=0):
     else:
         if split_tp_rank(controller) == 0:
             parameters = budget.offer(chunk, controller.split_prefill_budget, length)
+            inflight = getattr(controller, "split_prefill_inflight", None)
+            cap, chunk, rate, neg_step_us, coverage = parameters
+            if (
+                inflight is not None
+                and reason is None
+                and req.bootstrap_room % 1000 < coverage
+            ):
+                share_cap = min(cap, prompt_cap)
+                reservation = getattr(req, "_hybrid_split_inflight_reservation", None)
+                if reservation is None:
+                    estimate = rate or max(
+                        1, int(min(RATE_LIMIT, chunk * 1000 / budget.stall_ms))
+                    )
+                    reservation = inflight.reserve(
+                        share_cap, length=length, page=page, rate=estimate
+                    )
+                    req._hybrid_split_inflight_reservation = reservation
+                reserved = reservation.tokens if reservation is not None else 0
+                if 0 < reserved < share_cap:
+                    log_decision(
+                        controller,
+                        req,
+                        "decode_offer",
+                        "decode_inflight_clipped",
+                        share_cap=share_cap,
+                        suffix_cap=reserved,
+                    )
+                parameters = reserved, chunk, rate, neg_step_us, coverage
         else:
             # Publish rank 0's estimates through MIN while keeping this rank's
             # prefill limit and request veto in the same vote.
@@ -372,14 +424,25 @@ def negotiate_decode_offer(controller, req, reason, *, min_cut=0):
                 TP_MIN_IDENTITY,
                 TP_MIN_IDENTITY,
             )
-        allowed, suffix_cap, chunk, rate, neg_step_us, coverage = controller.agree(
-            [int(reason is None), *parameters]
-        )
+        try:
+            allowed, suffix_cap, chunk, rate, neg_step_us, coverage = controller.agree(
+                [int(reason is None), *parameters]
+            )
+        except BaseException:
+            release_reservation(req)
+            raise
         chunk -= chunk % page
         if allowed and length < 2 * chunk:
+            release_reservation(req)
             return None, "decode_split_short_for_chunk"
         if allowed and req.bootstrap_room % 1000 >= coverage:
+            release_reservation(req)
             return None, "decode_split_budget"
+        if allowed and not suffix_cap and getattr(
+            controller, "split_prefill_max_inflight_ms", 0
+        ):
+            release_reservation(req)
+            return None, "decode_inflight_budget"
         step_us = -neg_step_us
         defer = controller.split_prefill_defer_ticks
         patience = budget.patience_steps(
@@ -387,6 +450,7 @@ def negotiate_decode_offer(controller, req, reason, *, min_cut=0):
         )
         schedule = chunk, defer, patience, rate, step_us
     if not allowed:
+        release_reservation(req)
         return None, reason or "decode_peer_rejected"
     if budget is not None and not suffix_cap:
         return None, "decode_suffix_too_short"
@@ -462,6 +526,10 @@ def advertise(queue, dr, decode_prefix_len):
 
 
 def release_reservation(req):
+    reservation = getattr(req, "_hybrid_split_inflight_reservation", None)
+    if reservation is not None:
+        reservation.shrink(0)
+        req._hybrid_split_inflight_reservation = None
     controller = getattr(req, "_hybrid_split_reservation", None)
     if controller is not None:
         req._hybrid_split_reservation = None
@@ -793,6 +861,9 @@ def commit(queue, dr, *, keep_receiver):
             status_code=HTTPStatus.INTERNAL_SERVER_ERROR,
         )
         return True
+    reservation = getattr(req, "_hybrid_split_inflight_reservation", None)
+    if reservation is not None:
+        reservation.shrink(length - cut)
     controller.pd_visibility.receive()
     if paged:
         from .dsv4_split_prefill import trim_swa
@@ -951,6 +1022,9 @@ def next_batch(original, scheduler, running_batch):
         scheduler.chunked_req = None
         if not chunked.finished():
             chunked.prefix_len = chunked.kv.kv_committed_len
+            reservation = getattr(chunked, "_hybrid_split_inflight_reservation", None)
+            if reservation is not None:
+                reservation.shrink(len(chunked.origin_input_ids) - chunked.prefix_len)
             scheduler.waiting_queue.prepend([chunked])
         if last_was_split:
             last._hybrid_split_extend = False
