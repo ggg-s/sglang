@@ -1345,6 +1345,103 @@ class TestSplitPD(CustomTestCase):
         self.split.configure(controller)
         return controller
 
+    def test_plain_flash_split_keeps_native_receive_without_dspark(self):
+        from tempfile import TemporaryDirectory
+
+        from sglang_remote_attn import dsv41_layerwise
+
+        for role in ("prefill", "decode"):
+            for experimental_remote in (False, True):
+                with self.subTest(role=role, remote=experimental_remote):
+                    with TemporaryDirectory() as folder:
+                        controller = self.controller(role, dsv4=True)
+                        controller.split_dpa = controller.split_pcp = False
+                        controller.pd_remote = experimental_remote
+                        controller.config = NS(
+                            mode="remote",
+                            host_staging=False,
+                            recv_host_staging=False,
+                            directory=Path(folder),
+                        )
+                        controller._schema = lambda _: {"ratios": [0, 4, 128]}
+                        controller.scheduler.sliding_window_size = 128
+                        controller.scheduler.kv_checksum_computer = None
+                        controller.pool.swa_page_size = 256
+                        controller.pool.request_window = None
+                        state_type = NS(SWA="swa", DSV4_REQUEST_STATE="state")
+                        manager = NS(
+                            enable_staging=False,
+                            kv_shard_size=1,
+                            kv_args=NS(state_types=["swa", "state"]),
+                        )
+                        controller.scheduler.disagg_decode_prealloc_queue = NS(
+                            kv_manager=manager
+                        )
+                        controller.scheduler.disagg_prefill_bootstrap_queue = NS(
+                            kv_manager=manager
+                        )
+                        controller.scheduler.token_to_kv_pool_allocator = NS(
+                            get_kvcache=lambda: controller.pool
+                        )
+                        controller.scheduler.tp_worker = NS(
+                            model_runner=NS(
+                                lora_manager=None,
+                                model_config=NS(hf_config=NS(model_type="deepseek_v4")),
+                                model=NS(model=NS(layers=[Mock()])),
+                                attn_backend=NS(),
+                                prefill_attention_backend_str="dsv4",
+                                decode_attention_backend_str="dsv4",
+                            )
+                        )
+                        controller.layers = 1
+                        with (
+                            patch.dict(
+                                os.environ,
+                                {"HANDOFF_HYBRID_SPLIT_PREFILL": "1"},
+                            ),
+                            patch.dict(
+                                sys.modules,
+                                {
+                                    "sglang.srt.runtime_context": NS(
+                                        get_disagg=lambda: NS(
+                                            language_model_only=True,
+                                            disaggregation_decode_allocation_policy="early",
+                                            disaggregation_transfer_backend="mooncake",
+                                        ),
+                                        get_memory=lambda: NS(
+                                            disable_radix_cache=True,
+                                            enable_unified_memory=False,
+                                            enable_hierarchical_cache=False,
+                                        ),
+                                        get_spec=lambda: NS(speculative_algorithm=None),
+                                        get_exec=lambda: NS(
+                                            graph=NS(enable_torch_compile=False)
+                                        ),
+                                    ),
+                                    "sglang.srt.disaggregation.base.conn": NS(
+                                        StateType=state_type
+                                    ),
+                                },
+                            ),
+                            patch.object(
+                                dsv41_layerwise.dsv41_remote, "validate"
+                            ) as bind,
+                            patch.object(
+                                dsv41_layerwise.dsv41_receive, "install"
+                            ) as receive,
+                        ):
+                            dsv41_layerwise.DSV41Controller.validate(controller)
+                        self.assertEqual(controller.dsv41_remote, experimental_remote)
+                        self.assertEqual(
+                            bool(controller.dsv4_split_schema), not experimental_remote
+                        )
+                        self.assertEqual(bind.call_count, int(experimental_remote))
+                        self.assertEqual(
+                            receive.call_count,
+                            int(experimental_remote and role == "decode"),
+                        )
+                        self.assertEqual(controller._layer_handles, [])
+
     def test_dsv4_split_negotiates_swa_capacity_and_commits_page_aligned_cut(self):
         self.assertFalse(self.controller(dsv4=True).split_prefill)
         with patch.dict(os.environ, {"HANDOFF_HYBRID_SPLIT_PREFILL": "1"}):

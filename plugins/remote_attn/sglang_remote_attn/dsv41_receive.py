@@ -80,6 +80,9 @@ def install(controller, manager, role):
     manager._staging_handler = handler
     prealloc = controller.scheduler.disagg_decode_prealloc_queue
     transfer = prealloc.transfer_queue
+    # Native init decided this before the plugin enabled staging. Publish now
+    # so register_decode_req runs before the transfer queue polls this room.
+    prealloc._defer_publish = False
     prealloc.enable_staging = transfer.enable_staging = True
     transfer.staging_handler = handler
     # TE registration alone does not own torch storage. Retain the ring/KV

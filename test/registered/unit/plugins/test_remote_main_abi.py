@@ -16,6 +16,7 @@ import time
 import unittest
 from collections import deque
 from contextlib import contextmanager, nullcontext
+from dataclasses import dataclass
 from http import HTTPStatus
 from pathlib import Path
 from types import ModuleType, SimpleNamespace
@@ -307,6 +308,109 @@ class TestRemoteMainABI(CustomTestCase):
             f.handler.register_decode_req(
                 7, SimpleNamespace(req=f.req, kv_receiver=f.receiver)
             )
+
+    def test_late_receive_ring_registers_before_staging_poll(self):
+        f = self.scatter_fixture(False)
+        handler = f.handler
+        handler._room_to_decode_req.clear()
+        handler._room_to_receiver.clear()
+        handler._room_tokens.clear()
+        handler.kv_buffer_info["page_size"] = 2
+        handler._defer_scatter = False
+        req_type = definitions(
+            NATIVE / "decode.py",
+            {"DecodeRequest"},
+            {
+                "dataclass": dataclass,
+                "HiCacheRestoreResult": SimpleNamespace(PENDING=0),
+            },
+        )["DecodeRequest"]
+        dr = req_type(req=f.req, kv_receiver=f.receiver)
+        f.req.time_stats = SimpleNamespace(
+            set_decode_transfer_queue_entry_time=lambda: None
+        )
+        f.receiver.require_staging = True
+        f.receiver.chunk_staging_infos = []
+        f.manager.kv_args.kv_data_ptrs = [f.destination.data_ptr()]
+        f.manager.kv_buffer_tensors = dict(
+            k_buffers=[f.destination], v_buffers=[], page_size=2
+        )
+        f.manager.engine = SimpleNamespace()
+        transfer = SimpleNamespace(enable_staging=False)
+        prealloc = SimpleNamespace(
+            transfer_queue=transfer,
+            _defer_publish=True,
+            scheduler=handler.scheduler,
+            _num_published_destinations=0,
+            _transfer_page_indices=lambda _, indices, __: indices.numpy(),
+        )
+        handler.scheduler.disagg_decode_prealloc_queue = prealloc
+        handler.scheduler.enable_overlap = False
+        c = SimpleNamespace(
+            _schema=lambda _: {},
+            config=SimpleNamespace(recv_host_staging=True),
+            pool=SimpleNamespace(page_size=2),
+            scheduler=handler.scheduler,
+            tp_size=1,
+            rank=0,
+        )
+        install = definitions(
+            PLUGIN / "dsv41_receive.py",
+            {"install"},
+            {
+                "__package__": "sglang_remote_attn",
+                "dsv41_staging": SimpleNamespace(buffers=lambda *_: [f.destination]),
+                "logger": logging.getLogger(__name__),
+            },
+        )["install"]
+        with patch.dict(
+            sys.modules,
+            {
+                "sglang.srt.disaggregation.common.staging_handler": module(
+                    "sglang.srt.disaggregation.common.staging_handler",
+                    DecodeStagingContext=SimpleNamespace,
+                    DecodeStagingHandler=lambda *_: handler,
+                    init_staging_allocator=lambda *_args, **_kwargs: f.allocator,
+                ),
+            },
+        ):
+            f.manager._register_staging_memory = lambda *_: None
+            install(c, f.manager, "decode")
+        self.assertFalse(prealloc._defer_publish)
+        self.assertTrue(transfer.enable_staging)
+        self.assertFalse(hasattr(dr, "_staging_scatter_done"))
+
+        def metadata(*_args, **_kwargs):
+            self.assertTrue(handler.is_staging_room(7))
+            self.assertFalse(handler.is_done(dr))
+
+        f.receiver.send_metadata = metadata
+        destinations = SimpleNamespace(HOST="host")
+        publish = definitions(
+            NATIVE / "decode.py",
+            {"_send_kv_metadata"},
+            {"KVTransferDestination": destinations},
+            owner="DecodePreallocQueue",
+        )["_send_kv_metadata"]
+        publish(prealloc, dr, torch.arange(4), 2, metadata_buffer_preassigned=True)
+        self.assertTrue(handler.is_staging_room(7))
+        polls = SimpleNamespace(Failed=0, Transferring=2, Success=4)
+        f.receiver.poll = lambda: polls.Success
+        poll = definitions(
+            NATIVE / "utils.py",
+            {"poll_and_all_reduce_with_staging"},
+            {
+                "KVPoll": polls,
+                "_poll_with_failure_injection": lambda receivers: [
+                    receiver.poll() for receiver in receivers
+                ],
+                "_all_reduce_polls": lambda values, _: values,
+            },
+        )["poll_and_all_reduce_with_staging"]
+        self.assertEqual(poll([dr], handler, None), [polls.Transferring])
+        self.assertTrue(handler.submit_last_scatter_async(7))
+        self.assertEqual(poll([dr], handler, None), [polls.Success])
+        self.assertTrue(handler.is_done(dr))
 
     def test_first_dsv_registration_publishes_aux_strides_without_customized_info(self):
         native = definitions(

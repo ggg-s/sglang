@@ -353,7 +353,6 @@ class DSV41Controller(Controller):
         s = self.scheduler
         self.dsv4_split_dspark = dspark_requested()
         native_split = self.dsv4_split_dspark or self.split_dpa or self.split_pcp
-        self.dsv41_remote = self.config.mode == "remote" and not native_split
         if not hasattr(self, "remote_targets"):
             self.remote_targets = {}
         if self.config.mode not in ("layerwise", "remote"):
@@ -429,6 +428,8 @@ class DSV41Controller(Controller):
             raise ValueError(
                 "Flash DSpark/DPA/PCP requires the native paged split-prefill layout"
             )
+        native_split = native_split or self.dsv4_split_schema is not None
+        self.dsv41_remote = self.config.mode == "remote" and not native_split
         if self.dsv41_remote:
             dsv41_remote.validate(self, runner, role)
 
