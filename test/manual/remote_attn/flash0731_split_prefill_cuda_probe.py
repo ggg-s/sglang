@@ -17,7 +17,6 @@ from sglang.srt.mem_cache.allocator.swa import SWATokenToKVPoolAllocator
 from sglang.srt.mem_cache.unified_cache.component_type import ComponentType
 from sglang_remote_attn import dsv4_split_prefill, pd_mesh
 from sglang_remote_attn import qwen_split_prefill as split
-from sglang_remote_attn.split_budget_ledger import BudgetLedger, LocalStore
 from sglang_remote_attn.split_decode_budget import DecodeBudget
 
 PAGE, WINDOW = 256, 128
@@ -145,7 +144,7 @@ def compressor(ratio, dim, online, rid, table, full_to_swa):
     return NS(run=run, state=state, inputs=inputs, ape=ape, ring_size=ring_size)
 
 
-def measure_forward(controller, phase, tokens, forward, req=None):
+def measure_forward(controller, phase, tokens, forward):
     worker = NS(model_runner=NS(_pre_layerwise=controller))
     batch = NS(
         forward_mode=NS(
@@ -156,21 +155,6 @@ def measure_forward(controller, phase, tokens, forward, req=None):
         extend_num_tokens=tokens,
         batch_size=lambda: 1,
     )
-    if phase == "suffix":
-        if req is None:
-            budget = controller.split_prefill_decode_budget
-            key = "compressor-warmup"
-            budget.ledger.reserve(
-                key,
-                worker=budget.worker,
-                cap=tokens,
-                minimum=1,
-                rate=max(tokens, split.MIN_SUFFIX_TOKENS) * 1000 / budget.stall_ms,
-                limit=1,
-            )
-            assert budget.ledger.commit(key, tokens, controlled=False)
-            req = NS(_hybrid_split_time_budget=(budget, key))
-        batch.reqs = [req]
     result = split.time_suffix_forward(lambda *_: NS(output=forward()), worker, batch)
     torch.cuda.synchronize()
     split.record_completed_suffix(controller, result)
@@ -184,7 +168,7 @@ def negotiate(adaptive, schedule, p_table, p_swa, d_pages):
             patience_ms=200,
             pinned_chunk=False,
             max_cap=LENGTH // 2,
-            ledger=BudgetLedger(LocalStore(), g=1, stall_ms=600),
+            min_cap=2560,
         )
         if adaptive
         else None
@@ -197,7 +181,6 @@ def negotiate(adaptive, schedule, p_table, p_swa, d_pages):
         split_prefill_chunk_size=1024,
         split_prefill_budget=1536,
         split_prefill_auto_cap=0,
-        split_prefill_max_outstanding=1,
         split_prefill_defer_ticks=150,
         split_prefill_patience_ticks=15,
         split_prefill_prefix_rate=None,
@@ -263,14 +246,9 @@ def negotiate(adaptive, schedule, p_table, p_swa, d_pages):
         PREFIX_HIT,
         (*peer._hybrid_split_limits, getattr(peer, "_hybrid_split_suffix_cap", 0)),
         rates,
-        alpha=getattr(peer, "_hybrid_split_alpha", 1_000_000),
     )
     assert reason == "selected"
     assert cut == (6656 if adaptive else 7936)
-    if adaptive:
-        _, key = request._hybrid_split_time_budget
-        assert budget.ledger.commit(key, LENGTH - cut, controlled=True)
-        controller.probe_request = request
     return controller, peer, reserve_start, cut, offer
 
 
@@ -404,22 +382,9 @@ def run(transport, online, adaptive):
         assert not d_swa[retired].any()
         retained = d_table[1, start - PAGE :].long()
         assert torch.equal(d_swa[retained], retained)
-
-        def suffix_forward(start=start, end=end):
-            for pieces, (_, _, d, _, _) in zip(outputs, compressors):
-                pieces.append(d.run(start, end))
-
-        if adaptive:
-            measure_forward(
-                controller,
-                "suffix",
-                end - start,
-                suffix_forward,
-                req=controller.probe_request,
-            )
-        else:
-            suffix_forward()
-            torch.cuda.synchronize()
+        for pieces, (_, _, d, _, _) in zip(outputs, compressors):
+            pieces.append(d.run(start, end))
+        torch.cuda.synchronize()
 
     errors = []
     decode_errors = []
@@ -457,7 +422,7 @@ def run(transport, online, adaptive):
 if __name__ == "__main__":
     os.environ["MC_FORCE_TCP"] = "1"
     torch.cuda.set_device(0)
-    adaptive = os.environ.get("HANDOFF_SPLIT_ADAPTIVE", "1") == "1"
+    adaptive = os.environ.get("HANDOFF_SPLIT_ADAPTIVE", "0") == "1"
     with Transport() as transport:
         result = [run(transport, online, adaptive) for online in (False, True)]
         print(

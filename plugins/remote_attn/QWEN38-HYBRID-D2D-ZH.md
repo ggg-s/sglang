@@ -120,8 +120,6 @@ Remote attention 用于 D2D 迁移。P→D Remote 早接纳作为实验功能，
 
 `HANDOFF_HYBRID_SPLIT_PREFILL` 默认 `1`，在 P、D 两端设为 `0` 可做原生 PD 对照。
 至少 4096 token 的纯文本请求可参与协商。P 配置切点，D 配置续算批大小。
-默认使用下文的 decode 时间预算闭环。以下固定切点、分块和让路参数描述静态对照，
-在 P、D 两端设 `HANDOFF_SPLIT_ADAPTIVE=0` 启用。
 
 - 选中的 D 先做准入，选中的 P 按本机实际命中前缀 `H` 计算 cut。
   默认 `HANDOFF_SPLIT_CUT_BASIS=miss`。未命中量为 `N - H`，D 接手其中
@@ -147,7 +145,7 @@ Remote attention 用于 D2D 迁移。P→D Remote 早接纳作为实验功能，
   预留一个名额，涵盖等待 P 传输和 D 续算的请求。D 达到该上限或 decode 批次已满时，
   新请求走原生 PD。续算完成、原生 PD 完成或请求终止清理时归还名额。
   默认上限是压测起点，可按在途 decode 的 token 间隔调整。
-- 静态模式下，D 的 `HANDOFF_HYBRID_SPLIT_PREFILL_CHUNK_SIZE` 默认 `4096`，以 D 的
+- D 的 `HANDOFF_HYBRID_SPLIT_PREFILL_CHUNK_SIZE` 默认 `4096`，以 D 的
   `--max-prefill-tokens` 为上限。D 声明最多承接半个 prompt，分块完成续算，
   并向 P 声明 `max(实际续算块上限, 2048)` 作为 chunk cap。
   这个设置独立于原生 `--chunked-prefill-size`。
@@ -165,12 +163,12 @@ C1 的 TTFT p90 下降 14.3%，ITL 均值增加 0.5%。更换模型、硬件或�
 [H100 1P1D 自适应 cap 复测](validation/qwen-split-prefill-adaptive-h100.md)
 记录了 `4e360aa4f2` 在 C=8 的等并发对照、C=7→14 的达标边界和 ITL 代价。
 
-#### 静态对照中的后缀上限
+#### 自适应后缀上限（实验）
 
 | 对照 | P 侧 | D 侧 |
 | --- | --- | --- |
-| 按请求切点约束 | `HANDOFF_SPLIT_SUFFIX_CAP_TOKENS=auto`，也可设整数上限 | `HANDOFF_SPLIT_CAP_AUTO=0` |
-| 按实测速率估算 | `HANDOFF_SPLIT_SUFFIX_CAP_TOKENS=auto` | `HANDOFF_SPLIT_CAP_AUTO=1` |
+| 请求切点约束（默认） | `HANDOFF_SPLIT_SUFFIX_CAP_TOKENS=auto`，也可设整数上限 | `HANDOFF_SPLIT_CAP_AUTO=0` |
+| 自适应 | `HANDOFF_SPLIT_SUFFIX_CAP_TOKENS=auto` | `HANDOFF_SPLIT_CAP_AUTO=1` |
 
 D 默认用 `HANDOFF_SPLIT_SUFFIX_BUDGET_S=2.0` 将实测续算速度换算为整段
 后缀预算，先按 512 token 向下对齐并保留 2048 token 的估算下限。
@@ -188,48 +186,27 @@ P 若配置整数 cap，`miss` 路径仍取该值和 D 宣告上限的较小值�
 D 可用 `HANDOFF_SPLIT_DEFER_PATIENCE_TICKS` 调整提前结束等待的阈值，
 默认 15，设为 0 仅关闭早退。
 
-#### Decode 时间预算闭环
+#### Decode 时间预算闭环（实验）
 
-D 的各 attention TP leader 使用同一 D 实例的原生分布式 Store，通过 CAS
-原子维护 GPU 时间余额和请求预留。多个 P 竞争同一份余额；独立 D 实例使用各自的
-Store。DPA workers 共用账本，纯 TP 请求只由 leader 扣账。
+两端设置 `HANDOFF_SPLIT_ADAPTIVE=1` 启用。D 的 TP rank 0 在原生结果
+处理后读取 suffix 和 decode 的 CUDA event 时间，用后缀占有效 forward 时间的比例
+调整后缀份额 `share`。初始份额为 25%，范围为 5% 到 50%，每个反馈窗口最多
+相对调整 10%。D 将 `share × prompt 长度` 按 512 token 向下对齐，应用后缀
+地板和 D 的最长 prompt 限制，再以该请求可交接的后缀长度为上限。
+默认 `HANDOFF_SPLIT_DECODE_BUDGET_G=1.0`，对应目标占比 `g / (1 + g)`。
+如果份额已到 5% 且仍超目标，就逐窗减少准入比例，并保留至少 5% 探测。
+g=0 时 D 拒绝实验 split。
 
-控制状态是 `α`，初值 1，范围为 0 到 1。P 根据未命中量和所选 D 的速率算候选
-后缀 `miss × μ_D / (μ_P + μ_D)`，缺少速率样本时用默认 25% miss。
-P 用 `min(α × 候选量, D 预留上限)` 选择合法页对齐切点，保留至少一个未命中
-token 给 P。实际 suffix 不足 2048 时走原生 PD。切点和未缩放候选量使用已有
-completion metadata 的空闲槽返回 D，α 随现有 bootstrap offer 发送。
-
-默认 `HANDOFF_SPLIT_DECODE_BUDGET_G=1.0`，目标占比为 `g / (1 + g)`。
-D 仅统计有 decode 竞争的 suffix 时间，以累计 forward 时间达到 `stall_ms`
-作为反馈窗口。按 `clip(1 + 0.25 × (target - delta) / target, 0.9, 1.1)`
-调整 α。全部受预算上限约束的窗口冻结 α；α 导致后缀过小时，后续 decode 窗口
-可以恢复 α。空闲 suffix 单独结算，避免压低 α。g=0 拒绝 split。
-
-每完成一段 decode，补充 `g × 实测 decode GPU 毫秒`，多个 DP completion 的
-补充时间按原生 forward_iter 去重，每个 step 取各 DP leader 报告的最大耗时。没有 decode 需求且没有在执行的 forward 时按空闲时间
-补充。余额加未完成预留的上限为 `max(stall_ms, 最小合法后缀预计耗时) + r × H`，
-r 为每单位墙钟时间的实测
-补充速率 EMA，H 为 offer 到 KV 就绪的实测时间 EMA。没有样本时从一块时间额度
-起步。冷启动速率按起步 chunk 和 stall_ms 估计，并容纳至少一段合法后缀。
-上限收缩时保留已有预留，余额不足则拒绝新的 split offer。
-
-D 发 offer 即扣除预留，KV 交接后按实际切点退回差额。每块完成后用 CUDA event
-实测耗时替换该块预估，超支成为后续额度先偿还的欠账。取消释放未来工作预留，
-已经在执行的 chunk 等结果完成再结算。预留跨反馈窗口保留，重试对同一次预留
-幂等处理，重建请求时释放旧尝试。较保守的预留可能暂时降低其他 P 的准入机会。
-
-`[handoff-split-budget]` 打印 alpha、delta、target、credit_ms、reserved_ms、capacity_ms 和
-outstanding，`[handoff-split-decision] stage=prefill_cut` 打印候选量、α 和实际
-suffix。单块执行继续由 `[handoff-split-chunk]` 观察。
-共享 GPU 上并行的 suffix 逐请求保守结算，重叠时间可能被累计计费，需结合 DPA
-实测检查准入利用率、ITL 和吞吐。
-
+P 使用这次选中的 D 的速率计算约等耗时的后缀
+`miss × μ_D / (μ_P + μ_D)`，再应用协商上限。缺样本或可选速率扩展无效时用原 miss 比例，
+默认 25%。实验 miss 路径将后缀至少抬到 2048 token，同时给 P 保留至少一个
+未命中 token。未命中长度或协商上限容不下 2048 时回退原生 PD，并记录
+`split_too_small`。
 D 的 `N ≥ 2 × chunk` 是短 prompt 的准入启发式。
 
 D 用 `HANDOFF_SPLIT_STALL_MS`（默认 600）估算单块大小，动态块下限为
-1024 token，仍受调度器的 prefill token 上限约束。采样前从 4096 token 起步。
-`HANDOFF_HYBRID_SPLIT_PREFILL_CHUNK_SIZE` 设为正数可固定块大小。D 在准入时通过
+1024 token，仍受调度器的 prefill token 上限约束。显式设置
+`HANDOFF_HYBRID_SPLIT_PREFILL_CHUNK_SIZE` 则固定块大小。D 在准入时通过
 原有 TP MIN 投票发布 rank 0 的估计，保留各 rank 的准入否决和单块 token 上限，
 并随请求保存投票结果。每块按预计耗时除以实测 decode 步时确定让路轮数，
 末块按实际 token 数估算。缺少速率或步时样本时使用
@@ -238,6 +215,7 @@ D 用 `HANDOFF_SPLIT_STALL_MS`（默认 600）估算单块大小，动态块下�
 实际 TPOT 与 ITL 仍需实测。
 
 闭环也会在 D 的 TP rank 0 给普通 decode forward 记录 CUDA event。
+`HANDOFF_SPLIT_ADAPTIVE=0` 可继续使用原有静态或按速率估算的 cap 对照。
 内网原型数据见 [RTX 5090 闭环实验](validation/qwen-split-prefill-closed-loop-5090.md)。
 
 沿用同 TP 的原生 Mooncake、early device allocation 和 page-1 KV 配置。

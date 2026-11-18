@@ -138,8 +138,6 @@ def select_swa_prealloc_start(
     from sglang.srt.disaggregation.mooncake.conn import MooncakeKVReceiver
 
     req, receiver = decode_req.req, decode_req.kv_receiver
-    receiver._dsv4_split_offer = None
-    already_reserved = getattr(req, "_hybrid_split_reservation", None) is controller
     eligible = (
         prefix_len == 0
         and fill_len == len(req.origin_input_ids)
@@ -147,11 +145,8 @@ def select_swa_prealloc_start(
         and type(receiver) is MooncakeKVReceiver
         and not receiver.require_staging
         and split.request_blocker(req) is None
-        and (
-            already_reserved
-            or controller.split_prefill_outstanding
-            < controller.split_prefill_max_outstanding
-        )
+        and controller.split_prefill_outstanding
+        < controller.split_prefill_max_outstanding
         and queue.scheduler.running_batch.batch_size()
         < queue.scheduler.max_running_requests
     )
@@ -168,7 +163,6 @@ def select_swa_prealloc_start(
         [int(eligible), max(0, min(extra_swa_budget, free_extra))]
     )
     if not allowed:
-        split.release_reservation(req)
         return None
     earliest_start = max(0, normal_start - extra // page * page)
     first_cut = max((fill_len + 1) // 2, earliest_start + window)
@@ -176,7 +170,6 @@ def select_swa_prealloc_start(
         controller, req, None, min_cut=first_cut
     )
     if offer is None:
-        split.release_reservation(req)
         split.log_decision(controller, req, "decode_offer", reason)
         return None
     if offer.suffix_cap:
@@ -188,12 +181,10 @@ def select_swa_prealloc_start(
         else split.min_suffix_tokens(fill_len)
     )
     if min_cut > fill_len - floor:
-        split.release_reservation(req)
         split.log_decision(controller, req, "decode_offer", "dsv4_suffix_too_short")
         return None
 
-    if not already_reserved:
-        controller.split_prefill_outstanding += 1
+    controller.split_prefill_outstanding += 1
     req._hybrid_split_reservation = controller
     receiver._dsv4_split_offer = min_cut, offer
     return min(normal_start, window_start(min_cut, window, page))
@@ -241,7 +232,6 @@ def advertise(queue, dr):
         chunk_size=offer.chunk,
         suffix_cap=receiver._hybrid_split_suffix_cap,
     )
-    split.log_budget(controller, "offer", req)
 
 
 def encode_offer(receiver):

@@ -390,7 +390,6 @@ def _reset_retracted(original, req):
             cert.admission.overlap.drain(req)
     if prefix_stream.stream_for(req) is not None:
         raise RuntimeError("prefix stream must retire before request reset")
-    qwen_split_prefill.release_reservation(req)
     result = original(req)
     if (
         getattr(req, "_remote_attn_decode_cache_enabled", False)

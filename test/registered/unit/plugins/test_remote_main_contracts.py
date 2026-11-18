@@ -480,12 +480,10 @@ class TestGatewayControlPaths(CustomTestCase):
         import tempfile
         import threading
         import time
-
         from sglang.srt.environ import envs
         from sglang.srt.managers.scheduler_components.idle_sleeper import IdleSleeper
         from sglang.srt.runtime_context import get_parallel
-        from sglang_remote_attn import control_wakeup
-        from sglang_remote_attn import handoff_control as runtime
+        from sglang_remote_attn import control_wakeup, handoff_control as runtime
 
         entered, stopped = threading.Event(), threading.Event()
         failures, executed = [], []
@@ -919,8 +917,8 @@ class TestQwenHybridD2D(CustomTestCase):
 
     def test_hybrid_prefill_prefix_cache_enabled_decode_stays_disabled(self):
         """A P cache hit must not be rejected by a D-only ownership restriction."""
-        from sglang.srt.mem_cache.unified_cache.component_type import ComponentType
         from sglang.srt.mem_cache.unified_radix_cache import UnifiedRadixCache
+        from sglang.srt.mem_cache.unified_cache.component_type import ComponentType
 
         # Startup validates cache type/policy; the native CUDA probe exercises
         # actual checkpoint, match, CoW and native PD send/retirement.
@@ -1392,9 +1390,7 @@ class TestSplitPD(CustomTestCase):
                 },
             )
         )
-        self.stack.enter_context(
-            patch.dict(os.environ, {"HANDOFF_SPLIT_ADAPTIVE": "0"}, clear=True)
-        )
+        self.stack.enter_context(patch.dict(os.environ, {}, clear=True))
 
     def controller(
         self, role="prefill", *, hybrid=False, dsv4=False, max_prefill_tokens=16384
@@ -1526,8 +1522,11 @@ class TestSplitPD(CustomTestCase):
         with patch.dict(os.environ, {"HANDOFF_HYBRID_SPLIT_PREFILL": "1"}):
             self._check_dsv4_split(adaptive=False)
 
-    def test_dsv4_split_defaults_to_page_aligned_adaptive_offer(self):
-        with patch.dict(os.environ, {"HANDOFF_HYBRID_SPLIT_PREFILL": "1"}, clear=True):
+    def test_dsv4_split_freezes_page_aligned_adaptive_offer(self):
+        with patch.dict(
+            os.environ,
+            {"HANDOFF_HYBRID_SPLIT_PREFILL": "1", "HANDOFF_SPLIT_ADAPTIVE": "1"},
+        ):
             self._check_dsv4_split(adaptive=True)
 
     def test_dsv4_adaptive_keeps_offer_with_invalid_optional_hints(self):
@@ -1639,14 +1638,14 @@ class TestSplitPD(CustomTestCase):
         page, window = 256, 128
         p = self.controller(dsv4=True)
         d = self.controller("decode", dsv4=True, max_prefill_tokens=4200)
-        self.assertEqual(p.split_prefill_adaptive, adaptive)
-        self.assertEqual(d.split_prefill_adaptive, adaptive)
         chunk = 1280 if invalid_hints else 2560
         if adaptive:
             p.split_prefill_prefix_rate = 6000
             budget = d.split_prefill_decode_budget
-            self.assertFalse(budget.pinned_chunk)
-            budget.ledger._update(lambda state: state.update(credit=375.0))
+            budget.share = 0.05
+            for _ in range(8):
+                budget.observe(2560, 200, suffix=True, rank=1)
+            self.assertLess(budget.coverage, 1)
             d.agree = lambda vote: (
                 [*vote[:2], chunk + 140, 4500, -20_000, vote[-1]]
                 if len(vote) == 6
@@ -1723,8 +1722,6 @@ class TestSplitPD(CustomTestCase):
         self.assertEqual(d.split_prefill_outstanding, 0)
         start = reserve(3072 if adaptive else 2048)
         self.assertEqual(start, 5632 if adaptive else 6144)
-        self.assertEqual(reserve(3072 if adaptive else 2048), start)
-        self.assertEqual(d.split_prefill_outstanding, 1)
         self.assertEqual(receiver._dsv4_split_offer[0], 5888 if adaptive else 6400)
         req.kv.req_pool_idx = 0
         req.kv.set_row_len(length)
@@ -1879,7 +1876,7 @@ class TestSplitPD(CustomTestCase):
                     lambda *_: True, NS(scheduler=NS(_pre_layerwise=follower)), dummy, 1
                 )
                 self.split.finalize_bootstrap(lambda *_: True, None, dummy)
-                follower.agree.assert_called_once_with([self.split.TP_MIN_IDENTITY] * 9)
+                follower.agree.assert_called_once_with([self.split.TP_MIN_IDENTITY] * 8)
                 self.assertEqual(
                     dummy._hybrid_split_limits, source._hybrid_split_limits
                 )
@@ -2334,12 +2331,11 @@ class TestSplitPD(CustomTestCase):
             controller.split_dpa = True
         p.split_prefill_prefix_rate = 6000
         d.split_prefill_decode_budget.suffix_rate = 4500
-        self.fund_time_budget(d)
         _, _, req, dr = self.bootstrap(prefill=p, decode=d)
         self.assertEqual(req._hybrid_split_rates, [4500, 6000])
         self.assertEqual(dr.kv_receiver._hybrid_split_schedule[3], 4500)
         self.split.init_input(self.match, req, object())
-        self.assertEqual(req._hybrid_split_at, 18725)
+        self.assertEqual(req._hybrid_split_at, 24576)
 
     def test_dpa_prefill_samples_only_the_attention_group_leader(self):
         with patch.dict(os.environ, {"HANDOFF_SPLIT_ADAPTIVE": "1"}):
@@ -2450,7 +2446,7 @@ class TestSplitPD(CustomTestCase):
         )
         self.assertEqual(native.call_count, 2)
 
-    def test_static_cut_uses_prompt_bound_without_a_fixed_cap(self):
+    def test_default_cut_uses_prompt_bound_without_a_fixed_cap(self):
         for hybrid in (False, True):
             for length, prefix, expected in (
                 (16384, 0, 12288),
@@ -2516,17 +2512,6 @@ class TestSplitPD(CustomTestCase):
                 self.split.init_input(self.match, req, object())
                 self.assertEqual(req._hybrid_split_at, 61440)
 
-    def fund_time_budget(self, controller):
-        # Layout/TP tests arrange a trained D with ample time credits. Atomic
-        # admission and cold-start limits are exercised by TestSplitBudget.
-        budget = controller.split_prefill_decode_budget
-        if budget is not None and budget.ledger is not None:
-            budget.ledger._update(
-                lambda state: state.update(
-                    credit=60000.0, handoff_ms=60000.0, refill_rate=1.0
-                )
-            )
-
     def test_dynamic_suffix_cap_is_clamped_per_prompt_and_round_trips(self):
         for mode in ("HANDOFF_SPLIT_ADAPTIVE", "HANDOFF_SPLIT_CAP_AUTO"):
             with (
@@ -2543,25 +2528,41 @@ class TestSplitPD(CustomTestCase):
                 d = self.controller("decode")
                 budget = d.split_prefill_decode_budget
                 if budget is None:
-                    d.split_prefill_auto_cap = 60000
+                    d.split_prefill_auto_cap = 60_000
                 else:
-                    budget.suffix_rate = 10000
-                    self.fund_time_budget(d)
-                short = self.offer(d, length=8193)
-                self.assertEqual(short.kv_receiver._hybrid_split_suffix_cap, 4096)
-                self.split.release_reservation(short.req)
+                    self.assertEqual(budget.share, 0.25)
+                    for length, cap in ((8193, 2048), (98305, 24576)):
+                        receiver = self.offer(d, length=length).kv_receiver
+                        self.assertEqual(receiver._hybrid_split_suffix_cap, cap)
+
+                    for _ in range(7):
+                        budget.observe(1024, 25, suffix=True, rank=0)
+                    budget.observe(1, 1400, suffix=False, rank=0)
+                    self.assertEqual(budget.share, 0.25)
+                    budget.observe(1024, 25, suffix=True, rank=0)
+                    self.assertAlmostEqual(budget.share, 0.275)
+                    for _ in range(8):
+                        budget.observe(1, 1400, suffix=False, rank=0)
+                        for _ in range(8):
+                            budget.observe(1024, 25, suffix=True, rank=0)
+                    self.assertEqual(budget.share, 0.5)
+
+                short = self.offer(d, length=8193).kv_receiver
+                self.assertEqual(short._hybrid_split_suffix_cap, 4096)
                 _, _, req, long = self.bootstrap(length=98305, decode=d)
                 self.assertEqual(long.kv_receiver._hybrid_split_suffix_cap, 49152)
                 self.assertEqual(req._hybrid_split_limits, (49153, 4096, 49152))
-                self.split.release_reservation(long.req)
+                if budget is None:
+                    self.assertEqual(d.split_prefill_auto_cap, 60_000)
+                else:
+                    self.assertEqual(budget.share, 0.5)
+
                 d.split_prefill_page_size = 256
-                request = self.request(length=98305)
                 offer, reason = self.split.negotiate_decode_offer(
-                    d, request, None, min_cut=64020
+                    d, self.request(length=98305), None, min_cut=64020
                 )
                 self.assertIsNone(reason)
                 self.assertEqual(offer.suffix_cap, 98305 - 64256)
-                self.split.release_time_budget(request)
 
     def test_auto_prefill_falls_back_to_the_negotiated_bound(self):
         with patch.dict(os.environ, {"HANDOFF_SPLIT_SUFFIX_CAP_TOKENS": "auto"}):
@@ -2585,8 +2586,7 @@ class TestSplitPD(CustomTestCase):
         for worker, rate in ((d, 6000), (other, 3000)):
             worker.split_prefill_decode_budget.suffix_rate = rate
             worker.split_prefill_decode_budget.decode_ms = 10
-            self.fund_time_budget(worker)
-        d.agree = lambda vote: [vote[0], 8192, 3072, 4500, -20_000, 1_000_000]
+        d.agree = lambda vote: [vote[0], 8192, 3072, 4500, -20_000, 1000]
         _, _, first, dr = self.bootstrap(prefill=p, decode=d, prefix=20480)
         _, _, second, _ = self.bootstrap(prefill=p, decode=other, prefix=20480)
         self.assertEqual(dr.kv_receiver._hybrid_split_limits, (24576, 3072))
@@ -2625,7 +2625,6 @@ class TestSplitPD(CustomTestCase):
                     budget = leader.split_prefill_decode_budget
                     budget.suffix_rate = 5000
                     budget.decode_ms = 20
-                    self.fund_time_budget(leader)
                     expected_schedule = (2048, 150, 10, 5000, 20_000)
                 else:
                     leader.split_prefill_auto_cap = 8192
@@ -2643,10 +2642,7 @@ class TestSplitPD(CustomTestCase):
                 leader.agree.side_effect = lambda vote: reduce_min(vote, follower_vote)
                 leader_receiver = self.offer(leader).kv_receiver
                 for receiver in (leader_receiver, follower_receiver):
-                    self.assertEqual(
-                        receiver._hybrid_split_suffix_cap,
-                        16384 if adaptive == "1" else 8192,
-                    )
+                    self.assertEqual(receiver._hybrid_split_suffix_cap, 8192)
                     self.assertEqual(
                         getattr(receiver, "_hybrid_split_schedule", None),
                         expected_schedule,
@@ -2702,22 +2698,29 @@ class TestSplitPD(CustomTestCase):
                 d = self.controller("decode", max_prefill_tokens=max_tokens)
                 budget = d.split_prefill_decode_budget
                 budget.suffix_rate = 1000
-                self.fund_time_budget(d)
                 receiver = self.offer(d).kv_receiver
                 self.assertEqual(receiver._hybrid_split_limits[1], expected)
 
-    def test_cold_small_pinned_chunk_can_offer_a_legal_suffix(self):
+    def test_feedback_coverage_recovers_after_reaching_share_floor(self):
         with patch.dict(
             os.environ,
-            {
-                "HANDOFF_SPLIT_ADAPTIVE": "1",
-                "HANDOFF_HYBRID_SPLIT_PREFILL_CHUNK_SIZE": "512",
-            },
+            {"HANDOFF_SPLIT_ADAPTIVE": "1", "HANDOFF_SPLIT_DECODE_BUDGET_G": "0.2"},
         ):
             d = self.controller("decode")
-        dr = self.offer(d)
-        self.assertEqual(dr.kv_receiver._hybrid_split_limits[1], 512)
-        self.assertGreaterEqual(dr.kv_receiver._hybrid_split_suffix_cap, 2048)
+        budget = d.split_prefill_decode_budget
+        for _ in range(8):
+            budget.observe(2048, 200, suffix=True, rank=1)
+        self.assertAlmostEqual(budget.share, 0.225)
+        self.assertEqual(budget.coverage, 1)
+        for _ in range(49 * 8):
+            budget.observe(2048, 200, suffix=True, rank=1)
+        self.assertEqual(budget.share, 0.05)
+        self.assertAlmostEqual(budget.coverage, 0.05)
+        for _ in range(35 * 8):
+            budget.observe(1, 200, suffix=False, rank=1)
+            budget.observe(2048, 10, suffix=True, rank=1)
+        self.assertEqual(budget.coverage, 1)
+        self.assertGreater(budget.share, 0.05)
 
     def test_feedback_observes_prefill_overlap_and_decode_only_when_enabled(self):
         from sglang_remote_attn import decode_overlap
@@ -2740,10 +2743,6 @@ class TestSplitPD(CustomTestCase):
             rate_only_follower = self.controller("decode")
         p.rank = follower.rank = rate_only_follower.rank = 1
         p.prefill_overlap = NS()
-        dr = self.offer(d)
-        budget, key = dr.req._hybrid_split_time_budget
-        budget.ledger.commit(key, 4096, controlled=True)
-        suffix.reqs = [dr.req]
         static = self.controller("decode")
         for controller, batch, ms, phase in (
             (static, decode, 10, None),
@@ -2790,10 +2789,6 @@ class TestSplitPD(CustomTestCase):
             _hybrid_split_extend=True,
             extend_num_tokens=4096,
         )
-        dr = self.offer(d)
-        budget, key = dr.req._hybrid_split_time_budget
-        budget.ledger.commit(key, 4096, controlled=True)
-        batch.reqs = [dr.req]
         trace = []
         start, end = Mock(), Mock()
         start.record.side_effect = lambda _: trace.append("start")
@@ -3132,7 +3127,7 @@ class TestSplitPD(CustomTestCase):
                     feedback.suffix_rate = 20_000
                     feedback.decode_ms = 10
                     decode.agree = lambda vote: (
-                        [vote[0], 8192, 4096, rate, -20_000, 1_000_000]
+                        [vote[0], 8192, 4096, rate, -20_000, 1000]
                         if len(vote) == 6
                         else vote
                     )
@@ -3162,7 +3157,6 @@ class TestSplitPD(CustomTestCase):
 
                 scheduler.waiting_queue = waiting = WaitingQueue([req])
                 running = Mock()
-                running.reqs = None
                 running.batch_size.return_value = 2
 
                 def prepare_for_extend(**_):

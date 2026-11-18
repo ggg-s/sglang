@@ -46,16 +46,14 @@ native completion、Remote GPU reader 和 TP，D 等待 scatter/forward/IO/TP；
 
 P、D 两端显式设置 `HANDOFF_HYBRID_SPLIT_PREFILL=1` 和
 `HANDOFF_PRE_LAYERWISE=remote`，使用原生 Mooncake、同 TP、early allocation，
-保持 `HANDOFF_EXPERIMENTAL_PD_REMOTE=0`。Split 启用后默认使用 decode 时间预算闭环。
-两端设 `HANDOFF_SPLIT_ADAPTIVE=0` 可跑静态对照。
+保持 `HANDOFF_EXPERIMENTAL_PD_REMOTE=0`。两端再设
+`HANDOFF_SPLIT_ADAPTIVE=1` 可启用 decode 时间预算闭环，缺省使用静态策略。
 
 D 先按可用 SWA 页和后缀预算协商最早切点。P 匹配缓存后选择页对齐切点，
 传输已有压缩 KV、C4 indexer 及切点处的 SWA 窗口和 C4 压缩状态。
 切点落在完整的 C128 块边界，由 D 续算后缀并采样首 token。中间块也按页对齐，
 末块使用实际剩余长度。自适应时，D 按 TP 协商后的速率和步时派生每块等待量。
-P 用 α 缩放实际候选量，再应用 D 的时间预算预留上限，实际后缀至少为 2,048 token。
-多个 P 共用所选 D 的 Store 账本，DPA workers 也共享预留。α 随已有 offer 传输，
-实际切点和候选量随已有 KV completion metadata 返回，交接后退回多预留额度。
+控制器 cap 地板包含尾页对齐余量，P 仍要求实际后缀至少为 2,048 token。
 
 D 已有前缀命中、SWA 预算不足、无合法切点或对端无法协商时使用原生 PD。
 本地 CPU 契约覆盖静态和自适应 Bootstrap、状态页重映射、原生回退及页回收。
