@@ -3,10 +3,12 @@
 import logging
 import math
 import os
+import secrets
 import time
 from http import HTTPStatus
 from typing import NamedTuple
 
+from .split_budget_ledger import ALPHA_SCALE, BudgetLedger, native_store
 from .split_decode_budget import (
     MIN_SUFFIX_TOKENS,
     RATE_LIMIT,
@@ -22,8 +24,10 @@ WIRE = b"REMOTE_ATTN_HYBRID_SPLIT_V3:"
 DECODE_PRIORITY = b"REMOTE_ATTN_SPLIT_DECODE_PRIORITY"
 SUFFIX_CAP_WIRE = b"REMOTE_ATTN_SPLIT_SUFFIX_CAP:"
 SUFFIX_RATE_WIRE = b"REMOTE_ATTN_SPLIT_RATE:"
+ALPHA_WIRE = b"REMOTE_ATTN_SPLIT_ALPHA_V1:"
 # output_ids rows are already transferred in full; native uses only slot 0.
 CUT_SLOT = 1
+CANDIDATE_SLOT = 2
 MIN_PROMPT_TOKENS = 4096
 BALANCED_CUT_RATIO = 0.75
 PREFIX_GROWTH_TOKENS = 1024
@@ -39,6 +43,7 @@ class DecodeOffer(NamedTuple):
     suffix_cap: int
     chunk: int
     schedule: tuple[int, int, int, int, int] | None
+    alpha: int | None = None
 
 
 def min_suffix_tokens(length):
@@ -83,7 +88,7 @@ def configure(controller):
             raise ValueError("split prefill requires early device KV allocation")
     scheduler = controller.scheduler
     role = scheduler.disaggregation_mode.value
-    adaptive = os.environ.get("HANDOFF_SPLIT_ADAPTIVE", "0")
+    adaptive = os.environ.get("HANDOFF_SPLIT_ADAPTIVE", "1")
     if adaptive not in ("0", "1"):
         raise ValueError("HANDOFF_SPLIT_ADAPTIVE must be 0 or 1")
     controller.split_prefill_adaptive = (
@@ -202,15 +207,6 @@ def configure(controller):
             g = read_budget("HANDOFF_SPLIT_DECODE_BUDGET_G", 1.0, allow_zero=True)
             # Keep the offered token cap within the scheduler's prompt limit.
             max_cap = min(scheduler.max_req_input_len // 2, TP_MIN_IDENTITY)
-            max_cap -= max_cap % SUFFIX_CAP_GRANULARITY
-            # A paged cut can need up to one extra partial page of suffix.
-            # Round the floor up to preserve unaligned coverage probes.
-            min_cap = min(
-                max_cap,
-                quantize_suffix_cap(
-                    MIN_SUFFIX_TOKENS + page - 1 + SUFFIX_CAP_GRANULARITY - 1
-                ),
-            )
             controller.split_prefill_decode_budget = DecodeBudget(
                 target=g / (1 + g),
                 stall_ms=read_budget("HANDOFF_SPLIT_STALL_MS", 600),
@@ -219,9 +215,13 @@ def configure(controller):
                 ),
                 pinned_chunk=bool(chunk_size),
                 max_cap=max_cap,
-                min_cap=min_cap,
             )
             budget = controller.split_prefill_decode_budget
+            if split_tp_rank(controller) == 0:
+                budget.worker = str(controller.rank)
+                budget.ledger = BudgetLedger(
+                    native_store(scheduler), g=g, stall_ms=budget.stall_ms
+                )
             if not budget.patience_ms:
                 controller.split_prefill_patience_ticks = 0
         elif auto == "1":
@@ -353,6 +353,7 @@ def negotiate_decode_offer(controller, req, reason, *, min_cut=0):
 
     chunk = controller.split_prefill_chunk_size
     budget = controller.split_prefill_decode_budget
+    alpha = None
     if budget is None:
         suffix_cap = controller.split_prefill_auto_cap
         if suffix_cap and split_tp_rank(controller) != 0:
@@ -362,6 +363,29 @@ def negotiate_decode_offer(controller, req, reason, *, min_cut=0):
     else:
         if split_tp_rank(controller) == 0:
             parameters = budget.offer(chunk, controller.split_prefill_budget, length)
+            cap, chunk, rate, negative_step, alpha = parameters
+            cap = min(cap, prompt_cap)
+            if reason is None:
+                reservation = getattr(req, "_hybrid_split_time_budget", None)
+                if reservation is None:
+                    reservation = budget, secrets.token_hex(16)
+                    req._hybrid_split_time_budget = reservation
+                _, key = reservation
+                estimate_rate = (
+                    rate
+                    or max(chunk, MIN_SUFFIX_TOKENS + page - 1) * 1000 / budget.stall_ms
+                )
+                cap, alpha = budget.ledger.reserve(
+                    key,
+                    worker=budget.worker,
+                    cap=cap,
+                    minimum=MIN_SUFFIX_TOKENS,
+                    rate=estimate_rate,
+                    limit=controller.split_prefill_max_outstanding,
+                    page=page,
+                    length=length,
+                )
+            parameters = cap, chunk, rate, negative_step, alpha
         else:
             # Publish rank 0's estimates through MIN while keeping this rank's
             # prefill limit and request veto in the same vote.
@@ -372,13 +396,19 @@ def negotiate_decode_offer(controller, req, reason, *, min_cut=0):
                 TP_MIN_IDENTITY,
                 TP_MIN_IDENTITY,
             )
-        allowed, suffix_cap, chunk, rate, neg_step_us, coverage = controller.agree(
-            [int(reason is None), *parameters]
-        )
+        try:
+            allowed, suffix_cap, chunk, rate, neg_step_us, alpha = controller.agree(
+                [int(reason is None), *parameters]
+            )
+        except BaseException:
+            release_time_budget(req)
+            raise
         chunk -= chunk % page
         if allowed and length < 2 * chunk:
+            release_time_budget(req)
             return None, "decode_split_short_for_chunk"
-        if allowed and req.bootstrap_room % 1000 >= coverage:
+        if allowed and not suffix_cap:
+            release_time_budget(req)
             return None, "decode_split_budget"
         step_us = -neg_step_us
         defer = controller.split_prefill_defer_ticks
@@ -387,10 +417,11 @@ def negotiate_decode_offer(controller, req, reason, *, min_cut=0):
         )
         schedule = chunk, defer, patience, rate, step_us
     if not allowed:
+        release_time_budget(req)
         return None, reason or "decode_peer_rejected"
     if budget is not None and not suffix_cap:
         return None, "decode_suffix_too_short"
-    return DecodeOffer(min(suffix_cap, prompt_cap), chunk, schedule), None
+    return DecodeOffer(min(suffix_cap, prompt_cap), chunk, schedule, alpha), None
 
 
 def publish_decode_offer(controller, receiver, length, min_cut, offer):
@@ -401,6 +432,8 @@ def publish_decode_offer(controller, receiver, length, min_cut, offer):
         chunk if suffix_cap else max(chunk, MIN_SUFFIX_TOKENS),
     )
     receiver._hybrid_split_suffix_cap = suffix_cap
+    if offer.alpha is not None:
+        receiver._hybrid_split_alpha = offer.alpha
     defer = controller.split_prefill_defer_ticks
     if offer.schedule is not None:
         receiver._hybrid_split_schedule = offer.schedule
@@ -459,13 +492,43 @@ def advertise(queue, dr, decode_prefix_len):
         chunk_size=offer.chunk if offer else controller.split_prefill_chunk_size,
         suffix_cap=getattr(receiver, "_hybrid_split_suffix_cap", 0),
     )
+    log_budget(controller, "offer", req)
 
 
 def release_reservation(req):
+    release_time_budget(req)
     controller = getattr(req, "_hybrid_split_reservation", None)
     if controller is not None:
         req._hybrid_split_reservation = None
         controller.split_prefill_outstanding -= 1
+
+
+def release_time_budget(req):
+    reservation = getattr(req, "_hybrid_split_time_budget", None)
+    if reservation is not None:
+        budget, key = reservation
+        budget.ledger.release(key)
+        req._hybrid_split_time_budget = None
+
+
+def log_budget(controller, stage, req=None):
+    budget = getattr(controller, "split_prefill_decode_budget", None)
+    if budget is not None and budget.ledger is not None:
+        state = budget.ledger.snapshot()
+        logger.info(
+            "[handoff-split-budget] stage=%s rid=%s alpha=%.4f delta=%s target=%.3f "
+            "credit_ms=%.1f reserved_ms=%.1f capacity_ms=%.1f outstanding=%s windows=%s",
+            stage,
+            getattr(req, "rid", None),
+            state["alpha"],
+            state["delta"],
+            state["target"],
+            state["credit_ms"],
+            state["reserved_ms"],
+            state["capacity_ms"],
+            state["outstanding"],
+            state["windows"],
+        )
 
 
 def offered_limits(req, controller):
@@ -516,7 +579,8 @@ def offered_limits(req, controller):
     if fanout and dst_ranks != set(range(dst_tp_size)):
         return None, "incompatible_destination_registration"
 
-    cuts, chunks, caps, rates = zip(*offers)
+    cuts, chunks, caps, rates, alphas = zip(*offers)
+    req._hybrid_split_peer_alpha = min(alphas)
     min_cut = max(cuts)
     suffix_cap = length - min_cut if any(caps) else 0
     return (min_cut, min(length, *chunks), suffix_cap, min(rates)), None
@@ -543,7 +607,8 @@ def _peer_limits(controller, peer, length):
         if not dsv4_split_prefill.compatible_offer(controller, peer, length, cut):
             return None, "incompatible_destination_split_layout"
     rate = getattr(peer, "_hybrid_split_suffix_rate", 0)
-    return (cut, chunk_cap, suffix_cap, rate), None
+    alpha = getattr(peer, "_hybrid_split_alpha", ALPHA_SCALE)
+    return (cut, chunk_cap, suffix_cap, rate, alpha), None
 
 
 def finalize_bootstrap(original, queue, req):
@@ -570,7 +635,15 @@ def finalize_bootstrap(original, queue, req):
             or getattr(controller, "split_pcp", False)
         ) and split_tp_rank(controller) != 0:
             prefix_rate = TP_MIN_IDENTITY
-        vote.extend([TP_MIN_IDENTITY if dummy_cp else remote_rate, prefix_rate])
+        vote.extend(
+            [
+                TP_MIN_IDENTITY if dummy_cp else remote_rate,
+                prefix_rate,
+                TP_MIN_IDENTITY
+                if dummy_cp
+                else getattr(req, "_hybrid_split_peer_alpha", ALPHA_SCALE),
+            ]
+        )
     cut, negative_cut, chunk, negative_chunk, suffix, negative_suffix, *rates = (
         controller.agree(vote)
     )
@@ -582,7 +655,8 @@ def finalize_bootstrap(original, queue, req):
         and suffix == -negative_suffix
     ):
         req._hybrid_split_limits = cut, chunk, suffix
-        req._hybrid_split_rates = rates if rates and all(rates) else None
+        req._hybrid_split_rates = rates[:2] if rates and all(rates[:2]) else None
+        req._hybrid_split_alpha = rates[2] if len(rates) == 3 else ALPHA_SCALE
     else:
         log_decision(
             controller,
@@ -612,8 +686,46 @@ def prefill_backlog_tokens(scheduler, exclude):
     )
 
 
-def select_cut(controller, length, prefix, limits, rates=None):
+def candidate_suffix(controller, length, prefix, chunk, rates):
+    miss = max(0, length - prefix)
+    ratio = controller.split_prefill_cut_ratio
+    pinned = controller.split_prefill_suffix_tokens
+    basis = controller.split_prefill_cut_basis
+    if pinned:
+        candidate = pinned
+    elif basis == "whole":
+        candidate = length - max(int(length * ratio), prefix + PREFIX_GROWTH_TOKENS)
+    elif basis == "balanced":
+        candidate = length - (length + prefix + COLLISION_BUDGET_TOKENS) // 2
+    elif rates is not None:
+        remote, local = rates
+        candidate = miss * remote // (remote + local)
+    else:
+        candidate = int(miss * (1 - ratio))
+    candidate = min(max(candidate, MIN_SUFFIX_TOKENS), miss - 1, length // 2)
+    cap = controller.split_prefill_suffix_cap
+    if cap is not None:
+        candidate = min(candidate, cap)
+    if basis == "miss" and not pinned and miss <= chunk:
+        candidate = min(candidate, chunk, length * 15 // 100)
+    return max(0, candidate)
+
+
+def select_cut(controller, length, prefix, limits, rates=None, *, alpha=ALPHA_SCALE):
     min_cut, chunk_cap, offered_suffix_cap = limits
+    if controller.split_prefill_adaptive:
+        candidate = candidate_suffix(controller, length, prefix, chunk_cap, rates)
+        suffix = min(candidate * alpha // ALPHA_SCALE, length - min_cut)
+        if offered_suffix_cap:
+            suffix = min(suffix, offered_suffix_cap)
+        page = controller.split_prefill_page_size
+        earliest = max(prefix + 1, min_cut, length - (offered_suffix_cap or length))
+        earliest = (earliest + page - 1) // page * page
+        latest = (length - MIN_SUFFIX_TOKENS) // page * page
+        if suffix < MIN_SUFFIX_TOKENS or earliest > latest:
+            return 0, "split_too_small"
+        cut = min((length - suffix + page - 1) // page * page, latest)
+        return cut, "selected"
     floor = min_suffix_tokens(length)
     ratio = controller.split_prefill_cut_ratio
     pinned_suffix = controller.split_prefill_suffix_tokens
@@ -639,12 +751,6 @@ def select_cut(controller, length, prefix, limits, rates=None):
             suffix_cap = min(suffix_cap, configured_cap)
         if miss <= chunk_cap:
             suffix_cap = min(suffix_cap, chunk_cap, length * 15 // 100)
-        if controller.split_prefill_adaptive:
-            # Leave at least one uncached token for P and honor D's offer.
-            suffix_cap = min(suffix_cap, length - min_cut, miss - 1)
-            if suffix_cap < MIN_SUFFIX_TOKENS:
-                return 0, "split_too_small"
-            floor = MIN_SUFFIX_TOKENS
         cut = length - min(max(suffix, floor), suffix_cap)
     earliest = max(prefix + 1, min_cut, length - suffix_cap)
     latest = length - floor
@@ -689,13 +795,32 @@ def init_input(original, req, tree_cache=None, cow_mamba=None):
             selected, reason = 0, "p_backlog_below_threshold"
         else:
             rates = getattr(req, "_hybrid_split_rates", None)
-            selected, reason = select_cut(controller, length, prefix, limits, rates)
+            alpha = getattr(req, "_hybrid_split_alpha", ALPHA_SCALE)
+            selected, reason = select_cut(
+                controller, length, prefix, limits, rates, alpha=alpha
+            )
+            if controller.split_prefill_adaptive:
+                req._hybrid_split_candidate_tokens = candidate_suffix(
+                    controller, length, prefix, limits[1], rates
+                )
         agreed, negative_max = controller.agree([selected, -selected])
         accepted = agreed > 0 and agreed == -negative_max
         cut = req._hybrid_split_at = agreed if accepted else 0
         if not accepted and selected:
             reason = "tp_cut_disagreement"
         req._hybrid_split_match_reason = reason
+        log_decision(
+            controller,
+            req,
+            "prefill_cut",
+            reason,
+            candidate_tokens=getattr(req, "_hybrid_split_candidate_tokens", 0),
+            alpha=getattr(req, "_hybrid_split_alpha", ALPHA_SCALE) / ALPHA_SCALE,
+            suffix_tokens=len(req.origin_input_ids) - cut if cut else 0,
+            share=(len(req.origin_input_ids) - cut) / len(req.origin_input_ids)
+            if cut
+            else 0,
+        )
     if cut:
         req.full_untruncated_fill_ids = req.full_untruncated_fill_ids[:cut]
 
@@ -725,15 +850,20 @@ def seal(req, end_idx):
 
 def set_metadata(original, buffers, req):
     cut = getattr(req, "_hybrid_split_at", 0)
-    if cut:
+    candidate = getattr(req, "_hybrid_split_candidate_tokens", 0)
+    if cut or candidate:
         buffers._hybrid_split_used = True
     if getattr(buffers, "_hybrid_split_used", False):
         buffers.output_ids[req.metadata_buffer_index, CUT_SLOT] = cut
+        if buffers.output_ids.shape[1] > CANDIDATE_SLOT:
+            buffers.output_ids[req.metadata_buffer_index, CANDIDATE_SLOT] = candidate
     return original(buffers, req)
 
 
 def clear_metadata(original, buffers, idx):
     buffers.output_ids[idx, CUT_SLOT] = 0
+    if buffers.output_ids.shape[1] > CANDIDATE_SLOT:
+        buffers.output_ids[idx, CANDIDATE_SLOT] = 0
     return original(buffers, idx)
 
 
@@ -750,6 +880,12 @@ def commit(queue, dr, *, keep_receiver):
     cut = int(queue.metadata_buffers.output_ids[idx, CUT_SLOT].item())
     controller = queue.scheduler._pre_layerwise
     length = len(req.origin_input_ids)
+    reservation = getattr(req, "_hybrid_split_time_budget", None)
+    candidate = (
+        int(queue.metadata_buffers.output_ids[idx, CANDIDATE_SLOT].item())
+        if queue.metadata_buffers.output_ids.shape[1] > CANDIDATE_SLOT
+        else 0
+    )
     min_cut, _ = limits
     page = controller.split_prefill_page_size
     paged = getattr(receiver, "_dsv4_split_window", None) is not None
@@ -757,7 +893,16 @@ def commit(queue, dr, *, keep_receiver):
     split, ordinary, agreed, negative_max = controller.agree(
         [int(valid_cut), int(cut == 0), cut, -cut]
     )
-    if ordinary:
+    room = int(queue.metadata_buffers.bootstrap_room[idx, 0].item())
+    if ordinary and room == req.bootstrap_room:
+        if reservation is not None:
+            budget, key = reservation
+            alpha = getattr(receiver, "_hybrid_split_alpha", ALPHA_SCALE)
+            suppressed = (
+                candidate >= MIN_SUFFIX_TOKENS
+                and candidate * alpha // ALPHA_SCALE < MIN_SUFFIX_TOKENS
+            )
+            budget.ledger.commit(key, 0, controlled=suppressed)
         if paged:
             from .dsv4_split_prefill import trim_swa
 
@@ -766,7 +911,6 @@ def commit(queue, dr, *, keep_receiver):
         if getattr(controller, "split_dpa", False):
             log_decision(controller, req, "decode_commit", "native_pd")
         return False
-    room = int(queue.metadata_buffers.bootstrap_room[idx, 0].item())
     valid = (
         split
         and agreed == -negative_max
@@ -779,6 +923,16 @@ def commit(queue, dr, *, keep_receiver):
         and req.kv.kv_allocated_len == length
         and not req.kv.cache_protected_len
     )
+    if valid and reservation is not None:
+        budget, key = reservation
+        alpha = getattr(receiver, "_hybrid_split_alpha", ALPHA_SCALE)
+        controlled = (
+            candidate > 0 and candidate * alpha // ALPHA_SCALE <= length - min_cut
+        )
+        valid = 0 <= candidate <= length and budget.ledger.commit(
+            key, length - cut, controlled=controlled
+        )
+        log_budget(controller, "commit", req)
     receiver.clear()
     dr.kv_receiver = None
     if not controller.agree([int(valid)])[0]:
@@ -851,10 +1005,10 @@ def _time_split_forward(controller, original, worker, batch, *args, **kwargs):
     ):
         return original(worker, batch, *args, **kwargs)
     phase = None
+    budget = getattr(controller, "split_prefill_decode_budget", None)
     if getattr(batch, "_hybrid_split_extend", False) and batch.forward_mode.is_extend():
         phase = "suffix"
     elif adaptive:
-        budget = controller.split_prefill_decode_budget
         if budget is None and batch.forward_mode.is_extend():
             phase = "prefix"
         elif budget is not None and budget.target and batch.forward_mode.is_decode():
@@ -878,26 +1032,70 @@ def _time_split_forward(controller, original, worker, batch, *args, **kwargs):
     start = torch.cuda.Event(enable_timing=True)
     end = torch.cuda.Event(enable_timing=True)
     stream = torch.cuda.current_stream()
+    reservation = None
+    competing = False
+    if adaptive and phase != "prefix":
+        reservation = (
+            getattr(batch.reqs[0], "_hybrid_split_time_budget", None)
+            if phase == "suffix"
+            else None
+        )
+        if phase == "suffix" and reservation is None:
+            raise RuntimeError("adaptive suffix has no budget reservation")
+        key = reservation[1] if reservation is not None else None
+        competing = budget.ledger.begin(budget.worker, key, tokens)
     start.record(stream)
     result = original(worker, batch, *args, **kwargs)
     end.record(stream)
     result._split_suffix_timing = (tokens, start, end, phase)
+    result._split_budget_timing = (
+        reservation,
+        competing,
+        getattr(batch, "forward_iter", None),
+    )
     return result
 
 
 def record_completed_suffix(controller, result):
+    pending = getattr(controller, "_split_pending_timings", [])
     timing = getattr(result, "_split_suffix_timing", None)
-    if timing is None:
+    if timing is not None:
+        del result._split_suffix_timing
+        extra = getattr(result, "_split_budget_timing", (None, False, None))
+        pending.append((timing, extra))
+    controller._split_pending_timings = []
+    for timing, extra in pending:
+        if not timing[2].query():
+            controller._split_pending_timings.append((timing, extra))
+            continue
+        _record_split_timing(controller, timing, extra)
+    running = getattr(getattr(controller, "scheduler", None), "running_batch", None)
+    if running is not None:
+        update_decode_demand(controller, running)
+
+
+def update_decode_demand(controller, running):
+    budget = getattr(controller, "split_prefill_decode_budget", None)
+    if budget is None or budget.ledger is None:
         return
-    del result._split_suffix_timing
+    reqs = getattr(running, "reqs", None)
+    demand = (
+        any(not req.finished() for req in reqs)
+        if reqs is not None
+        else bool(running.batch_size())
+    )
+    if getattr(controller, "_split_decode_demand", None) != demand:
+        budget.ledger.demand(budget.worker, demand)
+        controller._split_decode_demand = demand
+
+
+def _record_split_timing(controller, timing, extra):
     tokens, start, end, phase = timing
-    # The native result path has consumed the forward and its output copy.
-    # Skip any incomplete sample without adding a CUDA synchronization.
-    if tokens <= 0 or not end.query():
+    if tokens <= 0:
         return
     elapsed_ms = start.elapsed_time(end)
     if not math.isfinite(elapsed_ms) or elapsed_ms <= 0:
-        return
+        raise RuntimeError("invalid completed split CUDA timing")
     rate = tokens * 1000 / elapsed_ms
     if controller.split_prefill_adaptive:
         if phase == "prefix":
@@ -905,12 +1103,20 @@ def record_completed_suffix(controller, result):
                 controller.split_prefill_prefix_rate, min(rate, RATE_LIMIT)
             )
         else:
-            controller.split_prefill_decode_budget.observe(
+            budget = controller.split_prefill_decode_budget
+            reservation, competing, step = extra
+            key = reservation[1] if reservation is not None else None
+            changed = budget.ledger.complete(
+                budget.worker, elapsed_ms, key=key, competing=competing, step=step
+            )
+            budget.observe(
                 tokens,
                 elapsed_ms,
                 suffix=phase == "suffix",
                 rank=split_tp_rank(controller),
             )
+            if changed:
+                log_budget(controller, "feedback")
         return
     previous = controller.split_prefill_suffix_rate
     if previous is not None:
@@ -936,6 +1142,10 @@ def next_batch(original, scheduler, running_batch):
     controller = getattr(scheduler, "_pre_layerwise", None)
     if not getattr(controller, "split_prefill", False):
         return original(scheduler, running_batch)
+    budget = getattr(controller, "split_prefill_decode_budget", None)
+    if budget is not None and budget.ledger is not None:
+        update_decode_demand(controller, running_batch)
+        record_completed_suffix(controller, None)
 
     last = scheduler.last_batch
     last_was_split = getattr(last, "_hybrid_split_extend", False)

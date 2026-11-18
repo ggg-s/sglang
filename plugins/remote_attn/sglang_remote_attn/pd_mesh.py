@@ -511,6 +511,7 @@ def bootstrap(original, receiver, *, bootstrap_info, message, operation):
     if send_split_offer:
         from . import dsv4_split_prefill
         from .qwen_split_prefill import (
+            ALPHA_WIRE,
             DECODE_PRIORITY,
             SUFFIX_CAP_WIRE,
             SUFFIX_RATE_WIRE,
@@ -530,6 +531,9 @@ def bootstrap(original, receiver, *, bootstrap_info, message, operation):
         rate = getattr(receiver, "_hybrid_split_suffix_rate", 0)
         if rate:
             message.append(SUFFIX_RATE_WIRE + str(rate).encode("ascii"))
+        alpha = getattr(receiver, "_hybrid_split_alpha", None)
+        if alpha is not None:
+            message.append(ALPHA_WIRE + str(alpha).encode("ascii"))
         if getattr(receiver, "_hybrid_split_decode_priority", False):
             message.append(DECODE_PRIORITY)
     sent = original(
@@ -549,6 +553,7 @@ def parse_transfer(original, *args, **kwargs):
     message = kwargs.get("msg", args[-1] if args else None)
     from . import dsv4_split_prefill
     from .qwen_split_prefill import (
+        ALPHA_WIRE,
         DECODE_PRIORITY,
         SUFFIX_CAP_WIRE,
         SUFFIX_RATE_WIRE,
@@ -578,6 +583,25 @@ def parse_transfer(original, *args, **kwargs):
     if (split_offers or dsv4_offers) and not hasattr(value, "_hybrid_split_limits"):
         value._hybrid_split_offer_error = "invalid_decode_split_offer"
     if hasattr(value, "_hybrid_split_limits"):
+        from .split_budget_ledger import ALPHA_SCALE
+
+        alphas = [
+            frame[len(ALPHA_WIRE) :]
+            for frame in extensions
+            if frame.startswith(ALPHA_WIRE)
+        ]
+        if alphas:
+            field = alphas[0]
+            if (
+                len(alphas) != 1
+                or not field.isdigit()
+                or len(field) > 7
+                or int(field) > ALPHA_SCALE
+            ):
+                del value._hybrid_split_limits
+                value._hybrid_split_offer_error = "invalid_decode_split_alpha"
+            else:
+                value._hybrid_split_alpha = int(field)
         value._hybrid_split_decode_priority = DECODE_PRIORITY in extensions
         for tag, attr, maximum in (
             (SUFFIX_CAP_WIRE, "_hybrid_split_suffix_cap", TP_MIN_IDENTITY),

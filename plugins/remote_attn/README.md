@@ -56,24 +56,42 @@ P5.19 now has an opt-in same-host pre-layerwise PD prototype; see the
 It inherits the model deployment's token chunking and selects layer groups from
 the scheduler's actual batch lengths. No separate chunk-size setting is needed.
 Small tails use native transfer in `layerwise` mode. In `remote` mode, dense MHA
-and FULL+MAMBA PD default to split prefill.
+and FULL+MAMBA PD default to split prefill. With split enabled, both roles
+default to the adaptive decode time budget.
 
-- P defaults to a suffix of 25% of the cache miss, subject to the negotiated
-  cut bounds. `HANDOFF_SPLIT_SUFFIX_CAP_TOKENS=auto` uses D's per-request
-  suffix bound. An explicit integer adds a P-side ceiling. D's chunk size
-  controls one execution step and can be smaller than the suffix.
+- P estimates the suffix from the measured P and D rates, falling back to 25%
+  of the cache miss while samples are unavailable. `HANDOFF_SPLIT_SUFFIX_CAP_TOKENS=auto`
+  uses D's per-request suffix bound. An explicit integer adds a P-side ceiling.
+- Adaptive feedback scales P's actual candidate suffix by alpha (initially 1),
+  before applying D's reserved upper bound. Each feedback window spans at least
+  `stall_ms` of measured forward time and changes alpha by at most 10%.
+- D atomically reserves time credits before sending an offer. Attention groups
+  share the launched D instance's native distributed Store; separate D instances
+  have independent budgets. Actual cuts refund unused credits at native KV
+  completion, and completed CUDA events settle chunk costs and overruns.
+  Decode forwards replenish `g` times their GPU duration; genuinely idle time
+  also replenishes credits. Capacity is `max(stall_ms, minimum_legal_suffix_ms) + r * H`, using measured refill
+  rate and offer-to-KV-ready latency. Alpha travels in the existing offer and the
+  candidate uses an unused completion metadata slot. DP reports use native
+  `forward_iter` to credit each decode step once, taking the largest GPU duration. P/D message rounds are
+  unchanged. Conservative reservations remain held until native completion.
 - D defaults its outstanding split limit to its own `--max-running-requests`.
-  With active decodes, D defers each eligible chunk for up to 150 scheduling
-  decisions (45 at 70% or higher P cache hit), with early submission after
-  15 decisions if the running batch is still at or above its starting size.
+  D estimates its chunk size from the measured suffix rate and
+  `HANDOFF_SPLIT_STALL_MS` (600 ms by default). It uses a 4096-token starting
+  chunk before the first sample. A positive `HANDOFF_HYBRID_SPLIT_PREFILL_CHUNK_SIZE`
+  pins the chunk subject to scheduler and page limits.
+- With active decodes, D estimates how many decode steps fit in one suffix
+  chunk's forward time. Before rate and step samples are available, it uses
+  `HANDOFF_SPLIT_DEFER_TICKS` (150 by default).
 
 `HANDOFF_SPLIT_CUT_BASIS=balanced` on P selects the legacy V2 cut independently
 of D's defer setting. `HANDOFF_SPLIT_DEFER_TICKS=0` on D disables deferral.
 Set `HANDOFF_HYBRID_SPLIT_PREFILL=0` on both roles for native PD.
 Requests without a valid split also use native PD. See the
 [Qwen RTX 5090 measurements and settings](QWEN38-HYBRID-D2D-ZH.md#分段-prefill).
-For the opt-in adaptive suffix cap, set `HANDOFF_SPLIT_CAP_AUTO=1` on D and
-`HANDOFF_SPLIT_SUFFIX_CAP_TOKENS=auto` on P. D measures completed suffix
+Set `HANDOFF_SPLIT_ADAPTIVE=0` on both roles for a static comparison. Within
+that mode, `HANDOFF_SPLIT_CAP_AUTO=1` on D enables a suffix cap based on the
+measured suffix rate. D measures completed suffix
 forwards with CUDA events and advertises the TP-agreed suffix limit separately
 from the chunk cap. See the
 [H100 SWE-bench experiment](validation/qwen-split-prefill-adaptive-h100.md).
