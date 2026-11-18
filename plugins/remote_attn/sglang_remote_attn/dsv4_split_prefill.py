@@ -34,7 +34,7 @@ def init_decode_queue(original, queue, *args, **kwargs):
 
     parallel = get_parallel()
     # Only these native PD constructors see a TP wire topology. They retain
-    # the rank-local KV pools and use the four-rank CPU group for preallocation
+    # the rank-local KV pools and use the TP-wide CPU group for preallocation
     # and receive polling. The model and draft runners keep their CP topology.
     with parallel.override(
         attn_tp_size=parallel.tp_size,

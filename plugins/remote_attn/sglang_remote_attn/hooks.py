@@ -138,8 +138,7 @@ def validate_config():
         if pcp and (
             dpa
             or (disagg.disaggregation_mode != "prefill" and not decode_pcp)
-            or parallel.tp_size != 4
-            or parallel.attn_cp_size != 4
+            or parallel.tp_size != parallel.attn_cp_size
             or parallel.attn_dp_size != 1
             or not parallel.enable_prefill_cp
             or parallel.cp_strategy != "interleave"
@@ -149,7 +148,7 @@ def validate_config():
             or parallel.enable_cp_tp_group_sharing
         ):
             raise RuntimeError(
-                "Flash split prefill CP requires TP=CP=4, attention DP=1, "
+                "Flash split prefill CP requires TP=CP, attention DP=1, "
                 "interleave and replicated KV. D requires HANDOFF_SPLIT_DECODE_PCP=1."
             )
         if decode_pcp and disagg.disaggregation_decode_host_receive_threshold < 1:

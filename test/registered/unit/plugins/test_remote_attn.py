@@ -3461,8 +3461,8 @@ class TestRemoteAttn(CustomTestCase):
         allocations = []
 
         def gather(reports, report, group):
-            reports[0] = report
-            reports[1] = tuple(
+            reports[:] = [report] * len(reports)
+            reports[-1] = tuple(
                 (1, 2, 4) if mismatch[0] and value == (1, 2, 4, 8, 16) else value
                 for value in report
             )
@@ -3502,6 +3502,36 @@ class TestRemoteAttn(CustomTestCase):
             with self.assertRaisesRegex(RuntimeError, "settings differ"):
                 sg.resolve_backend(original, f.runner)
             self.assertEqual(len(allocations), before)
+
+            from sglang_remote_attn import dsv41_graph, dsv41_remote
+
+            mismatch[0] = False
+            mr = f.runner.model_runner
+            mr.model_config.hf_config.model_type = "deepseek_v4"
+            mr.token_to_kv_pool = SimpleNamespace(kv_layout=SimpleNamespace(value="v4"))
+            parallel = SimpleNamespace(tp_group=SimpleNamespace(cpu_group=None))
+            with (
+                patch.dict(os.environ, {"HANDOFF_SPLIT_DECODE_PCP": "1"}),
+                patch.object(context, "get_parallel", return_value=parallel),
+                patch.object(
+                    self.hooks.dsv4_split_prefill, "dspark_requested", return_value=False
+                ),
+                patch.object(dsv41_graph, "capture_signature", return_value=(True, ())),
+                patch.object(dsv41_graph, "install"),
+                patch.object(dsv41_remote, "validate_layout"),
+            ):
+                for width, native_buckets, remote_buckets in (
+                    (4, (4, 8, 16), (4, 8, 16)),
+                    (4, (8, 16), (8, 16)),
+                    (6, (6, 12, 18, 24), (6, 12, 18)),
+                    (8, (8, 16, 24), (8, 16)),
+                ):
+                    with self.subTest(width=width, native_buckets=native_buckets):
+                        parallel.attn_cp_size = parallel.tp_size = width
+                        f.runner.capture_bs = native_buckets
+                        backend = sg.resolve_backend(original, f.runner)
+                        self.assertIsInstance(backend, dsv41_graph.DSV41GraphBackend)
+                        self.assertEqual(backend.remote_batches, remote_buckets)
 
     def test_padded_remote_lease_rebuilds_metadata_for_wholly_local_layers(self):
         f = self._segmented_graph_fixture()

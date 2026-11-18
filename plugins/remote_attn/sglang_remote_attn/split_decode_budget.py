@@ -48,6 +48,17 @@ class DecodeBudget:
     suffix_samples: int = 0
     windows: int = 0
 
+    def startup_signature(self):
+        # Only configuration participates in the TP/CP startup agreement.
+        return (
+            self.target,
+            self.stall_ms,
+            self.patience_ms,
+            self.pinned_chunk,
+            self.max_cap,
+            self.min_cap,
+        )
+
     def observe(self, tokens, elapsed_ms, *, suffix, rank):
         if suffix:
             self.suffix_rate = ema(self.suffix_rate, tokens * 1000 / elapsed_ms)

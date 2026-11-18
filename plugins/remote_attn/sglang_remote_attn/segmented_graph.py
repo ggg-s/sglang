@@ -10,6 +10,7 @@ import json
 import logging
 import os
 import types
+from bisect import bisect_left
 from contextlib import contextmanager
 
 logger = logging.getLogger(__name__)
@@ -101,6 +102,8 @@ def agree_capture_settings(report, *, group, world_size):
 class RemoteGraphBackend:
     """Compose native full and breakable banks; own their replay lifetime."""
 
+    remote_batches = REMOTE_BATCHES
+
     def __init__(
         self, runner, full, remote, eager_on_graph, is_capturing, restore_pool
     ):
@@ -177,7 +180,7 @@ class RemoteGraphBackend:
         self, shape_key, forward_fn, capture_inputs=None, post_warmup_hook=None
     ):
         self.full.capture_one(shape_key, forward_fn, capture_inputs, post_warmup_hook)
-        if shape_key.size not in REMOTE_BATCHES:
+        if shape_key.size not in self.remote_batches:
             return
         self.validate_capture_key(shape_key)
         # Full capture can leave lazily initialized attention metadata whose
@@ -506,6 +509,24 @@ def resolve_backend(original, runner):
     )
     native_dspark = flash and dsv4_split_prefill.dspark_requested()
     parallel = get_parallel()
+    remote_batches = REMOTE_BATCHES
+    required_batches = MIN_REMOTE_BATCHES
+    if (
+        flash
+        and dsv4_split_prefill.decode_pcp_requested()
+        and parallel.attn_cp_size > 1
+    ):
+        # Map each Remote bucket to the next shape the native runner will
+        # capture. Several sizes can share one aligned graph via padding.
+        native_batches = runner.capture_bs
+        remote_batches = tuple(
+            dict.fromkeys(
+                native_batches[index]
+                for size in REMOTE_BATCHES
+                if (index := bisect_left(native_batches, size)) < len(native_batches)
+            )
+        )
+        required_batches = ()
     option = os.environ.get("HANDOFF_REMOTE_SEGMENTED_GRAPH", "1")
     settings = (
         get_disagg().disaggregation_mode,
@@ -541,7 +562,8 @@ def resolve_backend(original, runner):
     report = (
         settings,
         tuple(runner.capture_bs),
-        REMOTE_BATCHES,
+        remote_batches,
+        required_batches,
         type(runner.model_runner.model).__name__,
         runner.enable_torch_compile,
         config.graph.cuda_graph_config.decode.backend,
@@ -619,9 +641,12 @@ def resolve_backend(original, runner):
         not (dsv41 or hybrid) and type(mr.model).__name__ != "Qwen3ForCausalLM"
     ) or mr.lora_manager is not None:
         raise ValueError("Remote segments require a supported model without LoRA")
-    if not set(MIN_REMOTE_BATCHES).issubset(runner.capture_bs):
+    if not remote_batches:
+        raise ValueError("Remote segments need at least one native decode capture bucket")
+    if not set(required_batches).issubset(runner.capture_bs):
+        buckets = ", ".join(map(str, required_batches))
         raise ValueError(
-            "Native decode capture buckets must include 1, 2, 4 for Remote segments"
+            f"Native decode capture buckets must include {buckets} for Remote segments"
         )
     if live:
         raise RuntimeError("Cannot recapture Remote graphs with live handoff leases")
@@ -645,6 +670,7 @@ def resolve_backend(original, runner):
         is_capturing,
         lambda: set_graph_pool_id(full._pool),
     )
+    backend.remote_batches = remote_batches
     mr._remote_segmented_backend = backend
     if dsv41:
         dsv41_graph.install(mr, runner)

@@ -18,9 +18,11 @@ D_DPA=${D_DPA:-1}
 D_PCP=${D_PCP:-0}
 P_ONLY=${P_ONLY:-0}
 P_HOST=${P_HOST:-127.0.0.1}
-if [[ "$D_PCP" == 1 && ( "$TP" != 4 || "$P_PCP" != 1 || "$D_DPA" != 0 || "$SMG" != 0 ) ]]; then
-  echo "D_PCP=1 requires TP=4 P_PCP=1 D_DPA=0 SMG=0" >&2
-  exit 2
+if [[ "$D_PCP" == 1 ]]; then
+  if [[ ! "$TP" =~ ^[1-9][0-9]*$ || "$TP" == 1 || "$P_PCP" != 1 || "$D_DPA" != 0 || "$SMG" != 0 ]]; then
+    echo "D_PCP=1 requires TP > 1, P_PCP=1, D_DPA=0 and SMG=0" >&2
+    exit 2
+  fi
 fi
 RUN_DIR=$(mktemp -d "${TMPDIR:-/tmp}/flash-split-dpa.XXXXXX")
 echo "Logs: $RUN_DIR"

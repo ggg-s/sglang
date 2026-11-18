@@ -25,6 +25,70 @@ with patch.object(sys, "path", [str(ROOT / "plugins/remote_attn"), *sys.path]):
 
 
 class TestRemoteMainContracts(CustomTestCase):
+    def test_split_graph_startup_serializes_only_budget_configuration(self):
+        import pickle
+        from dataclasses import replace
+
+        from sglang.srt import runtime_context
+        from sglang_remote_attn import pd_mesh, pre_layerwise, source_cache
+        from sglang_remote_attn.split_decode_budget import DecodeBudget
+
+        @dataclass
+        class GraphConfig:
+            pass
+
+        budget = DecodeBudget(
+            target=0.75,
+            stall_ms=400,
+            patience_ms=200,
+            pinned_chunk=False,
+            max_cap=16384,
+        )
+        budget.ledger = torch.distributed.PrefixStore(
+            "split", torch.distributed.HashStore()
+        )
+        control = NS(
+            scheduler=NS(
+                tp_worker=NS(
+                    model_runner=NS(
+                        decode_cuda_graph_runner=None, prefill_cuda_graph_runner=None
+                    )
+                )
+            ),
+            config=NS(),
+            pd_remote=False,
+            split_vote_size=2,
+            split_vote_group=object(),
+            split_prefill_decode_budget=budget,
+        )
+        execution = NS(graph=NS(cuda_graph_config=GraphConfig()))
+        reports = []
+
+        def gather(result, report, group):
+            result[0] = pickle.loads(pickle.dumps(report))
+            reports.append(result[0])
+            result[1] = reports[0]
+
+        with (
+            patch.object(runtime_context, "get_exec", return_value=execution),
+            patch.object(pd_mesh, "startup_signature", return_value=None),
+            patch.object(source_cache, "cache_signature", return_value=None),
+            patch.object(
+                pre_layerwise,
+                "_runtime",
+                return_value=NS(has_target_states=lambda: False),
+            ),
+            patch.object(torch.distributed, "all_gather_object", side_effect=gather),
+        ):
+            pre_layerwise.Controller.validate_graphs(control)
+            self.assertTrue(control.graph_fast_path)
+            budget.suffix_rate = 6000
+            pre_layerwise.Controller.validate_graphs(control)
+            self.assertEqual(reports[0], reports[1])
+            control.split_prefill_decode_budget = replace(budget, stall_ms=500)
+            with self.assertRaisesRegex(RuntimeError, "config or captures differ"):
+                pre_layerwise.Controller.validate_graphs(control)
+
     def test_split_suffix_uses_native_breakable_prefill_eligibility(self):
         from sglang.srt.model_executor import cuda_graph_config
         from sglang.srt.runtime_context import get_forward
@@ -102,8 +166,8 @@ class TestRemoteMainContracts(CustomTestCase):
                 verify._remote_attn_graph_fallback, "native_graph_ineligible"
             )
 
-    def test_flash_decode_pcp_uses_four_native_receive_ranks(self):
-        """A width-one PD view collapses all four D destinations into rank zero."""
+    def test_flash_decode_pcp_uses_all_native_receive_ranks(self):
+        """A width-one PD view collapses all D destinations into rank zero."""
         from sglang.srt.runtime_context import get_parallel
 
         with patch.object(
@@ -118,7 +182,6 @@ class TestRemoteMainContracts(CustomTestCase):
             members={"_resolve_rank_mapping"},
         )
         parallel = get_parallel()
-        full_group = NS(world_size=4, cpu_group=object())
         singleton = NS(world_size=1, cpu_group=object())
         prefix = "sglang.srt.disaggregation.decode."
         transfer_init = hooks.HOOKS[prefix + "DecodeTransferQueue.__init__"]
@@ -142,40 +205,43 @@ class TestRemoteMainContracts(CustomTestCase):
                 pp_rank=0,
             )
 
-        registered = []
-        with patch.dict(os.environ, {"HANDOFF_SPLIT_DECODE_PCP": "1"}):
-            for rank in range(4):
-                with parallel.override(
-                    tp_size=4,
-                    tp_rank=rank,
-                    tp_group=full_group,
-                    attn_tp_size=1,
-                    attn_tp_rank=0,
-                    attn_tp_group=singleton,
-                    attn_cp_size=4,
-                    attn_cp_rank=rank,
-                    attn_cp_group=full_group,
-                    attn_dp_size=1,
-                    attn_dp_rank=0,
-                ):
-                    transfer, prealloc = NS(), NS()
-                    transfer_init(init_transfer, transfer)
-                    prealloc_init(init_prealloc, prealloc)
-                    self.assertIs(transfer.group, full_group.cpu_group)
-                    self.assertIs(prealloc.group, full_group.cpu_group)
-                    self.assertEqual(parallel.attn_cp_size, 4)
-                    self.assertIs(parallel.attn_tp_group, singleton)
-                    prefill = NS(
-                        attn_tp_size=1,
-                        attn_cp_size=4,
-                        enable_kv_cache_sharding=False,
-                        enable_dsa_cache_layer_split=False,
-                        pp_size=1,
-                    )
-                    manager._resolve_rank_mapping(prealloc.manager, prefill)
-                    self.assertEqual(prefill.required_dst_info_num, 4)
-                    registered.append(prealloc.args.engine_rank)
-        self.assertEqual(registered, [0, 1, 2, 3])
+        for width in (2, 4, 6, 8):
+            with self.subTest(width=width):
+                full_group = NS(world_size=width, cpu_group=object())
+                registered = []
+                with patch.dict(os.environ, {"HANDOFF_SPLIT_DECODE_PCP": "1"}):
+                    for rank in range(width):
+                        with parallel.override(
+                            tp_size=width,
+                            tp_rank=rank,
+                            tp_group=full_group,
+                            attn_tp_size=1,
+                            attn_tp_rank=0,
+                            attn_tp_group=singleton,
+                            attn_cp_size=width,
+                            attn_cp_rank=rank,
+                            attn_cp_group=full_group,
+                            attn_dp_size=1,
+                            attn_dp_rank=0,
+                        ):
+                            transfer, prealloc = NS(), NS()
+                            transfer_init(init_transfer, transfer)
+                            prealloc_init(init_prealloc, prealloc)
+                            self.assertIs(transfer.group, full_group.cpu_group)
+                            self.assertIs(prealloc.group, full_group.cpu_group)
+                            self.assertEqual(parallel.attn_cp_size, width)
+                            self.assertIs(parallel.attn_tp_group, singleton)
+                            prefill = NS(
+                                attn_tp_size=1,
+                                attn_cp_size=width,
+                                enable_kv_cache_sharding=False,
+                                enable_dsa_cache_layer_split=False,
+                                pp_size=1,
+                            )
+                            manager._resolve_rank_mapping(prealloc.manager, prefill)
+                            self.assertEqual(prefill.required_dst_info_num, width)
+                            registered.append(prealloc.args.engine_rank)
+                self.assertEqual(registered, list(range(width)))
 
     def test_every_native_decode_backend_access_is_implemented(self):
         source = (
@@ -1554,12 +1620,16 @@ class TestSplitPD(CustomTestCase):
             self._check_dsv4_split(adaptive=True, dspark=True, dpa=True, pcp=True)
 
     def test_dsv4_pcp_split_covers_all_decode_tp_destinations(self):
-        """CP0 must accept four compatible offers and use each D rank's pages."""
+        """CP0 must accept all compatible offers and use each D rank's pages."""
         with patch.dict(
             os.environ,
             {"HANDOFF_HYBRID_SPLIT_PREFILL": "1", "HANDOFF_SPLIT_ADAPTIVE": "1"},
         ):
-            self._check_dsv4_split(adaptive=True, dspark=True, pcp=True, fanout=True)
+            for width in (4, 8):
+                with self.subTest(width=width):
+                    self._check_dsv4_split(
+                        adaptive=True, dspark=True, pcp=True, fanout=True, pcp_width=width
+                    )
 
     def _check_dsv4_split(
         self,
@@ -1570,6 +1640,7 @@ class TestSplitPD(CustomTestCase):
         dpa=False,
         pcp=False,
         fanout=False,
+        pcp_width=4,
     ):
         from sglang_remote_attn import dsv4_split_prefill as flash
 
@@ -1589,7 +1660,7 @@ class TestSplitPD(CustomTestCase):
                 members={"_resolve_rank_mapping"},
             )
             decoder = NS(
-                attn_tp_size=4 if fanout else 1,
+                attn_tp_size=pcp_width if fanout else 1,
                 attn_cp_size=1,
                 is_mla_backend=True,
                 kv_args=NS(engine_rank=3),
@@ -1599,7 +1670,7 @@ class TestSplitPD(CustomTestCase):
             )
             prefill = NS(
                 attn_tp_size=1,
-                attn_cp_size=4,
+                attn_cp_size=pcp_width,
                 enable_kv_cache_sharding=False,
                 enable_dsa_cache_layer_split=False,
                 pp_size=1,
@@ -1609,7 +1680,7 @@ class TestSplitPD(CustomTestCase):
                 (prefill.target_cp_ranks, prefill.target_tp_ranks), ([0], [0])
             )
             self.assertEqual(prefill.required_prefill_response_num, 1)
-            self.assertEqual(prefill.required_dst_info_num, 4 if fanout else 1)
+            self.assertEqual(prefill.required_dst_info_num, pcp_width if fanout else 1)
         component_type = definitions(
             ROOT,
             "python/sglang/srt/mem_cache/unified_cache/component_type.py",
@@ -1665,7 +1736,7 @@ class TestSplitPD(CustomTestCase):
         )
         for controller in (p, d):
             if pcp and controller is p:
-                p.tp_size = 4
+                p.tp_size = pcp_width
                 p.attn_tp_rank = 0
                 p.attn_tp_size = 1
                 p.split_pcp = True
@@ -1787,7 +1858,7 @@ class TestSplitPD(CustomTestCase):
         if fanout:
             peers = sender.kv_mgr.transfer_infos[7]
             registrations = sender.kv_mgr.decode_kv_args_table
-            for rank in range(4):
+            for rank in range(pcp_width):
                 session = f"decode-{rank}"
                 destination = self.mesh.parse_transfer(
                     lambda **_: Peer(
@@ -1799,7 +1870,7 @@ class TestSplitPD(CustomTestCase):
                     msg=frames,
                 )
                 destination.is_dummy = False
-                destination.required_dst_info_num = 4
+                destination.required_dst_info_num = pcp_width
                 destination.mooncake_session_id = session
                 destination.dst_kv_indices = list(range(33))
                 schema, start_page, pages = destination._dsv4_split_window
@@ -1808,13 +1879,13 @@ class TestSplitPD(CustomTestCase):
                     start_page,
                     [index + 100 * rank for index in pages],
                 )
-                if rank == 3:
+                if rank == pcp_width - 1:
                     destination._hybrid_split_limits = (6144, 2048)
                     destination._hybrid_split_suffix_cap = length - 6144
                     destination._hybrid_split_suffix_rate = 4200
                 peers[session] = destination
                 registrations[session] = NS(
-                    requires_dcp_relayout=False, dst_attn_tp_size=4, dst_tp_rank=rank
+                    requires_dcp_relayout=False, dst_attn_tp_size=pcp_width, dst_tp_rank=rank
                 )
             del peers["decode"], registrations["decode"]
             peer = peers["decode-0"]
@@ -1827,11 +1898,11 @@ class TestSplitPD(CustomTestCase):
                 self.split.offered_limits(source, p),
                 ((6144, 2048, length - 6144, 4200), None),
             )
-            with patch.object(peers["decode-3"], "_hybrid_split_limits", None):
+            with patch.object(peers[f"decode-{pcp_width - 1}"], "_hybrid_split_limits", None):
                 self.assertEqual(
                     self.split.offered_limits(source, p), (None, "decode_did_not_offer")
                 )
-            with patch.object(registrations["decode-3"], "dst_tp_rank", 0):
+            with patch.object(registrations[f"decode-{pcp_width - 1}"], "dst_tp_rank", 0):
                 self.assertEqual(
                     self.split.offered_limits(source, p),
                     (None, "incompatible_destination_registration"),
@@ -2297,7 +2368,12 @@ class TestSplitPD(CustomTestCase):
                 },
             ),
         ):
-            hooks.validate_config()
+            for width in (2, 4, 6, 8):
+                with (
+                    self.subTest(role=disagg.disaggregation_mode, width=width),
+                    patch.multiple(parallel, tp_size=width, attn_cp_size=width),
+                ):
+                    hooks.validate_config()
             for config, name, value in (
                 (disagg, "disaggregation_mode", "decode"),
                 (parallel, "attn_cp_size", 2),
@@ -2306,7 +2382,7 @@ class TestSplitPD(CustomTestCase):
                 with (
                     self.subTest(name=name),
                     patch.object(config, name, value),
-                    self.assertRaisesRegex(RuntimeError, "TP=CP=4"),
+                    self.assertRaisesRegex(RuntimeError, "TP=CP,"),
                 ):
                     hooks.validate_config()
 
@@ -2315,7 +2391,12 @@ class TestSplitPD(CustomTestCase):
             with self.assertRaisesRegex(RuntimeError, "--enable-cp-decode-attn-tp"):
                 hooks.validate_config()
             parallel.enable_cp_decode_attn_tp = True
-            hooks.validate_config()
+            for width in (2, 4, 6, 8):
+                with (
+                    self.subTest(role=disagg.disaggregation_mode, width=width),
+                    patch.multiple(parallel, tp_size=width, attn_cp_size=width),
+                ):
+                    hooks.validate_config()
             disagg.disaggregation_decode_host_receive_threshold = 0
             with self.assertRaisesRegex(RuntimeError, "requires GPU KV receive"):
                 hooks.validate_config()

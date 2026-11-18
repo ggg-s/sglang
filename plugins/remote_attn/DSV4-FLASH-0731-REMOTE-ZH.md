@@ -92,17 +92,20 @@ C128 online 与 offline，各策略 22 次传输，四组均通过。
 以及原生 PD 回退。4060 探针使用合成的 draft SWA 和请求状态张量，整模 DSpark
 输出一致性、多 TP GPU 和性能仍待验证。
 
-### D 侧后缀 PCP4（实验）
+### D 侧后缀 PCP（实验）
 
-P、D 各用 4 张 GPU，D 启用 `HANDOFF_SPLIT_DECODE_PCP=1`、
+启用 PCP 的实例要求 `TP=CP`，每个实例的宽度由原生 DeepSeek-V4 和模型
+布局校验。D 启用 `HANDOFF_SPLIT_DECODE_PCP=1`、
 `--enable-prefill-cp --cp-strategy interleave --enable-cp-decode-attn-tp`。
 后缀 `EXTEND` 走原生 CP，普通 decode 和 DSpark verify 由原生路径切分
-attention 权重。Mooncake 仍按 TP4 注册四份接收页表。接收完成和预分配
-使用同一个四 rank CPU 组。无切点的请求使用原生 PD 收发和 DSpark。
+attention 权重。Mooncake 按 TP 宽度注册各 rank 的接收页表，预分配和接收完成
+使用同一个全 TP CPU 组。无切点的请求使用原生 PD 收发和 DSpark。
 该模式要求 interleave、复制的 GPU KV、attention DP=1 和原生 Mooncake。
+Remote 分段图从原生捕获的桶里选择能够覆盖常用 batch size 的桶，复用原生 padding。
 
-两台各四卡的机器可用直连冒烟。两端使用同一个 checkpoint、同一份代码和相同的
-DSpark draft 配置。如果 draft 是独立 checkpoint，两端都设置 `DRAFT`。
+下面是两台各四卡的验证命令。验证 PCP8 时两端都设置 `TP=8`，并分别提供
+8 张 GPU 的列表。两端使用同一个 checkpoint、同一份代码和相同的 DSpark draft
+配置。如果 draft 是独立 checkpoint，两端都设置 `DRAFT`。
 
 ```bash
 # P 机器

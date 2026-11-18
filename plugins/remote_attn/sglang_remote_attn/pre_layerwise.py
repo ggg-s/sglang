@@ -648,7 +648,7 @@ class Controller:
         self.attn_tp_size = (
             scheduler.attn_tp_group.world_size if split_attention else self.tp_size
         )
-        # PCP4 uses one attention shard. All CP peers run the same request,
+        # Full-width PCP uses one attention shard. All CP peers run the same request,
         # while each DPA shard agrees independently within its attention TP.
         self.split_vote_size = cp_size if self.split_pcp else self.attn_tp_size
         self.split_vote_group = (
@@ -694,6 +694,7 @@ class Controller:
                 )(),
             )
 
+        budget = getattr(self, "split_prefill_decode_budget", None)
         signature = (
             asdict(get_exec().graph.cuda_graph_config),
             manifest(runner.decode_cuda_graph_runner),
@@ -720,7 +721,7 @@ class Controller:
                 getattr(self, "split_prefill_patience_ticks", None),
                 getattr(self, "split_prefill_suffix_budget_s", None),
                 getattr(self, "split_prefill_adaptive", False),
-                getattr(self, "split_prefill_decode_budget", None),
+                budget.startup_signature() if budget is not None else None,
             ),
             ("destination-cache-v1", "prefix-range-v1", prefix_enabled()),
             (
